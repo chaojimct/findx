@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>FindX.Service</RootNamespace>
+    <AssemblyName>FindX</AssemblyName>
+    <FindxEngineRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\native\findx-engine'))</FindxEngineRoot>
+    <FindxCargoProfile Condition="'$(Configuration)' == 'Release'">release</FindxCargoProfile>
+    <FindxCargoProfile Condition="'$(Configuration)' != 'Release'">debug</FindxCargoProfile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\FindX.Core\FindX.Core.csproj" />
+  </ItemGroup>
+  <!-- 预编译 DLL：native\FindXNative\build.ps1 / build.cmd 产出后随 FindX 输出（优先 Release） -->
+  <Choose>
+    <When Condition="Exists('..\..\native\FindXNative\bin\x64\Release\FindXNative.dll')">
+      <ItemGroup>
+        <None Include="..\..\native\FindXNative\bin\x64\Release\FindXNative.dll" Link="FindXNative.dll" CopyToOutputDirectory="PreserveNewest" />
+      </ItemGroup>
+    </When>
+    <Otherwise>
+      <ItemGroup Condition="Exists('..\..\native\FindXNative\bin\x64\Debug\FindXNative.dll')">
+        <None Include="..\..\native\FindXNative\bin\x64\Debug\FindXNative.dll" Link="FindXNative.dll" CopyToOutputDirectory="PreserveNewest" />
+      </ItemGroup>
+    </Otherwise>
+  </Choose>
+  <ItemGroup>
+    <None Include="$(FindxEngineRoot)\target\$(FindxCargoProfile)\findx_engine.dll" Link="findx_engine.dll" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

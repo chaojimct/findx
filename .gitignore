@@ -1,0 +1,86 @@
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+[Oo]ut/
+
+# Visual Studio
+.vs/
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.userprefs
+*.VC.db
+*.VC.VC.opendb
+*.opensdf
+*.sdf
+*.cachefile
+*.aps
+*.ncb
+*.plg
+*.opt
+ipch/
+*.pch
+*.pdb
+*.ilk
+*.meta
+*.obj
+*.idb
+*.iobj
+*.ipdb
+
+# MSBuild / NuGet
+*.nupkg
+**/packages/*
+!**/packages/build/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# MSTest / test adapters
+[Tt]est[Rr]esult*/
+*.VisualState.xml
+TestResult.xml
+*.coverage
+*.coveragexml
+
+# .NET Core / SDK / tooling
+*.DotSettings.user
+
+# Rust (Cargo)
+**/target/
+
+# ReSharper / Rider
+_ReSharper*/
+*.[Rr]e[Ss]harper
+.idea/
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Local / secrets
+*.local.json
+secrets.json
+.env
+.env.*

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>FindX.Bench</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <FindxEngineRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\native\findx-engine'))</FindxEngineRoot>
+    <FindxCargoProfile Condition="'$(Configuration)' == 'Release'">release</FindxCargoProfile>
+    <FindxCargoProfile Condition="'$(Configuration)' != 'Release'">debug</FindxCargoProfile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\FindX.Core\FindX.Core.csproj" />
+    <None Include="$(FindxEngineRoot)\target\$(FindxCargoProfile)\findx_engine.dll" Link="findx_engine.dll" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

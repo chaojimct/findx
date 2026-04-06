@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>FindX.Core</RootNamespace>
+    <FindxEngineRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\native\findx-engine'))</FindxEngineRoot>
+    <FindxCargoProfile Condition="'$(Configuration)' == 'Release'">release</FindxCargoProfile>
+    <FindxCargoProfile Condition="'$(Configuration)' != 'Release'">debug</FindxCargoProfile>
+  </PropertyGroup>
+  <Target Name="CargoBuildFindxEngine" BeforeTargets="BeforeBuild" Condition="Exists('$(FindxEngineRoot)\Cargo.toml')">
+    <PropertyGroup>
+      <FindxCargoArgs Condition="'$(Configuration)' == 'Release'">--release</FindxCargoArgs>
+      <FindxCargoArgs Condition="'$(Configuration)' != 'Release'"></FindxCargoArgs>
+    </PropertyGroup>
+    <Exec Command="cargo build $(FindxCargoArgs)" WorkingDirectory="$(FindxEngineRoot)" IgnoreExitCode="false" />
+  </Target>
+  <ItemGroup>
+    <None Include="$(FindxEngineRoot)\target\$(FindxCargoProfile)\findx_engine.dll" Link="findx_engine.dll" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

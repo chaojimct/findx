@@ -1,0 +1,37 @@
+<Window x:Class="FindX.Service.TrayWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="FindX 索引状态"
+        Width="450" Height="400"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="NoResize"
+        ShowInTaskbar="False"
+        Visibility="Hidden">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Margin="0,0,0,12">
+            <TextBlock Text="FindX 文件搜索引擎" FontSize="16" FontWeight="Bold"/>
+            <TextBlock x:Name="StatusText" Text="状态: 运行中" Margin="0,4,0,0" Foreground="Gray"/>
+            <TextBlock x:Name="CountText" Text="索引文件数: 0" Margin="0,2,0,0" Foreground="Gray"/>
+        </StackPanel>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,8">
+            <CheckBox x:Name="AutoStartCheck" Content="开机自启" Checked="AutoStart_Changed" Unchecked="AutoStart_Changed"/>
+        </StackPanel>
+
+        <ListBox x:Name="LogList" Grid.Row="2" FontSize="11" FontFamily="Consolas"
+                 BorderThickness="1" BorderBrush="#DDD"/>
+
+        <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+            <Button Content="重建索引" Click="Reindex_Click" Padding="12,4" Margin="0,0,8,0"/>
+            <Button Content="隐藏" Click="Hide_Click" Padding="12,4" Margin="0,0,8,0"/>
+            <Button Content="退出" Click="Exit_Click" Padding="12,4"/>
+        </StackPanel>
+    </Grid>
+</Window>
