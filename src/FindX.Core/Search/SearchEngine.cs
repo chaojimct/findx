@@ -21,8 +21,10 @@ public sealed class SearchEngine
         if (parsed.Keywords.Count == 0 && !parsed.IsRegex)
             return new List<SearchResult>();
 
-        var candidates = GatherCandidates(parsed, maxResults * 10);
+        var candidates = GatherCandidates(parsed, maxResults);
         var results = new List<SearchResult>();
+
+        var combinedLower = parsed.IsRegex ? null : string.Join("", parsed.Keywords).ToLowerInvariant();
 
         foreach (var idx in candidates)
         {
@@ -54,8 +56,7 @@ public sealed class SearchEngine
             }
             else
             {
-                var combined = string.Join("", parsed.Keywords);
-                matchResult = PinyinMatcher.Match(combined, entry.Name);
+                matchResult = PinyinMatcher.Match(combinedLower!, entry.Name);
             }
 
             if (!matchResult.IsMatch) continue;
@@ -82,36 +83,80 @@ public sealed class SearchEngine
         return results;
     }
 
-    private HashSet<int> GatherCandidates(ParsedQuery parsed, int limit)
+    private HashSet<int> GatherCandidates(ParsedQuery parsed, int maxResults)
     {
         var candidates = new HashSet<int>();
 
         if (parsed.IsRegex)
         {
             var pattern = parsed.RegexPattern!;
+            var regexCap = maxResults * 10;
             _index.ForEachLiveEntry((entry, i) =>
             {
-                if (candidates.Count >= limit) return false;
+                if (candidates.Count >= regexCap) return false;
                 if (pattern.IsMatch(entry.Name)) candidates.Add(i);
                 return true;
             });
             return candidates;
         }
 
+        var cap = FileIndex.PrefixSearchHitCap;
+        const int mixCap = 512;
+
         foreach (var kw in parsed.Keywords)
         {
             var lower = kw.ToLowerInvariant();
 
-            var nameHits = _index.SearchNamePrefix(lower, limit);
-            foreach (var h in nameHits) candidates.Add(h);
+            foreach (var h in _index.SearchNamePrefix(lower, cap))
+                candidates.Add(h);
 
-            bool hasAscii = lower.All(c => char.IsAsciiLetterOrDigit(c));
-            if (hasAscii)
+            if (!lower.All(c => char.IsAsciiLetterOrDigit(c)))
+                continue;
+
+            foreach (var h in _index.SearchPinyinInitialsPrefix(lower, cap))
+                candidates.Add(h);
+            foreach (var h in _index.SearchFullPinyinCompactPrefix(lower, cap))
+                candidates.Add(h);
+
+            // 递进首字母前缀：2..min(len-1, 4)
+            // mchunt → "mc","mch","mchu"；其中 "mc" 命中 initials="mct"（马春天）
+            int pyInitMax = Math.Min(lower.Length - 1, 4);
+            for (int plen = pyInitMax; plen >= 2; plen--)
             {
-                var pinyinHits = _index.SearchPinyinInitialsPrefix(lower, limit);
-                foreach (var h in pinyinHits) candidates.Add(h);
-                var fullPyHits = _index.SearchFullPinyinCompactPrefix(lower, limit);
-                foreach (var h in fullPyHits) candidates.Add(h);
+                foreach (var h in _index.SearchPinyinInitialsPrefix(lower[..plen], mixCap))
+                    candidates.Add(h);
+            }
+
+            // 递进全拼前缀：2..min(len-1, 6)
+            int fullPyMax = Math.Min(lower.Length - 1, 6);
+            for (int plen = fullPyMax; plen >= 2; plen--)
+            {
+                foreach (var h in _index.SearchFullPinyinCompactPrefix(lower[..plen], mixCap))
+                    candidates.Add(h);
+            }
+
+            // 跨音节三字首字母组合：遍历查询中所有可能的 (P, Q) 位置对，
+            // P = 第二个 CJK 字起始位置，Q = 第三个 CJK 字起始位置，
+            // 组成三字首字母前缀搜索。三字前缀足够精确（如 "mct" 几乎仅命中 CJK），
+            // 用小 cap 避免 "min"/"mac" 等高频 ASCII 前缀带来的候选集爆炸。
+            // mact → (P=2,Q=3): "mct" → 命中 initials="mct"（马春天）
+            // mchunt → (P=1,Q=5): "mct" → 命中 initials="mct"（马春天）
+            if (lower.Length >= 3)
+            {
+                char first = lower[0];
+                int pMax = Math.Min(6, lower.Length - 2);
+                for (int p = 1; p <= pMax; p++)
+                {
+                    if (lower[p] is < 'a' or > 'z') continue;
+                    int qMax = Math.Min(p + 6, lower.Length - 1);
+                    for (int q = p + 1; q <= qMax; q++)
+                    {
+                        if (lower[q] is < 'a' or > 'z') continue;
+                        foreach (var h in _index.SearchPinyinInitialsPrefix(
+                            $"{first}{lower[p]}{lower[q]}", mixCap))
+                            candidates.Add(h);
+                    }
+                }
             }
         }
 

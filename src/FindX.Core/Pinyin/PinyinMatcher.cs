@@ -1,3 +1,5 @@
+using System.Buffers;
+
 namespace FindX.Core.Pinyin;
 
 /// <summary>
@@ -34,25 +36,22 @@ public static class PinyinMatcher
     }
 
     /// <summary>
-    /// 匹配输入 query 与候选文件名 candidate。
+    /// 匹配输入 queryLower（必须由调用方预先 ToLowerInvariant）与候选文件名 candidate。
     /// 同时尝试直接字符串匹配和拼音匹配，返回最优结果。
     /// </summary>
-    public static MatchResult Match(string query, string candidate)
+    public static MatchResult Match(string queryLower, string candidate)
     {
-        if (string.IsNullOrEmpty(query) || string.IsNullOrEmpty(candidate))
+        if (string.IsNullOrEmpty(queryLower) || string.IsNullOrEmpty(candidate))
             return MatchResult.NoMatch;
 
-        var qLower = query.ToLowerInvariant();
-        var cLower = candidate.ToLowerInvariant();
-
-        if (cLower == qLower)
+        if (candidate.Equals(queryLower, StringComparison.OrdinalIgnoreCase))
             return new MatchResult(MatchType.Exact, 1000, candidate.Length);
 
-        if (cLower.StartsWith(qLower))
-            return new MatchResult(MatchType.Prefix, 800, query.Length);
+        if (candidate.StartsWith(queryLower, StringComparison.OrdinalIgnoreCase))
+            return new MatchResult(MatchType.Prefix, 800, queryLower.Length);
 
-        if (cLower.Contains(qLower))
-            return new MatchResult(MatchType.Prefix, 600, query.Length);
+        if (candidate.Contains(queryLower, StringComparison.OrdinalIgnoreCase))
+            return new MatchResult(MatchType.Prefix, 600, queryLower.Length);
 
         bool hasCjk = false;
         foreach (var ch in candidate)
@@ -62,101 +61,115 @@ public static class PinyinMatcher
 
         if (!hasCjk)
         {
-            var fuzzy = FuzzyMatch(qLower, cLower);
-            return fuzzy > 0 ? new MatchResult(MatchType.Mixed, fuzzy, query.Length) : MatchResult.NoMatch;
+            int fuzzy = FuzzyMatch(queryLower, candidate);
+            return fuzzy > 0 ? new MatchResult(MatchType.Mixed, fuzzy, queryLower.Length) : MatchResult.NoMatch;
         }
 
         bool allAscii = true;
-        foreach (var ch in query)
+        foreach (var ch in queryLower)
         {
             if (!char.IsAsciiLetterOrDigit(ch)) { allAscii = false; break; }
         }
 
         if (!allAscii)
         {
-            if (cLower.Contains(qLower))
-                return new MatchResult(MatchType.Prefix, 700, query.Length);
+            if (candidate.Contains(queryLower, StringComparison.OrdinalIgnoreCase))
+                return new MatchResult(MatchType.Prefix, 700, queryLower.Length);
             return MatchResult.NoMatch;
         }
 
-        return MatchPinyin(qLower, candidate);
+        return MatchPinyin(queryLower, candidate);
     }
 
     /// <summary>
-    /// DP 拼音匹配核心：同时尝试全拼匹配、首字母匹配、混合模式。
-    /// dp[charPos, inputPos] = 该状态可达时的最高分。
+    /// 零分配 DP 拼音匹配：用 stackalloc 一维数组代替 new int[,]，
+    /// 直接遍历 candidate 字符并从 PinyinTable 获取读音，不再构建 List。
     /// </summary>
-    private static MatchResult MatchPinyin(string query, string candidate)
+    private static MatchResult MatchPinyin(string queryLower, string candidate)
     {
         PinyinTable.EnsureInitialized();
 
-        var cjkChars = new List<(char ch, string[][] readings)>();
-        foreach (var ch in candidate)
-        {
-            if (PinyinTable.IsCjk(ch))
-            {
-                var readings = PinyinTable.GetReadings(ch);
-                if (readings != null)
-                    cjkChars.Add((ch, readings.Select(r => new[] { r }).ToArray()));
-                else
-                    cjkChars.Add((ch, [[ch.ToString().ToLowerInvariant()]]));
-            }
-            else
-            {
-                cjkChars.Add((ch, [[char.ToLowerInvariant(ch).ToString()]]));
-            }
-        }
+        int n = candidate.Length;
+        int m = queryLower.Length;
+        int stride = m + 1;
+        int dpSize = (n + 1) * stride;
 
-        if (cjkChars.Count == 0) return MatchResult.NoMatch;
-
-        int n = cjkChars.Count;
-        int m = query.Length;
-        var dp = new int[n + 1, m + 1];
-        for (int i = 0; i <= n; i++)
-        for (int j = 0; j <= m; j++)
-            dp[i, j] = -1;
-        dp[0, 0] = 0;
+        int[]? rented = null;
+        Span<int> dp = dpSize <= 2048
+            ? stackalloc int[dpSize]
+            : (rented = ArrayPool<int>.Shared.Rent(dpSize)).AsSpan(0, dpSize);
+        dp.Fill(-1);
+        dp[0] = 0;
 
         for (int i = 0; i < n; i++)
         {
+            char ch = candidate[i];
+            int rowCur = i * stride;
+            int rowNext = rowCur + stride;
+
             for (int j = 0; j <= m; j++)
             {
-                if (dp[i, j] < 0) continue;
+                int cur = dp[rowCur + j];
+                if (cur < 0) continue;
 
-                dp[i + 1, j] = Math.Max(dp[i + 1, j], dp[i, j]);
+                ref int skipSlot = ref dp[rowNext + j];
+                if (cur > skipSlot) skipSlot = cur;
 
                 if (j >= m) continue;
 
-                foreach (var readingSet in cjkChars[i].readings)
+                if (PinyinTable.IsCjk(ch))
                 {
-                    var py = readingSet[0];
-                    if (string.IsNullOrEmpty(py)) continue;
-
-                    if (py[0] == query[j])
+                    var readings = PinyinTable.GetReadings(ch);
+                    if (readings != null)
                     {
-                        int newScore = dp[i, j] + 10;
-                        dp[i + 1, j + 1] = Math.Max(dp[i + 1, j + 1], newScore);
-                    }
-
-                    int maxPrefix = Math.Min(py.Length, m - j);
-                    for (int len = 1; len <= maxPrefix; len++)
-                    {
-                        bool match = true;
-                        for (int k = 0; k < len; k++)
+                        for (int ri = 0; ri < readings.Length; ri++)
                         {
-                            if (py[k] != query[j + k]) { match = false; break; }
-                        }
-                        if (!match) continue;
+                            var py = readings[ri];
+                            if (py.Length == 0) continue;
 
-                        int bonus = len == py.Length ? 50 : len * 8;
-                        int newScore2 = dp[i, j] + bonus;
-                        dp[i + 1, j + len] = Math.Max(dp[i + 1, j + len], newScore2);
+                            if (py[0] == queryLower[j])
+                            {
+                                ref int r = ref dp[rowNext + j + 1];
+                                int s = cur + 10;
+                                if (s > r) r = s;
+                            }
+
+                            int maxPre = Math.Min(py.Length, m - j);
+                            for (int len = 1; len <= maxPre; len++)
+                            {
+                                if (py[len - 1] != queryLower[j + len - 1]) break;
+                                int bonus = len == py.Length ? 50 : len * 8;
+                                ref int r = ref dp[rowNext + j + len];
+                                int s = cur + bonus;
+                                if (s > r) r = s;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (char.ToLowerInvariant(ch) == queryLower[j])
+                        {
+                            ref int r = ref dp[rowNext + j + 1];
+                            int s = cur + 10;
+                            if (s > r) r = s;
+                        }
+                    }
+                }
+                else
+                {
+                    if (char.ToLowerInvariant(ch) == queryLower[j])
+                    {
+                        ref int r = ref dp[rowNext + j + 1];
+                        int s = cur + 10;
+                        if (s > r) r = s;
                     }
                 }
             }
         }
 
-        int bestScore = dp[n, m];
+        int bestScore = dp[n * stride + m];
+        if (rented != null) ArrayPool<int>.Shared.Return(rented);
+
         if (bestScore > 0)
         {
             bool allFull = bestScore >= n * 40;
@@ -165,26 +178,26 @@ public static class PinyinMatcher
         }
 
         var initials = PinyinTable.GetInitials(candidate);
-        if (initials.StartsWith(query))
-            return new MatchResult(MatchType.Initials, 400, query.Length);
-        if (initials.Contains(query))
-            return new MatchResult(MatchType.Initials, 300, query.Length);
+        if (initials.StartsWith(queryLower))
+            return new MatchResult(MatchType.Initials, 400, queryLower.Length);
+        if (initials.Contains(queryLower))
+            return new MatchResult(MatchType.Initials, 300, queryLower.Length);
 
         return MatchResult.NoMatch;
     }
 
-    private static int FuzzyMatch(string query, string candidate)
+    private static int FuzzyMatch(string queryLower, string candidate)
     {
         int qi = 0;
         int score = 0;
-        for (int ci = 0; ci < candidate.Length && qi < query.Length; ci++)
+        for (int ci = 0; ci < candidate.Length && qi < queryLower.Length; ci++)
         {
-            if (candidate[ci] == query[qi])
+            if (char.ToLowerInvariant(candidate[ci]) == queryLower[qi])
             {
                 score += 10;
                 qi++;
             }
         }
-        return qi == query.Length ? score : 0;
+        return qi == queryLower.Length ? score : 0;
     }
 }

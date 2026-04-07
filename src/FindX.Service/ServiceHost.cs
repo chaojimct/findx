@@ -61,18 +61,45 @@ public sealed class ServiceHost : IDisposable
 
         _ = Task.Run(async () =>
         {
+            var swTotal = Stopwatch.StartNew();
             try
             {
-                _index.BeginBulk();
-                try
+                var swLoad = Stopwatch.StartNew();
+                bool loaded = TryLoadBinaryIndex();
+                swLoad.Stop();
+
+                if (loaded)
                 {
-                    TryLoadIndex();
-                    await ScanAllVolumesAsync();
+                    Log($"二进制索引加载耗时: {swLoad.Elapsed.TotalSeconds:F2}s");
+                    var swScan = Stopwatch.StartNew();
+                    await ScanAllVolumesAsync(skipSave: true);
+                    swScan.Stop();
+                    Log($"ScanAllVolumes 耗时: {swScan.Elapsed.TotalSeconds:F2}s");
                 }
-                finally
+                else
                 {
-                    _index.EndBulk();
+                    _index.BeginBulk();
+                    try
+                    {
+                        TryLoadLegacyIndex();
+                        swLoad.Stop();
+                        Log($"旧格式索引加载耗时: {swLoad.Elapsed.TotalSeconds:F2}s");
+
+                        var swScan = Stopwatch.StartNew();
+                        await ScanAllVolumesAsync(skipSave: true);
+                        swScan.Stop();
+                        Log($"ScanAllVolumes 耗时: {swScan.Elapsed.TotalSeconds:F2}s");
+                    }
+                    finally
+                    {
+                        var swRebuild = Stopwatch.StartNew();
+                        _index.EndBulk();
+                        swRebuild.Stop();
+                        Log($"EndBulk(rebuild_indexes) 耗时: {swRebuild.Elapsed.TotalSeconds:F2}s");
+                    }
                 }
+
+                SaveIndex();
             }
             catch (Exception ex)
             {
@@ -80,6 +107,8 @@ public sealed class ServiceHost : IDisposable
             }
             finally
             {
+                swTotal.Stop();
+                Log($"索引就绪总耗时: {swTotal.Elapsed.TotalSeconds:F2}s");
                 Volatile.Write(ref _indexBuildInProgress, 0);
             }
         });
@@ -114,12 +143,13 @@ public sealed class ServiceHost : IDisposable
                 _index.BeginBulk();
                 try
                 {
-                    await ScanAllVolumesAsync();
+                    await ScanAllVolumesAsync(skipSave: true);
                 }
                 finally
                 {
                     _index.EndBulk();
                 }
+                SaveIndex();
             }
             finally
             {
@@ -129,7 +159,7 @@ public sealed class ServiceHost : IDisposable
         _ipcServer.Start();
     }
 
-    private async Task ScanAllVolumesAsync()
+    private async Task ScanAllVolumesAsync(bool skipSave = false)
     {
         var sw = Stopwatch.StartNew();
         Log("开始扫描卷...");
@@ -163,19 +193,41 @@ public sealed class ServiceHost : IDisposable
         sw.Stop();
 
         Log($"索引完成: {_index.Count:N0} 条记录，耗时 {sw.Elapsed.TotalSeconds:F1}s");
-        SaveIndex();
+        if (!skipSave) SaveIndex();
     }
 
-    private void TryLoadIndex()
+    /// <summary>尝试加载 FXBIN02 快速二进制格式（无需 rebuild）。</summary>
+    private bool TryLoadBinaryIndex()
     {
-        var snapshot = IndexSerializer.Load(IndexPath);
-        if (snapshot == null) { Log("无已有索引"); return; }
+        try
+        {
+            var loaded = IndexSerializer.TryLoadBinary(IndexPath, _index, _volumeUsns);
+            if (loaded >= 0)
+            {
+                Log($"二进制索引加载完成: {loaded:N0} 条");
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"二进制索引加载异常: {ex.Message}");
+        }
+        return false;
+    }
 
-        Log($"加载已有索引: {snapshot.Entries.Count:N0} 条...");
-        _index.AddBulk(snapshot.Entries);
-        foreach (var (vol, usn) in snapshot.VolumeUsns)
-            _volumeUsns[vol] = usn;
-        Log($"索引加载完成");
+    /// <summary>加载旧 FINDX01 格式（需要在 bulk mode 下调用）。</summary>
+    private void TryLoadLegacyIndex()
+    {
+        try
+        {
+            var loaded = IndexSerializer.LoadStreaming(IndexPath, _index, _volumeUsns);
+            if (loaded < 0) { Log("无已有索引"); return; }
+            Log($"旧格式索引加载完成: {loaded:N0} 条");
+        }
+        catch (Exception ex)
+        {
+            Log($"旧格式索引加载异常: {ex.Message}");
+        }
     }
 
     private void SaveIndex()

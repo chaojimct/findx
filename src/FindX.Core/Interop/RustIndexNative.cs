@@ -139,4 +139,16 @@ internal static class RustIndexNative
         int idx,
         IntPtr buf,
         int bufLenChars);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    public static extern int findx_engine_save_file(
+        IntPtr p,
+        IntPtr pathUtf16,
+        int pathLen);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    public static extern int findx_engine_load_file(
+        IntPtr p,
+        IntPtr pathUtf16,
+        int pathLen);
 }

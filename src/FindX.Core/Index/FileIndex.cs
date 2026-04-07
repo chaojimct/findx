@@ -6,11 +6,14 @@ using FindX.Core.Interop;
 namespace FindX.Core.Index;
 
 /// <summary>
-/// 主索引：Rust <c>findx_engine</c> 紧凑存储（字符串池 + BTree 文件名/拼音序），USN 增量 O(log n) 立即参与检索。
+/// 主索引：Rust <c>findx_engine</c> 紧凑存储（字符串池 + 排序数组 文件名/拼音序），USN 增量 O(log n) 立即参与检索。
 /// </summary>
 public sealed class FileIndex
 {
-    private const int SearchIndexCap = 1024;
+    /// <summary>单次前缀检索从 Rust 引擎取回的最大条数。排序数组下此值仅影响返回缓冲区大小（4B×8192=32KB），开销很小。</summary>
+    internal const int PrefixSearchHitCap = 8192;
+
+    private const int SearchIndexCap = PrefixSearchHitCap;
 
     private readonly ReaderWriterLockSlim _lock = new();
     private IntPtr _engine;
@@ -383,6 +386,101 @@ public sealed class FileIndex
     }
 
     public IReadOnlyList<FileEntry> GetAllEntries() => Array.Empty<FileEntry>();
+
+    /// <summary>
+    /// 直接将 Rust 引擎内存状态（含排序索引）序列化到文件，加载时无需 rebuild。
+    /// Volume USN 附加在 Rust 数据之后。
+    /// </summary>
+    public unsafe void SaveBinary(string path, Dictionary<char, ulong> volumeUsns)
+    {
+        _lock.EnterReadLock();
+        try
+        {
+            fixed (char* pp = path)
+            {
+                var rc = RustIndexNative.findx_engine_save_file(_engine, (IntPtr)pp, path.Length);
+                if (rc != 0) throw new IOException($"findx_engine_save_file failed: {rc}");
+            }
+        }
+        finally { _lock.ExitReadLock(); }
+
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.None);
+        fs.Seek(0, SeekOrigin.End);
+        using var bw = new BinaryWriter(fs);
+        bw.Write(volumeUsns.Count);
+        foreach (var (vol, usn) in volumeUsns)
+        {
+            bw.Write(vol);
+            bw.Write(usn);
+        }
+    }
+
+    /// <summary>
+    /// 从二进制文件直接恢复 Rust 引擎状态（含排序索引），不需要 BeginBulk/EndBulk。
+    /// </summary>
+    /// <returns>live 条目数；失败返回 -1。</returns>
+    public unsafe int LoadBinary(string path, Dictionary<char, ulong> volumeUsns)
+    {
+        int live;
+        _lock.EnterWriteLock();
+        try
+        {
+            fixed (char* pp = path)
+            {
+                live = RustIndexNative.findx_engine_load_file(_engine, (IntPtr)pp, path.Length);
+            }
+        }
+        finally { _lock.ExitWriteLock(); }
+
+        if (live < 0) return -1;
+
+        var fi = new FileInfo(path);
+        var rustDataEnd = fi.Length - sizeof(int); // at least usn_count(4)
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        // Rust data is followed by: usn_count(4) + [vol(2) + usn(8)] × N
+        // We need to find where Rust data ends. Since Rust writes the file then C# appends,
+        // we read from the end backwards.
+        // usn section size = 4 + usnCount × 10
+        // Try: seek to end - 4 to read usnCount first
+        fs.Seek(-4, SeekOrigin.End);
+        using var br = new BinaryReader(fs);
+        // We don't know usnCount yet from end. Instead, use the approach:
+        // After Rust save, the Rust data occupies bytes 0..X. Then C# writes:
+        //   usnCount(4) + usnCount×(vol(2)+usn(8))
+        // Total appendix = 4 + usnCount×10
+        // We need to try reading from various offsets. Simpler: save usnCount at end too.
+        // BUT the current format already saves usnCount first then data.
+        // We have no reliable way to find the split point.
+        // Fix: save a footer marker instead. For now, use a simple approach:
+        // try all reasonable usn counts (typically 1-26 drives).
+        // Actually, let's just try to read from after Rust data.
+        // The Rust format has fixed header: magic(8) + header(20) + then variable data.
+        // We can calculate Rust data size from the header.
+        fs.Seek(8, SeekOrigin.Begin);
+        var hdr = br.ReadBytes(20);
+        var recordsCount = BitConverter.ToUInt32(hdr, 0);
+        var liveCount = BitConverter.ToUInt32(hdr, 4);
+        var namePoolLen = BitConverter.ToUInt32(hdr, 8);
+        var refKeysLen = BitConverter.ToUInt32(hdr, 12);
+
+        long rustSize = 8 + 20
+                        + (long)recordsCount * 40
+                        + namePoolLen
+                        + (long)refKeysLen * 8
+                        + (long)refKeysLen * 4
+                        + (long)liveCount * 4 * 3;
+
+        fs.Seek(rustSize, SeekOrigin.Begin);
+        var usnCount = br.ReadInt32();
+        for (int i = 0; i < usnCount; i++)
+        {
+            var vol = br.ReadChar();
+            var usn = br.ReadUInt64();
+            volumeUsns[vol] = usn;
+        }
+
+        return live;
+    }
 
     public void Clear()
     {

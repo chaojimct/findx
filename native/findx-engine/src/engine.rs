@@ -2,36 +2,95 @@ use hashbrown::HashMap;
 use pinyin::ToPinyin;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
 use std::collections::HashSet;
-use std::ops::Bound;
+
+// ---------------------------------------------------------------------------
+// time / size conversion helpers
+// ---------------------------------------------------------------------------
+
+const EPOCH_2000_TICKS: i64 = 630_822_816_000_000_000;
+const TICKS_PER_SEC: i64 = 10_000_000;
+
+#[inline]
+fn mtime_to_compact(ticks: i64) -> u32 {
+    if ticks <= EPOCH_2000_TICKS {
+        return 0;
+    }
+    let secs = (ticks - EPOCH_2000_TICKS) / TICKS_PER_SEC;
+    secs.min(u32::MAX as i64) as u32
+}
+
+#[inline]
+fn compact_to_mtime(c: u32) -> i64 {
+    EPOCH_2000_TICKS + (c as i64) * TICKS_PER_SEC
+}
+
+#[inline]
+fn size_to_compact(s: i64) -> u32 {
+    if s < 0 {
+        return 0;
+    }
+    s.min(u32::MAX as i64) as u32
+}
+
+// ---------------------------------------------------------------------------
+// Record – 40 bytes per entry (down from 72)
+// Removed: py_start, py_len, full_py_start, full_py_len (computed on the fly)
+// Shrunk:  size i64→u32, mtime i64→u32
+// Added:   parent_idx (avoids HashMap lookup for path building)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Record {
+    pub file_ref: u64,
+    pub parent_ref: u64,
+    pub name_start: u32,
+    pub parent_idx: u32,
+    pub size: u32,
+    pub mtime: u32,
+    pub name_len: u16,
+    pub vol: u8,
+    pub deleted: u8,
+    pub attr: u32,
+}
+
+// ---------------------------------------------------------------------------
+// string / pool utilities
+// ---------------------------------------------------------------------------
 
 #[inline]
 fn make_key(vol: u16, file_ref: u64) -> u64 {
     ((vol as u64) << 48) | (file_ref & 0x0000_FFFF_FFFF_FFFF)
 }
 
-#[derive(Clone)]
-#[repr(C)]
-pub struct Record {
-    pub file_ref: u64,
-    pub parent_ref: u64,
-    pub name_start: u32,
-    pub name_len: u32,
-    pub py_start: u32,
-    pub py_len: u32,
-    /// 无 CJK 时与 initials 相同逻辑的无分隔小拼串；有 CJK 时为连续全拼小写 ASCII（如「你好」→ nihao）。
-    pub full_py_start: u32,
-    pub full_py_len: u32,
-    pub attr: u32,
-    pub size: i64,
-    pub mtime: i64,
-    pub vol: u16,
-    pub deleted: u8,
-    _pad: u8,
+fn cmp_ignore_case(a: &[u8], b: &[u8]) -> Ordering {
+    let la = a.len();
+    let lb = b.len();
+    let n = la.min(lb);
+    for i in 0..n {
+        let ca = a[i].to_ascii_lowercase();
+        let cb = b[i].to_ascii_lowercase();
+        match ca.cmp(&cb) {
+            Ordering::Equal => continue,
+            o => return o,
+        }
+    }
+    la.cmp(&lb)
 }
 
-/// 与 .NET `StringComparison.OrdinalIgnoreCase` 接近：按 Unicode 标量做简单小写展开后比较。
+fn starts_with_ignore_case_bytes(hay: &[u8], needle: &[u8]) -> bool {
+    if hay.len() < needle.len() {
+        return false;
+    }
+    for i in 0..needle.len() {
+        if hay[i].to_ascii_lowercase() != needle[i].to_ascii_lowercase() {
+            return false;
+        }
+    }
+    true
+}
+
 fn cmp_name_str_ignore_case(a: &str, b: &str) -> Ordering {
     let mut ai = a.chars().flat_map(|c| c.to_lowercase());
     let mut bi = b.chars().flat_map(|c| c.to_lowercase());
@@ -70,116 +129,84 @@ pub(crate) fn pool_utf8<'a>(pool: &'a [u8], start: u32, len: u32) -> &'a str {
     std::str::from_utf8(&pool[s..e]).unwrap_or("")
 }
 
+// ---------------------------------------------------------------------------
+// pinyin helpers – zero-allocation stack-buffer versions for sort & search
+// ---------------------------------------------------------------------------
+
 #[inline]
-fn name_contains_cjk_for_pinyin(name: &str) -> bool {
-    name.chars()
-        .any(|c| matches!(c, '\u{4E00}'..='\u{9FFF}'))
+fn is_cjk(c: char) -> bool {
+    matches!(c, '\u{4E00}'..='\u{9FFF}')
 }
 
-fn compute_initials_fast_ascii_only(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-        }
-    }
-    out
+fn name_contains_cjk(name: &str) -> bool {
+    name.chars().any(|c| is_cjk(c))
 }
 
-/// 与 C# PinyinMatcher 全拼轴一致用途：连续小写拼音 + ASCII 字母数字，供「nihao」类前缀秒搜。
-fn compute_full_pinyin_compact(name: &str) -> String {
-    let mut out = String::with_capacity(name.len().saturating_mul(3));
+fn compute_initials_stack(name: &str) -> ([u8; 256], usize) {
+    let mut buf = [0u8; 256];
+    let mut len = 0;
+    let has_cjk = name_contains_cjk(name);
     for ch in name.chars() {
+        if len >= 256 {
+            break;
+        }
         if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            continue;
-        }
-        if let Some(py) = ch.to_pinyin() {
-            out.push_str(&py.plain().to_lowercase());
-        }
-    }
-    out
-}
-
-fn compute_initials(name: &str) -> String {
-    if !name_contains_cjk_for_pinyin(name) {
-        return compute_initials_fast_ascii_only(name);
-    }
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            continue;
-        }
-        let mut pushed = false;
-        if let Some(py) = ch.to_pinyin() {
-            if let Some(c) = py.plain().chars().next() {
-                out.push(c);
-                pushed = true;
+            buf[len] = ch.to_ascii_lowercase() as u8;
+            len += 1;
+        } else if has_cjk {
+            if let Some(py) = ch.to_pinyin() {
+                if let Some(b) = py.plain().bytes().next() {
+                    buf[len] = b;
+                    len += 1;
+                }
             }
         }
-        if !pushed && !ch.is_ascii() {}
     }
-    out
+    (buf, len)
 }
 
-/// 与 `cmp_name_str_ignore_case` 一致的折叠键，用于 BTree 顺序。
-fn fold_for_ord(s: &str) -> String {
-    s.chars().flat_map(|c| c.to_lowercase()).collect()
-}
-
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
-struct NameOrdKey {
-    folded: String,
-    idx: u32,
-}
-
-#[derive(Clone, Eq, PartialEq)]
-struct PyOrdKey {
-    py_folded: String,
-    name_folded: String,
-    idx: u32,
-}
-
-impl Ord for PyOrdKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        let a_empty = self.py_folded.is_empty();
-        let b_empty = other.py_folded.is_empty();
-        if a_empty && b_empty {
-            return cmp_name_str_ignore_case(&self.name_folded, &other.name_folded)
-                .then_with(|| self.idx.cmp(&other.idx));
+fn compute_full_py_stack(name: &str) -> ([u8; 1024], usize) {
+    let mut buf = [0u8; 1024];
+    let mut len = 0;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if len < 1024 {
+                buf[len] = ch.to_ascii_lowercase() as u8;
+                len += 1;
+            }
+        } else if let Some(py) = ch.to_pinyin() {
+            for b in py.plain().bytes() {
+                if len < 1024 {
+                    buf[len] = b;
+                    len += 1;
+                }
+            }
         }
-        if a_empty {
-            return Ordering::Greater;
-        }
-        if b_empty {
-            return Ordering::Less;
-        }
-        cmp_name_str_ignore_case(&self.py_folded, &other.py_folded)
-            .then_with(|| cmp_name_str_ignore_case(&self.name_folded, &other.name_folded))
-            .then_with(|| self.idx.cmp(&other.idx))
     }
+    (buf, len)
 }
 
-impl PartialOrd for PyOrdKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
+
+// ---------------------------------------------------------------------------
+// Engine
+// ---------------------------------------------------------------------------
 
 #[derive(Default)]
 pub struct Engine {
     pub records: Vec<Record>,
     pub name_pool: Vec<u8>,
-    pub py_pool: Vec<u8>,
-    pub full_py_pool: Vec<u8>,
-    pub ref_to_idx: HashMap<u64, u32>,
+
+    // ref lookup: sorted parallel arrays (compact, steady state)
+    ref_keys: Vec<u64>,
+    ref_vals: Vec<u32>,
+    // lazy HashMap for incremental ops (created on demand, freed on rebuild)
+    ref_map: Option<HashMap<u64, u32>>,
+
     pub live_count: u32,
-    /// 批量入库时 >0：只追加 records，结束时 rebuild_indexes 一次性建 BTree。
     pub bulk_mode: u32,
-    name_btree: BTreeSet<NameOrdKey>,
-    py_btree: BTreeSet<PyOrdKey>,
-    full_py_btree: BTreeSet<NameOrdKey>,
+    name_sorted: Vec<u32>,
+    py_sorted: Vec<u32>,
+    full_py_sorted: Vec<u32>,
 }
 
 impl Engine {
@@ -187,34 +214,169 @@ impl Engine {
         Self::default()
     }
 
-    fn name_key_at(&self, idx: u32) -> NameOrdKey {
-        let r = &self.records[idx as usize];
-        let name = pool_utf8(&self.name_pool, r.name_start, r.name_len);
-        NameOrdKey {
-            folded: fold_for_ord(name),
-            idx,
+    // -----------------------------------------------------------------------
+    // ref lookup helpers
+    // -----------------------------------------------------------------------
+
+    fn find_ref(&self, key: u64) -> Option<u32> {
+        if let Some(map) = &self.ref_map {
+            return map.get(&key).copied();
+        }
+        let pos = self.ref_keys.partition_point(|&k| k < key);
+        if pos < self.ref_keys.len() && self.ref_keys[pos] == key {
+            Some(self.ref_vals[pos])
+        } else {
+            None
         }
     }
 
-    fn py_key_at(&self, idx: u32) -> PyOrdKey {
-        let r = &self.records[idx as usize];
-        let name = pool_utf8(&self.name_pool, r.name_start, r.name_len);
-        let py = pool_utf8(&self.py_pool, r.py_start, r.py_len);
-        PyOrdKey {
-            py_folded: fold_for_ord(py),
-            name_folded: fold_for_ord(name),
-            idx,
+    fn ensure_ref_map(&mut self) {
+        if self.ref_map.is_some() {
+            return;
+        }
+        let mut map = HashMap::with_capacity(self.ref_keys.len());
+        for i in 0..self.ref_keys.len() {
+            map.insert(self.ref_keys[i], self.ref_vals[i]);
+        }
+        self.ref_map = Some(map);
+        self.ref_keys = Vec::new();
+        self.ref_vals = Vec::new();
+    }
+
+    fn insert_ref(&mut self, key: u64, val: u32) {
+        self.ensure_ref_map();
+        self.ref_map.as_mut().unwrap().insert(key, val);
+    }
+
+    fn remove_ref(&mut self, key: u64) -> Option<u32> {
+        self.ensure_ref_map();
+        self.ref_map.as_mut().unwrap().remove(&key)
+    }
+
+    fn compact_ref_lookup(&mut self) {
+        let cap = self.live_count as usize;
+        let mut keys = Vec::with_capacity(cap);
+        let mut vals = Vec::with_capacity(cap);
+
+        if let Some(map) = self.ref_map.take() {
+            let mut pairs: Vec<(u64, u32)> = map.into_iter().collect();
+            pairs.sort_unstable_by_key(|&(k, _)| k);
+            for (k, v) in pairs {
+                keys.push(k);
+                vals.push(v);
+            }
+        }
+        self.ref_keys = keys;
+        self.ref_vals = vals;
+    }
+
+    // -----------------------------------------------------------------------
+    // sorted-array helpers (binary insert / remove)
+    // -----------------------------------------------------------------------
+
+    fn sorted_insert_name(&mut self, idx: u32) {
+        let records = &self.records;
+        let pool = &self.name_pool;
+        let pos = self.name_sorted.partition_point(|&o| {
+            let ro = &records[o as usize];
+            let ri = &records[idx as usize];
+            let no = pool_utf8(pool, ro.name_start, ro.name_len as u32);
+            let ni = pool_utf8(pool, ri.name_start, ri.name_len as u32);
+            cmp_name_str_ignore_case(no, ni).then_with(|| o.cmp(&idx)) == Ordering::Less
+        });
+        self.name_sorted.insert(pos, idx);
+    }
+
+    fn sorted_remove_name(&mut self, idx: u32) {
+        let records = &self.records;
+        let pool = &self.name_pool;
+        let pos = self.name_sorted.partition_point(|&o| {
+            let ro = &records[o as usize];
+            let ri = &records[idx as usize];
+            let no = pool_utf8(pool, ro.name_start, ro.name_len as u32);
+            let ni = pool_utf8(pool, ri.name_start, ri.name_len as u32);
+            cmp_name_str_ignore_case(no, ni).then_with(|| o.cmp(&idx)) == Ordering::Less
+        });
+        if pos < self.name_sorted.len() && self.name_sorted[pos] == idx {
+            self.name_sorted.remove(pos);
         }
     }
 
-    fn full_py_key_at(&self, idx: u32) -> NameOrdKey {
-        let r = &self.records[idx as usize];
-        let fp = pool_utf8(&self.full_py_pool, r.full_py_start, r.full_py_len);
-        NameOrdKey {
-            folded: fold_for_ord(fp),
-            idx,
+    fn sorted_insert_py(&mut self, idx: u32) {
+        let records = &self.records;
+        let pool = &self.name_pool;
+        let ri = &records[idx as usize];
+        let ni = pool_utf8(pool, ri.name_start, ri.name_len as u32);
+        let (bi, li) = compute_initials_stack(ni);
+        let pi = &bi[..li];
+        let pos = self.py_sorted.partition_point(|&o| {
+            let ro = &records[o as usize];
+            let no = pool_utf8(pool, ro.name_start, ro.name_len as u32);
+            let (bo, lo) = compute_initials_stack(no);
+            let po = &bo[..lo];
+            cmp_ignore_case(po, pi).then_with(|| o.cmp(&idx)) == Ordering::Less
+        });
+        self.py_sorted.insert(pos, idx);
+    }
+
+    fn sorted_remove_py(&mut self, idx: u32) {
+        let records = &self.records;
+        let pool = &self.name_pool;
+        let ri = &records[idx as usize];
+        let ni = pool_utf8(pool, ri.name_start, ri.name_len as u32);
+        let (bi, li) = compute_initials_stack(ni);
+        let pi = &bi[..li];
+        let pos = self.py_sorted.partition_point(|&o| {
+            let ro = &records[o as usize];
+            let no = pool_utf8(pool, ro.name_start, ro.name_len as u32);
+            let (bo, lo) = compute_initials_stack(no);
+            let po = &bo[..lo];
+            cmp_ignore_case(po, pi).then_with(|| o.cmp(&idx)) == Ordering::Less
+        });
+        if pos < self.py_sorted.len() && self.py_sorted[pos] == idx {
+            self.py_sorted.remove(pos);
         }
     }
+
+    fn sorted_insert_full_py(&mut self, idx: u32) {
+        let records = &self.records;
+        let pool = &self.name_pool;
+        let ri = &records[idx as usize];
+        let ni = pool_utf8(pool, ri.name_start, ri.name_len as u32);
+        let (bi, li) = compute_full_py_stack(ni);
+        let pi = &bi[..li];
+        let pos = self.full_py_sorted.partition_point(|&o| {
+            let ro = &records[o as usize];
+            let no = pool_utf8(pool, ro.name_start, ro.name_len as u32);
+            let (bo, lo) = compute_full_py_stack(no);
+            let po = &bo[..lo];
+            cmp_ignore_case(po, pi).then_with(|| o.cmp(&idx)) == Ordering::Less
+        });
+        self.full_py_sorted.insert(pos, idx);
+    }
+
+    fn sorted_remove_full_py(&mut self, idx: u32) {
+        let records = &self.records;
+        let pool = &self.name_pool;
+        let ri = &records[idx as usize];
+        let ni = pool_utf8(pool, ri.name_start, ri.name_len as u32);
+        let (bi, li) = compute_full_py_stack(ni);
+        let pi = &bi[..li];
+        let pos = self.full_py_sorted.partition_point(|&o| {
+            let ro = &records[o as usize];
+            let no = pool_utf8(pool, ro.name_start, ro.name_len as u32);
+            let (bo, lo) = compute_full_py_stack(no);
+            let po = &bo[..lo];
+            cmp_ignore_case(po, pi).then_with(|| o.cmp(&idx)) == Ordering::Less
+        });
+        if pos < self.full_py_sorted.len() && self.full_py_sorted[pos] == idx {
+            self.full_py_sorted.remove(pos);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // bulk lifecycle
+    // -----------------------------------------------------------------------
 
     pub fn begin_bulk(&mut self) {
         self.bulk_mode = self.bulk_mode.saturating_add(1);
@@ -230,22 +392,26 @@ impl Engine {
     pub fn clear(&mut self) {
         self.records.clear();
         self.name_pool.clear();
-        self.py_pool.clear();
-        self.full_py_pool.clear();
-        self.ref_to_idx.clear();
-        self.name_btree.clear();
-        self.py_btree.clear();
-        self.full_py_btree.clear();
+        self.ref_keys.clear();
+        self.ref_vals.clear();
+        self.ref_map = None;
+        self.name_sorted.clear();
+        self.py_sorted.clear();
+        self.full_py_sorted.clear();
         self.live_count = 0;
         self.bulk_mode = 0;
     }
 
-    fn push_utf8(pool: &mut Vec<u8>, s: &str) -> (u32, u32) {
+    fn push_utf8(pool: &mut Vec<u8>, s: &str) -> (u32, u16) {
         let start = pool.len() as u32;
         pool.extend_from_slice(s.as_bytes());
-        let len = s.len() as u32;
+        let len = s.len().min(u16::MAX as usize) as u16;
         (start, len)
     }
+
+    // -----------------------------------------------------------------------
+    // entry mutation
+    // -----------------------------------------------------------------------
 
     pub fn add_entry_utf16(
         &mut self,
@@ -259,41 +425,26 @@ impl Engine {
     ) {
         let name = String::from_utf16_lossy(name_utf16);
         let (ns, nl) = Self::push_utf8(&mut self.name_pool, &name);
-        let (ps, pl, fs, fl) = if self.bulk_mode > 0 {
-            (0u32, 0u32, 0u32, 0u32)
-        } else {
-            let initials = compute_initials(&name);
-            let full_py = compute_full_pinyin_compact(&name);
-            let (ps, pl) = Self::push_utf8(&mut self.py_pool, &initials);
-            let (fs, fl) = Self::push_utf8(&mut self.full_py_pool, &full_py);
-            (ps, pl, fs, fl)
-        };
         let idx = self.records.len() as u32;
         self.records.push(Record {
             file_ref,
             parent_ref,
             name_start: ns,
+            parent_idx: u32::MAX,
+            size: size_to_compact(size),
+            mtime: mtime_to_compact(mtime),
             name_len: nl,
-            py_start: ps,
-            py_len: pl,
-            full_py_start: fs,
-            full_py_len: fl,
-            attr,
-            size,
-            mtime,
-            vol,
+            vol: vol as u8,
             deleted: 0,
-            _pad: 0,
+            attr,
         });
-        self.ref_to_idx.insert(make_key(vol, file_ref), idx);
+        let key = make_key(vol, file_ref);
+        self.insert_ref(key, idx);
         self.live_count += 1;
         if self.bulk_mode == 0 {
-            self.name_btree.insert(NameOrdKey {
-                folded: fold_for_ord(&name),
-                idx,
-            });
-            self.py_btree.insert(self.py_key_at(idx));
-            self.full_py_btree.insert(self.full_py_key_at(idx));
+            self.sorted_insert_name(idx);
+            self.sorted_insert_py(idx);
+            self.sorted_insert_full_py(idx);
         }
     }
 
@@ -309,46 +460,32 @@ impl Engine {
     ) {
         let key = make_key(vol, file_ref);
         let name = String::from_utf16_lossy(name_utf16);
-        if let Some(&idx) = self.ref_to_idx.get(&key) {
+        if let Some(idx) = self.find_ref(key) {
             let was_live = self.records[idx as usize].deleted == 0;
             if was_live && self.bulk_mode == 0 {
-                let nk = self.name_key_at(idx);
-                let pk = self.py_key_at(idx);
-                let fk = self.full_py_key_at(idx);
-                self.name_btree.remove(&nk);
-                self.py_btree.remove(&pk);
-                self.full_py_btree.remove(&fk);
+                self.sorted_remove_name(idx);
+                self.sorted_remove_py(idx);
+                self.sorted_remove_full_py(idx);
             }
             let r = &mut self.records[idx as usize];
             if r.deleted != 0 {
                 r.deleted = 0;
                 self.live_count += 1;
             }
-            let (ps, pl, fs, fl) = if self.bulk_mode == 0 {
-                let initials = compute_initials(&name);
-                let full_py = compute_full_pinyin_compact(&name);
-                let (ps, pl) = Self::push_utf8(&mut self.py_pool, &initials);
-                let (fs, fl) = Self::push_utf8(&mut self.full_py_pool, &full_py);
-                (ps, pl, fs, fl)
-            } else {
-                (0u32, 0u32, 0u32, 0u32)
-            };
             let (ns, nl) = Self::push_utf8(&mut self.name_pool, &name);
+            let r = &mut self.records[idx as usize];
             r.parent_ref = parent_ref;
+            r.parent_idx = u32::MAX;
             r.name_start = ns;
             r.name_len = nl;
-            r.py_start = ps;
-            r.py_len = pl;
-            r.full_py_start = fs;
-            r.full_py_len = fl;
             r.attr = attr;
-            r.size = size;
-            r.mtime = mtime;
-            r.vol = vol;
+            r.size = size_to_compact(size);
+            r.mtime = mtime_to_compact(mtime);
+            r.vol = vol as u8;
             if self.bulk_mode == 0 {
-                self.name_btree.insert(self.name_key_at(idx));
-                self.py_btree.insert(self.py_key_at(idx));
-                self.full_py_btree.insert(self.full_py_key_at(idx));
+                self.sorted_insert_name(idx);
+                self.sorted_insert_py(idx);
+                self.sorted_insert_full_py(idx);
             }
             return;
         }
@@ -357,16 +494,13 @@ impl Engine {
 
     pub fn remove_by_ref(&mut self, vol: u16, file_ref: u64) {
         let key = make_key(vol, file_ref);
-        if let Some(idx) = self.ref_to_idx.remove(&key) {
+        if let Some(idx) = self.remove_ref(key) {
             let was_live = self.records[idx as usize].deleted == 0;
             if was_live {
                 if self.bulk_mode == 0 {
-                    let nk = self.name_key_at(idx);
-                    let pk = self.py_key_at(idx);
-                    let fk = self.full_py_key_at(idx);
-                    self.name_btree.remove(&nk);
-                    self.py_btree.remove(&pk);
-                    self.full_py_btree.remove(&fk);
+                    self.sorted_remove_name(idx);
+                    self.sorted_remove_py(idx);
+                    self.sorted_remove_full_py(idx);
                 }
                 self.records[idx as usize].deleted = 1;
                 self.live_count = self.live_count.saturating_sub(1);
@@ -374,42 +508,54 @@ impl Engine {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // index state queries
+    // -----------------------------------------------------------------------
+
     pub(crate) fn sort_indexes_valid(&self) -> bool {
         if self.live_count == 0 {
-            return self.name_btree.is_empty()
-                && self.py_btree.is_empty()
-                && self.full_py_btree.is_empty();
+            return self.name_sorted.is_empty()
+                && self.py_sorted.is_empty()
+                && self.full_py_sorted.is_empty();
         }
         if self.bulk_mode > 0 {
             return false;
         }
-        self.name_btree.len() == self.live_count as usize
-            && self.py_btree.len() == self.live_count as usize
-            && self.full_py_btree.len() == self.live_count as usize
+        self.name_sorted.len() == self.live_count as usize
+            && self.py_sorted.len() == self.live_count as usize
+            && self.full_py_sorted.len() == self.live_count as usize
     }
 
     #[inline]
     pub(crate) fn name_sort_index_empty(&self) -> bool {
-        self.name_btree.is_empty()
+        self.name_sorted.is_empty()
     }
 
     #[inline]
     pub(crate) fn py_sort_index_empty(&self) -> bool {
-        self.py_btree.is_empty()
+        self.py_sorted.is_empty()
     }
 
     #[inline]
     pub(crate) fn full_py_sort_index_empty(&self) -> bool {
-        self.full_py_btree.is_empty()
+        self.full_py_sorted.is_empty()
     }
 
+    // -----------------------------------------------------------------------
+    // rebuild_indexes: compact name_pool, resolve parent_idx, parallel sort
+    // pinyin computed on-the-fly in comparators (py_pool/full_py_pool gone)
+    // -----------------------------------------------------------------------
+
     pub fn rebuild_indexes(&mut self) {
-        self.name_btree.clear();
-        self.py_btree.clear();
-        self.full_py_btree.clear();
+        let t_total = std::time::Instant::now();
+        self.name_sorted.clear();
+        self.py_sorted.clear();
+        self.full_py_sorted.clear();
         if self.live_count == 0 {
+            self.compact_ref_lookup();
             return;
         }
+
         let mut live: Vec<u32> = Vec::with_capacity(self.live_count as usize);
         for (i, r) in self.records.iter().enumerate() {
             if r.deleted == 0 {
@@ -418,160 +564,226 @@ impl Engine {
         }
         if live.is_empty() {
             self.live_count = 0;
+            self.compact_ref_lookup();
             return;
         }
 
-        const PY_FILL_CHUNK: usize = 65536;
-        for chunk in live.chunks(PY_FILL_CHUNK) {
-            let updates: Vec<(u32, String, String)> = {
-                let records = &self.records;
-                let name_pool = &self.name_pool;
-                chunk
-                    .par_iter()
-                    .map(|&idx| {
-                        let r = &records[idx as usize];
-                        let name = pool_utf8(name_pool, r.name_start, r.name_len);
-                        (
-                            idx,
-                            compute_initials(name),
-                            compute_full_pinyin_compact(name),
-                        )
-                    })
-                    .collect()
-            };
-            for (idx, ini, full) in updates {
-                let i = idx as usize;
-                let (ps, pl) = Self::push_utf8(&mut self.py_pool, &ini);
-                let (fs, fl) = Self::push_utf8(&mut self.full_py_pool, &full);
-                self.records[i].py_start = ps;
-                self.records[i].py_len = pl;
-                self.records[i].full_py_start = fs;
-                self.records[i].full_py_len = fl;
+        let t0 = std::time::Instant::now();
+        // Phase 1: compact name_pool with deduplication
+        let mut new_name_pool: Vec<u8> = Vec::new();
+        let mut dedup: HashMap<&[u8], (u32, u16)> = HashMap::with_capacity(live.len() / 2);
+        for &idx in &live {
+            let r = &self.records[idx as usize];
+            let name_bytes = &self.name_pool
+                [r.name_start as usize..(r.name_start as usize + r.name_len as usize)];
+            if let Some(&(start, len)) = dedup.get(name_bytes) {
+                self.records[idx as usize].name_start = start;
+                self.records[idx as usize].name_len = len;
+            } else {
+                let ns = new_name_pool.len() as u32;
+                let nl = name_bytes.len().min(u16::MAX as usize) as u16;
+                new_name_pool.extend_from_slice(name_bytes);
+                dedup.insert(
+                    &self.name_pool
+                        [r.name_start as usize..(r.name_start as usize + r.name_len as usize)],
+                    (ns, nl),
+                );
+                self.records[idx as usize].name_start = ns;
+                self.records[idx as usize].name_len = nl;
             }
         }
+        drop(dedup);
+        self.name_pool = new_name_pool;
 
+        let d1 = t0.elapsed();
+        // Phase 2: resolve parent_idx using ref lookup
+        let t1 = std::time::Instant::now();
         for &idx in &live {
-            self.name_btree.insert(self.name_key_at(idx));
-            self.py_btree.insert(self.py_key_at(idx));
-            self.full_py_btree.insert(self.full_py_key_at(idx));
+            let r = &self.records[idx as usize];
+            let pkey = make_key(r.vol as u16, r.parent_ref);
+            let pidx = self.find_ref(pkey).unwrap_or(u32::MAX);
+            self.records[idx as usize].parent_idx = pidx;
         }
+
+        let d2 = t1.elapsed();
+        // Phase 3: compact ref lookup (HashMap → sorted arrays, free HashMap)
+        let t2 = std::time::Instant::now();
+        self.compact_ref_lookup();
+        let d3 = t2.elapsed();
+
+        // Phase 4: parallel sort with on-the-fly pinyin computation
+        let t3 = std::time::Instant::now();
+        self.name_sorted = live.clone();
+        self.py_sorted = live.clone();
+        self.full_py_sorted = live;
+
+        let records = &self.records;
+        let name_pool = &self.name_pool;
+
+        self.name_sorted.par_sort_unstable_by(|&a, &b| {
+            let ra = &records[a as usize];
+            let rb = &records[b as usize];
+            let na = pool_utf8(name_pool, ra.name_start, ra.name_len as u32);
+            let nb = pool_utf8(name_pool, rb.name_start, rb.name_len as u32);
+            cmp_name_str_ignore_case(na, nb).then_with(|| a.cmp(&b))
+        });
+
+        self.py_sorted.par_sort_unstable_by(|&a, &b| {
+            let ra = &records[a as usize];
+            let rb = &records[b as usize];
+            let na = pool_utf8(name_pool, ra.name_start, ra.name_len as u32);
+            let nb = pool_utf8(name_pool, rb.name_start, rb.name_len as u32);
+            let (ba, la) = compute_initials_stack(na);
+            let (bb, lb) = compute_initials_stack(nb);
+            let pa = &ba[..la];
+            let pb = &bb[..lb];
+            let ae = pa.is_empty();
+            let be = pb.is_empty();
+            if ae && be {
+                return cmp_name_str_ignore_case(na, nb).then_with(|| a.cmp(&b));
+            }
+            if ae {
+                return Ordering::Greater;
+            }
+            if be {
+                return Ordering::Less;
+            }
+            cmp_ignore_case(pa, pb)
+                .then_with(|| cmp_name_str_ignore_case(na, nb))
+                .then_with(|| a.cmp(&b))
+        });
+
+        self.full_py_sorted.par_sort_unstable_by(|&a, &b| {
+            let ra = &records[a as usize];
+            let rb = &records[b as usize];
+            let na = pool_utf8(name_pool, ra.name_start, ra.name_len as u32);
+            let nb = pool_utf8(name_pool, rb.name_start, rb.name_len as u32);
+            let (ba, la) = compute_full_py_stack(na);
+            let (bb, lb) = compute_full_py_stack(nb);
+            cmp_ignore_case(&ba[..la], &bb[..lb]).then_with(|| a.cmp(&b))
+        });
+
+        let d4 = t3.elapsed();
+        eprintln!(
+            "[findx_engine] rebuild_indexes: live={} P1_namepool={:.1}s P2_parent={:.1}s P3_reflookup={:.1}s P4_sort={:.1}s total={:.1}s",
+            self.live_count, d1.as_secs_f64(), d2.as_secs_f64(), d3.as_secs_f64(), d4.as_secs_f64(), t_total.elapsed().as_secs_f64()
+        );
+        // Release excess capacity from all Vecs
+        self.records.shrink_to_fit();
+        self.name_pool.shrink_to_fit();
+        self.ref_keys.shrink_to_fit();
+        self.ref_vals.shrink_to_fit();
+        self.name_sorted.shrink_to_fit();
+        self.py_sorted.shrink_to_fit();
+        self.full_py_sorted.shrink_to_fit();
     }
+
+    // -----------------------------------------------------------------------
+    // prefix search (pinyin computed on the fly from name_pool)
+    // -----------------------------------------------------------------------
 
     pub fn search_name_prefix(&self, prefix: &str, out: &mut Vec<u32>, max_results: usize) {
         out.clear();
-        if max_results == 0 {
+        if max_results == 0 || (self.live_count > 0 && self.name_sorted.is_empty()) {
             return;
         }
-        if self.live_count > 0 && self.name_btree.is_empty() {
-            return;
-        }
-        let pool = &self.name_pool;
         let records = &self.records;
-        let start = NameOrdKey {
-            folded: fold_for_ord(prefix),
-            idx: 0,
-        };
-        for key in self
-            .name_btree
-            .range((Bound::Included(start), Bound::Unbounded))
-        {
+        let pool = &self.name_pool;
+        let pos = self.name_sorted.partition_point(|&idx| {
+            let r = &records[idx as usize];
+            let name = pool_utf8(pool, r.name_start, r.name_len as u32);
+            cmp_name_str_ignore_case(name, prefix) == Ordering::Less
+        });
+        for &idx in &self.name_sorted[pos..] {
             if out.len() >= max_results {
                 break;
             }
-            let idx = key.idx;
             let r = &records[idx as usize];
-            if r.deleted != 0 {
-                continue;
-            }
-            let name = pool_utf8(pool, r.name_start, r.name_len);
+            let name = pool_utf8(pool, r.name_start, r.name_len as u32);
             if starts_with_ignore_case(name, prefix) {
                 out.push(idx);
-                continue;
-            }
-            if cmp_name_str_ignore_case(name, prefix) == Ordering::Greater {
+            } else {
                 break;
             }
         }
     }
 
-    pub fn search_pinyin_prefix(&self, prefix_lower: &str, out: &mut Vec<u32>, max_results: usize) {
+    pub fn search_pinyin_prefix(
+        &self,
+        prefix_lower: &str,
+        out: &mut Vec<u32>,
+        max_results: usize,
+    ) {
         out.clear();
-        if max_results == 0 {
+        if max_results == 0 || (self.live_count > 0 && self.py_sorted.is_empty()) {
             return;
         }
-        if self.live_count > 0 && self.py_btree.is_empty() {
-            return;
-        }
-        let py_pool = &self.py_pool;
+        let prefix = prefix_lower.as_bytes();
         let records = &self.records;
-        let start = PyOrdKey {
-            py_folded: fold_for_ord(prefix_lower),
-            name_folded: String::new(),
-            idx: 0,
-        };
-        for key in self
-            .py_btree
-            .range((Bound::Included(start), Bound::Unbounded))
-        {
+        let name_pool = &self.name_pool;
+        let pos = self.py_sorted.partition_point(|&idx| {
+            let r = &records[idx as usize];
+            let name = pool_utf8(name_pool, r.name_start, r.name_len as u32);
+            let (buf, len) = compute_initials_stack(name);
+            let py = &buf[..len];
+            if py.is_empty() {
+                return false;
+            }
+            cmp_ignore_case(py, prefix) == Ordering::Less
+        });
+        for &idx in &self.py_sorted[pos..] {
             if out.len() >= max_results {
                 break;
             }
-            let idx = key.idx;
             let r = &records[idx as usize];
-            if r.deleted != 0 {
-                continue;
-            }
-            let py = pool_utf8(py_pool, r.py_start, r.py_len);
-            if py.is_empty() && !prefix_lower.is_empty() {
+            let name = pool_utf8(name_pool, r.name_start, r.name_len as u32);
+            let (buf, len) = compute_initials_stack(name);
+            let py = &buf[..len];
+            if py.is_empty() {
                 break;
             }
-            if starts_with_ignore_case(py, prefix_lower) {
+            if starts_with_ignore_case_bytes(py, prefix) {
                 out.push(idx);
-                continue;
-            }
-            if cmp_name_str_ignore_case(py, prefix_lower) == Ordering::Greater {
+            } else {
                 break;
             }
         }
     }
 
-    /// 连续全拼串前缀（如 nihao → 含「你好」的文件名）。
     pub fn search_full_py_prefix(&self, prefix: &str, out: &mut Vec<u32>, max_results: usize) {
         out.clear();
-        if max_results == 0 {
+        if max_results == 0 || (self.live_count > 0 && self.full_py_sorted.is_empty()) {
             return;
         }
-        if self.live_count > 0 && self.full_py_btree.is_empty() {
-            return;
-        }
-        let fp_pool = &self.full_py_pool;
+        let prefix_bytes = prefix.as_bytes();
         let records = &self.records;
-        let start = NameOrdKey {
-            folded: fold_for_ord(prefix),
-            idx: 0,
-        };
-        for key in self
-            .full_py_btree
-            .range((Bound::Included(start), Bound::Unbounded))
-        {
+        let name_pool = &self.name_pool;
+        let pos = self.full_py_sorted.partition_point(|&idx| {
+            let r = &records[idx as usize];
+            let name = pool_utf8(name_pool, r.name_start, r.name_len as u32);
+            let (buf, len) = compute_full_py_stack(name);
+            let fp = &buf[..len];
+            cmp_ignore_case(fp, prefix_bytes) == Ordering::Less
+        });
+        for &idx in &self.full_py_sorted[pos..] {
             if out.len() >= max_results {
                 break;
             }
-            let idx = key.idx;
             let r = &records[idx as usize];
-            if r.deleted != 0 {
-                continue;
-            }
-            let fp = pool_utf8(fp_pool, r.full_py_start, r.full_py_len);
-            if starts_with_ignore_case(fp, prefix) {
+            let name = pool_utf8(name_pool, r.name_start, r.name_len as u32);
+            let (buf, len) = compute_full_py_stack(name);
+            let fp = &buf[..len];
+            if starts_with_ignore_case_bytes(fp, prefix_bytes) {
                 out.push(idx);
-                continue;
-            }
-            if cmp_name_str_ignore_case(fp, prefix) == Ordering::Greater {
+            } else {
                 break;
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // data access
+    // -----------------------------------------------------------------------
 
     pub fn get_name_utf16(&self, idx: i32, buf: &mut [u16]) -> usize {
         if idx < 0 || idx as usize >= self.records.len() {
@@ -581,12 +793,16 @@ impl Engine {
         if r.deleted != 0 {
             return 0;
         }
-        let name = pool_utf8(&self.name_pool, r.name_start, r.name_len);
-        let mut out = Vec::with_capacity(name.encode_utf16().count());
-        out.extend(name.encode_utf16());
-        let n = out.len().min(buf.len());
-        buf[..n].copy_from_slice(&out[..n]);
-        n
+        let name = pool_utf8(&self.name_pool, r.name_start, r.name_len as u32);
+        let mut i = 0;
+        for u in name.encode_utf16() {
+            if i >= buf.len() {
+                break;
+            }
+            buf[i] = u;
+            i += 1;
+        }
+        i
     }
 
     pub fn build_path_utf16(&self, idx: i32, buf: &mut [u16]) -> usize {
@@ -595,7 +811,7 @@ impl Engine {
         }
         let mut cur = idx as u32;
         let mut visited = HashSet::new();
-        let mut parts: Vec<(u32, u32)> = Vec::new();
+        let mut parts: Vec<(u32, u16)> = Vec::new();
         loop {
             if !visited.insert(cur) {
                 break;
@@ -605,28 +821,33 @@ impl Engine {
                 _ => return 0,
             };
             parts.push((r.name_start, r.name_len));
-            let pkey = make_key(r.vol, r.parent_ref);
-            match self.ref_to_idx.get(&pkey).copied() {
-                Some(p) if p != cur => cur = p,
-                _ => {
-                    let ch = char::from_u32(r.vol as u32).unwrap_or('?');
-                    let root = format!("{}:", ch);
-                    let mut total: Vec<u16> = root.encode_utf16().collect();
-                    for (start, len) in parts.into_iter().rev() {
-                        total.push('\\' as u16);
-                        let name = pool_utf8(&self.name_pool, start, len);
-                        total.extend(name.encode_utf16());
-                    }
-                    let n = total.len().min(buf.len());
-                    buf[..n].copy_from_slice(&total[..n]);
-                    return n;
+            let pidx = r.parent_idx;
+            if pidx != u32::MAX && pidx != cur {
+                cur = pidx;
+            } else {
+                let ch = char::from_u32(r.vol as u32).unwrap_or('?');
+                let root = format!("{}:", ch);
+                let mut total: Vec<u16> = root.encode_utf16().collect();
+                for (start, len) in parts.into_iter().rev() {
+                    total.push('\\' as u16);
+                    let name = pool_utf8(&self.name_pool, start, len as u32);
+                    total.extend(name.encode_utf16());
                 }
+                let n = total.len().min(buf.len());
+                buf[..n].copy_from_slice(&total[..n]);
+                return n;
             }
         }
         0
     }
 
-    pub fn get_meta(&self, idx: i32, out_size: &mut i64, out_mtime: &mut i64, out_attr: &mut u32) -> bool {
+    pub fn get_meta(
+        &self,
+        idx: i32,
+        out_size: &mut i64,
+        out_mtime: &mut i64,
+        out_attr: &mut u32,
+    ) -> bool {
         if idx < 0 || idx as usize >= self.records.len() {
             return false;
         }
@@ -634,8 +855,8 @@ impl Engine {
         if r.deleted != 0 {
             return false;
         }
-        *out_size = r.size;
-        *out_mtime = r.mtime;
+        *out_size = r.size as i64;
+        *out_mtime = compact_to_mtime(r.mtime);
         *out_attr = r.attr;
         true
     }
@@ -659,10 +880,10 @@ impl Engine {
         }
         *out_fr = r.file_ref;
         *out_pr = r.parent_ref;
-        *out_vol = r.vol;
+        *out_vol = r.vol as u16;
         *out_attr = r.attr;
-        *out_size = r.size;
-        *out_mtime = r.mtime;
+        *out_size = r.size as i64;
+        *out_mtime = compact_to_mtime(r.mtime);
         true
     }
 
@@ -678,11 +899,161 @@ impl Engine {
     }
 
     pub fn try_live_index(&self, vol: u16, file_ref: u64) -> Option<i32> {
-        let idx = *self.ref_to_idx.get(&make_key(vol, file_ref))? as usize;
+        let key = make_key(vol, file_ref);
+        let idx = self.find_ref(key)? as usize;
         let r = self.records.get(idx)?;
         if r.deleted != 0 {
             return None;
         }
         Some(idx as i32)
+    }
+
+    // -------------------------------------------------------------------
+    // binary persistence: save/load entire engine state to skip rebuild
+    // Format: MAGIC(8) + header(20) + records + name_pool + ref + sorted×3
+    // -------------------------------------------------------------------
+
+    const BIN_MAGIC: &'static [u8; 8] = b"FXBIN02\0";
+
+    pub fn save_to_file(&self, path: &str) -> std::io::Result<u64> {
+        use std::io::{BufWriter, Write};
+
+        let f = std::fs::File::create(path)?;
+        let mut w = BufWriter::with_capacity(1 << 20, f);
+
+        w.write_all(Self::BIN_MAGIC)?;
+
+        let records_count = self.records.len() as u32;
+        let name_pool_len = self.name_pool.len() as u32;
+        let ref_keys_len = self.ref_keys.len() as u32;
+
+        w.write_all(&records_count.to_le_bytes())?;
+        w.write_all(&self.live_count.to_le_bytes())?;
+        w.write_all(&name_pool_len.to_le_bytes())?;
+        w.write_all(&ref_keys_len.to_le_bytes())?;
+        w.write_all(&self.bulk_mode.to_le_bytes())?;
+
+        let rec_bytes = unsafe {
+            std::slice::from_raw_parts(
+                self.records.as_ptr() as *const u8,
+                self.records.len() * std::mem::size_of::<Record>(),
+            )
+        };
+        w.write_all(rec_bytes)?;
+        w.write_all(&self.name_pool)?;
+
+        let rk_bytes = unsafe {
+            std::slice::from_raw_parts(
+                self.ref_keys.as_ptr() as *const u8,
+                self.ref_keys.len() * 8,
+            )
+        };
+        w.write_all(rk_bytes)?;
+        let rv_bytes = unsafe {
+            std::slice::from_raw_parts(
+                self.ref_vals.as_ptr() as *const u8,
+                self.ref_vals.len() * 4,
+            )
+        };
+        w.write_all(rv_bytes)?;
+
+        for arr in [&self.name_sorted, &self.py_sorted, &self.full_py_sorted] {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(arr.as_ptr() as *const u8, arr.len() * 4)
+            };
+            w.write_all(bytes)?;
+        }
+
+        w.flush()?;
+        let pos = w.into_inner()?.metadata()?.len();
+        Ok(pos)
+    }
+
+    pub fn load_from_file(&mut self, path: &str) -> std::io::Result<i32> {
+        use std::io::{BufReader, Read};
+
+        let f = std::fs::File::open(path)?;
+        let mut r = BufReader::with_capacity(1 << 20, f);
+
+        let mut magic = [0u8; 8];
+        r.read_exact(&mut magic)?;
+        if &magic != Self::BIN_MAGIC {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad magic"));
+        }
+
+        let mut hdr = [0u8; 20];
+        r.read_exact(&mut hdr)?;
+        let records_count = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+        let live_count = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
+        let name_pool_len = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+        let ref_keys_len = u32::from_le_bytes(hdr[12..16].try_into().unwrap());
+        let _bulk_mode = u32::from_le_bytes(hdr[16..20].try_into().unwrap());
+
+        let rec_size = std::mem::size_of::<Record>();
+        let mut rec_buf = vec![0u8; records_count as usize * rec_size];
+        r.read_exact(&mut rec_buf)?;
+        let mut records: Vec<Record> = Vec::with_capacity(records_count as usize);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                rec_buf.as_ptr(),
+                records.as_mut_ptr() as *mut u8,
+                rec_buf.len(),
+            );
+            records.set_len(records_count as usize);
+        }
+        drop(rec_buf);
+
+        let mut name_pool = vec![0u8; name_pool_len as usize];
+        r.read_exact(&mut name_pool)?;
+
+        let mut rk_buf = vec![0u8; ref_keys_len as usize * 8];
+        r.read_exact(&mut rk_buf)?;
+        let mut ref_keys: Vec<u64> = Vec::with_capacity(ref_keys_len as usize);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                rk_buf.as_ptr(),
+                ref_keys.as_mut_ptr() as *mut u8,
+                rk_buf.len(),
+            );
+            ref_keys.set_len(ref_keys_len as usize);
+        }
+        drop(rk_buf);
+
+        let mut rv_buf = vec![0u8; ref_keys_len as usize * 4];
+        r.read_exact(&mut rv_buf)?;
+        let mut ref_vals: Vec<u32> = Vec::with_capacity(ref_keys_len as usize);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                rv_buf.as_ptr(),
+                ref_vals.as_mut_ptr() as *mut u8,
+                rv_buf.len(),
+            );
+            ref_vals.set_len(ref_keys_len as usize);
+        }
+        drop(rv_buf);
+
+        let live = live_count as usize;
+        let mut name_sorted = vec![0u32; live];
+        let mut py_sorted = vec![0u32; live];
+        let mut full_py_sorted = vec![0u32; live];
+        for arr in [&mut name_sorted, &mut py_sorted, &mut full_py_sorted] {
+            let buf = unsafe {
+                std::slice::from_raw_parts_mut(arr.as_mut_ptr() as *mut u8, live * 4)
+            };
+            r.read_exact(buf)?;
+        }
+
+        self.records = records;
+        self.name_pool = name_pool;
+        self.ref_keys = ref_keys;
+        self.ref_vals = ref_vals;
+        self.ref_map = None;
+        self.live_count = live_count;
+        self.bulk_mode = 0;
+        self.name_sorted = name_sorted;
+        self.py_sorted = py_sorted;
+        self.full_py_sorted = full_py_sorted;
+
+        Ok(live_count as i32)
     }
 }

@@ -1,11 +1,13 @@
 //! C ABI，供 FindX.Core P/Invoke。调用方需保证单线程或外加锁（与现版 C# FileIndex 一致）。
 
-use crate::engine::Engine;
+use crate::engine::{pool_utf8, Engine};
 use std::ffi::c_void;
+
+const EPOCH_2000_TICKS: i64 = 630_822_816_000_000_000;
+const TICKS_PER_SEC: i64 = 10_000_000;
 
 pub struct EngineBox {
     pub inner: Engine,
-    /// FFI 层复用缓冲区，减少查询时分配。
     pub scratch_idx: Vec<u32>,
 }
 
@@ -167,7 +169,6 @@ pub unsafe extern "C" fn findx_engine_is_sort_ready(p: *const EngineBox) -> i32 
     }
 }
 
-/// 批量入库 (BeginBulk) 期间为 1；此时不得对引擎做 rebuild，否则会损坏增量中的状态。
 #[no_mangle]
 pub unsafe extern "C" fn findx_engine_is_in_bulk_load(p: *const EngineBox) -> i32 {
     if p.is_null() {
@@ -271,10 +272,7 @@ pub unsafe extern "C" fn findx_engine_search_full_py_prefix(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn findx_engine_get_name_utf16_len(
-    p: *const EngineBox,
-    idx: i32,
-) -> i32 {
+pub unsafe extern "C" fn findx_engine_get_name_utf16_len(p: *const EngineBox, idx: i32) -> i32 {
     if p.is_null() {
         return -1;
     }
@@ -286,7 +284,7 @@ pub unsafe extern "C" fn findx_engine_get_name_utf16_len(
     if r.deleted != 0 {
         return -1;
     }
-    let name = crate::engine::pool_utf8(&eng.name_pool, r.name_start, r.name_len);
+    let name = pool_utf8(&eng.name_pool, r.name_start, r.name_len as u32);
     name.encode_utf16().count() as i32
 }
 
@@ -395,6 +393,50 @@ pub unsafe extern "C" fn findx_engine_visit_live(
     });
 }
 
+/// Save engine state to a binary file. Returns 0 on success, -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn findx_engine_save_file(
+    p: *const EngineBox,
+    path_utf16: *const u16,
+    path_len: i32,
+) -> i32 {
+    if p.is_null() || path_utf16.is_null() || path_len < 0 {
+        return -1;
+    }
+    let path = String::from_utf16_lossy(std::slice::from_raw_parts(path_utf16, path_len as usize));
+    match (*p).inner.save_to_file(&path) {
+        Ok(_) => 0,
+        Err(e) => {
+            eprintln!("[findx_engine] save_to_file error: {}", e);
+            -1
+        }
+    }
+}
+
+/// Load engine state from a binary file. Returns live_count on success, -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn findx_engine_load_file(
+    p: *mut EngineBox,
+    path_utf16: *const u16,
+    path_len: i32,
+) -> i32 {
+    let b = match as_box(p) {
+        Some(x) => x,
+        None => return -1,
+    };
+    if path_utf16.is_null() || path_len < 0 {
+        return -1;
+    }
+    let path = String::from_utf16_lossy(std::slice::from_raw_parts(path_utf16, path_len as usize));
+    match b.inner.load_from_file(&path) {
+        Ok(live) => live,
+        Err(e) => {
+            eprintln!("[findx_engine] load_from_file error: {}", e);
+            -1
+        }
+    }
+}
+
 pub type PersistRowFn = Option<
     unsafe extern "system" fn(
         user: *mut c_void,
@@ -410,7 +452,11 @@ pub type PersistRowFn = Option<
 >;
 
 #[no_mangle]
-pub unsafe extern "C" fn findx_engine_for_each_persist(p: *const EngineBox, user: *mut c_void, cb: PersistRowFn) {
+pub unsafe extern "C" fn findx_engine_for_each_persist(
+    p: *const EngineBox,
+    user: *mut c_void,
+    cb: PersistRowFn,
+) {
     if p.is_null() {
         return;
     }
@@ -420,8 +466,10 @@ pub unsafe extern "C" fn findx_engine_for_each_persist(p: *const EngineBox, user
         if r.deleted != 0 {
             continue;
         }
-        let nm = crate::engine::pool_utf8(&eng.name_pool, r.name_start, r.name_len);
+        let nm = pool_utf8(&eng.name_pool, r.name_start, r.name_len as u32);
         let name_utf16: Vec<u16> = nm.encode_utf16().collect();
+        let size_i64 = r.size as i64;
+        let mtime_i64 = EPOCH_2000_TICKS + (r.mtime as i64) * TICKS_PER_SEC;
         let _ = cb(
             user,
             r.file_ref,
@@ -429,9 +477,9 @@ pub unsafe extern "C" fn findx_engine_for_each_persist(p: *const EngineBox, user
             name_utf16.as_ptr(),
             name_utf16.len() as i32,
             r.attr,
-            r.size,
-            r.mtime,
-            r.vol,
+            size_i64,
+            mtime_i64,
+            r.vol as u16,
         );
     }
 }
