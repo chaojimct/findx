@@ -35,4 +35,5 @@ public sealed class SearchResult
     public required int Score { get; init; }
     public required PinyinMatcher.MatchType MatchType { get; init; }
     public int EntryIndex { get; init; }
+    public DateTime LastModified { get; init; }
 }

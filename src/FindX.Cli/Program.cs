@@ -1,4 +1,5 @@
 using FindX.Client;
+using FindX.Core.Update;
 
 namespace FindX.Cli;
 
@@ -22,6 +23,7 @@ public static class Program
                 "search" or "s" => await RunSearch(client, args),
                 "status" => await RunStatus(client),
                 "reindex" => await RunReindex(client),
+                "update" => await RunUpdate(),
                 _ => PrintUsage(),
             };
         }
@@ -111,6 +113,47 @@ public static class Program
         return ok ? 0 : 1;
     }
 
+    private static async Task<int> RunUpdate()
+    {
+        Console.WriteLine($"当前版本: v{UpdateChecker.GetCurrentVersion()}");
+        Console.WriteLine("正在检查更新...");
+
+        using var checker = new UpdateChecker();
+        var info = await checker.CheckAsync();
+
+        if (info == null)
+        {
+            Console.Error.WriteLine("检查更新失败，请检查网络连接。");
+            return 1;
+        }
+
+        if (!info.HasUpdate)
+        {
+            Console.WriteLine($"当前已是最新版本 (v{info.CurrentVersion})。");
+            return 0;
+        }
+
+        Console.WriteLine($"发现新版本: v{info.LatestVersion}");
+        if (info.PublishedAt.HasValue)
+            Console.WriteLine($"发布时间: {info.PublishedAt.Value:yyyy-MM-dd HH:mm}");
+        if (!string.IsNullOrWhiteSpace(info.ReleaseNotes))
+        {
+            Console.WriteLine();
+            Console.WriteLine("更新说明:");
+            var notes = info.ReleaseNotes.Length > 500
+                ? info.ReleaseNotes[..500] + "..."
+                : info.ReleaseNotes;
+            Console.WriteLine(notes);
+        }
+        Console.WriteLine();
+        if (!string.IsNullOrEmpty(info.DownloadUrl))
+            Console.WriteLine($"下载地址: {info.DownloadUrl}");
+        if (!string.IsNullOrEmpty(info.ReleaseUrl))
+            Console.WriteLine($"发布页面: {info.ReleaseUrl}");
+
+        return 0;
+    }
+
     private static int PrintUsage()
     {
         Console.WriteLine("FindX — 高性能文件搜索引擎 CLI");
@@ -121,6 +164,7 @@ public static class Program
         Console.WriteLine("  search <query> [--max N] [--path <filter>]   搜索文件");
         Console.WriteLine("  status                                       查看索引状态");
         Console.WriteLine("  reindex                                      触发重新索引");
+        Console.WriteLine("  update                                       检查更新");
         return 1;
     }
 

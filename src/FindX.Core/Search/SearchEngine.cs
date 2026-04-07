@@ -58,16 +58,40 @@ public sealed class SearchEngine
                     continue;
             }
 
-            // 评分：对有搜索词的查询用 PinyinMatcher 打分
             PinyinMatcher.MatchResult matchResult;
             if (hasTerms)
             {
-                var combinedLower = string.Join("", parsed.Keywords).ToLowerInvariant();
-                matchResult = PinyinMatcher.Match(combinedLower, entry.Name);
-                if (!matchResult.IsMatch && !hasFilters)
-                    continue;
-                if (!matchResult.IsMatch)
-                    matchResult = new PinyinMatcher.MatchResult(PinyinMatcher.MatchType.None, 0, 0);
+                if (parsed.Root != null)
+                {
+                    // AST 已验证匹配；按每个关键词独立评分，消除关键词顺序对结果的影响
+                    int totalScore = 0;
+                    int totalLen = 0;
+                    var bestType = PinyinMatcher.MatchType.None;
+
+                    foreach (var kw in parsed.Keywords)
+                    {
+                        var mr = PinyinMatcher.Match(kw.ToLowerInvariant(), entry.Name);
+                        if (mr.IsMatch)
+                        {
+                            totalScore += mr.Score;
+                            totalLen += mr.MatchedChars;
+                            if (mr.Type > bestType) bestType = mr.Type;
+                        }
+                    }
+
+                    matchResult = totalScore > 0
+                        ? new PinyinMatcher.MatchResult(bestType, totalScore, totalLen)
+                        : new PinyinMatcher.MatchResult(PinyinMatcher.MatchType.None, 10, 0);
+                }
+                else
+                {
+                    var combinedLower = string.Join("", parsed.Keywords).ToLowerInvariant();
+                    matchResult = PinyinMatcher.Match(combinedLower, entry.Name);
+                    if (!matchResult.IsMatch && !hasFilters)
+                        continue;
+                    if (!matchResult.IsMatch)
+                        matchResult = new PinyinMatcher.MatchResult(PinyinMatcher.MatchType.None, 0, 0);
+                }
             }
             else if (hasRegex && parsed.RegexPattern != null)
             {
@@ -94,6 +118,9 @@ public sealed class SearchEngine
                 Score = score,
                 MatchType = matchResult.Type,
                 EntryIndex = idx,
+                LastModified = entry.LastWriteTimeTicks > 0
+                    ? DateTime.FromFileTimeUtc(entry.LastWriteTimeTicks).ToLocalTime()
+                    : default,
             });
         }
 

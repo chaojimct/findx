@@ -11,6 +11,7 @@
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
@@ -21,14 +22,24 @@
             <TextBlock x:Name="CountText" Text="索引文件数: 0" Margin="0,2,0,0" Foreground="Gray"/>
         </StackPanel>
 
-        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,8">
+        <Border x:Name="UpdatePanel" Grid.Row="1" Background="#FFF3CD" BorderBrush="#FFD93D"
+                BorderThickness="1" CornerRadius="4" Padding="10,6" Margin="0,0,0,8" Visibility="Collapsed">
+            <DockPanel>
+                <Button DockPanel.Dock="Right" Content="前往下载" Click="OpenReleasePage_Click"
+                        Padding="10,2" Margin="8,0,0,0" VerticalAlignment="Center"/>
+                <TextBlock x:Name="UpdateText" Text="" VerticalAlignment="Center" FontSize="12"/>
+            </DockPanel>
+        </Border>
+
+        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,8">
             <CheckBox x:Name="AutoStartCheck" Content="开机自启" Checked="AutoStart_Changed" Unchecked="AutoStart_Changed"/>
         </StackPanel>
 
-        <ListBox x:Name="LogList" Grid.Row="2" FontSize="11" FontFamily="Consolas"
+        <ListBox x:Name="LogList" Grid.Row="3" FontSize="11" FontFamily="Consolas"
                  BorderThickness="1" BorderBrush="#DDD"/>
 
-        <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+            <Button x:Name="CheckUpdateBtn" Content="检查更新" Click="CheckUpdate_Click" Padding="12,4" Margin="0,0,8,0"/>
             <Button Content="重建索引" Click="Reindex_Click" Padding="12,4" Margin="0,0,8,0"/>
             <Button Content="隐藏" Click="Hide_Click" Padding="12,4" Margin="0,0,8,0"/>
             <Button Content="退出" Click="Exit_Click" Padding="12,4"/>

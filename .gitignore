@@ -79,6 +79,10 @@ $RECYCLE.BIN/
 .AppleDouble
 .LSOverride
 
+# Build publish output
+publish/
+dist/
+
 # Local / secrets
 *.local.json
 secrets.json

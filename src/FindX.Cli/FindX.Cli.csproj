@@ -9,5 +9,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\FindX.Client\FindX.Client.csproj" />
+    <ProjectReference Include="..\FindX.Core\FindX.Core.csproj" />
   </ItemGroup>
 </Project>

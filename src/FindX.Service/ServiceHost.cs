@@ -7,6 +7,7 @@ using FindX.Core.Index;
 using FindX.Core.Pinyin;
 using FindX.Core.Search;
 using FindX.Core.Storage;
+using FindX.Core.Update;
 using Microsoft.Win32;
 
 namespace FindX.Service;
@@ -27,6 +28,8 @@ public sealed class ServiceHost : IDisposable
 
     private readonly Dictionary<char, ulong> _volumeUsns = new();
     private readonly List<string> _logs = new();
+    private readonly UpdateChecker _updateChecker = new();
+    private UpdateInfo? _latestUpdateInfo;
 
     /// <summary>非 0：正在执行 TryLoadIndex / 全量扫盘；0 表示首轮建立完成。用于 status 与托盘提示。</summary>
     private int _indexBuildInProgress = 1;
@@ -111,6 +114,8 @@ public sealed class ServiceHost : IDisposable
                 swTotal.Stop();
                 Log($"索引就绪总耗时: {swTotal.Elapsed.TotalSeconds:F2}s");
                 Volatile.Write(ref _indexBuildInProgress, 0);
+
+                _ = CheckForUpdateAsync();
             }
         });
 
@@ -277,6 +282,9 @@ public sealed class ServiceHost : IDisposable
         FlushLogs();
     }
 
+    public List<SearchResult> Search(string query, int maxResults = 100)
+        => _searchEngine.Search(query, maxResults);
+
     public int IndexCount => _index.CountSnapshot;
 
     /// <summary>若 true，CLI/托盘应提示「建立中」：全量扫描批量入库时文件数与内存会连续上升，属正常。</summary>
@@ -314,6 +322,25 @@ public sealed class ServiceHost : IDisposable
         catch { return false; }
     }
 
+    public UpdateInfo? LatestUpdateInfo => _latestUpdateInfo;
+
+    public async Task<UpdateInfo?> CheckForUpdateAsync()
+    {
+        try
+        {
+            var info = await _updateChecker.CheckAsync();
+            _latestUpdateInfo = info;
+            if (info?.HasUpdate == true)
+                Log($"发现新版本: v{info.LatestVersion}（当前: v{info.CurrentVersion}）");
+            return info;
+        }
+        catch (Exception ex)
+        {
+            Log($"检查更新失败: {ex.Message}");
+            return null;
+        }
+    }
+
     private void Log(string msg)
     {
         var line = $"[{DateTime.Now:HH:mm:ss}] {msg}";
@@ -338,5 +365,6 @@ public sealed class ServiceHost : IDisposable
         _journalWatcher.Dispose();
         _fallbackWatcher.Dispose();
         _ipcServer?.Dispose();
+        _updateChecker.Dispose();
     }
 }
