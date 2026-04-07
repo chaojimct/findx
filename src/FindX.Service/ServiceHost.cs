@@ -23,6 +23,7 @@ public sealed class ServiceHost : IDisposable
     private readonly JournalWatcher _journalWatcher;
     private readonly FallbackWatcher _fallbackWatcher;
     private IpcServer? _ipcServer;
+    private EverythingIpcServer? _everythingIpc;
 
     private readonly Dictionary<char, ulong> _volumeUsns = new();
     private readonly List<string> _logs = new();
@@ -157,6 +158,11 @@ public sealed class ServiceHost : IDisposable
             }
         };
         _ipcServer.Start();
+
+        _everythingIpc = new EverythingIpcServer(_index, _searchEngine);
+        _everythingIpc.Log += Log;
+        _everythingIpc.GetIndexReady = () => Volatile.Read(ref _indexBuildInProgress) == 0;
+        _everythingIpc.Start();
     }
 
     private async Task ScanAllVolumesAsync(bool skipSave = false)
@@ -263,6 +269,7 @@ public sealed class ServiceHost : IDisposable
     private void Shutdown()
     {
         Log("服务关闭中...");
+        _everythingIpc?.Dispose();
         _journalWatcher.Stop();
         _fallbackWatcher.Dispose();
         _ipcServer?.Dispose();
@@ -327,6 +334,7 @@ public sealed class ServiceHost : IDisposable
 
     public void Dispose()
     {
+        _everythingIpc?.Dispose();
         _journalWatcher.Dispose();
         _fallbackWatcher.Dispose();
         _ipcServer?.Dispose();
