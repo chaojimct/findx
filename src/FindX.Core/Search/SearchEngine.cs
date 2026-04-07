@@ -5,6 +5,7 @@ namespace FindX.Core.Search;
 
 /// <summary>
 /// 统一搜索引擎入口。组合排序表二分前缀、拼音匹配、正则、路径过滤等策略。
+/// 支持 Everything 兼容的 AST 表达式树求值。
 /// </summary>
 public sealed class SearchEngine
 {
@@ -18,50 +19,70 @@ public sealed class SearchEngine
         if (parsed.PathFilter == null && pathFilter != null)
             parsed.PathFilter = pathFilter;
 
-        if (parsed.Keywords.Count == 0 && !parsed.IsRegex)
+        bool hasTerms = parsed.Keywords.Count > 0;
+        bool hasRegex = parsed.IsRegex;
+        bool hasFilters = parsed.HasFilters;
+
+        // 纯 filter 查询（如 "ext:cs size:>1mb"）没有搜索词，需全量扫描
+        bool filterOnlyQuery = !hasTerms && !hasRegex && hasFilters;
+
+        if (!hasTerms && !hasRegex && !hasFilters)
             return new List<SearchResult>();
 
-        var candidates = GatherCandidates(parsed, maxResults);
-        var results = new List<SearchResult>();
+        int effectiveMax = parsed.MaxCount.HasValue
+            ? Math.Min(parsed.MaxCount.Value, maxResults)
+            : maxResults;
 
-        var combinedLower = parsed.IsRegex ? null : string.Join("", parsed.Keywords).ToLowerInvariant();
+        var candidates = GatherCandidates(parsed, effectiveMax, filterOnlyQuery);
+        var results = new List<SearchResult>();
+        var evalCtx = new EvalContext();
 
         foreach (var idx in candidates)
         {
             var entry = _index.GetByIndex(idx);
             if (entry == null) continue;
 
-            if (parsed.ExtFilter != null)
+            string fullPath = _index.BuildFullPath(idx);
+            evalCtx.Reset(entry, fullPath);
+
+            // AST 求值：如果有 Root 节点，用表达式树做完整过滤
+            if (parsed.Root != null)
             {
-                var ext = Path.GetExtension(entry.Name).TrimStart('.');
-                if (!ext.Equals(parsed.ExtFilter, StringComparison.OrdinalIgnoreCase))
+                if (!parsed.Root.Match(evalCtx))
+                    continue;
+            }
+            else
+            {
+                // 向后兼容：无 AST 时用旧逻辑
+                if (!LegacyFilter(parsed, entry, fullPath))
                     continue;
             }
 
-            string? fullPath = null;
-
-            if (parsed.PathFilter != null)
-            {
-                fullPath = _index.BuildFullPath(idx);
-                if (!fullPath.StartsWith(parsed.PathFilter, StringComparison.OrdinalIgnoreCase))
-                    continue;
-            }
-
+            // 评分：对有搜索词的查询用 PinyinMatcher 打分
             PinyinMatcher.MatchResult matchResult;
-            if (parsed.IsRegex && parsed.RegexPattern != null)
+            if (hasTerms)
+            {
+                var combinedLower = string.Join("", parsed.Keywords).ToLowerInvariant();
+                matchResult = PinyinMatcher.Match(combinedLower, entry.Name);
+                if (!matchResult.IsMatch && !hasFilters)
+                    continue;
+                if (!matchResult.IsMatch)
+                    matchResult = new PinyinMatcher.MatchResult(PinyinMatcher.MatchType.None, 0, 0);
+            }
+            else if (hasRegex && parsed.RegexPattern != null)
             {
                 matchResult = parsed.RegexPattern.IsMatch(entry.Name)
                     ? new PinyinMatcher.MatchResult(PinyinMatcher.MatchType.Exact, 500, entry.Name.Length)
                     : PinyinMatcher.MatchResult.NoMatch;
+                if (!matchResult.IsMatch)
+                    continue;
             }
             else
             {
-                matchResult = PinyinMatcher.Match(combinedLower!, entry.Name);
+                // 纯 filter 查询，给基础分
+                matchResult = new PinyinMatcher.MatchResult(PinyinMatcher.MatchType.Exact, 100, 0);
             }
 
-            if (!matchResult.IsMatch) continue;
-
-            fullPath ??= _index.BuildFullPath(idx);
             var score = Scorer.Score(entry, fullPath, matchResult);
 
             results.Add(new SearchResult
@@ -77,15 +98,47 @@ public sealed class SearchEngine
         }
 
         results.Sort((a, b) => b.Score.CompareTo(a.Score));
-        if (results.Count > maxResults)
-            results.RemoveRange(maxResults, results.Count - maxResults);
+        if (results.Count > effectiveMax)
+            results.RemoveRange(effectiveMax, results.Count - effectiveMax);
 
         return results;
     }
 
-    private HashSet<int> GatherCandidates(ParsedQuery parsed, int maxResults)
+    /// <summary>向后兼容：无 AST 时的旧过滤逻辑</summary>
+    private static bool LegacyFilter(ParsedQuery parsed, FileEntry entry, string fullPath)
+    {
+        if (parsed.ExtFilter != null)
+        {
+            var ext = Path.GetExtension(entry.Name).TrimStart('.');
+            if (!ext.Equals(parsed.ExtFilter, StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+
+        if (parsed.PathFilter != null)
+        {
+            if (!fullPath.StartsWith(parsed.PathFilter, StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+
+        return true;
+    }
+
+    private HashSet<int> GatherCandidates(ParsedQuery parsed, int maxResults, bool filterOnly)
     {
         var candidates = new HashSet<int>();
+
+        // 纯 filter 查询需全量扫描
+        if (filterOnly)
+        {
+            var scanCap = maxResults * 20;
+            _index.ForEachLiveEntry((entry, i) =>
+            {
+                if (candidates.Count >= scanCap) return false;
+                candidates.Add(i);
+                return true;
+            });
+            return candidates;
+        }
 
         if (parsed.IsRegex)
         {
@@ -118,8 +171,6 @@ public sealed class SearchEngine
             foreach (var h in _index.SearchFullPinyinCompactPrefix(lower, cap))
                 candidates.Add(h);
 
-            // 递进首字母前缀：2..min(len-1, 4)
-            // mchunt → "mc","mch","mchu"；其中 "mc" 命中 initials="mct"（马春天）
             int pyInitMax = Math.Min(lower.Length - 1, 4);
             for (int plen = pyInitMax; plen >= 2; plen--)
             {
@@ -127,7 +178,6 @@ public sealed class SearchEngine
                     candidates.Add(h);
             }
 
-            // 递进全拼前缀：2..min(len-1, 6)
             int fullPyMax = Math.Min(lower.Length - 1, 6);
             for (int plen = fullPyMax; plen >= 2; plen--)
             {
@@ -135,12 +185,6 @@ public sealed class SearchEngine
                     candidates.Add(h);
             }
 
-            // 跨音节三字首字母组合：遍历查询中所有可能的 (P, Q) 位置对，
-            // P = 第二个 CJK 字起始位置，Q = 第三个 CJK 字起始位置，
-            // 组成三字首字母前缀搜索。三字前缀足够精确（如 "mct" 几乎仅命中 CJK），
-            // 用小 cap 避免 "min"/"mac" 等高频 ASCII 前缀带来的候选集爆炸。
-            // mact → (P=2,Q=3): "mct" → 命中 initials="mct"（马春天）
-            // mchunt → (P=1,Q=5): "mct" → 命中 initials="mct"（马春天）
             if (lower.Length >= 3)
             {
                 char first = lower[0];
