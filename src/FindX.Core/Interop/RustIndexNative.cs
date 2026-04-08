@@ -89,6 +89,30 @@ internal static class RustIndexNative
         int outCap);
 
     [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    public static extern int findx_engine_search_name_contains(
+        IntPtr p,
+        IntPtr needleUtf8,
+        int needleLen,
+        IntPtr outIndices,
+        int outCap);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    public static extern int findx_engine_search_full_py_contains(
+        IntPtr p,
+        IntPtr needleUtf8,
+        int needleLen,
+        IntPtr outIndices,
+        int outCap);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    public static extern int findx_engine_search_initials_contains(
+        IntPtr p,
+        IntPtr needleUtf8,
+        int needleLen,
+        IntPtr outIndices,
+        int outCap);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
     public static extern int findx_engine_get_live_record(
         IntPtr p,
         int idx,

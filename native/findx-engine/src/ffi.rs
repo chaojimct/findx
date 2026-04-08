@@ -272,6 +272,84 @@ pub unsafe extern "C" fn findx_engine_search_full_py_prefix(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn findx_engine_search_name_contains(
+    p: *mut EngineBox,
+    needle_utf8: *const u8,
+    needle_len: i32,
+    out_indices: *mut u32,
+    out_cap: i32,
+) -> i32 {
+    let b = match as_box(p) {
+        Some(x) => x,
+        None => return -1,
+    };
+    if needle_utf8.is_null() || needle_len < 0 || out_indices.is_null() || out_cap <= 0 {
+        return -2;
+    }
+    let needle =
+        std::str::from_utf8(std::slice::from_raw_parts(needle_utf8, needle_len as usize))
+            .unwrap_or("");
+    b.inner
+        .search_name_contains(needle, &mut b.scratch_idx, out_cap as usize);
+    let n = b.scratch_idx.len();
+    let ncpy = n.min(out_cap as usize);
+    std::ptr::copy_nonoverlapping(b.scratch_idx.as_ptr(), out_indices, ncpy);
+    ncpy as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn findx_engine_search_full_py_contains(
+    p: *mut EngineBox,
+    needle_utf8: *const u8,
+    needle_len: i32,
+    out_indices: *mut u32,
+    out_cap: i32,
+) -> i32 {
+    let b = match as_box(p) {
+        Some(x) => x,
+        None => return -1,
+    };
+    if needle_utf8.is_null() || needle_len < 0 || out_indices.is_null() || out_cap <= 0 {
+        return -2;
+    }
+    let needle =
+        std::str::from_utf8(std::slice::from_raw_parts(needle_utf8, needle_len as usize))
+            .unwrap_or("");
+    b.inner
+        .search_full_py_contains(needle, &mut b.scratch_idx, out_cap as usize);
+    let n = b.scratch_idx.len();
+    let ncpy = n.min(out_cap as usize);
+    std::ptr::copy_nonoverlapping(b.scratch_idx.as_ptr(), out_indices, ncpy);
+    ncpy as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn findx_engine_search_initials_contains(
+    p: *mut EngineBox,
+    needle_utf8: *const u8,
+    needle_len: i32,
+    out_indices: *mut u32,
+    out_cap: i32,
+) -> i32 {
+    let b = match as_box(p) {
+        Some(x) => x,
+        None => return -1,
+    };
+    if needle_utf8.is_null() || needle_len < 0 || out_indices.is_null() || out_cap <= 0 {
+        return -2;
+    }
+    let needle =
+        std::str::from_utf8(std::slice::from_raw_parts(needle_utf8, needle_len as usize))
+            .unwrap_or("");
+    b.inner
+        .search_initials_contains(needle, &mut b.scratch_idx, out_cap as usize);
+    let n = b.scratch_idx.len();
+    let ncpy = n.min(out_cap as usize);
+    std::ptr::copy_nonoverlapping(b.scratch_idx.as_ptr(), out_indices, ncpy);
+    ncpy as i32
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn findx_engine_get_name_utf16_len(p: *const EngineBox, idx: i32) -> i32 {
     if p.is_null() {
         return -1;

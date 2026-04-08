@@ -91,6 +91,53 @@ fn starts_with_ignore_case_bytes(hay: &[u8], needle: &[u8]) -> bool {
     true
 }
 
+fn contains_ignore_case_bytes(hay: &[u8], needle: &[u8]) -> bool {
+    let hl = hay.len();
+    let nl = needle.len();
+    if nl == 0 {
+        return true;
+    }
+    if nl > hl {
+        return false;
+    }
+    let first = needle[0].to_ascii_lowercase();
+    'outer: for s in 0..=(hl - nl) {
+        if hay[s].to_ascii_lowercase() != first {
+            continue;
+        }
+        for j in 1..nl {
+            if hay[s + j].to_ascii_lowercase() != needle[j].to_ascii_lowercase() {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+fn contains_chars_lower(hay: &str, needle_low: &[char]) -> bool {
+    if needle_low.is_empty() {
+        return true;
+    }
+    let hay_low: Vec<char> = hay.chars().flat_map(|c| c.to_lowercase()).collect();
+    if needle_low.len() > hay_low.len() {
+        return false;
+    }
+    let first = needle_low[0];
+    'outer: for s in 0..=(hay_low.len() - needle_low.len()) {
+        if hay_low[s] != first {
+            continue;
+        }
+        for j in 1..needle_low.len() {
+            if hay_low[s + j] != needle_low[j] {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
+}
+
 fn cmp_name_str_ignore_case(a: &str, b: &str) -> Ordering {
     let mut ai = a.chars().flat_map(|c| c.to_lowercase());
     let mut bi = b.chars().flat_map(|c| c.to_lowercase());
@@ -894,6 +941,80 @@ impl Engine {
             }
             if !f(i as i32) {
                 break;
+            }
+        }
+    }
+
+    pub fn search_name_contains(&self, needle: &str, out: &mut Vec<u32>, max_results: usize) {
+        out.clear();
+        if max_results == 0 || needle.is_empty() {
+            return;
+        }
+        let needle_has_cjk = needle.chars().any(|c| is_cjk(c));
+        let needle_low: Vec<char> = needle.chars().flat_map(|c| c.to_lowercase()).collect();
+        for (i, r) in self.records.iter().enumerate() {
+            if r.deleted != 0 {
+                continue;
+            }
+            if out.len() >= max_results {
+                break;
+            }
+            let name = pool_utf8(&self.name_pool, r.name_start, r.name_len as u32);
+            if needle_has_cjk && !name_contains_cjk(name) {
+                continue;
+            }
+            if contains_chars_lower(name, &needle_low) {
+                out.push(i as u32);
+            }
+        }
+    }
+
+    pub fn search_full_py_contains(&self, needle: &str, out: &mut Vec<u32>, max_results: usize) {
+        out.clear();
+        if max_results == 0 || needle.is_empty() {
+            return;
+        }
+        let needle_bytes = needle.as_bytes();
+        for (i, r) in self.records.iter().enumerate() {
+            if r.deleted != 0 {
+                continue;
+            }
+            if out.len() >= max_results {
+                break;
+            }
+            let name = pool_utf8(&self.name_pool, r.name_start, r.name_len as u32);
+            if !name_contains_cjk(name) {
+                continue;
+            }
+            let (buf, len) = compute_full_py_stack(name);
+            let fp = &buf[..len];
+            if contains_ignore_case_bytes(fp, needle_bytes) {
+                out.push(i as u32);
+            }
+        }
+    }
+
+    pub fn search_initials_contains(&self, needle: &str, out: &mut Vec<u32>, max_results: usize) {
+        out.clear();
+        if max_results == 0 || needle.is_empty() {
+            return;
+        }
+        let needle_bytes = needle.as_bytes();
+        for (i, r) in self.records.iter().enumerate() {
+            if r.deleted != 0 {
+                continue;
+            }
+            if out.len() >= max_results {
+                break;
+            }
+            let name = pool_utf8(&self.name_pool, r.name_start, r.name_len as u32);
+            if !name_contains_cjk(name) {
+                continue;
+            }
+            let (buf, len) = compute_initials_stack(name);
+            let initials = &buf[..len];
+            if contains_ignore_case_bytes(initials, needle_bytes) {
+                out.push(i as u32);
             }
         }
     }

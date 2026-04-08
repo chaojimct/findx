@@ -302,6 +302,129 @@ public sealed class FileIndex
         }
     }
 
+    /// <summary>Rust 内部全量扫描文件名子串匹配（不走 P/Invoke 逐条回调）。</summary>
+    public List<int> SearchNameContains(string needle, int maxResults)
+    {
+        if (maxResults <= 0 || string.IsNullOrEmpty(needle))
+            return new List<int>();
+
+        var rent = ArrayPool<uint>.Shared.Rent(SearchIndexCap);
+        var utfRent = ArrayPool<byte>.Shared.Rent(Math.Max(1024, Encoding.UTF8.GetMaxByteCount(needle.Length)));
+        try
+        {
+            int blen = Encoding.UTF8.GetBytes(needle.AsSpan(), utfRent);
+            int rc;
+            _lock.EnterReadLock();
+            try
+            {
+                unsafe
+                {
+                    fixed (byte* pb = utfRent)
+                    fixed (uint* po = rent)
+                    {
+                        rc = RustIndexNative.findx_engine_search_name_contains(_engine, (IntPtr)pb, blen, (IntPtr)po,
+                            SearchIndexCap);
+                    }
+                }
+            }
+            finally { _lock.ExitReadLock(); }
+
+            if (rc < 0) return new List<int>();
+            var list = new List<int>(Math.Min(rc, maxResults));
+            int take = Math.Min(rc, maxResults);
+            for (int i = 0; i < take; i++)
+                list.Add((int)rent[i]);
+            return list;
+        }
+        finally
+        {
+            ArrayPool<uint>.Shared.Return(rent);
+            ArrayPool<byte>.Shared.Return(utfRent);
+        }
+    }
+
+    /// <summary>Rust 内部全量扫描全拼子串匹配。</summary>
+    public List<int> SearchFullPinyinContains(string needle, int maxResults)
+    {
+        if (maxResults <= 0 || string.IsNullOrEmpty(needle))
+            return new List<int>();
+
+        var rent = ArrayPool<uint>.Shared.Rent(SearchIndexCap);
+        var utfRent = ArrayPool<byte>.Shared.Rent(Math.Max(1024, Encoding.UTF8.GetMaxByteCount(needle.Length)));
+        try
+        {
+            int blen = Encoding.UTF8.GetBytes(needle.AsSpan(), utfRent);
+            int rc;
+            _lock.EnterReadLock();
+            try
+            {
+                unsafe
+                {
+                    fixed (byte* pb = utfRent)
+                    fixed (uint* po = rent)
+                    {
+                        rc = RustIndexNative.findx_engine_search_full_py_contains(_engine, (IntPtr)pb, blen, (IntPtr)po,
+                            SearchIndexCap);
+                    }
+                }
+            }
+            finally { _lock.ExitReadLock(); }
+
+            if (rc < 0) return new List<int>();
+            var list = new List<int>(Math.Min(rc, maxResults));
+            int take = Math.Min(rc, maxResults);
+            for (int i = 0; i < take; i++)
+                list.Add((int)rent[i]);
+            return list;
+        }
+        finally
+        {
+            ArrayPool<uint>.Shared.Return(rent);
+            ArrayPool<byte>.Shared.Return(utfRent);
+        }
+    }
+
+    /// <summary>Rust 内部全量扫描拼音首字母子串匹配。</summary>
+    public List<int> SearchInitialsContains(string needle, int maxResults)
+    {
+        if (maxResults <= 0 || string.IsNullOrEmpty(needle))
+            return new List<int>();
+
+        var rent = ArrayPool<uint>.Shared.Rent(SearchIndexCap);
+        var utfRent = ArrayPool<byte>.Shared.Rent(Math.Max(1024, Encoding.UTF8.GetMaxByteCount(needle.Length)));
+        try
+        {
+            int blen = Encoding.UTF8.GetBytes(needle.AsSpan(), utfRent);
+            int rc;
+            _lock.EnterReadLock();
+            try
+            {
+                unsafe
+                {
+                    fixed (byte* pb = utfRent)
+                    fixed (uint* po = rent)
+                    {
+                        rc = RustIndexNative.findx_engine_search_initials_contains(_engine, (IntPtr)pb, blen, (IntPtr)po,
+                            SearchIndexCap);
+                    }
+                }
+            }
+            finally { _lock.ExitReadLock(); }
+
+            if (rc < 0) return new List<int>();
+            var list = new List<int>(Math.Min(rc, maxResults));
+            int take = Math.Min(rc, maxResults);
+            for (int i = 0; i < take; i++)
+                list.Add((int)rent[i]);
+            return list;
+        }
+        finally
+        {
+            ArrayPool<uint>.Shared.Return(rent);
+            ArrayPool<byte>.Shared.Return(utfRent);
+        }
+    }
+
     public void ForEachLiveEntry(Func<FileEntry, int, bool> visitor)
     {
         _lock.EnterReadLock();

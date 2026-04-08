@@ -285,42 +285,16 @@ public sealed class SearchEngine
     {
         if (_index.IsInBulkLoad) return;
 
-        List<string>? cjkKws = null;
         foreach (var kw in keywords)
         {
             bool hasCjk = false;
             foreach (var c in kw)
                 if (c >= '\u4E00' && c <= '\u9FFF') { hasCjk = true; break; }
-            if (hasCjk)
-            {
-                cjkKws ??= new();
-                cjkKws.Add(kw);
-            }
+            if (!hasCjk) continue;
+
+            foreach (var h in _index.SearchNameContains(kw, addCap))
+                candidates.Add(h);
         }
-        if (cjkKws == null) return;
-
-        int added = 0;
-        long deadline = Environment.TickCount64 + 1500;
-        int checked_ = 0;
-
-        _index.ForEachLiveEntry((entry, i) =>
-        {
-            if (added >= addCap) return false;
-            if (++checked_ % 1024 == 0 && Environment.TickCount64 >= deadline)
-                return false;
-            if (candidates.Contains(i)) return true;
-
-            foreach (var kw in cjkKws)
-            {
-                if (entry.Name.Contains(kw, StringComparison.OrdinalIgnoreCase))
-                {
-                    candidates.Add(i);
-                    added++;
-                    return true;
-                }
-            }
-            return true;
-        });
     }
 
     private void GatherPinyinSubstringCandidates(
@@ -328,49 +302,24 @@ public sealed class SearchEngine
     {
         if (_index.IsInBulkLoad) return;
 
-        int added = 0;
-        long deadline = Environment.TickCount64 + 1500;
-        int checked_ = 0;
-
-        _index.ForEachLiveEntry((entry, i) =>
+        foreach (var kw in keywords)
         {
-            if (added >= addCap) return false;
-            if (++checked_ % 1024 == 0 && Environment.TickCount64 >= deadline)
-                return false;
-            if (candidates.Contains(i)) return true;
-            if (!PinyinTable.NameContainsCjk(entry.Name)) return true;
+            if (kw.Length < 2) continue;
+            bool allAscii = true;
+            foreach (var c in kw)
+                if (!char.IsAsciiLetterOrDigit(c)) { allAscii = false; break; }
+            if (!allAscii) continue;
 
-            string? initials = null;
-            string? fullPy = null;
+            var kwLower = kw.ToLowerInvariant();
 
-            foreach (var kw in keywords)
+            foreach (var h in _index.SearchFullPinyinContains(kwLower, addCap))
+                candidates.Add(h);
+
+            if (kwLower.Length <= 5)
             {
-                if (kw.Length < 2) continue;
-                bool allAscii = true;
-                foreach (var c in kw)
-                    if (!char.IsAsciiLetterOrDigit(c)) { allAscii = false; break; }
-                if (!allAscii) continue;
-
-                var kwLower = kw.ToLowerInvariant();
-
-                initials ??= PinyinTable.GetInitials(entry.Name);
-                if (initials.Contains(kwLower, StringComparison.Ordinal))
-                {
-                    candidates.Add(i);
-                    added++;
-                    return true;
-                }
-
-                fullPy ??= string.Concat(PinyinTable.GetPinyinSequence(entry.Name));
-                if (fullPy.Contains(kwLower, StringComparison.Ordinal))
-                {
-                    candidates.Add(i);
-                    added++;
-                    return true;
-                }
+                foreach (var h in _index.SearchInitialsContains(kwLower, addCap))
+                    candidates.Add(h);
             }
-
-            return true;
-        });
+        }
     }
 }
