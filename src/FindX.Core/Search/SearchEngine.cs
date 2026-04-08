@@ -184,12 +184,18 @@ public sealed class SearchEngine
         var fullCap = FileIndex.PrefixSearchHitCap;
         const int mixCap = 512;
 
-        int minKwLen = int.MaxValue;
+        int minAsciiKwLen = int.MaxValue;
         foreach (var kw in parsed.Keywords)
-            if (kw.Length < minKwLen) minKwLen = kw.Length;
+        {
+            bool ascii = true;
+            foreach (var c in kw)
+                if (!char.IsAsciiLetterOrDigit(c)) { ascii = false; break; }
+            if (ascii && kw.Length < minAsciiKwLen)
+                minAsciiKwLen = kw.Length;
+        }
 
-        bool shortQuery = minKwLen <= 2;
-        var cap = shortQuery ? Math.Min(512, fullCap) : fullCap;
+        bool shortAscii = minAsciiKwLen <= 1;
+        var cap = shortAscii ? Math.Min(512, fullCap) : fullCap;
 
         foreach (var kw in parsed.Keywords)
         {
@@ -201,7 +207,7 @@ public sealed class SearchEngine
             if (!lower.All(c => char.IsAsciiLetterOrDigit(c)))
                 continue;
 
-            if (shortQuery) continue;
+            if (shortAscii && lower.Length <= 1) continue;
 
             foreach (var h in _index.SearchPinyinInitialsPrefix(lower, cap))
                 candidates.Add(h);
@@ -242,8 +248,6 @@ public sealed class SearchEngine
         }
 
         // ── 拼音子串补充扫描 ──
-        // 前缀索引只能命中「以 query 开头」的候选；对于 "jianli" 查 "马春天简历.doc" 这类
-        // query 出现在文件名拼音中部的情况，需要线性扫描含 CJK 字符的条目做子串匹配。
         bool hasAsciiKw = false;
         foreach (var kw in parsed.Keywords)
         {
@@ -257,7 +261,68 @@ public sealed class SearchEngine
         if (hasAsciiKw)
             GatherPinyinSubstringCandidates(parsed.Keywords, candidates, cap);
 
+        // ── CJK 子串补充扫描 ──
+        // SearchNamePrefix 只能命中文件名以关键词开头的条目；
+        // 搜索 "退场" 找不到 "工人退场确认书.docx"，需要子串匹配补充。
+        bool hasCjkKw = false;
+        foreach (var kw in parsed.Keywords)
+        {
+            foreach (var c in kw)
+                if (c >= '\u4E00' && c <= '\u9FFF') { hasCjkKw = true; break; }
+            if (hasCjkKw) break;
+        }
+
+        if (hasCjkKw)
+            GatherCjkSubstringCandidates(parsed.Keywords, candidates, cap);
+
         return candidates;
+    }
+
+    /// <summary>
+    /// 线性扫描文件名，检查 CJK 关键词是否为文件名的子串。
+    /// 命中则补入候选集，上限 <paramref name="addCap"/> 条，且总耗时不超过 200ms。
+    /// </summary>
+    private void GatherCjkSubstringCandidates(
+        IReadOnlyList<string> keywords, HashSet<int> candidates, int addCap)
+    {
+        if (_index.IsInBulkLoad) return;
+
+        List<string>? cjkKws = null;
+        foreach (var kw in keywords)
+        {
+            bool hasCjk = false;
+            foreach (var c in kw)
+                if (c >= '\u4E00' && c <= '\u9FFF') { hasCjk = true; break; }
+            if (hasCjk)
+            {
+                cjkKws ??= new();
+                cjkKws.Add(kw);
+            }
+        }
+        if (cjkKws == null) return;
+
+        int added = 0;
+        long deadline = Environment.TickCount64 + 200;
+        int checked_ = 0;
+
+        _index.ForEachLiveEntry((entry, i) =>
+        {
+            if (added >= addCap) return false;
+            if (++checked_ % 4096 == 0 && Environment.TickCount64 >= deadline)
+                return false;
+            if (candidates.Contains(i)) return true;
+
+            foreach (var kw in cjkKws)
+            {
+                if (entry.Name.Contains(kw, StringComparison.OrdinalIgnoreCase))
+                {
+                    candidates.Add(i);
+                    added++;
+                    return true;
+                }
+            }
+            return true;
+        });
     }
 
     /// <summary>
