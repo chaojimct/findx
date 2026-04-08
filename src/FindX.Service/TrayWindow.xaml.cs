@@ -28,9 +28,12 @@ public partial class TrayWindow : Window
 
         try
         {
+            _notifyIcon.Icon = Icon.ExtractAssociatedIcon(Environment.ProcessPath!);
+        }
+        catch
+        {
             _notifyIcon.Icon = SystemIcons.Application;
         }
-        catch { }
 
         _updateMenuItem = new WinForms.ToolStripMenuItem("检查更新");
         _updateMenuItem.Click += async (_, _) => await CheckUpdateFromMenu();

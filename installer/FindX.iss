@@ -32,6 +32,8 @@ PrivilegesRequired=admin
 WizardStyle=modern
 SetupLogging=yes
 UninstallDisplayName={#MyAppName}
+SetupIconFile=..\assets\findx-icon.ico
+UninstallDisplayIcon={app}\{#MyAppExeName}
 MinVersion=10.0
 
 [Languages]

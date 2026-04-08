@@ -10,12 +10,16 @@
     <AssemblyName>FindX</AssemblyName>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\..\assets\findx-icon.ico</ApplicationIcon>
     <FindxEngineRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\native\findx-engine'))</FindxEngineRoot>
     <FindxCargoProfile Condition="'$(Configuration)' == 'Release'">release</FindxCargoProfile>
     <FindxCargoProfile Condition="'$(Configuration)' != 'Release'">debug</FindxCargoProfile>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\FindX.Core\FindX.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Resource Include="..\..\assets\findx-icon.ico" Link="findx-icon.ico" />
   </ItemGroup>
   <!-- 预编译 DLL：native\FindXNative\build.ps1 / build.cmd 产出后随 FindX 输出（优先 Release） -->
   <Choose>

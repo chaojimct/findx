@@ -6,6 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>FindX.Cli</RootNamespace>
     <AssemblyName>fx</AssemblyName>
+    <ApplicationIcon>..\..\assets\findx-icon.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\FindX.Client\FindX.Client.csproj" />
