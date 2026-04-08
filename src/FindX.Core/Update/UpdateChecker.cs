@@ -18,7 +18,7 @@ public sealed class UpdateInfo
 
 public sealed class UpdateChecker : IDisposable
 {
-    private const string DefaultOwner = "user";
+    private const string DefaultOwner = "chaojimct";
     private const string DefaultRepo = "findx";
 
     private readonly HttpClient _http;
@@ -27,11 +27,34 @@ public sealed class UpdateChecker : IDisposable
 
     public UpdateChecker(string? owner = null, string? repo = null)
     {
-        _owner = owner ?? DefaultOwner;
-        _repo = repo ?? DefaultRepo;
+        (owner, repo) = ResolveOwnerRepo(owner, repo);
+        _owner = owner;
+        _repo = repo;
         _http = new HttpClient();
         _http.DefaultRequestHeaders.UserAgent.ParseAdd("FindX-UpdateChecker/1.0");
         _http.Timeout = TimeSpan.FromSeconds(15);
+    }
+
+    /// <summary>环境变量 FINDX_UPDATE_REPO=owner/repo，便于 fork / 私有源；未设置则用默认仓库。</summary>
+    private static (string Owner, string Repo) ResolveOwnerRepo(string? owner, string? repo)
+    {
+        if (owner != null && repo != null)
+            return (owner, repo);
+
+        var env = Environment.GetEnvironmentVariable("FINDX_UPDATE_REPO")?.Trim();
+        if (!string.IsNullOrEmpty(env))
+        {
+            var idx = env.IndexOf('/');
+            if (idx > 0 && idx < env.Length - 1)
+            {
+                var o = env[..idx].Trim();
+                var r = env[(idx + 1)..].Trim();
+                if (o.Length > 0 && r.Length > 0)
+                    return (o, r);
+            }
+        }
+
+        return (owner ?? DefaultOwner, repo ?? DefaultRepo);
     }
 
     public static string GetCurrentVersion()
@@ -55,15 +78,10 @@ public sealed class UpdateChecker : IDisposable
             var release = await _http.GetFromJsonAsync<GitHubRelease>(url, ct);
             if (release?.TagName == null) return null;
 
-            var latestStr = release.TagName.TrimStart('v', 'V');
+            var latestStr = StripLeadingV(release.TagName);
             var currentStr = GetCurrentVersion();
 
-            bool hasUpdate = false;
-            if (Version.TryParse(NormalizeSemver(latestStr), out var latest) &&
-                Version.TryParse(NormalizeSemver(currentStr), out var current))
-            {
-                hasUpdate = latest > current;
-            }
+            bool hasUpdate = CompareVersions(latestStr, currentStr) > 0;
 
             string? downloadUrl = null;
             if (release.Assets != null)
@@ -89,6 +107,39 @@ public sealed class UpdateChecker : IDisposable
         {
             return null;
         }
+    }
+
+    /// <summary>去掉 tag 前缀 v/V（逐字符 TrimStart 会误伤其他情况，这里只去一层常见前缀）。</summary>
+    private static string StripLeadingV(string tag)
+    {
+        tag = tag.Trim();
+        if (tag.Length >= 2 &&
+            (tag[0] == 'v' || tag[0] == 'V') &&
+            char.IsDigit(tag[1]))
+            return tag[1..];
+        return tag;
+    }
+
+    /// <summary>剥离 SemVer 的 +build / -prerelease 后再交给 <see cref="Version"/>（仅支持 x.x.x.x 数值段）。</summary>
+    private static bool TryParseCoreVersion(string ver, out Version? version)
+    {
+        ver = ver.Trim();
+        var plus = ver.IndexOf('+');
+        if (plus >= 0) ver = ver[..plus];
+        var dash = ver.IndexOf('-');
+        if (dash >= 0) ver = ver[..dash];
+        ver = NormalizeSemver(ver);
+        return Version.TryParse(ver, out version);
+    }
+
+    /// <returns>&lt;0 当前较新；0 相同或无法比较；&gt;0 远程较新。</returns>
+    private static int CompareVersions(string remoteLatest, string localCurrent)
+    {
+        if (!TryParseCoreVersion(remoteLatest, out var latest) || latest is null ||
+            !TryParseCoreVersion(localCurrent, out var current) || current is null)
+            return 0;
+
+        return latest.CompareTo(current);
     }
 
     private static string NormalizeSemver(string ver)

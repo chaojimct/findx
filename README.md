@@ -51,7 +51,7 @@
 
 ### 安装包（推荐）
 
-从 [Releases](https://github.com/user/findx/releases) 下载 `FindX-x.x.x-setup.exe`，运行安装向导。
+从 [Releases](https://github.com/chaojimct/findx/releases) 下载 `FindX-x.x.x-setup.exe`，运行安装向导。
 
 安装选项：
 - **FindX 搜索服务** — 后台常驻进程（默认安装）

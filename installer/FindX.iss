@@ -7,7 +7,7 @@
 
 #define MyAppName      "FindX"
 #define MyAppPublisher "FindX"
-#define MyAppURL       "https://github.com/user/findx"
+#define MyAppURL       "https://github.com/chaojimct/findx"
 #define MyAppExeName   "FindX.exe"
 #define MyCliExeName   "fx.exe"
 #define PublishDir     "..\publish"
