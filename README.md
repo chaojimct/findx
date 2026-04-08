@@ -219,6 +219,34 @@ git push origin v1.0.0
 
 也可在 Actions 页面手动触发 `workflow_dispatch`。
 
+## 路线图
+
+### 搜索过滤器
+
+- [ ] `dc:` / `datecreated:` — 创建时间过滤（需 Rust 引擎扩展 FileEntry 存储 CreationTimeTicks）
+- [ ] `da:` / `dateaccessed:` — 访问时间过滤（需 Rust 引擎扩展 FileEntry 存储 AccessTimeTicks）
+- [ ] `empty:` — 空文件夹判断（需遍历子树检查子条目）
+- [ ] `content:` — 文件内容搜索（需文件 IO，性能敏感）
+- [ ] `type:` — Windows 文件类型名过滤（如 "Text Document"，需查询注册表）
+- [ ] `dupe:` / `sizedupe:` / `namedupe:` — 重复文件检测（需全索引扫描 + 分组）
+- [ ] `child:` / `childcount:` / `childfile:` / `childfolder:` — 子项计数（需遍历子树）
+- [ ] `runcount:` / `daterun:` — 运行历史跟踪
+- [ ] `shell:` — Shell 已知文件夹映射（桌面/文档等 KNOWNFOLDERID）
+- [ ] `audio:` / `video:` / `doc:` / `exe:` / `zip:` / `pic:` 等宏 — ext 列表展开
+
+### GUI 搜索窗口
+
+- [ ] 文件大小列显示
+- [ ] 表头点击排序
+- [ ] 搜索历史记录
+- [ ] 结果导出（CSV / 文本）
+- [ ] 搜索进度指示与取消
+- [ ] 侧栏增加路径范围、大小范围筛选
+
+### 架构
+
+- [ ] Windows Service 模式 — 拆分为无头服务进程 + 独立 GUI 托盘客户端（类似 Everything 服务模式，SYSTEM 权限运行，支持无人登录时索引、崩溃自动恢复）
+
 ## 许可证
 
 MIT
