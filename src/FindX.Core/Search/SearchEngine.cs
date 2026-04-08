@@ -154,7 +154,9 @@ public sealed class SearchEngine
     {
         var candidates = new HashSet<int>();
 
-        // 纯 filter 查询需全量扫描
+        if (_index.IsInBulkLoad)
+            return candidates;
+
         if (filterOnly)
         {
             var scanCap = maxResults * 20;
@@ -231,6 +233,77 @@ public sealed class SearchEngine
             }
         }
 
+        // ── 拼音子串补充扫描 ──
+        // 前缀索引只能命中「以 query 开头」的候选；对于 "jianli" 查 "马春天简历.doc" 这类
+        // query 出现在文件名拼音中部的情况，需要线性扫描含 CJK 字符的条目做子串匹配。
+        bool hasAsciiKw = false;
+        foreach (var kw in parsed.Keywords)
+        {
+            if (kw.Length < 2) continue;
+            bool ok = true;
+            foreach (var c in kw)
+                if (!char.IsAsciiLetterOrDigit(c)) { ok = false; break; }
+            if (ok) { hasAsciiKw = true; break; }
+        }
+
+        if (hasAsciiKw)
+            GatherPinyinSubstringCandidates(parsed.Keywords, candidates, cap);
+
         return candidates;
+    }
+
+    /// <summary>
+    /// 线性扫描含 CJK 字符的文件名，检查 query 是否为拼音首字母或全拼拼接的子串。
+    /// 命中则补入候选集，上限 <paramref name="addCap"/> 条，且总耗时不超过 150ms。
+    /// </summary>
+    private void GatherPinyinSubstringCandidates(
+        IReadOnlyList<string> keywords, HashSet<int> candidates, int addCap)
+    {
+        if (_index.IsInBulkLoad) return;
+
+        int added = 0;
+        long deadline = Environment.TickCount64 + 150;
+        int checked_ = 0;
+
+        _index.ForEachLiveEntry((entry, i) =>
+        {
+            if (added >= addCap) return false;
+            if (++checked_ % 4096 == 0 && Environment.TickCount64 >= deadline)
+                return false;
+            if (candidates.Contains(i)) return true;
+            if (!PinyinTable.NameContainsCjk(entry.Name)) return true;
+
+            string? initials = null;
+            string? fullPy = null;
+
+            foreach (var kw in keywords)
+            {
+                if (kw.Length < 2) continue;
+                bool allAscii = true;
+                foreach (var c in kw)
+                    if (!char.IsAsciiLetterOrDigit(c)) { allAscii = false; break; }
+                if (!allAscii) continue;
+
+                var kwLower = kw.ToLowerInvariant();
+
+                initials ??= PinyinTable.GetInitials(entry.Name);
+                if (initials.Contains(kwLower, StringComparison.Ordinal))
+                {
+                    candidates.Add(i);
+                    added++;
+                    return true;
+                }
+
+                fullPy ??= string.Concat(PinyinTable.GetPinyinSequence(entry.Name));
+                if (fullPy.Contains(kwLower, StringComparison.Ordinal))
+                {
+                    candidates.Add(i);
+                    added++;
+                    return true;
+                }
+            }
+
+            return true;
+        });
     }
 }

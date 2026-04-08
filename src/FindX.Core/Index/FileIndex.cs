@@ -55,6 +55,8 @@ public sealed class FileIndex
 
     public int CountSnapshot => RustIndexNative.findx_engine_live_count(_engine);
 
+    public bool IsInBulkLoad => RustIndexNative.findx_engine_is_in_bulk_load(_engine) != 0;
+
     public void AddEntry(FileEntry entry)
     {
         entry.IsDeleted = false;

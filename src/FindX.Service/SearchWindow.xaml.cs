@@ -108,6 +108,15 @@ public partial class SearchWindow : Window
         {
             ResultsList.ItemsSource = null;
             StatusText.Text = "就绪";
+            UpdateIndexStatus();
+            return;
+        }
+
+        if (_host.IsIndexInBulkLoad)
+        {
+            ResultsList.ItemsSource = null;
+            StatusText.Text = "索引构建中，请稍候…";
+            UpdateIndexStatus();
             return;
         }
 

@@ -283,12 +283,19 @@ public sealed class ServiceHost : IDisposable
     }
 
     public List<SearchResult> Search(string query, int maxResults = 100)
-        => _searchEngine.Search(query, maxResults);
+    {
+        if (_index.IsInBulkLoad)
+            return new List<SearchResult>();
+        return _searchEngine.Search(query, maxResults);
+    }
 
     public int IndexCount => _index.CountSnapshot;
 
     /// <summary>若 true，CLI/托盘应提示「建立中」：全量扫描批量入库时文件数与内存会连续上升，属正常。</summary>
     public bool IndexBuildInProgress => Volatile.Read(ref _indexBuildInProgress) != 0;
+
+    /// <summary>若 true，Rust 引擎处于 bulk load 阶段：排序索引尚未构建，搜索会退化为全量扫描，必须阻止。</summary>
+    public bool IsIndexInBulkLoad => _index.IsInBulkLoad;
     public IReadOnlyList<string> RecentLogs => _logs.TakeLast(50).ToList();
 
     public void SetAutoStart(bool enable)
