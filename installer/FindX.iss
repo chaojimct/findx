@@ -65,8 +65,9 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: """{app}\{#MyAppExeName}"""; Flags: uninsdeletevalue; Tasks: autostart_reg
 
 [Run]
-; 安装完成后启动服务
+; 安装完成后启动服务（图形向导）；静默安装时上一条因 skipifsilent 不执行，故增加 WizardSilent 分支
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent shellexec; Components: service
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait postinstall shellexec; Check: WizardSilent; Components: service
 
 [UninstallRun]
 ; 卸载前停止服务进程

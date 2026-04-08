@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using FindX.Client;
 using FindX.Core.Update;
 
@@ -23,7 +24,7 @@ public static class Program
                 "search" or "s" => await RunSearch(client, args),
                 "status" => await RunStatus(client),
                 "reindex" => await RunReindex(client),
-                "update" => await RunUpdate(),
+                "update" => await RunUpdate(args),
                 _ => PrintUsage(),
             };
         }
@@ -113,8 +114,11 @@ public static class Program
         return ok ? 0 : 1;
     }
 
-    private static async Task<int> RunUpdate()
+    private static async Task<int> RunUpdate(string[] args)
     {
+        var apply = args.Any(a => string.Equals(a, "--install", StringComparison.OrdinalIgnoreCase)
+                                  || string.Equals(a, "-i", StringComparison.OrdinalIgnoreCase));
+
         Console.WriteLine($"当前版本: v{UpdateChecker.GetCurrentVersion()}");
         Console.WriteLine("正在检查更新...");
 
@@ -151,6 +155,30 @@ public static class Program
         if (!string.IsNullOrEmpty(info.ReleaseUrl))
             Console.WriteLine($"发布页面: {info.ReleaseUrl}");
 
+        if (!apply)
+            return 0;
+
+        if (string.IsNullOrEmpty(info.DownloadUrl))
+        {
+            Console.Error.WriteLine("错误: 发布中未包含 setup 安装包，请到发布页手动下载。");
+            return 1;
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("正在下载安装包…");
+        try
+        {
+            var path = await UpdateInstaller.DownloadInstallerAsync(info.DownloadUrl, info.LatestVersion, null);
+            Console.WriteLine($"已保存: {path}");
+            Console.WriteLine("正在启动安装程序（可能需要 UAC）…");
+            UpdateInstaller.LaunchInstaller(path);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"下载或启动失败: {ex.Message}");
+            return 1;
+        }
+
         return 0;
     }
 
@@ -164,7 +192,7 @@ public static class Program
         Console.WriteLine("  search <query> [--max N] [--path <filter>]   搜索文件");
         Console.WriteLine("  status                                       查看索引状态");
         Console.WriteLine("  reindex                                      触发重新索引");
-        Console.WriteLine("  update                                       检查更新");
+        Console.WriteLine("  update [--install|-i]                         检查更新；加 --install 则下载并启动安装");
         return 1;
     }
 

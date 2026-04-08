@@ -40,7 +40,7 @@ public partial class TrayWindow : Window
 
         var menu = new WinForms.ContextMenuStrip();
         menu.Items.Add("搜索", null, (_, _) => ShowSearchWindow());
-        menu.Items.Add("显示状态", null, (_, _) => ShowWindow());
+        menu.Items.Add("设置", null, (_, _) => ShowWindow());
         menu.Items.Add("重建索引", null, (_, _) => _host.SetAutoStart(true));
         menu.Items.Add(_updateMenuItem);
         menu.Items.Add(new WinForms.ToolStripSeparator());
@@ -138,6 +138,62 @@ public partial class TrayWindow : Window
         }
     }
 
+    private async void DownloadAndInstall_Click(object sender, RoutedEventArgs e)
+    {
+        var info = _host.LatestUpdateInfo;
+        if (info?.HasUpdate != true || string.IsNullOrEmpty(info.DownloadUrl))
+        {
+            StatusText.Text = "状态: 正在检查更新…";
+            info = await _host.CheckForUpdateAsync();
+            RefreshStatus();
+        }
+
+        if (info?.HasUpdate != true)
+        {
+            System.Windows.MessageBox.Show(this, "当前已是最新版本。", "FindX", MessageBoxButton.OK, MessageBoxImage.Information);
+            StatusText.Text = "状态: 运行中";
+            return;
+        }
+
+        if (string.IsNullOrEmpty(info.DownloadUrl))
+        {
+            System.Windows.MessageBox.Show(this, "发布中未包含 setup 安装包，请使用「发布页」在浏览器中下载。", "FindX",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+            StatusText.Text = "状态: 运行中";
+            return;
+        }
+
+        if (System.Windows.MessageBox.Show(this,
+                $"将下载 v{info.LatestVersion} 并启动安装程序（可能出现 UAC 提权），FindX 将退出以便覆盖文件。是否继续？",
+                "FindX 更新",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question)
+            != MessageBoxResult.Yes)
+        {
+            StatusText.Text = "状态: 运行中";
+            return;
+        }
+
+        DownloadInstallBtn.IsEnabled = false;
+        StatusText.Text = "状态: 正在下载安装包…";
+        try
+        {
+            var (ok, err) = await _host.TryDownloadAndApplyUpdateAsync();
+            if (!ok && !string.IsNullOrEmpty(err))
+            {
+                System.Windows.MessageBox.Show(this, err, "FindX", MessageBoxButton.OK, MessageBoxImage.Error);
+                DownloadInstallBtn.IsEnabled = true;
+                StatusText.Text = "状态: 运行中";
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Windows.MessageBox.Show(this, ex.Message, "FindX", MessageBoxButton.OK, MessageBoxImage.Error);
+            DownloadInstallBtn.IsEnabled = true;
+            StatusText.Text = "状态: 运行中";
+        }
+    }
+
     private async void CheckUpdate_Click(object sender, RoutedEventArgs e)
     {
         CheckUpdateBtn.IsEnabled = false;
@@ -168,7 +224,7 @@ public partial class TrayWindow : Window
     private void ShowSearchWindow()
     {
         if (_searchWindow == null || !_searchWindow.IsLoaded)
-            _searchWindow = new SearchWindow(_host);
+            _searchWindow = new SearchWindow(_host, ShowWindow);
 
         if (_searchWindow.IsVisible)
         {

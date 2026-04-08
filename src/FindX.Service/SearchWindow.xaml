@@ -284,11 +284,30 @@
 
         <!-- ═══ Status Bar ═══ -->
         <Border Grid.Row="2" Background="White" BorderBrush="#E0E0E0"
-                BorderThickness="0,1,0,0" Padding="16,6">
+                BorderThickness="0,1,0,0" Padding="16,4">
             <Grid>
-                <TextBlock x:Name="StatusText" Text="就绪" FontSize="12" Foreground="#888"/>
-                <TextBlock x:Name="IndexStatus" FontSize="12" Foreground="#888"
-                           HorizontalAlignment="Right"/>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" x:Name="StatusText" Text="就绪" FontSize="12"
+                           Foreground="#888" VerticalAlignment="Center"/>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock x:Name="IndexStatus" FontSize="12" Foreground="#888"
+                               VerticalAlignment="Center" Margin="0,0,4,0"/>
+                    <Button Content="&#xE713;" FontFamily="{StaticResource SymbolFont}"
+                            FontSize="13" Padding="4,2" MinWidth="26" MinHeight="24"
+                            Background="Transparent" Foreground="#888"
+                            BorderThickness="0" Cursor="Hand"
+                            ToolTip="设置"
+                            Click="SettingsBtn_Click">
+                        <Button.Resources>
+                            <Style TargetType="Border">
+                                <Setter Property="CornerRadius" Value="4"/>
+                            </Style>
+                        </Button.Resources>
+                    </Button>
+                </StackPanel>
             </Grid>
         </Border>
     </Grid>

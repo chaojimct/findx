@@ -341,6 +341,36 @@ public sealed class ServiceHost : IDisposable
         }
     }
 
+    /// <summary>使用最近一次检查到的 <see cref="UpdateInfo.DownloadUrl"/> 下载 setup 并启动静默安装，随后请求退出 UI 进程。</summary>
+    public async Task<(bool Ok, string? Error)> TryDownloadAndApplyUpdateAsync(CancellationToken ct = default)
+    {
+        var info = _latestUpdateInfo;
+        if (info?.HasUpdate != true)
+            return (false, "当前没有可用的新版本信息，请先点击「检查更新」。");
+        if (string.IsNullOrEmpty(info.DownloadUrl))
+            return (false, "发布页未包含 setup.exe 资源，请使用「发布页」手动下载。");
+
+        try
+        {
+            Log($"开始下载 v{info.LatestVersion} 安装包…");
+            var path = await UpdateInstaller.DownloadInstallerAsync(info.DownloadUrl, info.LatestVersion, null, ct);
+            Log($"安装包已保存: {path}");
+            UpdateInstaller.LaunchInstaller(path);
+            Log("已启动安装程序，将退出 FindX 以完成更新…");
+            RequestShutdown();
+            return (true, null);
+        }
+        catch (OperationCanceledException)
+        {
+            return (false, "已取消下载。");
+        }
+        catch (Exception ex)
+        {
+            Log($"下载或启动安装失败: {ex.Message}");
+            return (false, ex.Message);
+        }
+    }
+
     private void Log(string msg)
     {
         var line = $"[{DateTime.Now:HH:mm:ss}] {msg}";

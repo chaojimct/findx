@@ -11,14 +11,16 @@ namespace FindX.Service;
 public partial class SearchWindow : Window
 {
     private readonly ServiceHost _host;
+    private readonly Action _openSettings;
     private readonly DispatcherTimer _debounce;
     private string _currentTypeFilter = "";
     private string _currentTimeFilter = "";
     private bool _initialized;
 
-    public SearchWindow(ServiceHost host)
+    public SearchWindow(ServiceHost host, Action openSettings)
     {
         _host = host;
+        _openSettings = openSettings;
         InitializeComponent();
         _initialized = true;
 
@@ -58,6 +60,11 @@ public partial class SearchWindow : Window
     }
 
     private void SearchBtn_Click(object sender, RoutedEventArgs e) => DoSearch();
+
+    private void SettingsBtn_Click(object sender, RoutedEventArgs e)
+    {
+        _openSettings();
+    }
 
     private void TypeFilter_Changed(object sender, RoutedEventArgs e)
     {
