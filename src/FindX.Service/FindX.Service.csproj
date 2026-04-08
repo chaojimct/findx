@@ -9,6 +9,7 @@
     <RootNamespace>FindX.Service</RootNamespace>
     <AssemblyName>FindX</AssemblyName>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
     <FindxEngineRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\native\findx-engine'))</FindxEngineRoot>
     <FindxCargoProfile Condition="'$(Configuration)' == 'Release'">release</FindxCargoProfile>
     <FindxCargoProfile Condition="'$(Configuration)' != 'Release'">debug</FindxCargoProfile>
