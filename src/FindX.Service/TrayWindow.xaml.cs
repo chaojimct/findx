@@ -28,7 +28,7 @@ public partial class TrayWindow : Window
 
         try
         {
-            _notifyIcon.Icon = Icon.ExtractAssociatedIcon(Environment.ProcessPath!);
+            _notifyIcon.Icon = System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!);
         }
         catch
         {
