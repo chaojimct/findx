@@ -35,6 +35,7 @@ public sealed class SearchEngine
 
         var candidates = GatherCandidates(parsed, effectiveMax, filterOnlyQuery);
         var results = new List<SearchResult>();
+        var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var evalCtx = new EvalContext();
         int scoreBudget = Math.Max(effectiveMax * 5, 2000);
 
@@ -46,6 +47,7 @@ public sealed class SearchEngine
             if (entry == null) continue;
 
             string fullPath = _index.BuildFullPath(idx);
+            if (!seenPaths.Add(fullPath)) continue;
             evalCtx.Reset(entry, fullPath);
 
             if (parsed.Root != null)
@@ -278,10 +280,6 @@ public sealed class SearchEngine
         return candidates;
     }
 
-    /// <summary>
-    /// 线性扫描文件名，检查 CJK 关键词是否为文件名的子串。
-    /// 命中则补入候选集，上限 <paramref name="addCap"/> 条，且总耗时不超过 200ms。
-    /// </summary>
     private void GatherCjkSubstringCandidates(
         IReadOnlyList<string> keywords, HashSet<int> candidates, int addCap)
     {
@@ -302,13 +300,13 @@ public sealed class SearchEngine
         if (cjkKws == null) return;
 
         int added = 0;
-        long deadline = Environment.TickCount64 + 200;
+        long deadline = Environment.TickCount64 + 1500;
         int checked_ = 0;
 
         _index.ForEachLiveEntry((entry, i) =>
         {
             if (added >= addCap) return false;
-            if (++checked_ % 4096 == 0 && Environment.TickCount64 >= deadline)
+            if (++checked_ % 1024 == 0 && Environment.TickCount64 >= deadline)
                 return false;
             if (candidates.Contains(i)) return true;
 
@@ -325,23 +323,19 @@ public sealed class SearchEngine
         });
     }
 
-    /// <summary>
-    /// 线性扫描含 CJK 字符的文件名，检查 query 是否为拼音首字母或全拼拼接的子串。
-    /// 命中则补入候选集，上限 <paramref name="addCap"/> 条，且总耗时不超过 150ms。
-    /// </summary>
     private void GatherPinyinSubstringCandidates(
         IReadOnlyList<string> keywords, HashSet<int> candidates, int addCap)
     {
         if (_index.IsInBulkLoad) return;
 
         int added = 0;
-        long deadline = Environment.TickCount64 + 150;
+        long deadline = Environment.TickCount64 + 1500;
         int checked_ = 0;
 
         _index.ForEachLiveEntry((entry, i) =>
         {
             if (added >= addCap) return false;
-            if (++checked_ % 4096 == 0 && Environment.TickCount64 >= deadline)
+            if (++checked_ % 1024 == 0 && Environment.TickCount64 >= deadline)
                 return false;
             if (candidates.Contains(i)) return true;
             if (!PinyinTable.NameContainsCjk(entry.Name)) return true;
