@@ -43,6 +43,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build FindXNative (C++)
+        run: msbuild native\FindXNative\FindXNative.vcxproj /p:Configuration=Release /p:Platform=x64 /v:m
+
       - name: Build Rust engine
         working-directory: native/findx-engine
         run: cargo build --release
