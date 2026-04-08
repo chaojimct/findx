@@ -263,6 +263,34 @@ public sealed class ServiceHost : IDisposable
         app.Run();
     }
 
+    public async Task ForceReindexAsync()
+    {
+        if (Volatile.Read(ref _indexBuildInProgress) != 0)
+            return;
+        Log("UI 触发重建索引");
+        Volatile.Write(ref _indexBuildInProgress, 1);
+        try
+        {
+            _index.Clear();
+            _volumeUsns.Clear();
+            _index.BeginBulk();
+            try
+            {
+                await ScanAllVolumesAsync(skipSave: true);
+            }
+            finally
+            {
+                _index.EndBulk();
+            }
+            SaveIndex();
+            Log("重建索引完成");
+        }
+        finally
+        {
+            Volatile.Write(ref _indexBuildInProgress, 0);
+        }
+    }
+
     public void RequestShutdown()
     {
         System.Windows.Application.Current?.Dispatcher.Invoke(() =>

@@ -43,7 +43,7 @@ public partial class TrayWindow : Window
         var menu = new WinForms.ContextMenuStrip();
         menu.Items.Add("搜索", null, (_, _) => ShowSearchWindow());
         menu.Items.Add("设置", null, (_, _) => ShowWindow());
-        menu.Items.Add("重建索引", null, (_, _) => _host.SetAutoStart(true));
+        menu.Items.Add("重建索引", null, (_, _) => _ = Task.Run(() => _host.ForceReindexAsync()));
         menu.Items.Add(_updateMenuItem);
         menu.Items.Add(new WinForms.ToolStripSeparator());
         menu.Items.Add("退出", null, (_, _) => ExitApp());
@@ -289,9 +289,16 @@ public partial class TrayWindow : Window
         _host.SetAutoStart(AutoStartCheck.IsChecked == true);
     }
 
-    private void Reindex_Click(object sender, RoutedEventArgs e)
+    private async void Reindex_Click(object sender, RoutedEventArgs e)
     {
+        if (_host.IndexBuildInProgress)
+        {
+            StatusText.Text = "状态: 索引构建中，请稍候...";
+            return;
+        }
         StatusText.Text = "状态: 正在重建索引...";
+        await Task.Run(() => _host.ForceReindexAsync());
+        StatusText.Text = $"状态: 重建完成，索引 {_host.IndexCount:N0} 条";
     }
 
     private void Hide_Click(object sender, RoutedEventArgs e) => Hide();
