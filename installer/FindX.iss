@@ -78,6 +78,52 @@ Type: filesandordirs; Name: "{app}"
 
 [Code]
 
+// ── 运行环境：.NET 8 桌面运行时（x64）──
+
+function DotNet8DesktopX64Installed: Boolean;
+var
+  Names: TArrayOfString;
+  I: Integer;
+begin
+  Result := False;
+  if not RegGetSubkeyNames(HKLM,
+    'SOFTWARE\dotnet\Setup\InstalledVersions\x64\sharedfx\Microsoft.WindowsDesktop.App',
+    Names) then
+    Exit;
+  for I := 0 to GetArrayLength(Names) - 1 do
+    if Pos('8.', Names[I]) = 1 then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+function InitializeSetup: Boolean;
+var
+  ErrCode: Integer;
+begin
+  Result := True;
+  if DotNet8DesktopX64Installed then
+    Exit;
+
+  if WizardSilent then
+  begin
+    Log('未安装 .NET 8 Desktop Runtime (x64)。请从 https://dotnet.microsoft.com/download/dotnet/8.0 安装「桌面运行时」Windows x64 后重试。');
+    Result := False;
+    Exit;
+  end;
+
+  if MsgBox('未检测到 .NET 8 桌面运行时（x64）。'#13#10#13#10 +
+    'FindX 使用 WPF，必须安装 Microsoft .NET 桌面运行时，且需为 8.x 与 x64 架构。'#13#10#13#10 +
+    '下载页面（请选择「运行库」→「.NET 桌面运行时」→ Windows x64）：'#13#10 +
+    'https://dotnet.microsoft.com/download/dotnet/8.0'#13#10#13#10 +
+    '若浏览器未自动打开，请手动复制上述地址。'#13#10#13#10 +
+    '是否现在打开下载页面？安装完成后请重新运行本安装程序。',
+    mbConfirmation, MB_YESNO) = IDYES then
+    ShellExec('open', 'https://dotnet.microsoft.com/download/dotnet/8.0', '', '', SW_SHOWNORMAL, ewNoWait, ErrCode);
+  Result := False;
+end;
+
 // ── 任务计划程序 ──
 
 procedure CreateScheduledTask;
@@ -138,24 +184,24 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
-    if IsTaskSelected('autostart_task') then
+    if WizardIsTaskSelected('autostart_task') then
     begin
       CreateScheduledTask;
       // 从注册表模式切换过来时，清除旧的注册表自启动项
       RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#MyAppName}');
     end
-    else if IsTaskSelected('autostart_reg') then
+    else if WizardIsTaskSelected('autostart_reg') then
     begin
       // 从任务计划模式切换过来时，清除旧的计划任务
       RemoveScheduledTask;
     end
-    else if IsTaskSelected('autostart_none') then
+    else if WizardIsTaskSelected('autostart_none') then
     begin
       RemoveScheduledTask;
       RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#MyAppName}');
     end;
 
-    if IsTaskSelected('addpath') then
+    if WizardIsTaskSelected('addpath') then
       AddToPath(ExpandConstant('{app}\cli'));
   end;
 end;

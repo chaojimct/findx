@@ -49,6 +49,18 @@
 
 ## 安装
 
+### 运行环境与依赖
+
+| 项目 | 说明 | 获取方式 |
+|------|------|----------|
+| **操作系统** | Windows 10（建议 1809 及以上）或 Windows 11，**64 位（x64）** | — |
+| **.NET 8 桌面运行时** | **必需**。`FindX.exe` / `fx.exe` 目标框架为 `net8.0-windows`（含 WPF），需安装 **Desktop Runtime**，不能只用 ASP.NET Core 运行时或仅 SDK。 | 官方下载： [.NET 8 下载页](https://dotnet.microsoft.com/download/dotnet/8.0) → **Desktop Runtime** → **Windows x64** |
+| **Visual C++ 可再发行组件** | **建议**。随包内的 `findx_engine.dll`（及可选的 `FindXNative.dll`）通常依赖 **VC++ 2015–2022 x64** 运行库。若启动时提示缺少 `VCRUNTIME140.dll`、`MSVCP140.dll` 等，请安装。 | [最新受支持版本说明](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist)；**x64 直链**：[vc_redist.x64.exe](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
+
+Release 安装包为**框架依赖**发布（体积较小），**不包含** .NET 运行时。安装程序会在开始前检测本机是否已安装 **.NET 8 桌面运行时（x64）**；若未安装会**中止安装**，并提示可通过浏览器打开上述 .NET 下载页（静默安装时仅写入日志并退出，需先手动安装运行时）。
+
+便携版（zip）同样依赖本机已安装上述运行环境。
+
 ### 安装包（推荐）
 
 从 [Releases](https://github.com/chaojimct/findx/releases) 下载 `FindX-x.x.x-setup.exe`，运行安装向导。
@@ -58,8 +70,6 @@
 - **命令行工具 fx** — 可选，安装后自动加入 PATH
 - **开机自启动** — 默认启用
 - 卸载时自动停止进程、清理注册表和 PATH
-
-> 运行环境：Windows 10+ x64，需安装 [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0)。
 
 ### 便携使用
 
