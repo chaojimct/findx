@@ -120,6 +120,7 @@ public partial class TrayWindow : Window
             }
             else if (info.HasUpdate)
             {
+                _autoUpgradeDialogVersionOffered = info.LatestVersion;
                 await Dispatcher.InvokeAsync(() =>
                 {
                     if (System.Windows.MessageBox.Show(
@@ -244,6 +245,7 @@ public partial class TrayWindow : Window
                 else if (info.HasUpdate)
                 {
                     StatusText.Text = $"状态: 发现新版本 v{info.LatestVersion}";
+                    _autoUpgradeDialogVersionOffered = info.LatestVersion;
                     if (System.Windows.MessageBox.Show(
                             $"发现新版本 v{info.LatestVersion}（当前 v{info.CurrentVersion}）。\n\n是否下载安装包并打开安装向导升级？",
                             "FindX 更新",
