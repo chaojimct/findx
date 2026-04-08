@@ -114,6 +114,20 @@ public sealed class EverythingIpcServer : IDisposable
         _thread.Start();
     }
 
+    /// <summary>
+    /// FindX 以管理员运行时，未提升的第三方进程发往本窗口的 IPC 消息会被 UIPI 默认拒绝，
+    /// 需对隐藏 IPC 窗口登记 <c>WM_COPYDATA</c> / <c>WM_USER</c> 方可与 uTools、Wox 等通信。
+    /// </summary>
+    private void AllowLowerIntegrityIpc(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return;
+        const uint MSGFLT_ALLOW = 1;
+        if (!ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, IntPtr.Zero))
+            Log?.Invoke($"Everything IPC: ChangeWindowMessageFilterEx(WM_COPYDATA) err={Marshal.GetLastWin32Error()}");
+        if (!ChangeWindowMessageFilterEx(hwnd, WM_USER, MSGFLT_ALLOW, IntPtr.Zero))
+            Log?.Invoke($"Everything IPC: ChangeWindowMessageFilterEx(WM_USER) err={Marshal.GetLastWin32Error()}");
+    }
+
     private IntPtr _hwndAlt;
 
     private void MessageLoop()
@@ -136,6 +150,8 @@ public sealed class EverythingIpcServer : IDisposable
 
         _hwnd = CreateWindowEx(0, WNDCLASS_IPC, "EVERYTHING",
             WS_POPUP, 0, 0, 0, 0, IntPtr.Zero, IntPtr.Zero, hInst, IntPtr.Zero);
+        if (_hwnd != IntPtr.Zero)
+            AllowLowerIntegrityIpc(_hwnd);
 
         // 备用窗口：EVERYTHING — 部分工具直接查找此类名
         var wc2 = new WNDCLASSEX
@@ -151,7 +167,9 @@ public sealed class EverythingIpcServer : IDisposable
             _hwndAlt = CreateWindowEx(0, WNDCLASS_ALT, "EVERYTHING",
                 WS_POPUP, 0, 0, 0, 0, IntPtr.Zero, IntPtr.Zero, hInst, IntPtr.Zero);
             if (_hwndAlt == IntPtr.Zero)
-                Log?.Invoke($"Everything IPC: CreateWindowEx({WNDCLASS_ALT}) 失败 (err={Marshal.GetLastWin32Error()})");
+                Log?.Invoke($"Everything IPC: CreateWindowEx({WNDCLASS_ALT}) 失败 (err={Marshal.GetLastWin32Error()}");
+            else
+                AllowLowerIntegrityIpc(_hwndAlt);
         }
         else
         {
@@ -641,6 +659,9 @@ public sealed class EverythingIpcServer : IDisposable
 
     [DllImport("user32.dll")]
     static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool ChangeWindowMessageFilterEx(IntPtr hwnd, uint message, uint action, IntPtr pChangeFilterStruct);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     static extern IntPtr GetModuleHandle(string? moduleName);
