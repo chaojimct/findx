@@ -70,6 +70,18 @@ jobs:
           -p:Version=${{ steps.ver.outputs.VERSION }}
           --no-self-contained
 
+      - name: Verify native DLLs in publish output
+        shell: pwsh
+        run: |
+          $missing = @()
+          if (-not (Test-Path "publish/service/FindXNative.dll")) { $missing += "FindXNative.dll" }
+          if (-not (Test-Path "publish/service/findx_engine.dll")) { $missing += "findx_engine.dll" }
+          if ($missing.Count -gt 0) {
+            Write-Error "publish/service 中缺少: $($missing -join ', ')"
+            exit 1
+          }
+          Write-Host "OK: FindXNative.dll + findx_engine.dll 均已包含"
+
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup -y --no-progress
