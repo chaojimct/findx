@@ -2,6 +2,36 @@
 
 自研文件搜索引擎，集 Everything 的极速 NTFS 索引与 Listary 的拼音模糊匹配于一体，并完整兼容 Everything SDK v2 IPC，可无缝替代 Everything 供 uTools 等第三方应用调用。
 
+> **Beta 说明**：当前版本仍在快速迭代，可能存在未覆盖场景或缺陷。**遇到问题请到 [Issues](https://github.com/chaojimct/findx/issues) 反馈**（附上系统版本、索引规模、复现步骤更佳）。  
+> **与 Everything / Listary 的差异与优势** 见独立文档：[PROMOTION.md](./PROMOTION.md)。
+
+## 快速链接
+
+| 用途 | 链接 |
+|------|------|
+| **仓库主页**（源码、README、讨论） | [github.com/chaojimct/findx](https://github.com/chaojimct/findx) |
+| **下载页面**（安装包、便携包，按版本标签发布） | [github.com/chaojimct/findx/releases](https://github.com/chaojimct/findx/releases) |
+| **问题反馈** | [Issues](https://github.com/chaojimct/findx/issues) |
+| **CI 构建记录** | [Actions](https://github.com/chaojimct/findx/actions) |
+
+推广说明与竞品对比仍见 [PROMOTION.md](./PROMOTION.md)（内含更详细的下载说明）。
+
+## 目录
+
+- [快速链接](#快速链接)
+- [推广与竞品对比](./PROMOTION.md)
+- [架构](#架构)
+- [核心特性](#核心特性)
+- [安装](#安装)
+- [使用](#使用)
+- [搜索语法](#搜索语法)
+- [Everything 兼容](#everything-兼容)
+- [IPC 协议](#ipc-协议)
+- [从源码构建](#从源码构建)
+- [CI/CD](#cicd)
+- [路线图](#路线图)
+- [许可证](#许可证)
+
 ## 架构
 
 ```
@@ -46,6 +76,9 @@
 - **Everything SDK v2 IPC 完整兼容**（WM_COPYDATA + WM_USER），可直接替代 Everything
 - **Everything 搜索语法兼容**（过滤器、布尔运算、通配符、正则等）
 - 开机自启 + 系统托盘
+- 应用内检查更新（确认后下载并启动安装向导）
+
+更多产品定位说明及与 **Everything**、**Listary** 的对比，见 [PROMOTION.md](./PROMOTION.md)。
 
 ## 安装
 
