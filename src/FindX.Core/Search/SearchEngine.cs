@@ -36,16 +36,18 @@ public sealed class SearchEngine
         var candidates = GatherCandidates(parsed, effectiveMax, filterOnlyQuery);
         var results = new List<SearchResult>();
         var evalCtx = new EvalContext();
+        int scoreBudget = Math.Max(effectiveMax * 5, 2000);
 
         foreach (var idx in candidates)
         {
+            if (results.Count >= scoreBudget) break;
+
             var entry = _index.GetByIndex(idx);
             if (entry == null) continue;
 
             string fullPath = _index.BuildFullPath(idx);
             evalCtx.Reset(entry, fullPath);
 
-            // AST 求值：如果有 Root 节点，用表达式树做完整过滤
             if (parsed.Root != null)
             {
                 if (!parsed.Root.Match(evalCtx))
@@ -53,7 +55,6 @@ public sealed class SearchEngine
             }
             else
             {
-                // 向后兼容：无 AST 时用旧逻辑
                 if (!LegacyFilter(parsed, entry, fullPath))
                     continue;
             }
@@ -63,7 +64,6 @@ public sealed class SearchEngine
             {
                 if (parsed.Root != null)
                 {
-                    // AST 已验证匹配；按每个关键词独立评分，消除关键词顺序对结果的影响
                     int totalScore = 0;
                     int totalLen = 0;
                     var bestType = PinyinMatcher.MatchType.None;
@@ -103,7 +103,6 @@ public sealed class SearchEngine
             }
             else
             {
-                // 纯 filter 查询，给基础分
                 matchResult = new PinyinMatcher.MatchResult(PinyinMatcher.MatchType.Exact, 100, 0);
             }
 
@@ -182,8 +181,15 @@ public sealed class SearchEngine
             return candidates;
         }
 
-        var cap = FileIndex.PrefixSearchHitCap;
+        var fullCap = FileIndex.PrefixSearchHitCap;
         const int mixCap = 512;
+
+        int minKwLen = int.MaxValue;
+        foreach (var kw in parsed.Keywords)
+            if (kw.Length < minKwLen) minKwLen = kw.Length;
+
+        bool shortQuery = minKwLen <= 2;
+        var cap = shortQuery ? Math.Min(512, fullCap) : fullCap;
 
         foreach (var kw in parsed.Keywords)
         {
@@ -194,6 +200,8 @@ public sealed class SearchEngine
 
             if (!lower.All(c => char.IsAsciiLetterOrDigit(c)))
                 continue;
+
+            if (shortQuery) continue;
 
             foreach (var h in _index.SearchPinyinInitialsPrefix(lower, cap))
                 candidates.Add(h);

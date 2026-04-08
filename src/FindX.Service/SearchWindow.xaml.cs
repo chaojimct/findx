@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using Media = System.Windows.Media;
 using System.Windows.Threading;
@@ -16,6 +18,8 @@ public partial class SearchWindow : Window
     private string _currentTypeFilter = "";
     private string _currentTimeFilter = "";
     private bool _initialized;
+    private CancellationTokenSource? _searchCts;
+    private int _searchVersion;
 
     public SearchWindow(ServiceHost host, Action openSettings)
     {
@@ -101,8 +105,10 @@ public partial class SearchWindow : Window
         DoSearch();
     }
 
-    private void DoSearch()
+    private async void DoSearch()
     {
+        _searchCts?.Cancel();
+
         var raw = SearchBox.Text.Trim();
         if (string.IsNullOrEmpty(raw) && string.IsNullOrEmpty(_currentTypeFilter) && string.IsNullOrEmpty(_currentTimeFilter))
         {
@@ -126,18 +132,28 @@ public partial class SearchWindow : Window
         if (!string.IsNullOrEmpty(_currentTimeFilter)) parts.Add(_currentTimeFilter);
         var query = string.Join(" ", parts);
 
-        var sw = Stopwatch.StartNew();
+        var ver = Interlocked.Increment(ref _searchVersion);
+        var cts = _searchCts = new CancellationTokenSource();
+
+        StatusText.Text = "搜索中…";
+
         List<SearchResult> results;
+        Stopwatch sw;
         try
         {
-            results = _host.Search(query, 200);
+            sw = Stopwatch.StartNew();
+            results = await Task.Run(() => _host.Search(query, 200), cts.Token);
+            sw.Stop();
         }
+        catch (OperationCanceledException) { return; }
         catch
         {
+            if (ver != Volatile.Read(ref _searchVersion)) return;
             StatusText.Text = "搜索出错";
             return;
         }
-        sw.Stop();
+
+        if (ver != Volatile.Read(ref _searchVersion)) return;
 
         var items = new List<ResultItem>(results.Count);
         foreach (var r in results)
