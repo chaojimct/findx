@@ -6,8 +6,15 @@ namespace FindX.Core.Update;
 /// <summary>下载发布页中的 setup 安装包并启动 Inno Setup 进行覆盖安装。</summary>
 public static class UpdateInstaller
 {
-    /// <summary>与 <c>PrepareToInstall</c> 中结束 FindX 进程配合，静默覆盖正在运行的安装目录。</summary>
-    public const string SilentInstallArguments = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS";
+    /// <summary>启动安装包，显示向导（不使用静默参数，避免静默失败且用户无感知）。</summary>
+    public static void LaunchInstaller(string setupPath)
+    {
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = setupPath,
+            UseShellExecute = true,
+        });
+    }
 
     public static async Task<string> DownloadInstallerAsync(
         string downloadUrl,
@@ -43,15 +50,5 @@ public static class UpdateInstaller
         }
 
         return path;
-    }
-
-    public static void LaunchInstaller(string setupPath)
-    {
-        Process.Start(new ProcessStartInfo
-        {
-            FileName = setupPath,
-            Arguments = SilentInstallArguments,
-            UseShellExecute = true,
-        });
     }
 }

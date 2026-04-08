@@ -170,7 +170,7 @@ public static class Program
         {
             var path = await UpdateInstaller.DownloadInstallerAsync(info.DownloadUrl, info.LatestVersion, null);
             Console.WriteLine($"已保存: {path}");
-            Console.WriteLine("正在启动安装程序（可能需要 UAC）…");
+            Console.WriteLine("正在启动安装向导（图形界面，可能需要 UAC）…");
             UpdateInstaller.LaunchInstaller(path);
         }
         catch (Exception ex)

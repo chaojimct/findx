@@ -341,7 +341,7 @@ public sealed class ServiceHost : IDisposable
         }
     }
 
-    /// <summary>使用最近一次检查到的 <see cref="UpdateInfo.DownloadUrl"/> 下载 setup 并启动静默安装，随后请求退出 UI 进程。</summary>
+    /// <summary>下载 setup 并启动安装向导（非静默），稍候再退出本进程，避免安装进程尚未就绪就被连带结束。</summary>
     public async Task<(bool Ok, string? Error)> TryDownloadAndApplyUpdateAsync(CancellationToken ct = default)
     {
         var info = _latestUpdateInfo;
@@ -356,7 +356,16 @@ public sealed class ServiceHost : IDisposable
             var path = await UpdateInstaller.DownloadInstallerAsync(info.DownloadUrl, info.LatestVersion, null, ct);
             Log($"安装包已保存: {path}");
             UpdateInstaller.LaunchInstaller(path);
-            Log("已启动安装程序，将退出 FindX 以完成更新…");
+            Log("已启动安装向导，稍后将退出 FindX…");
+            try
+            {
+                await Task.Delay(1200, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                return (false, "已取消。");
+            }
+
             RequestShutdown();
             return (true, null);
         }

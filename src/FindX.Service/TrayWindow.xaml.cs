@@ -14,6 +14,8 @@ public partial class TrayWindow : Window
     private readonly WinForms.ToolStripMenuItem _updateMenuItem;
     private SearchWindow? _searchWindow;
     private bool _updateNotified;
+    /// <summary>本轮已弹过「是否升级」的版本号，避免定时器重复弹窗。</summary>
+    private string? _autoUpgradeDialogVersionOffered;
 
     public TrayWindow(ServiceHost host)
     {
@@ -79,14 +81,22 @@ public partial class TrayWindow : Window
             {
                 _updateNotified = true;
                 _updateMenuItem.Text = $"检查更新 ✦ v{updateInfo.LatestVersion}";
-                _notifyIcon.ShowBalloonTip(5000, "FindX 更新可用",
-                    $"新版本 v{updateInfo.LatestVersion} 已发布，点击托盘菜单查看详情。",
-                    WinForms.ToolTipIcon.Info);
+            }
+
+            if (_autoUpgradeDialogVersionOffered != updateInfo.LatestVersion)
+            {
+                var latest = updateInfo.LatestVersion;
+                var current = updateInfo.CurrentVersion;
+                _autoUpgradeDialogVersionOffered = latest;
+                Dispatcher.BeginInvoke(() => ShowAutoUpgradeOfferDialog(latest, current),
+                    System.Windows.Threading.DispatcherPriority.ApplicationIdle);
             }
         }
         else
         {
             UpdatePanel.Visibility = Visibility.Collapsed;
+            if (updateInfo != null && !updateInfo.HasUpdate)
+                _autoUpgradeDialogVersionOffered = null;
         }
 
         var logs = _host.RecentLogs;
@@ -110,8 +120,17 @@ public partial class TrayWindow : Window
             }
             else if (info.HasUpdate)
             {
-                _notifyIcon.ShowBalloonTip(5000, "FindX 更新可用",
-                    $"新版本 v{info.LatestVersion} 已发布！", WinForms.ToolTipIcon.Info);
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    if (System.Windows.MessageBox.Show(
+                            $"发现新版本 v{info.LatestVersion}（当前 v{info.CurrentVersion}）。\n\n是否下载安装包并打开安装向导升级？",
+                            "FindX 更新",
+                            MessageBoxButton.YesNo,
+                            MessageBoxImage.Question)
+                        != MessageBoxResult.Yes)
+                        return;
+                    _ = RunDownloadInstallCoreAsync();
+                });
             }
             else
             {
@@ -135,6 +154,40 @@ public partial class TrayWindow : Window
         {
             try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }
             catch { }
+        }
+    }
+
+    private void ShowAutoUpgradeOfferDialog(string latest, string current)
+    {
+        if (System.Windows.MessageBox.Show(
+                $"发现新版本 v{latest}（当前 v{current}）。\n\n是否下载安装包并打开安装向导进行升级？",
+                "FindX 更新",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question)
+            != MessageBoxResult.Yes)
+            return;
+        _ = RunDownloadInstallCoreAsync();
+    }
+
+    private async Task RunDownloadInstallCoreAsync()
+    {
+        DownloadInstallBtn.IsEnabled = false;
+        StatusText.Text = "状态: 正在下载安装包…";
+        try
+        {
+            var (ok, err) = await _host.TryDownloadAndApplyUpdateAsync();
+            if (!ok && !string.IsNullOrEmpty(err))
+            {
+                System.Windows.MessageBox.Show(this, err, "FindX", MessageBoxButton.OK, MessageBoxImage.Error);
+                DownloadInstallBtn.IsEnabled = true;
+                StatusText.Text = "状态: 运行中";
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Windows.MessageBox.Show(this, ex.Message, "FindX", MessageBoxButton.OK, MessageBoxImage.Error);
+            DownloadInstallBtn.IsEnabled = true;
+            StatusText.Text = "状态: 运行中";
         }
     }
 
@@ -164,7 +217,7 @@ public partial class TrayWindow : Window
         }
 
         if (System.Windows.MessageBox.Show(this,
-                $"将下载 v{info.LatestVersion} 并启动安装程序（可能出现 UAC 提权），FindX 将退出以便覆盖文件。是否继续？",
+                $"将下载 v{info.LatestVersion}，并启动安装向导（可按提示完成升级，可能出现 UAC）。下载完成后 FindX 会在约一秒后退出。是否继续？",
                 "FindX 更新",
                 MessageBoxButton.YesNo,
                 MessageBoxImage.Question)
@@ -174,24 +227,7 @@ public partial class TrayWindow : Window
             return;
         }
 
-        DownloadInstallBtn.IsEnabled = false;
-        StatusText.Text = "状态: 正在下载安装包…";
-        try
-        {
-            var (ok, err) = await _host.TryDownloadAndApplyUpdateAsync();
-            if (!ok && !string.IsNullOrEmpty(err))
-            {
-                System.Windows.MessageBox.Show(this, err, "FindX", MessageBoxButton.OK, MessageBoxImage.Error);
-                DownloadInstallBtn.IsEnabled = true;
-                StatusText.Text = "状态: 运行中";
-            }
-        }
-        catch (Exception ex)
-        {
-            System.Windows.MessageBox.Show(this, ex.Message, "FindX", MessageBoxButton.OK, MessageBoxImage.Error);
-            DownloadInstallBtn.IsEnabled = true;
-            StatusText.Text = "状态: 运行中";
-        }
+        await RunDownloadInstallCoreAsync();
     }
 
     private async void CheckUpdate_Click(object sender, RoutedEventArgs e)
@@ -206,7 +242,16 @@ public partial class TrayWindow : Window
                 if (info == null)
                     StatusText.Text = "状态: 检查更新失败";
                 else if (info.HasUpdate)
+                {
                     StatusText.Text = $"状态: 发现新版本 v{info.LatestVersion}";
+                    if (System.Windows.MessageBox.Show(
+                            $"发现新版本 v{info.LatestVersion}（当前 v{info.CurrentVersion}）。\n\n是否下载安装包并打开安装向导升级？",
+                            "FindX 更新",
+                            MessageBoxButton.YesNo,
+                            MessageBoxImage.Question)
+                        == MessageBoxResult.Yes)
+                        _ = RunDownloadInstallCoreAsync();
+                }
                 else
                     StatusText.Text = $"状态: 已是最新版本 (v{info.CurrentVersion})";
             });
