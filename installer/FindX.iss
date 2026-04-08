@@ -79,16 +79,16 @@ Type: filesandordirs; Name: "{app}"
 [Code]
 
 // ── 运行环境：.NET 8 桌面运行时（x64）──
+// 说明：.NET 安装器对 bundle 常写在 32 位注册表视图中；纯 64 位路径可能漏检，故同时查
+// HKLM\...\dotnet\... 与 HKLM\...\WOW6432Node\dotnet\...，并回退到 shared 目录枚举。
 
-function DotNet8DesktopX64Installed: Boolean;
+function DotNet8DesktopRegSubkeysOk(const RelPath: String): Boolean;
 var
   Names: TArrayOfString;
   I: Integer;
 begin
   Result := False;
-  if not RegGetSubkeyNames(HKLM,
-    'SOFTWARE\dotnet\Setup\InstalledVersions\x64\sharedfx\Microsoft.WindowsDesktop.App',
-    Names) then
+  if not RegGetSubkeyNames(HKLM, RelPath, Names) then
     Exit;
   for I := 0 to GetArrayLength(Names) - 1 do
     if Pos('8.', Names[I]) = 1 then
@@ -96,6 +96,48 @@ begin
       Result := True;
       Exit;
     end;
+end;
+
+function DotNet8DesktopSharedFolderOk: Boolean;
+var
+  FindRec: TFindRec;
+  Base: String;
+begin
+  Result := False;
+  Base := ExpandConstant('{pf64}\dotnet\shared\Microsoft.WindowsDesktop.App');
+  if not DirExists(Base) then
+    Exit;
+  if not FindFirst(Base + '\*', FindRec) then
+    Exit;
+  try
+    repeat
+      if ((FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0)
+        and (Pos('8.', FindRec.Name) = 1) then
+      begin
+        Result := True;
+        Exit;
+      end;
+    until not FindNext(FindRec);
+  finally
+    FindClose(FindRec);
+  end;
+end;
+
+function DotNet8DesktopX64Installed: Boolean;
+begin
+  if DotNet8DesktopRegSubkeysOk(
+    'SOFTWARE\dotnet\Setup\InstalledVersions\x64\sharedfx\Microsoft.WindowsDesktop.App') then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if DotNet8DesktopRegSubkeysOk(
+    'SOFTWARE\WOW6432Node\dotnet\Setup\InstalledVersions\x64\sharedfx\Microsoft.WindowsDesktop.App') then
+  begin
+    Result := True;
+    Exit;
+  end;
+  Result := DotNet8DesktopSharedFolderOk;
 end;
 
 function InitializeSetup: Boolean;
