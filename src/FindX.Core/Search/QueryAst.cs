@@ -178,20 +178,16 @@ public enum FilterType
     Extension,
     Size,
     DateModified,
-    // TODO: DateCreated — 需 FileEntry.CreationTimeTicks（Rust 引擎扩展）
-    // TODO: DateAccessed — 需 FileEntry.AccessTimeTicks（Rust 引擎扩展）
+    DateCreated,
+    DateAccessed,
     Path,
     NoPath,
     NameLength,
     Depth,
     Root,
-    // TODO: Empty — 空文件夹检测（需遍历子树）
     Attributes,
     StartWith,
     EndWith,
-    // TODO: Content — 文件内容搜索（IO 密集）
-    // TODO: ChildCount — 子项计数（需遍历子树）
-    // TODO: Dupe — 重复文件检测（需全索引扫描）
 }
 
 /// <summary>范围比较类型</summary>
@@ -234,6 +230,8 @@ public sealed class FilterNode : QueryNode
             FilterType.Extension => MatchExtension(ctx),
             FilterType.Size => CompareValue(ctx.Entry.Size),
             FilterType.DateModified => CompareValue(ctx.Entry.LastWriteTimeTicks),
+            FilterType.DateCreated => CompareValue(ctx.Entry.CreationTimeTicks),
+            FilterType.DateAccessed => CompareValue(ctx.Entry.AccessTimeTicks),
             FilterType.Path => MatchPath(ctx.FullPath, false),
             FilterType.NoPath => !MatchPath(ctx.FullPath, false),
             FilterType.NameLength => CompareValue(ctx.Entry.Name.Length),
@@ -318,6 +316,18 @@ public sealed class FilterNode : QueryNode
     {
         var (op, v1, v2) = ParseDateRange(value);
         return new FilterNode(FilterType.DateModified, op: op, longVal: v1, longVal2: v2);
+    }
+
+    public static FilterNode ParseDateCreated(string value)
+    {
+        var (op, v1, v2) = ParseDateRange(value);
+        return new FilterNode(FilterType.DateCreated, op: op, longVal: v1, longVal2: v2);
+    }
+
+    public static FilterNode ParseDateAccessed(string value)
+    {
+        var (op, v1, v2) = ParseDateRange(value);
+        return new FilterNode(FilterType.DateAccessed, op: op, longVal: v1, longVal2: v2);
     }
 
     public static FilterNode ParseNameLength(string value)

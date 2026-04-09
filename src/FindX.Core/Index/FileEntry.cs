@@ -11,6 +11,8 @@ public sealed class FileEntry
     public uint Attributes;
     public long Size;
     public long LastWriteTimeTicks;
+    public long CreationTimeTicks;
+    public long AccessTimeTicks;
     public char VolumeLetter;
 
     /// <summary>拼音首字母链（仅用于拼音前缀 Trie）；全拼由 <see cref="Pinyin.PinyinMatcher"/> 在查询时按名字现算，避免索引阶段为每个文件分配 string[]。</summary>

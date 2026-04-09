@@ -87,6 +87,9 @@ public sealed class FindXClient : IDisposable
                         IsDir = item.TryGetProperty("isDir", out var d) && d.GetBoolean(),
                         Size = item.TryGetProperty("size", out var s) ? s.GetInt64() : 0,
                         Score = item.TryGetProperty("score", out var sc) ? sc.GetInt32() : 0,
+                        LastWriteUtcTicks = item.TryGetProperty("lastWriteUtcTicks", out var tw) && tw.TryGetInt64(out var t)
+                            ? t
+                            : 0,
                     });
                 }
             }

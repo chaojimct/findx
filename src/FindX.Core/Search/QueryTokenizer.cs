@@ -37,25 +37,19 @@ public static class QueryTokenizer
         "file", "folder",
         "size",
         "dm", "datemodified",
-        // TODO: "dc", "datecreated" — 创建时间，需 Rust 引擎扩展 FileEntry 存储 CreationTimeTicks
-        // TODO: "da", "dateaccessed" — 访问时间，需 Rust 引擎扩展 FileEntry 存储 AccessTimeTicks
+        "dc", "datecreated",
+        "da", "dateaccessed",
         "len",
         "depth", "parents",
         "root",
-        // TODO: "empty" — 空文件夹判断，需遍历子树检查是否有子条目
         "attrib", "attributes",
         "case", "nocase",
         "wholeword", "ww",
         "startwith", "endwith",
         "regex",
         "count",
-        // TODO: "content" — 文件内容搜索，需读取文件 IO（性能敏感）
-        // TODO: "type" — Windows 文件类型名（如 "Text Document"），需查询注册表
-        // TODO: "dupe", "sizedupe", "namedupe" — 重复文件检测，需全索引扫描+分组
-        // TODO: "child", "childcount", "childfile", "childfolder" — 子项计数，需遍历子树
-        // TODO: "runcount", "daterun" — 运行历史，需实现运行历史跟踪
-        // TODO: "shell" — Shell 已知文件夹（桌面/文档等），需 KNOWNFOLDERID 映射
-        // TODO: "audio", "video", "doc", "exe", "zip", "pic" 等宏 — ext 列表展开，低难度可快速添加
+        "type", "audio", "video", "doc", "exe", "zip", "pic",
+        "shell",
     };
 
     public static List<QueryToken> Tokenize(string input)

@@ -10,7 +10,9 @@ public delegate void FindXEnumCallback(
     int fileNameLen,
     uint attributes,
     ulong fileSize,
-    long lastWriteTime);
+    long lastWriteTime,
+    long creationTime,
+    long accessTime);
 
 [UnmanagedFunctionPointer(CallingConvention.StdCall)]
 public delegate void FindXJournalCallback(
@@ -19,7 +21,11 @@ public delegate void FindXJournalCallback(
     ulong parentRef,
     IntPtr fileName,
     int fileNameLen,
-    uint attributes);
+    uint attributes,
+    ulong fileSize,
+    long lastWriteTime,
+    long creationTime,
+    long accessTime);
 
 public static class NativeInterop
 {

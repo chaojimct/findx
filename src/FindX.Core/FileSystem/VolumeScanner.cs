@@ -50,10 +50,14 @@ public sealed class VolumeScanner
         var batch = new List<FileEntry>(8192);
         int total = 0;
 
-        FindXEnumCallback callback = (fileRef, parentRef, namePtr, nameLen, attrs, size, lastWrite) =>
+        FindXEnumCallback callback = (fileRef, parentRef, namePtr, nameLen, attrs, size, lastWrite, creation,
+            access) =>
         {
             var name = NativeInterop.PtrToString(namePtr, nameLen);
             if (string.IsNullOrEmpty(name)) return;
+
+            static long FtToTicks(long fileTime)
+                => fileTime > 0 ? DateTime.FromFileTimeUtc(fileTime).Ticks : 0;
 
             var entry = new FileEntry
             {
@@ -62,7 +66,9 @@ public sealed class VolumeScanner
                 Name = name,
                 Attributes = attrs,
                 Size = (long)size,
-                LastWriteTimeTicks = lastWrite,
+                LastWriteTimeTicks = FtToTicks(lastWrite),
+                CreationTimeTicks = FtToTicks(creation),
+                AccessTimeTicks = FtToTicks(access),
                 VolumeLetter = driveLetter,
             };
             batch.Add(entry);
@@ -143,6 +149,8 @@ public sealed class VolumeScanner
                         Attributes = (uint)(info.Attributes & (FileAttributes)0xFFFF),
                         Size = info.Exists ? info.Length : 0,
                         LastWriteTimeTicks = info.LastWriteTimeUtc.Ticks,
+                        CreationTimeTicks = info.CreationTimeUtc.Ticks,
+                        AccessTimeTicks = info.LastAccessTimeUtc.Ticks,
                         VolumeLetter = driveLetter,
                     };
                     batch.Add(entry);

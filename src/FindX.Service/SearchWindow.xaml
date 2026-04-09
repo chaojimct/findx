@@ -12,6 +12,7 @@
     <Window.Resources>
         <!-- Segoe Fluent Icons font -->
         <FontFamily x:Key="SymbolFont">Segoe Fluent Icons, Segoe MDL2 Assets</FontFamily>
+        <DropShadowEffect x:Key="PopupShadow" ShadowDepth="2" BlurRadius="8" Opacity="0.2"/>
 
         <!-- Sidebar filter button style -->
         <Style x:Key="FilterBtn" TargetType="RadioButton">
@@ -118,34 +119,69 @@
         <Border Grid.Row="0" Background="White" BorderBrush="#E0E0E0" BorderThickness="0,0,0,1"
                 Padding="16,12">
             <Grid>
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                </Grid.ColumnDefinitions>
-                <Border Background="#F5F5F5" CornerRadius="8" Padding="12,0">
-                    <Grid>
-                        <TextBlock x:Name="SearchPlaceholder" Text="搜索文件和文件夹..."
-                                   Foreground="#AAA" FontSize="15"
-                                   VerticalAlignment="Center" Margin="4,0,0,0"
-                                   IsHitTestVisible="False"/>
-                        <TextBox x:Name="SearchBox" FontSize="15" Background="Transparent"
-                                 BorderThickness="0" Padding="4,8"
-                                 VerticalContentAlignment="Center"
-                                 TextChanged="SearchBox_TextChanged"
-                                 KeyDown="SearchBox_KeyDown"/>
-                    </Grid>
-                </Border>
-                <Button Grid.Column="1" Content="&#xE721;" FontFamily="{StaticResource SymbolFont}"
-                        FontSize="16" Margin="10,0,0,0" Padding="12,8"
-                        Background="#0078D4" Foreground="White"
-                        BorderThickness="0" Cursor="Hand"
-                        Click="SearchBtn_Click">
-                    <Button.Resources>
-                        <Style TargetType="Border">
-                            <Setter Property="CornerRadius" Value="8"/>
-                        </Style>
-                    </Button.Resources>
-                </Button>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <Grid Grid.Row="0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <Border Background="#F5F5F5" CornerRadius="8" Padding="12,0">
+                        <Grid>
+                            <TextBlock x:Name="SearchPlaceholder" Text="搜索文件和文件夹..."
+                                       Foreground="#AAA" FontSize="15"
+                                       VerticalAlignment="Center" Margin="4,0,0,0"
+                                       IsHitTestVisible="False"/>
+                            <TextBox x:Name="SearchBox" FontSize="15" Background="Transparent"
+                                     BorderThickness="0" Padding="4,8"
+                                     VerticalContentAlignment="Center"
+                                     TextChanged="SearchBox_TextChanged"
+                                     KeyDown="SearchBox_KeyDown"/>
+                        </Grid>
+                    </Border>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                        <Button Content="&#xE81C;" FontFamily="{StaticResource SymbolFont}"
+                                FontSize="14" Margin="6,0,0,0" Padding="10,8"
+                                Background="Transparent" Foreground="#888"
+                                BorderThickness="0" Cursor="Hand"
+                                ToolTip="搜索历史"
+                                Click="HistoryBtn_Click">
+                            <Button.Resources>
+                                <Style TargetType="Border">
+                                    <Setter Property="CornerRadius" Value="8"/>
+                                </Style>
+                            </Button.Resources>
+                        </Button>
+                        <Button Content="&#xE721;" FontFamily="{StaticResource SymbolFont}"
+                                FontSize="16" Margin="4,0,0,0" Padding="12,8"
+                                Background="#0078D4" Foreground="White"
+                                BorderThickness="0" Cursor="Hand"
+                                Click="SearchBtn_Click">
+                            <Button.Resources>
+                                <Style TargetType="Border">
+                                    <Setter Property="CornerRadius" Value="8"/>
+                                </Style>
+                            </Button.Resources>
+                        </Button>
+                    </StackPanel>
+                </Grid>
+                <!-- Search history popup -->
+                <Popup x:Name="HistoryPopup" Placement="Bottom" PlacementTarget="{Binding ElementName=SearchBox}"
+                       StaysOpen="False" AllowsTransparency="True">
+                    <Border Background="White" BorderBrush="#D0D0D0" BorderThickness="1"
+                            CornerRadius="6" Padding="0" MinWidth="400"
+                            Effect="{StaticResource PopupShadow}">
+                        <ListBox x:Name="HistoryList" BorderThickness="0" Background="Transparent"
+                                 MaxHeight="260" FontSize="13"
+                                 SelectionChanged="HistoryList_SelectionChanged"/>
+                    </Border>
+                </Popup>
+                <!-- Search progress bar -->
+                <ProgressBar x:Name="SearchProgress" Grid.Row="1" Height="2" Margin="0,6,0,0"
+                             IsIndeterminate="True" Visibility="Collapsed"
+                             Foreground="#0078D4" Background="Transparent" BorderThickness="0"/>
             </Grid>
         </Border>
 
@@ -202,6 +238,37 @@
                                  Checked="TimeFilter_Changed" x:Name="Time30D"/>
                     <RadioButton Style="{StaticResource TimeRadio}" Content="最近 365 天"
                                  Checked="TimeFilter_Changed" x:Name="Time365D"/>
+
+                    <Separator Margin="12,10" Background="#E8E8E8"/>
+
+                    <TextBlock Text="路径" FontSize="12" Foreground="#999"
+                               Margin="12,2,0,6" FontWeight="SemiBold"/>
+                    <TextBox x:Name="PathFilterBox" FontSize="12" Margin="8,0,8,0"
+                             Padding="6,4" BorderBrush="#D0D0D0" BorderThickness="1"
+                             ToolTip="输入路径关键字，如 C:\Users" Background="#FBFBFB"
+                             KeyDown="SidebarFilter_KeyDown"/>
+
+                    <Separator Margin="12,10" Background="#E8E8E8"/>
+
+                    <TextBlock Text="大小" FontSize="12" Foreground="#999"
+                               Margin="12,2,0,6" FontWeight="SemiBold"/>
+                    <Grid Margin="8,0,8,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="6"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="SizeMinBox" Grid.Column="0" FontSize="12"
+                                 Padding="4,4" BorderBrush="#D0D0D0" BorderThickness="1"
+                                 ToolTip="最小 (MB)" Background="#FBFBFB"
+                                 KeyDown="SidebarFilter_KeyDown"/>
+                        <TextBlock Grid.Column="1" Text="~" VerticalAlignment="Center"
+                                   HorizontalAlignment="Center" Foreground="#999" FontSize="12"/>
+                        <TextBox x:Name="SizeMaxBox" Grid.Column="2" FontSize="12"
+                                 Padding="4,4" BorderBrush="#D0D0D0" BorderThickness="1"
+                                 ToolTip="最大 (MB)" Background="#FBFBFB"
+                                 KeyDown="SidebarFilter_KeyDown"/>
+                    </Grid>
                 </StackPanel>
             </ScrollViewer>
 
@@ -225,6 +292,8 @@
                         <MenuItem Header="复制文件名" FontSize="13" Click="Ctx_CopyName"/>
                         <Separator/>
                         <MenuItem Header="复制为路径列表" FontSize="13" Click="Ctx_CopyAllPaths"/>
+                        <Separator/>
+                        <MenuItem Header="导出为 CSV" FontSize="13" Click="Ctx_ExportCsv"/>
                     </ContextMenu>
                 </ListView.ContextMenu>
                 <ListView.View>
@@ -238,9 +307,11 @@
                                 <Setter Property="BorderThickness" Value="0,0,0,1"/>
                                 <Setter Property="BorderBrush" Value="#E0E0E0"/>
                                 <Setter Property="HorizontalContentAlignment" Value="Left"/>
+                                <Setter Property="Cursor" Value="Hand"/>
+                                <EventSetter Event="Click" Handler="ColumnHeader_Click"/>
                             </Style>
                         </GridView.ColumnHeaderContainerStyle>
-                        <GridViewColumn Header="名称" Width="280">
+                        <GridViewColumn Header="名称" Width="260">
                             <GridViewColumn.CellTemplate>
                                 <DataTemplate>
                                     <StackPanel Orientation="Horizontal" Margin="4,4">
@@ -249,15 +320,36 @@
                                                    FontSize="16" Width="24"
                                                    Foreground="{Binding IconColor}"
                                                    VerticalAlignment="Center"/>
-                                        <TextBlock Text="{Binding Name}" FontSize="13"
-                                                   Foreground="#222"
-                                                   VerticalAlignment="Center"
-                                                   TextTrimming="CharacterEllipsis"/>
+                                        <ItemsControl ItemsSource="{Binding NameParts}"
+                                                      VerticalAlignment="Center">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate>
+                                                    <StackPanel Orientation="Horizontal"/>
+                                                </ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate>
+                                                    <TextBlock FontSize="13" Text="{Binding Text}">
+                                                        <TextBlock.Style>
+                                                            <Style TargetType="TextBlock">
+                                                                <Setter Property="Foreground" Value="#222"/>
+                                                                <Style.Triggers>
+                                                                    <DataTrigger Binding="{Binding IsHighlight}" Value="True">
+                                                                        <Setter Property="Background" Value="#FFECB3"/>
+                                                                        <Setter Property="Foreground" Value="#0D47A1"/>
+                                                                    </DataTrigger>
+                                                                </Style.Triggers>
+                                                            </Style>
+                                                        </TextBlock.Style>
+                                                    </TextBlock>
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
                                     </StackPanel>
                                 </DataTemplate>
                             </GridViewColumn.CellTemplate>
                         </GridViewColumn>
-                        <GridViewColumn Header="路径" Width="380">
+                        <GridViewColumn Header="路径" Width="300">
                             <GridViewColumn.CellTemplate>
                                 <DataTemplate>
                                     <TextBlock Text="{Binding Path}" FontSize="12"
@@ -268,7 +360,17 @@
                                 </DataTemplate>
                             </GridViewColumn.CellTemplate>
                         </GridViewColumn>
-                        <GridViewColumn Header="修改时间" Width="170">
+                        <GridViewColumn Header="大小" Width="90">
+                            <GridViewColumn.CellTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding SizeText}" FontSize="12"
+                                               Foreground="#888" Margin="4,0"
+                                               VerticalAlignment="Center"
+                                               HorizontalAlignment="Right"/>
+                                </DataTemplate>
+                            </GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="修改时间" Width="160">
                             <GridViewColumn.CellTemplate>
                                 <DataTemplate>
                                     <TextBlock Text="{Binding ModifiedText}" FontSize="12"

@@ -1,15 +1,21 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Controls;
 using Media = System.Windows.Media;
 using System.Windows.Threading;
 using FindX.Core.Search;
+using SaveFileDialog = Microsoft.Win32.SaveFileDialog;
 
 namespace FindX.Service;
 
+// TODO(IbEverythingExt 可借): 结果列表快速选择（如 0-9/A-Z 选中、Alt+数字打开）与关闭/定位热键，降低纯键盘操作成本。
 public partial class SearchWindow : Window
 {
     private readonly ServiceHost _host;
@@ -20,6 +26,15 @@ public partial class SearchWindow : Window
     private bool _initialized;
     private CancellationTokenSource? _searchCts;
     private int _searchVersion;
+    private string? _sortColumn;
+    private bool _sortAsc = true;
+    private List<ResultItem> _currentItems = new();
+
+    private static readonly string HistoryPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "FindX", "search_history.json");
+    private List<string> _searchHistory = new();
+    private const int MaxHistory = 30;
 
     public SearchWindow(ServiceHost host, Action openSettings)
     {
@@ -35,6 +50,7 @@ public partial class SearchWindow : Window
             DoSearch();
         };
 
+        LoadHistory();
         UpdateIndexStatus();
     }
 
@@ -105,14 +121,45 @@ public partial class SearchWindow : Window
         DoSearch();
     }
 
+    private void SidebarFilter_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key == System.Windows.Input.Key.Enter)
+        {
+            _debounce.Stop();
+            DoSearch();
+        }
+    }
+
+    private string BuildSidebarFilters()
+    {
+        var parts = new List<string>();
+        var pathText = PathFilterBox.Text.Trim();
+        if (!string.IsNullOrEmpty(pathText))
+            parts.Add($"path:\"{pathText}\"");
+
+        var sizeMin = SizeMinBox.Text.Trim();
+        var sizeMax = SizeMaxBox.Text.Trim();
+        if (!string.IsNullOrEmpty(sizeMin) && !string.IsNullOrEmpty(sizeMax))
+            parts.Add($"size:{sizeMin}mb..{sizeMax}mb");
+        else if (!string.IsNullOrEmpty(sizeMin))
+            parts.Add($"size:>={sizeMin}mb");
+        else if (!string.IsNullOrEmpty(sizeMax))
+            parts.Add($"size:<={sizeMax}mb");
+
+        return string.Join(" ", parts);
+    }
+
     private async void DoSearch()
     {
         _searchCts?.Cancel();
 
         var raw = SearchBox.Text.Trim();
-        if (string.IsNullOrEmpty(raw) && string.IsNullOrEmpty(_currentTypeFilter) && string.IsNullOrEmpty(_currentTimeFilter))
+        var sidebarFilters = BuildSidebarFilters();
+        if (string.IsNullOrEmpty(raw) && string.IsNullOrEmpty(_currentTypeFilter)
+            && string.IsNullOrEmpty(_currentTimeFilter) && string.IsNullOrEmpty(sidebarFilters))
         {
             ResultsList.ItemsSource = null;
+            _currentItems.Clear();
             StatusText.Text = "就绪";
             UpdateIndexStatus();
             return;
@@ -121,6 +168,7 @@ public partial class SearchWindow : Window
         if (_host.IsIndexInBulkLoad)
         {
             ResultsList.ItemsSource = null;
+            _currentItems.Clear();
             StatusText.Text = "索引构建中，请稍候…";
             UpdateIndexStatus();
             return;
@@ -130,12 +178,14 @@ public partial class SearchWindow : Window
         if (!string.IsNullOrEmpty(raw)) parts.Add(raw);
         if (!string.IsNullOrEmpty(_currentTypeFilter)) parts.Add(_currentTypeFilter);
         if (!string.IsNullOrEmpty(_currentTimeFilter)) parts.Add(_currentTimeFilter);
+        if (!string.IsNullOrEmpty(sidebarFilters)) parts.Add(sidebarFilters);
         var query = string.Join(" ", parts);
 
         var ver = Interlocked.Increment(ref _searchVersion);
         var cts = _searchCts = new CancellationTokenSource();
 
         StatusText.Text = "搜索中…";
+        SearchProgress.Visibility = Visibility.Visible;
 
         List<SearchResult> results;
         Stopwatch sw;
@@ -145,34 +195,50 @@ public partial class SearchWindow : Window
             results = await Task.Run(() => _host.Search(query, 200), cts.Token);
             sw.Stop();
         }
-        catch (OperationCanceledException) { return; }
+        catch (OperationCanceledException)
+        {
+            SearchProgress.Visibility = Visibility.Collapsed;
+            return;
+        }
         catch
         {
+            SearchProgress.Visibility = Visibility.Collapsed;
             if (ver != Volatile.Read(ref _searchVersion)) return;
             StatusText.Text = "搜索出错";
             return;
         }
 
+        SearchProgress.Visibility = Visibility.Collapsed;
         if (ver != Volatile.Read(ref _searchVersion)) return;
+
+        if (!string.IsNullOrEmpty(raw))
+            AddHistory(raw);
 
         var items = new List<ResultItem>(results.Count);
         foreach (var r in results)
         {
+            var nameParts = SearchHighlightBuilder.BuildNameParts(r.Name, raw);
             items.Add(new ResultItem
             {
                 Name = r.Name,
+                NameParts = nameParts,
                 FullPath = r.FullPath,
                 Path = TruncatePath(r.FullPath),
                 IsDirectory = r.IsDirectory,
                 Size = r.Size,
-                ModifiedText = r.LastModified > DateTime.MinValue
-                    ? r.LastModified.ToString("yyyy/M/d h:mm:ss tt")
+                SizeText = r.IsDirectory ? "" : FormatSize(r.Size),
+                ModifiedText = r.LastWriteUtcTicks > 0
+                    ? new DateTime(r.LastWriteUtcTicks, DateTimeKind.Utc).ToLocalTime().ToString("yyyy/M/d H:mm:ss")
                     : "",
+                ModifiedTicks = r.LastWriteUtcTicks > 0
+                    ? new DateTime(r.LastWriteUtcTicks, DateTimeKind.Utc).ToLocalTime().Ticks
+                    : 0,
                 Icon = GetIcon(r.Name, r.IsDirectory),
                 IconColor = GetIconColor(r.Name, r.IsDirectory),
             });
         }
 
+        _currentItems = items;
         ResultsList.ItemsSource = items;
         StatusText.Text = $"找到 {results.Count} 个结果（耗时 {sw.Elapsed.TotalMilliseconds:F1}ms）";
         UpdateIndexStatus();
@@ -218,11 +284,138 @@ public partial class SearchWindow : Window
 
     private void Ctx_CopyAllPaths(object sender, RoutedEventArgs e)
     {
-        if (ResultsList.ItemsSource is not List<ResultItem> items || items.Count == 0) return;
+        if (_currentItems.Count == 0) return;
         var selected = ResultsList.SelectedItems.Cast<ResultItem>().ToList();
-        var list = selected.Count > 1 ? selected : items;
+        var list = selected.Count > 1 ? selected : _currentItems;
         System.Windows.Clipboard.SetText(string.Join(Environment.NewLine, list.Select(i => i.FullPath)));
     }
+
+    private void Ctx_ExportCsv(object sender, RoutedEventArgs e)
+    {
+        if (_currentItems.Count == 0) return;
+        var dlg = new SaveFileDialog
+        {
+            Filter = "CSV 文件|*.csv",
+            DefaultExt = ".csv",
+            FileName = $"FindX_Export_{DateTime.Now:yyyyMMdd_HHmmss}.csv",
+        };
+        if (dlg.ShowDialog() != true) return;
+
+        try
+        {
+            using var fs = new FileStream(dlg.FileName, FileMode.Create, FileAccess.Write, FileShare.Read);
+            using var sw = new StreamWriter(fs, new UTF8Encoding(true));
+            sw.WriteLine("名称,完整路径,大小,修改时间");
+            foreach (var item in _currentItems)
+            {
+                var name = CsvEscape(item.Name);
+                var path = CsvEscape(item.FullPath);
+                sw.WriteLine($"{name},{path},{item.Size},{item.ModifiedText}");
+            }
+            StatusText.Text = $"已导出 {_currentItems.Count} 条至 {dlg.FileName}";
+        }
+        catch (Exception ex)
+        {
+            System.Windows.MessageBox.Show($"导出失败: {ex.Message}", "FindX", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private static string CsvEscape(string s)
+    {
+        if (s.Contains(',') || s.Contains('"') || s.Contains('\n'))
+            return $"\"{s.Replace("\"", "\"\"")}\"";
+        return s;
+    }
+
+    private void ColumnHeader_Click(object sender, RoutedEventArgs e)
+    {
+        if (e.OriginalSource is not GridViewColumnHeader header) return;
+        var headerText = header.Content?.ToString();
+        if (string.IsNullOrEmpty(headerText)) return;
+
+        if (_sortColumn == headerText)
+            _sortAsc = !_sortAsc;
+        else
+        {
+            _sortColumn = headerText;
+            _sortAsc = true;
+        }
+
+        var sorted = headerText switch
+        {
+            "名称" => _sortAsc
+                ? _currentItems.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList()
+                : _currentItems.OrderByDescending(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList(),
+            "路径" => _sortAsc
+                ? _currentItems.OrderBy(x => x.FullPath, StringComparer.OrdinalIgnoreCase).ToList()
+                : _currentItems.OrderByDescending(x => x.FullPath, StringComparer.OrdinalIgnoreCase).ToList(),
+            "大小" => _sortAsc
+                ? _currentItems.OrderBy(x => x.Size).ToList()
+                : _currentItems.OrderByDescending(x => x.Size).ToList(),
+            "修改时间" => _sortAsc
+                ? _currentItems.OrderBy(x => x.ModifiedTicks).ToList()
+                : _currentItems.OrderByDescending(x => x.ModifiedTicks).ToList(),
+            _ => _currentItems,
+        };
+
+        _currentItems = sorted;
+        ResultsList.ItemsSource = sorted;
+    }
+
+    // --- Search history ---
+
+    private void HistoryBtn_Click(object sender, RoutedEventArgs e)
+    {
+        if (_searchHistory.Count == 0) return;
+        HistoryList.ItemsSource = _searchHistory;
+        HistoryPopup.IsOpen = true;
+    }
+
+    private void HistoryList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (HistoryList.SelectedItem is string text)
+        {
+            SearchBox.Text = text;
+            HistoryPopup.IsOpen = false;
+            _debounce.Stop();
+            DoSearch();
+        }
+    }
+
+    private void AddHistory(string query)
+    {
+        _searchHistory.Remove(query);
+        _searchHistory.Insert(0, query);
+        if (_searchHistory.Count > MaxHistory)
+            _searchHistory.RemoveRange(MaxHistory, _searchHistory.Count - MaxHistory);
+        SaveHistory();
+    }
+
+    private void LoadHistory()
+    {
+        try
+        {
+            if (File.Exists(HistoryPath))
+            {
+                var json = File.ReadAllText(HistoryPath);
+                _searchHistory = JsonSerializer.Deserialize<List<string>>(json) ?? new();
+            }
+        }
+        catch { _searchHistory = new(); }
+    }
+
+    private void SaveHistory()
+    {
+        try
+        {
+            var dir = System.IO.Path.GetDirectoryName(HistoryPath);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            File.WriteAllText(HistoryPath, JsonSerializer.Serialize(_searchHistory));
+        }
+        catch { }
+    }
+
+    // --- Helpers ---
 
     private void UpdateIndexStatus()
     {
@@ -247,6 +440,15 @@ public partial class SearchWindow : Window
     {
         var dir = System.IO.Path.GetDirectoryName(fullPath);
         return dir != null && dir.Length > 70 ? dir[..35] + "..." + dir[^30..] : dir ?? fullPath;
+    }
+
+    private static string FormatSize(long bytes)
+    {
+        if (bytes < 0) return "";
+        if (bytes < 1024) return $"{bytes} B";
+        if (bytes < 1024 * 1024) return $"{bytes / 1024.0:F1} KB";
+        if (bytes < 1024L * 1024 * 1024) return $"{bytes / (1024.0 * 1024):F1} MB";
+        return $"{bytes / (1024.0 * 1024 * 1024):F2} GB";
     }
 
     private static string GetIcon(string name, bool isDir)
@@ -300,11 +502,16 @@ public partial class SearchWindow : Window
 public sealed class ResultItem
 {
     public string Name { get; init; } = "";
+    /// <summary>名称列分段高亮；无关键词时仅一段、IsHighlight=false。</summary>
+    public IReadOnlyList<HighlightPart> NameParts { get; init; } =
+        Array.Empty<HighlightPart>();
     public string FullPath { get; init; } = "";
     public string Path { get; init; } = "";
     public bool IsDirectory { get; init; }
     public long Size { get; init; }
+    public string SizeText { get; init; } = "";
     public string ModifiedText { get; init; } = "";
+    public long ModifiedTicks { get; init; }
     public string Icon { get; init; } = "";
     public Media.SolidColorBrush IconColor { get; init; } = Media.Brushes.Gray;
 }

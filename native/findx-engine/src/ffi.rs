@@ -90,6 +90,8 @@ pub unsafe extern "C" fn findx_engine_add_entry_utf16(
     attr: u32,
     size: i64,
     mtime: i64,
+    ctime: i64,
+    atime: i64,
 ) -> i32 {
     let b = match as_box(p) {
         Some(x) => x,
@@ -100,7 +102,7 @@ pub unsafe extern "C" fn findx_engine_add_entry_utf16(
     }
     let name = std::slice::from_raw_parts(name_utf16, name_len as usize);
     b.inner
-        .add_entry_utf16(vol, file_ref, parent_ref, name, attr, size, mtime);
+        .add_entry_utf16(vol, file_ref, parent_ref, name, attr, size, mtime, ctime, atime);
     0
 }
 
@@ -115,6 +117,8 @@ pub unsafe extern "C" fn findx_engine_upsert_entry_utf16(
     attr: u32,
     size: i64,
     mtime: i64,
+    ctime: i64,
+    atime: i64,
 ) -> i32 {
     let b = match as_box(p) {
         Some(x) => x,
@@ -125,7 +129,7 @@ pub unsafe extern "C" fn findx_engine_upsert_entry_utf16(
     }
     let name = std::slice::from_raw_parts(name_utf16, name_len as usize);
     b.inner
-        .upsert_entry_utf16(vol, file_ref, parent_ref, name, attr, size, mtime);
+        .upsert_entry_utf16(vol, file_ref, parent_ref, name, attr, size, mtime, ctime, atime);
     0
 }
 
@@ -420,6 +424,8 @@ pub unsafe extern "C" fn findx_engine_get_live_record(
     out_attr: *mut u32,
     out_size: *mut i64,
     out_mtime: *mut i64,
+    out_ctime: *mut i64,
+    out_atime: *mut i64,
 ) -> i32 {
     if p.is_null()
         || out_fr.is_null()
@@ -428,6 +434,8 @@ pub unsafe extern "C" fn findx_engine_get_live_record(
         || out_attr.is_null()
         || out_size.is_null()
         || out_mtime.is_null()
+        || out_ctime.is_null()
+        || out_atime.is_null()
     {
         return -1;
     }
@@ -437,9 +445,11 @@ pub unsafe extern "C" fn findx_engine_get_live_record(
     let mut at = 0u32;
     let mut sz = 0i64;
     let mut mt = 0i64;
+    let mut ct = 0i64;
+    let mut at_time = 0i64;
     let ok = (*p)
         .inner
-        .get_live_record(idx, &mut fr, &mut pr, &mut vol, &mut at, &mut sz, &mut mt);
+        .get_live_record(idx, &mut fr, &mut pr, &mut vol, &mut at, &mut sz, &mut mt, &mut ct, &mut at_time);
     if !ok {
         return 0;
     }
@@ -449,6 +459,8 @@ pub unsafe extern "C" fn findx_engine_get_live_record(
     *out_attr = at;
     *out_size = sz;
     *out_mtime = mt;
+    *out_ctime = ct;
+    *out_atime = at_time;
     1
 }
 
@@ -525,6 +537,8 @@ pub type PersistRowFn = Option<
         attr: u32,
         size: i64,
         mtime: i64,
+        ctime: i64,
+        atime: i64,
         vol: u16,
     ) -> i32,
 >;
@@ -548,6 +562,8 @@ pub unsafe extern "C" fn findx_engine_for_each_persist(
         let name_utf16: Vec<u16> = nm.encode_utf16().collect();
         let size_i64 = r.size as i64;
         let mtime_i64 = EPOCH_2000_TICKS + (r.mtime as i64) * TICKS_PER_SEC;
+        let ctime_i64 = EPOCH_2000_TICKS + (r.ctime as i64) * TICKS_PER_SEC;
+        let atime_i64 = EPOCH_2000_TICKS + (r.atime as i64) * TICKS_PER_SEC;
         let _ = cb(
             user,
             r.file_ref,
@@ -557,6 +573,8 @@ pub unsafe extern "C" fn findx_engine_for_each_persist(
             r.attr,
             size_i64,
             mtime_i64,
+            ctime_i64,
+            atime_i64,
             r.vol as u16,
         );
     }

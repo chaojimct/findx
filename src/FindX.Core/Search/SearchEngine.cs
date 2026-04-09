@@ -119,8 +119,9 @@ public sealed class SearchEngine
                 Score = score,
                 MatchType = matchResult.Type,
                 EntryIndex = idx,
+                LastWriteUtcTicks = entry.LastWriteTimeTicks,
                 LastModified = entry.LastWriteTimeTicks > 0
-                    ? DateTime.FromFileTimeUtc(entry.LastWriteTimeTicks).ToLocalTime()
+                    ? new DateTime(entry.LastWriteTimeTicks, DateTimeKind.Utc).ToLocalTime()
                     : default,
             });
         }

@@ -117,24 +117,24 @@ public sealed class FileIndex
     }
 
     private unsafe void WriteEntryUtf16(char vol, ulong fileRef, ulong parentRef, string name, uint attr, long size,
-        long mtime)
+        long mtime, long ctime, long atime)
     {
         fixed (char* pn = name)
         {
             RustIndexNative.findx_engine_add_entry_utf16(_engine, vol, fileRef, parentRef, (IntPtr)pn, name.Length, attr,
-                size, mtime);
+                size, mtime, ctime, atime);
         }
     }
 
     private unsafe void WriteEntryUtf16(FileEntry e) =>
-        WriteEntryUtf16(e.VolumeLetter, e.FileRef, e.ParentRef, e.Name, e.Attributes, e.Size, e.LastWriteTimeTicks);
+        WriteEntryUtf16(e.VolumeLetter, e.FileRef, e.ParentRef, e.Name, e.Attributes, e.Size, e.LastWriteTimeTicks, e.CreationTimeTicks, e.AccessTimeTicks);
 
     private unsafe void WriteUpsertUtf16(FileEntry entry)
     {
         fixed (char* pn = entry.Name)
         {
             RustIndexNative.findx_engine_upsert_entry_utf16(_engine, entry.VolumeLetter, entry.FileRef, entry.ParentRef,
-                (IntPtr)pn, entry.Name.Length, entry.Attributes, entry.Size, entry.LastWriteTimeTicks);
+                (IntPtr)pn, entry.Name.Length, entry.Attributes, entry.Size, entry.LastWriteTimeTicks, entry.CreationTimeTicks, entry.AccessTimeTicks);
         }
     }
 
@@ -589,7 +589,7 @@ public sealed class FileIndex
         var refKeysLen = BitConverter.ToUInt32(hdr, 12);
 
         long rustSize = 8 + 20
-                        + (long)recordsCount * 40
+                        + (long)recordsCount * 48
                         + namePoolLen
                         + (long)refKeysLen * 8
                         + (long)refKeysLen * 4
@@ -618,7 +618,7 @@ public sealed class FileIndex
     private FileEntry? MaterializeCore(int idx)
     {
         if (RustIndexNative.findx_engine_get_live_record(_engine, idx, out var fr, out var pr, out var vol, out var at,
-                out var sz, out var mt) != 1)
+                out var sz, out var mt, out var ct, out var at_time) != 1)
             return null;
 
         Span<char> nb = stackalloc char[8192];
@@ -637,6 +637,8 @@ public sealed class FileIndex
                     Attributes = at,
                     Size = sz,
                     LastWriteTimeTicks = mt,
+                    CreationTimeTicks = ct,
+                    AccessTimeTicks = at_time,
                     VolumeLetter = (char)vol,
                     IsDeleted = false,
                     PinyinInitials = "",
@@ -661,7 +663,7 @@ public sealed class FileIndex
     }
 
     private static int PersistRowStatic(IntPtr user, ulong fileRef, ulong parentRef, IntPtr nameUtf16, int nameLen,
-        uint attr, long size, long mtime, ushort vol)
+        uint attr, long size, long mtime, long ctime, long atime, ushort vol)
     {
         _ = user;
         var bw = _persistBw ?? throw new InvalidOperationException("findx persist: BinaryWriter 未就绪");
@@ -671,6 +673,8 @@ public sealed class FileIndex
         bw.Write(attr);
         bw.Write(size);
         bw.Write(mtime);
+        bw.Write(ctime);
+        bw.Write(atime);
         bw.Write((char)vol);
         return 1;
     }

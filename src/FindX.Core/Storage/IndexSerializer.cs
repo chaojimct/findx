@@ -4,13 +4,13 @@ namespace FindX.Core.Storage;
 
 /// <summary>
 /// 索引二进制序列化/反序列化。
-/// 优先使用 FXBIN02 快速格式（Rust 内存直写，含排序索引，加载后无需 rebuild）；
+/// 优先使用 FXBIN03 快速格式（Rust 内存直写，含排序索引，加载后无需 rebuild）；
 /// 回退兼容 FINDX01 旧格式（逐条读取+rebuild）。
 /// </summary>
 public static class IndexSerializer
 {
     private static readonly byte[] MagicLegacy = "FINDX01\0"u8.ToArray();
-    private static readonly byte[] MagicBinary = "FXBIN02\0"u8.ToArray();
+    private static readonly byte[] MagicBinary = "FXBIN03\0"u8.ToArray();
 
     /// <summary>快速二进制保存。</summary>
     public static void Save(string path, FileIndex index, Dictionary<char, ulong> volumeUsns)
@@ -21,7 +21,7 @@ public static class IndexSerializer
     }
 
     /// <summary>
-    /// 尝试加载 FXBIN02 二进制格式。成功返回 live 条目数，失败返回 -1。
+    /// 尝试加载 FXBIN03 二进制格式。成功返回 live 条目数，失败返回 -1。
     /// 无需 BeginBulk/EndBulk，含排序索引直接可用。
     /// </summary>
     public static int TryLoadBinary(string path, FileIndex index, Dictionary<char, ulong> volumeUsns)

@@ -32,6 +32,7 @@ public sealed class ParsedQuery
 /// atom     = "&lt;" expr "&gt;" | QUOTED_STRING | FILTER | TERM
 /// </code>
 /// </summary>
+// TODO(IbEverythingExt 可借): 显式匹配模式（仅拼音/仅字面/自动，如 ;py|;en 或全局设置）、小写/大写与字面匹配的约定、路径级通配 / 与 // 及文档与实现对齐。参见 Chaoses-Ib/IbEverythingExt README「搜索增强」。
 public static class QueryParser
 {
     public static ParsedQuery Parse(string input)
@@ -229,6 +230,14 @@ public static class QueryParser
                 q.HasFilters = true;
                 return FilterNode.ParseDateModified(value);
 
+            case "dc" or "datecreated":
+                q.HasFilters = true;
+                return FilterNode.ParseDateCreated(value);
+
+            case "da" or "dateaccessed":
+                q.HasFilters = true;
+                return FilterNode.ParseDateAccessed(value);
+
             case "len":
                 q.HasFilters = true;
                 return FilterNode.ParseNameLength(value);
@@ -280,8 +289,98 @@ public static class QueryParser
                     return new TermNode(value);
                 }
 
+            case "audio":
+                q.HasFilters = true;
+                return FilterNode.ParseExtension("mp3;wav;flac;aac;ogg;wma;m4a;opus");
+
+            case "video":
+                q.HasFilters = true;
+                return FilterNode.ParseExtension("mp4;avi;mkv;mov;wmv;flv;webm;m4v;ts");
+
+            case "doc":
+                q.HasFilters = true;
+                return FilterNode.ParseExtension("doc;docx;pdf;xls;xlsx;ppt;pptx;txt;rtf;odt;csv;md");
+
+            case "exe":
+                q.HasFilters = true;
+                return FilterNode.ParseExtension("exe;msi;bat;cmd;com;scr;ps1");
+
+            case "zip":
+                q.HasFilters = true;
+                return FilterNode.ParseExtension("zip;rar;7z;tar;gz;bz2;xz;zst;cab;iso");
+
+            case "pic":
+                q.HasFilters = true;
+                return FilterNode.ParseExtension("jpg;jpeg;png;gif;bmp;svg;webp;ico;tiff;psd;raw");
+
+            case "type":
+                q.HasFilters = true;
+                return ResolveTypeMacro(value);
+
+            case "shell":
+                q.HasFilters = true;
+                return ResolveShellFolder(value);
+
             default:
                 return new TermNode($"{prefix}:{value}");
         }
+    }
+
+    private static readonly Dictionary<string, string> TypeMacroExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["audio"] = "mp3;wav;flac;aac;ogg;wma;m4a;opus",
+        ["video"] = "mp4;avi;mkv;mov;wmv;flv;webm;m4v;ts",
+        ["doc"] = "doc;docx;pdf;xls;xlsx;ppt;pptx;txt;rtf;odt;csv;md",
+        ["exe"] = "exe;msi;bat;cmd;com;scr;ps1",
+        ["zip"] = "zip;rar;7z;tar;gz;bz2;xz;zst;cab;iso",
+        ["pic"] = "jpg;jpeg;png;gif;bmp;svg;webp;ico;tiff;psd;raw",
+        ["image"] = "jpg;jpeg;png;gif;bmp;svg;webp;ico;tiff;psd;raw",
+    };
+
+    private static QueryNode ResolveTypeMacro(string value)
+    {
+        if (TypeMacroExtensions.TryGetValue(value, out var exts))
+            return FilterNode.ParseExtension(exts);
+        return FilterNode.ParseExtension(value);
+    }
+
+    private static readonly Dictionary<string, Environment.SpecialFolder> ShellFolderMap = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["desktop"] = Environment.SpecialFolder.DesktopDirectory,
+        ["documents"] = Environment.SpecialFolder.MyDocuments,
+        ["music"] = Environment.SpecialFolder.MyMusic,
+        ["pictures"] = Environment.SpecialFolder.MyPictures,
+        ["videos"] = Environment.SpecialFolder.MyVideos,
+        ["appdata"] = Environment.SpecialFolder.ApplicationData,
+        ["localappdata"] = Environment.SpecialFolder.LocalApplicationData,
+        ["startup"] = Environment.SpecialFolder.Startup,
+        ["programs"] = Environment.SpecialFolder.Programs,
+        ["favorites"] = Environment.SpecialFolder.Favorites,
+        ["recent"] = Environment.SpecialFolder.Recent,
+        ["templates"] = Environment.SpecialFolder.Templates,
+        ["fonts"] = Environment.SpecialFolder.Fonts,
+        ["windows"] = Environment.SpecialFolder.Windows,
+        ["system"] = Environment.SpecialFolder.System,
+        ["programfiles"] = Environment.SpecialFolder.ProgramFiles,
+        ["profile"] = Environment.SpecialFolder.UserProfile,
+    };
+
+    private static QueryNode ResolveShellFolder(string value)
+    {
+        if (value.Equals("downloads", StringComparison.OrdinalIgnoreCase))
+        {
+            var downloads = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+            return FilterNode.ParsePath(downloads);
+        }
+
+        if (ShellFolderMap.TryGetValue(value, out var folder))
+        {
+            var path = Environment.GetFolderPath(folder);
+            if (!string.IsNullOrEmpty(path))
+                return FilterNode.ParsePath(path);
+        }
+
+        return FilterNode.ParsePath(value);
     }
 }

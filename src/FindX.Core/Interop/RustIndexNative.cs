@@ -32,7 +32,9 @@ internal static class RustIndexNative
         int nameLen,
         uint attr,
         long size,
-        long mtime);
+        long mtime,
+        long ctime,
+        long atime);
 
     [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
     public static extern int findx_engine_upsert_entry_utf16(
@@ -44,7 +46,9 @@ internal static class RustIndexNative
         int nameLen,
         uint attr,
         long size,
-        long mtime);
+        long mtime,
+        long ctime,
+        long atime);
 
     [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
     public static extern void findx_engine_remove_by_ref(IntPtr p, ushort vol, ulong fileRef);
@@ -121,7 +125,9 @@ internal static class RustIndexNative
         out ushort vol,
         out uint attr,
         out long size,
-        out long mtime);
+        out long mtime,
+        out long ctime,
+        out long atime);
 
     [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
     public static extern int findx_engine_get_name_utf16(
@@ -149,6 +155,8 @@ internal static class RustIndexNative
         uint attr,
         long size,
         long mtime,
+        long ctime,
+        long atime,
         ushort vol);
 
     [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]

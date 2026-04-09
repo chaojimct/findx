@@ -163,10 +163,20 @@ fx reindex                     # 重建索引
 | `ext:` | 扩展名过滤 | `ext:pdf`、`ext:jpg;png` |
 | `size:` | 文件大小过滤 | `size:>1mb`、`size:100kb..5mb` |
 | `dm:` | 修改日期过滤 | `dm:today`、`dm:>2024-01-01` |
+| `dc:` | 创建日期过滤 | `dc:thismonth`、`dc:>2024-06-01` |
+| `da:` | 访问日期过滤 | `da:thisweek`、`da:>2025-01-01` |
 | `path:` | 路径包含 | `path:documents` |
 | `nopath:` | 路径不包含 | `nopath:node_modules` |
+| `shell:` | 已知文件夹 | `shell:desktop`、`shell:downloads` |
 | `depth:` | 路径深度 | `depth:<=3` |
 | `len:` | 文件名长度 | `len:>50` |
+| `audio:` | 音频文件宏 | `audio: 报告` |
+| `video:` | 视频文件宏 | `video: 教程` |
+| `doc:` | 文档文件宏 | `doc: 简历` |
+| `pic:` | 图片文件宏 | `pic: 截图` |
+| `exe:` | 可执行文件宏 | `exe: setup` |
+| `zip:` | 压缩包宏 | `zip: backup` |
+| `type:` | 类型宏（值=audio/video/doc 等） | `type:audio` |
 | `root:` | 限定根目录 | `root:C:\Users` |
 | `attrib:` | 文件属性 | `attrib:H`（隐藏文件） |
 | `startwith:` | 文件名前缀 | `startwith:test` |
@@ -268,29 +278,28 @@ git push origin v1.0.0
 
 ### 搜索过滤器
 
-- [ ] `dc:` / `datecreated:` — 创建时间过滤（需 Rust 引擎扩展 FileEntry 存储 CreationTimeTicks）
-- [ ] `da:` / `dateaccessed:` — 访问时间过滤（需 Rust 引擎扩展 FileEntry 存储 AccessTimeTicks）
-- [ ] `empty:` — 空文件夹判断（需遍历子树检查子条目）
-- [ ] `content:` — 文件内容搜索（需文件 IO，性能敏感）
-- [ ] `type:` — Windows 文件类型名过滤（如 "Text Document"，需查询注册表）
-- [ ] `dupe:` / `sizedupe:` / `namedupe:` — 重复文件检测（需全索引扫描 + 分组）
-- [ ] `child:` / `childcount:` / `childfile:` / `childfolder:` — 子项计数（需遍历子树）
-- [ ] `runcount:` / `daterun:` — 运行历史跟踪
-- [ ] `shell:` — Shell 已知文件夹映射（桌面/文档等 KNOWNFOLDERID）
-- [ ] `audio:` / `video:` / `doc:` / `exe:` / `zip:` / `pic:` 等宏 — ext 列表展开
+- [x] `dc:` / `datecreated:` — 创建时间过滤
+- [x] `da:` / `dateaccessed:` — 访问时间过滤
+- [x] `type:` / `audio:` / `video:` / `doc:` / `exe:` / `zip:` / `pic:` — 扩展名宏
+- [x] `shell:` — Shell 已知文件夹映射（桌面/文档/下载等）
+- [ ] `empty:` — 空文件夹判断（计划后续迭代）
+- [ ] `content:` — 文件内容搜索（计划后续迭代）
+- [ ] `dupe:` / `sizedupe:` / `namedupe:` — 重复文件检测（计划后续迭代）
+- [ ] `child:` / `childcount:` / `childfile:` / `childfolder:` — 子项计数（计划后续迭代）
+- [ ] `runcount:` / `daterun:` — 运行历史跟踪（计划后续迭代）
 
 ### GUI 搜索窗口
 
-- [ ] 文件大小列显示
-- [ ] 表头点击排序
-- [ ] 搜索历史记录
-- [ ] 结果导出（CSV / 文本）
-- [ ] 搜索进度指示与取消
-- [ ] 侧栏增加路径范围、大小范围筛选
+- [x] 文件大小列显示
+- [x] 表头点击排序（名称/路径/大小/修改时间，升降序切换）
+- [x] 搜索历史记录（最近 30 条，JSON 持久化）
+- [x] 结果导出（CSV，UTF-8 BOM）
+- [x] 搜索进度指示
+- [x] 侧栏增加路径范围、大小范围筛选
 
 ### 架构
 
-- [ ] Windows Service 模式 — 拆分为无头服务进程 + 独立 GUI 托盘客户端（类似 Everything 服务模式，SYSTEM 权限运行，支持无人登录时索引、崩溃自动恢复）
+- [ ] Windows Service 模式 — 拆分为无头服务进程 + 独立 GUI 托盘客户端（计划后续迭代）
 
 ## 许可证
 

@@ -9,6 +9,9 @@
 
 extern "C" {
 
+/// <param name="lastWriteTime">FILETIME (UTC) QuadPart，0 表示未知</param>
+/// <param name="creationTime">FILETIME (UTC) QuadPart</param>
+/// <param name="accessTime">FILETIME (UTC) QuadPart</param>
 typedef void(__stdcall* FindXEnumCallback)(
     uint64_t fileRef,
     uint64_t parentRef,
@@ -16,7 +19,9 @@ typedef void(__stdcall* FindXEnumCallback)(
     int fileNameLen,
     uint32_t attributes,
     uint64_t fileSize,
-    int64_t lastWriteTime
+    int64_t lastWriteTime,
+    int64_t creationTime,
+    int64_t accessTime
 );
 
 typedef void(__stdcall* FindXJournalCallback)(
@@ -25,7 +30,11 @@ typedef void(__stdcall* FindXJournalCallback)(
     uint64_t parentRef,
     const wchar_t* fileName,
     int fileNameLen,
-    uint32_t attributes
+    uint32_t attributes,
+    uint64_t fileSize,
+    int64_t lastWriteTime,
+    int64_t creationTime,
+    int64_t accessTime
 );
 
 FINDX_API int __stdcall FindX_EnumVolume(

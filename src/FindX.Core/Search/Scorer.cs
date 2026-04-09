@@ -35,5 +35,7 @@ public sealed class SearchResult
     public required int Score { get; init; }
     public required PinyinMatcher.MatchType MatchType { get; init; }
     public int EntryIndex { get; init; }
+    /// <summary>索引中的最后写入时间（UTC ticks，0 表示未知）</summary>
+    public long LastWriteUtcTicks { get; init; }
     public DateTime LastModified { get; init; }
 }

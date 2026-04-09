@@ -14,6 +14,8 @@ public sealed class FindXResultItem
     public bool IsDir { get; set; }
     public long Size { get; set; }
     public int Score { get; set; }
+    /// <summary>最后写入 UTC .NET ticks，0 表示未知</summary>
+    public long LastWriteUtcTicks { get; set; }
 }
 
 public sealed class FindXStatus

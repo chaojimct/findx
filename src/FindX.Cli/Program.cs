@@ -44,13 +44,14 @@ public static class Program
     {
         if (args.Length < 2)
         {
-            Console.Error.WriteLine("用法: fx search <query> [--max N] [--path <filter>]");
+            Console.Error.WriteLine("用法: fx search <query> [--max N] [--path <filter>] [--json]");
             return 1;
         }
 
         var query = args[1];
         int maxResults = 20;
         string? pathFilter = null;
+        var jsonOut = false;
 
         for (int i = 2; i < args.Length; i++)
         {
@@ -58,6 +59,8 @@ public static class Program
                 int.TryParse(args[++i], out maxResults);
             else if (args[i] == "--path" && i + 1 < args.Length)
                 pathFilter = args[++i];
+            else if (args[i] == "--json")
+                jsonOut = true;
         }
 
         var result = await client.SearchAsync(query, maxResults, pathFilter);
@@ -71,14 +74,36 @@ public static class Program
         Console.WriteLine($"找到 {result.TotalCount} 个结果 (耗时 {result.ElapsedMs:F1}ms)");
         Console.WriteLine();
 
+        if (jsonOut)
+        {
+            foreach (var item in result.Items)
+            {
+                Console.WriteLine(
+                    System.Text.Json.JsonSerializer.Serialize(new
+                    {
+                        path = item.Path,
+                        name = item.Name,
+                        isDir = item.IsDir,
+                        size = item.Size,
+                        lastWriteUtcTicks = item.LastWriteUtcTicks,
+                        score = item.Score,
+                    }));
+            }
+
+            return 0;
+        }
+
         int idx = 1;
         foreach (var item in result.Items)
         {
             var icon = item.IsDir ? "[D]" : "[F]";
             Console.WriteLine($"  {idx,2}. {icon} {item.Name}");
             Console.WriteLine($"      {item.Path}");
-            if (!item.IsDir && item.Size > 0)
-                Console.WriteLine($"      {FormatSize(item.Size)}  Score={item.Score}");
+            var sizePart = item.IsDir ? "" : $"大小 {FormatSize(item.Size)}  ";
+            var timePart = item.LastWriteUtcTicks > 0
+                ? $"修改 {new DateTime(item.LastWriteUtcTicks, DateTimeKind.Utc).ToLocalTime():yyyy-MM-dd HH:mm:ss}  "
+                : "修改 (索引无/未知)  ";
+            Console.WriteLine($"      {sizePart}{timePart}Score={item.Score}");
             idx++;
         }
 
@@ -189,7 +214,7 @@ public static class Program
         Console.WriteLine("用法: fx <command> [options]");
         Console.WriteLine();
         Console.WriteLine("命令:");
-        Console.WriteLine("  search <query> [--max N] [--path <filter>]   搜索文件");
+        Console.WriteLine("  search <query> [--max N] [--path <filter>] [--json]  搜索（每行打印大小、修改时间、--json 为 NDJSON）");
         Console.WriteLine("  status                                       查看索引状态");
         Console.WriteLine("  reindex                                      触发重新索引");
         Console.WriteLine("  update [--install|-i]                         检查更新；加 --install 则下载并启动安装");

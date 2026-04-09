@@ -56,9 +56,13 @@ public sealed class JournalWatcher : IDisposable
     {
         int created = 0, deleted = 0, renamed = 0;
 
-        FindXJournalCallback callback = (reason, fileRef, parentRef, namePtr, nameLen, attrs) =>
+        FindXJournalCallback callback = (reason, fileRef, parentRef, namePtr, nameLen, attrs, fileSize, lastWrite,
+            creation, access) =>
         {
             var name = NativeInterop.PtrToString(namePtr, nameLen);
+
+            static long FtToTicks(long fileTime)
+                => fileTime > 0 ? DateTime.FromFileTimeUtc(fileTime).Ticks : 0;
 
             // 顺序：重命名先于「创建」判断，避免单条记录同时带多种 Reason 时走错分支
             if ((reason & NativeInterop.USN_REASON_FILE_DELETE) != 0
@@ -76,6 +80,10 @@ public sealed class JournalWatcher : IDisposable
                     ParentRef = parentRef,
                     Name = name,
                     Attributes = attrs,
+                    Size = (long)fileSize,
+                    LastWriteTimeTicks = FtToTicks(lastWrite),
+                    CreationTimeTicks = FtToTicks(creation),
+                    AccessTimeTicks = FtToTicks(access),
                     VolumeLetter = vol,
                 });
                 renamed++;
@@ -89,6 +97,10 @@ public sealed class JournalWatcher : IDisposable
                     ParentRef = parentRef,
                     Name = name,
                     Attributes = attrs,
+                    Size = (long)fileSize,
+                    LastWriteTimeTicks = FtToTicks(lastWrite),
+                    CreationTimeTicks = FtToTicks(creation),
+                    AccessTimeTicks = FtToTicks(access),
                     VolumeLetter = vol,
                 });
                 created++;

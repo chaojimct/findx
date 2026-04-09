@@ -34,9 +34,9 @@ fn size_to_compact(s: i64) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// Record – 40 bytes per entry (down from 72)
+// Record – 48 bytes per entry (down from 72)
 // Removed: py_start, py_len, full_py_start, full_py_len (computed on the fly)
-// Shrunk:  size i64→u32, mtime i64→u32
+// Shrunk:  size i64→u32, mtime/ctime/atime i64→u32
 // Added:   parent_idx (avoids HashMap lookup for path building)
 // ---------------------------------------------------------------------------
 
@@ -49,6 +49,8 @@ pub struct Record {
     pub parent_idx: u32,
     pub size: u32,
     pub mtime: u32,
+    pub ctime: u32,
+    pub atime: u32,
     pub name_len: u16,
     pub vol: u8,
     pub deleted: u8,
@@ -469,6 +471,8 @@ impl Engine {
         attr: u32,
         size: i64,
         mtime: i64,
+        ctime: i64,
+        atime: i64,
     ) {
         let name = String::from_utf16_lossy(name_utf16);
         let (ns, nl) = Self::push_utf8(&mut self.name_pool, &name);
@@ -480,6 +484,8 @@ impl Engine {
             parent_idx: u32::MAX,
             size: size_to_compact(size),
             mtime: mtime_to_compact(mtime),
+            ctime: mtime_to_compact(ctime),
+            atime: mtime_to_compact(atime),
             name_len: nl,
             vol: vol as u8,
             deleted: 0,
@@ -504,6 +510,8 @@ impl Engine {
         attr: u32,
         size: i64,
         mtime: i64,
+        ctime: i64,
+        atime: i64,
     ) {
         let key = make_key(vol, file_ref);
         let name = String::from_utf16_lossy(name_utf16);
@@ -528,6 +536,8 @@ impl Engine {
             r.attr = attr;
             r.size = size_to_compact(size);
             r.mtime = mtime_to_compact(mtime);
+            r.ctime = mtime_to_compact(ctime);
+            r.atime = mtime_to_compact(atime);
             r.vol = vol as u8;
             if self.bulk_mode == 0 {
                 self.sorted_insert_name(idx);
@@ -536,7 +546,7 @@ impl Engine {
             }
             return;
         }
-        self.add_entry_utf16(vol, file_ref, parent_ref, name_utf16, attr, size, mtime);
+        self.add_entry_utf16(vol, file_ref, parent_ref, name_utf16, attr, size, mtime, ctime, atime);
     }
 
     pub fn remove_by_ref(&mut self, vol: u16, file_ref: u64) {
@@ -917,6 +927,8 @@ impl Engine {
         out_attr: &mut u32,
         out_size: &mut i64,
         out_mtime: &mut i64,
+        out_ctime: &mut i64,
+        out_atime: &mut i64,
     ) -> bool {
         if idx < 0 || idx as usize >= self.records.len() {
             return false;
@@ -931,6 +943,8 @@ impl Engine {
         *out_attr = r.attr;
         *out_size = r.size as i64;
         *out_mtime = compact_to_mtime(r.mtime);
+        *out_ctime = compact_to_mtime(r.ctime);
+        *out_atime = compact_to_mtime(r.atime);
         true
     }
 
@@ -1034,7 +1048,7 @@ impl Engine {
     // Format: MAGIC(8) + header(20) + records + name_pool + ref + sorted×3
     // -------------------------------------------------------------------
 
-    const BIN_MAGIC: &'static [u8; 8] = b"FXBIN02\0";
+    const BIN_MAGIC: &'static [u8; 8] = b"FXBIN03\0";
 
     pub fn save_to_file(&self, path: &str) -> std::io::Result<u64> {
         use std::io::{BufWriter, Write};

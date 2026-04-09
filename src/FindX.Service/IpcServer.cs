@@ -182,6 +182,7 @@ public sealed class IpcServer : IDisposable
             IsDir = r.IsDirectory,
             Size = r.Size,
             Score = r.Score,
+            LastWriteUtcTicks = r.LastWriteUtcTicks,
         }).ToList();
 
         var response = new IpcResponse
@@ -268,4 +269,6 @@ public class IpcResultItem
     public bool IsDir { get; set; }
     public long Size { get; set; }
     public int Score { get; set; }
+    /// <summary>最后写入 UTC .NET ticks，0 表示索引中无此元数据</summary>
+    public long LastWriteUtcTicks { get; set; }
 }
