@@ -117,6 +117,41 @@ internal static class RustIndexNative
         int outCap);
 
     [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    public static extern int findx_engine_search_full_py_fuzzy(
+        IntPtr p,
+        IntPtr needleUtf8,
+        int needleLen,
+        IntPtr outIndices,
+        int outCap);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    public static extern int findx_engine_search_match_query(
+        IntPtr p,
+        IntPtr queryUtf8,
+        int queryLen,
+        IntPtr outIndices,
+        int outCap);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    public static extern int findx_match_name_utf8(
+        IntPtr queryUtf8,
+        int queryLen,
+        IntPtr candidateUtf8,
+        int candidateLen,
+        out int matchType,
+        out int score,
+        out int matchedChars);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    public static extern int findx_highlight_name_utf8(
+        IntPtr queryUtf8,
+        int queryLen,
+        IntPtr candidateUtf8,
+        int candidateLen,
+        IntPtr outRanges,
+        int outPairCap);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
     public static extern int findx_engine_get_live_record(
         IntPtr p,
         int idx,
@@ -128,6 +163,11 @@ internal static class RustIndexNative
         out long mtime,
         out long ctime,
         out long atime);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    public static extern int findx_engine_get_path_depth(
+        IntPtr p,
+        int idx);
 
     [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
     public static extern int findx_engine_get_name_utf16(

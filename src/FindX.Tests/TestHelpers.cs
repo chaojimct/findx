@@ -1,3 +1,4 @@
+using System.Linq;
 using FindX.Core.Index;
 using FindX.Core.Search;
 
@@ -15,7 +16,8 @@ internal static class TestHelpers
     public static EvalContext MakeCtx(FileEntry entry, string fullPath)
     {
         var ctx = new EvalContext();
-        ctx.Reset(entry, fullPath);
+        int pathDepth = fullPath.Count(ch => ch is '\\' or '/');
+        ctx.Reset(entry, fullPath, pathDepth);
         return ctx;
     }
 

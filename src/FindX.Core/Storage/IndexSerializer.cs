@@ -10,7 +10,7 @@ namespace FindX.Core.Storage;
 public static class IndexSerializer
 {
     private static readonly byte[] MagicLegacy = "FINDX01\0"u8.ToArray();
-    private static readonly byte[] MagicBinary = "FXBIN03\0"u8.ToArray();
+    private static readonly byte[] MagicBinary = "FXBIN04\0"u8.ToArray();
 
     /// <summary>快速二进制保存。</summary>
     public static void Save(string path, FileIndex index, Dictionary<char, ulong> volumeUsns)

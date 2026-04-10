@@ -1,7 +1,6 @@
 using System.Runtime.InteropServices;
 using FindX.Core.Index;
 using FindX.Core.Interop;
-using FindX.Core.Pinyin;
 
 namespace FindX.Core.FileSystem;
 
@@ -25,7 +24,6 @@ public sealed class VolumeScanner
 
     public async Task<ScanResult> ScanVolumeAsync(char driveLetter, CancellationToken ct = default)
     {
-        PinyinTable.EnsureInitialized();
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
         try

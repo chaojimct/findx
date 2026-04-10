@@ -8,14 +8,32 @@ namespace FindX.Core.Search;
 /// </summary>
 public static class Scorer
 {
-    public static int Score(FileEntry entry, string fullPath, PinyinMatcher.MatchResult match)
+    public static int Score(FileEntry entry, int pathDepth, PinyinMatcher.MatchResult match,
+        bool preferPinyinForAsciiQuery = false)
     {
         int score = match.Score;
 
-        int depth = 0;
-        foreach (var ch in fullPath)
-            if (ch is '\\' or '/') depth++;
-        score -= depth * 2;
+        if (preferPinyinForAsciiQuery && NameContainsCjk(entry.Name))
+        {
+            score += match.Type switch
+            {
+                PinyinMatcher.MatchType.FullPinyin => 340,
+                PinyinMatcher.MatchType.Initials => 280,
+                PinyinMatcher.MatchType.Mixed => 420,
+                _ => 0,
+            };
+
+            var ext = Path.GetExtension(entry.Name);
+            if (IsPreferredDocumentExtension(ext))
+                score += 170;
+            else if (IsLowValueAsciiPinyinExtension(ext))
+                score -= 90;
+
+            if (entry.IsDirectory)
+                score -= 35;
+        }
+
+        score -= pathDepth * 2;
 
         score -= entry.Name.Length;
 
@@ -23,6 +41,42 @@ public static class Scorer
             score += 5;
 
         return score;
+    }
+
+    private static bool NameContainsCjk(string name)
+    {
+        foreach (var ch in name)
+        {
+            if (ch is >= '\u4E00' and <= '\u9FFF')
+                return true;
+        }
+        return false;
+    }
+
+    private static bool IsPreferredDocumentExtension(string ext)
+    {
+        return ext.Equals(".doc", StringComparison.OrdinalIgnoreCase)
+               || ext.Equals(".docx", StringComparison.OrdinalIgnoreCase)
+               || ext.Equals(".pdf", StringComparison.OrdinalIgnoreCase)
+               || ext.Equals(".xls", StringComparison.OrdinalIgnoreCase)
+               || ext.Equals(".xlsx", StringComparison.OrdinalIgnoreCase)
+               || ext.Equals(".ppt", StringComparison.OrdinalIgnoreCase)
+               || ext.Equals(".pptx", StringComparison.OrdinalIgnoreCase)
+               || ext.Equals(".txt", StringComparison.OrdinalIgnoreCase)
+               || ext.Equals(".md", StringComparison.OrdinalIgnoreCase)
+               || ext.Equals(".csv", StringComparison.OrdinalIgnoreCase)
+               || ext.Equals(".rtf", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsLowValueAsciiPinyinExtension(string ext)
+    {
+        return ext.Equals(".lnk", StringComparison.OrdinalIgnoreCase)
+               || ext.Equals(".png", StringComparison.OrdinalIgnoreCase)
+               || ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase)
+               || ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase)
+               || ext.Equals(".gif", StringComparison.OrdinalIgnoreCase)
+               || ext.Equals(".webp", StringComparison.OrdinalIgnoreCase)
+               || ext.Equals(".ico", StringComparison.OrdinalIgnoreCase);
     }
 }
 

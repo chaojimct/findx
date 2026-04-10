@@ -16,21 +16,13 @@ public sealed class EvalContext
     public int PathDepth;
     public bool CaseSensitive;
 
-    public void Reset(FileEntry entry, string fullPath)
+    public void Reset(FileEntry entry, string fullPath, int pathDepth)
     {
         Entry = entry;
         FullPath = fullPath;
         NameLower = entry.Name.ToLowerInvariant();
-        PathDepth = CountSeparators(fullPath);
+        PathDepth = pathDepth;
         CaseSensitive = false;
-    }
-
-    private static int CountSeparators(string path)
-    {
-        int count = 0;
-        foreach (var ch in path)
-            if (ch is '\\' or '/') count++;
-        return count;
     }
 }
 
@@ -103,6 +95,7 @@ public sealed class TermNode : QueryNode
     public readonly bool WholeWord;
     public readonly bool CaseSensitive;
     private readonly Regex? _wildcardRegex;
+    private readonly PinyinMatcher.PreparedQuery _preparedPinyinQuery;
 
     public TermNode(string pattern, bool isExact = false, bool wholeWord = false, bool caseSensitive = false)
     {
@@ -111,6 +104,7 @@ public sealed class TermNode : QueryNode
         WholeWord = wholeWord;
         CaseSensitive = caseSensitive;
         HasWildcard = pattern.Contains('*') || pattern.Contains('?');
+        _preparedPinyinQuery = caseSensitive ? default : PinyinMatcher.Prepare(pattern);
 
         if (HasWildcard)
         {
@@ -147,7 +141,7 @@ public sealed class TermNode : QueryNode
         if (CaseSensitive)
             return false;
 
-        var result = PinyinMatcher.Match(Pattern.ToLowerInvariant(), name);
+        var result = PinyinMatcher.Match(_preparedPinyinQuery, name);
         return result.IsMatch;
     }
 

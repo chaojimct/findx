@@ -1,3 +1,5 @@
+using System.Linq;
+using FindX.Core.FileSystem;
 using FindX.Core.Index;
 using FindX.Core.Pinyin;
 
@@ -9,9 +11,37 @@ namespace FindX.Core.Search;
 /// </summary>
 public sealed class SearchEngine
 {
-    private readonly FileIndex _index;
+    private readonly record struct CandidateHit(
+        int EntryIndex,
+        FileEntry Entry,
+        int Score,
+        PinyinMatcher.MatchType MatchType);
 
-    public SearchEngine(FileIndex index) => _index = index;
+    private static readonly string[] PinyinInitials =
+    [
+        "zh", "ch", "sh",
+        "b", "p", "m", "f", "d", "t", "n", "l",
+        "g", "k", "h", "j", "q", "x", "r", "z", "c", "s", "y", "w"
+    ];
+
+    private static readonly HashSet<string> PinyinFinals = new(StringComparer.Ordinal)
+    {
+        "a", "ai", "an", "ang", "ao",
+        "e", "ei", "en", "eng", "er",
+        "i", "ia", "ian", "iang", "iao", "ie", "in", "ing", "iong", "iu",
+        "o", "ong", "ou",
+        "u", "ua", "uai", "uan", "uang", "ue", "ui", "un", "uo",
+        "v", "van", "ve", "vn"
+    };
+
+    private readonly FileIndex _index;
+    private readonly Func<SearchPreferences>? _getPreferences;
+
+    public SearchEngine(FileIndex index, Func<SearchPreferences>? getPreferences = null)
+    {
+        _index = index;
+        _getPreferences = getPreferences;
+    }
 
     public List<SearchResult> Search(string query, int maxResults = 50, string? pathFilter = null)
     {
@@ -22,6 +52,9 @@ public sealed class SearchEngine
         bool hasTerms = parsed.Keywords.Count > 0;
         bool hasRegex = parsed.IsRegex;
         bool hasFilters = parsed.HasFilters;
+        bool needsMetadataForFilters = parsed.HasMetadataFilters;
+        bool needsFullPathForFiltering = QueryNeedsFullPath(parsed);
+        bool needsPathDepthForFiltering = QueryNeedsPathDepth(parsed);
 
         // 纯 filter 查询（如 "ext:cs size:>1mb"）没有搜索词，需全量扫描
         bool filterOnlyQuery = !hasTerms && !hasRegex && hasFilters;
@@ -32,83 +65,227 @@ public sealed class SearchEngine
         int effectiveMax = parsed.MaxCount.HasValue
             ? Math.Min(parsed.MaxCount.Value, maxResults)
             : maxResults;
+        var preferences = _getPreferences?.Invoke() ?? new SearchPreferences();
+        var preparedKeywords = parsed.Keywords
+            .Select(PinyinMatcher.Prepare)
+            .ToArray();
+        var preparedCombined = hasTerms
+            ? PinyinMatcher.Prepare(string.Concat(parsed.Keywords))
+            : default;
+        bool preferPinyinForAsciiQuery = preferences.PreferPinyinForAsciiQueries
+            && hasTerms
+            && KeywordsAreAsciiAlnum(parsed.Keywords);
 
         var candidates = GatherCandidates(parsed, effectiveMax, filterOnlyQuery);
-        var results = new List<SearchResult>();
-        var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var hits = new List<CandidateHit>();
+        var seenIndices = new HashSet<int>();
         var evalCtx = new EvalContext();
         int scoreBudget = Math.Max(effectiveMax * 5, 2000);
 
         foreach (var idx in candidates)
         {
-            if (results.Count >= scoreBudget) break;
+            if (hits.Count >= scoreBudget) break;
 
             var entry = _index.GetByIndex(idx);
             if (entry == null) continue;
+            if (!seenIndices.Add(idx)) continue;
 
-            string fullPath = _index.BuildFullPath(idx);
-            if (!seenPaths.Add(fullPath)) continue;
-            evalCtx.Reset(entry, fullPath);
+            if (TryEvaluateCandidate(
+                    parsed,
+                    idx,
+                    entry,
+                    hasTerms,
+                    hasFilters,
+                    hasRegex,
+                    needsMetadataForFilters,
+                    needsFullPathForFiltering,
+                    needsPathDepthForFiltering,
+                    preparedKeywords,
+                    preparedCombined,
+                    preferPinyinForAsciiQuery,
+                    evalCtx,
+                    out var hit))
+            {
+                hits.Add(hit);
+            }
+        }
 
+        if (hits.Count == 0)
+        {
+            int fallbackPool = Math.Min(FileIndex.PrefixSearchHitCap, Math.Max(effectiveMax * 20, 256));
+            foreach (var keyword in parsed.Keywords)
+            {
+                if (keyword.Length < 5 || !IsAsciiAlnum(keyword))
+                    continue;
+
+                foreach (var idx in _index.SearchMatchQuery(keyword.ToLowerInvariant(), fallbackPool))
+                {
+                    if (hits.Count >= scoreBudget) break;
+
+                    var entry = _index.GetByIndex(idx);
+                    if (entry == null) continue;
+                    if (!seenIndices.Add(idx)) continue;
+
+                    var preparedKeyword = PinyinMatcher.Prepare(keyword);
+                    if (TryEvaluateCandidate(
+                            parsed,
+                            idx,
+                            entry,
+                            hasTerms,
+                            hasFilters,
+                            hasRegex,
+                            needsMetadataForFilters,
+                            needsFullPathForFiltering,
+                            needsPathDepthForFiltering,
+                            [preparedKeyword],
+                            preparedKeyword,
+                            preferPinyinForAsciiQuery,
+                            evalCtx,
+                            out var hit))
+                    {
+                        hits.Add(hit);
+                    }
+                }
+
+                if (hits.Count > 0)
+                    break;
+            }
+        }
+
+        hits.Sort((a, b) => b.Score.CompareTo(a.Score));
+        if (hits.Count > effectiveMax)
+            hits.RemoveRange(effectiveMax, hits.Count - effectiveMax);
+
+        return MaterializeResults(hits, needsMetadataForFilters);
+    }
+
+    /// <summary>向后兼容：无 AST 时的旧过滤逻辑</summary>
+    private bool TryEvaluateCandidate(
+        ParsedQuery parsed,
+        int idx,
+        FileEntry entry,
+        bool hasTerms,
+        bool hasFilters,
+        bool hasRegex,
+        bool needsMetadataForFilters,
+        bool needsFullPathForFiltering,
+        bool needsPathDepthForFiltering,
+        IReadOnlyList<PinyinMatcher.PreparedQuery> preparedKeywords,
+        PinyinMatcher.PreparedQuery preparedCombined,
+        bool preferPinyinForAsciiQuery,
+        EvalContext evalCtx,
+        out CandidateHit hit)
+    {
+        int pathDepth = _index.GetPathDepth(idx);
+        if (pathDepth < 0)
+        {
+            hit = default;
+            return false;
+        }
+
+        string fullPath = string.Empty;
+        if (needsFullPathForFiltering || needsMetadataForFilters)
+        {
+            fullPath = _index.BuildFullPath(idx);
+            if (string.IsNullOrEmpty(fullPath))
+            {
+                hit = default;
+                return false;
+            }
+        }
+
+        if (needsMetadataForFilters)
+            entry = MaybeHydrateMetadata(entry, fullPath);
+
+        evalCtx.Reset(entry, fullPath, pathDepth);
+
+        if (parsed.Root != null)
+        {
+            if (!parsed.Root.Match(evalCtx))
+            {
+                hit = default;
+                return false;
+            }
+        }
+        else if (!LegacyFilter(parsed, entry, fullPath))
+        {
+            hit = default;
+            return false;
+        }
+
+        PinyinMatcher.MatchResult matchResult;
+        if (hasTerms)
+        {
             if (parsed.Root != null)
             {
-                if (!parsed.Root.Match(evalCtx))
-                    continue;
-            }
-            else
-            {
-                if (!LegacyFilter(parsed, entry, fullPath))
-                    continue;
-            }
+                int totalScore = 0;
+                int totalLen = 0;
+                var bestType = PinyinMatcher.MatchType.None;
 
-            PinyinMatcher.MatchResult matchResult;
-            if (hasTerms)
-            {
-                if (parsed.Root != null)
+                foreach (var preparedKeyword in preparedKeywords)
                 {
-                    int totalScore = 0;
-                    int totalLen = 0;
-                    var bestType = PinyinMatcher.MatchType.None;
-
-                    foreach (var kw in parsed.Keywords)
-                    {
-                        var mr = PinyinMatcher.Match(kw.ToLowerInvariant(), entry.Name);
-                        if (mr.IsMatch)
-                        {
-                            totalScore += mr.Score;
-                            totalLen += mr.MatchedChars;
-                            if (mr.Type > bestType) bestType = mr.Type;
-                        }
-                    }
-
-                    matchResult = totalScore > 0
-                        ? new PinyinMatcher.MatchResult(bestType, totalScore, totalLen)
-                        : new PinyinMatcher.MatchResult(PinyinMatcher.MatchType.None, 10, 0);
-                }
-                else
-                {
-                    var combinedLower = string.Join("", parsed.Keywords).ToLowerInvariant();
-                    matchResult = PinyinMatcher.Match(combinedLower, entry.Name);
-                    if (!matchResult.IsMatch && !hasFilters)
+                    var mr = PinyinMatcher.Match(preparedKeyword, entry.Name);
+                    if (!mr.IsMatch)
                         continue;
-                    if (!matchResult.IsMatch)
-                        matchResult = new PinyinMatcher.MatchResult(PinyinMatcher.MatchType.None, 0, 0);
+
+                    totalScore += mr.Score;
+                    totalLen += mr.MatchedChars;
+                    if (mr.Type > bestType) bestType = mr.Type;
                 }
-            }
-            else if (hasRegex && parsed.RegexPattern != null)
-            {
-                matchResult = parsed.RegexPattern.IsMatch(entry.Name)
-                    ? new PinyinMatcher.MatchResult(PinyinMatcher.MatchType.Exact, 500, entry.Name.Length)
-                    : PinyinMatcher.MatchResult.NoMatch;
-                if (!matchResult.IsMatch)
-                    continue;
+
+                matchResult = totalScore > 0
+                    ? new PinyinMatcher.MatchResult(bestType, totalScore, totalLen)
+                    : new PinyinMatcher.MatchResult(PinyinMatcher.MatchType.None, 10, 0);
             }
             else
             {
-                matchResult = new PinyinMatcher.MatchResult(PinyinMatcher.MatchType.Exact, 100, 0);
-            }
+                matchResult = PinyinMatcher.Match(preparedCombined, entry.Name);
+                if (!matchResult.IsMatch && !hasFilters)
+                {
+                    hit = default;
+                    return false;
+                }
 
-            var score = Scorer.Score(entry, fullPath, matchResult);
+                if (!matchResult.IsMatch)
+                    matchResult = new PinyinMatcher.MatchResult(PinyinMatcher.MatchType.None, 0, 0);
+            }
+        }
+        else if (hasRegex && parsed.RegexPattern != null)
+        {
+            matchResult = parsed.RegexPattern.IsMatch(entry.Name)
+                ? new PinyinMatcher.MatchResult(PinyinMatcher.MatchType.Exact, 500, entry.Name.Length)
+                : PinyinMatcher.MatchResult.NoMatch;
+            if (!matchResult.IsMatch)
+            {
+                hit = default;
+                return false;
+            }
+        }
+        else
+        {
+            matchResult = new PinyinMatcher.MatchResult(PinyinMatcher.MatchType.Exact, 100, 0);
+        }
+
+        hit = new CandidateHit(
+            idx,
+            entry,
+            Scorer.Score(entry, pathDepth, matchResult, preferPinyinForAsciiQuery),
+            matchResult.Type);
+        return true;
+    }
+
+    private List<SearchResult> MaterializeResults(List<CandidateHit> hits, bool alreadyHydrated)
+    {
+        var results = new List<SearchResult>(hits.Count);
+        foreach (var hit in hits)
+        {
+            var entry = hit.Entry;
+            string fullPath = _index.BuildFullPath(hit.EntryIndex);
+            if (string.IsNullOrEmpty(fullPath))
+                continue;
+
+            if (!alreadyHydrated)
+                entry = MaybeHydrateMetadata(entry, fullPath);
 
             results.Add(new SearchResult
             {
@@ -116,9 +293,9 @@ public sealed class SearchEngine
                 Name = entry.Name,
                 IsDirectory = entry.IsDirectory,
                 Size = entry.Size,
-                Score = score,
-                MatchType = matchResult.Type,
-                EntryIndex = idx,
+                Score = hit.Score,
+                MatchType = hit.MatchType,
+                EntryIndex = hit.EntryIndex,
                 LastWriteUtcTicks = entry.LastWriteTimeTicks,
                 LastModified = entry.LastWriteTimeTicks > 0
                     ? new DateTime(entry.LastWriteTimeTicks, DateTimeKind.Utc).ToLocalTime()
@@ -126,14 +303,41 @@ public sealed class SearchEngine
             });
         }
 
-        results.Sort((a, b) => b.Score.CompareTo(a.Score));
-        if (results.Count > effectiveMax)
-            results.RemoveRange(effectiveMax, results.Count - effectiveMax);
-
         return results;
     }
 
-    /// <summary>向后兼容：无 AST 时的旧过滤逻辑</summary>
+    private static bool QueryNeedsFullPath(ParsedQuery parsed)
+        => parsed.PathFilter != null || QueryNodeNeedsFullPath(parsed.Root);
+
+    private static bool QueryNeedsPathDepth(ParsedQuery parsed)
+        => QueryNodeNeedsPathDepth(parsed.Root);
+
+    private static bool QueryNodeNeedsFullPath(QueryNode? node)
+    {
+        return node switch
+        {
+            null => false,
+            FilterNode filter => filter.Type is FilterType.Path or FilterType.NoPath,
+            AndNode andNode => andNode.Children.Any(QueryNodeNeedsFullPath),
+            OrNode orNode => orNode.Children.Any(QueryNodeNeedsFullPath),
+            NotNode notNode => QueryNodeNeedsFullPath(notNode.Child),
+            _ => false,
+        };
+    }
+
+    private static bool QueryNodeNeedsPathDepth(QueryNode? node)
+    {
+        return node switch
+        {
+            null => false,
+            FilterNode filter => filter.Type is FilterType.Path or FilterType.NoPath or FilterType.Depth or FilterType.Root,
+            AndNode andNode => andNode.Children.Any(QueryNodeNeedsPathDepth),
+            OrNode orNode => orNode.Children.Any(QueryNodeNeedsPathDepth),
+            NotNode notNode => QueryNodeNeedsPathDepth(notNode.Child),
+            _ => false,
+        };
+    }
+
     private static bool LegacyFilter(ParsedQuery parsed, FileEntry entry, string fullPath)
     {
         if (parsed.ExtFilter != null)
@@ -150,6 +354,162 @@ public sealed class SearchEngine
         }
 
         return true;
+    }
+
+    private static bool KeywordsAreAsciiAlnum(IReadOnlyList<string> keywords)
+    {
+        if (keywords.Count == 0)
+            return false;
+
+        foreach (var keyword in keywords)
+        {
+            if (keyword.Length == 0)
+                return false;
+            foreach (var ch in keyword)
+            {
+                if (!char.IsAsciiLetterOrDigit(ch))
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    internal static bool IsAsciiAlnum(string value)
+    {
+        if (value.Length == 0)
+            return false;
+
+        foreach (var ch in value)
+        {
+            if (!char.IsAsciiLetterOrDigit(ch))
+                return false;
+        }
+
+        return true;
+    }
+
+    internal static bool ShouldUsePinyinSubstringExpansion(IReadOnlyList<string> keywords)
+    {
+        foreach (var keyword in keywords)
+        {
+            if (keyword.Length < 3)
+                continue;
+            if (IsAsciiAlnum(keyword))
+                return true;
+        }
+
+        return false;
+    }
+
+    internal static bool ShouldUseShortAsciiInitialsExpansion(IReadOnlyList<string> keywords)
+    {
+        foreach (var keyword in keywords)
+        {
+            if (keyword.Length != 2)
+                continue;
+            if (IsAsciiAlnum(keyword))
+                return true;
+        }
+
+        return false;
+    }
+
+    internal static bool TryBuildAsciiPinyinInitialsAnchor(string keyword, out string anchor)
+    {
+        anchor = string.Empty;
+        if (keyword.Length < 4 || !IsAsciiAlnum(keyword))
+            return false;
+
+        Span<char> buffer = stackalloc char[Math.Min(keyword.Length, 12)];
+        int count = 0;
+        var lower = keyword.ToLowerInvariant().AsSpan();
+        int pos = 0;
+        while (pos < lower.Length && count < buffer.Length)
+        {
+            int len = TryConsumePinyinTokenLength(lower[pos..]);
+            if (len <= 0)
+                break;
+
+            buffer[count++] = lower[pos];
+            pos += len;
+        }
+
+        if (count < 2)
+            return false;
+
+        anchor = new string(buffer[..count]);
+        return anchor.Length >= 2 && anchor.Length < keyword.Length;
+    }
+
+    internal static bool TryBuildAsciiPinyinTailToken(string keyword, out string tail)
+    {
+        tail = string.Empty;
+        if (keyword.Length < 4 || !IsAsciiAlnum(keyword))
+            return false;
+
+        var lower = keyword.ToLowerInvariant().AsSpan();
+        int pos = 0;
+        string? lastFullToken = null;
+        while (pos < lower.Length)
+        {
+            int len = TryConsumePinyinTokenLength(lower[pos..]);
+            if (len <= 0)
+                break;
+
+            var token = lower[pos..(pos + len)];
+            if (len >= 2 && IsValidPinyinSyllable(token))
+                lastFullToken = token.ToString();
+            pos += len;
+        }
+
+        if (string.IsNullOrEmpty(lastFullToken))
+            return false;
+
+        tail = lastFullToken;
+        return tail.Length >= 2 && tail.Length < keyword.Length;
+    }
+
+    private static bool IsAsciiVowel(char ch)
+        => ch is 'a' or 'e' or 'i' or 'o' or 'u' or 'v';
+
+    private static int TryConsumePinyinTokenLength(ReadOnlySpan<char> text)
+    {
+        int max = Math.Min(text.Length, 6);
+        for (int len = max; len >= 1; len--)
+        {
+            var token = text[..len];
+            if (IsValidPinyinSyllable(token))
+                return len;
+        }
+
+        if (text.Length >= 2 && text[0] is 'z' or 'c' or 's' && text[1] == 'h')
+            return 2;
+        return char.IsAsciiLetter(text[0]) ? 1 : 0;
+    }
+
+    private static bool IsValidPinyinSyllable(ReadOnlySpan<char> token)
+    {
+        if (token.IsEmpty)
+            return false;
+
+        var syllable = token.ToString();
+        if (PinyinFinals.Contains(syllable))
+            return true;
+
+        foreach (var initial in PinyinInitials)
+        {
+            if (!syllable.StartsWith(initial, StringComparison.Ordinal))
+                continue;
+            if (syllable.Length == initial.Length)
+                continue;
+
+            var final = syllable[initial.Length..];
+            if (PinyinFinals.Contains(final))
+                return true;
+        }
+
+        return false;
     }
 
     private HashSet<int> GatherCandidates(ParsedQuery parsed, int maxResults, bool filterOnly)
@@ -190,10 +550,7 @@ public sealed class SearchEngine
         int minAsciiKwLen = int.MaxValue;
         foreach (var kw in parsed.Keywords)
         {
-            bool ascii = true;
-            foreach (var c in kw)
-                if (!char.IsAsciiLetterOrDigit(c)) { ascii = false; break; }
-            if (ascii && kw.Length < minAsciiKwLen)
+            if (IsAsciiAlnum(kw) && kw.Length < minAsciiKwLen)
                 minAsciiKwLen = kw.Length;
         }
 
@@ -207,7 +564,7 @@ public sealed class SearchEngine
             foreach (var h in _index.SearchNamePrefix(lower, cap))
                 candidates.Add(h);
 
-            if (!lower.All(c => char.IsAsciiLetterOrDigit(c)))
+            if (!IsAsciiAlnum(lower))
                 continue;
 
             if (shortAscii && lower.Length <= 1) continue;
@@ -251,18 +608,29 @@ public sealed class SearchEngine
         }
 
         // ── 拼音子串补充扫描 ──
-        bool hasAsciiKw = false;
-        foreach (var kw in parsed.Keywords)
+        if (ShouldUsePinyinSubstringExpansion(parsed.Keywords))
         {
-            if (kw.Length < 2) continue;
-            bool ok = true;
-            foreach (var c in kw)
-                if (!char.IsAsciiLetterOrDigit(c)) { ok = false; break; }
-            if (ok) { hasAsciiKw = true; break; }
+            int substringCap = Math.Min(cap, 1024);
+            GatherPinyinSubstringCandidates(parsed.Keywords, candidates, substringCap);
+        }
+        else if (ShouldUseShortAsciiInitialsExpansion(parsed.Keywords))
+        {
+            int target = Math.Max(maxResults * 2, 64);
+            if (candidates.Count < target)
+            {
+                int shortfall = target - candidates.Count;
+                int addCap = Math.Clamp(shortfall, 64, 256);
+                GatherShortAsciiInitialsCandidates(parsed.Keywords, candidates, addCap);
+            }
         }
 
-        if (hasAsciiKw)
-            GatherPinyinSubstringCandidates(parsed.Keywords, candidates, cap);
+        int mixedTarget = Math.Max(maxResults, 32);
+        if (candidates.Count < mixedTarget)
+        {
+            int shortfall = mixedTarget - candidates.Count;
+            int addCap = Math.Clamp(shortfall * 8, 256, 2048);
+            GatherMixedAsciiAnchorCandidates(parsed.Keywords, candidates, addCap);
+        }
 
         // ── CJK 子串补充扫描 ──
         // SearchNamePrefix 只能命中文件名以关键词开头的条目；
@@ -305,11 +673,8 @@ public sealed class SearchEngine
 
         foreach (var kw in keywords)
         {
-            if (kw.Length < 2) continue;
-            bool allAscii = true;
-            foreach (var c in kw)
-                if (!char.IsAsciiLetterOrDigit(c)) { allAscii = false; break; }
-            if (!allAscii) continue;
+            if (kw.Length < 3 || !IsAsciiAlnum(kw))
+                continue;
 
             var kwLower = kw.ToLowerInvariant();
 
@@ -319,8 +684,121 @@ public sealed class SearchEngine
             if (kwLower.Length <= 5)
             {
                 foreach (var h in _index.SearchInitialsContains(kwLower, addCap))
-                    candidates.Add(h);
+                candidates.Add(h);
             }
+        }
+    }
+
+    private void GatherShortAsciiInitialsCandidates(
+        IReadOnlyList<string> keywords, HashSet<int> candidates, int addCap)
+    {
+        if (_index.IsInBulkLoad) return;
+
+        foreach (var kw in keywords)
+        {
+            if (kw.Length != 2 || !IsAsciiAlnum(kw))
+                continue;
+
+            var kwLower = kw.ToLowerInvariant();
+            foreach (var h in _index.SearchInitialsContains(kwLower, addCap))
+                candidates.Add(h);
+        }
+    }
+
+    private void GatherMixedAsciiAnchorCandidates(
+        IReadOnlyList<string> keywords, HashSet<int> candidates, int addCap)
+    {
+        if (_index.IsInBulkLoad) return;
+
+        foreach (var kw in keywords)
+        {
+            if (!TryBuildAsciiPinyinInitialsAnchor(kw, out var anchor))
+                continue;
+
+            int beforeCount = candidates.Count;
+            if (TryBuildAsciiPinyinTailToken(kw, out var tail))
+            {
+                var initialsHits = _index.SearchInitialsContains(anchor, addCap * 2);
+                var tailHits = _index.SearchFullPinyinContains(tail, addCap * 2);
+                if (initialsHits.Count > 0 && tailHits.Count > 0)
+                {
+                    var tailSet = new HashSet<int>(tailHits);
+                    int added = 0;
+                    foreach (var h in initialsHits)
+                    {
+                        if (!tailSet.Contains(h))
+                            continue;
+                        candidates.Add(h);
+                        added++;
+                        if (added >= addCap)
+                            break;
+                    }
+                    if (added > 0)
+                        continue;
+                }
+            }
+
+            if (kw.Length >= 5 && candidates.Count == beforeCount)
+            {
+                foreach (var h in _index.SearchFullPinyinFuzzy(kw.ToLowerInvariant(), addCap))
+                    candidates.Add(h);
+                if (candidates.Count > beforeCount)
+                    continue;
+            }
+
+            foreach (var h in _index.SearchInitialsContains(anchor, addCap))
+                candidates.Add(h);
+        }
+    }
+
+    private FileEntry MaybeHydrateMetadata(FileEntry entry, string fullPath)
+    {
+        if (!FileMetadataReader.NeedsHydration(entry))
+            return entry;
+        if (!FileMetadataReader.TryHydrate(fullPath, entry, out var hydrated))
+            return entry;
+
+        if (hydrated.Size == entry.Size
+            && hydrated.LastWriteTimeTicks == entry.LastWriteTimeTicks
+            && hydrated.CreationTimeTicks == entry.CreationTimeTicks
+            && hydrated.AccessTimeTicks == entry.AccessTimeTicks
+            && hydrated.Attributes == entry.Attributes)
+            return hydrated;
+
+        _index.UpsertEntry(hydrated);
+        return hydrated;
+    }
+
+    private void HydrateFinalResults(List<SearchResult> results)
+    {
+        for (int i = 0; i < results.Count; i++)
+        {
+            var result = results[i];
+            if (result.Size > 0 && result.LastWriteUtcTicks > 0)
+                continue;
+
+            var entry = _index.GetByIndex(result.EntryIndex);
+            if (entry == null)
+                continue;
+
+            var hydrated = MaybeHydrateMetadata(entry, result.FullPath);
+            if (hydrated.Size == result.Size && hydrated.LastWriteTimeTicks == result.LastWriteUtcTicks)
+                continue;
+
+            results[i] = new SearchResult
+            {
+                FullPath = result.FullPath,
+                Name = hydrated.Name,
+                IsDirectory = hydrated.IsDirectory,
+                Size = hydrated.Size,
+                Score = result.Score,
+                MatchType = result.MatchType,
+                EntryIndex = result.EntryIndex,
+                LastWriteUtcTicks = hydrated.LastWriteTimeTicks,
+                LastModified = hydrated.LastWriteTimeTicks > 0
+                    ? new DateTime(hydrated.LastWriteTimeTicks, DateTimeKind.Utc).ToLocalTime()
+                    : default,
+            };
         }
     }
 }

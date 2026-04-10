@@ -19,6 +19,7 @@ public sealed class ParsedQuery
     public QueryNode? Root;
     public int? MaxCount;
     public bool HasFilters;
+    public bool HasMetadataFilters;
 }
 
 /// <summary>
@@ -224,18 +225,22 @@ public static class QueryParser
 
             case "size":
                 q.HasFilters = true;
+                q.HasMetadataFilters = true;
                 return FilterNode.ParseSize(value);
 
             case "dm" or "datemodified":
                 q.HasFilters = true;
+                q.HasMetadataFilters = true;
                 return FilterNode.ParseDateModified(value);
 
             case "dc" or "datecreated":
                 q.HasFilters = true;
+                q.HasMetadataFilters = true;
                 return FilterNode.ParseDateCreated(value);
 
             case "da" or "dateaccessed":
                 q.HasFilters = true;
+                q.HasMetadataFilters = true;
                 return FilterNode.ParseDateAccessed(value);
 
             case "len":

@@ -1,6 +1,6 @@
 //! C ABI，供 FindX.Core P/Invoke。调用方需保证单线程或外加锁（与现版 C# FileIndex 一致）。
 
-use crate::engine::{pool_utf8, Engine};
+use crate::engine::{highlight_query_ranges, match_query, pool_utf8, Engine};
 use std::ffi::c_void;
 
 const EPOCH_2000_TICKS: i64 = 630_822_816_000_000_000;
@@ -354,6 +354,131 @@ pub unsafe extern "C" fn findx_engine_search_initials_contains(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn findx_engine_search_full_py_fuzzy(
+    p: *mut EngineBox,
+    needle_utf8: *const u8,
+    needle_len: i32,
+    out_indices: *mut u32,
+    out_cap: i32,
+) -> i32 {
+    let b = match as_box(p) {
+        Some(x) => x,
+        None => return -1,
+    };
+    if needle_utf8.is_null() || needle_len < 0 || out_indices.is_null() || out_cap <= 0 {
+        return -2;
+    }
+    let needle =
+        std::str::from_utf8(std::slice::from_raw_parts(needle_utf8, needle_len as usize))
+            .unwrap_or("");
+    b.inner
+        .search_full_py_fuzzy(needle, &mut b.scratch_idx, out_cap as usize);
+    let n = b.scratch_idx.len();
+    let ncpy = n.min(out_cap as usize);
+    std::ptr::copy_nonoverlapping(b.scratch_idx.as_ptr(), out_indices, ncpy);
+    ncpy as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn findx_engine_search_match_query(
+    p: *mut EngineBox,
+    query_utf8: *const u8,
+    query_len: i32,
+    out_indices: *mut u32,
+    out_cap: i32,
+) -> i32 {
+    let b = match as_box(p) {
+        Some(x) => x,
+        None => return -1,
+    };
+    if query_utf8.is_null() || query_len < 0 || out_indices.is_null() || out_cap <= 0 {
+        return -2;
+    }
+    let query =
+        std::str::from_utf8(std::slice::from_raw_parts(query_utf8, query_len as usize))
+            .unwrap_or("");
+    b.inner
+        .search_query_matches(query, &mut b.scratch_idx, out_cap as usize);
+    let n = b.scratch_idx.len();
+    let ncpy = n.min(out_cap as usize);
+    std::ptr::copy_nonoverlapping(b.scratch_idx.as_ptr(), out_indices, ncpy);
+    ncpy as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn findx_match_name_utf8(
+    query_utf8: *const u8,
+    query_len: i32,
+    candidate_utf8: *const u8,
+    candidate_len: i32,
+    out_kind: *mut i32,
+    out_score: *mut i32,
+    out_matched_chars: *mut i32,
+) -> i32 {
+    if query_utf8.is_null()
+        || query_len < 0
+        || candidate_utf8.is_null()
+        || candidate_len < 0
+        || out_kind.is_null()
+        || out_score.is_null()
+        || out_matched_chars.is_null()
+    {
+        return -1;
+    }
+
+    let query =
+        std::str::from_utf8(std::slice::from_raw_parts(query_utf8, query_len as usize))
+            .unwrap_or("");
+    let candidate =
+        std::str::from_utf8(std::slice::from_raw_parts(candidate_utf8, candidate_len as usize))
+            .unwrap_or("");
+    let result = match_query(query, candidate);
+
+    *out_kind = result.kind as i32;
+    *out_score = result.score;
+    *out_matched_chars = result.matched_chars;
+    if result.is_match() { 1 } else { 0 }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn findx_highlight_name_utf8(
+    query_utf8: *const u8,
+    query_len: i32,
+    candidate_utf8: *const u8,
+    candidate_len: i32,
+    out_ranges: *mut i32,
+    out_pair_cap: i32,
+) -> i32 {
+    if query_utf8.is_null()
+        || query_len < 0
+        || candidate_utf8.is_null()
+        || candidate_len < 0
+        || out_ranges.is_null()
+        || out_pair_cap < 0
+    {
+        return -1;
+    }
+
+    let query =
+        std::str::from_utf8(std::slice::from_raw_parts(query_utf8, query_len as usize))
+            .unwrap_or("");
+    let candidate =
+        std::str::from_utf8(std::slice::from_raw_parts(candidate_utf8, candidate_len as usize))
+            .unwrap_or("");
+    let ranges = highlight_query_ranges(query, candidate);
+    let pair_cap = out_pair_cap as usize;
+    let copy_count = ranges.len().min(pair_cap);
+    let out = std::slice::from_raw_parts_mut(out_ranges, pair_cap.saturating_mul(2));
+
+    for i in 0..copy_count {
+        out[i * 2] = ranges[i].0;
+        out[i * 2 + 1] = ranges[i].1;
+    }
+
+    copy_count as i32
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn findx_engine_get_name_utf16_len(p: *const EngineBox, idx: i32) -> i32 {
     if p.is_null() {
         return -1;
@@ -464,6 +589,14 @@ pub unsafe extern "C" fn findx_engine_get_live_record(
     1
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn findx_engine_get_path_depth(p: *const EngineBox, idx: i32) -> i32 {
+    if p.is_null() {
+        return -1;
+    }
+    (*p).inner.get_path_depth(idx)
+}
+
 pub type VisitLiveFn =
     Option<unsafe extern "system" fn(user: *mut c_void, idx: i32) -> i32>;
 
@@ -561,9 +694,21 @@ pub unsafe extern "C" fn findx_engine_for_each_persist(
         let nm = pool_utf8(&eng.name_pool, r.name_start, r.name_len as u32);
         let name_utf16: Vec<u16> = nm.encode_utf16().collect();
         let size_i64 = r.size as i64;
-        let mtime_i64 = EPOCH_2000_TICKS + (r.mtime as i64) * TICKS_PER_SEC;
-        let ctime_i64 = EPOCH_2000_TICKS + (r.ctime as i64) * TICKS_PER_SEC;
-        let atime_i64 = EPOCH_2000_TICKS + (r.atime as i64) * TICKS_PER_SEC;
+        let mtime_i64 = if r.mtime == 0 {
+            0
+        } else {
+            EPOCH_2000_TICKS + (r.mtime as i64) * TICKS_PER_SEC
+        };
+        let ctime_i64 = if r.ctime == 0 {
+            0
+        } else {
+            EPOCH_2000_TICKS + (r.ctime as i64) * TICKS_PER_SEC
+        };
+        let atime_i64 = if r.atime == 0 {
+            0
+        } else {
+            EPOCH_2000_TICKS + (r.atime as i64) * TICKS_PER_SEC
+        };
         let _ = cb(
             user,
             r.file_ref,

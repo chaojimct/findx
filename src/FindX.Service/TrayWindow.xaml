@@ -35,8 +35,15 @@
             </DockPanel>
         </Border>
 
-        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,8">
-            <CheckBox x:Name="AutoStartCheck" Content="开机自启" Checked="AutoStart_Changed" Unchecked="AutoStart_Changed"/>
+        <StackPanel Grid.Row="2" Margin="0,0,0,8">
+            <CheckBox x:Name="AutoStartCheck" Content="开机自启"
+                      Checked="AutoStart_Changed"
+                      Unchecked="AutoStart_Changed"/>
+            <CheckBox x:Name="PreferPinyinSortCheck"
+                      Content="ASCII 查询时优先拼音结果（默认开启）"
+                      Margin="0,8,0,0"
+                      Checked="PreferPinyinSort_Changed"
+                      Unchecked="PreferPinyinSort_Changed"/>
         </StackPanel>
 
         <ListBox x:Name="LogList" Grid.Row="3" FontSize="11" FontFamily="Consolas"

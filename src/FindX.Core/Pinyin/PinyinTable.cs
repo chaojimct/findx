@@ -133,6 +133,7 @@ public static class PinyinTable
         SetMulti('乘', "cheng", "sheng");
         SetMulti('藏', "cang", "zang");
         SetMulti('薄', "bao", "bo", "bo");
+        Set('报', "bao");
         SetMulti('弹', "dan", "tan");
         SetMulti('担', "dan", "dan");
         SetMulti('角', "jiao", "jue");

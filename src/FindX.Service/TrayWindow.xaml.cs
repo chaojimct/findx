@@ -55,6 +55,7 @@ public partial class TrayWindow : Window
         _refreshTimer.Start();
 
         AutoStartCheck.IsChecked = _host.IsAutoStartEnabled();
+        PreferPinyinSortCheck.IsChecked = _host.PreferPinyinForAsciiQueries;
     }
 
     private void ShowWindow()
@@ -287,6 +288,11 @@ public partial class TrayWindow : Window
     private void AutoStart_Changed(object sender, RoutedEventArgs e)
     {
         _host.SetAutoStart(AutoStartCheck.IsChecked == true);
+    }
+
+    private void PreferPinyinSort_Changed(object sender, RoutedEventArgs e)
+    {
+        _host.SetPreferPinyinForAsciiQueries(PreferPinyinSortCheck.IsChecked == true);
     }
 
     private async void Reindex_Click(object sender, RoutedEventArgs e)

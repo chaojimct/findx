@@ -4,7 +4,6 @@ using System.Threading;
 using FindX.Core.FileSystem;
 using FindX.Core.Interop;
 using FindX.Core.Index;
-using FindX.Core.Pinyin;
 using FindX.Core.Search;
 using FindX.Core.Storage;
 using FindX.Core.Update;
@@ -23,6 +22,8 @@ public sealed class ServiceHost : IDisposable
     private readonly VolumeScanner _scanner;
     private readonly JournalWatcher _journalWatcher;
     private readonly FallbackWatcher _fallbackWatcher;
+    private readonly object _settingsLock = new();
+    private readonly UserSettings _settings;
     private IpcServer? _ipcServer;
     private EverythingIpcServer? _everythingIpc;
 
@@ -42,9 +43,14 @@ public sealed class ServiceHost : IDisposable
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "FindX", "findx.log");
 
+    private string SettingsPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "FindX", "settings.json");
+
     public ServiceHost()
     {
-        _searchEngine = new SearchEngine(_index);
+        _settings = UserSettingsStore.Load(SettingsPath);
+        _searchEngine = new SearchEngine(_index, GetSearchPreferencesSnapshot);
         _scanner = new VolumeScanner(_index);
         _journalWatcher = new JournalWatcher(_index);
         _fallbackWatcher = new FallbackWatcher(_index);
@@ -56,7 +62,6 @@ public sealed class ServiceHost : IDisposable
 
     public void Run(string[] args)
     {
-        PinyinTable.EnsureInitialized();
         Log("FindX 服务启动中...");
         VolumeAccessHelper.PrepareOnce(Log);
 
@@ -359,6 +364,27 @@ public sealed class ServiceHost : IDisposable
 
     public UpdateInfo? LatestUpdateInfo => _latestUpdateInfo;
 
+    public bool PreferPinyinForAsciiQueries
+    {
+        get
+        {
+            lock (_settingsLock)
+                return _settings.PreferPinyinForAsciiQueries;
+        }
+    }
+
+    public void SetPreferPinyinForAsciiQueries(bool value)
+    {
+        lock (_settingsLock)
+        {
+            if (_settings.PreferPinyinForAsciiQueries == value)
+                return;
+            _settings.PreferPinyinForAsciiQueries = value;
+            SaveSettings();
+        }
+        Log($"拼音优先排序: {(value ? "开启" : "关闭")}");
+    }
+
     public async Task<UpdateInfo?> CheckForUpdateAsync()
     {
         try
@@ -440,5 +466,23 @@ public sealed class ServiceHost : IDisposable
         _fallbackWatcher.Dispose();
         _ipcServer?.Dispose();
         _updateChecker.Dispose();
+    }
+
+    private SearchPreferences GetSearchPreferencesSnapshot()
+    {
+        lock (_settingsLock)
+            return _settings.ToSearchPreferences();
+    }
+
+    private void SaveSettings()
+    {
+        try
+        {
+            UserSettingsStore.Save(SettingsPath, _settings);
+        }
+        catch (Exception ex)
+        {
+            Log($"保存设置失败: {ex.Message}");
+        }
     }
 }

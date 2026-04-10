@@ -425,6 +425,86 @@ public sealed class FileIndex
         }
     }
 
+    public List<int> SearchFullPinyinFuzzy(string needle, int maxResults)
+    {
+        if (maxResults <= 0 || string.IsNullOrEmpty(needle))
+            return new List<int>();
+
+        var rent = ArrayPool<uint>.Shared.Rent(SearchIndexCap);
+        var utfRent = ArrayPool<byte>.Shared.Rent(Math.Max(1024, Encoding.UTF8.GetMaxByteCount(needle.Length)));
+        try
+        {
+            int blen = Encoding.UTF8.GetBytes(needle.AsSpan(), utfRent);
+            int rc;
+            _lock.EnterReadLock();
+            try
+            {
+                unsafe
+                {
+                    fixed (byte* pb = utfRent)
+                    fixed (uint* po = rent)
+                    {
+                        rc = RustIndexNative.findx_engine_search_full_py_fuzzy(_engine, (IntPtr)pb, blen, (IntPtr)po,
+                            SearchIndexCap);
+                    }
+                }
+            }
+            finally { _lock.ExitReadLock(); }
+
+            if (rc < 0) return new List<int>();
+            var list = new List<int>(Math.Min(rc, maxResults));
+            int take = Math.Min(rc, maxResults);
+            for (int i = 0; i < take; i++)
+                list.Add((int)rent[i]);
+            return list;
+        }
+        finally
+        {
+            ArrayPool<uint>.Shared.Return(rent);
+            ArrayPool<byte>.Shared.Return(utfRent);
+        }
+    }
+
+    public List<int> SearchMatchQuery(string query, int maxResults)
+    {
+        if (maxResults <= 0 || string.IsNullOrEmpty(query))
+            return new List<int>();
+
+        var rent = ArrayPool<uint>.Shared.Rent(SearchIndexCap);
+        var utfRent = ArrayPool<byte>.Shared.Rent(Math.Max(1024, Encoding.UTF8.GetMaxByteCount(query.Length)));
+        try
+        {
+            int blen = Encoding.UTF8.GetBytes(query.AsSpan(), utfRent);
+            int rc;
+            _lock.EnterReadLock();
+            try
+            {
+                unsafe
+                {
+                    fixed (byte* pb = utfRent)
+                    fixed (uint* po = rent)
+                    {
+                        rc = RustIndexNative.findx_engine_search_match_query(_engine, (IntPtr)pb, blen, (IntPtr)po,
+                            SearchIndexCap);
+                    }
+                }
+            }
+            finally { _lock.ExitReadLock(); }
+
+            if (rc < 0) return new List<int>();
+            var list = new List<int>(Math.Min(rc, maxResults));
+            int take = Math.Min(rc, maxResults);
+            for (int i = 0; i < take; i++)
+                list.Add((int)rent[i]);
+            return list;
+        }
+        finally
+        {
+            ArrayPool<uint>.Shared.Return(rent);
+            ArrayPool<byte>.Shared.Return(utfRent);
+        }
+    }
+
     public void ForEachLiveEntry(Func<FileEntry, int, bool> visitor)
     {
         _lock.EnterReadLock();
@@ -478,6 +558,16 @@ public sealed class FileIndex
                     return new string(span[..n]);
                 }
             }
+        }
+        finally { _lock.ExitReadLock(); }
+    }
+
+    public int GetPathDepth(int idx)
+    {
+        _lock.EnterReadLock();
+        try
+        {
+            return RustIndexNative.findx_engine_get_path_depth(_engine, idx);
         }
         finally { _lock.ExitReadLock(); }
     }
@@ -641,7 +731,6 @@ public sealed class FileIndex
                     AccessTimeTicks = at_time,
                     VolumeLetter = (char)vol,
                     IsDeleted = false,
-                    PinyinInitials = "",
                 };
             }
         }

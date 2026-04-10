@@ -21,8 +21,12 @@ fn mtime_to_compact(ticks: i64) -> u32 {
 }
 
 #[inline]
-fn compact_to_mtime(c: u32) -> i64 {
-    EPOCH_2000_TICKS + (c as i64) * TICKS_PER_SEC
+fn compact_to_ticks_or_zero(c: u32) -> i64 {
+    if c == 0 {
+        0
+    } else {
+        EPOCH_2000_TICKS + (c as i64) * TICKS_PER_SEC
+    }
 }
 
 #[inline]
@@ -140,6 +144,36 @@ fn contains_chars_lower(hay: &str, needle_low: &[char]) -> bool {
     false
 }
 
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchKind {
+    None = 0,
+    Initials = 1,
+    FullPinyin = 2,
+    Mixed = 3,
+    Exact = 4,
+    Prefix = 5,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueryMatch {
+    pub kind: MatchKind,
+    pub score: i32,
+    pub matched_chars: i32,
+}
+
+impl QueryMatch {
+    pub const NO_MATCH: Self = Self {
+        kind: MatchKind::None,
+        score: 0,
+        matched_chars: 0,
+    };
+
+    pub fn is_match(&self) -> bool {
+        self.kind != MatchKind::None
+    }
+}
+
 fn cmp_name_str_ignore_case(a: &str, b: &str) -> Ordering {
     let mut ai = a.chars().flat_map(|c| c.to_lowercase());
     let mut bi = b.chars().flat_map(|c| c.to_lowercase());
@@ -233,6 +267,399 @@ fn compute_full_py_stack(name: &str) -> ([u8; 1024], usize) {
         }
     }
     (buf, len)
+}
+
+pub fn match_query(query_lower: &str, candidate: &str) -> QueryMatch {
+    if query_lower.is_empty() || candidate.is_empty() {
+        return QueryMatch::NO_MATCH;
+    }
+
+    let candidate_lower = candidate.to_lowercase();
+    let query_chars = query_lower.chars().count() as i32;
+
+    if candidate_lower == query_lower {
+        return QueryMatch {
+            kind: MatchKind::Exact,
+            score: 1000,
+            matched_chars: candidate.chars().count() as i32,
+        };
+    }
+
+    if candidate_lower.starts_with(query_lower) {
+        return QueryMatch {
+            kind: MatchKind::Prefix,
+            score: 800,
+            matched_chars: query_chars,
+        };
+    }
+
+    if candidate_lower.contains(query_lower) {
+        return QueryMatch {
+            kind: MatchKind::Prefix,
+            score: 600,
+            matched_chars: query_chars,
+        };
+    }
+
+    let query_bytes = query_lower.as_bytes();
+    if !name_contains_cjk(candidate) {
+        let fuzzy = fuzzy_match_bytes(query_bytes, candidate_lower.as_bytes());
+        return if fuzzy > 0 {
+            QueryMatch {
+                kind: MatchKind::Mixed,
+                score: fuzzy,
+                matched_chars: query_chars,
+            }
+        } else {
+            QueryMatch::NO_MATCH
+        };
+    }
+
+    if !query_lower.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return if candidate_lower.contains(query_lower) {
+            QueryMatch {
+                kind: MatchKind::Prefix,
+                score: 700,
+                matched_chars: query_chars,
+            }
+        } else {
+            QueryMatch::NO_MATCH
+        };
+    }
+
+    let (full_buf, full_len) = compute_full_py_stack(candidate);
+    let full_py = &full_buf[..full_len];
+    if starts_with_ignore_case_bytes(full_py, query_bytes) {
+        return QueryMatch {
+            kind: MatchKind::FullPinyin,
+            score: 520,
+            matched_chars: query_chars,
+        };
+    }
+    if contains_ignore_case_bytes(full_py, query_bytes) {
+        return QueryMatch {
+            kind: MatchKind::FullPinyin,
+            score: 420,
+            matched_chars: query_chars,
+        };
+    }
+
+    let (initials_buf, initials_len) = compute_initials_stack(candidate);
+    let initials = &initials_buf[..initials_len];
+    if starts_with_ignore_case_bytes(initials, query_bytes) {
+        return QueryMatch {
+            kind: MatchKind::Initials,
+            score: 400,
+            matched_chars: query_chars,
+        };
+    }
+    if contains_ignore_case_bytes(initials, query_bytes) {
+        return QueryMatch {
+            kind: MatchKind::Initials,
+            score: 300,
+            matched_chars: query_chars,
+        };
+    }
+
+    let fuzzy = fuzzy_match_bytes(query_bytes, full_py);
+    if fuzzy > 0 {
+        return QueryMatch {
+            kind: MatchKind::Mixed,
+            score: 200 + fuzzy,
+            matched_chars: query_chars,
+        };
+    }
+
+    QueryMatch::NO_MATCH
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Utf16CharSpan {
+    start: i32,
+    len: i32,
+}
+
+fn utf16_char_spans(value: &str) -> Vec<Utf16CharSpan> {
+    let mut spans = Vec::with_capacity(value.chars().count());
+    let mut start = 0i32;
+    for ch in value.chars() {
+        let len = ch.len_utf16() as i32;
+        spans.push(Utf16CharSpan { start, len });
+        start += len;
+    }
+    spans
+}
+
+fn lower_chars_with_owners(value: &str) -> (Vec<char>, Vec<usize>) {
+    let mut lower = Vec::new();
+    let mut owners = Vec::new();
+    for (char_idx, ch) in value.chars().enumerate() {
+        for lc in ch.to_lowercase() {
+            lower.push(lc);
+            owners.push(char_idx);
+        }
+    }
+    (lower, owners)
+}
+
+fn merge_ranges(ranges: &mut Vec<(i32, i32)>) {
+    if ranges.len() <= 1 {
+        return;
+    }
+
+    ranges.sort_by_key(|&(start, _)| start);
+    let mut merged: Vec<(i32, i32)> = Vec::with_capacity(ranges.len());
+    for &(start, len) in ranges.iter() {
+        if len <= 0 {
+            continue;
+        }
+
+        if let Some(last) = merged.last_mut() {
+            let last_end = last.0 + last.1;
+            let cur_end = start + len;
+            if start <= last_end {
+                last.1 = last_end.max(cur_end) - last.0;
+                continue;
+            }
+        }
+
+        merged.push((start, len));
+    }
+
+    *ranges = merged;
+}
+
+fn add_owner_indices_as_ranges(owner_indices: &[usize], spans: &[Utf16CharSpan], ranges: &mut Vec<(i32, i32)>) {
+    if owner_indices.is_empty() {
+        return;
+    }
+
+    let mut owners = owner_indices.to_vec();
+    owners.sort_unstable();
+    owners.dedup();
+
+    let mut run_start = spans[owners[0]].start;
+    let mut run_end = spans[owners[0]].start + spans[owners[0]].len;
+
+    for &owner in owners.iter().skip(1) {
+        let span = spans[owner];
+        if span.start <= run_end {
+            run_end = run_end.max(span.start + span.len);
+            continue;
+        }
+
+        ranges.push((run_start, run_end - run_start));
+        run_start = span.start;
+        run_end = span.start + span.len;
+    }
+
+    ranges.push((run_start, run_end - run_start));
+}
+
+fn add_literal_ranges(query_lower: &str, candidate: &str, spans: &[Utf16CharSpan], ranges: &mut Vec<(i32, i32)>) -> bool {
+    let needle: Vec<char> = query_lower.chars().collect();
+    if needle.is_empty() {
+        return false;
+    }
+
+    let (hay_lower, owners) = lower_chars_with_owners(candidate);
+    if needle.len() > hay_lower.len() {
+        return false;
+    }
+
+    let mut found = false;
+    'outer: for start in 0..=(hay_lower.len() - needle.len()) {
+        for j in 0..needle.len() {
+            if hay_lower[start + j] != needle[j] {
+                continue 'outer;
+            }
+        }
+        add_owner_indices_as_ranges(&owners[start..start + needle.len()], spans, ranges);
+        found = true;
+    }
+
+    found
+}
+
+fn build_initials_with_owners(name: &str) -> (Vec<u8>, Vec<usize>) {
+    let has_cjk = name_contains_cjk(name);
+    let mut initials = Vec::with_capacity(256);
+    let mut owners = Vec::with_capacity(256);
+
+    for (char_idx, ch) in name.chars().enumerate() {
+        if initials.len() >= 256 {
+            break;
+        }
+
+        if ch.is_ascii_alphanumeric() {
+            initials.push(ch.to_ascii_lowercase() as u8);
+            owners.push(char_idx);
+        } else if has_cjk {
+            if let Some(py) = ch.to_pinyin() {
+                if let Some(b) = py.plain().bytes().next() {
+                    initials.push(b);
+                    owners.push(char_idx);
+                }
+            }
+        }
+    }
+
+    (initials, owners)
+}
+
+fn build_full_py_with_owners(name: &str) -> (Vec<u8>, Vec<usize>) {
+    let mut full_py = Vec::with_capacity(1024);
+    let mut owners = Vec::with_capacity(1024);
+
+    for (char_idx, ch) in name.chars().enumerate() {
+        if full_py.len() >= 1024 {
+            break;
+        }
+
+        if ch.is_ascii_alphanumeric() {
+            full_py.push(ch.to_ascii_lowercase() as u8);
+            owners.push(char_idx);
+        } else if let Some(py) = ch.to_pinyin() {
+            for b in py.plain().bytes() {
+                if full_py.len() >= 1024 {
+                    break;
+                }
+                full_py.push(b);
+                owners.push(char_idx);
+            }
+        }
+    }
+
+    (full_py, owners)
+}
+
+fn find_first_ignore_case_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    let hl = hay.len();
+    let nl = needle.len();
+    if nl == 0 || nl > hl {
+        return None;
+    }
+
+    let first = needle[0].to_ascii_lowercase();
+    'outer: for start in 0..=(hl - nl) {
+        if hay[start].to_ascii_lowercase() != first {
+            continue;
+        }
+        for j in 1..nl {
+            if hay[start + j].to_ascii_lowercase() != needle[j].to_ascii_lowercase() {
+                continue 'outer;
+            }
+        }
+        return Some(start);
+    }
+
+    None
+}
+
+fn add_bytes_match_ranges(
+    owners: &[usize],
+    start: usize,
+    len: usize,
+    spans: &[Utf16CharSpan],
+    ranges: &mut Vec<(i32, i32)>,
+) {
+    if len == 0 || start + len > owners.len() {
+        return;
+    }
+    add_owner_indices_as_ranges(&owners[start..start + len], spans, ranges);
+}
+
+fn add_ascii_subsequence_ranges(query: &[u8], candidate: &str, spans: &[Utf16CharSpan], ranges: &mut Vec<(i32, i32)>) -> bool {
+    let mut query_idx = 0usize;
+    let mut owners = Vec::with_capacity(query.len());
+
+    for (char_idx, ch) in candidate.chars().enumerate() {
+        if query_idx >= query.len() {
+            break;
+        }
+        if ch.is_ascii() && ch.to_ascii_lowercase() as u8 == query[query_idx] {
+            owners.push(char_idx);
+            query_idx += 1;
+        }
+    }
+
+    if query_idx == query.len() {
+        add_owner_indices_as_ranges(&owners, spans, ranges);
+        true
+    } else {
+        false
+    }
+}
+
+fn add_fuzzy_owner_ranges(
+    query: &[u8],
+    hay: &[u8],
+    owners: &[usize],
+    spans: &[Utf16CharSpan],
+    ranges: &mut Vec<(i32, i32)>,
+) -> bool {
+    let mut query_idx = 0usize;
+    let mut matched_owners = Vec::with_capacity(query.len());
+
+    for (idx, &b) in hay.iter().enumerate() {
+        if query_idx >= query.len() {
+            break;
+        }
+        if b.to_ascii_lowercase() == query[query_idx] {
+            matched_owners.push(owners[idx]);
+            query_idx += 1;
+        }
+    }
+
+    if query_idx == query.len() {
+        add_owner_indices_as_ranges(&matched_owners, spans, ranges);
+        true
+    } else {
+        false
+    }
+}
+
+pub fn highlight_query_ranges(query_lower: &str, candidate: &str) -> Vec<(i32, i32)> {
+    if query_lower.is_empty() || candidate.is_empty() {
+        return Vec::new();
+    }
+
+    let spans = utf16_char_spans(candidate);
+    let mut ranges = Vec::new();
+    let literal_found = add_literal_ranges(query_lower, candidate, &spans, &mut ranges);
+    if literal_found {
+        merge_ranges(&mut ranges);
+        return ranges;
+    }
+
+    let query_bytes = query_lower.as_bytes();
+    if !query_lower.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return ranges;
+    }
+
+    if !name_contains_cjk(candidate) {
+        add_ascii_subsequence_ranges(query_bytes, candidate, &spans, &mut ranges);
+        merge_ranges(&mut ranges);
+        return ranges;
+    }
+
+    let (full_py, full_owners) = build_full_py_with_owners(candidate);
+    if let Some(start) = find_first_ignore_case_bytes(&full_py, query_bytes) {
+        add_bytes_match_ranges(&full_owners, start, query_bytes.len(), &spans, &mut ranges);
+        merge_ranges(&mut ranges);
+        return ranges;
+    }
+
+    let (initials, initials_owners) = build_initials_with_owners(candidate);
+    if let Some(start) = find_first_ignore_case_bytes(&initials, query_bytes) {
+        add_bytes_match_ranges(&initials_owners, start, query_bytes.len(), &spans, &mut ranges);
+        merge_ranges(&mut ranges);
+        return ranges;
+    }
+
+    add_fuzzy_owner_ranges(query_bytes, &full_py, &full_owners, &spans, &mut ranges);
+    merge_ranges(&mut ranges);
+    ranges
 }
 
 
@@ -898,6 +1325,36 @@ impl Engine {
         0
     }
 
+    pub fn get_path_depth(&self, idx: i32) -> i32 {
+        if idx < 0 || idx as usize >= self.records.len() {
+            return -1;
+        }
+
+        let mut cur = idx as u32;
+        let mut visited = HashSet::new();
+        let mut depth = 1i32; // drive root, e.g. C:
+
+        loop {
+            if !visited.insert(cur) {
+                return -1;
+            }
+
+            let r = match self.records.get(cur as usize) {
+                Some(x) if x.deleted == 0 => x,
+                _ => return -1,
+            };
+
+            depth += 1; // current segment
+            let pidx = r.parent_idx;
+            if pidx != u32::MAX && pidx != cur {
+                cur = pidx;
+                continue;
+            }
+
+            return depth;
+        }
+    }
+
     pub fn get_meta(
         &self,
         idx: i32,
@@ -913,7 +1370,7 @@ impl Engine {
             return false;
         }
         *out_size = r.size as i64;
-        *out_mtime = compact_to_mtime(r.mtime);
+        *out_mtime = compact_to_ticks_or_zero(r.mtime);
         *out_attr = r.attr;
         true
     }
@@ -942,9 +1399,9 @@ impl Engine {
         *out_vol = r.vol as u16;
         *out_attr = r.attr;
         *out_size = r.size as i64;
-        *out_mtime = compact_to_mtime(r.mtime);
-        *out_ctime = compact_to_mtime(r.ctime);
-        *out_atime = compact_to_mtime(r.atime);
+        *out_mtime = compact_to_ticks_or_zero(r.mtime);
+        *out_ctime = compact_to_ticks_or_zero(r.ctime);
+        *out_atime = compact_to_ticks_or_zero(r.atime);
         true
     }
 
@@ -1033,6 +1490,88 @@ impl Engine {
         }
     }
 
+    pub fn search_full_py_fuzzy(&self, needle: &str, out: &mut Vec<u32>, max_results: usize) {
+        out.clear();
+        if max_results == 0 || needle.is_empty() {
+            return;
+        }
+
+        let needle_bytes = needle.as_bytes();
+        let mut best: Vec<(i32, u32)> = Vec::with_capacity(max_results.min(256));
+        for (i, r) in self.records.iter().enumerate() {
+            if r.deleted != 0 {
+                continue;
+            }
+
+            let name = pool_utf8(&self.name_pool, r.name_start, r.name_len as u32);
+            if !name_contains_cjk(name) {
+                continue;
+            }
+
+            let (buf, len) = compute_full_py_stack(name);
+            let full_py = &buf[..len];
+            let score = fuzzy_match_bytes(needle_bytes, full_py);
+            if score <= 0 {
+                continue;
+            }
+
+            if best.len() < max_results {
+                best.push((score, i as u32));
+                best.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+                continue;
+            }
+
+            if let Some((min_score, min_idx)) = best.first_mut() {
+                if score > *min_score || (score == *min_score && (i as u32) < *min_idx) {
+                    *min_score = score;
+                    *min_idx = i as u32;
+                    best.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+                }
+            }
+        }
+
+        best.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        out.extend(best.into_iter().map(|(_, idx)| idx));
+    }
+
+    pub fn search_query_matches(&self, query: &str, out: &mut Vec<u32>, max_results: usize) {
+        out.clear();
+        if max_results == 0 || query.is_empty() {
+            return;
+        }
+
+        let mut best: Vec<(i32, u32)> = Vec::with_capacity(max_results.min(256));
+        for (i, r) in self.records.iter().enumerate() {
+            if r.deleted != 0 {
+                continue;
+            }
+
+            let name = pool_utf8(&self.name_pool, r.name_start, r.name_len as u32);
+            let matched = match_query(query, name);
+            if !matched.is_match() {
+                continue;
+            }
+
+            let score = matched.score;
+            if best.len() < max_results {
+                best.push((score, i as u32));
+                best.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+                continue;
+            }
+
+            if let Some((min_score, min_idx)) = best.first_mut() {
+                if score > *min_score || (score == *min_score && (i as u32) < *min_idx) {
+                    *min_score = score;
+                    *min_idx = i as u32;
+                    best.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+                }
+            }
+        }
+
+        best.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        out.extend(best.into_iter().map(|(_, idx)| idx));
+    }
+
     pub fn try_live_index(&self, vol: u16, file_ref: u64) -> Option<i32> {
         let key = make_key(vol, file_ref);
         let idx = self.find_ref(key)? as usize;
@@ -1048,7 +1587,7 @@ impl Engine {
     // Format: MAGIC(8) + header(20) + records + name_pool + ref + sorted×3
     // -------------------------------------------------------------------
 
-    const BIN_MAGIC: &'static [u8; 8] = b"FXBIN03\0";
+    const BIN_MAGIC: &'static [u8; 8] = b"FXBIN04\0";
 
     pub fn save_to_file(&self, path: &str) -> std::io::Result<u64> {
         use std::io::{BufWriter, Write};
@@ -1191,4 +1730,66 @@ impl Engine {
 
         Ok(live_count as i32)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_full_py_stack, match_query, MatchKind};
+
+    #[test]
+    fn full_pinyin_of_yuebao_contains_bao() {
+        let (buf, len) = compute_full_py_stack("月报");
+        let s = std::str::from_utf8(&buf[..len]).unwrap();
+        assert_eq!(s, "yuebao");
+    }
+
+    #[test]
+    fn match_query_finds_yuebao_by_bao() {
+        let result = match_query("bao", "【彩石智能月报】马春天+3月.docx");
+        assert!(result.is_match());
+        assert_eq!(result.kind, MatchKind::FullPinyin);
+    }
+}
+
+fn fuzzy_match_bytes(query: &[u8], candidate: &[u8]) -> i32 {
+    let mut qi = 0usize;
+    let mut matched = 0i32;
+    let mut start = usize::MAX;
+    let mut end = 0usize;
+    let mut prev = usize::MAX;
+    let mut gaps = 0i32;
+    let mut streak = 0i32;
+    let mut best_streak = 0i32;
+
+    for (idx, &b) in candidate.iter().enumerate() {
+        if qi >= query.len() {
+            break;
+        }
+        if b.to_ascii_lowercase() == query[qi] {
+            if start == usize::MAX {
+                start = idx;
+            }
+            if prev != usize::MAX {
+                if idx == prev + 1 {
+                    streak += 1;
+                    if streak > best_streak {
+                        best_streak = streak;
+                    }
+                } else {
+                    gaps += (idx - prev - 1) as i32;
+                    streak = 0;
+                }
+            }
+            prev = idx;
+            end = idx;
+            matched += 10;
+            qi += 1;
+        }
+    }
+    if qi != query.len() {
+        return 0;
+    }
+
+    let span = (end - start + 1) as i32;
+    matched + best_streak * 8 - gaps - span
 }
