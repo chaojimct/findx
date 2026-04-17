@@ -178,7 +178,10 @@ public enum FilterType
     NoPath,
     NameLength,
     Depth,
+    /// <summary>卷根下一层（路径深度 ≤ 1），对应 <c>root:</c> 无参数或 FindX 扩展 <c>volroot:</c>。</summary>
     Root,
+    /// <summary>Everything 风格：完整路径须位于指定根路径之下（前缀匹配，支持通配）。</summary>
+    RootPath,
     Attributes,
     StartWith,
     EndWith,
@@ -231,6 +234,7 @@ public sealed class FilterNode : QueryNode
             FilterType.NameLength => CompareValue(ctx.Entry.Name.Length),
             FilterType.Depth => CompareValue(ctx.PathDepth),
             FilterType.Root => ctx.PathDepth <= 1,
+            FilterType.RootPath => MatchRootPath(ctx.FullPath),
             FilterType.Attributes => (ctx.Entry.Attributes & _uintMask) == _uintVal,
             FilterType.StartWith => ctx.Entry.Name.StartsWith(_strVal, StringComparison.OrdinalIgnoreCase),
             FilterType.EndWith => ctx.Entry.Name.EndsWith(_strVal, StringComparison.OrdinalIgnoreCase),
@@ -260,6 +264,29 @@ public sealed class FilterNode : QueryNode
         return fullPath.Contains(_strVal, StringComparison.OrdinalIgnoreCase);
     }
 
+    private bool MatchRootPath(string fullPath)
+    {
+        if (string.IsNullOrEmpty(_strVal))
+            return true;
+
+        var normPath = fullPath.Replace('/', '\\');
+        var root = _strVal.Replace('/', '\\').TrimEnd('\\');
+        if (root.Length >= 2 && root[^1] == ':')
+            root += "\\";
+
+        if (root.Contains('*') || root.Contains('?'))
+        {
+            string escaped = Regex.Escape(root).Replace("\\*", ".*").Replace("\\?", ".");
+            return Regex.IsMatch(normPath, "^" + escaped, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        }
+
+        if (!normPath.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (normPath.Length == root.Length)
+            return true;
+        return normPath[root.Length] == '\\';
+    }
+
     private bool CompareValue(long actual)
     {
         return _op switch
@@ -279,6 +306,9 @@ public sealed class FilterNode : QueryNode
     public static FilterNode FileOnly() => new(FilterType.FileOnly);
     public static FilterNode FolderOnly() => new(FilterType.FolderOnly);
     public static FilterNode RootOnly() => new(FilterType.Root);
+
+    public static FilterNode ParseRootPath(string root) =>
+        new(FilterType.RootPath, strVal: root.Trim().Trim('"').Replace('/', '\\'));
 
     public static FilterNode StartWith(string text) =>
         new(FilterType.StartWith, strVal: text);

@@ -4,13 +4,14 @@ namespace FindX.Core.Storage;
 
 /// <summary>
 /// 索引二进制序列化/反序列化。
-/// 优先使用 FXBIN03 快速格式（Rust 内存直写，含排序索引，加载后无需 rebuild）；
-/// 回退兼容 FINDX01 旧格式（逐条读取+rebuild）。
+/// 优先使用 FXBIN06 快速格式（Rust 内存直写，含排序索引与拼音池 + trigram 快照，冷启动不重算拼音）；
+/// 兼容 FXBIN05（加载后 Rust 内重建拼音与倒排）；回退 FINDX01 旧格式（逐条读取+rebuild）。
 /// </summary>
 public static class IndexSerializer
 {
     private static readonly byte[] MagicLegacy = "FINDX01\0"u8.ToArray();
-    private static readonly byte[] MagicBinary = "FXBIN04\0"u8.ToArray();
+    private static readonly byte[] MagicBinary05 = "FXBIN05\0"u8.ToArray();
+    private static readonly byte[] MagicBinary06 = "FXBIN06\0"u8.ToArray();
 
     /// <summary>快速二进制保存。</summary>
     public static void Save(string path, FileIndex index, Dictionary<char, ulong> volumeUsns)
@@ -35,7 +36,8 @@ public static class IndexSerializer
                 magic = new byte[8];
                 if (peek.Read(magic, 0, 8) < 8) return -1;
             }
-            if (!magic.AsSpan().SequenceEqual(MagicBinary)) return -1;
+            if (!magic.AsSpan().SequenceEqual(MagicBinary05) && !magic.AsSpan().SequenceEqual(MagicBinary06))
+                return -1;
             return index.LoadBinary(path, volumeUsns);
         }
         catch (Exception ex)

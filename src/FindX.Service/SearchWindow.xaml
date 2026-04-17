@@ -245,7 +245,9 @@
                                Margin="12,2,0,6" FontWeight="SemiBold"/>
                     <TextBox x:Name="PathFilterBox" FontSize="12" Margin="8,0,8,0"
                              Padding="6,4" BorderBrush="#D0D0D0" BorderThickness="1"
-                             ToolTip="输入路径关键字，如 C:\Users" Background="#FBFBFB"
+                             ToolTip="输入路径前缀，如 C:\Users\name\dev；与上方搜索词组合过滤，留空则不限制路径"
+                             Background="#FBFBFB"
+                             TextChanged="SidebarFilter_TextChanged"
                              KeyDown="SidebarFilter_KeyDown"/>
 
                     <Separator Margin="12,10" Background="#E8E8E8"/>
@@ -261,12 +263,14 @@
                         <TextBox x:Name="SizeMinBox" Grid.Column="0" FontSize="12"
                                  Padding="4,4" BorderBrush="#D0D0D0" BorderThickness="1"
                                  ToolTip="最小 (MB)" Background="#FBFBFB"
+                                 TextChanged="SidebarFilter_TextChanged"
                                  KeyDown="SidebarFilter_KeyDown"/>
                         <TextBlock Grid.Column="1" Text="~" VerticalAlignment="Center"
                                    HorizontalAlignment="Center" Foreground="#999" FontSize="12"/>
                         <TextBox x:Name="SizeMaxBox" Grid.Column="2" FontSize="12"
                                  Padding="4,4" BorderBrush="#D0D0D0" BorderThickness="1"
                                  ToolTip="最大 (MB)" Background="#FBFBFB"
+                                 TextChanged="SidebarFilter_TextChanged"
                                  KeyDown="SidebarFilter_KeyDown"/>
                     </Grid>
                 </StackPanel>

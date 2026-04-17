@@ -2,5 +2,6 @@
 
 mod engine;
 mod ffi;
+mod trigram;
 
 pub use engine::Engine;

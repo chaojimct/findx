@@ -32,12 +32,12 @@ public sealed class VolumeScanner
         }
         catch (DllNotFoundException)
         {
-            Log?.Invoke($"FindXNative.dll 未找到，使用回退扫描 {driveLetter}:");
+            Log?.Invoke($"FindXNative.dll 未找到，{driveLetter}: 使用托管目录回退枚举…");
             return await Task.Run(() => ScanFallback(driveLetter, sw, ct), ct);
         }
         catch (EntryPointNotFoundException)
         {
-            Log?.Invoke($"FindXNative.dll 入口点缺失，使用回退扫描 {driveLetter}:");
+            Log?.Invoke($"FindXNative.dll 入口点缺失，{driveLetter}: 使用托管目录回退枚举…");
             return await Task.Run(() => ScanFallback(driveLetter, sw, ct), ct);
         }
     }
@@ -76,7 +76,7 @@ public sealed class VolumeScanner
                 _index.AddBulk(batch);
                 total += batch.Count;
                 batch.Clear();
-                Log?.Invoke($"  {driveLetter}: 已索引 {total:N0} 条...");
+                Log?.Invoke($"  {driveLetter}: 全量枚举写入进度 {total:N0} 条…");
             }
         };
 
@@ -108,7 +108,7 @@ public sealed class VolumeScanner
             return new ScanResult(total, 0, sw.Elapsed, false);
         }
 
-        Log?.Invoke($"  {driveLetter}: 扫描完成 {total:N0} 条，耗时 {sw.Elapsed.TotalSeconds:F1}s");
+        Log?.Invoke($"  {driveLetter}: 全量枚举完成 {total:N0} 条，耗时 {sw.Elapsed.TotalSeconds:F1}s");
         return new ScanResult(total, nextUsn, sw.Elapsed, true);
     }
 

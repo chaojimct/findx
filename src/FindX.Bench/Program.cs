@@ -16,6 +16,12 @@ internal static class Program
 
         for (int i = 0; i < args.Length; i++)
         {
+            if (args[i].Equals("--trace-engine", StringComparison.OrdinalIgnoreCase))
+            {
+                Environment.SetEnvironmentVariable("FINDX_ENGINE_TRACE", "1");
+                continue;
+            }
+
             if (args[i].Equals("--index", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
             {
                 indexPath = args[++i];
@@ -82,6 +88,9 @@ internal static class Program
         var engine = new SearchEngine(index);
         foreach (var query in queries)
             RunSearch(engine, query, 200);
+
+        if (Environment.GetEnvironmentVariable("FINDX_ENGINE_TRACE") is { Length: > 0 })
+            Console.WriteLine("  (FINDX_ENGINE_TRACE 已启用：Rust search_simple_query 会输出候选数/耗时到 stderr)");
 
         if (!skipHeavyPoll && indexPath is null)
         {

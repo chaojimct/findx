@@ -6,6 +6,7 @@ using System.Threading;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using FindX.Core.Diagnostics;
 using FindX.Core.Index;
 using FindX.Core.Search;
 using FindX.Core.Pinyin;
@@ -171,10 +172,12 @@ public sealed class IpcServer : IDisposable
         var maxResults = req.Params?.MaxResults ?? 50;
         var pathFilter = req.Params?.PathFilter;
 
+        var swTotal = System.Diagnostics.Stopwatch.StartNew();
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var results = _searchEngine.Search(query, maxResults, pathFilter);
         sw.Stop();
 
+        var swMap = System.Diagnostics.Stopwatch.StartNew();
         var items = results.Select(r => new IpcResultItem
         {
             Path = r.FullPath,
@@ -184,6 +187,7 @@ public sealed class IpcServer : IDisposable
             Score = r.Score,
             LastWriteUtcTicks = r.LastWriteUtcTicks,
         }).ToList();
+        swMap.Stop();
 
         var response = new IpcResponse
         {
@@ -196,7 +200,14 @@ public sealed class IpcServer : IDisposable
             }
         };
 
-        return JsonSerializer.Serialize(response, JsonOpts);
+        var swJson = System.Diagnostics.Stopwatch.StartNew();
+        var json = JsonSerializer.Serialize(response, JsonOpts);
+        swJson.Stop();
+        swTotal.Stop();
+        SearchPerfLog.WriteLine?.Invoke(
+            $"IPC.search id={req.Id} qLen={query.Length} hits={items.Count} engineMs={sw.Elapsed.TotalMilliseconds:F1} mapMs={swMap.Elapsed.TotalMilliseconds:F1} jsonMs={swJson.Elapsed.TotalMilliseconds:F1} ipcTotalMs={swTotal.Elapsed.TotalMilliseconds:F1}");
+
+        return json;
     }
 
     private string HandleStatus(IpcRequest req)

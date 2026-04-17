@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
+using FindX.Core.Diagnostics;
 using FindX.Core.FileSystem;
 using FindX.Core.Interop;
 using FindX.Core.Index;
@@ -81,9 +82,9 @@ public sealed class ServiceHost : IDisposable
                 {
                     Log($"二进制索引加载耗时: {swLoad.Elapsed.TotalSeconds:F2}s");
                     var swScan = Stopwatch.StartNew();
-                    await ScanAllVolumesAsync(skipSave: true);
+                    await ScanAllVolumesAsync(skipSave: true, reindexingAfterClear: false);
                     swScan.Stop();
-                    Log($"ScanAllVolumes 耗时: {swScan.Elapsed.TotalSeconds:F2}s");
+                    Log($"启动卷同步耗时: {swScan.Elapsed.TotalSeconds:F2}s");
                 }
                 else
                 {
@@ -95,9 +96,9 @@ public sealed class ServiceHost : IDisposable
                         Log($"旧格式索引加载耗时: {swLoad.Elapsed.TotalSeconds:F2}s");
 
                         var swScan = Stopwatch.StartNew();
-                        await ScanAllVolumesAsync(skipSave: true);
+                        await ScanAllVolumesAsync(skipSave: true, reindexingAfterClear: false);
                         swScan.Stop();
-                        Log($"ScanAllVolumes 耗时: {swScan.Elapsed.TotalSeconds:F2}s");
+                        Log($"启动卷同步耗时: {swScan.Elapsed.TotalSeconds:F2}s");
                     }
                     finally
                     {
@@ -141,12 +142,13 @@ public sealed class ServiceHost : IDisposable
 
     private void StartIpc()
     {
+        SearchPerfLog.WriteLine = LogSearchPerf;
         _ipcServer = new IpcServer(_index, _searchEngine);
         _ipcServer.Log += Log;
         _ipcServer.GetIndexReady = () => Volatile.Read(ref _indexBuildInProgress) == 0;
         _ipcServer.OnReindexRequested = async () =>
         {
-            Log("收到重新索引请求");
+            Log("收到重新索引请求（将清空内存索引后全卷重建，与启动时「卷同步」不同）");
             Volatile.Write(ref _indexBuildInProgress, 1);
             try
             {
@@ -154,7 +156,7 @@ public sealed class ServiceHost : IDisposable
                 _index.BeginBulk();
                 try
                 {
-                    await ScanAllVolumesAsync(skipSave: true);
+                    await ScanAllVolumesAsync(skipSave: true, reindexingAfterClear: true);
                 }
                 finally
                 {
@@ -175,10 +177,13 @@ public sealed class ServiceHost : IDisposable
         _everythingIpc.Start();
     }
 
-    private async Task ScanAllVolumesAsync(bool skipSave = false)
+    private async Task ScanAllVolumesAsync(bool skipSave = false, bool reindexingAfterClear = false)
     {
         var sw = Stopwatch.StartNew();
-        Log("开始扫描卷...");
+        if (reindexingAfterClear)
+            Log("重建索引：全卷扫描并写入新索引（内存已 Clear，与启动时「卷同步」不同）。");
+        else
+            Log("启动卷同步：在已加载的内存快照上补齐关机期间的变更（优先 USN 增量）。此步骤不会清空快照，也不同于托盘「重建索引」。");
 
         var drives = DriveInfo.GetDrives()
             .Where(d => d.IsReady && d.DriveType is DriveType.Fixed or DriveType.Removable)
@@ -192,11 +197,12 @@ public sealed class ServiceHost : IDisposable
                 var startUsn = _volumeUsns.GetValueOrDefault(vol);
                 if (startUsn > 0)
                 {
-                    Log($"  {vol}: 增量更新 (USN={startUsn})...");
+                    Log($"  {vol}: USN 增量同步（起始 USN={startUsn}）…");
                     _journalWatcher.SetStartUsn(vol, startUsn);
                 }
                 else
                 {
+                    Log($"  {vol}: 无已持久化的 USN 基线，本卷执行一次完整枚举以建立 USN 起点（合并进当前索引，非「重建索引」）…");
                     var result = await _scanner.ScanVolumeAsync(vol);
                     _volumeUsns[vol] = result.NextUsn;
                     _journalWatcher.SetStartUsn(vol, result.NextUsn);
@@ -208,7 +214,10 @@ public sealed class ServiceHost : IDisposable
         _journalWatcher.Start();
         sw.Stop();
 
-        Log($"索引完成: {_index.Count:N0} 条记录，耗时 {sw.Elapsed.TotalSeconds:F1}s");
+        if (reindexingAfterClear)
+            Log($"重建索引扫描结束：内存索引共 {_index.Count:N0} 条，本阶段耗时 {sw.Elapsed.TotalSeconds:F1}s");
+        else
+            Log($"卷同步阶段结束：内存索引共 {_index.Count:N0} 条，本阶段耗时 {sw.Elapsed.TotalSeconds:F1}s");
         if (!skipSave) SaveIndex();
     }
 
@@ -220,6 +229,12 @@ public sealed class ServiceHost : IDisposable
             var loaded = IndexSerializer.TryLoadBinary(IndexPath, _index, _volumeUsns);
             if (loaded >= 0)
             {
+                if (_volumeUsns.Count == 0)
+                {
+                    Log("二进制索引缺少卷 USN 信息，放弃复用并执行干净重建");
+                    _index.Clear();
+                    return false;
+                }
                 Log($"二进制索引加载完成: {loaded:N0} 条");
                 return true;
             }
@@ -272,7 +287,7 @@ public sealed class ServiceHost : IDisposable
     {
         if (Volatile.Read(ref _indexBuildInProgress) != 0)
             return;
-        Log("UI 触发重建索引");
+        Log("UI 触发重建索引（将 Clear 后全卷扫描，日志中会标明「重建索引」）");
         Volatile.Write(ref _indexBuildInProgress, 1);
         try
         {
@@ -281,14 +296,14 @@ public sealed class ServiceHost : IDisposable
             _index.BeginBulk();
             try
             {
-                await ScanAllVolumesAsync(skipSave: true);
+                await ScanAllVolumesAsync(skipSave: true, reindexingAfterClear: true);
             }
             finally
             {
                 _index.EndBulk();
             }
             SaveIndex();
-            Log("重建索引完成");
+            Log("重建索引：保存完成");
         }
         finally
         {
@@ -306,6 +321,7 @@ public sealed class ServiceHost : IDisposable
 
     private void Shutdown()
     {
+        SearchPerfLog.WriteLine = null;
         Log("服务关闭中...");
         _everythingIpc?.Dispose();
         _journalWatcher.Stop();
@@ -385,6 +401,27 @@ public sealed class ServiceHost : IDisposable
         Log($"拼音优先排序: {(value ? "开启" : "关闭")}");
     }
 
+    public bool HydrateSearchResultMetadata
+    {
+        get
+        {
+            lock (_settingsLock)
+                return _settings.HydrateSearchResultMetadata != false;
+        }
+    }
+
+    public void SetHydrateSearchResultMetadata(bool value)
+    {
+        lock (_settingsLock)
+        {
+            if (_settings.HydrateSearchResultMetadata == value)
+                return;
+            _settings.HydrateSearchResultMetadata = value;
+            SaveSettings();
+        }
+        Log($"结果元数据补全（大小/日期）: {(value ? "开启" : "关闭")}");
+    }
+
     public async Task<UpdateInfo?> CheckForUpdateAsync()
     {
         try
@@ -446,6 +483,22 @@ public sealed class ServiceHost : IDisposable
         var line = $"[{DateTime.Now:HH:mm:ss}] {msg}";
         lock (_logs) _logs.Add(line);
         Console.WriteLine(line);
+    }
+
+    /// <summary>搜索性能行：同步追加到 findx.log，便于托盘模式下无需退出即可 tail。</summary>
+    private void LogSearchPerf(string msg)
+    {
+        var line = $"[{DateTime.Now:HH:mm:ss}] [perf] {msg}";
+        lock (_logs) _logs.Add(line);
+        Console.WriteLine(line);
+        try
+        {
+            var dir = Path.GetDirectoryName(LogPath);
+            if (!string.IsNullOrEmpty(dir))
+                Directory.CreateDirectory(dir);
+            File.AppendAllText(LogPath, line + Environment.NewLine);
+        }
+        catch { /* 忽略磁盘满等 */ }
     }
 
     private void FlushLogs()

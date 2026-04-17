@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FindX — 本地文件名搜索 · 拼音 · Everything 兼容</title>
+  <meta name="description" content="FindX：Windows 上基于 NTFS USN 的极速文件名索引，内置中文拼音，兼容 Everything SDK v2 IPC。MIT 开源。" />
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --accent2: #3fb950;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { max-width: 880px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+    header {
+      text-align: center;
+      padding: 2rem 0 2.5rem;
+      border-bottom: 1px solid var(--border);
+    }
+    h1 {
+      font-size: clamp(1.75rem, 5vw, 2.35rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin: 0 0 0.5rem;
+    }
+    .tag {
+      display: inline-block;
+      font-size: 0.85rem;
+      color: var(--accent2);
+      background: rgba(63, 185, 80, 0.12);
+      border: 1px solid rgba(63, 185, 80, 0.35);
+      padding: 0.2rem 0.65rem;
+      border-radius: 999px;
+      margin-bottom: 1rem;
+    }
+    .lead { color: var(--muted); font-size: 1.05rem; max-width: 36em; margin: 0 auto; }
+    .cta {
+      margin-top: 1.75rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      justify-content: center;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0.65rem 1.25rem;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 0.95rem;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--text);
+    }
+    .btn.primary {
+      background: var(--accent);
+      color: #0d1117;
+      border-color: var(--accent);
+    }
+    .btn.primary:hover { filter: brightness(1.08); text-decoration: none; }
+    .btn:hover { border-color: var(--accent); text-decoration: none; }
+    section { margin-top: 2.75rem; }
+    h2 {
+      font-size: 1.15rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin: 0 0 1rem;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 1rem;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.15rem 1.25rem;
+    }
+    .card h3 { margin: 0 0 0.4rem; font-size: 1.05rem; }
+    .card p { margin: 0; color: var(--muted); font-size: 0.92rem; }
+    footer {
+      margin-top: 3rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--border);
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <span class="tag">v1.2.0</span>
+      <h1>FindX</h1>
+      <p class="lead">
+        Windows 本地文件名搜索引擎：NTFS USN 增量索引、内置中文拼音（全拼 / 首字母 / 子串）、
+        Everything 风格语法，并<strong>兼容 Everything SDK v2 IPC</strong>，可被 uTools 等当作 Everything 使用。
+      </p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/chaojimct/findx/releases">下载最新版</a>
+        <a class="btn" href="https://github.com/chaojimct/findx">源码与文档</a>
+        <a class="btn" href="https://github.com/chaojimct/findx/issues">反馈问题</a>
+      </div>
+    </header>
+
+    <section>
+      <h2>亮点</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>快</h3>
+          <p>Rust 紧凑索引 + USN / MFT，百万级条目仍可保持较低延迟与内存占用。</p>
+        </div>
+        <div class="card">
+          <h3>中文拼音</h3>
+          <p>拼音与排序索引、评分管线打通，适配「只记得读音」的检索习惯。</p>
+        </div>
+        <div class="card">
+          <h3>路径收窄</h3>
+          <p><code>path:</code> / <code>parent:</code> 与侧栏路径可解析目录子树，候选在子树内再匹配，减少漏搜。</p>
+        </div>
+        <div class="card">
+          <h3>持久化</h3>
+          <p>FXBIN06 含拼音池与 trigram 快照，冷启动以磁盘读为主，避免全量重算。</p>
+        </div>
+        <div class="card">
+          <h3>Everything 生态</h3>
+          <p>WM_COPYDATA / WM_USER 协议与窗口类名兼容，降低迁移成本。</p>
+        </div>
+        <div class="card">
+          <h3>开源</h3>
+          <p>MIT 许可，代码可审、可改、可集成。</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>文档与对比</h2>
+      <p class="lead" style="text-align:center">
+        完整语法、构建说明、路线图见仓库
+        <a href="https://github.com/chaojimct/findx#readme">README</a>；
+        与 Everything / Listary 的定位对比见
+        <a href="https://github.com/chaojimct/findx/blob/main/PROMOTION.md">PROMOTION.md</a>。
+      </p>
+    </section>
+
+    <footer>
+      <p>© FindX 贡献者 · MIT License</p>
+      <p>本页由仓库 <code>docs/</code> 构建；若 404，请在仓库 <strong>Settings → Pages</strong> 将 Source 设为 <strong>GitHub Actions</strong> 并推送任意更新触发部署。</p>
+    </footer>
+  </div>
+</body>
+</html>

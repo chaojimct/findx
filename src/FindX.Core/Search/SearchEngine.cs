@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.Linq;
+using FindX.Core.Diagnostics;
 using FindX.Core.FileSystem;
 using FindX.Core.Index;
 using FindX.Core.Pinyin;
@@ -75,8 +77,23 @@ public sealed class SearchEngine
         bool preferPinyinForAsciiQuery = preferences.PreferPinyinForAsciiQueries
             && hasTerms
             && KeywordsAreAsciiAlnum(parsed.Keywords);
+        bool hydrateResultMetadata = preferences.HydrateSearchResultMetadata;
 
-        var candidates = GatherCandidates(parsed, effectiveMax, filterOnlyQuery);
+        if (CanUseRustSimpleQueryPath(parsed, hasRegex, hasFilters, pathFilter))
+        {
+            if (TrySearchWithRustSimpleTerms(
+                    parsed.Keywords,
+                    effectiveMax,
+                    preferPinyinForAsciiQuery,
+                    hydrateResultMetadata,
+                    out var fastResults))
+                return fastResults;
+
+            SearchPerfLog.WriteLine?.Invoke(
+                $"SearchEngine: Rust 快路径无命中，回退 C# 候选池 query=\"{query}\" kwCount={parsed.Keywords.Count}");
+        }
+
+        var candidates = GatherCandidates(parsed, effectiveMax, filterOnlyQuery, needsFullPathForFiltering);
         var hits = new List<CandidateHit>();
         var seenIndices = new HashSet<int>();
         var evalCtx = new EvalContext();
@@ -115,7 +132,9 @@ public sealed class SearchEngine
             int fallbackPool = Math.Min(FileIndex.PrefixSearchHitCap, Math.Max(effectiveMax * 20, 256));
             foreach (var keyword in parsed.Keywords)
             {
-                if (keyword.Length < 5 || !IsAsciiAlnum(keyword))
+                if (keyword.Length == 0 || !IsAsciiAlnum(keyword))
+                    continue;
+                if (keyword.Length < 3)
                     continue;
 
                 foreach (var idx in _index.SearchMatchQuery(keyword.ToLowerInvariant(), fallbackPool))
@@ -156,7 +175,109 @@ public sealed class SearchEngine
         if (hits.Count > effectiveMax)
             hits.RemoveRange(effectiveMax, hits.Count - effectiveMax);
 
-        return MaterializeResults(hits, needsMetadataForFilters);
+        return MaterializeResults(hits, needsMetadataForFilters || !hydrateResultMetadata);
+    }
+
+    private bool TrySearchWithRustSimpleTerms(
+        IReadOnlyList<string> keywords,
+        int maxResults,
+        bool preferPinyin,
+        bool hydrateResultMetadata,
+        out List<SearchResult> results)
+    {
+        var swRust = Stopwatch.StartNew();
+        List<int> indices = keywords.Count == 1
+            ? _index.SearchSimpleQuery(keywords[0], preferPinyin, maxResults)
+            : _index.SearchSimpleTerms(keywords, preferPinyin, maxResults);
+        swRust.Stop();
+        if (indices.Count == 0)
+        {
+            SearchPerfLog.WriteLine?.Invoke(
+                $"TrySearchWithRustSimpleTerms rustListMs={swRust.Elapsed.TotalMilliseconds:F1} rustHits=0 (no C# materialize)");
+            results = new List<SearchResult>();
+            return false;
+        }
+
+        var swMat = Stopwatch.StartNew();
+        var preparedKeywords = keywords.Select(PinyinMatcher.Prepare).ToArray();
+        var materialized = new List<SearchResult>(indices.Count);
+        foreach (var idx in indices)
+        {
+            var entry = _index.GetByIndex(idx);
+            if (entry == null)
+                continue;
+
+            string fullPath = _index.BuildFullPath(idx);
+            if (string.IsNullOrEmpty(fullPath))
+                continue;
+
+            var entryForDisplay = hydrateResultMetadata
+                ? MaybeHydrateMetadata(entry, fullPath, true)
+                : entry;
+
+            int totalScore = 0;
+            int totalLen = 0;
+            var bestType = PinyinMatcher.MatchType.None;
+            foreach (var preparedKeyword in preparedKeywords)
+            {
+                var match = PinyinMatcher.Match(preparedKeyword, entry.Name);
+                if (!match.IsMatch)
+                {
+                    totalScore = 0;
+                    break;
+                }
+
+                totalScore += match.Score;
+                totalLen += match.MatchedChars;
+                if (match.Type > bestType) bestType = match.Type;
+            }
+
+            if (totalScore <= 0)
+                continue;
+
+            var matchResult = new PinyinMatcher.MatchResult(bestType, totalScore, totalLen);
+
+            int pathDepth = _index.GetPathDepth(idx);
+            materialized.Add(new SearchResult
+            {
+                FullPath = fullPath,
+                Name = entryForDisplay.Name,
+                IsDirectory = entryForDisplay.IsDirectory,
+                Size = entryForDisplay.Size,
+                Score = Scorer.Score(entryForDisplay, pathDepth, matchResult, preferPinyin),
+                MatchType = matchResult.Type,
+                EntryIndex = idx,
+                LastWriteUtcTicks = entryForDisplay.LastWriteTimeTicks,
+                LastModified = entryForDisplay.LastWriteTimeTicks > 0
+                    ? new DateTime(entryForDisplay.LastWriteTimeTicks, DateTimeKind.Utc).ToLocalTime()
+                    : default,
+            });
+        }
+
+        swMat.Stop();
+        SearchPerfLog.WriteLine?.Invoke(
+            $"TrySearchWithRustSimpleTerms rustListMs={swRust.Elapsed.TotalMilliseconds:F1} materializeMs={swMat.Elapsed.TotalMilliseconds:F1} rustHits={indices.Count} kept={materialized.Count}");
+
+        results = materialized;
+        return results.Count > 0;
+    }
+
+    private static bool CanUseRustSimpleQueryPath(ParsedQuery parsed, bool hasRegex, bool hasFilters, string? pathFilter)
+        => !hasRegex
+           && !hasFilters
+           && pathFilter == null
+           && parsed.Keywords.Count > 0
+           && QueryNodeIsSimpleTerms(parsed.Root);
+
+    private static bool QueryNodeIsSimpleTerms(QueryNode? node)
+    {
+        return node switch
+        {
+            null => false,
+            TermNode term => !term.IsExact && !term.HasWildcard && !term.WholeWord && !term.CaseSensitive,
+            AndNode andNode => andNode.Children.Count > 0 && andNode.Children.All(QueryNodeIsSimpleTerms),
+            _ => false,
+        };
     }
 
     /// <summary>向后兼容：无 AST 时的旧过滤逻辑</summary>
@@ -195,7 +316,7 @@ public sealed class SearchEngine
         }
 
         if (needsMetadataForFilters)
-            entry = MaybeHydrateMetadata(entry, fullPath);
+            entry = MaybeHydrateMetadata(entry, fullPath, true);
 
         evalCtx.Reset(entry, fullPath, pathDepth);
 
@@ -285,7 +406,7 @@ public sealed class SearchEngine
                 continue;
 
             if (!alreadyHydrated)
-                entry = MaybeHydrateMetadata(entry, fullPath);
+                entry = MaybeHydrateMetadata(entry, fullPath, true);
 
             results.Add(new SearchResult
             {
@@ -317,7 +438,7 @@ public sealed class SearchEngine
         return node switch
         {
             null => false,
-            FilterNode filter => filter.Type is FilterType.Path or FilterType.NoPath,
+            FilterNode filter => filter.Type is FilterType.Path or FilterType.NoPath or FilterType.RootPath,
             AndNode andNode => andNode.Children.Any(QueryNodeNeedsFullPath),
             OrNode orNode => orNode.Children.Any(QueryNodeNeedsFullPath),
             NotNode notNode => QueryNodeNeedsFullPath(notNode.Child),
@@ -512,7 +633,119 @@ public sealed class SearchEngine
         return false;
     }
 
-    private HashSet<int> GatherCandidates(ParsedQuery parsed, int maxResults, bool filterOnly)
+    /// <summary>
+    /// 与 Rust <c>Engine::normalize_dir_path_key</c> 对齐，用于逐级向上解析已索引目录。
+    /// </summary>
+    private static string NormalizeDirPathKeyForRust(string path)
+    {
+        var s = path.Trim().Replace("/", "\\", StringComparison.Ordinal);
+        while (s.Length > 3 && s.EndsWith("\\", StringComparison.Ordinal))
+            s = s[..^1];
+        return s.ToLowerInvariant();
+    }
+
+    private static bool TryGetParentDirNormalized(string normalizedPath, out string parent)
+    {
+        parent = "";
+        var last = normalizedPath.LastIndexOf('\\');
+        if (last <= 0)
+            return false;
+        parent = normalizedPath[..last];
+        return true;
+    }
+
+    /// <summary>
+    /// 从 <paramref name="pathFilter"/> 起向上查找，返回索引中存在的最近祖先目录行号；找不到返回 -1。
+    /// </summary>
+    private int TryResolveNearestIndexedDirectoryForPathFilter(string? pathFilter)
+    {
+        if (string.IsNullOrEmpty(pathFilter))
+            return -1;
+        var work = NormalizeDirPathKeyForRust(pathFilter);
+        for (var depth = 0; depth < 256; depth++)
+        {
+            var idx = _index.TryResolveDirPathToIndex(work);
+            if (idx >= 0)
+                return idx;
+            if (!TryGetParentDirNormalized(work, out var p))
+                return -1;
+            work = p;
+        }
+
+        return -1;
+    }
+
+    /// <summary>
+    /// 在已解析目录行号 <paramref name="resolvedDirRoot"/> 下，把「子树 × 各 ASCII 字母数字关键词的名字前缀」并入候选池。
+    /// 非 ASCII 关键词仍依赖下方全局收集；收集结束后由 <see cref="FileIndex.RetainIndicesUnderDirRoot"/> 将候选限制在子树 <c>S</c> 上。
+    /// </summary>
+    private void AddParentPathSubtreeAsciiAlnumPrefixCandidates(
+        ParsedQuery parsed,
+        bool needsFullPathForFiltering,
+        HashSet<int> candidates,
+        int maxResults,
+        int resolvedDirRoot)
+    {
+        if (!needsFullPathForFiltering || _index.IsInBulkLoad)
+            return;
+        var pathNeedle = parsed.PathFilter;
+        if (string.IsNullOrEmpty(pathNeedle) || pathNeedle.AsSpan().IndexOfAny('*', '?') >= 0)
+            return;
+        if (resolvedDirRoot < 0)
+            return;
+
+        int takeCap = Math.Clamp(Math.Max(maxResults * 8, 64), 64, FileIndex.PrefixSearchHitCap);
+        const int subtreeMaxNodes = 300_000;
+
+        foreach (var kw in parsed.Keywords)
+        {
+            if (!IsAsciiAlnum(kw))
+                continue;
+            foreach (var idx in _index.SearchNamePrefixInSubtree(
+                         (uint)resolvedDirRoot,
+                         kw.ToLowerInvariant(),
+                         takeCap,
+                         subtreeMaxNodes))
+                candidates.Add(idx);
+        }
+    }
+
+    /// <summary>
+    /// 单关键词、子树路径增强未贡献任何候选时，用全局名字前缀序区间 + 路径子串扫描补一层（仅长路径，成本较高）。
+    /// </summary>
+    private void AddParentPathSingleKeywordPathNeedleIfSubtreeMissed(
+        ParsedQuery parsed,
+        bool needsFullPathForFiltering,
+        HashSet<int> candidates,
+        int maxResults,
+        int maxScan,
+        int candidateCountBeforePathBoost)
+    {
+        if (!needsFullPathForFiltering || _index.IsInBulkLoad)
+            return;
+        if (parsed.Keywords.Count != 1)
+            return;
+        if (candidates.Count > candidateCountBeforePathBoost)
+            return;
+
+        var pathNeedle = parsed.PathFilter;
+        if (string.IsNullOrEmpty(pathNeedle) || pathNeedle.Length < 20 || pathNeedle.AsSpan().IndexOfAny('*', '?') >= 0)
+            return;
+
+        var kw = parsed.Keywords[0];
+        if (!IsAsciiAlnum(kw))
+            return;
+
+        int takeCap = Math.Clamp(Math.Max(maxResults * 8, 64), 64, FileIndex.PrefixSearchHitCap);
+        foreach (var idx in _index.SearchNamePrefixPathNeedle(
+                     kw.ToLowerInvariant(),
+                     pathNeedle,
+                     takeCap,
+                     maxScan))
+            candidates.Add(idx);
+    }
+
+    private HashSet<int> GatherCandidates(ParsedQuery parsed, int maxResults, bool filterOnly, bool needsFullPathForFiltering)
     {
         var candidates = new HashSet<int>();
 
@@ -546,6 +779,31 @@ public sealed class SearchEngine
 
         var fullCap = FileIndex.PrefixSearchHitCap;
         const int mixCap = 512;
+        const int parentPathPrefixMaxScan = 300_000;
+
+        // 路径索引：若能解析出最近已索引目录，则其行号定义子树 S；先并集收集，再在 S 上收缩（见文末 RetainIndicesUnderDirRoot）。
+        int resolvedPathSubtreeRoot = -1;
+        if (needsFullPathForFiltering
+            && !string.IsNullOrEmpty(parsed.PathFilter)
+            && parsed.PathFilter.AsSpan().IndexOfAny('*', '?') < 0)
+        {
+            resolvedPathSubtreeRoot = TryResolveNearestIndexedDirectoryForPathFilter(parsed.PathFilter);
+        }
+
+        int countBeforePathBoost = candidates.Count;
+        AddParentPathSubtreeAsciiAlnumPrefixCandidates(
+            parsed,
+            needsFullPathForFiltering,
+            candidates,
+            maxResults,
+            resolvedPathSubtreeRoot);
+        AddParentPathSingleKeywordPathNeedleIfSubtreeMissed(
+            parsed,
+            needsFullPathForFiltering,
+            candidates,
+            maxResults,
+            parentPathPrefixMaxScan,
+            countBeforePathBoost);
 
         int minAsciiKwLen = int.MaxValue;
         foreach (var kw in parsed.Keywords)
@@ -567,7 +825,8 @@ public sealed class SearchEngine
             if (!IsAsciiAlnum(lower))
                 continue;
 
-            if (shortAscii && lower.Length <= 1) continue;
+            if (shortAscii && lower.Length <= 1)
+                continue;
 
             foreach (var h in _index.SearchPinyinInitialsPrefix(lower, cap))
                 candidates.Add(h);
@@ -646,6 +905,19 @@ public sealed class SearchEngine
         if (hasCjkKw)
             GatherCjkSubstringCandidates(parsed.Keywords, candidates, cap);
 
+        if (resolvedPathSubtreeRoot >= 0)
+            _index.RetainIndicesUnderDirRoot(candidates, resolvedPathSubtreeRoot);
+
+        int candBudget = Math.Clamp(maxResults * 512, 4096, 24576);
+        if (candidates.Count > candBudget)
+        {
+            var sorted = candidates.ToList();
+            sorted.Sort();
+            candidates.Clear();
+            foreach (var idx in sorted.Take(candBudget))
+                candidates.Add(idx);
+        }
+
         return candidates;
     }
 
@@ -681,10 +953,10 @@ public sealed class SearchEngine
             foreach (var h in _index.SearchFullPinyinContains(kwLower, addCap))
                 candidates.Add(h);
 
-            if (kwLower.Length <= 5)
+            if (kwLower.Length <= 64)
             {
                 foreach (var h in _index.SearchInitialsContains(kwLower, addCap))
-                candidates.Add(h);
+                    candidates.Add(h);
             }
         }
     }
@@ -751,8 +1023,11 @@ public sealed class SearchEngine
         }
     }
 
-    private FileEntry MaybeHydrateMetadata(FileEntry entry, string fullPath)
+    private FileEntry MaybeHydrateMetadata(FileEntry entry, string fullPath, bool allowDiskHydration)
     {
+        if (!allowDiskHydration)
+            return entry;
+
         if (!FileMetadataReader.NeedsHydration(entry))
             return entry;
         if (!FileMetadataReader.TryHydrate(fullPath, entry, out var hydrated))
@@ -781,7 +1056,7 @@ public sealed class SearchEngine
             if (entry == null)
                 continue;
 
-            var hydrated = MaybeHydrateMetadata(entry, result.FullPath);
+            var hydrated = MaybeHydrateMetadata(entry, result.FullPath, true);
             if (hydrated.Size == result.Size && hydrated.LastWriteTimeTicks == result.LastWriteUtcTicks)
                 continue;
 

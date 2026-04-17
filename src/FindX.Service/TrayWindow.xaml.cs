@@ -56,6 +56,7 @@ public partial class TrayWindow : Window
 
         AutoStartCheck.IsChecked = _host.IsAutoStartEnabled();
         PreferPinyinSortCheck.IsChecked = _host.PreferPinyinForAsciiQueries;
+        HydrateMetadataCheck.IsChecked = _host.HydrateSearchResultMetadata;
     }
 
     private void ShowWindow()
@@ -293,6 +294,11 @@ public partial class TrayWindow : Window
     private void PreferPinyinSort_Changed(object sender, RoutedEventArgs e)
     {
         _host.SetPreferPinyinForAsciiQueries(PreferPinyinSortCheck.IsChecked == true);
+    }
+
+    private void HydrateMetadata_Changed(object sender, RoutedEventArgs e)
+    {
+        _host.SetHydrateSearchResultMetadata(HydrateMetadataCheck.IsChecked == true);
     }
 
     private async void Reindex_Click(object sender, RoutedEventArgs e)

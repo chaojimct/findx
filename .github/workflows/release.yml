@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "版本号 (如 1.0.0)"
+        description: "版本号 (如 1.2.0)"
         required: true
-        default: "0.1.0"
+        default: "1.2.0"
 
 env:
   DOTNET_NOLOGO: true

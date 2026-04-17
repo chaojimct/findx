@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="FindX 设置"
         Icon="findx-icon.ico"
-        Width="450" Height="400"
+        Width="450" Height="440"
         WindowStartupLocation="CenterScreen"
         ResizeMode="NoResize"
         ShowInTaskbar="False"
@@ -44,6 +44,11 @@
                       Margin="0,8,0,0"
                       Checked="PreferPinyinSort_Changed"
                       Unchecked="PreferPinyinSort_Changed"/>
+            <CheckBox x:Name="HydrateMetadataCheck"
+                      Content="搜索结果补全大小与修改日期（默认开启，关闭可减少磁盘访问）"
+                      Margin="0,8,0,0"
+                      Checked="HydrateMetadata_Changed"
+                      Unchecked="HydrateMetadata_Changed"/>
         </StackPanel>
 
         <ListBox x:Name="LogList" Grid.Row="3" FontSize="11" FontFamily="Consolas"

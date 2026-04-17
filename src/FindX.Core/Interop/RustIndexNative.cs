@@ -76,6 +76,44 @@ internal static class RustIndexNative
         IntPtr outIndices,
         int outCap);
 
+    /// <summary>
+    /// 在名字前缀有序区间内扫描，仅返回全路径包含 pathNeedle（UTF-8，忽略大小写）的索引；解决 parent:/path + 单字符时全局前缀帽下无命中问题。
+    /// </summary>
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    public static extern int findx_engine_search_name_prefix_path_needle(
+        IntPtr p,
+        IntPtr prefixUtf8,
+        int prefixLen,
+        IntPtr pathNeedleUtf8,
+        int pathNeedleLen,
+        IntPtr outIndices,
+        int outCap,
+        int maxScan);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    public static extern int findx_engine_resolve_dir_path_utf8(
+        IntPtr p,
+        IntPtr pathUtf8,
+        int pathLen);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    public static extern int findx_engine_search_name_prefix_in_subtree(
+        IntPtr p,
+        uint rootDirIdx,
+        IntPtr prefixUtf8,
+        int prefixLen,
+        IntPtr outIndices,
+        int outCap,
+        int maxNodes);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    public static extern int findx_engine_mask_indices_under_dir_root(
+        IntPtr p,
+        IntPtr indices,
+        int n,
+        uint rootDirIdx,
+        IntPtr outMask);
+
     [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
     public static extern int findx_engine_search_pinyin_prefix(
         IntPtr p,
@@ -129,6 +167,25 @@ internal static class RustIndexNative
         IntPtr p,
         IntPtr queryUtf8,
         int queryLen,
+        IntPtr outIndices,
+        int outCap);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    public static extern int findx_engine_search_simple_query(
+        IntPtr p,
+        IntPtr queryUtf8,
+        int queryLen,
+        int preferPinyin,
+        IntPtr outIndices,
+        int outCap);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    public static extern int findx_engine_search_simple_terms(
+        IntPtr p,
+        IntPtr termsUtf8,
+        int termsLen,
+        int termCount,
+        int preferPinyin,
         IntPtr outIndices,
         int outCap);
 

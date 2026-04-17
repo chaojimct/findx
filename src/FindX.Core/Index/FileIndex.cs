@@ -1,6 +1,8 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using FindX.Core.Diagnostics;
 using FindX.Core.Interop;
 
 namespace FindX.Core.Index;
@@ -161,7 +163,11 @@ public sealed class FileIndex
             if (RustIndexNative.findx_engine_live_count(_engine) == 0) return;
             if (RustIndexNative.findx_engine_is_in_bulk_load(_engine) != 0) return;
             if (RustIndexNative.findx_engine_is_sort_ready(_engine) != 0) return;
+            var sw = Stopwatch.StartNew();
             RustIndexNative.findx_engine_rebuild_indexes(_engine);
+            sw.Stop();
+            SearchPerfLog.WriteLine?.Invoke(
+                $"EnsureSearchIndexesReady: rebuild_indexes live={RustIndexNative.findx_engine_live_count(_engine)} took {sw.Elapsed.TotalMilliseconds:F1}ms");
         }
         finally { _lock.ExitWriteLock(); }
     }
@@ -208,6 +214,209 @@ public sealed class FileIndex
         {
             ArrayPool<uint>.Shared.Return(rent);
             ArrayPool<byte>.Shared.Return(utfRent);
+        }
+    }
+
+    /// <summary>
+    /// 名字前缀全局序区间内扫描，路径子串过滤（与 <c>parent:</c>/<c>path:</c> 全路径包含语义一致，忽略大小写）。
+    /// </summary>
+    public List<int> SearchNamePrefixPathNeedle(
+        string prefixLower,
+        string pathNeedle,
+        int maxResults,
+        int maxScan)
+    {
+        if (maxResults <= 0 || maxScan <= 0)
+            return new List<int>();
+        EnsureSearchIndexesReady();
+        if (CountSnapshot == 0)
+            return new List<int>();
+
+        var rent = ArrayPool<uint>.Shared.Rent(SearchIndexCap);
+        var utfPrefix = ArrayPool<byte>.Shared.Rent(
+            Math.Max(1024, Encoding.UTF8.GetMaxByteCount(prefixLower.Length)));
+        var utfNeedle = ArrayPool<byte>.Shared.Rent(
+            Math.Max(1024, Encoding.UTF8.GetMaxByteCount(pathNeedle.Length)));
+        try
+        {
+            int plen = Encoding.UTF8.GetBytes(prefixLower.AsSpan(), utfPrefix);
+            int nlen = Encoding.UTF8.GetBytes(pathNeedle.AsSpan(), utfNeedle);
+            int rc;
+            _lock.EnterReadLock();
+            try
+            {
+                unsafe
+                {
+                    fixed (byte* pp = utfPrefix)
+                    fixed (byte* pn = utfNeedle)
+                    fixed (uint* po = rent)
+                    {
+                        rc = RustIndexNative.findx_engine_search_name_prefix_path_needle(
+                            _engine, (IntPtr)pp, plen, (IntPtr)pn, nlen, (IntPtr)po, SearchIndexCap, maxScan);
+                    }
+                }
+            }
+            finally
+            {
+                _lock.ExitReadLock();
+            }
+
+            if (rc < 0)
+                return new List<int>();
+
+            var list = new List<int>(Math.Min(rc, maxResults));
+            int take = Math.Min(rc, maxResults);
+            for (int i = 0; i < take; i++)
+                list.Add((int)rent[i]);
+            return list;
+        }
+        finally
+        {
+            ArrayPool<uint>.Shared.Return(rent);
+            ArrayPool<byte>.Shared.Return(utfPrefix);
+            ArrayPool<byte>.Shared.Return(utfNeedle);
+        }
+    }
+
+    /// <summary>
+    /// 将目录路径解析为索引中的目录行号（与 Rust <c>normalize_dir_path_key</c> 一致）；失败返回 -1。
+    /// </summary>
+    public int TryResolveDirPathToIndex(string dirPath)
+    {
+        EnsureSearchIndexesReady();
+        if (CountSnapshot == 0 || string.IsNullOrEmpty(dirPath))
+            return -1;
+
+        var utfRent = ArrayPool<byte>.Shared.Rent(Math.Max(1024, Encoding.UTF8.GetMaxByteCount(dirPath.Length)));
+        try
+        {
+            int blen = Encoding.UTF8.GetBytes(dirPath.AsSpan(), utfRent);
+            int rc;
+            _lock.EnterReadLock();
+            try
+            {
+                unsafe
+                {
+                    fixed (byte* pb = utfRent)
+                        rc = RustIndexNative.findx_engine_resolve_dir_path_utf8(_engine, (IntPtr)pb, blen);
+                }
+            }
+            finally
+            {
+                _lock.ExitReadLock();
+            }
+
+            return rc < 0 ? -1 : rc;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(utfRent);
+        }
+    }
+
+    /// <summary>
+    /// 在已解析的目录 <paramref name="rootDirIdx"/> 子树内按文件名忽略大小写前缀检索（Rust DFS，<paramref name="maxNodes"/> 封顶）。
+    /// </summary>
+    public List<int> SearchNamePrefixInSubtree(uint rootDirIdx, string prefixLower, int maxResults, int maxNodes)
+    {
+        if (maxResults <= 0 || maxNodes <= 0)
+            return new List<int>();
+        EnsureSearchIndexesReady();
+        if (CountSnapshot == 0)
+            return new List<int>();
+
+        var rent = ArrayPool<uint>.Shared.Rent(SearchIndexCap);
+        var utfRent = ArrayPool<byte>.Shared.Rent(Math.Max(1024, Encoding.UTF8.GetMaxByteCount(prefixLower.Length)));
+        try
+        {
+            int blen = Encoding.UTF8.GetBytes(prefixLower.AsSpan(), utfRent);
+            int rc;
+            _lock.EnterReadLock();
+            try
+            {
+                unsafe
+                {
+                    fixed (byte* pb = utfRent)
+                    fixed (uint* po = rent)
+                    {
+                        rc = RustIndexNative.findx_engine_search_name_prefix_in_subtree(
+                            _engine, rootDirIdx, (IntPtr)pb, blen, (IntPtr)po, SearchIndexCap, maxNodes);
+                    }
+                }
+            }
+            finally
+            {
+                _lock.ExitReadLock();
+            }
+
+            if (rc < 0)
+                return new List<int>();
+
+            var list = new List<int>(Math.Min(rc, maxResults));
+            int take = Math.Min(rc, maxResults);
+            for (int i = 0; i < take; i++)
+                list.Add((int)rent[i]);
+            return list;
+        }
+        finally
+        {
+            ArrayPool<uint>.Shared.Return(rent);
+            ArrayPool<byte>.Shared.Return(utfRent);
+        }
+    }
+
+    /// <summary>
+    /// 在能解析出目录行号时，将 <paramref name="candidates"/> 限制为「该目录子树内」的索引（含根），单次批量问 Rust。
+    /// 与 <c>parent:</c> 的 <c>StartsWith</c> 过滤在解析到最近祖先时可能略宽，最终仍由搜索评估阶段收紧。
+    /// </summary>
+    public void RetainIndicesUnderDirRoot(HashSet<int> candidates, int rootDirIdx)
+    {
+        if (rootDirIdx < 0 || candidates.Count == 0)
+            return;
+        EnsureSearchIndexesReady();
+
+        int n = candidates.Count;
+        var indices = ArrayPool<uint>.Shared.Rent(n);
+        var mask = ArrayPool<byte>.Shared.Rent(n);
+        try
+        {
+            int i = 0;
+            foreach (var x in candidates)
+                indices[i++] = (uint)x;
+
+            int rc;
+            _lock.EnterReadLock();
+            try
+            {
+                unsafe
+                {
+                    fixed (uint* pi = indices)
+                    fixed (byte* pm = mask)
+                    {
+                        rc = RustIndexNative.findx_engine_mask_indices_under_dir_root(
+                            _engine, (IntPtr)pi, n, (uint)rootDirIdx, (IntPtr)pm);
+                    }
+                }
+            }
+            finally
+            {
+                _lock.ExitReadLock();
+            }
+
+            if (rc < 0)
+                return;
+
+            candidates.Clear();
+            for (int j = 0; j < n; j++)
+            {
+                if (mask[j] != 0)
+                    candidates.Add((int)indices[j]);
+            }
+        }
+        finally
+        {
+            ArrayPool<uint>.Shared.Return(indices);
+            ArrayPool<byte>.Shared.Return(mask);
         }
     }
 
@@ -505,6 +714,133 @@ public sealed class FileIndex
         }
     }
 
+    public List<int> SearchSimpleQuery(string query, bool preferPinyin, int maxResults)
+    {
+        if (maxResults <= 0 || string.IsNullOrEmpty(query))
+            return new List<int>();
+
+        var swEnsure = Stopwatch.StartNew();
+        EnsureSearchIndexesReady();
+        swEnsure.Stop();
+        if (CountSnapshot == 0)
+            return new List<int>();
+
+        var rent = ArrayPool<uint>.Shared.Rent(SearchIndexCap);
+        var utfRent = ArrayPool<byte>.Shared.Rent(Math.Max(1024, Encoding.UTF8.GetMaxByteCount(query.Length)));
+        try
+        {
+            int blen = Encoding.UTF8.GetBytes(query.AsSpan(), utfRent);
+            int rc;
+            var swNative = Stopwatch.StartNew();
+            _lock.EnterReadLock();
+            try
+            {
+                unsafe
+                {
+                    fixed (byte* pb = utfRent)
+                    fixed (uint* po = rent)
+                    {
+                        rc = RustIndexNative.findx_engine_search_simple_query(
+                            _engine,
+                            (IntPtr)pb,
+                            blen,
+                            preferPinyin ? 1 : 0,
+                            (IntPtr)po,
+                            SearchIndexCap);
+                    }
+                }
+            }
+            finally { _lock.ExitReadLock(); }
+
+            swNative.Stop();
+            SearchPerfLog.WriteLine?.Invoke(
+                $"SearchSimpleQuery ensureMs={swEnsure.Elapsed.TotalMilliseconds:F1} ffiMs={swNative.Elapsed.TotalMilliseconds:F1} rc={rc} preferPy={preferPinyin} qLen={query.Length}");
+
+            if (rc < 0) return new List<int>();
+            var list = new List<int>(Math.Min(rc, maxResults));
+            int take = Math.Min(rc, maxResults);
+            for (int i = 0; i < take; i++)
+                list.Add((int)rent[i]);
+            return list;
+        }
+        finally
+        {
+            ArrayPool<uint>.Shared.Return(rent);
+            ArrayPool<byte>.Shared.Return(utfRent);
+        }
+    }
+
+    public List<int> SearchSimpleTerms(IReadOnlyList<string> terms, bool preferPinyin, int maxResults)
+    {
+        if (maxResults <= 0 || terms.Count == 0)
+            return new List<int>();
+
+        var swEnsure = Stopwatch.StartNew();
+        EnsureSearchIndexesReady();
+        swEnsure.Stop();
+        if (CountSnapshot == 0)
+            return new List<int>();
+
+        var normalized = terms.Where(static t => !string.IsNullOrWhiteSpace(t)).ToArray();
+        if (normalized.Length == 0)
+            return new List<int>();
+
+        int byteCount = 0;
+        foreach (var term in normalized)
+            byteCount += Encoding.UTF8.GetByteCount(term) + 1;
+
+        var rent = ArrayPool<uint>.Shared.Rent(SearchIndexCap);
+        var utfRent = ArrayPool<byte>.Shared.Rent(Math.Max(1024, byteCount));
+        try
+        {
+            int offset = 0;
+            foreach (var term in normalized)
+            {
+                offset += Encoding.UTF8.GetBytes(term.AsSpan(), utfRent.AsSpan(offset));
+                utfRent[offset++] = 0;
+            }
+
+            int rc;
+            var swNative = Stopwatch.StartNew();
+            _lock.EnterReadLock();
+            try
+            {
+                unsafe
+                {
+                    fixed (byte* pb = utfRent)
+                    fixed (uint* po = rent)
+                    {
+                        rc = RustIndexNative.findx_engine_search_simple_terms(
+                            _engine,
+                            (IntPtr)pb,
+                            offset,
+                            normalized.Length,
+                            preferPinyin ? 1 : 0,
+                            (IntPtr)po,
+                            SearchIndexCap);
+                    }
+                }
+            }
+            finally { _lock.ExitReadLock(); }
+
+            swNative.Stop();
+            SearchPerfLog.WriteLine?.Invoke(
+                $"SearchSimpleTerms ensureMs={swEnsure.Elapsed.TotalMilliseconds:F1} ffiMs={swNative.Elapsed.TotalMilliseconds:F1} rc={rc} termCount={normalized.Length} preferPy={preferPinyin}");
+
+            if (rc < 0) return new List<int>();
+            var list = new List<int>(Math.Min(rc, maxResults));
+            int take = Math.Min(rc, maxResults);
+            for (int i = 0; i < take; i++)
+                list.Add((int)rent[i]);
+            return list;
+        }
+        finally
+        {
+            ArrayPool<uint>.Shared.Return(rent);
+            ArrayPool<byte>.Shared.Return(utfRent);
+        }
+    }
+
     public void ForEachLiveEntry(Func<FileEntry, int, bool> visitor)
     {
         _lock.EnterReadLock();
@@ -625,7 +961,7 @@ public sealed class FileIndex
         bw.Write(volumeUsns.Count);
         foreach (var (vol, usn) in volumeUsns)
         {
-            bw.Write(vol);
+            bw.Write((ushort)vol);
             bw.Write(usn);
         }
     }
@@ -678,18 +1014,35 @@ public sealed class FileIndex
         var namePoolLen = BitConverter.ToUInt32(hdr, 8);
         var refKeysLen = BitConverter.ToUInt32(hdr, 12);
 
-        long rustSize = 8 + 20
+        long coreRust = 8 + 20
                         + (long)recordsCount * 48
                         + namePoolLen
                         + (long)refKeysLen * 8
                         + (long)refKeysLen * 4
                         + (long)liveCount * 4 * 3;
 
+        // FXBIN06：核心块后为 PINYAUX(8) + aux_len(8) + 拼音/倒排快照；FXBIN05 核心块后紧接 C# 写入的 USN 尾。
+        fs.Seek(coreRust, SeekOrigin.Begin);
+        var peek = br.ReadBytes(8);
+        long rustSize = coreRust;
+        ReadOnlySpan<byte> pinyAux = "PINYAUX\0"u8;
+        if (peek.Length == 8 && peek.AsSpan().SequenceEqual(pinyAux))
+        {
+            long auxLen = br.ReadInt64();
+            rustSize = coreRust + 8 + 8 + auxLen;
+        }
+        else
+        {
+            // 非 PINYAUX：这 8 字节实为 USN 附录开头，回退后再按 rustSize=coreRust 解析。
+            fs.Seek(coreRust, SeekOrigin.Begin);
+        }
+
+        // FXBIN06 在 PINYAUX 后有 aux 正文，必须跳到 rustSize 再读 usnCount；否则会把 aux 当成 USN 头，卷 USN 全丢。
         fs.Seek(rustSize, SeekOrigin.Begin);
         var usnCount = br.ReadInt32();
         for (int i = 0; i < usnCount; i++)
         {
-            var vol = br.ReadChar();
+            var vol = (char)br.ReadUInt16();
             var usn = br.ReadUInt64();
             volumeUsns[vol] = usn;
         }

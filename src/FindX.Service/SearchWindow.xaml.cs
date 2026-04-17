@@ -130,6 +130,14 @@ public partial class SearchWindow : Window
         }
     }
 
+    private void SidebarFilter_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (!_initialized)
+            return;
+        _debounce.Stop();
+        _debounce.Start();
+    }
+
     private string BuildSidebarFilters()
     {
         var parts = new List<string>();

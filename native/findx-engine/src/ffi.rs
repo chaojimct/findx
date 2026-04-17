@@ -216,6 +216,135 @@ pub unsafe extern "C" fn findx_engine_search_name_prefix(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn findx_engine_search_name_prefix_path_needle(
+    p: *mut EngineBox,
+    prefix_utf8: *const u8,
+    prefix_len: i32,
+    path_needle_utf8: *const u8,
+    path_needle_len: i32,
+    out_indices: *mut u32,
+    out_cap: i32,
+    max_scan: i32,
+) -> i32 {
+    let b = match as_box(p) {
+        Some(x) => x,
+        None => return -1,
+    };
+    if prefix_utf8.is_null()
+        || prefix_len < 0
+        || path_needle_utf8.is_null()
+        || path_needle_len < 0
+        || out_indices.is_null()
+        || out_cap <= 0
+        || max_scan <= 0
+    {
+        return -2;
+    }
+    if b.inner.live_count > 0 && b.inner.name_sort_index_empty() {
+        return -3;
+    }
+    let prefix =
+        std::str::from_utf8(std::slice::from_raw_parts(prefix_utf8, prefix_len as usize))
+            .unwrap_or("");
+    let path_needle =
+        std::str::from_utf8(std::slice::from_raw_parts(
+            path_needle_utf8,
+            path_needle_len as usize,
+        ))
+        .unwrap_or("");
+    b.inner.search_name_prefix_path_needle(
+        prefix,
+        path_needle,
+        &mut b.scratch_idx,
+        out_cap as usize,
+        max_scan as usize,
+    );
+    let n = b.scratch_idx.len();
+    let cap = out_cap as usize;
+    let ncpy = n.min(cap);
+    std::ptr::copy_nonoverlapping(b.scratch_idx.as_ptr(), out_indices, ncpy);
+    ncpy as i32
+}
+
+/// 将规范化目录路径（UTF-8，与 `Engine::normalize_dir_path_key` 一致）解析为目录行号；未找到返回 -1。
+#[no_mangle]
+pub unsafe extern "C" fn findx_engine_resolve_dir_path_utf8(
+    p: *const EngineBox,
+    path_utf8: *const u8,
+    path_len: i32,
+) -> i32 {
+    if p.is_null() || path_utf8.is_null() || path_len < 0 {
+        return -2;
+    }
+    let path =
+        std::str::from_utf8(std::slice::from_raw_parts(path_utf8, path_len as usize)).unwrap_or("");
+    (&*p).inner.resolve_dir_path_lower(path)
+}
+
+/// 在 `root_dir_idx` 为根的子树内按文件名忽略大小写前缀收集索引，最多 `out_cap` 条、最多访问 `max_nodes` 个结点。
+#[no_mangle]
+pub unsafe extern "C" fn findx_engine_search_name_prefix_in_subtree(
+    p: *mut EngineBox,
+    root_dir_idx: u32,
+    prefix_utf8: *const u8,
+    prefix_len: i32,
+    out_indices: *mut u32,
+    out_cap: i32,
+    max_nodes: i32,
+) -> i32 {
+    let b = match as_box(p) {
+        Some(x) => x,
+        None => return -1,
+    };
+    if prefix_utf8.is_null()
+        || prefix_len < 0
+        || out_indices.is_null()
+        || out_cap <= 0
+        || max_nodes <= 0
+    {
+        return -2;
+    }
+    if b.inner.live_count > 0 && b.inner.name_sort_index_empty() {
+        return -3;
+    }
+    let prefix =
+        std::str::from_utf8(std::slice::from_raw_parts(prefix_utf8, prefix_len as usize))
+            .unwrap_or("");
+    b.inner.search_name_prefix_in_subtree(
+        root_dir_idx,
+        prefix,
+        &mut b.scratch_idx,
+        out_cap as usize,
+        max_nodes as usize,
+    );
+    let n = b.scratch_idx.len();
+    let cap = out_cap as usize;
+    let ncpy = n.min(cap);
+    std::ptr::copy_nonoverlapping(b.scratch_idx.as_ptr(), out_indices, ncpy);
+    ncpy as i32
+}
+
+/// 对 `indices[0..n)` 逐条写入 `out_mask[i]`：1 表示 `index_is_under_dir_root(indices[i], root_dir_idx)`。
+#[no_mangle]
+pub unsafe extern "C" fn findx_engine_mask_indices_under_dir_root(
+    p: *const EngineBox,
+    indices: *const u32,
+    n: i32,
+    root_dir_idx: u32,
+    out_mask: *mut u8,
+) -> i32 {
+    if p.is_null() || indices.is_null() || out_mask.is_null() || n < 0 {
+        return -2;
+    }
+    let eng = &(*p).inner;
+    for i in 0..n as usize {
+        let idx = *indices.add(i);
+        *out_mask.add(i) = u8::from(eng.index_is_under_dir_root(idx, root_dir_idx));
+    }
+    0
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn findx_engine_search_pinyin_prefix(
     p: *mut EngineBox,
     prefix_utf8: *const u8,
@@ -399,6 +528,80 @@ pub unsafe extern "C" fn findx_engine_search_match_query(
             .unwrap_or("");
     b.inner
         .search_query_matches(query, &mut b.scratch_idx, out_cap as usize);
+    let n = b.scratch_idx.len();
+    let ncpy = n.min(out_cap as usize);
+    std::ptr::copy_nonoverlapping(b.scratch_idx.as_ptr(), out_indices, ncpy);
+    ncpy as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn findx_engine_search_simple_query(
+    p: *mut EngineBox,
+    query_utf8: *const u8,
+    query_len: i32,
+    prefer_pinyin: i32,
+    out_indices: *mut u32,
+    out_cap: i32,
+) -> i32 {
+    let b = match as_box(p) {
+        Some(x) => x,
+        None => return -1,
+    };
+    if query_utf8.is_null() || query_len < 0 || out_indices.is_null() || out_cap <= 0 {
+        return -2;
+    }
+    let query =
+        std::str::from_utf8(std::slice::from_raw_parts(query_utf8, query_len as usize))
+            .unwrap_or("");
+    b.inner
+        .search_simple_query(query, prefer_pinyin != 0, &mut b.scratch_idx, out_cap as usize);
+    let n = b.scratch_idx.len();
+    let ncpy = n.min(out_cap as usize);
+    std::ptr::copy_nonoverlapping(b.scratch_idx.as_ptr(), out_indices, ncpy);
+    ncpy as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn findx_engine_search_simple_terms(
+    p: *mut EngineBox,
+    terms_utf8: *const u8,
+    terms_len: i32,
+    term_count: i32,
+    prefer_pinyin: i32,
+    out_indices: *mut u32,
+    out_cap: i32,
+) -> i32 {
+    let b = match as_box(p) {
+        Some(x) => x,
+        None => return -1,
+    };
+    if terms_utf8.is_null()
+        || terms_len < 0
+        || term_count <= 0
+        || out_indices.is_null()
+        || out_cap <= 0
+    {
+        return -2;
+    }
+
+    let raw = std::slice::from_raw_parts(terms_utf8, terms_len as usize);
+    let mut terms = Vec::with_capacity(term_count as usize);
+    for segment in raw.split(|b| *b == 0).take(term_count as usize) {
+        let text = std::str::from_utf8(segment).unwrap_or("");
+        if !text.is_empty() {
+            terms.push(text);
+        }
+    }
+    if terms.is_empty() {
+        return 0;
+    }
+
+    b.inner.search_simple_terms(
+        &terms,
+        prefer_pinyin != 0,
+        &mut b.scratch_idx,
+        out_cap as usize,
+    );
     let n = b.scratch_idx.len();
     let ncpy = n.min(out_cap as usize);
     std::ptr::copy_nonoverlapping(b.scratch_idx.as_ptr(), out_indices, ncpy);

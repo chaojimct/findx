@@ -1,5 +1,8 @@
 using System.Diagnostics;
 using FindX.Client;
+using FindX.Core.Index;
+using FindX.Core.Search;
+using FindX.Core.Storage;
 using FindX.Core.Update;
 
 namespace FindX.Cli;
@@ -15,6 +18,9 @@ public static class Program
         }
 
         var command = args[0].ToLowerInvariant();
+        if (command is "test" or "t")
+            return RunLocalSmokeTests(args);
+
         using var client = new FindXClient();
 
         try
@@ -63,7 +69,9 @@ public static class Program
                 jsonOut = true;
         }
 
+        var wall = Stopwatch.StartNew();
         var result = await client.SearchAsync(query, maxResults, pathFilter);
+        wall.Stop();
         if (result == null)
         {
             var detail = string.IsNullOrEmpty(client.LastError) ? "" : $": {client.LastError}";
@@ -71,7 +79,8 @@ public static class Program
             return 1;
         }
 
-        Console.WriteLine($"找到 {result.TotalCount} 个结果 (耗时 {result.ElapsedMs:F1}ms)");
+        Console.WriteLine(
+            $"找到 {result.TotalCount} 个结果 (服务端 Search {result.ElapsedMs:F1} ms, 含 IPC/JSON 往返 {wall.Elapsed.TotalMilliseconds:F1} ms)");
         Console.WriteLine();
 
         if (jsonOut)
@@ -215,10 +224,209 @@ public static class Program
         Console.WriteLine();
         Console.WriteLine("命令:");
         Console.WriteLine("  search <query> [--max N] [--path <filter>] [--json]  搜索（每行打印大小、修改时间、--json 为 NDJSON）");
+        Console.WriteLine("    注意: search 走本机 FindX 命名管道服务；索引/Rust 优化需将 findx_engine.dll 与 FindX.exe 同目录部署并重启服务后生效。");
         Console.WriteLine("  status                                       查看索引状态");
         Console.WriteLine("  reindex                                      触发重新索引");
         Console.WriteLine("  update [--install|-i]                         检查更新；加 --install 则下载并启动安装");
+        Console.WriteLine("  test [--index <path>]                         本进程加载 index.dat，测 Core+Rust 搜索耗时（与 search 是否重启服务无关）");
+        Console.WriteLine("  test --synthetic [--quick] [N]               内存合成索引（无安装索引时用）");
         return 1;
+    }
+
+    private static string DefaultInstalledIndexPath()
+        => Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "FindX",
+            "index.dat");
+
+    /// <summary>
+    /// 默认加载 FindX 与本机服务相同的 index.dat；<c>--synthetic</c> 时使用内存合成索引。
+    /// </summary>
+    private static int RunLocalSmokeTests(string[] args)
+    {
+        if (args.Contains("--synthetic", StringComparer.OrdinalIgnoreCase))
+            return RunSyntheticSmokeTests(args);
+
+        string? indexPath = null;
+        for (var i = 1; i < args.Length; i++)
+        {
+            if (args[i].Equals("--index", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+            {
+                indexPath = args[++i];
+                continue;
+            }
+
+            if (args[i].Equals("--quick", StringComparison.OrdinalIgnoreCase)
+                || args[i].Equals("--synthetic", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (!args[i].StartsWith('-') && File.Exists(args[i]))
+                indexPath = args[i];
+        }
+
+        indexPath ??= DefaultInstalledIndexPath();
+
+        if (!File.Exists(indexPath))
+        {
+            Console.Error.WriteLine($"fx test: 索引文件不存在: {indexPath}");
+            Console.Error.WriteLine("  请先运行 FindX 完成索引，或指定: fx test --index <其它 index.dat 路径>");
+            Console.Error.WriteLine("  开发机无安装索引时可用: fx test --synthetic [--quick] [N]");
+            return 1;
+        }
+
+        Console.WriteLine($"fx test: 加载索引 {indexPath}");
+
+        var index = new FileIndex();
+        var usns = new Dictionary<char, ulong>();
+        var swLoad = Stopwatch.StartNew();
+        var loaded = IndexSerializer.TryLoadBinary(indexPath, index, usns);
+        swLoad.Stop();
+
+        if (loaded < 0)
+        {
+            Console.Error.WriteLine("fx test: 加载失败（非 FXBIN 或文件损坏）。");
+            return 1;
+        }
+
+        if (index.Count == 0)
+        {
+            Console.Error.WriteLine("fx test: 索引条目数为 0。");
+            return 1;
+        }
+
+        Console.WriteLine($"  加载: {swLoad.Elapsed.TotalMilliseconds:F1} ms, live={index.Count:N0}");
+
+        var engine = new SearchEngine(index);
+
+        static void BenchQuery(SearchEngine eng, string q, int max)
+        {
+            var sw = Stopwatch.StartNew();
+            var r = eng.Search(q, max);
+            sw.Stop();
+            Console.WriteLine($"  Search \"{q}\" max={max} -> {r.Count} 条, {sw.Elapsed.TotalMilliseconds:F2} ms");
+        }
+
+        BenchQuery(engine, "yuebao", 200);
+        BenchQuery(engine, "ybhz", 200);
+        BenchQuery(engine, "bao", 200);
+        BenchQuery(engine, "windows", 20);
+        BenchQuery(engine, "clipboard", 20);
+        BenchQuery(engine, "clip", 20);
+
+        Console.WriteLine("fx test: 本机索引检查完成（未对命中内容做强断言；回归请 dotnet test src/FindX.Tests）");
+        return 0;
+    }
+
+    /// <summary>内存合成索引 + 固定断言（仅 <c>--synthetic</c>）。</summary>
+    private static int RunSyntheticSmokeTests(string[] args)
+    {
+        int count = 120_000;
+        var quick = args.Contains("--quick", StringComparer.OrdinalIgnoreCase);
+        if (quick)
+            count = 25_000;
+
+        foreach (var a in args)
+        {
+            if (a.StartsWith('-')) continue;
+            if (int.TryParse(a, out var n) && n > 0)
+                count = Math.Min(n, 2_000_000);
+        }
+
+        Console.WriteLine($"fx test --synthetic: 合成索引条目数={count:N0} …");
+
+        var index = new FileIndex();
+        var swBulk = Stopwatch.StartNew();
+        index.BeginBulk();
+        const int chunk = 8192;
+        var batch = new List<FileEntry>(chunk);
+        for (int i = 0; i < count; i++)
+        {
+            var month = i % 12 + 1;
+            var name = i % 2048 == 0
+                ? $"【彩石智能月报】马春天+{month}月.docx"
+                : $"bench_{i % 256:x2}_{(uint)i:x6}.txt";
+            batch.Add(new FileEntry
+            {
+                VolumeLetter = 'C',
+                FileRef = (ulong)(i + 1),
+                ParentRef = 0x1000UL,
+                Name = name,
+                Attributes = (i & 1) == 0 ? 0u : 0x10u,
+                Size = i,
+                LastWriteTimeTicks = i,
+            });
+            if (batch.Count >= chunk)
+            {
+                index.AddBulk(batch);
+                batch.Clear();
+            }
+        }
+
+        if (batch.Count > 0)
+            index.AddBulk(batch);
+        index.EndBulk();
+        index.AddEntry(new FileEntry
+        {
+            VolumeLetter = 'C',
+            FileRef = (ulong)count + 10_000_000UL,
+            ParentRef = 0x1000UL,
+            Name = "月报汇总.md",
+            Attributes = 0x20,
+            Size = 1,
+            LastWriteTimeTicks = 0,
+        });
+        swBulk.Stop();
+        Console.WriteLine($"  EndBulk+月报汇总: {swBulk.Elapsed.TotalMilliseconds:F1} ms");
+
+        var engine = new SearchEngine(index);
+
+        var failed = false;
+
+        var sw1 = Stopwatch.StartNew();
+        var ry = engine.Search("yuebao", 50);
+        sw1.Stop();
+        var ms1 = sw1.Elapsed.TotalMilliseconds;
+        if (!ry.Exists(x => x.Name.Contains("月报", StringComparison.Ordinal)))
+        {
+            Console.Error.WriteLine("  失败: yuebao 应命中月报名称");
+            failed = true;
+        }
+        else
+            Console.WriteLine($"  yuebao: {ms1:F2} ms, 命中 {ry.Count} 条");
+
+        var sw2 = Stopwatch.StartNew();
+        var rb = engine.Search("ybhz", 50);
+        sw2.Stop();
+        var ms2 = sw2.Elapsed.TotalMilliseconds;
+        if (rb.Count == 0 || !rb.Exists(x => x.Name.Contains("月报汇总", StringComparison.Ordinal)))
+        {
+            Console.Error.WriteLine("  失败: ybhz 应命中 月报汇总.md（首字母子串）");
+            failed = true;
+        }
+        else
+            Console.WriteLine($"  ybhz: {ms2:F2} ms, 命中 {rb.Count} 条");
+
+        var sw3 = Stopwatch.StartNew();
+        var rbao = engine.Search("bao", 50);
+        sw3.Stop();
+        var ms3 = sw3.Elapsed.TotalMilliseconds;
+        if (rbao.Count == 0)
+        {
+            Console.Error.WriteLine("  失败: bao 应有结果");
+            failed = true;
+        }
+        else
+            Console.WriteLine($"  bao: {ms3:F2} ms, 命中 {rbao.Count} 条");
+
+        if (failed)
+        {
+            Console.Error.WriteLine("fx test --synthetic: 未通过");
+            return 1;
+        }
+
+        Console.WriteLine($"fx test --synthetic: 全部通过（yuebao {ms1:F1} ms / ybhz {ms2:F1} ms / bao {ms3:F1} ms）");
+        Console.WriteLine("完整单元测试请执行: dotnet test src/FindX.Tests");
+        return 0;
     }
 
     private static string FormatSize(long bytes)

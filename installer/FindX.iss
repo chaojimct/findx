@@ -1,8 +1,8 @@
 ; FindX Inno Setup 安装脚本
-; 构建命令: iscc /DMyAppVersion=1.0.0 FindX.iss
+; 构建命令: iscc /DMyAppVersion=1.2.0 FindX.iss
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.1.2"
+  #define MyAppVersion "1.2.0"
 #endif
 
 #define MyAppName      "FindX"

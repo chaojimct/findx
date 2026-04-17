@@ -90,4 +90,24 @@ public class TokenizerTests
         Assert.Equal(">=1mb", tokens[0].Value);
         Assert.Equal("<500kb", tokens[1].Value);
     }
+
+    [Fact]
+    public void PathFilter_QuotedValue_PreservesSpaces()
+    {
+        var tokens = QueryTokenizer.Tokenize(@"path:""C:\Program Files"" ext:exe");
+        Assert.Equal(2, tokens.Count);
+        Assert.Equal(TokenType.Filter, tokens[0].Type);
+        Assert.Equal("path", tokens[0].FilterPrefix);
+        Assert.Equal(@"C:\Program Files", tokens[0].Value);
+        Assert.Equal("exe", tokens[1].Value);
+    }
+
+    [Fact]
+    public void RegexFilterValue_KeepsPipe()
+    {
+        var tokens = QueryTokenizer.Tokenize(@"regex:^(a|b)\.cs$ | x");
+        Assert.Equal(3, tokens.Count);
+        Assert.Equal(@"^(a|b)\.cs$", tokens[0].Value);
+        Assert.Equal(TokenType.OrOp, tokens[1].Type);
+    }
 }

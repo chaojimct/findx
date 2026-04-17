@@ -31,6 +31,12 @@ public readonly struct QueryToken
 /// </summary>
 public static class QueryTokenizer
 {
+    /// <summary>值可写为 path:&quot;... ...&quot;（含空格、冒号），与 Everything 一致。</summary>
+    private static readonly HashSet<string> QuotedValueFilters = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "path", "parent", "nopath", "root",
+    };
+
     private static readonly HashSet<string> KnownFilters = new(StringComparer.OrdinalIgnoreCase)
     {
         "ext", "path", "nopath", "parent",
@@ -41,7 +47,7 @@ public static class QueryTokenizer
         "da", "dateaccessed",
         "len",
         "depth", "parents",
-        "root",
+        "root", "volroot",
         "attrib", "attributes",
         "case", "nocase",
         "wholeword", "ww",
@@ -90,9 +96,19 @@ public static class QueryTokenizer
             int wordStart = i;
             bool inFilterValue = false;
             bool valueHasContent = false;
+            bool regexValueMode = false;
+            bool emittedQuotedFilter = false;
             while (i < len)
             {
                 char ch = input[i];
+                if (regexValueMode)
+                {
+                    if (char.IsWhiteSpace(ch) || ch == '"')
+                        break;
+                    i++;
+                    continue;
+                }
+
                 if (char.IsWhiteSpace(ch) || ch == '|' || ch == '"')
                     break;
                 // < > 仅在 filter 值开头不断词（如 size:>1mb, dm:<=2024）
@@ -106,7 +122,25 @@ public static class QueryTokenizer
                 {
                     string potentialPrefix = input[wordStart..i];
                     if (KnownFilters.Contains(potentialPrefix))
+                    {
+                        i++; // skip ':'
+                        if (i < len && input[i] == '"' && QuotedValueFilters.Contains(potentialPrefix))
+                        {
+                            i++; // opening "
+                            int v0 = i;
+                            while (i < len && input[i] != '"') i++;
+                            string qval = input[v0..i];
+                            if (i < len) i++; // closing "
+                            tokens.Add(new QueryToken(TokenType.Filter, qval, potentialPrefix));
+                            emittedQuotedFilter = true;
+                            break;
+                        }
+
                         inFilterValue = true;
+                        if (potentialPrefix.Equals("regex", StringComparison.OrdinalIgnoreCase))
+                            regexValueMode = true;
+                        continue;
+                    }
                 }
                 else if (inFilterValue && ch is not (':' or '<' or '>' or '='))
                 {
@@ -114,6 +148,9 @@ public static class QueryTokenizer
                 }
                 i++;
             }
+
+            if (emittedQuotedFilter)
+                continue;
 
             string word = input[wordStart..i];
 

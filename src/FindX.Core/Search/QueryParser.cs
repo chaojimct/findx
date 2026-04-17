@@ -11,6 +11,8 @@ public sealed class ParsedQuery
     public string RawQuery = "";
     public List<string> Keywords = new();
     public string? PathFilter;
+    /// <summary>非空 <c>root:路径</c> 时的根路径前缀，与 AST 中 RootPath 一致。</summary>
+    public string? RootPathFilter;
     public string? ExtFilter;
     public Regex? RegexPattern;
     public bool IsRegex;
@@ -207,6 +209,16 @@ public static class QueryParser
 
             case "root":
                 q.HasFilters = true;
+                {
+                    var rv = value.Trim('"').Trim().Replace('/', '\\');
+                    if (string.IsNullOrEmpty(rv))
+                        return FilterNode.RootOnly();
+                    q.RootPathFilter ??= rv;
+                    return FilterNode.ParseRootPath(value);
+                }
+
+            case "volroot":
+                q.HasFilters = true;
                 return FilterNode.RootOnly();
 
             case "ext":
@@ -265,14 +277,20 @@ public static class QueryParser
 
             case "case":
                 m.CaseSensitive = true;
+                if (value.Length > 0)
+                    return new TermNode(value.Trim('"'), wholeWord: m.WholeWord, caseSensitive: true);
                 return null;
 
             case "nocase":
                 m.CaseSensitive = false;
+                if (value.Length > 0)
+                    return new TermNode(value.Trim('"'), wholeWord: m.WholeWord, caseSensitive: false);
                 return null;
 
             case "wholeword" or "ww":
                 m.WholeWord = true;
+                if (value.Length > 0)
+                    return new TermNode(value.Trim('"'), wholeWord: true, caseSensitive: m.CaseSensitive);
                 return null;
 
             case "count":

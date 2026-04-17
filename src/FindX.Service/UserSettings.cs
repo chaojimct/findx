@@ -9,9 +9,15 @@ public sealed class UserSettings
 {
     public bool PreferPinyinForAsciiQueries { get; set; } = true;
 
+    /// <summary>
+    /// 搜索结果是否从磁盘补全大小、修改时间。null 表示旧版 settings.json 未写该字段，按「开启」处理。
+    /// </summary>
+    public bool? HydrateSearchResultMetadata { get; set; }
+
     public SearchPreferences ToSearchPreferences() => new()
     {
         PreferPinyinForAsciiQueries = PreferPinyinForAsciiQueries,
+        HydrateSearchResultMetadata = HydrateSearchResultMetadata != false,
     };
 }
 
