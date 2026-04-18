@@ -415,8 +415,139 @@ fn compute_full_py_stack(name: &str) -> ([u8; 1024], usize) {
     (buf, len)
 }
 
-/// 拼音相关打分（全拼 / 首字母 / 模糊），与 `compute_full_py_stack` 结果一致。
-fn match_pinyin_stages(query_bytes: &[u8], query_chars: i32, full_py: &[u8], initials: &[u8]) -> QueryMatch {
+/// 每个 CJK 字对应一条全拼（小写 ASCII）与首字母，用于按字混合匹配与高亮。
+struct CjkSyllable {
+    full: Vec<u8>,
+    initial: u8,
+    char_idx: usize,
+}
+
+#[inline]
+fn bytes_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && a
+            .iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
+}
+
+fn collect_cjk_syllables(candidate: &str) -> Vec<CjkSyllable> {
+    let mut out = Vec::new();
+    for (char_idx, ch) in candidate.chars().enumerate() {
+        if ch.is_ascii_alphanumeric() {
+            continue;
+        }
+        if let Some(py) = ch.to_pinyin() {
+            let plain = py.plain().to_ascii_lowercase();
+            let full: Vec<u8> = plain.bytes().collect();
+            let initial = full.first().copied().unwrap_or(0);
+            out.push(CjkSyllable {
+                full,
+                initial,
+                char_idx,
+            });
+        }
+    }
+    out
+}
+
+/// 按字对齐：每个字仅消耗「全拼」或「首字母」之一，支持从任意字起算的局部匹配（部分首字母 / 部分全拼 / 混合）。
+fn match_mixed_pinyin(query_bytes: &[u8], candidate: &str) -> bool {
+    let syllables = collect_cjk_syllables(candidate);
+    if syllables.is_empty() {
+        return false;
+    }
+    let nq = query_bytes.len();
+    for start in 0..syllables.len() {
+        let slice = &syllables[start..];
+        let ns = slice.len();
+        let mut memo = vec![vec![false; ns + 1]; nq + 1];
+        for j in 0..=ns {
+            memo[nq][j] = true;
+        }
+        for i in (0..nq).rev() {
+            for j in (0..ns).rev() {
+                let t = &slice[j];
+                let mut ok = false;
+                let flen = t.full.len();
+                if i + flen <= nq && bytes_eq_ignore_case(&query_bytes[i..i + flen], &t.full[..]) {
+                    ok = memo[i + flen][j + 1];
+                }
+                if !ok && query_bytes[i].to_ascii_lowercase() == t.initial.to_ascii_lowercase() {
+                    ok = memo[i + 1][j + 1];
+                }
+                memo[i][j] = ok;
+            }
+        }
+        if memo[0][0] {
+            return true;
+        }
+    }
+    false
+}
+
+fn dfs_mixed_path(
+    q: &[u8],
+    slice: &[CjkSyllable],
+    qi: usize,
+    si: usize,
+    start_offset: usize,
+    path: &mut Vec<usize>,
+) -> bool {
+    if qi == q.len() {
+        return true;
+    }
+    if si >= slice.len() {
+        return false;
+    }
+    let global = start_offset + si;
+    let s = &slice[si];
+    if q.len() >= qi + s.full.len() && bytes_eq_ignore_case(&q[qi..qi + s.full.len()], &s.full[..]) {
+        path.push(global);
+        if dfs_mixed_path(q, slice, qi + s.full.len(), si + 1, start_offset, path) {
+            return true;
+        }
+        path.pop();
+    }
+    if qi < q.len() && q[qi].to_ascii_lowercase() == s.initial.to_ascii_lowercase() {
+        path.push(global);
+        if dfs_mixed_path(q, slice, qi + 1, si + 1, start_offset, path) {
+            return true;
+        }
+        path.pop();
+    }
+    false
+}
+
+fn add_mixed_pinyin_ranges(
+    query: &[u8],
+    candidate: &str,
+    spans: &[Utf16CharSpan],
+    ranges: &mut Vec<(i32, i32)>,
+) -> bool {
+    let syllables = collect_cjk_syllables(candidate);
+    if syllables.is_empty() {
+        return false;
+    }
+    for start in 0..syllables.len() {
+        let mut path = Vec::new();
+        if dfs_mixed_path(query, &syllables[start..], 0, 0, start, &mut path) {
+            let char_indices: Vec<usize> = path.iter().map(|&si| syllables[si].char_idx).collect();
+            add_owner_indices_as_ranges(&char_indices, spans, ranges);
+            return true;
+        }
+    }
+    false
+}
+
+/// 拼音相关打分（全拼子串 / 首字母子串 / 按字混合），与 `compute_full_py_stack` 结果一致。
+fn match_pinyin_stages(
+    query_bytes: &[u8],
+    query_chars: i32,
+    full_py: &[u8],
+    initials: &[u8],
+    candidate: &str,
+) -> QueryMatch {
     if starts_with_ignore_case_bytes(full_py, query_bytes) {
         return QueryMatch {
             kind: MatchKind::FullPinyin,
@@ -447,11 +578,10 @@ fn match_pinyin_stages(query_bytes: &[u8], query_chars: i32, full_py: &[u8], ini
         };
     }
 
-    let fuzzy = fuzzy_match_bytes(query_bytes, full_py);
-    if fuzzy > 0 {
+    if match_mixed_pinyin(query_bytes, candidate) {
         return QueryMatch {
             kind: MatchKind::Mixed,
-            score: 200 + fuzzy,
+            score: 380,
             matched_chars: query_chars,
         };
     }
@@ -610,7 +740,7 @@ pub fn match_query_with_pinyin_cache(
         }
     };
 
-    match_pinyin_stages(query_bytes, query_chars, full_py, initials)
+    match_pinyin_stages(query_bytes, query_chars, full_py, initials, candidate)
 }
 
 pub fn match_query(query_lower: &str, candidate: &str) -> QueryMatch {
@@ -835,34 +965,6 @@ fn add_ascii_subsequence_ranges(query: &[u8], candidate: &str, spans: &[Utf16Cha
     }
 }
 
-fn add_fuzzy_owner_ranges(
-    query: &[u8],
-    hay: &[u8],
-    owners: &[usize],
-    spans: &[Utf16CharSpan],
-    ranges: &mut Vec<(i32, i32)>,
-) -> bool {
-    let mut query_idx = 0usize;
-    let mut matched_owners = Vec::with_capacity(query.len());
-
-    for (idx, &b) in hay.iter().enumerate() {
-        if query_idx >= query.len() {
-            break;
-        }
-        if b.to_ascii_lowercase() == query[query_idx] {
-            matched_owners.push(owners[idx]);
-            query_idx += 1;
-        }
-    }
-
-    if query_idx == query.len() {
-        add_owner_indices_as_ranges(&matched_owners, spans, ranges);
-        true
-    } else {
-        false
-    }
-}
-
 pub fn highlight_query_ranges(query_lower: &str, candidate: &str) -> Vec<(i32, i32)> {
     if query_lower.is_empty() || candidate.is_empty() {
         return Vec::new();
@@ -901,8 +1003,11 @@ pub fn highlight_query_ranges(query_lower: &str, candidate: &str) -> Vec<(i32, i
         return ranges;
     }
 
-    add_fuzzy_owner_ranges(query_bytes, &full_py, &full_owners, &spans, &mut ranges);
-    merge_ranges(&mut ranges);
+    if add_mixed_pinyin_ranges(query_bytes, candidate, &spans, &mut ranges) {
+        merge_ranges(&mut ranges);
+        return ranges;
+    }
+
     ranges
 }
 
@@ -2440,42 +2545,9 @@ impl Engine {
         self.append_py_contains_verified_ids(needle_bytes, &ids, out, max_results, false);
     }
 
+    /// 候选过少时的补全：与 `search_query_matches` 一致（按字混合 / 全拼子串 / 首字母子串），不再使用全拼子序列模糊。
     pub fn search_full_py_fuzzy(&self, needle: &str, out: &mut Vec<u32>, max_results: usize) {
-        out.clear();
-        if max_results == 0 || needle.is_empty() {
-            return;
-        }
-
-        let needle_bytes = needle.as_bytes();
-        let name_pool = &self.name_pool;
-        let fp_pool = &self.full_py_pool;
-        let fp_off = &self.full_py_off;
-        let fp_len = &self.full_py_len;
-
-        let mut hits: Vec<(i32, u32)> = self
-            .records
-            .par_iter()
-            .enumerate()
-            .filter_map(|(i, r)| {
-                if r.deleted != 0 {
-                    return None;
-                }
-                let name = pool_utf8(name_pool, r.name_start, r.name_len as u32);
-                if !name_contains_cjk(name) {
-                    return None;
-                }
-                let full_py = pool_bytes_slice(fp_pool, fp_off, fp_len, i);
-                let score = fuzzy_match_bytes(needle_bytes, full_py);
-                if score <= 0 {
-                    return None;
-                }
-                Some((score, i as u32))
-            })
-            .collect();
-
-        hits.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        hits.truncate(max_results);
-        out.extend(hits.into_iter().map(|(_, idx)| idx));
+        self.search_query_matches(needle, out, max_results);
     }
 
     pub fn search_query_matches(&self, query: &str, out: &mut Vec<u32>, max_results: usize) {
@@ -3418,6 +3490,54 @@ mod tests {
         assert_eq!(a, b);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn match_query_nhao_is_mixed_nihao() {
+        let r = match_query("nhao", "你好");
+        assert!(r.is_match());
+        assert_eq!(r.kind, MatchKind::Mixed);
+    }
+
+    #[test]
+    fn match_query_nihao_full_pinyin() {
+        let r = match_query("nihao", "你好");
+        assert!(r.is_match());
+        assert_eq!(r.kind, MatchKind::FullPinyin);
+    }
+
+    #[test]
+    fn match_query_nzdaom_mixed() {
+        let r = match_query("nzdaom", "你知道吗");
+        assert!(r.is_match());
+        assert_eq!(r.kind, MatchKind::Mixed);
+    }
+
+    #[test]
+    fn match_query_nzdm_initials() {
+        let r = match_query("nzdm", "你知道吗");
+        assert!(r.is_match());
+        assert_eq!(r.kind, MatchKind::Initials);
+    }
+
+    #[test]
+    fn match_query_jt_initials_in_sentence() {
+        let r = match_query("jt", "今天是什么日子");
+        assert!(r.is_match());
+        assert_eq!(r.kind, MatchKind::Initials);
+    }
+
+    #[test]
+    fn match_query_nizhidaoma_partial_full() {
+        let r = match_query("nizhidaoma", "你知道吗");
+        assert!(r.is_match());
+        assert_eq!(r.kind, MatchKind::FullPinyin);
+    }
+
+    #[test]
+    fn match_query_no_subsequence_fuzzy_across_chars() {
+        let r = match_query("nihao", "拟承担中");
+        assert!(!r.is_match());
     }
 }
 
