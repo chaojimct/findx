@@ -1,17 +1,36 @@
-# findx
+# FindX 2.0
 
-本仓库为 **FindX 下一代实现**（由原 `findx2` 代码树迁入 `chaojimct/findx`，作为唯一主线发版仓库）。
+本仓库为 **FindX 下一代（v2）** 的唯一主线：[Rust](https://www.rust-lang.org/) 实现的 Windows 本地文件高速索引与搜索（MFT 全量枚举 + USN Journal 增量），**Everything IPC 兼容**；提供 **CLI、常驻 Windows 服务、Tauri 图形界面**。
 
-Rust 实现的 Windows 本地文件高速索引与搜索：MFT 全量枚举 + USN Journal 增量，**Everything IPC 兼容**，提供 CLI、常驻服务与 Tauri GUI。
+> 设计目标：在百万～千万级路径规模下，常规搜索保持毫秒级响应；内存与磁盘占用可对标或优于同场景下的 Everything 体验。
 
-> 目标：在 100 万 / 800 万 条目下做到 < 100 ms 的常规搜索延迟，内存占用对齐或超越 Everything。
+| 资源 | 链接 |
+| --- | --- |
+| **发行版与安装包 (Windows .exe / .msi)** | [GitHub Releases](https://github.com/chaojimct/findx/releases) |
+| **产品/介绍页 (GitHub Pages)** | <https://chaojimct.github.io/findx/> |
+| **v1 源码归档 (.NET, 只读对照)** | 分支 [`findx-v1`](https://github.com/chaojimct/findx/tree/findx-v1)（最后一版为 `44d1d38`） |
+
+## 仓库与工作目录说明
+
+- **远程仓库**：`https://github.com/chaojimct/findx`（组织与用户名下仅此一处发版。）
+- **日常开发（团队约定）**：本机将仓库克隆在 **`findx2` 目录** 下；路径名仅为习惯，**与 `chaojimct/findx` 远程一一对应**，提交与 CI 以该工作区为准即可。
+
+**首次开启 Pages**：若 [站点](https://chaojimct.github.io/findx/) 未自动更新，请在仓库 **Settings → Pages** 中把 **Source** 选为 **GitHub Actions**（本仓库已含 [`.github/workflows/pages.yml`](.github/workflows/pages.yml)）。
+
+**自动发版**：对 `v*` 标签（例如 `v2.0.0`）推送会触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，在 `windows-latest` 上跑测试、构建 **NSIS 与 MSI** 安装包，并（在 tag 场景下）创建/更新 [Release](https://github.com/chaojimct/findx/releases) 资源。
+
+## 功能概览（v2）
+
+- **索引与增量**：MFT 首建 + USN 续跑，支持多卷、checkpoint 与元数据后台回填（详见下文「建索引与元数据回填」）。
+- **多入口**：`findx2` CLI 本地搜 / 建库；`findx2-service` 做命名管道与 Everything 兼容；**FindX**（Tauri）托盘与搜索 UI，可选服务模式或单进程提权模式。
+- **查询语法**：顶层 `|` OR、多词 AND、排除 `!`、各类 `func:` 与时间/大小/路径修饰符等（详见下文「查询语法」）。
 
 ## 性能与内存
 
 实测于本机 8.5M 条目 / 1.25M 目录单库（D 盘 NTFS，service 默认开启异步 OpenFileById 元数据回填）：
 
 | 指标 | findx2 | Everything 1.5 |
-|---|---|---|
+| --- | --- | --- |
 | 服务常驻 RSS | **691.9 MB** | ~700 MB |
 | `index.bin` 体积（v5 紧凑布局） | **550 MiB** | n/a |
 | 索引加载耗时 | 6.4 s | n/a |
@@ -27,10 +46,12 @@ Rust 实现的 Windows 本地文件高速索引与搜索：MFT 全量枚举 + US
 ## 建索引与元数据回填
 
 CLI / service 默认走 **fast 首遍**：
+
 - `findx2 index -v C:` 仅枚举 MFT 拿到名字 + 父链 + FRN + **USN TimeStamp**（作为 mtime/ctime 近似值，零额外 IO），size 暂留 0；
 - 加 `--full-stat` 时立刻走 **NtQueryDirectoryFile 批量快路径**：对每个目录 `OpenFileById(vol, dir_frn)` + `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)`，一次 syscall 拿一批子项的 `(FRN, size, mtime, ctime)`，摊销到单文件 ~几百纳秒。兜底才走 `OpenFileById` 逐文件。
 
 service 启动时若加载到的索引 `metadata_ready=false`，后台线程按**同样**的两阶段跑：
+
 1. `findx2_windows::fetch_dir_meta_batched` — 按卷分组、一卷一个 rayon 池、每目录 1 次 open + K 次 `GetFileInformationByHandleEx`；
 2. 未命中条目（reparse / 孤儿）走 `fill_metadata_by_id_pooled` 兜底；
 3. 进度写 `metadata_overlay` + 周期 checkpoint，搜索全程零阻塞。
@@ -70,8 +91,9 @@ findx2-service install --index <绝对路径>\index.bin
 sc start FindX2Search
 
 # 3) 运行 GUI（普通用户即可）
-gui/  → npm run tauri dev   (开发)
-       npm run tauri build  (打包)
+cd gui
+npm run tauri dev    # 开发
+npm run tauri build  # 打包
 ```
 
 GUI 启动时若管道连不上会引导你"安装服务"。**这种模式下 GUI 自身全程不需要管理员**。
@@ -139,6 +161,10 @@ findx2-service uninstall
 当前 `index.bin` 为 **v5**：FileEntry 32 字节紧凑布局（mtime/ctime u32 unix 秒），目录路径按需解析（不物化到磁盘）。`watch` 会写真实 `volume_serial` / `usn_journal_id` / `last_usn`，从上次游标续跑；Journal 被重建（ID 变化）时会全量重建。
 
 加载兼容：v3 / v4 老索引在 load 时一次性迁移到 v5 内存布局，下次保存写出 v5。
+
+## 版本号（GUI / 安装包）
+
+- Tauri 与 Windows 安装包版本以 **`gui/src-tauri/tauri.conf.json`** 与 **`gui/src-tauri/Cargo.toml`** 的 `version` 为准；发版时与 Git 标签 `v2.0.0` 等保持一致即可。
 
 ## 许可证
 

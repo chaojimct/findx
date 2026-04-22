@@ -31,9 +31,9 @@ jobs:
           if ("${{ github.event_name }}" -eq "workflow_dispatch") {
             $v = "${{ github.event.inputs.version }}"
           } else {
-            $v = "${{ github.ref_name }}".TrimStart('v')
+            $v = ("${{ github.ref_name }}").TrimStart("v")
           }
-          "VERSION=$v" | Out-File -Append $env:GITHUB_OUTPUT
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "VERSION=$v"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
