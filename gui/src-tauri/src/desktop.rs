@@ -689,6 +689,12 @@ fn show_main_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
 }
 
 fn hide_main_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    // 原生系统预览（Office/doc 等）使用独立顶层 popup HWND，叠在 WebView 之上；
+    // 仅 hide 主窗时前端不一定运行 cleanup，必须在 Rust 侧先卸掉预览，否则会「窗没了预览框还在」。
+    #[cfg(windows)]
+    {
+        let _ = crate::win_preview::unload_preview();
+    }
     let window = main_window(app)?;
     persist_full_window_state_snapshot(app)?;
     if matches!(current_window_mode(app), WindowMode::Full) {
@@ -1228,6 +1234,11 @@ pub fn handle_window_event<R: Runtime>(window: &Window<R>, event: &WindowEvent) 
 
     match event {
         WindowEvent::CloseRequested { api, .. } => {
+            // 标题栏关闭 / Alt+F4：在窗口真正销毁前卸掉 prevhost popup，避免残留（与前端 unmount 时序无关）。
+            #[cfg(windows)]
+            {
+                let _ = crate::win_preview::unload_preview();
+            }
             if !desktop_state(&app).is_quitting.load(Ordering::SeqCst)
                 && is_background_mode_enabled(&app)
             {
