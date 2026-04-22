@@ -159,7 +159,7 @@ begin
     if IsComponentSelected('servicec') then
     begin
       Marker := AppDir + '\{#MyInstalledMarker}';
-      SaveStringToFile(Marker, '1' + #13#10);
+      SaveStringToFile(Marker, '1' + #13#10, False);
     end;
   end;
 end;
