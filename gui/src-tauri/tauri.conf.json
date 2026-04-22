@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "FindX",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "identifier": "tools.findx.gui",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build && npm run bundle:win-exes",
     "frontendDist": "../dist"
   },
   "app": {
@@ -93,9 +93,22 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": {
+      "bundled/findx2.exe": "bin/findx2.exe",
+      "bundled/fx.exe": "bin/fx.exe",
+      "bundled/findx2-service.exe": "bin/findx2-service.exe"
+    },
     "windows": {
       "nsis": {
-        "installerIcon": "icons/icon.ico"
+        "installerIcon": "icons/icon.ico",
+        "installMode": "perMachine",
+        "displayLanguageSelector": true,
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
+        "minimumWebview2Version": "100.0.0",
+        "installerHooks": "windows/nsis-installer-hooks.nsh"
       }
     }
   }

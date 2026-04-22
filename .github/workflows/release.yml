@@ -52,18 +52,17 @@ jobs:
       - name: Run tests (workspace)
         run: cargo test --workspace --exclude findx2-gui
 
-      - name: Build Tauri bundles (NSIS + MSI)
+      - name: Build Tauri Windows 安装包（仅 NSIS，含 CLI/服务与安装钩子）
         working-directory: gui
-        run: npm run tauri build -- --bundles nsis,msi
+        run: npm run tauri build -- --bundles nsis
 
       - name: Collect artifacts
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path dist -Force | Out-Null
           Get-ChildItem -Path target/release/bundle/nsis -Filter *.exe -Recurse -ErrorAction SilentlyContinue | Copy-Item -Destination dist -Force
-          Get-ChildItem -Path target/release/bundle/msi -Filter *.msi -Recurse -ErrorAction SilentlyContinue | Copy-Item -Destination dist -Force
           if (-not (Get-ChildItem dist -File -ErrorAction SilentlyContinue)) {
-            Write-Error "未找到可发布安装包（NSIS/MSI）。"
+            Write-Error "未找到可发布安装包（NSIS .exe）。"
             exit 1
           }
           Get-ChildItem dist -File | ForEach-Object { Write-Host "artifact: $($_.FullName)" }

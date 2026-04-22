@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tauri::{Manager, Runtime};
 
+/// NSIS 安装程序在 `$INSTDIR` 下写入；存在时首启使用「ProgramData 索引 + 服务模式」。
+#[cfg(windows)]
+const FINDX_INSTALLED_MARKER: &str = "FindX.installed";
+
 fn default_true() -> bool {
     true
 }
@@ -95,10 +99,30 @@ fn settings_path<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf, Strin
         .join("findx2-gui-settings.json"))
 }
 
+/// 与 NSIS 安装器约定：已安装正式包时（同目录存在 `FindX.installed`），首启默认公共索引路径 + 服务模式。
+#[cfg(windows)]
+fn settings_for_nsis_installed_layout() -> Option<FindxGuiSettings> {
+    let base = exe_resource_dir();
+    if !base.join(FINDX_INSTALLED_MARKER).exists() {
+        return None;
+    }
+    let pd = std::env::var_os("ProgramData")?;
+    let index = Path::new(&pd).join("FindX").join("index.bin");
+    let mut s = FindxGuiSettings::default();
+    s.index_path = index.to_string_lossy().into_owned();
+    s.run_mode = RunMode::Service;
+    s.auto_start_service = true;
+    Some(s)
+}
+
 #[tauri::command]
 pub fn load_findx_settings<R: Runtime>(app: tauri::AppHandle<R>) -> Result<FindxGuiSettings, String> {
     let path = settings_path(&app)?;
     if !path.exists() {
+        #[cfg(windows)]
+        if let Some(s) = settings_for_nsis_installed_layout() {
+            return Ok(s);
+        }
         return Ok(FindxGuiSettings::default());
     }
     let s = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
@@ -140,22 +164,38 @@ fn resolve_service_exe(base: &Path, settings: &FindxGuiSettings) -> Result<PathB
             p.display()
         ));
     }
-    let here = base.join("findx2-service.exe");
-    if here.exists() {
-        return Ok(here);
+    for candidate in service_exe_search_paths(base).into_iter() {
+        if candidate.exists() {
+            return Ok(candidate);
+        }
     }
     Err(
-        "未找到 findx2-service.exe，请将可执行文件与 FindX2 同目录或于设置中指定存在的路径。"
+        "未找到 findx2-service.exe，请将可执行文件与 FindX2 同目录、resources\\bin 下，或于设置中指定存在的路径。"
             .into(),
     )
+}
+
+fn service_exe_search_paths(base: &Path) -> [PathBuf; 2] {
+    [
+        base.join("findx2-service.exe"),
+        base.join("resources").join("bin").join("findx2-service.exe"),
+    ]
+}
+
+fn cli_name_paths(base: &Path, name: &str) -> [PathBuf; 2] {
+    [
+        base.join(name),
+        base.join("resources").join("bin").join(name),
+    ]
 }
 
 /// 与 `findx2-service` 同目录的 `findx2` / `fx` 命令行（建索引子进程）
 pub fn resolve_cli_exe(base: &Path, settings: &FindxGuiSettings) -> Option<PathBuf> {
     for name in ["findx2.exe", "fx.exe"] {
-        let p = base.join(name);
-        if p.exists() {
-            return Some(p);
+        for p in cli_name_paths(base, name).into_iter() {
+            if p.exists() {
+                return Some(p);
+            }
         }
     }
     if let Ok(svc) = resolve_service_exe(base, settings) {

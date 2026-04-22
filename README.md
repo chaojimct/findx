@@ -6,7 +6,7 @@
 
 | 资源 | 链接 |
 | --- | --- |
-| **发行版与安装包 (Windows .exe / .msi)** | [GitHub Releases](https://github.com/chaojimct/findx/releases) |
+| **发行版与安装包 (Windows NSIS .exe)** | [GitHub Releases](https://github.com/chaojimct/findx/releases) |
 | **产品/介绍页 (GitHub Pages)** | <https://chaojimct.github.io/findx/> |
 | **v1 源码归档 (.NET, 只读对照)** | 分支 [`findx-v1`](https://github.com/chaojimct/findx/tree/findx-v1)（最后一版为 `44d1d38`） |
 
@@ -17,7 +17,16 @@
 
 **首次开启 Pages**：若 [站点](https://chaojimct.github.io/findx/) 未自动更新，请在仓库 **Settings → Pages** 中把 **Source** 选为 **GitHub Actions**（本仓库已含 [`.github/workflows/pages.yml`](.github/workflows/pages.yml)）。
 
-**自动发版**：对 `v*` 标签（例如 `v2.0.0`）推送会触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，在 `windows-latest` 上跑测试、构建 **NSIS 与 MSI** 安装包，并（在 tag 场景下）创建/更新 [Release](https://github.com/chaojimct/findx/releases) 资源。
+**自动发版**：对 `v*` 标签（例如 `v2.0.1`）推送会触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，在 `windows-latest` 上跑测试、只构建 **NSIS** 安装包（与 CLI/服务一体），并（在 tag 场景下）创建/更新 [Release](https://github.com/chaojimct/findx/releases) 资源。
+
+## Windows 安装包行为（与 v1 Inno 向导的对应关系）
+
+- **内容**：除 **FindX** 图形主程序外，会打入 **`findx2.exe` / `fx.exe` / `findx2-service.exe`**（构建时由 `gui/scripts/bundle-win-exes.mjs` 从工作区 `cargo build --release` 复制，见 `gui/src-tauri/bundled/` + `tauri.conf.json` 的 `bundle.resources`）。
+- **安装方式**：`perMachine`（**需管理员**），可写 `ProgramData` 并注册服务；与旧版 v1 使用「系统安装/任务计划提权」的思路一致。安装结束时安装器会把上述三个 exe 解到**与主程序同目录**（`resources\bin` 中的副本为打包形态，见 [`nsis-installer-hooks.nsh`](gui/src-tauri/windows/nsis-installer-hooks.nsh)）。
+- **服务**：向 SCM 安装服务 **`FindX2Search`**，索引文件默认 **`%ProgramData%\FindX\index.bin`**，安装后尝试 **`sc start`** 拉起。
+- **首次启动 GUI**：若安装目录下存在由 NSIS 写入的 **`FindX.installed` 标记**且用户尚未有 `findx2-gui-settings.json`，则默认 **服务模式**、索引路径为上述 `ProgramData` 路径（见 `findx_settings.rs`），避免「只有空壳、连不上服务」的错位。
+- **交互选项**：安装向导已支持 **中/英**、**计算机范围安装**、许可与 WebView2 检查；**像 v1 Inno 那样逐项勾选（仅 CLI/仅服务/自启动/任务计划等）** 需扩展 NSIS 多页或另做 Inno/高级包，当前版本默认 **全量安装服务 + 同目录工具**，以功能完整为先。
+- **开发构建**：`gui/src-tauri/bundled/` 下可提交 **0 字节占位** 的 `findx2.exe` / `fx.exe` / `findx2-service.exe`，仅用于满足 tauri 对 `bundle.resources` 路径存在性的校验；打正式包时 `beforeBuildCommand` 会在 Windows 上执行 `npm run bundle:win-exes` 用 `cargo build --release` 产物覆盖。
 
 ## 功能概览（v2）
 
@@ -164,7 +173,7 @@ findx2-service uninstall
 
 ## 版本号（GUI / 安装包）
 
-- Tauri 与 Windows 安装包版本以 **`gui/src-tauri/tauri.conf.json`** 与 **`gui/src-tauri/Cargo.toml`** 的 `version` 为准；发版时与 Git 标签 `v2.0.0` 等保持一致即可。
+- Tauri 与 Windows 安装包版本以 **`gui/src-tauri/tauri.conf.json`** 与 **`gui/src-tauri/Cargo.toml`** 的 `version` 为准；发版时与 Git 标签 `v2.0.1` 等保持一致即可。
 
 ## 许可证
 
