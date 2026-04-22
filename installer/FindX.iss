@@ -70,8 +70,14 @@ Name: "desktopicon";  Description: "创建桌面快捷方式";                  
 Name: "postlaunch";   Description: "安装完成后启动 FindX";                        GroupDescription: "安装结束:"; Components: main;   Flags: checkedonce
 
 [Files]
-; stage 由 stage-inno.ps1 从 target\release 生成
-Source: "{#PublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: main
+; stage 由 stage-inno.ps1 生成。勿用单条 "{#PublishDir}\*"：Inno 编译器要求根目录至少有一个能匹配 * 的文件；
+; 若仅有子目录（如 resources）而无根层文件，会报 No files found matching ...\stage\*。
+Source: "{#PublishDir}\FindX.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: main
+Source: "{#PublishDir}\resources\*"; DestDir: "{app}\resources"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: main
+Source: "{#PublishDir}\findx2.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: main
+Source: "{#PublishDir}\fx.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: main
+Source: "{#PublishDir}\findx2-service.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: main
+Source: "{#PublishDir}\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: main
 
 [Icons]
 Name: "{group}\{#MyAppName}";           Filename: "{app}\{#MyAppExeName}"; Components: main

@@ -5,16 +5,36 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$rel = Join-Path $RepoRoot "target\release"
 $stage = Join-Path $RepoRoot "installer\stage"
+$releaseCandidates = @(
+  (Join-Path $RepoRoot "target\release"),
+  (Join-Path $RepoRoot "target\x86_64-pc-windows-msvc\release"),
+  (Join-Path $RepoRoot "gui\target\release")
+)
+$rel = $null
+foreach ($c in $releaseCandidates) {
+  $fx = Join-Path $c "FindX.exe"
+  $gui = Join-Path $c "findx2-gui.exe"
+  if ((Test-Path $fx) -or (Test-Path $gui)) {
+    $rel = $c
+    Write-Host "[stage-inno] 使用 release 目录: $rel"
+    break
+  }
+}
+if (-not $rel) {
+  Write-Host "[stage-inno] 下列目录均未发现 FindX.exe / findx2-gui.exe："
+  $releaseCandidates | ForEach-Object { Write-Host "  $_" }
+  $t = Join-Path $RepoRoot "target"
+  if (Test-Path $t) {
+    Write-Host "[stage-inno] $($t) 下子项："
+    Get-ChildItem $t -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name)" }
+  }
+  throw "未找到 GUI release 产物。请先在 gui 目录执行: npm run tauri build -- --no-bundle"
+}
 $mainFindX = Join-Path $rel "FindX.exe"
 $mainGui = Join-Path $rel "findx2-gui.exe"
-$main = $null
 if (Test-Path $mainFindX) { $main = $mainFindX }
-elseif (Test-Path $mainGui) { $main = $mainGui }
-if (-not $main) {
-  throw "未找到 $mainFindX 或 $mainGui。请先在 gui 目录执行: npm run tauri build -- --no-bundle"
-}
+else { $main = $mainGui }
 $res = Join-Path $rel "resources"
 if (-not (Test-Path $res)) {
   throw "未找到 $res。Tauri 未产出 resources 目录，无法制 Inno 包。"
@@ -36,6 +56,6 @@ foreach ($f in @("findx2.exe", "fx.exe", "findx2-service.exe")) {
 }
 $n = (Get-ChildItem -Path $stage -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
 if ($n -lt 1) {
-  throw "Inno 源目录 $stage 内无任何文件，ISCC 会报 stage\* 无匹配。"
+  throw "Inno 源目录 $stage 内无任何文件，ISCC 无法收集安装文件。"
 }
 Write-Host "已写入 Inno 源目录: $stage （$n 个文件）"

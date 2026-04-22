@@ -65,7 +65,7 @@ jobs:
           if (-not (Test-Path $marker)) {
             Write-Host "---- installer\stage 内容 ----"
             Get-ChildItem $stage -Force -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
-            throw "缺少 $marker，ISCC 会报 No files matching stage\*。请先成功执行 stage-inno.ps1。"
+            throw "缺少 $marker。请先成功执行 stage-inno.ps1（且 [Files] 需能解析到 PublishDir 下各文件）。"
           }
           $stageAbs = (Resolve-Path $stage).Path
           $iscc = "$(${env:ProgramFiles(x86)})\Inno Setup 6\ISCC.exe"
