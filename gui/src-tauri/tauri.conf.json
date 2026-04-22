@@ -97,19 +97,6 @@
       "bundled/findx2.exe": "bin/findx2.exe",
       "bundled/fx.exe": "bin/fx.exe",
       "bundled/findx2-service.exe": "bin/findx2-service.exe"
-    },
-    "windows": {
-      "nsis": {
-        "installerIcon": "icons/icon.ico",
-        "installMode": "perMachine",
-        "displayLanguageSelector": true,
-        "languages": [
-          "SimpChinese",
-          "English"
-        ],
-        "minimumWebview2Version": "100.0.0",
-        "installerHooks": "windows/nsis-installer-hooks.nsh"
-      }
     }
   }
 }

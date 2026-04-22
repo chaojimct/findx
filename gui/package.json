@@ -8,7 +8,9 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "bundle:win-exes": "node ./scripts/bundle-win-exes.mjs"
+    "bundle:win-exes": "node ./scripts/bundle-win-exes.mjs",
+    "tauri:dir": "tauri build -- --no-bundle",
+    "inno:stage": "powershell -ExecutionPolicy Bypass -File ../installer/stage-inno.ps1 -RepoRoot .."
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

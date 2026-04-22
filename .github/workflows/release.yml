@@ -52,20 +52,30 @@ jobs:
       - name: Run tests (workspace)
         run: cargo test --workspace --exclude findx2-gui
 
-      - name: Build Tauri Windows 安装包（仅 NSIS，含 CLI/服务与安装钩子）
+      - name: 构建 Tauri 程序与 resources（不打 NSIS/MSI）
         working-directory: gui
-        run: npm run tauri build -- --bundles nsis
+        run: npm run tauri build -- --no-bundle
+
+      - name: 安装 Inno Setup 并制包
+        shell: pwsh
+        run: |
+          choco install innosetup -y
+          $v = "${{ steps.ver.outputs.VERSION }}"
+          & powershell -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\installer\stage-inno.ps1" -RepoRoot $env:GITHUB_WORKSPACE
+          $iscc = "$(${env:ProgramFiles(x86)})\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "未找到 ISCC: $iscc" }
+          & $iscc /DMyAppVersion=$v "$env:GITHUB_WORKSPACE\installer\FindX.iss"
 
       - name: Collect artifacts
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path dist -Force | Out-Null
-          Get-ChildItem -Path target/release/bundle/nsis -Filter *.exe -Recurse -ErrorAction SilentlyContinue | Copy-Item -Destination dist -Force
-          if (-not (Get-ChildItem dist -File -ErrorAction SilentlyContinue)) {
-            Write-Error "未找到可发布安装包（NSIS .exe）。"
+          $d = "$env:GITHUB_WORKSPACE\dist"
+          if (-not (Get-ChildItem $d -Filter "FindX-*-setup.exe" -File -ErrorAction SilentlyContinue)) {
+            Get-ChildItem $d -File -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "dist: $($_.Name)" }
+            Write-Error "未找到 dist 下的 FindX-*-setup.exe，请检查 Inno 是否成功。"
             exit 1
           }
-          Get-ChildItem dist -File | ForEach-Object { Write-Host "artifact: $($_.FullName)" }
+          Get-ChildItem $d -Filter "FindX-*-setup.exe" -File | ForEach-Object { Write-Host "artifact: $($_.FullName)" }
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
