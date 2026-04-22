@@ -58,10 +58,22 @@ jobs:
         run: |
           choco install innosetup -y
           $v = "${{ steps.ver.outputs.VERSION }}"
-          & powershell -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\installer\stage-inno.ps1" -RepoRoot $env:GITHUB_WORKSPACE
+          $ws = $env:GITHUB_WORKSPACE
+          & powershell -ExecutionPolicy Bypass -File "$ws\installer\stage-inno.ps1" -RepoRoot $ws
+          $stage = Join-Path $ws "installer\stage"
+          $marker = Join-Path $stage "FindX.exe"
+          if (-not (Test-Path $marker)) {
+            Write-Host "---- installer\stage 内容 ----"
+            Get-ChildItem $stage -Force -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+            throw "缺少 $marker，ISCC 会报 No files matching stage\*。请先成功执行 stage-inno.ps1。"
+          }
+          $stageAbs = (Resolve-Path $stage).Path
           $iscc = "$(${env:ProgramFiles(x86)})\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { throw "未找到 ISCC: $iscc" }
-          & $iscc /DMyAppVersion=$v "$env:GITHUB_WORKSPACE\installer\FindX.iss"
+          $iss = Join-Path $ws "installer\FindX.iss"
+          # 勿用 "/DPublishDir=$stageAbs"：路径中含 \f 等时 PowerShell 双引号会误解析转义
+          $publishArg = '/DPublishDir=' + ($stageAbs.Replace('\', '/'))
+          & $iscc /DMyAppVersion=$v $publishArg $iss
 
       - name: Collect artifacts
         shell: pwsh

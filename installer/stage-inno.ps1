@@ -7,9 +7,13 @@ param(
 $ErrorActionPreference = "Stop"
 $rel = Join-Path $RepoRoot "target\release"
 $stage = Join-Path $RepoRoot "installer\stage"
-$main = Join-Path $rel "FindX.exe"
-if (-not (Test-Path $main)) {
-  throw "未找到 $main。请先在 gui 目录执行: npm run tauri build -- --no-bundle"
+$mainFindX = Join-Path $rel "FindX.exe"
+$mainGui = Join-Path $rel "findx2-gui.exe"
+$main = $null
+if (Test-Path $mainFindX) { $main = $mainFindX }
+elseif (Test-Path $mainGui) { $main = $mainGui }
+if (-not $main) {
+  throw "未找到 $mainFindX 或 $mainGui。请先在 gui 目录执行: npm run tauri build -- --no-bundle"
 }
 $res = Join-Path $rel "resources"
 if (-not (Test-Path $res)) {
@@ -17,7 +21,8 @@ if (-not (Test-Path $res)) {
 }
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 $null = New-Item -ItemType Directory -Path $stage
-Copy-Item -Path $main -Destination $stage
+# 安装包与 [Icons] 均要求 {app}\FindX.exe 固定名
+Copy-Item -Path $main -Destination (Join-Path $stage "FindX.exe") -Force
 Copy-Item -Path $res -Destination (Join-Path $stage "resources") -Recurse
 Get-ChildItem -Path $rel -Filter *.dll -File -ErrorAction SilentlyContinue | ForEach-Object {
   Copy-Item -Path $_.FullName -Destination $stage
@@ -29,4 +34,8 @@ foreach ($f in @("findx2.exe", "fx.exe", "findx2-service.exe")) {
   }
   Copy-Item -Path $p -Destination $stage
 }
-Write-Host "已写入 Inno 源目录: $stage"
+$n = (Get-ChildItem -Path $stage -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
+if ($n -lt 1) {
+  throw "Inno 源目录 $stage 内无任何文件，ISCC 会报 stage\* 无匹配。"
+}
+Write-Host "已写入 Inno 源目录: $stage （$n 个文件）"

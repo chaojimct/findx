@@ -2,6 +2,7 @@
 ; 构建: 1) 在仓库根/ gui 中完成 tauri build --no-bundle
 ;       2) powershell -File installer\stage-inno.ps1
 ;       3) iscc /DMyAppVersion=x.y.z installer\FindX.iss
+;       CI 建议再加 /DPublishDir=<仓库>\installer\stage 绝对路径，避免 ISCC 解析不到 stage\*
 ;
 ; 与 v1 的 FindX.iss 类似：多任务（服务注册、PATH、桌面快捷方式、安装后启动），无 .NET 检测。
 
@@ -13,7 +14,9 @@
 #define MyAppPublisher "FindX"
 #define MyAppURL       "https://github.com/chaojimct/findx"
 #define MyAppExeName   "FindX.exe"
-#define PublishDir     "stage"
+#ifndef PublishDir
+#define PublishDir "stage"
+#endif
 #define MyServiceName  "FindX2Search"
 ; 与 GUI 内约定一致：存在该文件时首启用 ProgramData 索引 + 服务模式
 #define MyInstalledMarker "FindX.installed"
