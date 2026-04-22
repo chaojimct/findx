@@ -6,7 +6,7 @@
 ; 与 v1 的 FindX.iss 类似：多任务（服务注册、PATH、桌面快捷方式、安装后启动），无 .NET 检测。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.0.1"
+  #define MyAppVersion "2.0.2"
 #endif
 
 #define MyAppName      "FindX"
@@ -15,7 +15,7 @@
 #define MyAppExeName   "FindX.exe"
 #define PublishDir     "stage"
 #define MyServiceName  "FindX2Search"
-; 与 tauri/NSIS 及 GUI 内约定一致：存在该文件时首启用 ProgramData 索引 + 服务模式
+; 与 GUI 内约定一致：存在该文件时首启用 ProgramData 索引 + 服务模式
 #define MyInstalledMarker "FindX.installed"
 
 [Setup]
@@ -44,8 +44,9 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 MinVersion=10.0
 
 [Languages]
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
-Name: "english"; MessagesFile: "compiler:Default.isl"
+; 随仓库提供 .isl，避免 CI（如 choco innosetup）未带 Languages 子目录导致 ISCC 找不到 compiler: 下文件
+Name: "chinesesimplified"; MessagesFile: "Languages\ChineseSimplified.isl"
+Name: "english"; MessagesFile: "Languages\Default.isl"
 
 [Types]
 Name: "full"; Description: "完全安装 (推荐)"
