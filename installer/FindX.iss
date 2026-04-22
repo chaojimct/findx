@@ -6,7 +6,7 @@
 ; 与 v1 的 FindX.iss 类似：多任务（服务注册、PATH、桌面快捷方式、安装后启动），无 .NET 检测。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.0.2"
+  #define MyAppVersion "2.0.3"
 #endif
 
 #define MyAppName      "FindX"
@@ -50,7 +50,8 @@ Name: "english"; MessagesFile: "Languages\Default.isl"
 
 [Types]
 Name: "full"; Description: "完全安装 (推荐)"
-Name: "custom"; Description: "自定义"; IsCustom: true; Flags: iscustom
+; 仅 Flags: iscustom 为官方语法；勿写 IsCustom: true（旧版 ISCC 会报 Unrecognized parameter name）
+Name: "custom"; Description: "自定义"; Flags: iscustom
 
 [Components]
 ; 与 v1 一样保留「主程序 / 服务 / CLI 路径」三段的语义，实际文件同一目录一次拷入

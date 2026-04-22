@@ -1,6 +1,6 @@
 [package]
 name = "findx2-gui"
-version = "2.0.2"
+version = "2.0.3"
 description = "FindX2 Tauri GUI"
 edition = "2021"
 

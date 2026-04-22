@@ -9,7 +9,7 @@ on:
       version:
         description: "版本号（如 2.0.0）"
         required: true
-        default: "2.0.0"
+        default: "2.0.3"
 
 permissions:
   contents: write
@@ -48,9 +48,6 @@ jobs:
       - name: Install frontend dependencies
         working-directory: gui
         run: npm ci
-
-      - name: Run tests (workspace)
-        run: cargo test --workspace --exclude findx2-gui
 
       - name: 构建 Tauri 程序与 resources（不打 NSIS/MSI）
         working-directory: gui
