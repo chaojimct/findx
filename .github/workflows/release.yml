@@ -1,0 +1,84 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（如 2.0.0）"
+        required: true
+        default: "2.0.0"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $v = "${{ github.event.inputs.version }}"
+          } else {
+            $v = "${{ github.ref_name }}".TrimStart('v')
+          }
+          "VERSION=$v" | Out-File -Append $env:GITHUB_OUTPUT
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: gui/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        working-directory: gui
+        run: npm ci
+
+      - name: Run tests (workspace)
+        run: cargo test --workspace --exclude findx2-gui
+
+      - name: Build Tauri bundles (NSIS + MSI)
+        working-directory: gui
+        run: npm run tauri build -- --bundles nsis,msi
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Get-ChildItem -Path target/release/bundle/nsis -Filter *.exe -Recurse -ErrorAction SilentlyContinue | Copy-Item -Destination dist -Force
+          Get-ChildItem -Path target/release/bundle/msi -Filter *.msi -Recurse -ErrorAction SilentlyContinue | Copy-Item -Destination dist -Force
+          if (-not (Get-ChildItem dist -File -ErrorAction SilentlyContinue)) {
+            Write-Error "未找到可发布安装包（NSIS/MSI）。"
+            exit 1
+          }
+          Get-ChildItem dist -File | ForEach-Object { Write-Host "artifact: $($_.FullName)" }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: findx-${{ steps.ver.outputs.VERSION }}-windows
+          path: dist/*
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: FindX ${{ steps.ver.outputs.VERSION }}
+          files: dist/*
+          generate_release_notes: true
+

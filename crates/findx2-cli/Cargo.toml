@@ -1,0 +1,33 @@
+[package]
+name = "findx2-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "findx2 命令行"
+
+[[bin]]
+name = "findx2"
+path = "src/main.rs"
+
+[[bin]]
+name = "fx"
+path = "src/main.rs"
+
+[features]
+default = []
+pinyin = ["findx2-core/pinyin"]
+
+[dependencies]
+findx2-core = { path = "../findx2-core" }
+chrono = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(windows)'.dependencies]
+findx2-windows = { path = "../findx2-windows" }
+findx2-ipc = { path = "../findx2-ipc" }
+rayon = "1"
+tokio = { version = "1", features = ["rt", "io-util", "net", "time"] }

@@ -1,0 +1,1140 @@
+/* 浅色 / 深色（全黑底）由 html[data-fx-theme] 切换；侧栏约 210px、强调色可随主题略调 */
+
+:root[data-fx-theme="light"],
+:root:not([data-fx-theme]) {
+  color-scheme: light;
+  --fx-bg: #fafafa;
+  --fx-white: #ffffff;
+  --fx-border: #d8d8d8;
+  --fx-border-soft: #e8e8e8;
+  --fx-text: #222;
+  --fx-muted: #888;
+  --fx-sub: #555;
+  --fx-accent: #0078d4;
+  --fx-accent-soft: #dceefb;
+  --fx-hover: #f5f5f5;
+  --fx-row-sel: #e3f2fd;
+  --fx-search-box-bg: #f5f5f5;
+  --fx-placeholder: #aaa;
+  --fx-sidebar-section: #999;
+  --fx-filter-fg: #333;
+  --fx-filter-hover-bg: #e8e8e8;
+  --fx-time-hover-bg: #f0f0f0;
+  --fx-dot-border: #999;
+  --fx-input-border: #d0d0d0;
+  --fx-input-bg: #fbfbfb;
+  --fx-th-bg: #f3f3f3;
+  --fx-th-fg: #555;
+  --fx-cell-line: #ebebeb;
+  --fx-hit-bg: #ffecb3;
+  --fx-hit-fg: #0d47a1;
+  --fx-btn-ghost-bg: #f0f0f0;
+  --fx-settings-btn-bg: #f5f5f5;
+  --fx-drives-bg: #fafafa;
+  --fx-scrollbar-track: #eaeaea;
+  --fx-scrollbar-thumb: #a8a8a8;
+  --fx-scrollbar-thumb-hover: #888888;
+}
+
+/* 深色：背景/面板统一纯黑 #000，靠细边框与对比度分层 */
+:root[data-fx-theme="dark"] {
+  color-scheme: dark;
+  --fx-bg: #000000;
+  --fx-white: #000000;
+  --fx-border: #2a2a2a;
+  --fx-border-soft: #1a1a1a;
+  --fx-text: #ececec;
+  --fx-muted: #9a9a9a;
+  --fx-sub: #c4c4c4;
+  --fx-accent: #4da3ff;
+  --fx-accent-soft: rgba(77, 163, 255, 0.18);
+  --fx-hover: #121212;
+  --fx-row-sel: #0d2847;
+  --fx-search-box-bg: #0a0a0a;
+  --fx-placeholder: #777;
+  --fx-sidebar-section: #888;
+  --fx-filter-fg: #ddd;
+  --fx-filter-hover-bg: #1a1a1a;
+  --fx-time-hover-bg: #141414;
+  --fx-dot-border: #666;
+  --fx-input-border: #333;
+  --fx-input-bg: #0a0a0a;
+  --fx-th-bg: #000000;
+  --fx-th-fg: #b8b8b8;
+  --fx-cell-line: #1c1c1c;
+  --fx-hit-bg: #6a5400;
+  --fx-hit-fg: #fff8e1;
+  --fx-btn-ghost-bg: #1a1a1a;
+  --fx-settings-btn-bg: #141414;
+  --fx-drives-bg: #0a0a0a;
+  --fx-scrollbar-track: #0a0a0a;
+  --fx-scrollbar-thumb: #3a3a3a;
+  --fx-scrollbar-thumb-hover: #555555;
+}
+
+body {
+  margin: 0;
+}
+
+/* 滚动条：Firefox */
+html {
+  scrollbar-width: thin;
+  scrollbar-color: var(--fx-scrollbar-thumb) var(--fx-scrollbar-track);
+}
+
+/* 滚动条：WebKit（桌面端常见） */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--fx-scrollbar-track);
+  border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--fx-scrollbar-thumb);
+  border-radius: 5px;
+  border: 2px solid var(--fx-scrollbar-track);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--fx-scrollbar-thumb-hover);
+  border: 2px solid var(--fx-scrollbar-track);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: var(--fx-scrollbar-track);
+}
+
+.fx-root {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  margin: 0;
+  font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+  background: var(--fx-bg);
+  color: var(--fx-text);
+  font-size: 13px;
+}
+
+.fx-search-bar {
+  background: var(--fx-white);
+  border-bottom: 1px solid var(--fx-border);
+  padding: 12px 16px;
+}
+
+.fx-search-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+/* 输入框 + 历史下拉叠在同一定位上下文，下拉浮动盖住下方内容 */
+.fx-search-combo {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+}
+
+.fx-search-combo .fx-search-input-wrap {
+  flex: 0 0 auto;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.fx-search-input-wrap {
+  flex: 1;
+  background: var(--fx-search-box-bg);
+  border-radius: 8px;
+  padding: 0 12px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  border: 1px solid var(--fx-border-soft);
+  box-sizing: border-box;
+}
+
+.fx-search-placeholder {
+  position: absolute;
+  left: 16px;
+  color: var(--fx-placeholder);
+  font-size: 15px;
+  pointer-events: none;
+}
+
+.fx-search-input {
+  flex: 1;
+  border: none;
+  background: transparent;
+  font-size: 15px;
+  padding: 8px 4px;
+  outline: none;
+  width: 100%;
+  color: var(--fx-text);
+}
+
+.fx-btn-icon {
+  border: none;
+  border-radius: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 14px;
+  background: var(--fx-btn-ghost-bg);
+  color: var(--fx-text);
+}
+
+.fx-btn-icon.active {
+  background: var(--fx-accent-soft);
+  color: var(--fx-accent);
+}
+
+.fx-btn-search {
+  background: var(--fx-accent);
+  color: #fff;
+}
+
+.fx-main {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.fx-sidebar {
+  width: 210px;
+  flex-shrink: 0;
+  background: var(--fx-white);
+  padding: 8px;
+  overflow-y: auto;
+  border-right: 1px solid var(--fx-border-soft);
+}
+
+.fx-sidebar h3 {
+  font-size: 12px;
+  color: var(--fx-sidebar-section);
+  font-weight: 600;
+  margin: 4px 12px 10px;
+}
+
+.fx-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  margin-bottom: 2px;
+  border: none;
+  background: transparent;
+  width: 100%;
+  text-align: left;
+  font-size: 13px;
+  color: var(--fx-filter-fg);
+}
+
+.fx-filter:hover {
+  background: var(--fx-filter-hover-bg);
+}
+
+.fx-filter.active {
+  background: var(--fx-accent-soft);
+  color: var(--fx-accent);
+}
+
+.fx-filter.active:hover {
+  background: var(--fx-accent-soft);
+  color: var(--fx-accent);
+}
+
+.fx-sep {
+  height: 1px;
+  background: var(--fx-border-soft);
+  margin: 10px 12px;
+}
+
+.fx-time {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-bottom: 2px;
+  border: none;
+  background: transparent;
+  width: 100%;
+  text-align: left;
+  font-size: 12.5px;
+  color: var(--fx-sub);
+}
+
+.fx-time:hover {
+  background: var(--fx-time-hover-bg);
+}
+
+.fx-time.active:hover {
+  background: var(--fx-time-hover-bg);
+}
+
+.fx-time.active .fx-dot {
+  background: var(--fx-accent);
+  border-color: var(--fx-accent);
+}
+
+.fx-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.2px solid var(--fx-dot-border);
+  background: transparent;
+  flex-shrink: 0;
+}
+
+.fx-side-input {
+  width: 90%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border: 1px solid var(--fx-input-border);
+  border-radius: 4px;
+  font-size: 12px;
+  background: var(--fx-input-bg);
+  color: var(--fx-text);
+}
+
+.fx-size-row {
+  display: grid;
+  grid-template-columns: 1fr 12px 1fr;
+  gap: 4px;
+  align-items: center;
+  margin: 0 8px;
+}
+
+.fx-results {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--fx-bg);
+}
+
+.fx-table-wrap {
+  flex: 1;
+  overflow: auto;
+}
+
+.fx-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  /* 虚拟滚动假设固定行高 32px；列宽用 fixed 避免随窗口内不同切片重排抖动。
+     列宽分布与之前 auto 版基本一致，靠 col 显式给出。 */
+  table-layout: fixed;
+  /* 列表项风格：禁止拖选文本、避免 I 形光标，接近资源管理器而非网页 */
+  user-select: none;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.fx-table tbody tr,
+.fx-table tbody td {
+  cursor: default;
+}
+
+.fx-table thead th {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.fx-table mark.fx-hit {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* 列宽由 JS 写入 <col style="width: xx%">，默认比例持久化到 localStorage */
+
+.fx-table thead tr {
+  box-shadow: 0 1px 0 var(--fx-border);
+}
+
+.fx-table th {
+  text-align: left;
+  padding: 0;
+  background: var(--fx-th-bg);
+  color: var(--fx-th-fg);
+  border-bottom: 1px solid var(--fx-border);
+  border-right: 1px solid var(--fx-border);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  vertical-align: middle;
+  font-weight: 600;
+}
+
+.fx-table th:nth-child(3) .fx-th-btn {
+  justify-content: flex-end;
+}
+.fx-table td:nth-child(3) {
+  text-align: right;
+}
+
+.fx-table th:last-child {
+  border-right: none;
+}
+
+.fx-th-cell {
+  display: flex;
+  align-items: stretch;
+  min-height: 36px;
+  position: relative;
+}
+
+.fx-th-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px 10px;
+  margin: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: inherit;
+  text-align: left;
+}
+
+.fx-th-btn:hover {
+  background: var(--fx-hover);
+}
+
+.fx-sort-ind {
+  flex-shrink: 0;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--fx-accent);
+  opacity: 0.95;
+}
+
+.fx-col-resize {
+  width: 5px;
+  margin: 0 -2px 0 0;
+  cursor: col-resize;
+  flex-shrink: 0;
+  align-self: stretch;
+  z-index: 3;
+  position: relative;
+}
+
+.fx-col-resize::after {
+  content: "";
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-50%);
+  background: var(--fx-border);
+  opacity: 0.85;
+}
+
+.fx-col-resize:hover {
+  background: var(--fx-accent-soft);
+}
+
+.fx-col-resize:active {
+  background: var(--fx-accent-soft);
+}
+
+.fx-table td {
+  padding: 0 10px;
+  border-bottom: 1px solid var(--fx-cell-line);
+  vertical-align: middle;
+  height: 32px;
+  line-height: 32px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fx-table mark.fx-hit {
+  background: var(--fx-hit-bg);
+  color: var(--fx-hit-fg);
+  padding: 0 1px;
+  border-radius: 2px;
+}
+
+.fx-table tr:hover td {
+  background: var(--fx-hover);
+}
+
+.fx-table tr.selected td {
+  background: var(--fx-row-sel);
+}
+
+.fx-path {
+  color: var(--fx-muted);
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fx-status {
+  background: var(--fx-white);
+  border-top: 1px solid var(--fx-border);
+  padding: 6px 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--fx-muted);
+}
+
+.fx-status-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+/* 查询进行中：状态栏左侧转圈，替代原搜索框下进度条 */
+.fx-status-spin {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  border: 2px solid var(--fx-border);
+  border-top-color: var(--fx-accent);
+  border-radius: 50%;
+  animation: fx-status-spin 0.65s linear infinite;
+  vertical-align: middle;
+}
+
+@keyframes fx-status-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.fx-status-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  justify-content: flex-end;
+}
+
+.fx-index-line {
+  flex: 1;
+  min-width: 160px;
+  max-width: min(520px, 58vw);
+  text-align: right;
+  line-height: 1.35;
+  color: var(--fx-sub);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fx-v2-notice-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 220;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  padding: 16px;
+}
+
+.fx-v2-notice-card {
+  width: min(640px, calc(100vw - 32px));
+  background: var(--fx-white);
+  color: var(--fx-text);
+  border: 1px solid var(--fx-border);
+  border-radius: 10px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.35);
+  padding: 18px 20px;
+  line-height: 1.55;
+}
+
+.fx-v2-notice-card h3 {
+  margin: 0 0 10px;
+  font-size: 18px;
+}
+
+.fx-v2-notice-card p {
+  margin: 0 0 10px;
+}
+
+.fx-v2-notice-card ul {
+  margin: 8px 0 0;
+  padding-left: 22px;
+}
+
+.fx-v2-notice-actions {
+  margin-top: 14px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.fx-settings-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+/* 独立设置窗口：占满客户区，无圆角卡片感。
+   注意：此树不在 .fx-root 下，若未设 color 会继承 UA 默认（近黑），深色下与 --fx-white 黑底重叠则文字「消失」。 */
+.fx-settings-window-root {
+  box-sizing: border-box;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  background: var(--fx-white);
+  color: var(--fx-text);
+  font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+  font-size: 13px;
+  overflow: hidden;
+}
+
+.fx-settings-window-root .fx-settings--dialog {
+  flex: 1;
+  width: 100%;
+  max-width: none;
+  max-height: none;
+  min-height: 0;
+  margin: 0;
+  border-radius: 0;
+  box-shadow: none;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 20px;
+}
+
+/* 选项卡内容区可滚动；底部操作条固定在窗口下沿 */
+.fx-settings-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.fx-settings-footer-bar {
+  flex-shrink: 0;
+  padding-top: 12px;
+  margin-top: 0;
+  border-top: 1px solid var(--fx-border);
+}
+
+.fx-settings-footer-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.fx-settings-footer-note {
+  margin: 10px 0 0;
+  text-align: right;
+}
+
+.fx-settings {
+  background: var(--fx-white);
+  color: var(--fx-text);
+  border-radius: 8px;
+  padding: 20px;
+  width: 420px;
+  max-height: 90vh;
+  overflow-y: auto;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+}
+
+/* 与主窗一致：复选/单选用主题强调色，避免深色下系统默认勾画与黑底融在一起 */
+.fx-settings input[type="checkbox"],
+.fx-settings input[type="radio"] {
+  accent-color: var(--fx-accent);
+}
+
+.fx-settings h2 {
+  margin: 0 0 12px;
+  font-size: 16px;
+  color: var(--fx-text);
+}
+
+.fx-settings label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  margin: 10px 0 4px;
+  /* 独立设置窗内 label 在 WebView2 下有时不继承父级 color，与深色 --fx-white 黑底叠成「看不见」 */
+  color: var(--fx-text);
+  line-height: 1.35;
+}
+
+.fx-settings input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px;
+  border: 1px solid var(--fx-input-border);
+  border-radius: 4px;
+  background: var(--fx-input-bg);
+  color: var(--fx-text);
+}
+
+.fx-settings-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.fx-settings button {
+  padding: 8px 14px;
+  border-radius: 4px;
+  border: 1px solid var(--fx-border);
+  background: var(--fx-settings-btn-bg);
+  color: var(--fx-text);
+  cursor: pointer;
+}
+
+.fx-settings button.primary {
+  background: var(--fx-accent);
+  color: #fff;
+  border-color: var(--fx-accent);
+}
+
+/* 设置面板顶部的分页 tabs。
+   注意：`.fx-settings button` 全局规则把所有按钮都加了 border + 8px padding；
+   tab 必须显式覆写为「无 border、底部 2px 粗下划线」，否则下划线会画在 button 外框上、和文字错位。 */
+.fx-settings-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--fx-border);
+  margin-bottom: 12px;
+}
+
+.fx-settings-tabs .fx-settings-tab {
+  padding: 6px 14px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  color: var(--fx-muted);
+  cursor: pointer;
+  margin-bottom: -1px;
+  font-size: 13px;
+  line-height: 1.25;
+}
+
+.fx-settings-tabs .fx-settings-tab[aria-selected="true"] {
+  color: var(--fx-accent) !important;
+  border-bottom-color: var(--fx-accent) !important;
+  font-weight: 600;
+}
+
+.fx-settings-tabs .fx-settings-tab:hover:not([aria-selected="true"]) {
+  color: var(--fx-text);
+}
+
+/* textarea / number 输入框沿用 input[type=text] 样式 */
+.fx-settings textarea,
+.fx-settings input[type="number"] {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px;
+  border: 1px solid var(--fx-input-border);
+  border-radius: 4px;
+  font-family: inherit;
+  background: var(--fx-input-bg);
+  color: var(--fx-text);
+}
+
+.fx-settings textarea {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  resize: vertical;
+}
+
+.fx-settings .fx-drives {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 10px;
+  max-height: 100px;
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid var(--fx-border);
+  border-radius: 4px;
+  background: var(--fx-drives-bg);
+}
+
+.fx-settings .fx-drives label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  font-weight: normal;
+  color: var(--fx-text);
+}
+
+.fx-settings .fx-warn {
+  font-size: 11px;
+  color: #d28a3a;
+  margin: 4px 0 8px;
+}
+
+.fx-settings .fx-hint {
+  font-size: 11px;
+  color: var(--fx-muted);
+  margin: 4px 0 10px;
+}
+
+.fx-settings-footer {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--fx-border);
+}
+
+/* 搜索历史：紧贴输入框下方的浮层下拉 */
+.fx-hist-dropdown {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 80;
+  border: 1px solid var(--fx-border);
+  border-radius: 8px;
+  max-height: min(280px, 42vh);
+  overflow-x: hidden;
+  overflow-y: auto;
+  background: var(--fx-white);
+  box-shadow: 0 10px 36px rgba(0, 0, 0, 0.35);
+}
+
+:root[data-fx-theme="light"] .fx-hist-dropdown,
+:root:not([data-fx-theme]) .fx-hist-dropdown {
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.14);
+}
+
+.fx-hist-dropdown-empty-tip {
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--fx-muted);
+}
+
+.fx-hist-row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 10px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--fx-text);
+  font-size: 13px;
+}
+
+.fx-hist-row:hover {
+  background: var(--fx-hover);
+}
+
+/* ===== 预览面板（系统 IPreviewHandler 宿主在右侧） ===== */
+.fx-preview-resizer {
+  width: 4px;
+  flex: 0 0 4px;
+  cursor: col-resize;
+  background: transparent;
+  border-left: 1px solid var(--fx-border-soft);
+  transition: background 120ms ease;
+}
+.fx-preview-resizer:hover,
+.fx-preview-resizer:active {
+  background: var(--fx-accent-soft);
+}
+
+.fx-preview-wrap {
+  display: flex;
+  min-width: 0;
+  background: var(--fx-white);
+  border-left: 1px solid var(--fx-border-soft);
+}
+
+.fx-preview {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.fx-preview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--fx-border-soft);
+  font-size: 12px;
+  color: var(--fx-sub);
+  background: var(--fx-bg);
+  user-select: none;
+}
+
+.fx-preview-title {
+  font-weight: 600;
+  color: var(--fx-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fx-preview-busy {
+  color: var(--fx-muted);
+  font-size: 11px;
+}
+
+.fx-preview-body {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--fx-white);
+}
+
+.fx-preview-empty,
+.fx-preview-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  min-height: 0;
+  color: var(--fx-muted);
+  font-size: 13px;
+  padding: 16px;
+  text-align: center;
+}
+
+.fx-preview-error {
+  color: #c0392b;
+}
+
+.fx-preview-img {
+  display: block;
+  flex: 1;
+  min-height: 0;
+  max-width: 100%;
+  max-height: 100%;
+  margin: auto;
+  object-fit: contain;
+  background:
+    linear-gradient(45deg, var(--fx-bg) 25%, transparent 25%) 0 0 / 16px 16px,
+    linear-gradient(-45deg, var(--fx-bg) 25%, transparent 25%) 0 8px / 16px 16px,
+    linear-gradient(45deg, transparent 75%, var(--fx-bg) 75%) 8px -8px / 16px 16px,
+    linear-gradient(-45deg, transparent 75%, var(--fx-bg) 75%) 8px 0 / 16px 16px;
+}
+
+.fx-preview-text {
+  margin: 0;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 14px;
+  font-family: ui-monospace, "JetBrains Mono", "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre;
+  color: var(--fx-text);
+  background: var(--fx-white);
+}
+
+/* 原生预览区：在 flex 下用栈容器占满剩余高度；挂载点用 absolute 填满栈，避免 height:100% 在父高 auto 时塌成 0。 */
+.fx-preview-native-stack {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+}
+
+/* 原生预览挂载点：Rust 会把 STATIC 子 HWND 移到这个 div 的客户区位置之上。
+   此处保持填满栈并与父背景一致，避免 prevhost 渲染前一瞬白闪。 */
+.fx-preview-native-mount {
+  position: absolute;
+  inset: 0;
+  background: var(--fx-white);
+}
+
+/* 云盘路径：在 WebView 内盖住挂载区，提示「正在同步」；Rust 水化 + preview_show 完成后移除 */
+.fx-preview-native-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 20px 16px;
+  text-align: center;
+  background: color-mix(in srgb, var(--fx-white) 90%, transparent);
+  backdrop-filter: blur(3px);
+  pointer-events: none;
+}
+
+.fx-preview-spin {
+  display: inline-block;
+  width: 28px;
+  height: 28px;
+  border: 3px solid var(--fx-border);
+  border-top-color: var(--fx-accent);
+  border-radius: 50%;
+  animation: fx-preview-spin 0.7s linear infinite;
+}
+
+@keyframes fx-preview-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.fx-preview-native-overlay-text {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 280px;
+}
+
+.fx-preview-native-overlay-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fx-text);
+}
+
+.fx-preview-native-overlay-desc {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--fx-muted);
+}
+
+/* 原生预览失败：信息卡片叠在挂载区之上（prevhost 已卸载，仅 Web 内容） */
+.fx-preview-fallback-host {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  flex: 1;
+  min-height: 0;
+  padding: 16px 14px;
+  overflow: auto;
+  box-sizing: border-box;
+}
+
+.fx-preview-fallback-host--native {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  align-items: stretch;
+  justify-content: stretch;
+  padding: 18px 16px;
+  background: color-mix(in srgb, var(--fx-white) 92%, var(--fx-bg) 8%);
+  backdrop-filter: blur(4px);
+}
+
+.fx-preview-fallback-card {
+  width: 100%;
+  max-width: 100%;
+  text-align: left;
+  border-radius: 10px;
+  border: 1px solid var(--fx-border-soft);
+  background: color-mix(in srgb, var(--fx-white) 96%, var(--fx-bg) 4%);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--fx-text) 6%, transparent);
+  padding: 18px 16px 16px;
+  box-sizing: border-box;
+}
+
+.fx-preview-fallback-title {
+  margin: 0 0 10px;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--fx-text);
+  word-break: break-word;
+}
+
+.fx-preview-fallback-path {
+  margin: 0 0 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--fx-muted);
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+.fx-preview-fallback-reason {
+  margin: 0 0 14px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--fx-sub);
+  border-radius: 6px;
+  background: var(--fx-accent-soft);
+  border-left: 3px solid var(--fx-accent);
+}
+
+.fx-preview-fallback-rule {
+  margin: 0 0 14px;
+  border: none;
+  border-top: 1px solid var(--fx-border-soft);
+}
+
+.fx-preview-fallback-dl {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.fx-preview-fallback-dl > div {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  gap: 10px 12px;
+  align-items: start;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.fx-preview-fallback-dl dt {
+  margin: 0;
+  font-weight: 500;
+  color: var(--fx-muted);
+}
+
+.fx-preview-fallback-dl dd {
+  margin: 0;
+  color: var(--fx-text);
+  word-break: break-word;
+}

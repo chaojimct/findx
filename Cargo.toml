@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/findx2-core",
+    "crates/findx2-windows",
+    "crates/findx2-cli",
+    "crates/findx2-linux",
+    "crates/findx2-macos",
+    "crates/findx2-ipc",
+    "crates/findx2-service",
+    "gui/src-tauri",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.75"

@@ -1,0 +1,40 @@
+[package]
+name = "findx2-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "findx2 核心：索引、查询、持久化（平台无关）"
+
+[features]
+default = []
+pinyin = ["dep:ib-matcher"]
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dashmap = "5"
+fxhash = "0.2"
+memchr = "2.7"
+parking_lot = "0.12"
+rayon = "1.10"
+roaring = "0.10"
+zstd = "0.13"
+glob = "0.3"
+regex = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+ib-matcher = { version = "0.4", optional = true, features = ["regex", "pinyin"] }
+
+[[bench]]
+name = "search_perf"
+harness = false
+
+[[bench]]
+name = "pinyin_perf"
+harness = false
+required-features = ["pinyin"]
+
+[[test]]
+name = "pinyin_files_for_test"
+path = "tests/pinyin_files_for_test.rs"
+required-features = ["pinyin"]

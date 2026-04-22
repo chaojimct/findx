@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/app-icon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FindX2</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+      #root {
+        height: 100%;
+      }
+    </style>
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem("findx2_ui_theme");
+          var dark =
+            t === "dark" ||
+            (t === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+          var mode = dark ? "dark" : "light";
+          document.documentElement.setAttribute("data-fx-theme", mode);
+          document.documentElement.style.background = dark ? "#000000" : "#fafafa";
+          document.body.style.background = dark ? "#000000" : "#fafafa";
+        } catch (e) {
+          document.documentElement.setAttribute("data-fx-theme", "light");
+          document.documentElement.style.background = "#fafafa";
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
