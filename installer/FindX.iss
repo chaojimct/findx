@@ -142,10 +142,10 @@ begin
   if CurStep = ssPostInstall then
   begin
     AppDir := ExpandConstant('{app}');
-    if IsTaskSelected('addpath') then
+    if WizardIsTaskSelected('addpath') then
       AddToPath(AppDir);
 
-    if IsComponentSelected('servicec') then
+    if WizardIsComponentSelected('servicec') then
     begin
       ForceDirectories(ExpandConstant('{commonappdata}') + '\FindX');
       IndexPath := ExpandConstant('{commonappdata}') + '\FindX\index.bin';
@@ -156,7 +156,7 @@ begin
     end;
 
     { 与 GUI findx_settings 约定：仅在选择安装服务时写入，使首启用 ProgramData 索引 + 服务模式 }
-    if IsComponentSelected('servicec') then
+    if WizardIsComponentSelected('servicec') then
     begin
       Marker := AppDir + '\{#MyInstalledMarker}';
       SaveStringToFile(Marker, '1' + #13#10, False);

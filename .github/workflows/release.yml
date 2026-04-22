@@ -51,7 +51,11 @@ jobs:
 
       - name: 构建 Tauri 程序与 resources（不打 NSIS/MSI）
         working-directory: gui
-        run: npm run tauri build -- --no-bundle
+        shell: pwsh
+        run: |
+          # 避免本机/Runner 残留 CARGO_TARGET_DIR 导致产物不在仓库根 target\release，stage-inno 找不到
+          Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
+          npm run tauri build -- --no-bundle
 
       - name: 安装 Inno Setup 并制包
         shell: pwsh
@@ -69,7 +73,10 @@ jobs:
           }
           $stageAbs = (Resolve-Path $stage).Path
           $iscc = "$(${env:ProgramFiles(x86)})\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) { throw "未找到 ISCC: $iscc" }
+          if (-not (Test-Path $iscc)) {
+            $iscc = Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path $iscc)) { throw "未找到 ISCC（已尝试 Program Files (x86) 与 LocalAppData）。请确认 choco innosetup 或手动安装 Inno 6。" }
           $iss = Join-Path $ws "installer\FindX.iss"
           # 勿用 "/DPublishDir=$stageAbs"：路径中含 \f 等时 PowerShell 双引号会误解析转义
           $publishArg = '/DPublishDir=' + ($stageAbs.Replace('\', '/'))
