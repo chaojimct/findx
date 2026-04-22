@@ -6,7 +6,7 @@
 ; 与 v1 的 FindX.iss 类似：多任务（服务注册、PATH、桌面快捷方式、安装后启动），无 .NET 检测。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.0.3"
+  #define MyAppVersion "2.0.4"
 #endif
 
 #define MyAppName      "FindX"
@@ -56,7 +56,8 @@ Name: "custom"; Description: "自定义"; Flags: iscustom
 [Components]
 ; 与 v1 一样保留「主程序 / 服务 / CLI 路径」三段的语义，实际文件同一目录一次拷入
 Name: "main";     Description: "FindX 程序、资源与 findx2 / fx 命令行工具"; Types: full custom; Flags: fixed
-Name: "servicec"; Description: "注册并启动 Windows 服务 {#MyServiceName}（推荐；索引在 ProgramData\FindX）"; Types: full custom; Flags: disablenouninstall
+; 官方标志为 disablenouninstallwarning，勿写 disablenouninstall（旧版 ISCC 报 unknown flag）
+Name: "servicec"; Description: "注册并启动 Windows 服务 {#MyServiceName}（推荐；索引在 ProgramData\FindX）"; Types: full custom; Flags: disablenouninstallwarning
 Name: "clicfg";  Description: "为命令行工具配置 PATH/快捷方式等"; Types: full custom; Flags: fixed
 
 [Tasks]
