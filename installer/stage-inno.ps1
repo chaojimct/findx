@@ -49,16 +49,14 @@ Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 $null = New-Item -ItemType Directory -Path $stage
 # Installer expects {app}\FindX.exe
 Copy-Item -Path $main -Destination (Join-Path $stage "FindX.exe") -Force
-$stageRes = Join-Path $stage "resources"
 if (Test-Path $res) {
+  $stageRes = Join-Path $stage "resources"
   Copy-Item -Path $res -Destination $stageRes -Recurse
+  Write-Host "[stage-inno] copied resources from $res"
 } else {
-  # no-bundle 且未打任何 bundle 目标时，release 旁可能没有 resources；Inno 的 resources\* 至少要有一个文件
-  Write-Host "[stage-inno] no folder $res ; staging minimal resources from gui icon"
-  $null = New-Item -ItemType Directory -Path $stageRes -Force
-  $ico = Join-Path $RepoRoot "gui\src-tauri\icons\icon.ico"
-  if (-not (Test-Path $ico)) { throw "fallback icon missing: $ico" }
-  Copy-Item -Path $ico -Destination (Join-Path $stageRes "icon.ico") -Force
+  # GUI 运行时不强依赖 resources/ 目录（CLI/服务通过 current_exe 同目录解析），
+  # 因此 --no-bundle 时缺 resources 不再视为错误，[Files] 中 resources\* 为可选项。
+  Write-Host "[stage-inno] no folder $res ; skipping (resources is optional)"
 }
 Get-ChildItem -Path $rel -Filter *.dll -File -ErrorAction SilentlyContinue | ForEach-Object {
   Copy-Item -Path $_.FullName -Destination $stage

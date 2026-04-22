@@ -45,47 +45,49 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Rust target cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
       - name: Install frontend dependencies
         working-directory: gui
         run: npm ci
 
-      - name: 构建 Tauri 程序与 resources（不打 NSIS/MSI）
+      - name: 单独 release 编译 CLI / 服务（保证 stage 一定能拿到 findx2.exe / fx.exe / findx2-service.exe）
+        shell: pwsh
+        run: |
+          Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
+          cargo build --release -p findx2-cli -p findx2-service
+          $rel = Join-Path $env:GITHUB_WORKSPACE "target\release"
+          foreach ($f in @("findx2.exe","fx.exe","findx2-service.exe")) {
+            $p = Join-Path $rel $f
+            if (-not (Test-Path $p)) { throw "release 编译后仍缺少: $p" }
+            Write-Host "OK: $p"
+          }
+
+      - name: 构建 Tauri GUI（不打 NSIS/MSI，仅产出 FindX.exe）
         working-directory: gui
         shell: pwsh
         run: |
-          # 避免本机/Runner 残留 CARGO_TARGET_DIR 导致产物不在仓库根 target\release，stage-inno 找不到
           Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
           npm run tauri build -- --no-bundle
 
-      - name: 确认 Tauri release 产物（供 Inno stage）
+      - name: 确认 GUI release 产物
         shell: pwsh
         run: |
           $ws = $env:GITHUB_WORKSPACE
           Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
-          $rels = @(
-            (Join-Path $ws "target\release"),
-            (Join-Path $ws "target\x86_64-pc-windows-msvc\release"),
-            (Join-Path $ws "gui\target\release")
-          )
+          $rel = Join-Path $ws "target\release"
           $gui = $null
-          foreach ($r in $rels) {
-            if (Test-Path (Join-Path $r "findx2-gui.exe")) { $gui = Join-Path $r "findx2-gui.exe"; break }
-            if (Test-Path (Join-Path $r "FindX.exe")) { $gui = Join-Path $r "FindX.exe"; break }
+          foreach ($n in @("FindX.exe","findx2-gui.exe")) {
+            $p = Join-Path $rel $n
+            if (Test-Path $p) { $gui = $p; break }
           }
           if (-not $gui) {
-            Write-Host "---- 未找到 GUI exe，已检查目录 ----"
-            $rels | ForEach-Object { Write-Host $_ }
-            if (Test-Path (Join-Path $ws "target")) {
-              Get-ChildItem (Join-Path $ws "target") -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
-            }
-            throw "Tauri 构建后未找到 findx2-gui.exe 或 FindX.exe，stage-inno 无法继续。"
-          }
-          $resDir = Join-Path (Split-Path $gui) "resources"
-          # no-bundle 且 bundle.targets 为空时，Tauri 可能不把 resources 物化到 target\release 旁，由 stage-inno 用图标兜底
-          if (Test-Path $resDir) {
-            Write-Host "OK resources: $resDir"
-          } else {
-            Write-Host "WARN: 无 $resDir ，stage-inno 将写入最小 resources 供 Inno 匹配 resources\*"
+            Write-Host "---- target\release 内容 ----"
+            Get-ChildItem $rel -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+            throw "未找到 GUI exe（FindX.exe 或 findx2-gui.exe），无法继续。"
           }
           Write-Host "OK gui: $gui"
 
@@ -95,28 +97,25 @@ jobs:
           choco install innosetup -y
           $v = "${{ steps.ver.outputs.VERSION }}"
           $ws = $env:GITHUB_WORKSPACE
-          # 勿再套一层 Windows PowerShell 5.1 -File：Runner 上易出现编码/退出码与主 pwsh 不一致，导致 stage 未执行却仍往下跑
           $stageScript = Join-Path $ws "installer\stage-inno.ps1"
           & $stageScript -RepoRoot $ws
           $stage = Join-Path $ws "installer\stage"
-          $marker = Join-Path $stage "FindX.exe"
-          if (-not (Test-Path $marker)) {
-            Write-Host "---- installer\stage 内容 ----"
-            if (Test-Path $stage) {
-              Get-ChildItem $stage -Force -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
-            } else {
-              Write-Host "(installer\stage 目录不存在)"
+          foreach ($req in @("FindX.exe","findx2.exe","fx.exe","findx2-service.exe")) {
+            $p = Join-Path $stage $req
+            if (-not (Test-Path $p)) {
+              Write-Host "---- installer\stage 内容 ----"
+              Get-ChildItem $stage -Force -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+              throw "stage 缺少 $req，安装包将不可用。"
             }
-            throw "仍缺少 $marker。请查看上方 [stage-inno] 日志与 stage 列表。"
+            Write-Host "OK stage: $p"
           }
           $stageAbs = (Resolve-Path $stage).Path
           $iscc = "$(${env:ProgramFiles(x86)})\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) {
             $iscc = Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"
           }
-          if (-not (Test-Path $iscc)) { throw "未找到 ISCC（已尝试 Program Files (x86) 与 LocalAppData）。请确认 choco innosetup 或手动安装 Inno 6。" }
+          if (-not (Test-Path $iscc)) { throw "未找到 ISCC，请确认 choco innosetup 安装成功。" }
           $iss = Join-Path $ws "installer\FindX.iss"
-          # 勿用 "/DPublishDir=$stageAbs"：路径中含 \f 等时 PowerShell 双引号会误解析转义
           $publishArg = '/DPublishDir=' + ($stageAbs.Replace('\', '/'))
           & $iscc /DMyAppVersion=$v $publishArg $iss
 
@@ -144,4 +143,3 @@ jobs:
           name: FindX ${{ steps.ver.outputs.VERSION }}
           files: dist/*
           generate_release_notes: true
-

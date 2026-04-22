@@ -73,7 +73,8 @@ Name: "postlaunch";   Description: "安装完成后启动 FindX";               
 ; stage 由 stage-inno.ps1 生成。勿用单条 "{#PublishDir}\*"：Inno 编译器要求根目录至少有一个能匹配 * 的文件；
 ; 若仅有子目录（如 resources）而无根层文件，会报 No files found matching ...\stage\*。
 Source: "{#PublishDir}\FindX.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: main
-Source: "{#PublishDir}\resources\*"; DestDir: "{app}\resources"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: main
+; resources 目录是可选项：tauri --no-bundle 不一定生成；GUI 运行时不强依赖（CLI/服务通过同目录 current_exe 解析）
+Source: "{#PublishDir}\resources\*"; DestDir: "{app}\resources"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist; Components: main
 Source: "{#PublishDir}\findx2.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: main
 Source: "{#PublishDir}\fx.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: main
 Source: "{#PublishDir}\findx2-service.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: main
