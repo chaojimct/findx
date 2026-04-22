@@ -57,19 +57,53 @@ jobs:
           Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
           npm run tauri build -- --no-bundle
 
+      - name: 确认 Tauri release 产物（供 Inno stage）
+        shell: pwsh
+        run: |
+          $ws = $env:GITHUB_WORKSPACE
+          Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
+          $rels = @(
+            (Join-Path $ws "target\release"),
+            (Join-Path $ws "target\x86_64-pc-windows-msvc\release"),
+            (Join-Path $ws "gui\target\release")
+          )
+          $gui = $null
+          foreach ($r in $rels) {
+            if (Test-Path (Join-Path $r "findx2-gui.exe")) { $gui = Join-Path $r "findx2-gui.exe"; break }
+            if (Test-Path (Join-Path $r "FindX.exe")) { $gui = Join-Path $r "FindX.exe"; break }
+          }
+          if (-not $gui) {
+            Write-Host "---- 未找到 GUI exe，已检查目录 ----"
+            $rels | ForEach-Object { Write-Host $_ }
+            if (Test-Path (Join-Path $ws "target")) {
+              Get-ChildItem (Join-Path $ws "target") -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+            }
+            throw "Tauri 构建后未找到 findx2-gui.exe 或 FindX.exe，stage-inno 无法继续。"
+          }
+          $resDir = Join-Path (Split-Path $gui) "resources"
+          if (-not (Test-Path $resDir)) { throw "未找到 resources 目录: $resDir" }
+          Write-Host "OK: $gui"
+          Write-Host "OK: $resDir"
+
       - name: 安装 Inno Setup 并制包
         shell: pwsh
         run: |
           choco install innosetup -y
           $v = "${{ steps.ver.outputs.VERSION }}"
           $ws = $env:GITHUB_WORKSPACE
-          & powershell -ExecutionPolicy Bypass -File "$ws\installer\stage-inno.ps1" -RepoRoot $ws
+          # 勿再套一层 Windows PowerShell 5.1 -File：Runner 上易出现编码/退出码与主 pwsh 不一致，导致 stage 未执行却仍往下跑
+          $stageScript = Join-Path $ws "installer\stage-inno.ps1"
+          & $stageScript -RepoRoot $ws
           $stage = Join-Path $ws "installer\stage"
           $marker = Join-Path $stage "FindX.exe"
           if (-not (Test-Path $marker)) {
             Write-Host "---- installer\stage 内容 ----"
-            Get-ChildItem $stage -Force -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
-            throw "缺少 $marker。请先成功执行 stage-inno.ps1（且 [Files] 需能解析到 PublishDir 下各文件）。"
+            if (Test-Path $stage) {
+              Get-ChildItem $stage -Force -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+            } else {
+              Write-Host "(installer\stage 目录不存在)"
+            }
+            throw "仍缺少 $marker。请查看上方 [stage-inno] 日志与 stage 列表。"
           }
           $stageAbs = (Resolve-Path $stage).Path
           $iscc = "$(${env:ProgramFiles(x86)})\Inno Setup 6\ISCC.exe"
