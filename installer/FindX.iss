@@ -7,7 +7,7 @@
 ; 与 v1 的 FindX.iss 类似：多任务（服务注册、PATH、桌面快捷方式、安装后启动），无 .NET 检测。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.0.4"
+  #define MyAppVersion "2.0.0"
 #endif
 
 #define MyAppName      "FindX"
