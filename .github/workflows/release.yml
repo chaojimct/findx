@@ -81,9 +81,13 @@ jobs:
             throw "Tauri 构建后未找到 findx2-gui.exe 或 FindX.exe，stage-inno 无法继续。"
           }
           $resDir = Join-Path (Split-Path $gui) "resources"
-          if (-not (Test-Path $resDir)) { throw "未找到 resources 目录: $resDir" }
-          Write-Host "OK: $gui"
-          Write-Host "OK: $resDir"
+          # no-bundle 且 bundle.targets 为空时，Tauri 可能不把 resources 物化到 target\release 旁，由 stage-inno 用图标兜底
+          if (Test-Path $resDir) {
+            Write-Host "OK resources: $resDir"
+          } else {
+            Write-Host "WARN: 无 $resDir ，stage-inno 将写入最小 resources 供 Inno 匹配 resources\*"
+          }
+          Write-Host "OK gui: $gui"
 
       - name: 安装 Inno Setup 并制包
         shell: pwsh
