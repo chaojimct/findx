@@ -1255,6 +1255,26 @@ fn fused_scan_pinyin(
     result
 }
 
+/// 文件名最后一段后缀（小写 ASCII）；无 `.` 或空后缀则 `None`。
+fn entry_ext_lower_ascii(store: &IndexStore, idx: u32) -> Option<String> {
+    let e = store.entries.get(idx as usize)?;
+    let name = store.name_str(e).ok()?;
+    let (_, ext) = name.rsplit_once('.')?;
+    if ext.is_empty() {
+        return None;
+    }
+    Some(ext.to_ascii_lowercase())
+}
+
+/// `ext_filter` 仅按 `hash_ext8` 分 256 桶，**不同扩展名会碰撞**（例如 `pdf` 与 `yml` 同为桶 21），
+/// 仅靠位图会误命中；必须在候选上按真实后缀与 `ext:` 列表精确比对。
+fn entry_matches_ext_candidates(store: &IndexStore, idx: u32, ext_src: &[String]) -> bool {
+    let Some(got) = entry_ext_lower_ascii(store, idx) else {
+        return false;
+    };
+    ext_src.iter().any(|want| want == &got)
+}
+
 fn initial_candidates(store: &IndexStore, q: &ParsedQuery) -> Vec<u32> {
     let ext_src: Vec<String> = if !q.ext_list.is_empty() {
         q.ext_list.clone()
@@ -1282,8 +1302,12 @@ fn initial_candidates(store: &IndexStore, q: &ParsedQuery) -> Vec<u32> {
         }
     }
 
-    acc.map(|b| b.iter().collect())
-        .unwrap_or_else(|| Vec::new())
+    acc.map(|b| {
+        b.iter()
+            .filter(|&idx| entry_matches_ext_candidates(store, idx, &ext_src))
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 fn path_matches_drive_prefix(

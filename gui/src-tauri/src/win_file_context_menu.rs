@@ -7,15 +7,14 @@ use tauri::AppHandle;
 use tauri_plugin_opener::OpenerExt;
 use windows::core::PCSTR;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     CMINVOKECOMMANDINFO, CMF_EXTENDEDVERBS, CMF_NORMAL, IContextMenu, IShellFolder, SHBindToParent,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, SetForegroundWindow, TrackPopupMenu, HMENU, MF_SEPARATOR,
-    MF_STRING, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TRACK_POPUP_MENU_FLAGS,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, SetForegroundWindow, TrackPopupMenu, HMENU,
+    MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD, TRACK_POPUP_MENU_FLAGS,
 };
 
 const CMD_OPEN: usize = 1;
@@ -25,6 +24,19 @@ const SHELL_CMD_FIRST: u32 = 0x1000;
 
 fn to_wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// WebView2 传入的 `screenX`/`screenY` 在多屏、混合缩放下常与 Win32 物理坐标不一致，
+/// `TrackPopupMenu` 会因此把菜单画到主屏。右键当下用 `GetCursorPos` 与 Shell 菜单对齐。
+fn track_popup_anchor_screen(screen_x: i32, screen_y: i32) -> (i32, i32) {
+    unsafe {
+        let mut pt = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut pt).is_ok() {
+            (pt.x, pt.y)
+        } else {
+            (screen_x, screen_y)
+        }
+    }
 }
 
 struct MenuGuard(HMENU);
@@ -111,8 +123,9 @@ pub(crate) fn run_composite_hit_menu(
 
         let _ = SetForegroundWindow(hwnd);
 
+        let (px, py) = track_popup_anchor_screen(screen_x, screen_y);
         let tpm = TRACK_POPUP_MENU_FLAGS(TPM_LEFTALIGN.0 | TPM_RETURNCMD.0);
-        let picked = TrackPopupMenu(hmenu, tpm, screen_x, screen_y, None, hwnd, None);
+        let picked = TrackPopupMenu(hmenu, tpm, px, py, None, hwnd, None);
 
         // WebView2/Win32 文档：TPM_RETURNCMD 时返回值为选中项 ID，但绑定为 BOOL，按数值读取。
         let cmd = picked.0 as u32;

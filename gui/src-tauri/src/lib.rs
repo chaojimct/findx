@@ -32,6 +32,7 @@ use windows::{
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod desktop;
 
+mod app_update;
 mod findx_settings;
 #[cfg(windows)]
 mod elevate;
@@ -1410,6 +1411,7 @@ async fn preview_show(
     y: f64,
     w: f64,
     h: f64,
+    dpr: f64,
 ) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -1419,14 +1421,7 @@ async fn preview_show(
             .run_on_main_thread(move || {
                 let result = (|| {
                     let hwnd = win_for_main.hwnd().map_err(|e| e.to_string())?;
-                    win_preview::show_preview(
-                        hwnd,
-                        path,
-                        x as i32,
-                        y as i32,
-                        w as i32,
-                        h as i32,
-                    )
+                    win_preview::show_preview(hwnd, path, x, y, w, h, dpr)
                 })();
                 let _ = tx.send(result);
             })
@@ -1437,7 +1432,7 @@ async fn preview_show(
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (window, path, x, y, w, h);
+        let _ = (window, path, x, y, w, h, dpr);
         Err("预览仅支持 Windows".to_string())
     }
 }
@@ -1449,6 +1444,7 @@ async fn preview_set_bounds(
     y: f64,
     w: f64,
     h: f64,
+    dpr: f64,
 ) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -1458,7 +1454,7 @@ async fn preview_set_bounds(
             .run_on_main_thread(move || {
                 let result = (|| {
                     let hwnd = win_for_main.hwnd().map_err(|e| e.to_string())?;
-                    win_preview::set_bounds(hwnd, x as i32, y as i32, w as i32, h as i32)
+                    win_preview::set_bounds(hwnd, x, y, w, h, dpr)
                 })();
                 let _ = tx.send(result);
             })
@@ -1469,7 +1465,7 @@ async fn preview_set_bounds(
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (window, x, y, w, h);
+        let _ = (window, x, y, w, h, dpr);
         Ok(())
     }
 }
@@ -1700,6 +1696,7 @@ pub fn run() {
             open_path_in_console,
             start_native_file_drag,
             open_external_url,
+            app_update::check_app_update,
             load_preview_data_url,
             detect_legacy_v1_installation,
             load_preview_text,

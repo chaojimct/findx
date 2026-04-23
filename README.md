@@ -17,7 +17,7 @@
 
 **首次开启 Pages**：若 [站点](https://chaojimct.github.io/findx/) 未自动更新，请在仓库 **Settings → Pages** 中把 **Source** 选为 **GitHub Actions**（本仓库已含 [`.github/workflows/pages.yml`](.github/workflows/pages.yml)）。
 
-**自动发版**：对 `v*` 标签（例如 `v2.0.1`）推送会触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，在 `windows-latest` 上 `tauri build --no-bundle` 产出程序与 `resources` 后，用 **[Inno Setup 6](https://jrsoftware.org/isinfo.php)** 执行 [`installer/FindX.iss`](installer/FindX.iss) 打 **`FindX-<ver>-setup.exe`**，并（在 tag 场景下）上传到 [Release](https://github.com/chaojimct/findx/releases)。
+**自动发版**：对 `v*` 标签（例如 `v2.1.0`）推送会触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，在 `windows-latest` 上 `tauri build --no-bundle` 产出程序与 `resources` 后，用 **[Inno Setup 6](https://jrsoftware.org/isinfo.php)** 执行 [`installer/FindX.iss`](installer/FindX.iss) 打 **`FindX-<ver>-setup.exe`**，并（在 tag 场景下）上传到 [Release](https://github.com/chaojimct/findx/releases)。
 
 ## Windows 安装包（Inno Setup，与 v1 同宗）
 
@@ -173,8 +173,15 @@ findx2-service uninstall
 ## 版本号（GUI / 安装包）
 
 - Tauri 与 GUI 以 **`gui/src-tauri/tauri.conf.json`** 与 **`gui/src-tauri/Cargo.toml`** 的 `version` 为准。  
-- **Inno** 安装包版本在 CI 中由 **`/DMyAppVersion=`** 传入 [`installer/FindX.iss`](installer/FindX.iss)（与 tag 如 `v2.0.1` 的纯数字部分一致即可）；`iss` 内 `#define MyAppVersion` 为本地无参数编译时的默认。
+- **Inno** 安装包版本在 CI 中由 **`/DMyAppVersion=`** 传入 [`installer/FindX.iss`](installer/FindX.iss)（与 tag 如 `v2.1.0` 的纯数字部分一致即可）；`iss` 内 `#define MyAppVersion` 为本地无参数编译时的默认。
+
+变更记录见仓库根目录 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ## 许可证
 
-MIT OR Apache-2.0
+Rust 工作区在根 [`Cargo.toml`](Cargo.toml) 中声明为 **`MIT OR Apache-2.0`**（与 `SPDX-License-Identifier` 常见写法一致）：你可任选其中一种条款使用本仓库代码。
+
+- **MIT**：全文见 [`LICENSE`](LICENSE)（与 [`gui/LICENSE`](gui/LICENSE) 一致，便于 Tauri 打包引用）。
+- **Apache-2.0**：全文见 [`LICENSE-APACHE`](LICENSE-APACHE)。
+
+第三方依赖各自遵循其许可证；Windows、WebView2、Everything 兼容协议等以相应厂商条款为准。

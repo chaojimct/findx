@@ -1,6 +1,6 @@
 [package]
 name = "findx2-gui"
-version = "2.0.1"
+version = "2.1.0"
 description = "FindX2 Tauri GUI"
 edition = "2021"
 
@@ -21,6 +21,8 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
+ureq = "2.9"
 base64 = "0.22"
 findx2-ipc = { path = "../../crates/findx2-ipc" }
 tokio = { version = "1", features = ["rt", "macros", "io-util", "net", "process", "time", "sync"] }
@@ -28,5 +30,5 @@ tokio = { version = "1", features = ["rt", "macros", "io-util", "net", "process"
 [target.'cfg(windows)'.dependencies]
 arboard = "3"
 findx2-windows = { path = "../../crates/findx2-windows" }
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Ole", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Ole", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem", "Win32_UI_WindowsAndMessaging"] }
 windows-core = "0.61"

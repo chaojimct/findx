@@ -32,3 +32,14 @@ export function loadUiThemePref(): UiThemePref {
   }
   return "light";
 }
+
+/** 与 Rust `app_update::AppUpdateInfo` 对应（GitHub Releases 检测） */
+export type AppUpdateInfo = {
+  ok: boolean;
+  error?: string;
+  currentVersion: string;
+  latestVersion?: string;
+  hasUpdate: boolean;
+  releasePageUrl?: string;
+  publishedAt?: string;
+};

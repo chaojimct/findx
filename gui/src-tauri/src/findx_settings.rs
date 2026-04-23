@@ -234,7 +234,10 @@ fn path_contains_dir(path_value: &str, target_dir: &str) -> bool {
 /// - 仅写入 HKCU（无需管理员），且具备幂等性（已存在则不重复追加）。
 #[cfg(windows)]
 pub fn ensure_cli_on_user_path() -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let exe_dir = exe_resource_dir();
     if !exe_dir.exists() {
@@ -280,6 +283,7 @@ pub fn ensure_cli_on_user_path() -> Result<(), String> {
             "-Command",
             &script,
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .status()
         .map_err(|e| format!("写入用户 PATH 失败：{e}"))?;
 
@@ -443,13 +447,32 @@ pub fn spawn_findx_service_process<R: Runtime>(app: tauri::AppHandle<R>) -> Resu
     }
 }
 
+/// 发起 `taskkill` 后不等待其结束。Windows 上丢弃 `Child` 只会关闭句柄，**不会**终止已启动的 taskkill，
+/// 用于退出 GUI 时避免在 UI 线程上阻塞。
+#[cfg(windows)]
+pub(crate) fn stop_findx_service_detached() {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = Command::new("taskkill")
+        .args(["/F", "/IM", "findx2-service.exe"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+}
+
+#[cfg(not(windows))]
+pub(crate) fn stop_findx_service_detached() {}
+
 #[tauri::command]
 pub fn stop_findx_service() -> Result<(), String> {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         use std::process::Command;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let _ = Command::new("taskkill")
             .args(["/F", "/IM", "findx2-service.exe"])
+            .creation_flags(CREATE_NO_WINDOW)
             .output();
         Ok(())
     }

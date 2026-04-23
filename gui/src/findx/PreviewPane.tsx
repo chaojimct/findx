@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 /**
  * Windows 资源管理器风格的预览面板。
@@ -160,23 +160,35 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
   const mode: PreviewMode = useMemo(() => classifyByExt(path ?? "", isDirectory), [path, isDirectory]);
   const cloudLabel = useMemo(() => (path ? cloudStorageLabel(path) : null), [path]);
 
-  // -------- 原生预览：把 nativeMountRef 的客户区矩形发给 Rust --------
-  // CSS 像素 → 物理像素需乘以 devicePixelRatio（高 DPI 屏下 webview 客户区是物理像素）。
-  // Tauri WebView2 的 HWND 客户区原点 = (0, 0)，与 webview 内 (0,0) 对齐，
-  // 因此 element.getBoundingClientRect() × DPR 即可直接传给 Rust。
-  const pushBounds = () => {
+  /** 拖动分隔条时 `preview_set_bounds` 极高频；合并到下一帧，减少与 prevhost 的交错重入导致的花屏/白块。 */
+  const boundsRafRef = useRef<number | null>(null);
+
+  // -------- 原生预览：把 nativeMountRef 的矩形发给 Rust（CSS 逻辑像素，与 getBoundingClientRect 一致）--------
+  // 物理像素与 DPI 换算在 Rust 侧用 `GetDpiForWindow(实际 WebView HWND)` 完成，避免与扩展屏/混用 DPI 下的
+  // `window.devicePixelRatio` 或 Tauri scaleFactor 与 Win32 `ClientToScreen` 不一致。
+  const pushBounds = useCallback(() => {
     const el = nativeMountRef.current;
     if (!el) return;
     const r = el.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return;
-    const dpr = window.devicePixelRatio || 1;
+    // dpr 是 webview 实际使用的 device-pixel-ratio——这是 CSS→物理像素 唯一权威值。
+    // 由前端报告而不是 Rust 用 GetDpiForWindow 猜，避免跨屏 / 启动瞬间监视器 DPI 与 webview dpr 不一致。
     void invoke("preview_set_bounds", {
-      x: Math.round(r.left * dpr),
-      y: Math.round(r.top * dpr),
-      w: Math.round(r.width * dpr),
-      h: Math.round(r.height * dpr),
+      x: r.left,
+      y: r.top,
+      w: r.width,
+      h: r.height,
+      dpr: window.devicePixelRatio || 1,
     }).catch(() => {});
-  };
+  }, []);
+
+  const schedulePushBounds = useCallback(() => {
+    if (boundsRafRef.current != null) cancelAnimationFrame(boundsRafRef.current);
+    boundsRafRef.current = requestAnimationFrame(() => {
+      boundsRafRef.current = null;
+      pushBounds();
+    });
+  }, [pushBounds]);
 
   // -------- 路径或模式变化 → 切换预览源 --------
   // useLayoutEffect 保证 DOM commit 之后、浏览器绘制之前跑：mount div 一定已经 attach，ref 就绪。
@@ -226,11 +238,11 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
     const debounce = window.setTimeout(() => {
       if (!alive) return;
       let attempts = 0;
-      const tryShow = () => {
+      const tryShow = async () => {
         if (!alive) return;
         const el = nativeMountRef.current;
         if (!el) {
-          if (attempts++ < 10) requestAnimationFrame(tryShow);
+          if (attempts++ < 10) requestAnimationFrame(() => void tryShow());
           else if (alive) {
             setBusy(false);
             setErrMsg("预览容器未就绪");
@@ -240,35 +252,33 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
         const r = el.getBoundingClientRect();
         if (r.width < 8 || r.height < 8) {
           if (attempts++ < 10) {
-            requestAnimationFrame(tryShow);
+            requestAnimationFrame(() => void tryShow());
             return;
           }
         }
-        const dpr = window.devicePixelRatio || 1;
         const args = {
           path,
-          x: Math.round(r.left * dpr),
-          y: Math.round(r.top * dpr),
-          w: Math.round(Math.max(1, r.width) * dpr),
-          h: Math.round(Math.max(1, r.height) * dpr),
+          x: r.left,
+          y: r.top,
+          w: Math.max(1, r.width),
+          h: Math.max(1, r.height),
+          dpr: window.devicePixelRatio || 1,
         };
-        void (async () => {
-          await doubleRaf();
-          if (!alive) return;
-          try {
-            await invoke("preview_show", args);
-            if (alive) setErrMsg(null);
-          } catch (e) {
-            if (alive) {
-              setErrMsg(String(e));
-              void invoke("preview_hide", { unload: true }).catch(() => {});
-            }
-          } finally {
-            if (alive) setBusy(false);
+        await doubleRaf();
+        if (!alive) return;
+        try {
+          await invoke("preview_show", args);
+          if (alive) setErrMsg(null);
+        } catch (e) {
+          if (alive) {
+            setErrMsg(String(e));
+            void invoke("preview_hide", { unload: true }).catch(() => {});
           }
-        })();
+        } finally {
+          if (alive) setBusy(false);
+        }
       };
-      requestAnimationFrame(tryShow);
+      requestAnimationFrame(() => void tryShow());
     }, 250);
 
     return () => {
@@ -284,26 +294,29 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
     if (mode !== "native") return;
     const el = nativeMountRef.current;
     if (!el) return;
-    const ro = new ResizeObserver(() => pushBounds());
+    const ro = new ResizeObserver(() => schedulePushBounds());
     ro.observe(el);
-    const onResize = () => pushBounds();
+    const onResize = () => schedulePushBounds();
     window.addEventListener("resize", onResize);
     window.addEventListener("scroll", onResize, true);
 
     const win = getCurrentWindow();
     let unlistenMoved: (() => void) | null = null;
     let unlistenResized: (() => void) | null = null;
-    win.onMoved(() => pushBounds()).then((u) => { unlistenMoved = u; }).catch(() => {});
-    win.onResized(() => pushBounds()).then((u) => { unlistenResized = u; }).catch(() => {});
+    win.onMoved(() => schedulePushBounds()).then((u) => { unlistenMoved = u; }).catch(() => {});
+    win.onResized(() => schedulePushBounds()).then((u) => { unlistenResized = u; }).catch(() => {});
+    schedulePushBounds();
 
     return () => {
+      if (boundsRafRef.current != null) cancelAnimationFrame(boundsRafRef.current);
+      boundsRafRef.current = null;
       ro.disconnect();
       window.removeEventListener("resize", onResize);
       window.removeEventListener("scroll", onResize, true);
       unlistenMoved?.();
       unlistenResized?.();
     };
-  }, [mode, path]);
+  }, [mode, path, schedulePushBounds]);
 
   // -------- 预览失败：从磁盘读取元数据，用于降级信息卡片 --------
   useEffect(() => {

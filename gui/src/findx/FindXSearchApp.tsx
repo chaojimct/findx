@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "./findx.css";
-import type { FindxGuiSettings, UiThemePref } from "./findxGuiTypes";
+import type { AppUpdateInfo, FindxGuiSettings, UiThemePref } from "./findxGuiTypes";
 import { UI_THEME_KEY, loadUiThemePref } from "./findxGuiTypes";
 import { PreviewPane } from "./PreviewPane";
 
@@ -32,6 +32,9 @@ const HISTORY_KEY = "findx2_search_history";
 const MAX_HISTORY = 30;
 const COL_FRAC_KEY = "findx2_col_fractions";
 const V2_MIGRATION_NOTICE_ACK_KEY = "findx2_v2_migration_notice_ack_v1";
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const UPDATE_LAST_CHECK_LS = "findx2_last_update_check_ms";
+const UPDATE_BANNER_DISMISS_LS = "findx2_update_banner_dismissed_for_tag";
 
 const DEFAULT_COL_FRAC: [number, number, number, number] = [0.28, 0.38, 0.1, 0.24];
 
@@ -317,6 +320,8 @@ export default function FindXSearchApp() {
     saveIntervalSecs: 30,
   });
   const [showV2MigrationNotice, setShowV2MigrationNotice] = useState(false);
+  /** GitHub Release 有新版本时顶部提示条 */
+  const [updateBanner, setUpdateBanner] = useState<AppUpdateInfo | null>(null);
   /** 界面主题：浅 / 深（全黑）/ 跟随系统 */
   const [uiThemePref, setUiThemePref] = useState<UiThemePref>(() => loadUiThemePref());
   const [systemDark, setSystemDark] = useState(
@@ -450,6 +455,7 @@ export default function FindXSearchApp() {
   // 自实现 30 行就够：监听 scrollTop / clientHeight 推算可见 [start,end)，前后用 spacer <tr> 占位。
   const tableScrollRef = useRef<HTMLDivElement | null>(null);
   const searchBarRowRef = useRef<HTMLDivElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const ROW_HEIGHT = 32;
   const OVERSCAN = 8;
   const [scrollTop, setScrollTop] = useState(0);
@@ -466,6 +472,64 @@ export default function FindXSearchApp() {
     return () => {
       el.removeEventListener("scroll", onScroll);
       ro.disconnect();
+    };
+  }, []);
+
+  /** Ctrl+F / Cmd+F：聚焦主检索框（避免 WebView 默认「在页面中查找」抢焦点） */
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "f" && e.key !== "F") return;
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const input = searchInputRef.current;
+      if (!input) return;
+      const hadFocus = document.activeElement === input;
+      input.focus();
+      if (!hadFocus) input.select();
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, []);
+
+  /** 启动数秒后检查 GitHub 最新 Release（每 24h 最多请求一次） */
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      try {
+        const raw = localStorage.getItem(UPDATE_LAST_CHECK_LS);
+        if (raw) {
+          const last = parseInt(raw, 10);
+          if (Number.isFinite(last) && Date.now() - last < UPDATE_CHECK_INTERVAL_MS) {
+            return;
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+      try {
+        const info = await invoke<AppUpdateInfo>("check_app_update");
+        if (cancelled) return;
+        try {
+          localStorage.setItem(UPDATE_LAST_CHECK_LS, String(Date.now()));
+        } catch {
+          /* ignore */
+        }
+        if (!info.ok || !info.hasUpdate || !info.latestVersion) return;
+        try {
+          if (localStorage.getItem(UPDATE_BANNER_DISMISS_LS) === info.latestVersion) return;
+        } catch {
+          /* ignore */
+        }
+        setUpdateBanner(info);
+      } catch {
+        /* ignore */
+      }
+    };
+    const tid = window.setTimeout(() => void run(), 3500);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(tid);
     };
   }, []);
 
@@ -614,11 +678,14 @@ export default function FindXSearchApp() {
     if (!query) {
       setHits([]);
       setStatus("就绪");
+      setSelected(null);
       return;
     }
     const seq = ++searchSeq.current;
     setLoading(true);
     setStatus("搜索中…");
+    // 每次重新搜索（含防抖自动搜）时清空列表选中，避免仍指向旧排序/旧结果中的行号。
+    setSelected(null);
     try {
       const resp = await invoke<{ hits: SearchHit[]; total: number; elapsedMs: number }>(
         "search_files",
@@ -650,6 +717,7 @@ export default function FindXSearchApp() {
     } catch (e) {
       if (seq === searchSeq.current) {
         setHits([]);
+        setSelected(null);
         setStatus(`错误: ${String(e)}`);
       }
     } finally {
@@ -736,12 +804,46 @@ export default function FindXSearchApp() {
 
   return (
     <div className="fx-root">
+      {updateBanner?.releasePageUrl && updateBanner.latestVersion && (
+        <div className="fx-update-banner" role="status">
+          <span>
+            发现新版本 <strong>{updateBanner.latestVersion}</strong>（当前 {updateBanner.currentVersion}）
+          </span>
+          <span className="fx-update-banner-actions">
+            <button
+              type="button"
+              className="fx-btn-icon fx-btn-search"
+              onClick={() => {
+                const u = updateBanner.releasePageUrl;
+                if (u) void invoke("open_external_url", { url: u }).catch(() => {});
+              }}
+            >
+              前往下载
+            </button>
+            <button
+              type="button"
+              className="fx-btn-icon"
+              onClick={() => {
+                try {
+                  localStorage.setItem(UPDATE_BANNER_DISMISS_LS, updateBanner.latestVersion ?? "");
+                } catch {
+                  /* ignore */
+                }
+                setUpdateBanner(null);
+              }}
+            >
+              忽略
+            </button>
+          </span>
+        </div>
+      )}
       <div className="fx-search-bar">
         <div className="fx-search-row" ref={searchBarRowRef}>
           <div className="fx-search-combo">
             <div className="fx-search-input-wrap">
               {!q && <span className="fx-search-placeholder">搜索文件和文件夹…</span>}
               <input
+                ref={searchInputRef}
                 className="fx-search-input"
                 value={q}
                 onChange={(e) => setQ(e.target.value)}

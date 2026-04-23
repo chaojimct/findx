@@ -8,9 +8,10 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
     },
+    time::{Duration, Instant},
 };
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     plugin::TauriPlugin,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     App, AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, PhysicalSize, Position,
@@ -33,7 +34,8 @@ const SETTINGS_WINDOW_LABEL: &str = "settings";
 const TRAY_ICON_ID: &str = "findx2-tray";
 const TRAY_MENU_SEARCH_ID: &str = "findx-search";
 const TRAY_MENU_SETTINGS_ID: &str = "findx-settings";
-const TRAY_MENU_START_SERVICE_ID: &str = "findx-start-service";
+/// 根据当前管道是否可连，在「启动索引服务」与「停止索引服务」之间切换文案（同一条目 id）。
+const TRAY_MENU_SERVICE_ID: &str = "findx-service-toggle";
 const TRAY_MENU_HIDE_ID: &str = "hide-window";
 const TRAY_MENU_QUIT_ID: &str = "quit-app";
 const DESKTOP_SETTINGS_FILE_NAME: &str = "desktop-settings.json";
@@ -103,9 +105,12 @@ impl Default for DesktopSettings {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedDesktopState {
+    /// 桌面状态文件格式；<1 时丢弃 `last_full_window_layout`，避免旧「物理像素」存档被误读为逻辑尺寸。
+    #[serde(default)]
+    desktop_state_version: u32,
     #[serde(default)]
     settings: DesktopSettings,
     #[serde(default)]
@@ -114,14 +119,29 @@ struct PersistedDesktopState {
     last_window_mode: Option<PersistedWindowMode>,
 }
 
+impl Default for PersistedDesktopState {
+    fn default() -> Self {
+        Self {
+            desktop_state_version: 1,
+            settings: DesktopSettings::default(),
+            last_full_window_layout: None,
+            last_window_mode: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FullWindowLayoutSnapshot {
     x: i32,
     y: i32,
-    width: u32,
-    height: u32,
+    /// 与 `layout_version` 联动：v1 为逻辑像素（与显示器 DPI 无关的「视觉尺寸」），v0 为历史 inner 物理像素。
+    width: f64,
+    height: f64,
     maximized: bool,
+    /// 0：旧版（`width`/`height` 按物理像素 `set_size`）；1：按逻辑像素恢复，修复混合 DPI 多显示器下「尺寸减半」。
+    #[serde(default)]
+    layout_version: u32,
 }
 
 #[derive(Clone, Serialize)]
@@ -161,7 +181,9 @@ fn shared_window_state_save_enabled() -> Arc<AtomicBool> {
 }
 
 fn full_window_state_flags() -> StateFlags {
-    StateFlags::POSITION | StateFlags::SIZE | StateFlags::MAXIMIZED
+    // 不保存 SIZE：插件按物理像素存宽高，在 100% 扩展屏与 200% 主屏之间切换会「尺寸减半」。
+    // 完整尺寸由 `FullWindowLayoutSnapshot`（逻辑像素）+ desktop-settings.json 负责。
+    StateFlags::POSITION | StateFlags::MAXIMIZED
 }
 
 pub fn window_state_plugin<R: Runtime>() -> TauriPlugin<R> {
@@ -243,8 +265,13 @@ fn sanitize_desktop_settings(settings: DesktopSettings) -> DesktopSettings {
     }
 }
 
-fn sanitize_persisted_desktop_state(state: PersistedDesktopState) -> PersistedDesktopState {
+fn sanitize_persisted_desktop_state(mut state: PersistedDesktopState) -> PersistedDesktopState {
+    if state.desktop_state_version < 1 {
+        state.desktop_state_version = 1;
+        state.last_full_window_layout = None;
+    }
     PersistedDesktopState {
+        desktop_state_version: state.desktop_state_version,
         settings: sanitize_desktop_settings(state.settings),
         last_full_window_layout: state
             .last_full_window_layout
@@ -256,13 +283,14 @@ fn sanitize_persisted_desktop_state(state: PersistedDesktopState) -> PersistedDe
 fn sanitize_full_window_layout_snapshot(
     snapshot: FullWindowLayoutSnapshot,
 ) -> Option<FullWindowLayoutSnapshot> {
-    if snapshot.width == 0 || snapshot.height == 0 {
+    if snapshot.width <= 0.0 || snapshot.height <= 0.0 || !snapshot.width.is_finite() || !snapshot.height.is_finite()
+    {
         return None;
     }
 
     Some(FullWindowLayoutSnapshot {
-        width: snapshot.width.max(FULL_WINDOW_MIN_WIDTH as u32),
-        height: snapshot.height.max(FULL_WINDOW_MIN_HEIGHT as u32),
+        width: snapshot.width.max(FULL_WINDOW_MIN_WIDTH),
+        height: snapshot.height.max(FULL_WINDOW_MIN_HEIGHT),
         ..snapshot
     })
 }
@@ -289,6 +317,7 @@ fn load_desktop_state<R: Runtime>(app: &AppHandle<R>) -> PersistedDesktopState {
             Ok(state) => sanitize_persisted_desktop_state(state),
             Err(state_err) => match serde_json::from_str::<DesktopSettings>(&contents) {
                 Ok(settings) => PersistedDesktopState {
+                    desktop_state_version: 1,
                     settings: sanitize_desktop_settings(settings),
                     last_full_window_layout: None,
                     last_window_mode: None,
@@ -411,6 +440,7 @@ fn persist_desktop_state<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     save_desktop_state_file(
         app,
         &PersistedDesktopState {
+            desktop_state_version: 1,
             settings: current_desktop_settings(app)?,
             last_full_window_layout,
             last_window_mode: Some(PersistedWindowMode::from(current_window_mode(app))),
@@ -423,13 +453,18 @@ fn snapshot_from_window<R: Runtime>(
 ) -> Result<FullWindowLayoutSnapshot, String> {
     let position = window.outer_position().map_err(|err| err.to_string())?;
     let size = window.inner_size().map_err(|err| err.to_string())?;
+    let scale = window.scale_factor().map_err(|err| err.to_string())?;
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err("Invalid window scale factor".to_string());
+    }
 
     Ok(FullWindowLayoutSnapshot {
         x: position.x,
         y: position.y,
-        width: size.width,
-        height: size.height,
+        width: size.width as f64 / scale,
+        height: size.height as f64 / scale,
         maximized: window.is_maximized().map_err(|err| err.to_string())?,
+        layout_version: 1,
     })
 }
 
@@ -446,12 +481,23 @@ fn apply_full_window_layout_snapshot<R: Runtime>(
     if window.is_maximized().map_err(|err| err.to_string())? {
         window.unmaximize().map_err(|err| err.to_string())?;
     }
-    window
-        .set_size(Size::Physical(PhysicalSize::new(
-            snapshot.width,
-            snapshot.height,
-        )))
-        .map_err(|err| err.to_string())?;
+    if snapshot.layout_version >= 1 {
+        window
+            .set_size(Size::Logical(LogicalSize::new(snapshot.width, snapshot.height)))
+            .map_err(|err| err.to_string())?;
+    } else {
+        let w = snapshot
+            .width
+            .round()
+            .clamp(1.0, u32::MAX as f64) as u32;
+        let h = snapshot
+            .height
+            .round()
+            .clamp(1.0, u32::MAX as f64) as u32;
+        window
+            .set_size(Size::Physical(PhysicalSize::new(w, h)))
+            .map_err(|err| err.to_string())?;
+    }
     window
         .set_position(Position::Physical(PhysicalPosition::new(
             snapshot.x,
@@ -564,6 +610,41 @@ fn apply_default_main_window_layout<R: Runtime>(
     window.center().map_err(|err| err.to_string())
 }
 
+/// 校验窗口当前外框是否与任一可见监视器有足够交集；若几乎完全脱屏（包括位置落在已断开的扩展屏旧坐标），返回 false。
+/// 这是 `tauri-plugin-window-state` 在多显示器 / DPI 变化场景下的兜底——插件保存的是物理像素，
+/// 当显示器拓扑变化时直接 `restore_state` 会把窗口放到不可见区域。
+fn window_visible_on_any_monitor<R: Runtime>(window: &WebviewWindow<R>) -> bool {
+    let Ok(pos) = window.outer_position() else {
+        return false;
+    };
+    let Ok(size) = window.outer_size() else {
+        return false;
+    };
+    let Ok(monitors) = window.available_monitors() else {
+        return false;
+    };
+    let win_left = pos.x;
+    let win_top = pos.y;
+    let win_right = pos.x + size.width as i32;
+    let win_bottom = pos.y + size.height as i32;
+    // 至少 100x100 的可见交集才算"在屏幕上"。
+    const MIN_VISIBLE: i32 = 100;
+    for m in monitors {
+        let mp = m.position();
+        let ms = m.size();
+        let m_left = mp.x;
+        let m_top = mp.y;
+        let m_right = mp.x + ms.width as i32;
+        let m_bottom = mp.y + ms.height as i32;
+        let ix = (win_right.min(m_right) - win_left.max(m_left)).max(0);
+        let iy = (win_bottom.min(m_bottom) - win_top.max(m_top)).max(0);
+        if ix >= MIN_VISIBLE && iy >= MIN_VISIBLE {
+            return true;
+        }
+    }
+    false
+}
+
 fn restore_saved_full_window_layout<R: Runtime>(
     app: &AppHandle<R>,
     window: &WebviewWindow<R>,
@@ -597,6 +678,13 @@ fn restore_saved_full_window_layout<R: Runtime>(
 
     match window.restore_state(full_window_state_flags()) {
         Ok(()) => {
+            // 兜底：保存的位置可能在已断开 / 当前不可见的扩展屏上。
+            // 若窗口外框与所有当前监视器交集都不足，直接返回 false → 上层会调用
+            // `apply_default_main_window_layout` 居中到主屏，避免"窗口隐形启动"。
+            if !window_visible_on_any_monitor(window) {
+                return Ok(false);
+            }
+
             let snapshot = snapshot_from_window(window)?;
             if loaded_state.last_window_mode.is_none() && snapshot_looks_like_quick_layout(&snapshot) {
                 return Ok(false);
@@ -933,6 +1021,10 @@ fn register_app_shortcut<R: Runtime>(
 }
 
 fn quit_background_app<R: Runtime>(app: &AppHandle<R>) {
+    #[cfg(windows)]
+    {
+        crate::findx_settings::stop_findx_service_detached();
+    }
     if let Err(err) = persist_full_window_state_snapshot(app) {
         log_desktop_error("persist the desktop window layout before quitting", &err);
     }
@@ -944,28 +1036,103 @@ fn log_desktop_error(action: &str, err: &str) {
     eprintln!("FindX2 desktop action failed while trying to {action}: {err}");
 }
 
-fn setup_system_tray(app: &mut App<tauri::Wry>) -> tauri::Result<()> {
-    let search_item = MenuItem::with_id(app, TRAY_MENU_SEARCH_ID, "搜索", true, None::<&str>)?;
-    let settings_item = MenuItem::with_id(app, TRAY_MENU_SETTINGS_ID, "设置", true, None::<&str>)?;
-    let start_svc_item = MenuItem::with_id(
-        app,
-        TRAY_MENU_START_SERVICE_ID,
-        "启动索引服务",
-        true,
-        None::<&str>,
-    )?;
-    let hide_item = MenuItem::with_id(app, TRAY_MENU_HIDE_ID, "隐藏", true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出", true, None::<&str>)?;
-    let tray_menu = Menu::with_items(
+/// Windows：读设置并同步探测管道（可能阻塞数百毫秒，勿在弹出菜单期间于主线程调用）。
+#[cfg(windows)]
+fn probe_tray_service_is_up(app: &AppHandle<tauri::Wry>) -> bool {
+    crate::findx_settings::load_findx_settings(app.clone())
+        .map(|s| crate::pipe::probe_service_pipe_sync(&s.pipe_name))
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn probe_tray_service_is_up(_app: &AppHandle<tauri::Wry>) -> bool {
+    false
+}
+
+/// 构建托盘菜单。`service_up` 由调用方提供，避免在启动路径上阻塞做管道探测。
+fn build_tray_menu(app: &AppHandle<tauri::Wry>, service_up: bool) -> tauri::Result<Menu<tauri::Wry>> {
+    let svc_label = if service_up {
+        "停止索引服务"
+    } else {
+        "启动索引服务"
+    };
+
+    let search_item =
+        MenuItem::with_id(app, TRAY_MENU_SEARCH_ID, "打开搜索", true, None::<&str>)?;
+    let settings_item = MenuItem::with_id(app, TRAY_MENU_SETTINGS_ID, "设置…", true, None::<&str>)?;
+    let svc_item = MenuItem::with_id(app, TRAY_MENU_SERVICE_ID, svc_label, true, None::<&str>)?;
+    let hide_item = MenuItem::with_id(app, TRAY_MENU_HIDE_ID, "隐藏窗口", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出 FindX", true, None::<&str>)?;
+    let sep1 = PredefinedMenuItem::separator(app)?;
+    let sep2 = PredefinedMenuItem::separator(app)?;
+    let sep3 = PredefinedMenuItem::separator(app)?;
+    Menu::with_items(
         app,
         &[
             &search_item,
             &settings_item,
-            &start_svc_item,
+            &sep1,
+            &svc_item,
+            &sep2,
             &hide_item,
+            &sep3,
             &quit_item,
         ],
-    )?;
+    )
+}
+
+fn sync_tray_menu_from_state(app: &AppHandle<tauri::Wry>, service_up: bool) {
+    let Ok(menu) = build_tray_menu(app, service_up) else {
+        return;
+    };
+    if let Some(tray) = app.tray_by_id(TRAY_ICON_ID) {
+        let _ = tray.set_menu(Some(menu));
+    }
+}
+
+/// 在主线程同步探测并刷新托盘（仅适用于菜单已关闭等安全时机）。
+fn sync_tray_menu(app: &AppHandle<tauri::Wry>) {
+    let up = probe_tray_service_is_up(app);
+    sync_tray_menu_from_state(app, up);
+}
+
+/// 在后台探测管道，再回到主线程 `set_menu`，避免卡住启动与托盘消息泵。
+/// 注意：不要在系统正在显示托盘右键菜单时调用（会替换 HMENU 导致菜单闪退）。
+fn refresh_tray_menu_async(app: AppHandle<tauri::Wry>) {
+    tauri::async_runtime::spawn(async move {
+        let h_probe = app.clone();
+        let up = match tokio::task::spawn_blocking(move || probe_tray_service_is_up(&h_probe)).await {
+            Ok(v) => v,
+            Err(_) => false,
+        };
+        let h = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            sync_tray_menu_from_state(&h, up);
+        });
+    });
+}
+
+static TRAY_MENU_LAST_ENTER_REFRESH: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+fn tray_menu_enter_refresh_should_run() -> bool {
+    let gate = TRAY_MENU_LAST_ENTER_REFRESH.get_or_init(|| Mutex::new(None));
+    let Ok(mut last) = gate.lock() else {
+        return true;
+    };
+    let now = Instant::now();
+    if let Some(t) = *last {
+        if now.duration_since(t) < Duration::from_millis(400) {
+            return false;
+        }
+    }
+    *last = Some(now);
+    true
+}
+
+fn setup_system_tray(app: &mut App<tauri::Wry>) -> tauri::Result<()> {
+    let handle = app.handle().clone();
+    // 首帧菜单不探测管道，避免启动阶段阻塞；随后 `refresh_tray_menu_async` 会异步校正文案。
+    let tray_menu = build_tray_menu(&handle, false)?;
 
     let mut tray_builder = TrayIconBuilder::with_id(TRAY_ICON_ID)
         .menu(&tray_menu)
@@ -982,13 +1149,37 @@ fn setup_system_tray(app: &mut App<tauri::Wry>) -> tauri::Result<()> {
                     log_desktop_error("open settings from the tray", &err);
                 }
             }
-            TRAY_MENU_START_SERVICE_ID => {
-                let handle = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Err(err) = crate::ensure_service_running(handle).await {
-                        log_desktop_error("start findx2-service from the tray", &err);
+            TRAY_MENU_SERVICE_ID => {
+                #[cfg(windows)]
+                {
+                    let was_up = probe_tray_service_is_up(app);
+                    if was_up {
+                        if let Err(err) = crate::findx_settings::stop_findx_service() {
+                            log_desktop_error("stop findx2-service from the tray", &err);
+                        }
+                    } else {
+                        let handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(err) = crate::ensure_service_running(handle.clone()).await {
+                                log_desktop_error("start findx2-service from the tray", &err);
+                            }
+                            refresh_tray_menu_async(handle);
+                        });
+                        // 启动为异步：后台刷新菜单，避免阻塞托盘消息线程
+                        refresh_tray_menu_async(app.clone());
+                        return;
                     }
-                });
+                    sync_tray_menu(app);
+                }
+                #[cfg(not(windows))]
+                {
+                    let handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(err) = crate::ensure_service_running(handle).await {
+                            log_desktop_error("start findx2-service from the tray", &err);
+                        }
+                    });
+                }
             }
             TRAY_MENU_HIDE_ID => {
                 if let Err(err) = hide_main_window(app) {
@@ -999,16 +1190,24 @@ fn setup_system_tray(app: &mut App<tauri::Wry>) -> tauri::Result<()> {
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                let app = tray.app_handle();
-                if let Err(err) = toggle_main_window(app) {
-                    log_desktop_error("toggle the app from the tray icon", &err);
+            match &event {
+                // 鼠标移入托盘图标时异步刷新「启动/停止」文案；勿在右键菜单已弹出时 set_menu。
+                TrayIconEvent::Enter { .. } => {
+                    if tray_menu_enter_refresh_should_run() {
+                        refresh_tray_menu_async(tray.app_handle().clone());
+                    }
                 }
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } => {
+                    let app = tray.app_handle();
+                    if let Err(err) = toggle_main_window(app) {
+                        log_desktop_error("toggle the app from the tray icon", &err);
+                    }
+                }
+                _ => {}
             }
         });
 
@@ -1017,6 +1216,7 @@ fn setup_system_tray(app: &mut App<tauri::Wry>) -> tauri::Result<()> {
     }
 
     let _tray = tray_builder.build(app)?;
+    refresh_tray_menu_async(app.handle().clone());
     Ok(())
 }
 
@@ -1183,9 +1383,12 @@ pub fn setup(app: &mut App<tauri::Wry>) -> tauri::Result<()> {
 
     #[cfg(windows)]
     {
-        if let Err(err) = crate::findx_settings::ensure_cli_on_user_path() {
-            log_desktop_error("append findx2 CLI directory to user PATH", &err);
-        }
+        // PowerShell 改用户 PATH 可能耗时数秒，勿阻塞首屏与托盘初始化。
+        std::thread::spawn(|| {
+            if let Err(err) = crate::findx_settings::ensure_cli_on_user_path() {
+                log_desktop_error("append findx2 CLI directory to user PATH", &err);
+            }
+        });
         if let Ok(settings) = crate::findx_settings::load_findx_settings(app.handle().clone()) {
             let base = crate::findx_settings::exe_resource_dir();
             let index = crate::findx_settings::resolve_index_path(&base, &settings);

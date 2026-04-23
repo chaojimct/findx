@@ -214,6 +214,35 @@ mod imp {
             return scan_volume_walk_fallback(root, fast);
         }
 
+        // FSCTL_ENUM_USN_DATA 通常**不**把「卷根目录」本身作为一条记录吐出；若 dirs 里没有
+        // 这条，则 `C:\` 根下文件的 `parent_id` 在 `index.rs::build_from_raw` 里对不上
+        // `dir_index_build`，会被 `unwrap_or(0)` 挂到错误的 dir_idx，路径变成
+        // `\其它目录\…`，甚至搜不到根下文件。
+        //
+        // 注意：NTFS 的 FileReferenceNumber 是「MFT 记录号 + 序列号」等拼成的完整 64 位值，
+        // USN 里的 parent_id 也是这个完整值，**绝不是**裸常量 5。必须用与 walk 回退相同
+        // 的方式打开 `X:\` 取 `BY_HANDLE_FILE_INFORMATION` 里的真实 FRN，才能与枚举一致。
+        let root_folder = volume_to_folder_root(root);
+        if let Some(root_frn) = file_id_from_path(Path::new(&root_folder)) {
+            if !dirs.iter().any(|d| d.file_id == root_frn) {
+                dirs.push(RawEntry {
+                    file_id: root_frn,
+                    file_id_128: None,
+                    parent_id: 0,
+                    name: String::new(),
+                    size: 0,
+                    mtime: 0,
+                    ctime: 0,
+                    attrs: 0x10,
+                    is_dir: true,
+                });
+                findx2_core::progress!(
+                    "索引：补注入卷根伪目录（FRN={:#018x}），用于挂载根下文件。",
+                    root_frn
+                );
+            }
+        }
+
         findx2_core::progress!(
             "MFT 枚举完成：文件 {}，目录 {}。",
             files.len(),
@@ -476,6 +505,22 @@ mod imp {
         );
         let mut files = Vec::new();
         let mut dirs = Vec::new();
+        // 与 USN 路径对齐：先把卷根目录本身入 dirs（WalkDir 第一项的 file_name() 为 None
+        // 会被后面的空名过滤跳过，需要在循环外手动补一条），否则根下文件的 parent_id
+        // 在 index.rs 的 dir_index 里找不到，会被错误归到 dir_idx=0。
+        if let Some(root_frn) = file_id_from_path(Path::new(&root_path)) {
+            dirs.push(RawEntry {
+                file_id: root_frn,
+                file_id_128: None,
+                parent_id: 0,
+                name: String::new(),
+                size: 0,
+                mtime: 0,
+                ctime: 0,
+                attrs: 0x10,
+                is_dir: true,
+            });
+        }
         let mut walked: usize = 0;
         for ent in WalkDir::new(&root_path).follow_links(false).into_iter().filter_map(|e| e.ok()) {
             let path = ent.path();

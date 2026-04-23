@@ -48,6 +48,69 @@ use windows::Win32::Foundation::POINT;
 /// 预览处理器的 shellex 子键 GUID。Explorer 与 prevhost 都查这一项。
 const PREVIEW_HANDLER_SHELLEX_KEY: &str = "shellex\\{8895b1c6-b41f-4c1c-a562-0d564250836f}";
 
+/// 日志双写：stderr + `%TEMP%\findx2-preview.log`。release 双击时 stderr 不可见，
+/// 文件日志便于用户把 `[findx2-preview]` 行贴回来诊断。
+pub(crate) fn plog(msg: &str) {
+    eprintln!("{}", msg);
+    use std::io::Write;
+    if let Ok(tmp) = std::env::var("TEMP") {
+        let mut p = std::path::PathBuf::from(tmp);
+        p.push("findx2-preview.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let _ = writeln!(f, "[{now}] {msg}");
+        }
+    }
+}
+macro_rules! plog {
+    ($($arg:tt)*) => { $crate::win_preview::plog(&format!($($arg)*)) };
+}
+
+/// RAII：临时把当前线程切到 `DPI_AWARENESS_CONTEXT_SYSTEM_AWARE`，drop 时还原。
+///
+/// 仅用于 **IPreviewHandler::SetWindow / DoPreview / SetRect**（不要包 `SetWindowPos` /
+/// `CreateWindowEx`，否则屏幕坐标会按 system/monitor 被反向缩放，popup 跳到错误监视器）。
+///
+/// 多数老牌 IPreviewHandler（WPS 32 位等）在 PerMonitorV2 父窗口下会按 system DPI 错位布局；
+/// 进入 system-aware 后与其内部假设一致。传给处理器的 RECT 需用 `host_phys_to_sys_inner`
+/// 从物理像素换算为 system-DPI 像素。
+struct SystemAwareGuard {
+    prev: windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT,
+    ok: bool,
+}
+impl SystemAwareGuard {
+    fn enter() -> Self {
+        use windows::Win32::UI::HiDpi::{
+            SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_SYSTEM_AWARE,
+        };
+        let prev = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE) };
+        Self { prev, ok: prev.0 as isize != 0 }
+    }
+}
+impl Drop for SystemAwareGuard {
+    fn drop(&mut self) {
+        if self.ok {
+            unsafe { let _ = windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(self.prev); }
+        }
+    }
+}
+
+/// 把 host 的物理像素尺寸换算成 **system-DPI 像素**，供 system-aware 上下文里的
+/// `IPreviewHandler::SetWindow` / `SetRect` 使用：`inner = phys * monitor_dpi / system_dpi`。
+fn host_phys_to_sys_inner(top_hwnd: HWND, phys_w: i32, phys_h: i32) -> RECT {
+    use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+    let system_dpi = unsafe { GetDpiForSystem() };
+    let monitor_dpi = unsafe { GetDpiForWindow(top_hwnd) };
+    let system_dpi = if system_dpi == 0 { 96 } else { system_dpi };
+    let monitor_dpi = if monitor_dpi == 0 { 96 } else { monitor_dpi };
+    let w = ((phys_w as f64) * (system_dpi as f64) / (monitor_dpi as f64)).round() as i32;
+    let h = ((phys_h as f64) * (system_dpi as f64) / (monitor_dpi as f64)).round() as i32;
+    RECT { left: 0, top: 0, right: w.max(1), bottom: h.max(1) }
+}
+
 /// `RPC_E_SERVERCALL_RETRYLATER`：COM 返回「应用程序正在使用中」，常见于 prevhost/Office
 /// 正在处理其它预览或 STA 忙；短延迟重试往往成功。
 const RPC_E_SERVERCALL_RETRYLATER: u32 = 0x8001_010A;
@@ -399,7 +462,7 @@ unsafe fn create_host_window(owner: HWND, screen_rect: RECT) -> Result<HWND, Str
     let class = to_wide("STATIC");
     let w = (screen_rect.right - screen_rect.left).max(1);
     let h = (screen_rect.bottom - screen_rect.top).max(1);
-    eprintln!(
+    plog!(
         "[findx2-preview] create_host owner=0x{:X} screen_rect=({},{},{}x{})",
         owner.0 as usize, screen_rect.left, screen_rect.top, w, h
     );
@@ -420,7 +483,7 @@ unsafe fn create_host_window(owner: HWND, screen_rect: RECT) -> Result<HWND, Str
         None,
     )
     .map_err(|e| format!("创建预览容器窗口失败: {e}"))?;
-    eprintln!("[findx2-preview] host created hwnd=0x{:X}", hwnd.0 as usize);
+    plog!("[findx2-preview] host created hwnd=0x{:X}", hwnd.0 as usize);
     // 浮在 owner 之上、保持不抢焦点（仍保持隐藏，直到 show_preview 里 DoPreview 后再 ShowWindow）。
     let _ = SetWindowPos(
         hwnd,
@@ -474,7 +537,7 @@ fn hydrate_cloud_file_best_effort(path: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    eprintln!(
+    plog!(
         "[findx2-preview] cloud hydrate start len={} attr=0x{:X} cloud_dir={}",
         len, attrs, cloud_dir
     );
@@ -488,7 +551,7 @@ fn hydrate_cloud_file_best_effort(path: &Path) -> Result<(), String> {
                         .to_string(),
                 );
             }
-            eprintln!("[findx2-preview] cloud hydrate open failed: {e}");
+            plog!("[findx2-preview] cloud hydrate open failed: {e}");
             return Ok(());
         }
     };
@@ -511,7 +574,7 @@ fn hydrate_cloud_file_best_effort(path: &Path) -> Result<(), String> {
                             .to_string(),
                     );
                 }
-                eprintln!("[findx2-preview] cloud hydrate read: {e}");
+                plog!("[findx2-preview] cloud hydrate read: {e}");
                 break;
             }
         }
@@ -523,7 +586,7 @@ fn hydrate_cloud_file_best_effort(path: &Path) -> Result<(), String> {
                 if a2 & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
                     == 0
                 {
-                    eprintln!(
+                    plog!(
                         "[findx2-preview] cloud placeholder attrs cleared after {} bytes",
                         total
                     );
@@ -532,7 +595,7 @@ fn hydrate_cloud_file_best_effort(path: &Path) -> Result<(), String> {
             }
         }
     }
-    eprintln!("[findx2-preview] cloud hydrate done, read {} / {} bytes", total, len);
+    plog!("[findx2-preview] cloud hydrate done, read {} / {} bytes", total, len);
     Ok(())
 }
 
@@ -571,7 +634,7 @@ unsafe fn initialize_handler(handler: &IPreviewHandler, path: &Path) -> Result<(
             ) {
                 Ok(stream) => match init_stream.Initialize(&stream, STGM_READ.0) {
                     Ok(_) => {
-                        eprintln!("[findx2-preview] Initialize via Stream ok");
+                        plog!("[findx2-preview] Initialize via Stream ok");
                         return Ok(());
                     }
                     Err(e) => errs.push(format!("Stream.Initialize: {e}")),
@@ -587,7 +650,7 @@ unsafe fn initialize_handler(handler: &IPreviewHandler, path: &Path) -> Result<(
             let wpath = to_wide(&path.to_string_lossy());
             match init_file.Initialize(PCWSTR(wpath.as_ptr()), STGM_READ.0) {
                 Ok(_) => {
-                    eprintln!("[findx2-preview] Initialize via File ok");
+                    plog!("[findx2-preview] Initialize via File ok");
                     return Ok(());
                 }
                 Err(e) => errs.push(format!("File.Initialize: {e}")),
@@ -602,7 +665,7 @@ unsafe fn initialize_handler(handler: &IPreviewHandler, path: &Path) -> Result<(
             match SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wpath.as_ptr()), None) {
                 Ok(item) => match init_item.Initialize(&item, STGM_READ.0) {
                     Ok(_) => {
-                        eprintln!("[findx2-preview] Initialize via Item ok");
+                        plog!("[findx2-preview] Initialize via Item ok");
                         return Ok(());
                     }
                     Err(e) => errs.push(format!("Item.Initialize: {e}")),
@@ -618,7 +681,7 @@ unsafe fn initialize_handler(handler: &IPreviewHandler, path: &Path) -> Result<(
             let wpath = to_wide(&path.to_string_lossy());
             match persist.Load(PCWSTR(wpath.as_ptr()), STGM_READ) {
                 Ok(_) => {
-                    eprintln!("[findx2-preview] Initialize via IPersistFile ok");
+                    plog!("[findx2-preview] Initialize via IPersistFile ok");
                     return Ok(());
                 }
                 Err(e) => errs.push(format!("IPersistFile.Load: {e}")),
@@ -627,7 +690,7 @@ unsafe fn initialize_handler(handler: &IPreviewHandler, path: &Path) -> Result<(
         Err(e) => errs.push(format!("cast IPersistFile: {e}")),
     }
     let msg = format!("预览处理器拒绝所有 Initialize 接口: [{}]", errs.join("; "));
-    eprintln!("[findx2-preview] {msg}");
+    plog!("[findx2-preview] {msg}");
     Err(msg)
 }
 
@@ -635,7 +698,7 @@ unsafe fn initialize_handler(handler: &IPreviewHandler, path: &Path) -> Result<(
 /// 显示/切换预览。`path` 是绝对路径。
 ///
 /// 必须在主线程调用。命令侧用 `run_on_main_thread` 包一层。
-pub fn show_preview(top_hwnd: HWND, path: String, x: i32, y: i32, w: i32, h: i32) -> Result<(), String> {
+pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w: f64, css_h: f64, dpr: f64) -> Result<(), String> {
     ensure_com_init();
     let p = Path::new(&path);
     if !p.exists() {
@@ -644,15 +707,40 @@ pub fn show_preview(top_hwnd: HWND, path: String, x: i32, y: i32, w: i32, h: i32
     if p.is_dir() {
         return Err("文件夹无可用预览".to_string());
     }
-    // 关键：WebView2 用 DComp 合成，子 HWND 一律被压在合成层下不可见；
-    // 因此宿主窗口必须是独立顶级窗口（WS_POPUP），owner = Tauri 顶级窗口（自动跟随激活/最小化）。
-    // 前端给的是 webview 客户区坐标，这里转成屏幕坐标。
-    let webview = find_webview_host(top_hwnd);
-    let owner_for_pos = if webview.is_invalid() { top_hwnd } else { webview };
-    let screen_rect = client_to_screen_rect(owner_for_pos, x, y, w, h);
-    eprintln!(
-        "[findx2-preview] show path='{}' top=0x{:X} webview=0x{:X} client=({},{},{}x{}) screen=({},{},{}x{})",
-        path, top_hwnd.0 as usize, webview.0 as usize,
+    // 关键设计：
+    // - WebView2 用 DComp 合成，子 HWND 一律被压在合成层下不可见，
+    //   因此宿主必须是独立顶级窗口 WS_POPUP，owner = Tauri 顶级窗口。
+    // - 坐标基准 = Tauri 顶级窗口客户区原点（与 webview 视口 (0,0) 对齐）。
+    //   不要去找 Chromium 子 HWND 当基准：DComp 模式下其位置/大小不可靠。
+    // - scale = 前端 `window.devicePixelRatio`（webview 真实使用的值），
+    //   不用 GetDpiForWindow 猜——跨屏/启动瞬间二者会不一致。
+    let scale = if dpr.is_finite() && dpr > 0.0 { dpr } else { 1.0 };
+    let x = (css_x * scale).round() as i32;
+    let y = (css_y * scale).round() as i32;
+    let w = ((css_w * scale).round() as i32).max(1);
+    let h = ((css_h * scale).round() as i32).max(1);
+    let webview = HWND::default();
+    let screen_rect = client_to_screen_rect(top_hwnd, x, y, w, h);
+    // 诊断：top_hwnd 自己的窗口框、客户区原点、当前 DPI——三者一起看就能区分
+    // 「PerMonitor 双重缩放」「dpr 不匹配」「webview 子窗口偏移」三类问题。
+    {
+        use windows::Win32::UI::HiDpi::GetDpiForWindow;
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let mut wr = RECT::default();
+        unsafe { let _ = GetWindowRect(top_hwnd, &mut wr); }
+        let mut o = POINT { x: 0, y: 0 };
+        unsafe { let _ = ClientToScreen(top_hwnd, &mut o); }
+        let dpi = unsafe { GetDpiForWindow(top_hwnd) };
+        plog!(
+            "[findx2-preview] diag top_window_rect=({},{},{}x{}) client_origin_screen=({},{}) GetDpiForWindow={}",
+            wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top,
+            o.x, o.y, dpi
+        );
+    }
+    plog!(
+        "[findx2-preview] show path='{}' top=0x{:X} dpr={:.3} css=({:.1},{:.1},{:.1}x{:.1}) phys=({},{},{}x{}) screen=({},{},{}x{})",
+        path, top_hwnd.0 as usize, dpr,
+        css_x, css_y, css_w, css_h,
         x, y, w, h,
         screen_rect.left, screen_rect.top,
         screen_rect.right - screen_rect.left, screen_rect.bottom - screen_rect.top
@@ -686,21 +774,26 @@ pub fn show_preview(top_hwnd: HWND, path: String, x: i32, y: i32, w: i32, h: i32
             unsafe {
                 use windows::Win32::UI::WindowsAndMessaging::IsWindow;
                 if IsWindow(Some(host)).as_bool() {
+                    // host 是 system-aware：屏幕坐标按 system/monitor 反向缩放，
+                    // 故传入 SetWindowPos 的 (x,y,w,h) 必须先 ×(system/monitor) 预补偿。
+                    use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+                    let sys = GetDpiForSystem().max(96);
+                    let mon = GetDpiForWindow(top_hwnd).max(96);
+                    let f = sys as f64 / mon as f64;
+                    let sx = (rect.left as f64 * f).round() as i32;
+                    let sy = (rect.top as f64 * f).round() as i32;
+                    let sw = (((rect.right - rect.left) as f64) * f).round() as i32;
+                    let sh = (((rect.bottom - rect.top) as f64) * f).round() as i32;
+                    let _sys_aware_guard = SystemAwareGuard::enter();
                     let _ = SetWindowPos(
-                        host,
-                        None,
-                        rect.left,
-                        rect.top,
-                        rect.right - rect.left,
-                        rect.bottom - rect.top,
+                        host, None, sx, sy, sw.max(1), sh.max(1),
                         SET_WINDOW_POS_FLAGS(SWP_NOZORDER.0 | SWP_NOACTIVATE.0),
                     );
-                    let inner = RECT {
-                        left: 0,
-                        top: 0,
-                        right: rect.right - rect.left,
-                        bottom: rect.bottom - rect.top,
-                    };
+                    let inner = host_phys_to_sys_inner(
+                        top_hwnd,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                    );
                     let _ = handler.SetRect(&inner);
                     let _ = ShowWindow(host, SW_SHOW);
                 }
@@ -722,7 +815,7 @@ pub fn show_preview(top_hwnd: HWND, path: String, x: i32, y: i32, w: i32, h: i32
         .ok_or_else(|| "该文件类型未注册系统预览处理器".to_string())?;
     let clsid_fallback = find_preview_handler_clsid_hklm(p)
         .filter(|c| format_clsid(c) != format_clsid(&clsid_primary));
-    eprintln!(
+    plog!(
         "[findx2-preview] clsid primary={:?} hklm_fallback={:?}",
         clsid_primary, clsid_fallback
     );
@@ -730,7 +823,7 @@ pub fn show_preview(top_hwnd: HWND, path: String, x: i32, y: i32, w: i32, h: i32
     // 内联辅助：基于一个 CLSID 尝试 CoCreateInstance（按位数智能选 ctx）。
     let try_create = |clsid: &GUID| -> Result<IPreviewHandler, String> {
         let info = probe_clsid(clsid);
-        eprintln!(
+        plog!(
             "[findx2-preview] clsid {:?} info: has_64={} has_32={} inproc_server={} local_server={} handler_only={}",
             clsid, info.has_64, info.has_32, info.has_inproc_server, info.has_local_server, info.handler_only
         );
@@ -758,7 +851,7 @@ pub fn show_preview(top_hwnd: HWND, path: String, x: i32, y: i32, w: i32, h: i32
         }
         let mut last_err: Option<String> = None;
         for ctx in attempts {
-            eprintln!("[findx2-preview]   try ctx=0x{:x}", ctx.0);
+            plog!("[findx2-preview]   try ctx=0x{:x}", ctx.0);
             let mut got: Option<IPreviewHandler> = None;
             for attempt in 0..6u32 {
                 match unsafe { CoCreateInstance::<_, IPreviewHandler>(clsid, None, ctx) } {
@@ -768,7 +861,7 @@ pub fn show_preview(top_hwnd: HWND, path: String, x: i32, y: i32, w: i32, h: i32
                     }
                     Err(e) => {
                         if is_com_server_busy(&e) && attempt < 5 {
-                            eprintln!(
+                            plog!(
                                 "[findx2-preview]   busy (0x8001010A) retry {}/5 ctx=0x{:x}",
                                 attempt + 1,
                                 ctx.0
@@ -776,14 +869,14 @@ pub fn show_preview(top_hwnd: HWND, path: String, x: i32, y: i32, w: i32, h: i32
                             std::thread::sleep(std::time::Duration::from_millis(80));
                             continue;
                         }
-                        eprintln!("[findx2-preview]   fail ctx=0x{:x}: {}", ctx.0, e);
+                        plog!("[findx2-preview]   fail ctx=0x{:x}: {}", ctx.0, e);
                         last_err = Some(format!("ctx=0x{:x}: {}", ctx.0, e));
                         break;
                     }
                 }
             }
             if let Some(h) = got {
-                eprintln!("[findx2-preview]   ok ctx=0x{:x}", ctx.0);
+                plog!("[findx2-preview]   ok ctx=0x{:x}", ctx.0);
                 return Ok(h);
             }
         }
@@ -796,7 +889,7 @@ pub fn show_preview(top_hwnd: HWND, path: String, x: i32, y: i32, w: i32, h: i32
         Ok(h) => h,
         Err(e_primary) => {
             if let Some(fb) = clsid_fallback {
-                eprintln!("[findx2-preview] primary failed, retry HKLM fallback");
+                plog!("[findx2-preview] primary failed, retry HKLM fallback");
                 match try_create(&fb) {
                     Ok(h) => h,
                     Err(e_fb) => {
@@ -817,16 +910,49 @@ pub fn show_preview(top_hwnd: HWND, path: String, x: i32, y: i32, w: i32, h: i32
     unsafe {
         initialize_handler(&handler, p)?;
     }
-    eprintln!("[findx2-preview] Initialize ok");
+    plog!("[findx2-preview] Initialize ok");
 
-    // 6. 创建承载窗口 + SetWindow + DoPreview
-    let host = unsafe { create_host_window(top_hwnd, screen_rect)? };
-    let inner = RECT {
-        left: 0,
-        top: 0,
-        right: (screen_rect.right - screen_rect.left).max(1),
-        bottom: (screen_rect.bottom - screen_rect.top).max(1),
+    // 6. 创建承载窗口
+    //    host **也**在 system-aware 上下文中创建——这样 host 被永久标记为 system-aware，
+    //    在 monitor_dpi != system_dpi 的屏（例如扩展屏 100% + 主屏 200%）上，
+    //    Windows 会自动把 host 内容按 monitor/system 缩放显示，
+    //    使 system-aware 预览处理器画的"按 system DPI 算字号"的内容看着大小正常。
+    //
+    //    屏幕坐标问题：system-aware 进程的"屏幕坐标"是 system-DPI 虚拟坐标，
+    //    数值 = 物理坐标 × system/primary_system（在所有屏幕上一致）。
+    //    我们传的 `screen_rect` 已经是 PerMonitorV2 的真实物理坐标，
+    //    在 system-aware 视角下 = `phys`（因为 system_dpi 取自主屏，主屏 phys = sys-virt）。
+    //    扩展屏上 popup 出现在 (sys_virt = phys) 位置，Windows 按 system/monitor 反向显示
+    //    → 实际物理位置 = phys × monitor/system。要让 popup 出现在我们想要的物理位置，
+    //    必须把 screen_rect 预先按 system/monitor 放大。
+    let popup_screen_rect = {
+        use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+        let sys = unsafe { GetDpiForSystem() }.max(96);
+        let mon = unsafe { GetDpiForWindow(top_hwnd) }.max(96);
+        let factor = sys as f64 / mon as f64;
+        RECT {
+            left: (screen_rect.left as f64 * factor).round() as i32,
+            top: (screen_rect.top as f64 * factor).round() as i32,
+            right: (screen_rect.right as f64 * factor).round() as i32,
+            bottom: (screen_rect.bottom as f64 * factor).round() as i32,
+        }
     };
+    let host = {
+        let _sys_aware_guard = SystemAwareGuard::enter();
+        unsafe { create_host_window(top_hwnd, popup_screen_rect)? }
+    };
+    let host_phys_w = (screen_rect.right - screen_rect.left).max(1);
+    let host_phys_h = (screen_rect.bottom - screen_rect.top).max(1);
+    let inner = host_phys_to_sys_inner(top_hwnd, host_phys_w, host_phys_h);
+    plog!(
+        "[findx2-preview] inner host_phys=({}x{}) inner_sys=({}x{}) popup_sys_rect=({},{},{}x{})",
+        host_phys_w, host_phys_h, inner.right, inner.bottom,
+        popup_screen_rect.left, popup_screen_rect.top,
+        popup_screen_rect.right - popup_screen_rect.left,
+        popup_screen_rect.bottom - popup_screen_rect.top,
+    );
+    // 与处理器交互（SetWindow / DoPreview / SetRect）也在 system-aware 下。
+    let _sys_aware_guard = SystemAwareGuard::enter();
     unsafe {
         handler
             .SetWindow(host, &inner)
@@ -841,7 +967,7 @@ pub fn show_preview(top_hwnd: HWND, path: String, x: i32, y: i32, w: i32, h: i32
         let _ = BringWindowToTop(host);
         let _ = InvalidateRect(Some(host), None, true);
         let _ = UpdateWindow(host);
-        eprintln!(
+        plog!(
             "[findx2-preview] DoPreview ok, host shown at ({}x{})",
             inner.right, inner.bottom
         );
@@ -867,17 +993,17 @@ pub fn show_preview(top_hwnd: HWND, path: String, x: i32, y: i32, w: i32, h: i32
 }
 
 /// 仅同步当前承载窗口的位置/大小（拖动分隔条 / resize 时高频调用，开销极小）。
-/// `x/y` 是相对于 webview 客户区的像素，会换算为屏幕坐标后应用到顶级 popup 宿主。
-pub fn set_bounds(top_hwnd: HWND, x: i32, y: i32, w: i32, h: i32) -> Result<(), String> {
-    let webview = find_webview_host(top_hwnd);
-    let owner = if webview.is_invalid() { top_hwnd } else { webview };
-    let r = client_to_screen_rect(owner, x, y, w, h);
-    let inner = RECT {
-        left: 0,
-        top: 0,
-        right: (r.right - r.left).max(1),
-        bottom: (r.bottom - r.top).max(1),
-    };
+/// `css_*` = 前端 `getBoundingClientRect`（CSS 逻辑像素），`dpr` = `window.devicePixelRatio`。
+/// 坐标基准 = Tauri 顶级窗口客户区。
+pub fn set_bounds(top_hwnd: HWND, css_x: f64, css_y: f64, css_w: f64, css_h: f64, dpr: f64) -> Result<(), String> {
+    let scale = if dpr.is_finite() && dpr > 0.0 { dpr } else { 1.0 };
+    let x = (css_x * scale).round() as i32;
+    let y = (css_y * scale).round() as i32;
+    let w = ((css_w * scale).round() as i32).max(1);
+    let h = ((css_h * scale).round() as i32).max(1);
+    let webview = HWND::default();
+    let r = client_to_screen_rect(top_hwnd, x, y, w, h);
+    let inner = host_phys_to_sys_inner(top_hwnd, r.right - r.left, r.bottom - r.top);
     let host_handler = {
         let mut g = PREVIEW_STATE.lock().map_err(|e| e.to_string())?;
         if let Some(st) = g.as_mut() {
@@ -897,13 +1023,18 @@ pub fn set_bounds(top_hwnd: HWND, x: i32, y: i32, w: i32, h: i32) -> Result<(), 
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::IsWindow;
             if IsWindow(Some(host)).as_bool() {
+                // host 是 system-aware，SetWindowPos 坐标先按 system/monitor 预补偿。
+                use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+                let sys = GetDpiForSystem().max(96);
+                let mon = GetDpiForWindow(top_hwnd).max(96);
+                let f = sys as f64 / mon as f64;
+                let sx = (r.left as f64 * f).round() as i32;
+                let sy = (r.top as f64 * f).round() as i32;
+                let sw = (((r.right - r.left) as f64) * f).round() as i32;
+                let sh = (((r.bottom - r.top) as f64) * f).round() as i32;
+                let _sys_aware_guard = SystemAwareGuard::enter();
                 let _ = SetWindowPos(
-                    host,
-                    None,
-                    r.left,
-                    r.top,
-                    (r.right - r.left).max(1),
-                    (r.bottom - r.top).max(1),
+                    host, None, sx, sy, sw.max(1), sh.max(1),
                     SET_WINDOW_POS_FLAGS(SWP_NOZORDER.0 | SWP_NOACTIVATE.0),
                 );
                 let _ = handler.SetRect(&inner);

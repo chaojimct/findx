@@ -121,6 +121,31 @@ html {
   font-size: 13px;
 }
 
+.fx-update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 8px 16px;
+  font-size: 13px;
+  background: color-mix(in srgb, var(--fx-accent) 12%, var(--fx-white));
+  border-bottom: 1px solid color-mix(in srgb, var(--fx-accent) 28%, var(--fx-border));
+  color: var(--fx-text);
+}
+
+.fx-update-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+:root[data-fx-theme="dark"] .fx-update-banner {
+  background: color-mix(in srgb, var(--fx-accent) 18%, #0d0d0d);
+  border-bottom-color: color-mix(in srgb, var(--fx-accent) 35%, #333);
+}
+
 .fx-search-bar {
   background: var(--fx-white);
   border-bottom: 1px solid var(--fx-border);

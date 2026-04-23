@@ -115,3 +115,31 @@ pub async fn ipc_status_on_pipe(pipe_endpoint: String) -> Result<IpcResponse, St
 pub async fn ipc_status_for_pipe_name(pipe_name: &str) -> Result<IpcResponse, String> {
     ipc_status_on_pipe(normalize_pipe(pipe_name)).await
 }
+
+/// 同步探测命名管道是否已有服务端在响应（用于托盘菜单「启动/停止」文案）。
+/// 短超时，避免托盘线程长时间阻塞。
+///
+/// 在独立线程里建 `current_thread` 运行时并 `block_on`，避免在 Tauri/Tokio 已占用
+/// 的线程上嵌套运行时触发 panic（表现为进程立刻退出）。
+pub fn probe_service_pipe_sync(pipe_name: &str) -> bool {
+    let endpoint = normalize_pipe(pipe_name);
+    let handle = std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+        else {
+            return false;
+        };
+        rt.block_on(async {
+            matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    ipc_status_on_pipe(endpoint),
+                )
+                .await,
+                Ok(Ok(_)),
+            )
+        })
+    });
+    handle.join().unwrap_or(false)
+}

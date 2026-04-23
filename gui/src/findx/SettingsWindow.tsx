@@ -3,7 +3,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import "./findx.css";
-import type { FindxGuiSettings, RunMode, UiThemePref } from "./findxGuiTypes";
+import type { AppUpdateInfo, FindxGuiSettings, RunMode, UiThemePref } from "./findxGuiTypes";
 import { UI_THEME_KEY, loadUiThemePref } from "./findxGuiTypes";
 
 /**
@@ -140,6 +140,29 @@ export default function SettingsWindow() {
     try {
       await invoke("stop_findx_service");
       setHint("已请求停止服务进程");
+    } catch (e) {
+      setHint(String(e));
+    }
+  };
+
+  const checkUpdateFromGithub = async () => {
+    setHint("正在从 GitHub 检查更新…");
+    try {
+      const info = await invoke<AppUpdateInfo>("check_app_update");
+      if (!info.ok) {
+        setHint(info.error ?? "检查失败");
+        return;
+      }
+      if (info.hasUpdate && info.releasePageUrl) {
+        setHint(`发现新版本 ${info.latestVersion ?? ""}，正在打开发行页。`);
+        await invoke("open_external_url", { url: info.releasePageUrl });
+        return;
+      }
+      if (info.error) {
+        setHint(info.error);
+        return;
+      }
+      setHint(`当前 ${info.currentVersion} 已是最新，或发行标签无法解析为语义化版本。`);
     } catch (e) {
       setHint(String(e));
     }
@@ -402,6 +425,24 @@ export default function SettingsWindow() {
 
         {settingsTab === "advanced" && (
           <div>
+            <label>应用更新</label>
+            <div className="fx-settings-row" style={{ marginBottom: 8 }}>
+              <button type="button" onClick={() => void checkUpdateFromGithub()}>
+                从 GitHub 检查更新
+              </button>
+            </div>
+            <p className="fx-hint" style={{ marginTop: -6, marginBottom: 16 }}>
+              请求 GitHub API 对比本程序版本与仓库{" "}
+              <a
+                href="https://github.com/chaojimct/findx/releases"
+                target="_blank"
+                rel="noreferrer"
+              >
+                chaojimct/findx
+              </a>{" "}
+              的最新 Release（需联网）。
+            </p>
+
             <label>界面主题</label>
             <div className="fx-settings-row" style={{ marginTop: 4, marginBottom: 14 }}>
               <label style={{ fontWeight: "normal", margin: 0 }}>
