@@ -23,6 +23,21 @@ gui/src-tauri/gen/
 *.userosscache
 *.sln.docstates
 
+# .NET build output
+**/bin/
+**/obj/
+
+# Publish / release output
+/publish/
+
+# Native build output
+/native/findx-engine/target/
+/native/FindXNative/bin/
+/native/FindXNative/obj/
+
+# Log files
+*.log
+
 # Temp
 *.tmp
 *.temp
