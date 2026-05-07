@@ -33,7 +33,28 @@ pub unsafe fn fetch_file_metadata_by_id(
 
     let hf = match first {
         Ok(h) if !h.is_invalid() => h,
-        _ => {
+        Ok(h) => {
+            let _ = CloseHandle(h);
+            let id128 = file_id_128?;
+            let mut desc2 = FILE_ID_DESCRIPTOR::default();
+            desc2.dwSize = size_of::<FILE_ID_DESCRIPTOR>() as u32;
+            desc2.Type = ExtendedFileIdType;
+            desc2.Anonymous.ExtendedFileId = FILE_ID_128 { Identifier: id128 };
+            let h2 = OpenFileById(
+                volume,
+                &desc2,
+                FILE_READ_ATTRIBUTES.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            .ok()?;
+            if h2.is_invalid() {
+                return None;
+            }
+            h2
+        }
+        Err(_e) => {
             let id128 = file_id_128?;
             let mut desc2 = FILE_ID_DESCRIPTOR::default();
             desc2.dwSize = size_of::<FILE_ID_DESCRIPTOR>() as u32;

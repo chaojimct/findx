@@ -127,9 +127,13 @@ pub fn fetch_dir_meta_batched(
                 Ok(h) if !h.is_invalid() => h,
                 Ok(h) => {
                     let _ = unsafe { CloseHandle(h) };
+                    findx2_core::progress!("NtQueryDirectoryFile: CreateFileW 返回无效句柄（需管理员权限）{}", path_owned);
                     return Vec::new();
                 }
-                Err(_) => return Vec::new(),
+                Err(e) => {
+                    findx2_core::progress!("NtQueryDirectoryFile: CreateFileW 失败（需管理员权限）{}: {}", path_owned, e);
+                    return Vec::new();
+                }
             };
 
             // 单 chunk 里所有 dir 共享 64K syscall buf，避免每次都重 alloc 64K 堆内存。

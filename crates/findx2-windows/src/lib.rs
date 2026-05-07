@@ -1,6 +1,7 @@
 //! Windows：MFT 枚举（`FSCTL_ENUM_USN_DATA`）与 USN 增量。
 
 mod mft;
+mod mft_read;
 #[cfg(windows)]
 mod volumes;
 #[cfg(windows)]
