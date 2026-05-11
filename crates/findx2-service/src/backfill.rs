@@ -381,11 +381,23 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
     //    回填扫描循环到此结束，所有元数据都在 overlay 里。
     //    flush + 写盘 549MB 是耗时操作（HDD 上可能 10+ 秒），扔到独立线程跑，
     //    本回填线程可以立刻退出，不阻塞任何东西。
+    let done_count = global_done.load(Ordering::Relaxed);
     info!(
-        "后台元数据回填完成：done={}/{}，触发终态落盘（异步线程）",
-        global_done.load(Ordering::Relaxed),
+        "后台元数据回填完成：done={}/{}",
+        done_count,
         total_pending
     );
+    if done_count == 0 {
+        // 回填了 0 条——可能是权限不足或句柄打开全部失败。
+        // 不触发终态落盘，不设 metadata_ready=true，下次启动 service 时重试。
+        error!(
+            "回填完成但成功 0 条（共 {} 条待补），可能是权限不足或卷句柄打开失败。\
+             不标记 metadata_ready=true，下次启动时将重试。",
+            total_pending
+        );
+        return Ok(());
+    }
+    info!("触发终态落盘（异步线程）");
     spawn_final_persist(engine, index_path);
     Ok(())
 }

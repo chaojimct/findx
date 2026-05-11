@@ -126,6 +126,7 @@ pub fn probe_service_pipe_sync(pipe_name: &str) -> bool {
     let handle = std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_io()
+            .enable_time()
             .build()
         else {
             return false;

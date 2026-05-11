@@ -1,9 +1,8 @@
 //! 卷句柄 + `OpenFileById` 批量回填文件元数据（size/mtime/ctime）。
 //!
 //! 是 fast 首遍 + 异步回填、与 full-stat MFT 枚举共用的唯一回填入口。
-//! 历史上还有一条 "顺序读 \\?\\X:\\$MFT 一次性建立 FRN→meta 表" 的快路径
-//! （FindX C++ `LoadNtfsMftMetaMap`），实测在 Win10/11 用户态 100% 被
-//! `ERROR_ACCESS_DENIED(5)` 拒访，已彻底删除，不再纠结。
+//! MFT 直读（`mft_read::read_mft_metadata`）已替代旧方案，作为全量元数据的首选路径；
+//! 本模块仅在 MFT 直读未命中或失败时，作为 `OpenFileById` 兜底回填使用。
 //!
 //! 设计：
 //! - 每个 rayon 任务独立打开一次卷句柄（`CreateFileW("\\\\.\\X:")`），块内多次复用，
@@ -119,9 +118,13 @@ pub fn fill_metadata_by_id_pooled(
                 Ok(h) if !h.is_invalid() => h,
                 Ok(h) => {
                     let _ = unsafe { CloseHandle(h) };
+                    findx2_core::progress!("OpenFileById: CreateFileW 返回无效句柄（需管理员权限）{}", path_owned);
                     return Vec::new();
                 }
-                Err(_) => return Vec::new(),
+                Err(e) => {
+                    findx2_core::progress!("OpenFileById: CreateFileW 失败（需管理员权限）{}: {}", path_owned, e);
+                    return Vec::new();
+                }
             };
 
             let mut out = Vec::with_capacity(chunk.len());
