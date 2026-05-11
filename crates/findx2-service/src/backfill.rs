@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 use findx2_core::{save_index_bin, SearchEngine};
 use tracing::{error, info};
+#[cfg(not(windows))]
+use tracing::warn;
 
 /// 是否启用后台元数据回填。默认 **on**；可用 `FINDX2_DISABLE_BACKFILL=1` 关掉
 /// （diagnostic 场景或想完全保留 fast 索引语义时）。

@@ -244,12 +244,6 @@ impl SearchEngine {
         opt: &SearchOptions,
         overlay: &MetaOverlay,
     ) -> Result<(Vec<SearchHit>, u32)> {
-        if q.atime_min.is_some() || q.atime_max.is_some() {
-            return Err(crate::Error::Query(
-                "当前索引未存储文件访问时间，无法使用 da: / dateaccessed:".into(),
-            ));
-        }
-
         let dbg = std::env::var("FINDX2_DEBUG_SEARCH").is_ok();
         let needle_for_log: String = q.substring.clone().unwrap_or_default();
 
@@ -409,7 +403,6 @@ impl SearchEngine {
         //
         // pin_res 非空意味着调用方已经决定要走拼音匹配，整张表跑预编译的 IbRegex。
         // 这是 IbEverythingExt ms 响应的关键。
-        let _no_complex_for_log = no_complex_name;
         let mut hits = if !pin_res.is_empty() && no_ext_filter && no_complex_name {
             #[cfg(feature = "pinyin")]
             {
@@ -1482,12 +1475,20 @@ fn filter_content(store: &IndexStore, hits: &[u32], q: &ParsedQuery) -> Result<V
     let Some(ns) = needle_opt else {
         return Ok(hits.to_vec());
     };
+    // 超过此大小的文件跳过内容搜索，避免内存爆炸和长时间阻塞
+    const MAX_CONTENT_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
     let low = ns.to_ascii_lowercase();
     let mut out = Vec::new();
     for &idx in hits {
         let p = store.entry_display_path(idx as usize)?;
-        let data =
-            std::fs::read(std::path::Path::new(&p)).map_err(|e| crate::Error::Platform(e.to_string()))?;
+        let path = std::path::Path::new(&p);
+        // 先检查文件大小，超限直接跳过
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.len() > MAX_CONTENT_FILE_SIZE => continue,
+            Err(_) => continue,
+            _ => {}
+        }
+        let data = std::fs::read(path).map_err(|e| crate::Error::Platform(e.to_string()))?;
         let text = String::from_utf8_lossy(&data);
         if text.to_ascii_lowercase().contains(&low) {
             out.push(idx);
