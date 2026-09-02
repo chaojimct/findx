@@ -727,9 +727,11 @@ export default function FindXSearchApp() {
 
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
+    // 搜索延迟已到亚毫秒级（trigram 剪枝后 0.3–3ms），250ms 是为慢全表扫描设计的；
+    // 60ms 既跟手又能在连续击键间合并掉中间态（Everything 同类即时刷新手感）。
     debounceRef.current = setTimeout(() => {
       void runSearch();
-    }, 250);
+    }, 60);
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };

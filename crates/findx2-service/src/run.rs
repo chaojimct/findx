@@ -30,6 +30,69 @@ fn persist_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// trigram 后台重建防重入标志：多卷 USN 线程 + 启动补建共享同一份全索引边车，
+/// 同时跑两份构建只会互相覆盖 tmp / rename 打架。
+fn trigram_rebuilding() -> &'static std::sync::atomic::AtomicBool {
+    static FLAG: OnceLock<std::sync::atomic::AtomicBool> = OnceLock::new();
+    FLAG.get_or_init(|| std::sync::atomic::AtomicBool::new(false))
+}
+
+struct TrigramRebuildGuard(());
+impl TrigramRebuildGuard {
+    fn acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        if trigram_rebuilding().swap(true, Ordering::AcqRel) {
+            None // 已有重建在进行
+        } else {
+            Some(Self(()))
+        }
+    }
+}
+impl Drop for TrigramRebuildGuard {
+    fn drop(&mut self) {
+        trigram_rebuilding().store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// 触发 trigram 边车后台重建（缺失补建 / 增量超阈值）。非阻塞：立刻返回。
+/// 防重入由 [`TrigramRebuildGuard`] 保证，重建期间再次触发直接忽略
+/// （溢出场景 pending 会继续积累到下一轮 save 周期再触发，无丢失）。
+fn spawn_trigram_rebuild(engine: Arc<SearchEngine>, index: PathBuf, reason: &'static str) {
+    let Some(guard) = TrigramRebuildGuard::acquire() else {
+        return;
+    };
+    let spawned = std::thread::Builder::new()
+        .name("findx2-trigram-rebuild".into())
+        .spawn(move || {
+            let _guard = guard;
+            info!("trigram：后台重建开始（{reason}）");
+            let t0 = Instant::now();
+            match engine.rebuild_trigram_sidecar(&index) {
+                Ok(()) => info!(
+                    "trigram：后台重建完成，耗时 {:.1}s",
+                    t0.elapsed().as_secs_f64()
+                ),
+                Err(e) => error!("trigram：后台重建失败（下一轮再试）: {e}"),
+            }
+        });
+    if spawned.is_err() {
+        // spawn 失败时 guard 还没进线程，手动释放（否则标志永远卡在 true）。
+        trigram_rebuilding().store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// save 周期后调用：增量超阈值时后台重建（阈值见 [`findx2_core::IndexStore::tri_pending_overflow`]，
+/// 默认 max(条目数/32, 65536)）。未超阈值是常态，检查本身只是一次位图 len 读取。
+fn maybe_rebuild_trigram(engine: &Arc<SearchEngine>, index: &Path) {
+    if engine.index_store().tri_pending_overflow() {
+        spawn_trigram_rebuild(
+            engine.clone(),
+            index.to_path_buf(),
+            "USN 增量超过阈值",
+        );
+    }
+}
+
 /// 前台运行。（非 Windows 下不提供本模块）
 pub(crate) fn run_foreground(
     index: PathBuf,
@@ -108,6 +171,16 @@ pub(crate) fn run_foreground(
     {
         let mut g = slot.write().expect("EngineSlot 写锁中毒");
         *g = Some(engine.clone());
+    }
+
+    // 边车缺失 / 加载时被判不可信（重建窗口内崩溃过）：后台补建一次，
+    // 本轮搜索先走全表扫描兜底，构建完成后自动切到剪枝路径。
+    if engine.index_store().trigram.is_none() {
+        spawn_trigram_rebuild(
+            engine.clone(),
+            index.clone(),
+            "启动时边车缺失或校验失败",
+        );
     }
 
     let _everything: Option<JoinHandle<()>> = if flags.no_everything_ipc {
@@ -281,6 +354,7 @@ fn usn_watch_loop(
                     if engine.metadata_ready() && last_save.elapsed() >= save_every {
                         persist_index(&engine, &index_path)?;
                         last_save = Instant::now();
+                        maybe_rebuild_trigram(&engine, &index_path);
                     }
                 }
             },
@@ -291,8 +365,9 @@ fn usn_watch_loop(
                 if engine.metadata_ready() && last_save.elapsed() >= save_every {
                     persist_index(&engine, &index_path)?;
                     last_save = Instant::now();
+                    maybe_rebuild_trigram(&engine, &index_path);
                 }
-            }
+            },
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
         if !pending.is_empty() && batch_started.elapsed() >= flush_every {

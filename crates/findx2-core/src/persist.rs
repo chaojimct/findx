@@ -6,9 +6,9 @@
 //!   旧 v3 通过 `*(e as *const FileEntry as *const [u8; 40])` 取头 40 字节写盘，
 //!   导致 `attrs` 字段从来没被持久化（所有 v3 索引加载后 `is_dir_entry()` 恒为 false）。
 //!   v4 改为按字段独立 `to_le_bytes`，attrs 真正进盘。
-//! - **去掉 `size_order/mtime_order/ctime_order` 三段占位向量**：每段 = `entry_count × u32`，
+//! - 去掉 `size_order/mtime_order/ctime_order` 三段占位向量**：每段 = `entry_count × u32`，
 //!   排序键由 `SearchEngine::finalize_hits` 现算，无需持久化。
-//! - 写入用 4MB `BufWriter` + `sync_data`，读取用 4MB `BufReader`，
+//! - 写入用 4MB `BufWriter` + `sync_data`；读取走 mmap（页缓存直读 + 整段 memcpy，见 `load_index_bin`），
 //!   避免百万条目下逐字段 syscall 风暴。
 //!
 //! v2/v3 仍可加载（兼容路径）：
@@ -18,7 +18,7 @@
 //! - 下次 `save_index_bin` 自动升级到 v4。
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use roaring::RoaringBitmap;
@@ -312,6 +312,20 @@ pub fn save_index_bin(path: &Path, store: &IndexStore) -> Result<()> {
         bytes as f64 / (1024.0 * 1024.0),
         started.elapsed().as_secs_f64()
     );
+
+    // trigram pending 边车随主索引一起落盘：
+    // - 没有快照（边车从未构建）就不写，避免产生「有 pending 无快照」的中间态；
+    // - 写入顺序在 index.bin 之后 —— 崩溃窗口内的旧 pending 对旧 index.bin 仍是正确的超集。
+    if store.trigram.is_some() {
+        let snap = store
+            .trigram
+            .as_ref()
+            .map(|t| t.snapshot_entry_count())
+            .unwrap_or(0);
+        if let Err(e) = crate::trigram::save_pending_sidecar(path, &store.tri_pending, snap) {
+            crate::progress!("trigram：pending 边车写入失败（下一轮重试）: {e}");
+        }
+    }
     Ok(())
 }
 
@@ -324,9 +338,20 @@ fn dir_entry_to_bytes(d: &DirEntry) -> [u8; 24] {
     b
 }
 
-/// 从 `index.bin` 加载（4MB BufReader；entries / dirs / frns 大块读入）。
+/// v5 磁盘 `FileEntry` 布局与内存布局逐字节一致的编译期保证（整段 memcpy 的前提）。
+const _: () = assert!(std::mem::size_of::<FileEntry>() == FILE_ENTRY_V5_DISK_SIZE);
+
+/// 从 `index.bin` 加载。
 ///
-/// 兼容 v2/v3：跳过尾部三段 `*_order`；v3 entries.attrs 全 0，按 dirs 表回填 `ATTR_IS_DIR`。
+/// v5 起走 **mmap + 整段 memcpy** 快路径：
+/// - 页缓存直读（BufReader 双拷贝消失）；
+/// - entries/frns 与内存布局逐字节一致（`file_entry_to_disk_bytes_v5` 同一字段序），
+///   8.5M 次逐字段 `from_le_bytes` 解析变成一次 272MB 的 `copy_nonoverlapping`；
+///   首条目做一次序列化 roundtrip 校验，布局漂移时自动退回逐条解析；
+/// - `FrnIdxMap::finalize_build` 内部已是 rayon 并行排序；
+/// - `<index>.tri`（trigram 倒排）与 `<index>.tri.pending` 边车在此一并挂载。
+///
+/// 兼容 v2/v3/v4：跳过尾部三段 `*_order`；v3 entries.attrs 全 0，按 dirs 表回填 `ATTR_IS_DIR`。
 pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
     let started = std::time::Instant::now();
     let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -336,10 +361,27 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
         bytes as f64 / (1024.0 * 1024.0)
     );
     let file = File::open(path)?;
-    let mut r = BufReader::with_capacity(4 * 1024 * 1024, file);
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let mm: &[u8] = &mmap[..];
+    // 整个文件马上会被顺序解析（take 逐段推进），一次预取把逐页 fault
+    // 换成大块顺序读，加载尾部条目不再吃随机 IO。
+    crate::trigram::prefetch_mmap(mm);
 
+    let mut cur = 0usize;
+    let mut take = |n: usize| -> Result<&[u8]> {
+        let end = cur
+            .checked_add(n)
+            .ok_or_else(|| crate::Error::Persist("索引段长度溢出".into()))?;
+        let s = mm
+            .get(cur..end)
+            .ok_or_else(|| crate::Error::Persist("索引文件截断（段越界）".into()))?;
+        cur = end;
+        Ok(s)
+    };
+
+    let hdr_bytes = take(64)?;
     let mut h = [0u8; 64];
-    r.read_exact(&mut h)?;
+    h.copy_from_slice(hdr_bytes);
     let (hdr, nvol) = IndexHeader::read(&h)?;
     if hdr.version > FORMAT_VERSION_CURRENT {
         return Err(crate::Error::Persist(format!(
@@ -348,8 +390,7 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
         )));
     }
 
-    let mut vbuf = vec![0u8; (nvol as usize) * 32];
-    r.read_exact(&mut vbuf)?;
+    let vbuf = take((nvol as usize) * 32)?;
     let mut volumes = Vec::with_capacity(nvol as usize);
     for chunk in vbuf.chunks_exact(32) {
         let mut a = [0u8; 32];
@@ -357,24 +398,18 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
         volumes.push(deserialize_volume(&a));
     }
 
-    let mut names_buf = vec![0u8; hdr.names_buf_len as usize];
-    r.read_exact(&mut names_buf)?;
+    let names_buf = take(hdr.names_buf_len as usize)?.to_vec();
 
     let dir_paths_buf: Vec<u8>;
     let dir_path_ranges: Vec<(u32, u32)>;
 
     if hdr.version >= FORMAT_VERSION_V2 {
-        let mut dpb_len = [0u8; 8];
-        r.read_exact(&mut dpb_len)?;
-        let dl = u64::from_le_bytes(dpb_len) as usize;
-        dir_paths_buf = read_exact_vec(&mut r, dl)?;
-        let mut nr_b = [0u8; 8];
-        r.read_exact(&mut nr_b)?;
-        let nr = u64::from_le_bytes(nr_b) as usize;
+        let dlen = u64::from_le_bytes(take(8)?.try_into().unwrap()) as usize;
+        dir_paths_buf = take(dlen)?.to_vec();
+        let nr = u64::from_le_bytes(take(8)?.try_into().unwrap()) as usize;
+        let nr_bytes = take(nr * 8)?;
         let mut ranges = Vec::with_capacity(nr);
-        let mut pair = [0u8; 8];
-        for _ in 0..nr {
-            r.read_exact(&mut pair)?;
+        for pair in nr_bytes.chunks_exact(8) {
             let a = u32::from_le_bytes(pair[0..4].try_into().unwrap());
             let b = u32::from_le_bytes(pair[4..8].try_into().unwrap());
             ranges.push((a, b));
@@ -389,22 +424,12 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
     let mut entries: Vec<FileEntry> = Vec::with_capacity(n_entries);
     if n_entries > 0 {
         if hdr.version >= FORMAT_VERSION_V5 {
-            // v5 紧凑布局，32B/entry。
-            let bytes_total = n_entries * FILE_ENTRY_V5_DISK_SIZE;
-            let mut buf = vec![0u8; bytes_total];
-            r.read_exact(&mut buf)?;
-            for chunk in buf.chunks_exact(FILE_ENTRY_V5_DISK_SIZE) {
-                let mut arr = [0u8; FILE_ENTRY_V5_DISK_SIZE];
-                arr.copy_from_slice(chunk);
-                entries.push(file_entry_from_disk_bytes_v5(&arr));
-            }
+            let section = take(n_entries * FILE_ENTRY_V5_DISK_SIZE)?;
+            bulk_copy_or_parse_v5(section, &mut entries);
         } else {
-            // v3/v4 老格式，40B/entry；时间字段在 from 内做 FILETIME → unix-secs 的迁移。
             let with_attrs = hdr.version >= FORMAT_VERSION_V4;
-            let bytes_total = n_entries * FILE_ENTRY_V4_DISK_SIZE;
-            let mut buf = vec![0u8; bytes_total];
-            r.read_exact(&mut buf)?;
-            for chunk in buf.chunks_exact(FILE_ENTRY_V4_DISK_SIZE) {
+            let section = take(n_entries * FILE_ENTRY_V4_DISK_SIZE)?;
+            for chunk in section.chunks_exact(FILE_ENTRY_V4_DISK_SIZE) {
                 let mut arr = [0u8; FILE_ENTRY_V4_DISK_SIZE];
                 arr.copy_from_slice(chunk);
                 entries.push(file_entry_from_disk_bytes_v4(&arr, with_attrs));
@@ -412,33 +437,44 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
         }
     }
 
+    let dirs_section = take(hdr.dir_count as usize * 24)?;
     let mut dirs = Vec::with_capacity(hdr.dir_count as usize);
-    let mut dbuf = [0u8; 24];
-    for _ in 0..hdr.dir_count {
-        r.read_exact(&mut dbuf)?;
+    for chunk in dirs_section.chunks_exact(24) {
         dirs.push(DirEntry {
-            frn: u64::from_le_bytes(dbuf[0..8].try_into().unwrap()),
-            parent_idx: u32::from_le_bytes(dbuf[8..12].try_into().unwrap()),
-            name_offset: u32::from_le_bytes(dbuf[12..16].try_into().unwrap()),
-            name_len: u16::from_le_bytes(dbuf[16..18].try_into().unwrap()),
+            frn: u64::from_le_bytes(chunk[0..8].try_into().unwrap()),
+            parent_idx: u32::from_le_bytes(chunk[8..12].try_into().unwrap()),
+            name_offset: u32::from_le_bytes(chunk[12..16].try_into().unwrap()),
+            name_len: u16::from_le_bytes(chunk[16..18].try_into().unwrap()),
         });
     }
 
     let frns: Vec<u64> = if hdr.version >= FORMAT_VERSION_V2 {
-        let mut nb = [0u8; 8];
-        r.read_exact(&mut nb)?;
-        let n_stored = u64::from_le_bytes(nb) as usize;
+        let n_stored = u64::from_le_bytes(take(8)?.try_into().unwrap()) as usize;
         const MAX_FRN: usize = 64 * 1024 * 1024;
         if n_stored > MAX_FRN {
             return Err(crate::Error::Persist("frns 计数异常（过大）".into()));
         }
+        let section = take(n_stored * 8)?;
         let mut v: Vec<u64> = vec![0u64; n_stored];
         if n_stored > 0 {
-            // u64 LE 大块读入。
-            let bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, n_stored * 8)
-            };
-            r.read_exact(bytes)?;
+            // u64 LE 大块拷入（小端平台直接 memcpy；大端理论路径逐个转换）。
+            // 同 bulk_copy_or_parse_v5：section 起点偏移由前面各段长度累加决定，
+            // 不保证 8 对齐，未对齐的 memcpy 是 UB，必须先验再拷。
+            let src_aligned =
+                (section.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u64>());
+            if cfg!(target_endian = "little") && src_aligned {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        section.as_ptr() as *const u64,
+                        v.as_mut_ptr(),
+                        n_stored,
+                    );
+                }
+            } else {
+                for (dst, chunk) in v.iter_mut().zip(section.chunks_exact(8)) {
+                    *dst = u64::from_le_bytes(chunk.try_into().unwrap());
+                }
+            }
         }
         if v.len() != n_entries {
             if v.len() < n_entries {
@@ -455,28 +491,26 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
     // v2/v3：跳过 size_order / mtime_order / ctime_order
     if hdr.version < FORMAT_VERSION_V4 {
         for _ in 0..3 {
-            skip_u32_vec(&mut r)?;
+            let n = u64::from_le_bytes(take(8)?.try_into().unwrap()) as usize;
+            let _ = take(n * 4)?; // 直接丢弃旧版占位段
         }
     }
 
     let mut ext_filter: [Option<RoaringBitmap>; 256] = std::array::from_fn(|_| None);
-    let mut len_buf = [0u8; 4];
     for slot in &mut ext_filter {
-        r.read_exact(&mut len_buf)?;
-        let len = u32::from_le_bytes(len_buf) as usize;
+        let len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
         if len > 0 {
-            let bm_buf = read_exact_vec(&mut r, len)?;
+            let blob = take(len)?;
             *slot = Some(
-                RoaringBitmap::deserialize_from(bm_buf.as_slice())
+                RoaringBitmap::deserialize_from(blob)
                     .map_err(|e| crate::Error::Persist(e.to_string()))?,
             );
         }
     }
 
-    r.read_exact(&mut len_buf)?;
-    let dlen = u32::from_le_bytes(len_buf) as usize;
-    let del_buf = read_exact_vec(&mut r, dlen)?;
-    let deleted = RoaringBitmap::deserialize_from(del_buf.as_slice())
+    let dlen = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+    let del_blob = take(dlen)?;
+    let deleted = RoaringBitmap::deserialize_from(del_blob)
         .map_err(|e| crate::Error::Persist(e.to_string()))?;
 
     // 加载阶段同样走 sorted Vec（push_unsorted + finalize_build），
@@ -513,6 +547,55 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
         true
     };
 
+    // trigram 边车挂载：`.tri` mmap + `.tri.pending`。缺失/损坏一律静默降级为全表扫描。
+    let mut trigram = match crate::trigram::TrigramIndex::load(&crate::trigram::tri_sidecar_path(path))
+    {
+        Ok(t) => t.map(std::sync::Arc::new),
+        Err(_) => None,
+    };
+    let mut tri_pending = RoaringBitmap::new();
+    if let Some(t) = trigram.as_ref() {
+        let tri_snap = t.snapshot_entry_count();
+        match crate::trigram::load_pending_sidecar(path) {
+            Some((bm, snap)) => {
+                if snap != tri_snap {
+                    // .tri 与 .tri.pending 落盘不同步：崩溃落在重建窗口内（.tri 已换新、
+                    // pending 还是旧快照配套数据）。此时 pending 内容对不上 .tri 的覆盖范围，
+                    // 有极小概率漏报 → 正确性优先，整体禁用剪枝（上层会后台重建）。
+                    crate::progress!(
+                        "trigram：pending 快照({snap}) 与 .tri 快照({tri_snap}) 不一致，本轮禁用剪枝",
+                    );
+                    trigram = None;
+                } else {
+                    tri_pending = bm;
+                    if snap as usize > n_entries {
+                        // 快照比当前库还大（异常状态，多半是回退了老 index.bin）：不可信，整体弃用。
+                        crate::progress!(
+                            "trigram：pending 快照({snap}) 大于条目数({n_entries})，忽略边车",
+                        );
+                        tri_pending = RoaringBitmap::new();
+                    }
+                }
+            }
+            None => {
+                // pending 丢失：改名条目无从知晓 → 保守起见放弃剪枝（上层启动后台重建）。
+                crate::progress!(
+                    "trigram：{} 缺失，本轮回退全表扫描（将后台重建）",
+                    crate::trigram::pending_sidecar_path(path).display()
+                );
+                trigram = None;
+            }
+        }
+    }
+    // 快照之后的尾部条目（构建后新增）一律视作 pending —— 与改名登记同一语义。
+    if let Some(t) = trigram.as_ref() {
+        let snap = t.snapshot_entry_count();
+        let total = n_entries as u32;
+        if snap < total {
+            tri_pending.insert_range(snap..total);
+        }
+    }
+
     let mut store = IndexStore {
         names_buf,
         entries,
@@ -526,8 +609,13 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
         frns,
         frn_to_entry,
         metadata_ready,
+        trigram,
+        tri_pending,
+        cjk_names: RoaringBitmap::new(),
         excluded_dirs: Vec::new(),
     };
+    // 拼音候选剪枝位图：并行扫一遍名字（1.15M 条目 ~10ms，8.5M ~100ms），之后 USN 增量维护。
+    store.rebuild_cjk_bitmap();
 
     if hdr.version < FORMAT_VERSION_V2 {
         store.rebuild_dir_paths();
@@ -544,15 +632,46 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
     }
 
     crate::progress!(
-        "持久化：加载完成 {}（v{}，条目 {}，目录 {}），耗时 {:.2}s",
+        "持久化：加载完成 {}（v{}，条目 {}，目录 {}，trigram {}），耗时 {:.2}s",
         path.display(),
         hdr.version,
         store.entry_count(),
         store.dirs.len(),
+        if store.trigram.is_some() { "on" } else { "off" },
         started.elapsed().as_secs_f64()
     );
 
     Ok(store)
+}
+
+/// v5 entries 整段 memcpy；首条目序列化 roundtrip 校验布局，不一致则退回逐条解析。
+fn bulk_copy_or_parse_v5(section: &[u8], entries: &mut Vec<FileEntry>) {
+    let n = section.len() / FILE_ENTRY_V5_DISK_SIZE;
+    debug_assert_eq!(section.len(), n * FILE_ENTRY_V5_DISK_SIZE);
+    // mmap 基址页对齐，但 section 在文件内的偏移由前面各段长度累加决定，
+    // 不保证是 `align_of::<FileEntry>()`（8）的倍数；未对齐的 memcpy 是 UB
+    // （debug 下被 unsafe precondition 检查直接 abort），必须先验再拷。
+    let src_aligned = (section.as_ptr() as usize).is_multiple_of(std::mem::align_of::<FileEntry>());
+    if src_aligned && n > 0 {
+        unsafe {
+            let dst = entries.as_mut_ptr();
+            std::ptr::copy_nonoverlapping(section.as_ptr() as *const FileEntry, dst, n);
+            entries.set_len(n);
+        }
+        let layout_ok = entries
+            .first()
+            .is_none_or(|e| file_entry_to_disk_bytes_v5(e).as_slice() == &section[..FILE_ENTRY_V5_DISK_SIZE]);
+        if layout_ok {
+            return;
+        }
+    }
+    // 未对齐 / 字段序漂移（未来 FileEntry 布局改动未同步 persist）：退回逐条解析保证正确性。
+    entries.clear();
+    for chunk in section.chunks_exact(FILE_ENTRY_V5_DISK_SIZE) {
+        let mut arr = [0u8; FILE_ENTRY_V5_DISK_SIZE];
+        arr.copy_from_slice(chunk);
+        entries.push(file_entry_from_disk_bytes_v5(&arr));
+    }
 }
 
 /// v3 兼容修复：根据 dirs 表与 deleted bitmap 回填 entries 的 `ATTR_IS_DIR` / `ATTR_DELETED`，
@@ -603,25 +722,6 @@ fn repair_attrs_deleted_bitmap_alignment(entries: &mut [FileEntry], deleted: &Ro
             e.attrs &= !FileEntry::ATTR_DELETED;
         }
     }
-}
-
-fn read_exact_vec<R: Read>(r: &mut R, n: usize) -> Result<Vec<u8>> {
-    let mut v = vec![0u8; n];
-    if n > 0 {
-        r.read_exact(&mut v)?;
-    }
-    Ok(v)
-}
-
-fn skip_u32_vec<R: Read + Seek>(r: &mut R) -> Result<()> {
-    let mut nb = [0u8; 8];
-    r.read_exact(&mut nb)?;
-    let n = u64::from_le_bytes(nb);
-    let bytes = n
-        .checked_mul(4)
-        .ok_or_else(|| crate::Error::Persist("v2/v3 *_order 长度溢出".into()))?;
-    r.seek(SeekFrom::Current(bytes as i64))?;
-    Ok(())
 }
 
 /// 与 index.bin 同目录的「排除目录」边车文件名（`<index>.exclude.json`）。

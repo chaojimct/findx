@@ -2,11 +2,13 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::Hasher;
 use std::io::Write;
 
 use fxhash::FxHashMap;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
+use std::sync::Arc;
 
 use crate::platform::{ChangeEvent, RawEntry};
 
@@ -53,8 +55,9 @@ impl FrnIdxMap {
     /// 构建期：批量 push 后调用一次 sort_dedup_keep_last，把 sorted 段建成紧凑形态。
     /// 同 frn 多次 push 时保留最后一次（与 HashMap insert 语义一致）。
     pub fn finalize_build(&mut self) {
-        // unstable 排序对 (u64, u32) 已经是稳定且更快的选择。
-        self.sorted.sort_unstable_by_key(|&(k, _)| k);
+        // rayon 并行排序：加载路径 8.5M 条目时省 ~1.5s（单线程 unstable sort 是启动大头之一）；
+        // 小数据（<4096）rayon 自动退化为串行，无额外开销。
+        self.sorted.par_sort_unstable_by_key(|&(k, _)| k);
         // 重复 frn 保留最后一次：从尾部往前扫，重复时丢弃前者。
         if self.sorted.len() > 1 {
             let mut write = 0usize;
@@ -270,12 +273,33 @@ pub struct IndexStore {
     pub frn_to_entry: FrnIdxMap,
     /// `false` 表示首遍快速建库尚未回填 size/mtime；时间/大小过滤与排序将降级（见 [`SearchEngine`]）。
     pub metadata_ready: bool,
+    /// 三字节倒排索引（`<index>.tri` 边车 mmap）；`None` = 边车缺失 / 损坏 → 子串查询回退全表扫描。
+    /// 只读；USN 增量不原地改写，全部进 `tri_pending`，超阈值后由上层重建边车。
+    pub trigram: Option<Arc<crate::trigram::TrigramIndex>>,
+    /// trigram 快照之后发生名字新增 / 改名的条目 idx；查询时并入候选集（必要条件超集，验证链兜底）。
+    /// 由 [`IndexStore::note_name_change`] 维护；持久化走 `<index>.tri.pending` 边车。
+    pub tri_pending: RoaringBitmap,
+    /// 名字含「拼音可命中字符」的条目位图（运行时字段，加载 / 建库后重建，USN 增量同步维护）。
+    ///
+    /// 拼音匹配（lita 正则）的候选超集 = `trigram(needle) ∪ cjk_names`：
+    /// 名字要么含 needle 字面（→ trigram 命中），要么含拼音字符（→ 本位图命中），二者必居其一。
+    /// 「拼音可命中字符」按 UTF-8 字节近似：任何字节 ≥ 0xE2（码点 ≥ U+2000 量级），
+    /// 覆盖 ib-matcher 拼音表全部区间（U+3400–U+9FED、U+20000–U+2D016、U+3007、PUA 等）且略宽，
+    /// 只会多扫不会漏扫。
+    pub cjk_names: RoaringBitmap,
     /// 用户配置的排除目录（小写、统一反斜杠，**含盘符**，例如 `c:\windows\winsxs`）。
     /// 仅运行时字段，不进 `index.bin`；由 `<index>.exclude.json` sidecar 与 service CLI `--exclude-dir` 注入。
     /// 命中规则：`apply_change_event` 在 USN 增量进库前用前缀匹配丢弃落入排除目录的新条目，
     /// 防止设置中"排除 C:\Windows"后 Windows Update 仍持续灌入新文件。
     /// 历史已入库的条目不会被回溯清理（用户应在改了排除目录后手动重建索引）。
     pub excluded_dirs: Vec<String>,
+}
+
+/// 名字是否含「拼音可命中」字节（任何 UTF-8 字节 ≥ 0xE2，即码点 ≥ U+2000 量级）。
+/// 是 ib-matcher 拼音表的保守超集：只多扫不漏扫。
+#[inline]
+pub fn name_has_pinyin_capable_byte(name: &[u8]) -> bool {
+    name.iter().any(|&b| b >= 0xE2)
 }
 
 /// 把用户输入的目录路径规范化为「**小写 + 反斜杠 + 末尾不带 `\`**」的前缀串，
@@ -309,6 +333,62 @@ impl IndexStore {
         self.entries.len()
     }
 
+    /// trigram 剪枝的名字变更登记：新条目 / 改名条目调用。
+    /// 纯元数据更新（size/mtime）不需要 —— posting 与名字内容无关。
+    #[inline]
+    pub fn note_name_change(&mut self, idx: u32) {
+        self.tri_pending.insert(idx);
+        // cjk 位图同步：调用点在 entry 名字已更新之后，按当前名字重算。
+        // 墓碑条目的残留位无害（扫描前有 is_deleted 过滤），不必清。
+        if self
+            .entries
+            .get(idx as usize)
+            .map(|e| name_has_pinyin_capable_byte(self.name_bytes(e)))
+            .unwrap_or(false)
+        {
+            self.cjk_names.insert(idx);
+        } else {
+            self.cjk_names.remove(idx);
+        }
+    }
+
+    /// 全量重建 cjk_names（加载 / 建库收尾调用一次；之后由 [`Self::note_name_change`] 增量维护）。
+    pub fn rebuild_cjk_bitmap(&mut self) {
+        let chunks: Vec<Vec<u32>> = {
+            let n = self.entries.len();
+            let chunk = (n / rayon::current_num_threads().max(1)).max(1);
+            let starts: Vec<usize> = (0..n).step_by(chunk).collect();
+            starts
+                .into_par_iter()
+                .map(|start| {
+                    let end = (start + chunk).min(n);
+                    let mut local = Vec::new();
+                    for idx in start..end {
+                        let e = &self.entries[idx];
+                        if e.is_deleted() {
+                            continue;
+                        }
+                        if name_has_pinyin_capable_byte(self.name_bytes(e)) {
+                            local.push(idx as u32);
+                        }
+                    }
+                    local
+                })
+                .collect()
+        };
+        let mut bm = RoaringBitmap::new();
+        for c in chunks {
+            bm.extend(c);
+        }
+        self.cjk_names = bm;
+    }
+
+    /// trigram 增量是否已超阈值，建议重建 `<index>.tri` 边车。
+    pub fn tri_pending_overflow(&self) -> bool {
+        let threshold = (self.entries.len() / 32).max(65_536);
+        self.tri_pending.len() as usize > threshold
+    }
+
     pub fn name_bytes(&self, e: &FileEntry) -> &[u8] {
         let o = e.name_offset as usize;
         let n = e.n_len as usize;
@@ -340,7 +420,8 @@ impl IndexStore {
     }
 
     /// 同步 push 一段文件名 / 目录名进 `names_buf`。
-    /// `tail_null` 为 true 时追加 1 字节 0（便于整块 memchr 扫描）。
+    /// 增量路径（USN）专用：不携带去重表，纯追加；`tail_null` 统一传 true，
+    /// 与构建期 interner 的「所有名字 null 终止」布局保持一致。
     fn append_name(&mut self, bytes: &[u8], tail_null: bool) -> u32 {
         let off = self.names_buf.len() as u32;
         self.names_buf.extend_from_slice(bytes);
@@ -543,6 +624,7 @@ impl IndexStore {
             .insert(new_idx);
         self.frns.push(raw.file_id);
         self.frn_to_entry.insert(raw.file_id, new_idx);
+        self.note_name_change(new_idx);
         new_idx
     }
 
@@ -584,7 +666,7 @@ impl IndexStore {
                 .get(&raw.parent_id)
                 .ok_or_else(|| crate::Error::Platform("父目录尚未出现在索引中".into()))?
         };
-        let name_off = self.append_name(raw.name.as_bytes(), false);
+        let name_off = self.append_name(raw.name.as_bytes(), true);
         let di = self.dirs.len() as u32;
         self.dirs.push(DirEntry {
             frn: raw.file_id,
@@ -611,6 +693,7 @@ impl IndexStore {
         self.ext_insert_idx(new_idx, eh);
         self.frns.push(raw.file_id);
         self.frn_to_entry.insert(raw.file_id, new_idx);
+        self.note_name_change(new_idx);
         Ok(())
     }
 
@@ -633,7 +716,7 @@ impl IndexStore {
 
         if raw.is_dir {
             if let Some(di) = self.dirs.iter().position(|d| d.frn == raw.file_id) {
-                let name_off = self.append_name(raw.name.as_bytes(), false);
+                let name_off = self.append_name(raw.name.as_bytes(), true);
                 let parent_idx = if raw.parent_id == 0 {
                     0u32
                 } else {
@@ -662,6 +745,7 @@ impl IndexStore {
                 }
                 self.ext_insert_idx(idx, eh);
             }
+            self.note_name_change(idx);
             return Ok(());
         }
 
@@ -681,6 +765,7 @@ impl IndexStore {
         }
         self.ext_insert_idx(idx, eh);
         let _ = old;
+        self.note_name_change(idx);
         Ok(())
     }
 
@@ -901,6 +986,53 @@ pub fn hash_ext8(name: &str) -> u8 {
     (h & 0xff) as u8
 }
 
+/// 构建期名字 interning：重复文件名/目录名复用 `names_buf` 中同一段字节。
+///
+/// Windows 全盘重名率很高（node_modules 的 package.json/index.js、.git/objects、
+/// winsxs 的同名组件、遍布各处的 desktop.ini/thumbs.db），8.5M 条目 × ~15B
+/// （名字 + null 终止）的 `names_buf` 中相当比例是同一批名字的重复拷贝。
+/// 构建时用 `名字 FxHash(u64) -> 起始 offset` 把重复名字映射回首份字节，
+/// 结束后整表 drop——常驻 RSS 与 `index.bin` 体积同步缩小，运行时零开销。
+///
+/// 取舍：
+/// - 键只存哈希不存字节，命中后回读 `names_buf` 逐字节校验；哈希碰撞
+///   只会退化成重复存储（校验失败→新 offset 覆盖同 key），绝不错误共享。
+/// - USN 增量路径不持有此表，新名字纯追加：增量条目量小，不值得为它
+///   常驻一张哈希表。
+/// - 所有名字统一 null 终止（含目录名）：同一名字无论先作为目录名还是
+///   文件名写入，字节段完全一致才可共享；读取方一律按 `[offset, offset+len)`
+///   切片，无代码依赖「目录名后无 null」。
+struct NameInterner {
+    map: FxHashMap<u64, u32>,
+}
+
+impl NameInterner {
+    fn with_expected(total_names: usize) -> Self {
+        let mut map = FxHashMap::default();
+        map.reserve(total_names / 2 + 16);
+        Self { map }
+    }
+
+    /// 把 `name`（UTF-8 字节）写入 `buf` 并 null 终止，返回起始 offset；
+    /// 已存在的同字节名字直接返回首份 offset，不重复写。
+    fn intern(&mut self, buf: &mut Vec<u8>, name: &[u8]) -> u32 {
+        let mut h = fxhash::FxHasher::default();
+        h.write(name);
+        let hash = h.finish();
+        if let Some(&off) = self.map.get(&hash) {
+            let end = off as usize + name.len();
+            if buf.get(off as usize..end) == Some(name) {
+                return off;
+            }
+        }
+        let off = buf.len() as u32;
+        buf.extend_from_slice(name);
+        buf.push(0);
+        self.map.insert(hash, off);
+        off
+    }
+}
+
 pub struct IndexBuilder {
     volume_letter: u8,
     volume_serial: u32,
@@ -937,6 +1069,8 @@ impl IndexBuilder {
         let _ = std::io::stderr().flush();
 
         let mut names_buf: Vec<u8> = Vec::new();
+        // 名字 interning：重复名字共享同段字节，构建结束整表 drop（见 `NameInterner` 注释）。
+        let mut interner = NameInterner::with_expected(dir_count + file_count);
         let mut dir_entries: Vec<DirEntry> = Vec::new();
         // BFS 阶段需要按 frn 反查父 idx：临时用 hashbrown，BFS 结束后立刻转换为
         // 紧凑的 sorted FrnIdxMap 释放内存。1.25M 目录 × 24B ≈ 30MB 是临时峰值，可接受。
@@ -974,8 +1108,7 @@ impl IndexBuilder {
                     }
                 }
             };
-            let name_off = names_buf.len() as u32;
-            names_buf.extend_from_slice(d.name.as_bytes());
+            let name_off = interner.intern(&mut names_buf, d.name.as_bytes());
             let idx = dir_entries.len() as u32;
             dir_entries.push(DirEntry {
                 frn: d.file_id,
@@ -1020,9 +1153,7 @@ impl IndexBuilder {
                 );
                 let _ = std::io::stderr().flush();
             }
-            let name_off = names_buf.len() as u32;
-            names_buf.extend_from_slice(f.name.as_bytes());
-            names_buf.push(0); // null 终止，便于整块扫描
+            let name_off = interner.intern(&mut names_buf, f.name.as_bytes());
             let dir_idx = dir_index_build.get(&f.parent_id).copied().unwrap_or(0);
             let eh = hash_ext8(&f.name);
             // 文件 attrs：`pack_attrs_from_windows_file` 处理 READONLY/ARCHIVE 与内部位冲突，见 `FileEntry` 上注释。
@@ -1063,6 +1194,18 @@ impl IndexBuilder {
             });
             frns.push(d.frn);
         }
+
+        // 去重统计 + 释放：去重表只活在构建期，此后常驻 RSS 不含任何哈希开销。
+        let total_name_writes = dir_count + assembled_files as usize;
+        let unique_names = interner.map.len();
+        drop(interner);
+        crate::progress!(
+            "索引：名字去重 {} → {} 段（names_buf {:.1} MB）…",
+            total_name_writes,
+            unique_names,
+            names_buf.len() as f64 / 1048576.0
+        );
+        let _ = std::io::stderr().flush();
 
         crate::progress!("索引：FRN→条目映射（{} 条）…", frns.len());
         let _ = std::io::stderr().flush();
@@ -1145,7 +1288,7 @@ impl IndexBuilder {
         dir_index.finalize_build();
         drop(dir_index_build);
 
-        Ok(IndexStore {
+        let mut store = IndexStore {
             names_buf,
             entries,
             dirs: dir_entries,
@@ -1158,8 +1301,13 @@ impl IndexBuilder {
             frns,
             frn_to_entry,
             metadata_ready,
+            trigram: None,
+            tri_pending: RoaringBitmap::new(),
+            cjk_names: RoaringBitmap::new(),
             excluded_dirs: Vec::new(),
-        })
+        };
+        store.rebuild_cjk_bitmap();
+        Ok(store)
     }
 }
 
@@ -1285,7 +1433,7 @@ pub fn merge_index_stores(stores: Vec<IndexStore>) -> crate::Result<IndexStore> 
     dir_index.finalize_build();
     frn_to_entry.finalize_build();
 
-    Ok(IndexStore {
+    let mut store = IndexStore {
         names_buf: merged_names,
         entries: merged_entries,
         dirs: merged_dirs,
@@ -1298,6 +1446,11 @@ pub fn merge_index_stores(stores: Vec<IndexStore>) -> crate::Result<IndexStore> 
         frns: merged_frns,
         frn_to_entry,
         metadata_ready,
+        trigram: None,
+        tri_pending: RoaringBitmap::new(),
+        cjk_names: RoaringBitmap::new(),
         excluded_dirs: Vec::new(),
-    })
+    };
+    store.rebuild_cjk_bitmap();
+    Ok(store)
 }

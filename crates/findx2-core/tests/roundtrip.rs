@@ -206,6 +206,157 @@ fn ntfs_volume_root_file_searchable_after_root_dir_injected() {
     assert_eq!(sys_hit.name, "vfcompat.dll");
 }
 
+/// 名字 interning：重复文件名/目录名共享同一段 `names_buf` 字节（`name_offset` 相同），
+/// 文件与目录同名同样共享；名字切片、搜索与持久化 roundtrip 均不受影响。
+#[test]
+fn index_build_interns_duplicate_names() {
+    let dirs = vec![
+        RawEntry {
+            file_id: 100,
+            file_id_128: None,
+            parent_id: 0,
+            name: "proj".into(),
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            attrs: 0x10,
+            is_dir: true,
+        },
+        RawEntry {
+            file_id: 101,
+            file_id_128: None,
+            parent_id: 100,
+            name: "src".into(),
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            attrs: 0x10,
+            is_dir: true,
+        },
+        RawEntry {
+            file_id: 102,
+            file_id_128: None,
+            parent_id: 101,
+            name: "src".into(),
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            attrs: 0x10,
+            is_dir: true,
+        },
+    ];
+    let files = vec![
+        RawEntry {
+            file_id: 1,
+            file_id_128: None,
+            parent_id: 101,
+            name: "index.js".into(),
+            size: 1,
+            mtime: 1,
+            ctime: 1,
+            attrs: 0,
+            is_dir: false,
+        },
+        RawEntry {
+            file_id: 2,
+            file_id_128: None,
+            parent_id: 102,
+            name: "index.js".into(),
+            size: 2,
+            mtime: 1,
+            ctime: 1,
+            attrs: 0,
+            is_dir: false,
+        },
+        RawEntry {
+            file_id: 3,
+            file_id_128: None,
+            parent_id: 101,
+            name: "index.js".into(),
+            size: 3,
+            mtime: 1,
+            ctime: 1,
+            attrs: 0,
+            is_dir: false,
+        },
+        RawEntry {
+            file_id: 4,
+            file_id_128: None,
+            parent_id: 100,
+            name: "src".into(),
+            size: 4,
+            mtime: 1,
+            ctime: 1,
+            attrs: 0,
+            is_dir: false,
+        },
+    ];
+    let store = IndexBuilder::new(b'C', 1, 2, 3)
+        .build_from_raw(files, dirs, true)
+        .unwrap();
+
+    // entries 布局：[0..4) 文件（index.js×3, src），[4..7) 目录（proj, src, src）。
+    let offsets: Vec<u32> = store.entries.iter().map(|e| e.name_offset).collect();
+    assert_eq!(
+        store.entries.len(),
+        7,
+        "4 文件 + 3 目录（目录也有 FileEntry）"
+    );
+    assert_eq!(offsets[0], offsets[1]);
+    assert_eq!(offsets[1], offsets[2], "三份 index.js 应共享同段字节");
+    assert_eq!(
+        offsets[3], offsets[6],
+        "文件 src 与目录 src 同名应共享（目录 FileEntry 复用 DirEntry offset）"
+    );
+    assert_eq!(offsets[5], offsets[6], "两个目录 src 应共享");
+    let unique = {
+        let mut s = offsets.clone();
+        s.sort_unstable();
+        s.dedup();
+        s.len()
+    };
+    assert_eq!(unique, 3, "全部名字只有 proj/src/index.js 三段");
+
+    // 共享不改变切片语义：每个条目仍能取回自己的名字。
+    for (e, expect) in store
+        .entries
+        .iter()
+        .zip(["index.js", "index.js", "index.js", "src", "proj", "src", "src"])
+    {
+        assert_eq!(store.name_str(e).unwrap(), expect);
+    }
+
+    // 持久化 roundtrip：offset 原样落盘，共享关系在 load 后保持。
+    let mut tmp = std::env::temp_dir();
+    tmp.push("findx2_test_intern.bin");
+    save_index_bin(&tmp, &store).unwrap();
+    let loaded: IndexStore = load_index_bin(&tmp).unwrap();
+    let _ = std::fs::remove_file(&tmp);
+    assert_eq!(loaded.entries.len(), store.entries.len());
+    for (a, b) in loaded.entries.iter().zip(store.entries.iter()) {
+        assert_eq!(a.name_offset, b.name_offset, "offset 应原样持久化");
+        assert_eq!(a.n_len, b.n_len);
+    }
+    let loaded_offsets: Vec<u32> = loaded.entries.iter().map(|e| e.name_offset).collect();
+    assert_eq!(loaded_offsets[0], loaded_offsets[2]);
+    for (e, expect) in loaded
+        .entries
+        .iter()
+        .zip(["index.js", "index.js", "index.js", "src", "proj", "src", "src"])
+    {
+        assert_eq!(loaded.name_str(e).unwrap(), expect);
+    }
+
+    // 搜索照常工作（store 最后消费进 engine）。
+    let engine = SearchEngine::new(store);
+    let pq = QueryParser::parse("index.js").unwrap();
+    let (hits, total) = engine
+        .search(&pq, &SearchOptions::default())
+        .expect("search");
+    assert_eq!(total, 3, "三份 index.js 都可被搜到");
+    assert_eq!(hits.len(), 3);
+}
+
 /// `hash_ext8` 仅 8 位：`pdf` 与 `yml` 会碰撞；`ext:` 过滤必须在位图后再按真实后缀收紧。
 #[test]
 fn ext_pdf_does_not_return_colliding_yml_bucket() {
@@ -260,4 +411,116 @@ fn ext_pdf_does_not_return_colliding_yml_bucket() {
         .expect("search");
     assert_eq!(hits.len(), 1, "应只命中 .pdf，不得因桶碰撞带入 .yml");
     assert_eq!(hits[0].name, "a.pdf");
+}
+
+/// trigram 剪枝正确性回归：`startwith:` / `ends_with:` / 普通子串查询在
+/// 「挂边车剪枝」与「无边车全表扫描」两条路径下结果必须完全一致。
+/// （三者的 needle 都进了 `trigram_candidate_ids` 的候选源，剪枝只是必要条件过滤。）
+#[test]
+fn starts_with_ends_with_trigram_pruning_matches_full_scan() {
+    let root = 5u64;
+    let dirs = vec![RawEntry {
+        file_id: root,
+        file_id_128: None,
+        parent_id: 0,
+        name: "C:".into(),
+        size: 0,
+        mtime: 0,
+        ctime: 0,
+        attrs: 0x10,
+        is_dir: true,
+    }];
+    let names = [
+        "readme.md",
+        "readme.txt",
+        "already_read.md",
+        "config.json",
+        "conftest.py",
+        "覆盖readme.md",
+    ];
+    let files: Vec<RawEntry> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| RawEntry {
+            file_id: 100 + i as u64,
+            file_id_128: None,
+            parent_id: root,
+            name: (*n).into(),
+            size: 1,
+            mtime: 1,
+            ctime: 1,
+            attrs: 0,
+            is_dir: false,
+        })
+        .collect();
+
+    let dir = std::env::temp_dir().join(format!(
+        "findx2-tri-search-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let index = dir.join("index.bin");
+
+    let store = IndexBuilder::new(b'C', 1, 1, 1)
+        .build_from_raw(files, dirs, true)
+        .unwrap();
+    save_index_bin(&index, &store).unwrap();
+    findx2_core::build_trigram_sidecar(&store, &index).unwrap();
+
+    let store = load_index_bin(&index).unwrap();
+    assert!(
+        store.trigram.is_some(),
+        "边车应挂载成功，否则本测试没有覆盖剪枝路径"
+    );
+    let engine = SearchEngine::new(store);
+
+    let run = |query: &str| -> Vec<(String, String)> {
+        let pq = QueryParser::parse(query).unwrap();
+        let (hits, _) = engine.search(&pq, &SearchOptions::default()).unwrap();
+        hits.into_iter().map(|h| (h.name, h.path)).collect()
+    };
+
+    for query in [
+        "startwith:readme",
+        "startwith:read",
+        "endwith:md",
+        "endwith:.json",
+        "readme",          // 普通子串（含前缀命中）
+        "startwith:覆盖",  // 非 ASCII 前缀（UTF-8 字节窗口）
+    ] {
+        let pruned = run(query);
+        // 关掉边车走全表扫描对照。
+        engine.index_store_mut().trigram = None;
+        let full = run(query);
+        engine.index_store_mut().trigram = {
+            // 重新挂回（下一轮 query 继续测剪枝路径）。
+            let snap = load_index_bin(&index).unwrap();
+            snap.trigram
+        };
+        assert_eq!(
+            pruned, full,
+            "query `{query}`：trigram 剪枝路径与全表扫描结果不一致"
+        );
+        assert!(!pruned.is_empty(), "query `{query}` 应有命中，否则对照无意义");
+    }
+
+    // spot check：具体语义抽查两个。
+    let names: Vec<String> = run("startwith:readme")
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(names.contains(&"readme.md".to_string()));
+    assert!(names.contains(&"readme.txt".to_string()));
+    assert!(
+        !names.contains(&"already_read.md".to_string()),
+        "starts_with 是前缀匹配，不得把子串命中带进来"
+    );
+    let md_count = run("endwith:md").len();
+    assert_eq!(md_count, 3, "readme.md / already_read.md / 覆盖readme.md");
+
+    std::fs::remove_dir_all(&dir).ok();
 }

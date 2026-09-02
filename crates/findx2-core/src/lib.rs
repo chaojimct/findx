@@ -33,6 +33,7 @@ pub use persist::{
 pub mod platform;
 pub mod query;
 pub mod search;
+pub mod trigram;
 
 pub use error::Error;
 pub use index::{
@@ -41,5 +42,9 @@ pub use index::{
 pub use platform::{ChangeEvent, ChangeWatcher, RawEntry, VolumeScanner};
 pub use query::{ParsedQuery, QueryParser, SortField};
 pub use search::{BackfillProgress, SearchEngine, SearchHit, SearchOptions};
+pub use trigram::{
+    build_and_save as build_trigram_sidecar, load_pending_sidecar, pending_sidecar_path,
+    save_pending_sidecar, tri_sidecar_path, TrigramIndex,
+};
 
 pub type Result<T> = std::result::Result<T, Error>;

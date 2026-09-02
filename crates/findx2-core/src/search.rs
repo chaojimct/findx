@@ -413,7 +413,10 @@ impl SearchEngine {
         let mut hits = if !pin_res.is_empty() && no_ext_filter && no_complex_name {
             #[cfg(feature = "pinyin")]
             {
-                fused_scan_pinyin(store, overlay, q, pin_res)
+                // 拼音候选剪枝：lita 匹配要求名字含 needle 字面（trigram 可检）
+                // 或含拼音字符（cjk_names 可检），二者必居其一 → 候选是命中超集。
+                let cands = pinyin_candidate_ids(store, q);
+                fused_scan_pinyin(store, overlay, q, pin_res, cands)
             }
             #[cfg(not(feature = "pinyin"))]
             {
@@ -421,7 +424,11 @@ impl SearchEngine {
                 fused_scan(store, overlay, q)
             }
         } else if no_ext_filter && no_complex_name && name_terms_compatible {
-            fused_scan(store, overlay, q)
+            // trigram 剪枝：字面 case-insensitive 查询先求交倒排候选，命中稀疏时直接省掉全表扫描。
+            match trigram_candidate_ids(store, q) {
+                Some(ids) => fused_scan_cand(store, overlay, q, ids),
+                None => fused_scan(store, overlay, q),
+            }
         } else {
             // === Slow / 复杂 path：保留原 retain 链 + name_match_phase（regex/glob/pinyin/name_terms 等）
             let mut cand = initial_candidates(store, q);
@@ -787,6 +794,36 @@ impl SearchEngine {
         self.store.write()
     }
 
+    /// 重建 trigram 边车并热替换进内存（service 运行期调用，不重启）。
+    ///
+    /// 时序与正确性：
+    /// 1. **读锁**内记下 `pending_before`（读锁持有期间 USN apply 等写锁，`tri_pending` 冻结）
+    ///    并全量构建新 `.tri`——构建用的就是此刻的 entries / 名字，天然覆盖 pending 条目；
+    /// 2. **写锁**内：加载新边车替换 `store.trigram`，再把 `pending_before` 从 `tri_pending`
+    ///    里减掉。构建结束后（读锁释放、写锁取得前）USN 登记的新 pending 不在 `pending_before`
+    ///    里，得以保留——新 `.tri` 不含它们的最新名字，仍需 pending 兜底。
+    ///
+    /// 构建耗时数秒（8.5M 条目 ~3-5s），期间 search reader 不受影响（读锁共享），
+    /// USN flush 短暂阻塞（journal 持久，事件不丢只延迟）。
+    pub fn rebuild_trigram_sidecar(&self, index_path: &std::path::Path) -> Result<()> {
+        let pending_before = {
+            let store = self.index_store();
+            let pending_before = store.tri_pending.clone();
+            crate::trigram::build_and_save(&store, index_path)?;
+            pending_before
+        };
+        let new_tri = crate::trigram::TrigramIndex::load(&crate::trigram::tri_sidecar_path(
+            index_path,
+        ))?
+        .ok_or_else(|| crate::Error::Persist("trigram 重建后加载失败".into()))?;
+        {
+            let mut store = self.index_store_mut();
+            store.trigram = Some(Arc::new(new_tri));
+            store.tri_pending -= &pending_before;
+        }
+        Ok(())
+    }
+
     /// 非阻塞读取——给 Status/Health 这种"宁可拿不到也别卡 IPC 线程"的场景。
     ///
     /// parking_lot 的 try_read 比 std 还宽松：std 在 Windows SRW 上 try_read 也会被排队中的
@@ -962,6 +999,141 @@ fn build_pinyin_matcher(needle: &str) -> Result<IbRegex<'_>> {
 }
 
 fn fused_scan(store: &IndexStore, overlay: &MetaOverlay, q: &ParsedQuery) -> Vec<u32> {
+    let n = store.entries.len() as u32;
+    fused_scan_par(store, overlay, q, (0..n).into_par_iter())
+}
+
+/// 候选集版本：trigram 剪枝后只在候选 idx 上跑同一套融合过滤。
+/// `ids` 为空 Vec 与全表扫描语义不同（空 = 0 候选），调用方负责语义。
+fn fused_scan_cand(
+    store: &IndexStore,
+    overlay: &MetaOverlay,
+    q: &ParsedQuery,
+    ids: Vec<u32>,
+) -> Vec<u32> {
+    fused_scan_par(store, overlay, q, ids.into_par_iter())
+}
+
+/// trigram 剪枝候选（含 pending 并入）。返回 `None` 表示不适合剪枝，应回退全表扫描。
+///
+/// 剪枝条件：case-insensitive（索引只覆盖 ASCII 小写字节）、纯字面路径（拼音 /
+/// regex / glob / ext 走各自路径）、needle ≥3 字节、候选规模 < 全表 1/3。
+///
+/// starts_with / ends_with 也并入候选源：它们是 AND 过滤（`apply_post_name_filters`
+/// 精确 retain），而名字以 X 开头/结尾必包含 X 的全部 trigram，交集候选仍是命中超集。
+fn trigram_candidate_ids(store: &IndexStore, q: &ParsedQuery) -> Option<Vec<u32>> {
+    if q.case_sensitive {
+        return None;
+    }
+    // 选最长 needle：多 term AND 里最长的通常最稀疏，位图求交收益最大。
+    let needle: Vec<u8> = {
+        let mut cands: Vec<&str> = Vec::new();
+        if let Some(ref s) = q.substring {
+            cands.push(s);
+        }
+        cands.extend(q.name_terms.iter().map(|s| s.as_str()));
+        if let Some(ref s) = q.starts_with {
+            cands.push(s);
+        }
+        if let Some(ref s) = q.ends_with {
+            cands.push(s);
+        }
+        cands
+            .into_iter()
+            .max_by_key(|s| s.len())
+            .map(|s| s.to_ascii_lowercase().into_bytes())?
+    };
+    let tri = store.trigram.as_ref()?;
+    let n = store.entries.len();
+    if n == 0 {
+        return None;
+    }
+    let mut bm = tri.lookup_candidates(&needle)?;
+    // 候选太密（如 "the" / "ing" 这类高频 trigram）：位图收集 + 收集后遍历不如直接扫全表。
+    if bm.len() as usize > n / 3 {
+        return None;
+    }
+    bm |= &store.tri_pending;
+    Some(bm.iter().collect())
+}
+
+/// needle 里不能出现的正则元字符：lita 把 needle 按正则语法解析，
+/// 含元字符时字面字节不再是命中的必要条件（"a.c" 能命中 "axb"），剪枝会漏。
+#[cfg(feature = "pinyin")]
+const REGEX_META_BYTES: &[u8] = b"\\.*+?()[]{}|^$";
+
+/// 拼音路径候选剪枝（Auto 模式的 GUI 热路径）。
+///
+/// 超集论证：lita（plain 子串 + 拼音两套匹配）命中一个名字时，二者必居其一：
+/// 1. 字面命中：名字含 needle 的（ASCII 不区分大小写）字节序列 → trigram 倒排可检出；
+/// 2. 拼音命中：名字至少含一个拼音字符（≥ U+2000 量级）→ `cjk_names` 位图可检出。
+///
+/// 故候选 = `∩ᵢ (trigram(nᵢ) ∪ cjk_names)`（多 needle AND）∪ tri_pending，恒为命中超集。
+///
+/// 放弃剪枝（返回 `None`，回退全表）的条件：
+/// - case-sensitive（trigram 索引只存小写）、边车缺失；
+/// - 任一 needle 含正则元字符（正则语义超出字面超集）；
+/// - 所有 needle 都 <3 字节（无 trigram 可用）；
+/// - 最终候选太密（> 全表 1/3，位图开销超过省下的扫描）。
+#[cfg(feature = "pinyin")]
+fn pinyin_candidate_ids(store: &IndexStore, q: &ParsedQuery) -> Option<Vec<u32>> {
+    if q.case_sensitive {
+        return None;
+    }
+    let tri = store.trigram.as_ref()?;
+    let n = store.entries.len();
+    if n == 0 {
+        return None;
+    }
+    let mut needles: Vec<&str> = Vec::new();
+    if let Some(ref s) = q.substring {
+        needles.push(s);
+    }
+    needles.extend(q.name_terms.iter().map(|s| s.as_str()));
+    if let Some(ref s) = q.starts_with {
+        needles.push(s);
+    }
+    if let Some(ref s) = q.ends_with {
+        needles.push(s);
+    }
+    if needles
+        .iter()
+        .any(|s| s.bytes().any(|b| REGEX_META_BYTES.contains(&b)))
+    {
+        return None;
+    }
+
+    let mut acc: Option<RoaringBitmap> = None;
+    let mut pruned_any = false;
+    for s in needles {
+        let lower = s.to_ascii_lowercase().into_bytes();
+        if lower.len() < 3 {
+            // <3 字节无 trigram 可用：该 needle 不参与剪枝（不约束候选集）。
+            continue;
+        }
+        pruned_any = true;
+        let mut needle_cand = tri.lookup_candidates(&lower)?;
+        needle_cand |= &store.cjk_names;
+        acc = Some(match acc {
+            None => needle_cand,
+            Some(a) => a & needle_cand,
+        });
+    }
+    if !pruned_any {
+        return None;
+    }
+    let mut bm = acc?;
+    bm |= &store.tri_pending;
+    if bm.len() as usize > n / 3 {
+        return None;
+    }
+    Some(bm.iter().collect())
+}
+/// 融合扫描主体：`ids` 是并行迭代器（全表 Range 或 trigram 候选 Vec），过滤逻辑完全一致。
+fn fused_scan_par<PI>(store: &IndexStore, overlay: &MetaOverlay, q: &ParsedQuery, ids: PI) -> Vec<u32>
+where
+    PI: rayon::iter::IndexedParallelIterator<Item = u32>,
+{
     // 收集 needle 列表：name_terms 是 AND 关系；fallback 到 substring。
     let needles_owned: Vec<Vec<u8>> = if !q.name_terms.is_empty() {
         q.name_terms
@@ -1020,8 +1192,7 @@ fn fused_scan(store: &IndexStore, overlay: &MetaOverlay, q: &ParsedQuery) -> Vec
     let _dbg = std::env::var("FINDX2_DEBUG_SEARCH").is_ok();
     let _t_par = std::time::Instant::now();
     let _n_threads = if _dbg { rayon::current_num_threads() } else { 0 };
-    let result = (0u32..n)
-        .into_par_iter()
+    let result = ids
         .fold(Vec::new, |mut acc, idx| {
             let e = unsafe { store.entries.get_unchecked(idx as usize) };
             // 1) deleted（最常 false，先剪枝）
@@ -1132,14 +1303,37 @@ fn fused_scan(store: &IndexStore, overlay: &MetaOverlay, q: &ParsedQuery) -> Vec
 ///    走 dense DFA（~50 ns），含中文走 IbMatcher 拼音表匹配（~200-500 ns）。
 ///
 /// 多 needle（name_terms.len() > 1）走 AND：所有 IbRegex 都命中才算命中，与字面 fused_scan 对齐。
+///
+/// `cands`：拼音候选剪枝位（`pinyin_candidate_ids` 产出）；`None` = 全表扫描。
 #[cfg(feature = "pinyin")]
 fn fused_scan_pinyin(
     store: &IndexStore,
     overlay: &MetaOverlay,
     q: &ParsedQuery,
     pin_res: &[IbRegex<'_>],
+    cands: Option<Vec<u32>>,
 ) -> Vec<u32> {
     debug_assert!(!pin_res.is_empty(), "fused_scan_pinyin 调用方必须保证 pin_res 非空");
+    match cands {
+        Some(ids) => fused_scan_pinyin_par(store, overlay, q, pin_res, ids.into_par_iter()),
+        None => {
+            let n = store.entries.len() as u32;
+            fused_scan_pinyin_par(store, overlay, q, pin_res, (0..n).into_par_iter())
+        }
+    }
+}
+
+#[cfg(feature = "pinyin")]
+fn fused_scan_pinyin_par<PI>(
+    store: &IndexStore,
+    overlay: &MetaOverlay,
+    q: &ParsedQuery,
+    pin_res: &[IbRegex<'_>],
+    ids: PI,
+) -> Vec<u32>
+where
+    PI: rayon::iter::IndexedParallelIterator<Item = u32>,
+{
 
     let only_files = q.only_files;
     let only_dirs = q.only_dirs;
@@ -1153,7 +1347,6 @@ fn fused_scan_pinyin(
     let ctime_min = q.ctime_min.map(crate::index::filetime_to_unix_secs);
     let ctime_max = q.ctime_max.map(crate::index::filetime_to_unix_secs);
     let check_deleted_bm = !store.deleted.is_empty();
-    let n = store.entries.len() as u32;
     let any_size_filter = metadata_ready && (size_min.is_some() || size_max.is_some());
     let any_time_filter = mtime_min.is_some()
         || mtime_max.is_some()
@@ -1164,8 +1357,7 @@ fn fused_scan_pinyin(
     let _t_par = std::time::Instant::now();
     let _n_threads = if _dbg { rayon::current_num_threads() } else { 0 };
 
-    let result = (0u32..n)
-        .into_par_iter()
+    let result = ids
         .fold(Vec::new, |mut acc, idx| {
             let e = unsafe { store.entries.get_unchecked(idx as usize) };
             if e.is_deleted() {
@@ -1245,7 +1437,7 @@ fn fused_scan_pinyin(
     if _dbg {
         eprintln!(
             "[fused_scan_pinyin] entries={} hits={} threads={} took={:.2}ms needles={}",
-            n,
+            store.entries.len(),
             result.len(),
             _n_threads,
             _t_par.elapsed().as_micros() as f64 / 1000.0,

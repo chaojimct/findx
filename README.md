@@ -50,6 +50,56 @@
 1. `FrnIdxMap`：`FxHashMap<u64, u32>` → `sorted: Vec<(u64, u32)> + overlay`，省 ~200 MB。
 2. 删 `names_lower_buf`：搜索热路径用栈缓冲即时 ASCII 小写化（`name_lower_into`），省 ~175 MB。
 3. `FileEntry` 紧凑化 40 B → 32 B：`mtime`/`ctime` 由 FILETIME u64 改为 unix 秒 u32（覆盖到 2106 年），对外 IPC/SearchHit 仍然返回 FILETIME，零兼容破坏；同时 `index.bin` 升 v5（v4 自动迁移），省 ~125 MB + 64 MiB 盘体积。
+4. `names_buf` 构建期名字去重（interning）：重复文件名/目录名共享同一段字节（node_modules、`.git/objects`、winsxs 等场景重名率很高），目录名统一 null 终止使同名文件/目录可互相共享；去重哈希表构建结束即整体释放，**运行时零常驻开销**，`index.bin` 同步缩小且 v5 格式不变。实测本机 371 万条目（`C:\Windows` + 用户目录）names_buf 84.6 MB → 45.2 MB，省 46.6%（`cargo run -p findx2-core --release --example dedup_stat -- <目录>` 可复现）。
+
+## 子串查询剪枝（trigram 倒排）与 mmap 加载
+
+参考 plocate 的 trigram 倒排思路，为 case-insensitive 字面查询增加**剪枝层**：把每个文件名拆成三字节组合（trigram），建 `trigram → 命中条目位图` 的倒排表，查询先对 needle 的全部 trigram 求交得到候选集，再只对候选跑原有 memmem 验证链——trigram 是**必要条件**（名字含 needle 必含其所有 trigram），候选集是真实命中的超集，绝不漏报。
+
+- **边车 `<index>.tri`**：mmap 只读挂载，posting 留在页缓存按需反序列化（私有 RSS 近零），带 64 MB 预算的位图 LRU。
+- **增量维护**：USN 改名/新增进 `tri_pending` 位图（查询时并入候选）；超过 `max(条目数/32, 65536)` 后 service 后台重建边车并热替换（构建期间读锁共享，搜索零阻塞）。
+- **回退条件**：needle <3 字节、case-sensitive、正则/glob 路径、候选超全表 1/3（高频词直接全表 SIMD 扫描更划算）。拼音路径不走此层，走下方专属剪枝。
+- **`startwith:` / `endwith:` 同样剪枝**：它们是 AND 精确过滤，名字以 X 开头必含 X 的全部 trigram，候选仍是命中超集。
+- **mmap 预取**：`index.bin` 与边车挂载后经 `PrefetchVirtualMemory`（Win8+，GetProcAddress 动态解析）一次整段读入页缓存，消除首查 ~12k 次逐页 fault 抖动。
+
+实测 115 万条目（80.7 MiB 索引，`cargo run -p findx2-core --release --example tri_bench -- index.bin` 可复现）：
+
+| 查询 | 全表扫描 | trigram 剪枝 | 加速 |
+| --- | --- | --- | --- |
+| `kernel32`（121 hits） | 5.05 ms | **0.35 ms** | **14.3x** |
+| `.gitignore`（313 hits） | 5.51 ms | **0.60 ms** | **9.2x** |
+| `template`（1902 hits） | 7.83 ms | **2.56 ms** | 3.1x |
+| `config`（9627 hits） | 9.04 ms | **3.15 ms** | 2.9x |
+| `startwith:kernel32`（40 hits） | 72.53 ms | **0.22 ms** | **323.8x** |
+| `startwith:readme`（6167 hits） | 75.58 ms | **2.59 ms** | **29.2x** |
+| `startwith:config`（1241 hits） | 76.44 ms | **3.80 ms** | **20.1x** |
+
+前缀查询原来走逐条 retain 的慢路径（72–76 ms），剪枝后加速最显著。边车构建成本 0.59 s / 49.8 MiB（建库或 service 启动时后台完成一次）；查询越稀疏加速越大，高频词退化为全表扫描路径、无额外开销。
+
+`index.bin` 加载自 v5 起走 **mmap + 整段 memcpy** 快路径（entries 段按 `align_of::<FileEntry>` 对齐校验后一次性拷入，未对齐退回逐条解析），115 万条目加载 63 ms、8.5M 条目约 0.7 s 量级，页缓存热态更快。
+
+## 拼音查询剪枝（trigram ∪ cjk_names）
+
+拼音 Auto 模式（GUI 默认）原本对全表跑 lita 拼音正则（dense DFA ~50 ns/条 + 中文走拼音表），百万条目量级 10–80 ms。剪枝思路：lita 命中一个名字**必居其一**——
+
+1. **字面命中**：名字含 needle 的 ASCII（不区分大小写）字节序列 → trigram 倒排可检出；
+2. **拼音命中**：名字至少含一个拼音字符（UTF-8 字节 ≥ 0xE2，码点 ≥ U+2000 量级）→ `cjk_names` 位图可检出。
+
+故候选 = `∩ᵢ (trigram(nᵢ) ∪ cjk_names)`（多 needle AND）∪ `tri_pending`，恒为命中超集；候选上仍走 lita 正则验证链，零漏报。纯英文索引上 `cjk_names` 为空、剪枝退化为纯 trigram；中文名占比越高剪枝越保守（候选超全表 1/3 自动回退全表）。
+
+- **`cjk_names` 位图**：运行时字段，加载/建库后并行扫一遍名字重建（115 万条目 ~10 ms），USN 增量由 `note_name_change` 与 `tri_pending` 同步维护。
+- **守卫**：case-sensitive、含正则元字符的 needle（`.` `*` 等会改变字面语义）、全部 needle <3 字节时放弃剪枝回退全表。
+- **一致性回归**：`pinyin_prune_consistency_with_trigram_sidecar`（fixture + 600 噪声条目，边车前后逐条比对）。
+
+实测 115 万条目（同一份 `tri_bench`，`--features pinyin`）：
+
+| 查询 | 拼音 Auto 全表 | 剪枝后 | 加速 |
+| --- | --- | --- | --- |
+| `config`（1000 hits） | 16.76 ms | **3.74 ms** | 4.5x |
+| `weixin`（108 hits，拼音命中中文名） | 11.09 ms | **0.45 ms** | **24.5x** |
+| `jisuanqi`（0 hits，无中文目标） | 9.73 ms | **0.25 ms** | **38.9x** |
+| `startwith:config`（1000 hits） | 82.20 ms | **4.10 ms** | **20.0x** |
+| `startwith:jisuanqi`（0 hits） | 76.88 ms | **0.00 ms** | >10⁴x |
 
 ## 建索引与元数据回填
 
@@ -169,6 +219,8 @@ findx2-service uninstall
 当前 `index.bin` 为 **v5**：FileEntry 32 字节紧凑布局（mtime/ctime u32 unix 秒），目录路径按需解析（不物化到磁盘）。`watch` 会写真实 `volume_serial` / `usn_journal_id` / `last_usn`，从上次游标续跑；Journal 被重建（ID 变化）时会全量重建。
 
 加载兼容：v3 / v4 老索引在 load 时一次性迁移到 v5 内存布局，下次保存写出 v5。
+
+trigram 剪枝有两个边车：`<index>.tri`（倒排表，构建/重建时原子替换）与 `<index>.tri.pending`（增量位图 + 快照条目数，随 `index.bin` 一起落盘；加载时若两者快照数不一致则禁用剪枝回退全表扫描）。边车缺失/损坏一律静默降级，service 启动时后台补建。
 
 ## 版本号（GUI / 安装包）
 

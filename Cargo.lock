@@ -1237,6 +1237,7 @@ dependencies = [
  "glob",
  "ib-matcher",
  "memchr",
+ "memmap2",
  "parking_lot",
  "rayon",
  "regex",
@@ -1249,7 +1250,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-gui"
-version = "2.1.0"
+version = "2.1.2"
 dependencies = [
  "arboard",
  "base64 0.22.1",
@@ -2627,6 +2628,15 @@ name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
+
+[[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "memoffset"

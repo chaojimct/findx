@@ -205,3 +205,116 @@ fn chinese_literal_name_term_no_ascii_pinyin_path() {
     assert_eq!(n.len(), 1);
 }
 
+/// 拼音剪枝一致性回归：trigram 边车挂载前后，拼音 Auto / 字面查询结果必须逐条一致。
+///
+/// fixture（含中文名）+ 600 条 ASCII 噪声，保证 cjk_names ≪ n/3 ——
+/// 否则 `pinyin_candidate_ids` 因候选过密回退全表，测不到剪枝分支。
+#[test]
+fn pinyin_prune_consistency_with_trigram_sidecar() {
+    use findx2_core::{build_trigram_sidecar, load_index_bin, save_index_bin};
+
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../files_for_test");
+    assert!(fixture_dir.is_dir(), "缺少 {}", fixture_dir.display());
+
+    const ROOT_FRN: u64 = 100;
+    let dirs = vec![RawEntry {
+        file_id: ROOT_FRN,
+        file_id_128: None,
+        parent_id: 0,
+        name: "fixture_root".into(),
+        size: 0,
+        mtime: 0,
+        ctime: 0,
+        attrs: 0x10,
+        is_dir: true,
+    }];
+
+    let mut files: Vec<RawEntry> = Vec::new();
+    let mut id: u64 = 10_000;
+    for e in std::fs::read_dir(&fixture_dir).expect("read_dir") {
+        let e = e.expect("dirent");
+        if !e.metadata().expect("metadata").is_file() {
+            continue;
+        }
+        files.push(RawEntry {
+            file_id: id,
+            file_id_128: None,
+            parent_id: ROOT_FRN,
+            name: e.file_name().to_string_lossy().into_owned(),
+            size: 1,
+            mtime: 1,
+            ctime: 1,
+            attrs: 0,
+            is_dir: false,
+        });
+        id += 1;
+    }
+    // ASCII 噪声：一部分故意以 "beijing" 开头（字面 + 前缀命中），其余无关。
+    for i in 0..600u64 {
+        let name = if i % 7 == 0 {
+            format!("beijing-noise-{i}.dat")
+        } else if i % 11 == 0 {
+            format!("noise-sh{i}.log")
+        } else {
+            format!("noise-file-{i}.bin")
+        };
+        files.push(RawEntry {
+            file_id: id,
+            file_id_128: None,
+            parent_id: ROOT_FRN,
+            name,
+            size: 1,
+            mtime: 1,
+            ctime: 1,
+            attrs: 0,
+            is_dir: false,
+        });
+        id += 1;
+    }
+
+    let build = |files: &[RawEntry]| {
+        IndexBuilder::new(b'C', 1, 1, 1)
+            .build_from_raw(files.to_vec(), dirs.clone(), true)
+            .expect("build_from_raw")
+    };
+
+    // 1) 无边车基线（trigram=None → fused_scan_pinyin 全表）。
+    let engine_plain = SearchEngine::new(build(&files));
+
+    // 2) 落盘 + 建边车 + 重载（mmap 挂载 + cjk_names 重建）。
+    let tmp = std::env::temp_dir().join(format!("findx2-py-prune-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let idx = tmp.join("index.bin");
+    let store = build(&files);
+    save_index_bin(&idx, &store).unwrap();
+    build_trigram_sidecar(&store, &idx).unwrap();
+    drop(store);
+    let loaded = load_index_bin(&idx).unwrap();
+    assert!(loaded.trigram.is_some(), "trigram 边车应挂载");
+    assert!(!loaded.cjk_names.is_empty(), "cjk_names 应非空");
+    let engine_pruned = SearchEngine::new(loaded);
+
+    let queries = [
+        "beijing",     // 全拼 → 北京 + noise-beijing-*（字面）
+        "sh",          // 简拼 → 上海 + noise-sh*（字面）；<3 字节不剪枝
+        "shanghai lujiazui", // 多 needle AND
+        "pinyin quanpin",    // 双拼音词
+        "中文",        // CJK needle（字面 UTF-8 窗口）
+        "english",     // 纯 ASCII
+        "startwith:beijing", // 前缀
+        "startwith:noise",   // 前缀 + 高频候选
+    ];
+    for q in queries {
+        let a = names(&engine_plain, q, true);
+        let b = names(&engine_pruned, q, true);
+        assert_eq!(a, b, "拼音 Auto 边车前后结果不一致: {q}");
+        assert!(!a.is_empty(), "拼音 Auto 应至少命中一条: {q}");
+        let a = names(&engine_plain, q, false);
+        let b = names(&engine_pruned, q, false);
+        assert_eq!(a, b, "字面查询边车前后结果不一致: {q}");
+    }
+
+    std::fs::remove_dir_all(&tmp).ok();
+}
+

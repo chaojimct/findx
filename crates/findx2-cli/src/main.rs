@@ -364,6 +364,7 @@ fn run() -> Result<()> {
                             if last_save.elapsed() >= save_every {
                                 save_index_bin(&index, &store)?;
                                 eprintln!("[findx2] 已保存 checkpoint last_usn={next_usn}");
+                                maybe_rebuild_trigram_cli(&mut store, &index);
                                 last_save = Instant::now();
                             }
                         }
@@ -374,6 +375,7 @@ fn run() -> Result<()> {
                             eprintln!("[findx2] 定时落盘（游标） last_usn={}", {
                                 store.volumes.first().map(|v| v.last_usn).unwrap_or(0)
                             });
+                            maybe_rebuild_trigram_cli(&mut store, &index);
                             last_save = Instant::now();
                         }
                     }
@@ -398,6 +400,26 @@ fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `watch` 调试模式：trigram 增量超阈值时同步重建边车（watch 是单线程串行，
+/// 构建期间无并发 apply，构建完成后 pending 可直接清零）。
+fn maybe_rebuild_trigram_cli(store: &mut findx2_core::IndexStore, index: &std::path::Path) {
+    if !store.tri_pending_overflow() {
+        return;
+    }
+    match findx2_core::build_trigram_sidecar(store, index) {
+        Ok(()) => {
+            if let Some(t) = findx2_core::TrigramIndex::load(&findx2_core::tri_sidecar_path(index))
+                .ok()
+                .flatten()
+            {
+                store.trigram = Some(std::sync::Arc::new(t));
+                store.tri_pending.clear();
+            }
+        }
+        Err(e) => eprintln!("[findx2] trigram 重建失败: {e}"),
+    }
 }
 
 fn print_table(hits: &[findx2_core::SearchHit], cols: &[OutColumn]) {

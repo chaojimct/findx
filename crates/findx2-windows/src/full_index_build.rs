@@ -248,6 +248,11 @@ pub fn build_full_disk_index(
     save_index_bin(output, &store)?;
     // 把规范化的排除目录写边车（即便为空也写一份；下次 GUI 改设置可以读到旧值做 diff）。
     save_exclude_sidecar(output, &normalized_excludes)?;
+    // trigram 倒排边车：建库后一次性构建（service 启动时若缺失也会后台补建）。
+    if let Err(e) = findx2_core::build_trigram_sidecar(&store, output) {
+        // 剪枝层缺失只影响性能（回退全表扫描），不阻断建库主流程。
+        findx2_core::progress!("trigram 边车构建失败（搜索将回退全表扫描）: {e}");
+    }
     let _ = std::fs::remove_file(progress_path.as_ref());
     tracing::info!("已写入 {}，条目 {}", output.display(), entry_count);
     println!("已写入 {}，条目 {}", output.display(), entry_count);
