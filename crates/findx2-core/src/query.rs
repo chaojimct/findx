@@ -83,9 +83,6 @@ pub struct ParsedQuery {
     pub wildcards: bool,
     /// `nowfn:` 仅匹配文件名（关闭全路径启发式）
     pub nowfn: bool,
-    /// 访问时间 FILETIME（当前索引未持久化 atime 时搜索层报错）
-    pub atime_min: Option<u64>,
-    pub atime_max: Option<u64>,
     /// `depth:` min..max
     pub depth_min: Option<u32>,
     pub depth_max: Option<u32>,
@@ -143,8 +140,6 @@ impl Default for ParsedQuery {
             nopath: false,
             wildcards: false,
             nowfn: false,
-            atime_min: None,
-            atime_max: None,
             depth_min: None,
             depth_max: None,
             child_exact: None,
@@ -396,7 +391,9 @@ fn apply_func(q: &mut ParsedQuery, key: &str, val: &str) -> std::result::Result<
             q.nowfn = v == "1" || v == "yes" || v == "true";
         }
         "da" | "dateaccessed" => {
-            parse_access_date_range(q, val)?;
+            return Err(crate::Error::Query(
+                "当前索引未存储文件访问时间，暂不支持 da: / dateaccessed: 过滤".into(),
+            ));
         }
         "depth" => {
             let v = val.trim();
@@ -745,73 +742,6 @@ fn parse_date_range(val: &str, mtime: bool, q: &mut ParsedQuery) -> std::result:
                 match parse_date_token_flexible(&v) {
                     Ok((lo, hi)) => apply(Some(lo), Some(hi)),
                     Err(_) => return Err(Error::Query(format!("不支持的日期条件: {val}"))),
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// `da:` / `dateaccessed:` — 访问时间由索引中的 atime 字段过滤；若未建 atime，搜索层会报错。
-fn parse_access_date_range(q: &mut ParsedQuery, val: &str) -> std::result::Result<(), Error> {
-    let v = val.trim().to_ascii_lowercase();
-    let now = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| Error::Query(e.to_string()))?
-        .as_secs();
-    let day_start = |unix: u64| unix - (unix % 86400);
-    let today_start = day_start(now);
-    let mut apply = |min_opt: Option<u64>, max_opt: Option<u64>| {
-        if let Some(x) = min_opt {
-            q.atime_min = Some(x);
-        }
-        if let Some(x) = max_opt {
-            q.atime_max = Some(x);
-        }
-    };
-    match v.as_str() {
-        "today" => apply(Some(unix_secs_to_filetime(today_start)), None),
-        "yesterday" => {
-            let ys = today_start.saturating_sub(86400);
-            apply(
-                Some(unix_secs_to_filetime(ys)),
-                Some(unix_secs_to_filetime(today_start).saturating_sub(1)),
-            );
-        }
-        "thisweek" => {
-            let (w0, _) = calendar_week_bounds_local();
-            apply(
-                Some(unix_secs_to_filetime(w0)),
-                Some(unix_secs_to_filetime(today_start.saturating_add(86400).saturating_sub(1))),
-            );
-        }
-        "thismonth" => {
-            let (m0, _) = calendar_month_bounds_local();
-            apply(Some(unix_secs_to_filetime(m0)), None);
-        }
-        _ => {
-            if let Some((a, b)) = v.split_once("..") {
-                let (a_lo, _) = parse_date_token_flexible(a.trim())?;
-                let (_, b_hi) = parse_date_token_flexible(b.trim())?;
-                apply(Some(a_lo), Some(b_hi));
-            } else if let Some(rest) = v.strip_prefix('>') {
-                let rest = rest.trim();
-                if rest.is_empty() {
-                    return Err(Error::Query(format!("不支持的访问日期条件: {val}")));
-                }
-                let (lo, _) = parse_date_token_flexible(rest)?;
-                apply(Some(lo), None);
-            } else if let Some(rest) = v.strip_prefix('<') {
-                let rest = rest.trim();
-                if rest.is_empty() {
-                    return Err(Error::Query(format!("不支持的访问日期条件: {val}")));
-                }
-                let (_, hi) = parse_date_token_flexible(rest)?;
-                apply(None, Some(hi));
-            } else {
-                match parse_date_token_flexible(&v) {
-                    Ok((lo, hi)) => apply(Some(lo), Some(hi)),
-                    Err(_) => return Err(Error::Query(format!("不支持的访问日期条件: {val}"))),
                 }
             }
         }

@@ -3,7 +3,7 @@
   <assemblyIdentity
     type="win32"
     name="tools.findx2.gui"
-    version="0.1.0.0"
+    version="2.1.0.0"
     processorArchitecture="*"
   />
   <dependency>

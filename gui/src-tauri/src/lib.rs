@@ -959,11 +959,6 @@ async fn rebuild_index(_app: tauri::AppHandle) -> Result<IndexStatus, String> {
 async fn apply_run_mode_change(app: tauri::AppHandle, target: String) -> Result<(), String> {
     let settings = findx_settings::load_findx_settings(app.clone())?;
     let base = findx_settings::exe_resource_dir();
-    let exe = match findx_settings::resolve_cli_exe(&base, &settings) {
-        Some(_) => {}
-        None => {}
-    };
-    let _ = exe;
     let service_exe = if !settings.service_exe_path.trim().is_empty() {
         std::path::PathBuf::from(settings.service_exe_path.trim())
     } else {
@@ -1035,14 +1030,45 @@ fn delete_path(
 ) -> Result<bool, String> {
     #[cfg(target_os = "windows")]
     {
-        let _ = recycle_bin.or(recycleBin);
-        let p = std::path::PathBuf::from(&path);
-        if p.is_dir() {
-            std::fs::remove_dir_all(&p).map_err(|e| e.to_string())?;
+        let use_recycle_bin = recycle_bin.or(recycleBin).unwrap_or(true);
+        if use_recycle_bin {
+            // 使用 SHFileOperationW 将文件/目录移至回收站
+            use std::os::windows::ffi::OsStrExt;
+            use windows::Win32::UI::Shell::{FOF_ALLOWUNDO, FO_DELETE, SHFileOperationW, SHFILEOPSTRUCTW};
+            // FOF_NO_UI = FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_NOCONFIRMMKDIR
+            const FOF_NO_UI: u16 = 0x0604;
+            let wide_path: Vec<u16> = std::path::Path::new(&path)
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0)) // 单 null 终止
+                .chain(Some(0)) // 双 null 终止（SHFileOperation 要求）
+                .collect();
+            let mut op = SHFILEOPSTRUCTW {
+                hwnd: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+                wFunc: FO_DELETE,
+                pFrom: windows::core::PCWSTR(wide_path.as_ptr()),
+                pTo: windows::core::PCWSTR(std::ptr::null()),
+                fFlags: FOF_ALLOWUNDO.0 as u16 | FOF_NO_UI,
+                fAnyOperationsAborted: Default::default(),
+                hNameMappings: std::ptr::null_mut(),
+                lpszProgressTitle: windows::core::PCWSTR(std::ptr::null()),
+            };
+            let result = unsafe { SHFileOperationW(&mut op) };
+            if result != 0 {
+                return Err(format!(
+                    "移至回收站失败（SHFileOperationW 返回 {result}）。请确认路径存在且未被占用。"
+                ));
+            }
+            Ok(true)
         } else {
-            std::fs::remove_file(&p).map_err(|e| e.to_string())?;
+            let p = std::path::PathBuf::from(&path);
+            if p.is_dir() {
+                std::fs::remove_dir_all(&p).map_err(|e| e.to_string())?;
+            } else {
+                std::fs::remove_file(&p).map_err(|e| e.to_string())?;
+            }
+            Ok(true)
         }
-        Ok(true)
     }
 
     #[cfg(not(target_os = "windows"))]
