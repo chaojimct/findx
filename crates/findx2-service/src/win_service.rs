@@ -168,20 +168,53 @@ pub fn install(
         account_password: None,
     };
 
-    let _ = manager
-        .create_service(&service_info, ServiceAccess::QUERY_STATUS)
+    // 升级安装时旧服务常处于「标记删除」，SCM 要等进程/句柄释放才让重建。
+    let mut last_err = None;
+    for attempt in 0..20 {
+        match manager.create_service(&service_info, ServiceAccess::QUERY_STATUS) {
+            Ok(_) => {
+                tracing::info!("已注册服务 {SERVICE_NAME}，请使用 services.msc 或 sc start 启动");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!("注册服务第 {} 次失败: {e}", attempt + 1);
+                last_err = Some(e);
+                let _ = try_delete_existing_service();
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "注册服务 {SERVICE_NAME} 失败: {}",
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "未知错误".into())
+    ))
+}
+
+fn try_delete_existing_service() -> anyhow::Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    tracing::info!("已注册服务 {SERVICE_NAME}，请使用 services.msc 或 sc start 启动");
+    let service = manager
+        .open_service(
+            SERVICE_NAME,
+            ServiceAccess::DELETE | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let _ = service.stop();
+    service.delete().map_err(|e| anyhow::anyhow!("{}", e))?;
     Ok(())
 }
 
 pub fn uninstall() -> anyhow::Result<()> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let service = manager
-        .open_service(SERVICE_NAME, ServiceAccess::DELETE)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    service.delete().map_err(|e| anyhow::anyhow!("{}", e))?;
-    tracing::info!("已标记删除服务 {SERVICE_NAME}（停止后生效）");
-    Ok(())
+    match try_delete_existing_service() {
+        Ok(()) => {
+            tracing::info!("已标记删除服务 {SERVICE_NAME}（停止后生效）");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::info!("卸载服务 {SERVICE_NAME}：{e}（可能尚未注册）");
+            Ok(())
+        }
+    }
 }

@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [2.1.4] - 2026-09-03
+
+### 修复
+
+- **正式安装后 USN「拒绝访问」**：升级时 `uninstall` 后立刻 `install`，旧服务还在「标记删除」就会注册失败且安装器不检查返回值；GUI 再沿用旧设置里的相对 `index.bin`，用普通权限拉起进程去开 `\\.\C:`。安装器改为等待 SCM 释放后重试注册，失败会弹窗；已安装布局把旧相对路径迁到 `ProgramData\FindX`；服务模式只通过 `FindX2Search` 启动，不再直拉无权限进程。
+
 ## [2.1.3] - 2026-09-03
 
 ### 索引创建与实时更新（HDD / 大批量复制专项）
@@ -61,7 +67,8 @@
 
 - 仓库根目录补充 **MIT** 全文许可（`LICENSE`），与 `Cargo.toml` 工作区 `MIT OR Apache-2.0` 声明在 README 中说明对应关系。
 
-[Unreleased]: https://github.com/chaojimct/findx/compare/v2.1.3...HEAD
+[Unreleased]: https://github.com/chaojimct/findx/compare/v2.1.4...HEAD
+[2.1.4]: https://github.com/chaojimct/findx/compare/v2.1.3...v2.1.4
 [2.1.3]: https://github.com/chaojimct/findx/compare/v2.1.2...v2.1.3
 [2.1.2]: https://github.com/chaojimct/findx/compare/v2.1.1...v2.1.2
 [2.1.1]: https://github.com/chaojimct/findx/compare/v2.1.0...v2.1.1

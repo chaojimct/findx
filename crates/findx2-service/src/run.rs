@@ -670,7 +670,17 @@ fn usn_watch_loop(
                     error!("卷 {letter} USN 断档重建达上限，监听线程退出");
                     return Err(anyhow::anyhow!("卷 {letter} USN 断档重建达上限"));
                 } else {
-                    set_watch_error(letter, Some(format!("监听中断，重试中: {reason}")));
+                    let denied = reason.contains("拒绝访问")
+                        || reason.contains("0x80070005")
+                        || reason.contains("Access is denied");
+                    let msg = if denied {
+                        format!(
+                            "打开卷被拒绝（权限不足）。请确认系统服务 FindX2Search 正在运行，而不是普通权限的 findx2-service。{reason}"
+                        )
+                    } else {
+                        format!("监听中断，重试中: {reason}")
+                    };
+                    set_watch_error(letter, Some(msg));
                     error!("卷 {letter} {reason}，退避重启监听");
                 }
                 // 重建 worker（resume 重读：重建后游标已回绕到 frozen 点）。

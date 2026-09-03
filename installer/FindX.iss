@@ -7,7 +7,7 @@
 ; 与 v1 的 FindX.iss 类似：多任务（服务注册、PATH、桌面快捷方式、安装后启动），无 .NET 检测。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.1.3"
+  #define MyAppVersion "2.1.4"
 #endif
 
 #define MyAppName      "FindX"
@@ -134,11 +134,79 @@ begin
   RegWriteStringValue(HKLM, 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment', 'Path', Path);
 end;
 
+function QuerySearchServiceCode: Integer;
+begin
+  if not Exec(ExpandConstant('{sys}\sc.exe'), 'query {#MyServiceName}', '', SW_HIDE, ewWaitUntilTerminated, Result) then
+    Result := -1;
+end;
+
+function WaitSearchServiceGone(TimeoutMs: Integer): Boolean;
+var
+  Elapsed: Integer;
+begin
+  Elapsed := 0;
+  while Elapsed < TimeoutMs do
+  begin
+    if QuerySearchServiceCode() <> 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+    Sleep(200);
+    Elapsed := Elapsed + 200;
+  end;
+  Result := QuerySearchServiceCode() <> 0;
+end;
+
+function InstallSearchService: Boolean;
+var
+  R, Attempt: Integer;
+  IndexPath, AppDir, Params: String;
+begin
+  Result := False;
+  AppDir := ExpandConstant('{app}');
+  IndexPath := ExpandConstant('{commonappdata}') + '\FindX\index.bin';
+  ForceDirectories(ExpandConstant('{commonappdata}') + '\FindX');
+
+  Exec(AppDir + '\findx2-service.exe', 'uninstall', '', SW_HIDE, ewWaitUntilTerminated, R);
+  Log('FindX uninstall service exit=' + IntToStr(R));
+  if not WaitSearchServiceGone(8000) then
+  begin
+    Exec(ExpandConstant('{sys}\sc.exe'), 'stop {#MyServiceName}', '', SW_HIDE, ewWaitUntilTerminated, R);
+    Exec(ExpandConstant('{sys}\sc.exe'), 'delete {#MyServiceName}', '', SW_HIDE, ewWaitUntilTerminated, R);
+    WaitSearchServiceGone(8000);
+  end;
+
+  Params := 'install --index ' + #34 + IndexPath + #34;
+  for Attempt := 1 to 15 do
+  begin
+    if Exec(AppDir + '\findx2-service.exe', Params, '', SW_HIDE, ewWaitUntilTerminated, R) and (R = 0) then
+    begin
+      Result := True;
+      Break;
+    end;
+    Log('FindX install service attempt=' + IntToStr(Attempt) + ' exit=' + IntToStr(R));
+    Sleep(400);
+  end;
+
+  if not Result then
+  begin
+    MsgBox('注册 Windows 服务 {#MyServiceName} 失败。' + #13#10 +
+      'USN 增量监听需要该服务以 SYSTEM 运行，否则状态栏会报「打开卷失败: 拒绝访问」。' + #13#10 + #13#10 +
+      '请卸载后以管理员重装，或手动执行：' + #13#10 +
+      AppDir + '\findx2-service.exe install --index "' + IndexPath + '"' + #13#10 +
+      'sc start {#MyServiceName}', mbError, MB_OK);
+    Exit;
+  end;
+
+  Exec(ExpandConstant('{sys}\sc.exe'), 'start {#MyServiceName}', '', SW_HIDE, ewWaitUntilTerminated, R);
+  Log('FindX sc start exit=' + IntToStr(R));
+end;
+
 // ── 安装结束：服务 + 标记 + PATH ──
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  R: Integer;
-  IndexPath, AppDir, Marker, Params: String;
+  AppDir, Marker: String;
 begin
   if CurStep = ssPostInstall then
   begin
@@ -148,17 +216,7 @@ begin
 
     if WizardIsComponentSelected('servicec') then
     begin
-      ForceDirectories(ExpandConstant('{commonappdata}') + '\FindX');
-      IndexPath := ExpandConstant('{commonappdata}') + '\FindX\index.bin';
-      Exec(ExpandConstant('{app}\findx2-service.exe'), 'uninstall', '', SW_HIDE, ewWaitUntilTerminated, R);
-      Params := 'install --index ' + #34 + IndexPath + #34;
-      Exec(ExpandConstant('{app}\findx2-service.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, R);
-      Exec(ExpandConstant('{sys}\cmd.exe'), '/c sc start FindX2Search', '', SW_HIDE, ewWaitUntilTerminated, R);
-    end;
-
-    { 与 GUI findx_settings 约定：仅在选择安装服务时写入，使首启用 ProgramData 索引 + 服务模式 }
-    if WizardIsComponentSelected('servicec') then
-    begin
+      InstallSearchService;
       Marker := AppDir + '\{#MyInstalledMarker}';
       SaveStringToFile(Marker, '1' + #13#10, False);
     end;

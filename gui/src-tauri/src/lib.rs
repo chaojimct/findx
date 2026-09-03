@@ -979,16 +979,38 @@ async fn apply_run_mode_change(app: tauri::AppHandle, target: String) -> Result<
             service_exe.display()
         ));
     }
-    let work = service_exe.parent().map(std::path::Path::to_path_buf).unwrap_or(base);
-    let sub = match target.as_str() {
-        "service" => "install",
-        "standalone" => "uninstall",
+    let work = service_exe
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| base.clone());
+    let params = match target.as_str() {
+        "service" => {
+            let index = findx_settings::resolve_index_path(&base, &settings);
+            let vol = if settings.volume.trim().is_empty() {
+                "C:"
+            } else {
+                settings.volume.trim()
+            };
+            let pipe = if settings.pipe_name.trim().is_empty() {
+                "findx2"
+            } else {
+                settings.pipe_name.trim()
+            };
+            format!(
+                "install --index {} --volume {} --pipe {} --save-interval-secs {}",
+                crate::elevate::quote_arg(&index.to_string_lossy()),
+                crate::elevate::quote_arg(vol),
+                crate::elevate::quote_arg(pipe),
+                settings.save_interval_secs.max(1),
+            )
+        }
+        "standalone" => "uninstall".to_string(),
         other => return Err(format!("未知的运行模式: {other}")),
     };
 
     use crate::elevate::shell_execute_runas;
-    shell_execute_runas(&service_exe, Some(sub), &work, true)
-        .map_err(|e| format!("提权执行 `findx2-service {sub}` 失败: {e}"))?;
+    shell_execute_runas(&service_exe, Some(&params), &work, true)
+        .map_err(|e| format!("提权执行 `findx2-service` 失败: {e}"))?;
     Ok(())
 }
 

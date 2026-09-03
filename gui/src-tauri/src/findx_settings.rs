@@ -13,8 +13,8 @@ fn default_true() -> bool {
 }
 
 /// GUI 与 service 的协同方式。
-/// - `Service`（默认）：GUI 普通用户运行；service 期望由 SCM（`findx2-service install` + `sc start`）拉起常驻；
-///   缺服务时 GUI 仅做「以普通权限直拉同目录 service」兜底（USN 增量在该模式下会受限，但搜索 IPC 仍可工作）。
+/// - `Service`（默认）：GUI 普通用户运行；只通过 SCM 拉起 `FindX2Search`（SYSTEM，才能读 USN）。
+///   不在该模式下用当前用户权限直拉 `findx2-service`，否则必现「打开卷失败: 拒绝访问」。
 /// - `Standalone`：GUI 与 service 跑在同一会话里；首次启动允许 ShellExecute runas 提权 spawn service。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -115,6 +115,35 @@ fn settings_for_nsis_installed_layout() -> Option<FindxGuiSettings> {
     Some(s)
 }
 
+/// 正式安装后若沿用旧设置里的相对 `index.bin`，会落到 `{app}\index.bin` 旧库，
+/// 并误用普通权限进程监听 USN。有 `FindX.installed` 时改走 ProgramData + 服务模式。
+#[cfg(windows)]
+fn migrate_installed_layout_settings<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    mut s: FindxGuiSettings,
+) -> FindxGuiSettings {
+    let Some(installed) = settings_for_nsis_installed_layout() else {
+        return s;
+    };
+    let base = exe_resource_dir();
+    let resolved = resolve_index_path(&base, &s);
+    let trimmed = s.index_path.trim();
+    let leftover = trimmed.is_empty()
+        || !Path::new(trimmed).is_absolute()
+        || resolved == base.join("index.bin");
+    if !leftover {
+        return s;
+    }
+    if resolved == PathBuf::from(&installed.index_path) && s.run_mode == RunMode::Service {
+        return s;
+    }
+    s.index_path = installed.index_path;
+    s.run_mode = RunMode::Service;
+    s.auto_start_service = true;
+    let _ = save_findx_settings(app.clone(), s.clone());
+    s
+}
+
 #[tauri::command]
 pub fn load_findx_settings<R: Runtime>(app: tauri::AppHandle<R>) -> Result<FindxGuiSettings, String> {
     let path = settings_path(&app)?;
@@ -126,7 +155,15 @@ pub fn load_findx_settings<R: Runtime>(app: tauri::AppHandle<R>) -> Result<Findx
         return Ok(FindxGuiSettings::default());
     }
     let s = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&s).map_err(|e| e.to_string())
+    let parsed = serde_json::from_str(&s).map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    {
+        return Ok(migrate_installed_layout_settings(&app, parsed));
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(parsed)
+    }
 }
 
 #[tauri::command]
@@ -303,7 +340,151 @@ pub fn ensure_cli_on_user_path() -> Result<(), String> {
     Ok(())
 }
 
-/// 直接拉起 findx2-service（要求 `index.bin` 已存在）。
+#[cfg(windows)]
+const WINDOWS_SERVICE_NAME: &str = "FindX2Search";
+
+#[cfg(windows)]
+fn sc_run(args: &[&str]) -> Result<(i32, String), String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = Command::new("sc.exe")
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("sc.exe: {e}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok((out.status.code().unwrap_or(-1), text))
+}
+
+#[cfg(windows)]
+fn windows_service_is_running() -> bool {
+    matches!(sc_run(&["query", WINDOWS_SERVICE_NAME]), Ok((0, text)) if text.contains("RUNNING"))
+}
+
+/// `sc start`：0 已启动，1056 已在运行。普通用户对 SCM 可能没有权限。
+#[cfg(windows)]
+fn try_start_windows_service() -> Result<(), String> {
+    if windows_service_is_running() {
+        return Ok(());
+    }
+    let (code, text) = sc_run(&["start", WINDOWS_SERVICE_NAME])?;
+    if code == 0 || code == 1056 || text.contains("1056") || windows_service_is_running() {
+        return Ok(());
+    }
+    Err(format!(
+        "sc start {WINDOWS_SERVICE_NAME} 失败 ({code}): {}",
+        text.trim()
+    ))
+}
+
+#[cfg(windows)]
+fn install_args_for_settings(settings: &FindxGuiSettings, index: &Path, vol: &str, pipe: &str) -> String {
+    use crate::elevate::quote_arg;
+    let mut params = format!(
+        "install --index {} --volume {} --pipe {} --save-interval-secs {}",
+        quote_arg(&index.to_string_lossy()),
+        quote_arg(vol),
+        quote_arg(pipe),
+        settings.save_interval_secs.max(1),
+    );
+    if !settings.enable_everything_ipc {
+        params.push_str(" --no-everything-ipc");
+    }
+    if !settings.enable_metadata_backfill {
+        params.push_str(" --no-backfill");
+    }
+    for dir in &settings.excluded_dirs {
+        let d = dir.trim();
+        if d.is_empty() {
+            continue;
+        }
+        params.push_str(" --exclude-dir ");
+        params.push_str(&quote_arg(d));
+    }
+    params
+}
+
+#[cfg(windows)]
+fn start_service_mode_process(
+    exe: &Path,
+    index: &Path,
+    vol: &str,
+    pipe: &str,
+    settings: &FindxGuiSettings,
+) -> Result<(), String> {
+    use crate::elevate::{process_is_elevated, shell_execute_runas};
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    if try_start_windows_service().is_ok() {
+        return Ok(());
+    }
+
+    let work = exe.parent().unwrap_or_else(|| Path::new("."));
+    let params = install_args_for_settings(settings, index, vol, pipe);
+
+    if process_is_elevated() {
+        let mut cmd = Command::new(exe);
+        cmd.current_dir(work)
+            .arg("install")
+            .arg("--index")
+            .arg(index)
+            .arg("--volume")
+            .arg(vol)
+            .arg("--pipe")
+            .arg(pipe)
+            .arg("--save-interval-secs")
+            .arg(format!("{}", settings.save_interval_secs.max(1)))
+            .creation_flags(CREATE_NO_WINDOW);
+        if !settings.enable_everything_ipc {
+            cmd.arg("--no-everything-ipc");
+        }
+        if !settings.enable_metadata_backfill {
+            cmd.arg("--no-backfill");
+        }
+        for dir in &settings.excluded_dirs {
+            let d = dir.trim();
+            if d.is_empty() {
+                continue;
+            }
+            cmd.arg("--exclude-dir").arg(d);
+        }
+        let status = cmd
+            .status()
+            .map_err(|e| format!("注册系统服务失败: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "注册系统服务失败（退出码 {}）。",
+                status.code().unwrap_or(-1)
+            ));
+        }
+        return try_start_windows_service();
+    }
+
+    let code = shell_execute_runas(exe, Some(&params), work, true)
+        .map_err(|e| format!("提权注册系统服务失败: {e}"))?;
+    if let Some(c) = code {
+        if c != 0 {
+            return Err(format!("提权注册系统服务失败（退出码 {c}）。"));
+        }
+    }
+    if try_start_windows_service().is_ok() {
+        return Ok(());
+    }
+    let sc = Path::new(r"C:\Windows\System32\sc.exe");
+    shell_execute_runas(sc, Some(&format!("start {WINDOWS_SERVICE_NAME}")), work, true)
+        .map_err(|e| format!("提权启动系统服务失败: {e}"))?;
+    Ok(())
+}
+
+/// 拉起索引服务（要求 `index.bin` 已存在）。
+/// 服务模式只走 SCM；单体模式才在当前会话 spawn。
 pub fn spawn_findx_service_process<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), String> {
     let settings = load_findx_settings(app.clone())?;
     let base = exe_resource_dir();
@@ -324,6 +505,10 @@ pub fn spawn_findx_service_process<R: Runtime>(app: tauri::AppHandle<R>) -> Resu
         use std::process::Command;
 
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        if settings.run_mode == RunMode::Service {
+            return start_service_mode_process(&exe, &index, vol, pipe, &settings);
+        }
 
         let work = exe.parent().unwrap_or_else(|| Path::new("."));
         let index_str = index.to_string_lossy().to_string();
