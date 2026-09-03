@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [2.1.3] - 2026-09-03
+
 ### 索引创建与实时更新（HDD / 大批量复制专项）
 
 - **USN 事件合并 + 延迟 stat**：watch 热路径不再同步 `OpenFileById`；同 FRN 批内去重，create 先入库（名字立刻可搜），size/mtime 由后台 worker 补。大批量复制/解压时不再把增量线程卡在随机寻道上。
@@ -13,6 +15,11 @@
 - **Journal 将满进状态栏**：剩余不足跨度 5% 时 GUI 提示，停机过久会触发全量重建。
 - **ReFS / 无 journal 卷**：建库不再因 journal 探测失败整盘挂掉；该卷跳过增量监听并提示需手动重建。
 - **回填断点续跑**：每卷完成后写 `<index>.overlay.bin` 边车，重启后过滤已完成条目再续跑。
+- **状态栏回填文案**：不再把「扫描中 / 已关闭 / 权限失败」一律写成「未跑异步回填」；服务上报真实原因，JournalGap 重建后会重新拉起回填。
+- **管理员服务管道 ACL**：提升权限后命名管道默认只给 Administrators，普通 GUI 会 `拒绝访问 (5)`；首实例写入本机已登录用户可读写的 DACL。
+- **USN「将满」误报**：追上增量时把 `next-cursor`（恒为 0）当成剩余、把 `next-first` 当分母，状态栏会显示「剩余 0 / 分母一直涨」。改为仅在落后且 FirstUsn 逼近游标时预警。
+- **IPC 拼音默认开启**：`Search.pinyin` 缺省从 false 改为 true，漏传不再静默关掉拼音。
+- **右键改为常用 + 更多**：默认只出打开 / 打开路径 / 复制路径 / 复制文件名 / 删除，点「更多 Windows 操作」再弹完整系统菜单（不再每次 `QueryContextMenu`）。`Shift+右键` 仍直接出系统菜单。系统长菜单转发自绘消息、限制工作区高度，并用 `WH_MSGFILTER` 把滚轮折成 ↑/↓，不必再点顶部/底部箭头。
 
 ## [2.1.2] - 2026-09-02
 
@@ -54,7 +61,8 @@
 
 - 仓库根目录补充 **MIT** 全文许可（`LICENSE`），与 `Cargo.toml` 工作区 `MIT OR Apache-2.0` 声明在 README 中说明对应关系。
 
-[Unreleased]: https://github.com/chaojimct/findx/compare/v2.1.2...HEAD
+[Unreleased]: https://github.com/chaojimct/findx/compare/v2.1.3...HEAD
+[2.1.3]: https://github.com/chaojimct/findx/compare/v2.1.2...v2.1.3
 [2.1.2]: https://github.com/chaojimct/findx/compare/v2.1.1...v2.1.2
 [2.1.1]: https://github.com/chaojimct/findx/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/chaojimct/findx/compare/v2.0.1...v2.1.0

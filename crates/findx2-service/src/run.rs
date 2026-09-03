@@ -356,6 +356,9 @@ pub(crate) fn run_foreground(
 
     if flags.no_backfill {
         info!("已通过 --no-backfill 关闭后台元数据回填（fast 首遍后 size/mtime 可能为 0）");
+        engine.set_backfill_error(Some(
+            "元数据回填已关闭（设置或 --no-backfill）；时间与大小筛选可能不准".into(),
+        ));
     } else {
         crate::backfill::spawn_backfill(engine.clone(), index.clone());
     }
@@ -771,6 +774,9 @@ fn rebuild_volume(
     // 4) 落盘 + trigram 重建（合并后 trigram=None，先回全表扫描，重建完自动切回剪枝）。
     persist_index(engine, index_path)?;
     spawn_trigram_rebuild(engine.clone(), index_path.to_path_buf(), "单卷重建后边车重建");
+    // 合并后 metadata_ready=false（fast 重枚举），必须重新拉起回填；旧 overlay 下标已失效。
+    engine.clear_metadata_overlay();
+    crate::backfill::spawn_backfill(Arc::clone(engine), index_path.to_path_buf());
     info!("卷 {letter} 重建完成（已回绕到 frozen={frozen} 重放），恢复增量监听");
     Ok(())
 }
@@ -821,8 +827,14 @@ fn merge_rebuilt_volume(
     Ok(merged)
 }
 
-/// P2 journal 覆写预警：查询 FirstUsn，剩余不足跨度 5% 时返回状态栏文案。
-/// 服务仍正常，但停机稍久就会断档——提前让用户看到。
+/// P2 journal 覆写预警：FirstUsn 逼近尚未读到的游标时返回状态栏文案。
+///
+/// 不能用 `next - cursor` 当「剩余」。监听追上时 cursor ≈ next，该值恒为 0，
+/// 而 `next - first`（已占用跨度）会随文件活动一直涨——状态栏就会显示
+/// 「剩余 0 / 分母狂增」，纯属误报。
+///
+/// 真正有风险的是：我们还落后（next > cursor），且 FirstUsn 已经逼近 cursor
+/// （历史缓冲 < 占用跨度的 5%）。追上后覆写的是早已处理过的旧记录，不必报警。
 fn probe_journal_wrap_warning(
     volume_path: &str,
     letter: char,
@@ -834,14 +846,18 @@ fn probe_journal_wrap_warning(
     if next <= first {
         return None;
     }
+    let cursor = cursor_usn as i64;
+    if next <= cursor {
+        return None;
+    }
     let span = (next - first) as u64;
-    let remaining = (next as u64).saturating_sub(cursor_usn);
-    if remaining < span / 20 {
+    let slack = cursor.saturating_sub(first).max(0) as u64;
+    if span > 0 && slack < span / 20 {
         tracing::warn!(
-            "卷 {letter} USN journal 剩余不足 (剩余 {remaining}/{span})：停机稍久将触发全量重建，考虑放大 journal"
+            "卷 {letter} USN journal 未读游标接近覆写前沿 (缓冲 {slack}/{span})"
         );
         return Some(format!(
-            "USN journal 将满（剩余 {remaining}/{span}），停机过久会触发全量重建"
+            "USN journal 未读记录即将被覆写（缓冲 {slack}/{span}），停机过久会触发全量重建"
         ));
     }
     None

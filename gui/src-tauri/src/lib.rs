@@ -393,6 +393,7 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
                 backfill_total,
                 loading,
                 watch_error,
+                backfill_error,
                 ..
             })) => {
                 // **关键自愈逻辑**：service 已经在线、index 已经有数据，那"是否在建库"就只能由 service
@@ -439,7 +440,7 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
                 last_error: if loading {
                     Some("索引加载中…（service 已启动，正在反序列化 index.bin）".into())
                 } else {
-                    watch_error
+                    watch_error.or(backfill_error)
                 },
             }
             }

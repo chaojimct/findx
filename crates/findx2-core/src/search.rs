@@ -103,6 +103,8 @@ pub struct SearchHit {
 pub struct BackfillProgress {
     pub done: AtomicU64,
     pub total: AtomicU64,
+    /// 回填被关闭 / 全部失败 / 线程异常时的说明；无问题时为 `None`。
+    pub error: parking_lot::Mutex<Option<String>>,
 }
 
 impl Default for BackfillProgress {
@@ -110,6 +112,7 @@ impl Default for BackfillProgress {
         Self {
             done: AtomicU64::new(0),
             total: AtomicU64::new(0),
+            error: parking_lot::Mutex::new(None),
         }
     }
 }
@@ -262,6 +265,15 @@ impl SearchEngine {
         self.backfill.done.store(0, Ordering::Relaxed);
     }
 
+    /// 回填关闭 / 失败原因；GUI 状态栏优先展示。
+    pub fn set_backfill_error(&self, msg: Option<String>) {
+        *self.backfill.error.lock() = msg;
+    }
+
+    pub fn backfill_error_snapshot(&self) -> Option<String> {
+        self.backfill.error.lock().clone()
+    }
+
     pub fn add_backfill_done(&self, n: u64) {
         self.backfill.done.fetch_add(n, Ordering::Relaxed);
     }
@@ -275,6 +287,7 @@ impl SearchEngine {
     fn clear_backfill_progress(&self) {
         self.backfill.done.store(0, Ordering::Relaxed);
         self.backfill.total.store(0, Ordering::Relaxed);
+        *self.backfill.error.lock() = None;
         // overlay 不在这里清——上层 flush 落盘成功后再显式 clear。
     }
 

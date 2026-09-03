@@ -23,11 +23,16 @@ fn normalize_pipe(pipe_name: &str) -> String {
 
 /// 客户端连命名管道失败时，Windows 常为 `ERROR_FILE_NOT_FOUND`（2）：表示尚无服务端在监听该管道。
 fn map_pipe_open_err(e: std::io::Error) -> String {
-    if e.raw_os_error() == Some(2) {
-        "无法连接 findx2-service：命名管道不存在（服务未在监听或仍在加载大索引）。请点「启动服务」或手动运行同目录 findx2-service.exe；若仍失败请打开 %TEMP%\\findx2-service-last-error.txt 查看原因，并确认设置里 index.bin 路径与 exe 目录一致。"
-            .to_string()
-    } else {
-        format!("无法连接 findx2-service: {e}")
+    match e.raw_os_error() {
+        Some(2) => {
+            "无法连接 findx2-service：命名管道不存在（服务未在监听或仍在加载大索引）。请点「启动服务」或手动运行同目录 findx2-service.exe；若仍失败请打开 %TEMP%\\findx2-service-last-error.txt 查看原因，并确认设置里 index.bin 路径与 exe 目录一致。"
+                .to_string()
+        }
+        Some(5) => {
+            "无法连接 findx2-service：拒绝访问。服务以管理员运行时，旧版管道只允许管理员连接；请重启本版本服务（已允许同一用户的普通界面连接）。"
+                .to_string()
+        }
+        _ => format!("无法连接 findx2-service: {e}"),
     }
 }
 

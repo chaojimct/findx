@@ -617,12 +617,12 @@ export default function FindXSearchApp() {
         const bt = st.backfillTotal ?? 0;
         const pct = bt > 0 ? Math.min(100, Math.round((bd / bt) * 100)) : null;
         const base = `索引: ${indexedCount.toLocaleString()} 条`;
-        if (pct !== null) {
+        if (!(settings.enableMetadataBackfill ?? true)) {
+          setIndexLine(`${base} · 元数据回填已关闭（可在设置中开启）`);
+        } else if (pct !== null) {
           setIndexLine(`${base} · 元数据回填 ${pct}%（${bd.toLocaleString()}/${bt.toLocaleString()}）`);
         } else {
-          setIndexLine(
-            `${base} · 元数据待补全（未跑异步回填或无进度；时间与大小类条件可能不准）`,
-          );
+          setIndexLine(`${base} · 元数据回填中…`);
         }
       } else {
         setIndexLine(`索引: ${indexedCount.toLocaleString()} 条`);
@@ -630,7 +630,7 @@ export default function FindXSearchApp() {
     } catch (e) {
       setIndexLine(`索引状态: ${String(e)}`);
     }
-  }, []);
+  }, [settings.enableMetadataBackfill]);
 
   useEffect(() => {
     try {

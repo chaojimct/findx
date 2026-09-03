@@ -29,21 +29,68 @@ fn configure_opts(opts: &mut tokio::net::windows::named_pipe::ServerOptions) {
         .max_instances(PIPE_MAX_INSTANCES as usize);
 }
 
+/// 管理员 / SYSTEM 创建的命名管道默认 DACL 只有 Administrators。
+/// GUI 以普通（过滤）令牌运行时，同一用户也会 `ERROR_ACCESS_DENIED (5)`。
+/// 首实例上写入允许本机已登录用户读写的 DACL；后续实例继承。
+///
+/// `0x12019f` = FILE_GENERIC_READ | FILE_GENERIC_WRITE（管道客户端 CreateFile 所需）。
+fn apply_local_client_acl(
+    server: &tokio::net::windows::named_pipe::NamedPipeServer,
+) -> anyhow::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetKernelObjectSecurity,
+    };
+
+    const SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019f;;;AU)";
+    let wide: Vec<u16> = SDDL.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(wide.as_ptr()),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )?;
+        let handle = HANDLE(server.as_raw_handle());
+        let applied = SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, sd);
+        let _ = LocalFree(HLOCAL(sd.0));
+        applied?;
+    }
+    Ok(())
+}
+
 fn create_first_pipe_server(pipe_path: &str) -> anyhow::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
     let mut opts = tokio::net::windows::named_pipe::ServerOptions::new();
     configure_opts(&mut opts);
     opts.first_pipe_instance(true);
+    // 创建后要改 DACL，必须带 WRITE_DAC。
+    opts.write_dac(true);
     match opts.create(pipe_path) {
-        Ok(s) => Ok(s),
+        Ok(s) => {
+            apply_local_client_acl(&s)?;
+            info!("命名管道 ACL 已放宽：本机已登录用户可连接（管理员服务 + 普通 GUI）");
+            Ok(s)
+        }
         Err(e) => {
             // 残留实例或异常状态下一度会失败；再试非首实例，避免服务直接起不来、GUI 永远连不上管道。
             warn!("命名管道 first_pipe_instance(true) 失败: {e}，尝试非首实例…");
             let mut opts2 = tokio::net::windows::named_pipe::ServerOptions::new();
             configure_opts(&mut opts2);
             opts2.first_pipe_instance(false);
-            opts2
+            opts2.write_dac(true);
+            let s = opts2
                 .create(pipe_path)
-                .map_err(|e2| anyhow::anyhow!("创建命名管道失败: {e}；重试: {e2}"))
+                .map_err(|e2| anyhow::anyhow!("创建命名管道失败: {e}；重试: {e2}"))?;
+            if let Err(acl_e) = apply_local_client_acl(&s) {
+                warn!("非首实例写入管道 ACL 失败: {acl_e}");
+            }
+            Ok(s)
         }
     }
 }
@@ -191,6 +238,7 @@ fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse {
             backfill_total: 0,
             loading: true,
             watch_error: crate::run::watch_error_summary(),
+            backfill_error: None,
         },
         (IpcRequest::Search { .. }, None) => IpcResponse::Error {
             message: "索引加载中，请稍候…".into(),
@@ -218,6 +266,7 @@ fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse {
             // 拿不到锁就退化成 backfill-only 快照（loading=true 复用 GUI 的"加载中"提示），
             // 比"卡 5s 超时"体验好得多。
             let backfill = eng.backfill_progress_snapshot();
+            let backfill_error = eng.backfill_error_snapshot();
             match eng.try_index_store() {
                 Some(g) => {
                     let vol = g.volumes.first();
@@ -238,6 +287,11 @@ fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse {
                         backfill_total,
                         loading: false,
                         watch_error: crate::run::watch_error_summary(),
+                        backfill_error: if g.metadata_ready {
+                            None
+                        } else {
+                            backfill_error
+                        },
                     }
                 }
                 None => IpcResponse::StatusResult {
@@ -252,6 +306,7 @@ fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse {
                     backfill_total: backfill.1,
                     loading: true,
                     watch_error: crate::run::watch_error_summary(),
+                    backfill_error,
                 },
             }
         }

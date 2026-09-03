@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 pub enum IpcRequest {
     Search {
         query: String,
-        #[serde(default)]
+        /// 缺省 true：与 GUI「默认拼音匹配」一致。旧客户端漏传时不应静默关掉拼音。
+        #[serde(default = "default_pinyin")]
         pinyin: bool,
         #[serde(default = "default_limit")]
         limit: usize,
@@ -24,6 +25,10 @@ pub enum IpcRequest {
 
 fn default_limit() -> usize {
     500
+}
+
+fn default_pinyin() -> bool {
+    true
 }
 
 fn default_metadata_ready() -> bool {
@@ -71,6 +76,9 @@ pub enum IpcResponse {
         /// GUI 状态栏展示。`#[serde(default)]` 保持与旧版 service 的兼容。
         #[serde(default)]
         watch_error: Option<String>,
+        /// 元数据回填被关闭或失败时的说明（`None` = 回填正常推进或已完成）。
+        #[serde(default)]
+        backfill_error: Option<String>,
     },
     Pong,
     Error {

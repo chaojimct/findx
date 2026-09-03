@@ -19,6 +19,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// 防止启动时与 JournalGap 重建后重复拉起两条回填线程。
+static BACKFILL_RUNNING: AtomicBool = AtomicBool::new(false);
+
+struct BackfillRunningGuard;
+impl Drop for BackfillRunningGuard {
+    fn drop(&mut self) {
+        BACKFILL_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
 use findx2_core::{save_index_bin, SearchEngine};
 use tracing::{error, info};
 #[cfg(not(windows))]
@@ -40,20 +50,37 @@ const OVERLAY_BATCH: usize = 8_192;
 pub(crate) fn spawn_backfill(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) {
     if !backfill_enabled() {
         info!("后台元数据回填已禁用（FINDX2_DISABLE_BACKFILL=1）");
+        engine.set_backfill_error(Some(
+            "元数据回填已关闭（FINDX2_DISABLE_BACKFILL）；时间与大小筛选可能不准".into(),
+        ));
         return;
     }
     if engine.metadata_ready() {
         info!("索引 metadata_ready 已为 true，跳过后台回填");
         return;
     }
-    std::thread::Builder::new()
+    if BACKFILL_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        info!("元数据回填已在运行，跳过重复启动");
+        return;
+    }
+    let engine_err = engine.clone();
+    if let Err(e) = std::thread::Builder::new()
         .name("findx2-backfill".into())
         .spawn(move || {
-            if let Err(e) = backfill_loop(engine, index_path) {
+            let _guard = BackfillRunningGuard;
+            if let Err(e) = backfill_loop(engine.clone(), index_path) {
                 error!("元数据回填线程退出: {e}");
+                engine.set_backfill_error(Some(format!("元数据回填异常：{e}")));
             }
         })
-        .ok();
+    {
+        BACKFILL_RUNNING.store(false, Ordering::SeqCst);
+        error!("无法启动回填线程: {e}");
+        engine_err.set_backfill_error(Some(format!("无法启动回填线程：{e}")));
+    }
 }
 
 /// 终态落盘：把 overlay 一次性 flush 进主索引并写盘 index.bin。
@@ -73,6 +100,9 @@ fn spawn_final_persist(engine: Arc<SearchEngine>, path: std::path::PathBuf) {
                 Ok(_) => info!("终态落盘：metadata_ready=true 已写入索引（耗时 {:?}）", t0.elapsed()),
                 Err(e) => {
                     error!("终态落盘：set_metadata_ready 失败: {e}");
+                    engine.set_backfill_error(Some(format!(
+                        "元数据已补全但写入索引失败：{e}"
+                    )));
                     return;
                 }
             }
@@ -237,6 +267,9 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
     );
 
     let total_entries = engine.index_store().entry_count();
+    // 扫描阶段也上报进度，避免 GUI 把 total=0 误读成「回填没跑」。
+    engine.set_backfill_error(None);
+    engine.set_backfill_total(total_entries as u64);
     info!(
         "后台回填启动：索引共 {total_entries} 条，扫描待补元数据条目 …"
     );
@@ -545,6 +578,9 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
              不标记 metadata_ready=true，下次启动时将重试。",
             total_pending
         );
+        engine.set_backfill_error(Some(
+            "元数据回填失败（可能需要管理员权限）；时间与大小筛选可能不准".into(),
+        ));
         return Ok(());
     }
     info!("触发终态落盘（异步线程）");
