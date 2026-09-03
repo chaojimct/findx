@@ -38,6 +38,11 @@ pub struct Cli {
     #[arg(long, default_value_t = false, global = true)]
     pub no_everything_ipc: bool,
 
+    /// 仅在当前用户会话创建 Everything 兼容窗口，查询走命名管道。
+    /// 由 Session 0 系统服务拉起；勿与 `--service` 同时手动使用。
+    #[arg(long, default_value_t = false, global = true)]
+    pub everything_host: bool,
+
     /// 关闭后台元数据回填线程（默认开启；关闭后 fast 首遍未命中的 size/mtime 将一直为 0）。
     /// 适合超弱机：CPU/磁盘 IO 占用最低，但搜索时大小/时间筛选与排序不准。
     #[arg(long, default_value_t = false, global = true)]

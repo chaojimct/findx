@@ -18,6 +18,8 @@ mod run;
 mod backfill;
 #[cfg(windows)]
 mod win_service;
+#[cfg(windows)]
+mod session_spawn;
 
 #[cfg(windows)]
 use clap::Parser;
@@ -85,6 +87,10 @@ fn try_main() -> anyhow::Result<()> {
     }
     if matches!(cli.cmd, Some(cli::ServiceCmd::Uninstall)) {
         return win_service::uninstall();
+    }
+
+    if cli.everything_host {
+        return everything_ipc::run_everything_host_via_pipe(cli.pipe);
     }
 
     if cli.service {

@@ -350,6 +350,10 @@ pub(crate) fn run_foreground(
     let _everything: Option<JoinHandle<()>> = if flags.no_everything_ipc {
         info!("已通过 --no-everything-ipc 关闭 Everything 兼容窗口（老客户端将无法连接）");
         None
+    } else if crate::session_spawn::current_session_id() == 0 {
+        info!("当前为 Session 0 系统服务，改在用户会话拉起 Everything 兼容窗口");
+        crate::session_spawn::spawn_everything_host_watchdog(pipe_name.clone());
+        None
     } else {
         Some(crate::everything_ipc::spawn_everything_ipc(engine.clone()))
     };

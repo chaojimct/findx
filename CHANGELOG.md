@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [2.1.6] - 2026-09-03
+
+### 修复
+
+- **Everything 兼容窗口在系统服务下不可见**：`FindX2Search` 跑在 Session 0，`FindWindow("EVERYTHING")` 只能看到用户会话。改为在活动用户桌面拉起 `--everything-host`，查询仍走命名管道。
+
 ## [2.1.5] - 2026-09-03
 
 ### 修复
@@ -73,7 +79,8 @@
 
 - 仓库根目录补充 **MIT** 全文许可（`LICENSE`），与 `Cargo.toml` 工作区 `MIT OR Apache-2.0` 声明在 README 中说明对应关系。
 
-[Unreleased]: https://github.com/chaojimct/findx/compare/v2.1.5...HEAD
+[Unreleased]: https://github.com/chaojimct/findx/compare/v2.1.6...HEAD
+[2.1.6]: https://github.com/chaojimct/findx/compare/v2.1.5...v2.1.6
 [2.1.5]: https://github.com/chaojimct/findx/compare/v2.1.4...v2.1.5
 [2.1.4]: https://github.com/chaojimct/findx/compare/v2.1.3...v2.1.4
 [2.1.3]: https://github.com/chaojimct/findx/compare/v2.1.2...v2.1.3

@@ -24,6 +24,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use findx2_core::{ParsedQuery, QueryParser, SearchEngine, SearchHit, SearchOptions, SortField};
+use findx2_ipc::{IpcRequest, IpcResponse, SearchHitDto};
 use tracing::{error, info};
 use windows::Win32::Foundation::*;
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
@@ -32,6 +33,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// 持有当前 SearchEngine 的全局句柄，IPC 窗口过程通过此读引擎。
 static ENGINE: Mutex<Option<Arc<SearchEngine>>> = Mutex::new(None);
+
+/// Session 0 宿主模式：不持有引擎，查询转发到系统服务命名管道。
+static PIPE_NAME: Mutex<Option<String>> = Mutex::new(None);
 
 /// 外部模块（如服务的建库/回填子系统）通过此 hook 报告 IS_DB_BUSY；返回 true 表示当前忙。
 static IS_DB_BUSY_HOOK: OnceLock<Box<dyn Fn() -> bool + Send + Sync>> = OnceLock::new();
@@ -112,6 +116,18 @@ pub(crate) fn spawn_everything_ipc(engine: Arc<SearchEngine>) -> JoinHandle<()> 
             *g = None;
         })
         .expect("spawn everything ipc")
+}
+
+/// 用户会话进程入口：只建 Everything 窗口，搜索走已有 `findx2` 管道。
+pub(crate) fn run_everything_host_via_pipe(pipe: String) -> anyhow::Result<()> {
+    {
+        let mut g = PIPE_NAME.lock().unwrap();
+        *g = Some(pipe);
+    }
+    let r = unsafe { message_loop() };
+    let mut g = PIPE_NAME.lock().unwrap();
+    *g = None;
+    r.map_err(|e| anyhow::anyhow!("Everything 兼容窗口: {e}"))
 }
 
 unsafe fn message_loop() -> windows::core::Result<()> {
@@ -243,6 +259,9 @@ fn db_busy_now() -> bool {
             return true;
         }
     }
+    if let Some(st) = pipe_status() {
+        return !st.0 || st.1;
+    }
     let g = match ENGINE.lock() {
         Ok(g) => g,
         Err(_) => return false,
@@ -254,6 +273,9 @@ fn db_busy_now() -> bool {
 }
 
 fn db_is_loaded() -> bool {
+    if let Some((ready, loading, entries)) = pipe_status() {
+        return ready && !loading && entries > 0;
+    }
     let g = match ENGINE.lock() {
         Ok(g) => g,
         Err(_) => return false,
@@ -261,6 +283,20 @@ fn db_is_loaded() -> bool {
     g.as_ref()
         .map(|eng| eng.index_store().entry_count() > 0)
         .unwrap_or(false)
+}
+
+/// `(metadata_ready, loading, entry_count)`
+fn pipe_status() -> Option<(bool, bool, u64)> {
+    let pipe = PIPE_NAME.lock().ok()?.clone()?;
+    match pipe_rpc(&pipe, &IpcRequest::Status)? {
+        IpcResponse::StatusResult {
+            metadata_ready,
+            loading,
+            entry_count,
+            ..
+        } => Some((metadata_ready, loading, entry_count)),
+        _ => None,
+    }
 }
 
 fn handle_wm_user(wparam: WPARAM) -> Option<LRESULT> {
@@ -474,11 +510,14 @@ fn do_search(
     sort_field: SortField,
     sort_desc: bool,
 ) -> Option<Vec<IpcHit>> {
-    let engine = ENGINE.lock().ok()?.as_ref()?.clone();
     let q = query.trim();
     if q.is_empty() {
         return Some(vec![]);
     }
+    if PIPE_NAME.lock().ok()?.is_some() {
+        return do_search_via_pipe(q, max_total);
+    }
+    let engine = ENGINE.lock().ok()?.as_ref()?.clone();
     let mut pq: ParsedQuery = QueryParser::parse(q).ok()?;
     apply_ipc_search_flags(&mut pq, ipc_flags);
     pq.limit = max_total.min(8192) as u32;
@@ -496,6 +535,60 @@ fn do_search(
             .filter_map(|h| ipc_hit_from_search(&engine, h))
             .collect(),
     )
+}
+
+fn do_search_via_pipe(query: &str, max_total: usize) -> Option<Vec<IpcHit>> {
+    let pipe = PIPE_NAME.lock().ok()?.clone()?;
+    let req = IpcRequest::Search {
+        query: query.to_string(),
+        pinyin: true,
+        limit: max_total.min(8192),
+        offset: 0,
+    };
+    match pipe_rpc(&pipe, &req)? {
+        IpcResponse::SearchResult { hits, .. } => Some(hits.into_iter().map(dto_to_ipc_hit).collect()),
+        _ => None,
+    }
+}
+
+fn dto_to_ipc_hit(h: SearchHitDto) -> IpcHit {
+    let parent = h
+        .path
+        .rfind('\\')
+        .map(|i| h.path[..i].to_string())
+        .unwrap_or_default();
+    IpcHit {
+        full_path: h.path,
+        name: h.name,
+        parent,
+        is_dir: h.is_directory,
+        size: h.size,
+        mtime: h.mtime,
+        ctime: 0,
+        attrs: 0,
+    }
+}
+
+fn pipe_rpc(pipe: &str, req: &IpcRequest) -> Option<IpcResponse> {
+    use std::fs::OpenOptions;
+    use std::io::{BufRead, BufReader, Write};
+    let path = if pipe.starts_with(r"\\") {
+        pipe.to_string()
+    } else {
+        format!(r"\\.\pipe\{pipe}")
+    };
+    let mut f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .ok()?;
+    let mut body = serde_json::to_string(req).ok()?;
+    body.push('\n');
+    f.write_all(body.as_bytes()).ok()?;
+    f.flush().ok()?;
+    let mut line = String::new();
+    BufReader::new(f).read_line(&mut line).ok()?;
+    serde_json::from_str(line.trim()).ok()
 }
 
 fn apply_ipc_search_flags(pq: &mut ParsedQuery, flags: u32) {
