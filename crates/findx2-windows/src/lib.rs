@@ -22,6 +22,7 @@ pub use full_index_build::{build_full_disk_index, resolve_volume_list};
 pub use volumes::enumerate_local_drive_letters;
 #[cfg(windows)]
 pub use usn::{
-    get_volume_serial_number, usn_watch_forever, UsnJournalWatcher, UsnResume, UsnState,
+    ensure_usn_journal, get_volume_serial_number, mft_extent_count, query_journal_state,
+    usn_watch_forever, volume_incurs_seek_penalty, UsnJournalWatcher, UsnResume, UsnState,
     UsnWatchMsg,
 };

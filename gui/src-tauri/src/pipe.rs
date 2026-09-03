@@ -42,8 +42,9 @@ pub async fn ipc_search_with_pipe_name(
     query: String,
     pinyin: bool,
     limit: usize,
+    offset: usize,
 ) -> Result<(Vec<findx2_ipc::SearchHitDto>, u32, u32), String> {
-    ipc_search_on_pipe(normalize_pipe(pipe_name), query, pinyin, limit).await
+    ipc_search_on_pipe(normalize_pipe(pipe_name), query, pinyin, limit, offset).await
 }
 
 pub async fn ipc_search_on_pipe(
@@ -51,6 +52,7 @@ pub async fn ipc_search_on_pipe(
     query: String,
     pinyin: bool,
     limit: usize,
+    offset: usize,
 ) -> Result<(Vec<findx2_ipc::SearchHitDto>, u32, u32), String> {
     let mut client = ClientOptions::new()
         .open(pipe_endpoint)
@@ -60,6 +62,7 @@ pub async fn ipc_search_on_pipe(
         query,
         pinyin,
         limit,
+        offset,
     };
     let mut body = serde_json::to_string(&req).map_err(|e| e.to_string())?;
     body.push('\n');

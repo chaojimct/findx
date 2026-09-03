@@ -124,6 +124,40 @@ pub struct SearchEngine {
     ///
     /// 见 `crate::meta_overlay` 的模块文档了解为什么不用 DashMap。
     metadata_overlay: Arc<MetaOverlay>,
+    /// 索引变更计数：任何影响搜索结果集/排序的写入都 +1（USN 增量、回填合并、
+    /// metadata_ready 翻转、overlay 写入/清空）。分页查询缓存凭它失效。
+    /// trigram 边车重建不 bump——剪枝只影响候选超集，不影响最终命中与排序。
+    revision: AtomicU64,
+    /// 分页查询缓存（仅一条：最近一次 `search_paged` 的已排序 top-K，见 `CachedTop`）。
+    /// 滚动翻页（同 query 不同 offset）命中时只做切片 + 当页构建，不重扫不重排。
+    /// key 含原始 query 文本 + 拼音开关（同文本同开关 ⇒ 同解析结果），
+    /// revision 对不上即失效。CLI / Everything 走 `search()` 不经过这里。
+    page_cache: parking_lot::Mutex<Option<CachedTop>>,
+}
+
+/// 分页缓存条目：已排序的 top-K（K 见 `PAGE_CACHE_TOP`）+ 总数。
+/// 实测 select_nth 耗时对 k 几乎不敏感（86k 命中下 top-500 与 top-5000 同为 ~7.6ms，
+/// 都是 O(H) 主导），因此 miss 时直接算到 8192（GUI 上限），之后全部翻页都是纯切片。
+#[derive(Debug, Clone)]
+struct CachedTop {
+    query_text: String,
+    allow_pinyin: bool,
+    pinyin_mode: PinyinMatchMode,
+    revision: u64,
+    /// 已按查询排序的前 K 个 idx（K = min(总数, max(请求页尾, PAGE_CACHE_TOP))）。
+    top: Vec<u32>,
+    total: u32,
+}
+
+/// 分页缓存的排序深度：与 GUI `limit` 上限（8192）对齐，保证可滚范围内翻页永不重排。
+const PAGE_CACHE_TOP: usize = 8192;
+
+/// 当页构建的分段耗时（`FINDX2_DEBUG_SEARCH` 用）。
+struct PageBuildStats {
+    path_us: u128,
+    hl_us: u128,
+    meta_us: u128,
+    build_us: u128,
 }
 
 impl SearchEngine {
@@ -133,7 +167,19 @@ impl SearchEngine {
             store: RwLock::new(store),
             backfill: Arc::new(BackfillProgress::default()),
             metadata_overlay: Arc::new(MetaOverlay::new(entry_count)),
+            revision: AtomicU64::new(0),
+            page_cache: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// 索引变更计数（见字段文档）。service 经 `index_store_mut()` 直接改索引后，
+    /// 调本函数使分页缓存失效（USN flush 每批调一次即可，不必每条）。
+    pub fn note_external_mutation(&self) {
+        self.revision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn bump_revision(&self) {
+        self.revision.fetch_add(1, Ordering::Relaxed);
     }
 
     /// overlay 已回填的条数（仅用于统计/进度，search 路径用不到）。
@@ -141,15 +187,31 @@ impl SearchEngine {
         self.metadata_overlay.filled_count()
     }
 
+    /// overlay 是否已有该条目（回填断点续跑：过滤已完成条目用）。
+    pub fn metadata_overlay_has(&self, idx: usize) -> bool {
+        self.metadata_overlay.get(idx).is_some()
+    }
+
+    /// overlay 全量快照（断点续跑落盘用；调用方保证回填线程无并发 put，或接受极小撕裂——
+    /// service 侧只在单卷完成后调用，此时该卷已 quiesce）。
+    pub fn metadata_overlay_snapshot(&self) -> Vec<(usize, u64, u32, u32)> {
+        self.metadata_overlay.snapshot()
+    }
+
     /// 并行回填后批量写入 overlay。**完全无锁**。
     /// 入参 `(idx, size, mtime_filetime, ctime_filetime)`——为了兼容老调用方仍给 FILETIME，
     /// 这里转成 unix 秒存进紧凑 overlay。
     pub fn extend_metadata_overlay_batch(&self, items: &[(usize, u64, u64, u64)]) {
+        if items.is_empty() {
+            return;
+        }
         for &(idx, size, m_ft, c_ft) in items {
             let mtime = crate::index::filetime_to_unix_secs(m_ft);
             let ctime = crate::index::filetime_to_unix_secs(c_ft);
             self.metadata_overlay.put(idx, size, mtime, ctime);
         }
+        // overlay 参与 size/time 过滤与排序：回填写入即视为索引变更。
+        self.bump_revision();
     }
 
     /// 把 overlay 一次性合并进主索引（单次写锁）。**只在持久化前/服务退出时调用**——
@@ -174,14 +236,17 @@ impl SearchEngine {
             )?;
         }
         drop(g);
+        self.bump_revision();
         // 合并完不立刻 clear——并发 backfill 可能此刻还在 put 新条目，clear 会丢数据。
         // 留给上层（确认回填彻底完成后）显式 clear。
         Ok(n)
     }
 
     /// 显式清空 overlay。**只在 metadata_ready 翻 true 之后**或者明确确定回填线程已停时调用。
+    /// 清空改变 size/time 的可见值（回退到主索引），同样 bump revision。
     pub fn clear_metadata_overlay(&self) {
         self.metadata_overlay.clear();
+        self.bump_revision();
     }
 
     /// `(done, total)`，回填未开始时可为 `(0,0)`。
@@ -226,6 +291,8 @@ impl SearchEngine {
         for &(idx, size, mtime, ctime) in updates {
             g.patch_entry_metadata(idx, size, mtime, ctime)?;
         }
+        drop(g);
+        self.bump_revision();
         Ok(())
     }
 
@@ -236,6 +303,106 @@ impl SearchEngine {
     pub fn search(&self, q: &ParsedQuery, opt: &SearchOptions) -> Result<(Vec<SearchHit>, u32)> {
         let store = self.store.read();
         Self::search_inner(&store, q, opt, &self.metadata_overlay)
+    }
+
+    /// 分页搜索（GUI 无限滚动 / IPC 分页用）。
+    ///
+    /// 语义与 `search()` 完全一致（同扫描、同排序），区别：
+    /// - 只构建 `[offset, offset+limit)` 当页的 `SearchHit`（path 解析 + 高亮只做当页，
+    ///   不再为 5000 条全量构建），IPC 只传当页 JSON；
+    /// - 服务侧单条「已排序 top-K 缓存」：同 query 文本 + 同拼音开关 + 同 revision 时，
+    ///   滚动翻页只做切片 + 当页构建，不重扫不重排。
+    ///   miss（新输入）成本 ≈ `search()`（同一次 scan + 同量级 select，只是 k 取到 8192）。
+    ///
+    /// `query_text` 必须与 `q` 的来源一致（service 传收到的原始串），用作缓存 key；
+    /// 同文本同开关 ⇒ 同解析结果（parse 确定性），revision 保证索引未变。
+    /// `offset` 越界 → 空页（`total` 照常返回）。
+    pub fn search_paged(
+        &self,
+        query_text: &str,
+        q: &ParsedQuery,
+        opt: &SearchOptions,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<SearchHit>, u32)> {
+        // pin matcher 构建（与 search_inner 同样的一次性编译，下游扫描/高亮复用）。
+        #[cfg(feature = "pinyin")]
+        let pin_needles: Vec<String> = collect_pinyin_needles(q, opt);
+        #[cfg(feature = "pinyin")]
+        let pin_res: Vec<IbRegex<'_>> = pin_needles
+            .iter()
+            .map(|s| build_pinyin_matcher(s.as_str()))
+            .collect::<Result<Vec<_>>>()?;
+        #[cfg(feature = "pinyin")]
+        let pin_res_ref: &PinList<'_> = pin_res.as_slice();
+        #[cfg(not(feature = "pinyin"))]
+        let pin_res_ref: &PinList<'_> = &[];
+
+        let want_end = offset.saturating_add(limit);
+        let rev_now = self.revision.load(Ordering::Relaxed);
+        // 1) 缓存命中？要求缓存的已排序深度覆盖本页页尾（只读 clone，不占锁做构建）。
+        let cached: Option<CachedTop> = {
+            let g = self.page_cache.lock();
+            match &*g {
+                Some(c)
+                    if c.query_text == query_text
+                        && c.allow_pinyin == opt.allow_pinyin
+                        && c.pinyin_mode == opt.pinyin_match_mode
+                        && c.revision == rev_now
+                        && c.top.len() >= want_end.min(c.total as usize) =>
+                {
+                    Some(c.clone())
+                }
+                _ => None,
+            }
+        };
+
+        let (top, total) = match cached {
+            Some(c) => (c.top, c.total),
+            None => {
+                // miss：读锁下全量扫描 + 排到 K（K 覆盖将来翻页，见 CachedTop）。
+                // 读锁持有期间 writer 进不来，扫完再取 revision 打标签，
+                // 保证「数据 ⇒ 标签」的时序正确。
+                let store = self.store.read();
+                let unordered =
+                    Self::search_unordered(&store, &self.metadata_overlay, q, opt, pin_res_ref)?;
+                let tag = self.revision.load(Ordering::Relaxed);
+                let total = unordered.len() as u32;
+                let k = want_end.max(PAGE_CACHE_TOP).min(unordered.len());
+                let top = Self::sort_top_k(&store, &unordered, q, k);
+                drop(unordered);
+                let entry = CachedTop {
+                    query_text: query_text.to_string(),
+                    allow_pinyin: opt.allow_pinyin,
+                    pinyin_mode: opt.pinyin_match_mode,
+                    revision: tag,
+                    top: top.clone(),
+                    total,
+                };
+                *self.page_cache.lock() = Some(entry);
+                (top, total)
+            }
+        };
+
+        // 2) 切页 + 当页构建。
+        let page: Vec<u32> = if offset >= top.len() {
+            Vec::new()
+        } else {
+            top[offset..].iter().take(limit).copied().collect()
+        };
+        drop(top);
+        let store = self.store.read();
+        let dbg_page = std::env::var("FINDX2_DEBUG_SEARCH").is_ok();
+        let (out, _) = Self::build_hit_page(
+            &store,
+            &page,
+            q,
+            opt,
+            &self.metadata_overlay,
+            pin_res_ref,
+            dbg_page,
+        )?;
+        Ok((out, total))
     }
 
     fn search_inner(
@@ -273,62 +440,8 @@ impl SearchEngine {
         #[cfg(not(feature = "pinyin"))]
         let pin_res_ref: &PinList<'_> = &[];
 
-        if !q.or_branches.is_empty() {
-            // OR 分支需各自 build pin_res：每个 branch 的 name_terms / substring 互相独立，
-            // 共用顶层 needles 会让某一支拿不到自己的拼音 matcher（如 `beijing | english`
-            // 中 english 分支需要 english 自己的 lita::Regex 才能命中纯英文文件名）。
-            let stripped_top = Self::strip_or(q);
-            #[cfg(feature = "pinyin")]
-            let top_needles: Vec<String> = collect_pinyin_needles(&stripped_top, opt);
-            #[cfg(feature = "pinyin")]
-            let top_res: Vec<IbRegex<'_>> = top_needles
-                .iter()
-                .map(|s| build_pinyin_matcher(s.as_str()))
-                .collect::<Result<Vec<_>>>()?;
-            #[cfg(feature = "pinyin")]
-            let top_ref: &PinList<'_> = top_res.as_slice();
-            #[cfg(not(feature = "pinyin"))]
-            let top_ref: &PinList<'_> = &[];
-
-            let mut uni: HashSet<u32> = HashSet::new();
-            uni.extend(Self::search_flat_indices(
-                store,
-                overlay,
-                &stripped_top,
-                opt,
-                top_ref,
-            )?);
-
-            for br in &q.or_branches {
-                let stripped = Self::strip_or(br);
-                #[cfg(feature = "pinyin")]
-                let br_needles: Vec<String> = collect_pinyin_needles(&stripped, opt);
-                #[cfg(feature = "pinyin")]
-                let br_res: Vec<IbRegex<'_>> = br_needles
-                    .iter()
-                    .map(|s| build_pinyin_matcher(s.as_str()))
-                    .collect::<Result<Vec<_>>>()?;
-                #[cfg(feature = "pinyin")]
-                let br_ref: &PinList<'_> = br_res.as_slice();
-                #[cfg(not(feature = "pinyin"))]
-                let br_ref: &PinList<'_> = &[];
-                uni.extend(Self::search_flat_indices(
-                    store,
-                    overlay,
-                    &stripped,
-                    opt,
-                    br_ref,
-                )?);
-            }
-            let mut hits: Vec<u32> = uni.into_iter().collect();
-            let total = hits.len() as u32;
-            // finalize 用顶层 q 的 pin_res 高亮即可：高亮失败只是不上色，不影响命中正确性。
-            let out = Self::finalize_hits(store, &mut hits, q, opt, overlay, pin_res_ref)?;
-            return Ok((out, total));
-        }
-
         let t_flat = std::time::Instant::now();
-        let mut hits = Self::search_flat_indices(store, overlay, q, opt, pin_res_ref)?;
+        let mut hits = Self::search_unordered(store, overlay, q, opt, pin_res_ref)?;
         let flat_us = t_flat.elapsed().as_micros();
         let total = hits.len() as u32;
         let t_fin = std::time::Instant::now();
@@ -346,6 +459,70 @@ impl SearchEngine {
             );
         }
         Ok((out, total))
+    }
+
+    /// 无序全量命中：OR 走多分支 union，否则单分支 flat。不排序、不构建。
+    /// `search()`（经 finalize 全量构建）与 `search_paged()`（分页缓存）共用。
+    fn search_unordered(
+        store: &IndexStore,
+        overlay: &MetaOverlay,
+        q: &ParsedQuery,
+        opt: &SearchOptions,
+        pin_res: &PinList<'_>,
+    ) -> Result<Vec<u32>> {
+        if !q.or_branches.is_empty() {
+            Self::search_or_union(store, overlay, q, opt)
+        } else {
+            Self::search_flat_indices(store, overlay, q, opt, pin_res)
+        }
+    }
+
+    /// OR 多分支 union（各分支独立扫描，见内联注释）。顶层 pin_res 不参与扫描
+    /// （各分支按自己的 needles 预编译 matcher），只用于外层 finalize 高亮。
+    fn search_or_union(
+        store: &IndexStore,
+        overlay: &MetaOverlay,
+        q: &ParsedQuery,
+        opt: &SearchOptions,
+    ) -> Result<Vec<u32>> {
+        // OR 分支各自独立（只读共享 store/overlay），并行扫描后 union。
+        // 语义：union 后走同一排序；分支间相对顺序本来就不保证（HashSet 去重）。
+        // pin matcher 按分支预编译一次（串行；构建便宜），扫描中各线程再 clone。
+        let mut branch_qs: Vec<ParsedQuery> = Vec::with_capacity(1 + q.or_branches.len());
+        branch_qs.push(Self::strip_or(q));
+            for br in &q.or_branches {
+                branch_qs.push(Self::strip_or(br));
+            }
+            #[cfg(feature = "pinyin")]
+            let branch_needles: Vec<Vec<String>> = branch_qs
+                .iter()
+                .map(|b| collect_pinyin_needles(b, opt))
+                .collect();
+            #[cfg(feature = "pinyin")]
+            let branch_matchers: Vec<Vec<IbRegex<'_>>> = branch_needles
+                .iter()
+                .map(|ns| {
+                    ns.iter()
+                        .map(|s| build_pinyin_matcher(s.as_str()))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let per_branch: Vec<Vec<u32>> = (0..branch_qs.len())
+                .into_par_iter()
+                .map(|i| {
+                    #[cfg(feature = "pinyin")]
+                    let m: &PinList<'_> = branch_matchers[i].as_slice();
+                    #[cfg(not(feature = "pinyin"))]
+                    let m: &PinList<'_> = &[];
+                    Self::search_flat_indices(store, overlay, &branch_qs[i], opt, m)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut uni: HashSet<u32> = HashSet::new();
+            for v in per_branch {
+                uni.extend(v);
+            }
+            Ok(uni.into_iter().collect())
     }
 
     fn strip_or(q: &ParsedQuery) -> ParsedQuery {
@@ -423,63 +600,10 @@ impl SearchEngine {
                 None => fused_scan(store, overlay, q),
             }
         } else {
-            // === Slow / 复杂 path：保留原 retain 链 + name_match_phase（regex/glob/pinyin/name_terms 等）
-            let mut cand = initial_candidates(store, q);
-
-            cand.retain(|&idx| {
-                let e = &store.entries[idx as usize];
-                !store.deleted.contains(idx) && !e.is_deleted()
-            });
-
-            if q.only_files {
-                cand.retain(|&idx| !store.entries[idx as usize].is_dir_entry());
-            }
-            if q.only_dirs {
-                cand.retain(|&idx| store.entries[idx as usize].is_dir_entry());
-            }
-
-            // 快速首遍：文件 size 多为占位 0，仅在后端标记 metadata_ready 后才做大小过滤。
-            // 修改/创建时间：USN 首遍与 MFT 扫描对多数条目已有秒级时间，应始终参与过滤（与 GUI dm: 一致）。
-            if store.metadata_ready {
-                if let Some(min) = q.size_min {
-                    cand.retain(|&idx| store.entries[idx as usize].size >= min);
-                }
-                if let Some(max) = q.size_max {
-                    cand.retain(|&idx| store.entries[idx as usize].size <= max);
-                }
-            }
-            if let Some(min) = q.mtime_min.map(crate::index::filetime_to_unix_secs) {
-                cand.retain(|&idx| {
-                    let (_, mt, _) = entry_meta_for_filter(overlay, store, idx);
-                    mt >= min
-                });
-            }
-            if let Some(max) = q.mtime_max.map(crate::index::filetime_to_unix_secs) {
-                cand.retain(|&idx| {
-                    let (_, mt, _) = entry_meta_for_filter(overlay, store, idx);
-                    mt <= max
-                });
-            }
-            if let Some(min) = q.ctime_min.map(crate::index::filetime_to_unix_secs) {
-                cand.retain(|&idx| {
-                    let (_, _, ct) = entry_meta_for_filter(overlay, store, idx);
-                    ct >= min
-                });
-            }
-            if let Some(max) = q.ctime_max.map(crate::index::filetime_to_unix_secs) {
-                cand.retain(|&idx| {
-                    let (_, _, ct) = entry_meta_for_filter(overlay, store, idx);
-                    ct <= max
-                });
-            }
-
-            if q.attrib_must != 0 {
-                let am = q.attrib_must;
-                cand.retain(|&idx| {
-                    let a = store.entries[idx as usize].attrs & 0xff;
-                    (a & am) == am
-                });
-            }
+            // === Slow / 复杂 path：属性过滤单遍并行（slow_attr_candidates，
+            // 替代原来的 deleted/dir/size/time/attrib 6 次串行全表 retain），
+            // 之后 name_match_phase（regex/glob/pinyin/name_terms）与 post 链语义不变。
+            let cand = slow_attr_candidates(store, overlay, q);
 
             if !q.name_terms.is_empty() {
                 name_match_all_terms(store, q, opt, cand, &q.name_terms)?
@@ -628,15 +752,41 @@ impl SearchEngine {
         if limit == 0 {
             return Ok(vec![]);
         }
-        let sort_by = effective_sort_field(store, q);
         let _dbg_fin = std::env::var("FINDX2_DEBUG_SEARCH").is_ok();
         let _t_sort = std::time::Instant::now();
         let _hits_total = hits.len();
+        let ordered: Vec<u32> = Self::sort_top_k(store, hits, q, limit);
+        let _sort_us = _t_sort.elapsed().as_micros();
+        let (out, stats) =
+            Self::build_hit_page(store, &ordered, q, opt, overlay, pin_res, _dbg_fin)?;
+        if _dbg_fin {
+            eprintln!(
+                "[finalize] sort_field={:?} hits_total={} returned={} sort={:.2}ms build={:.2}ms (path={:.2}ms hl={:.2}ms meta={:.2}ms)",
+                effective_sort_field(store, q),
+                _hits_total,
+                out.len(),
+                _sort_us as f64 / 1000.0,
+                stats.build_us as f64 / 1000.0,
+                stats.path_us as f64 / 1000.0,
+                stats.hl_us as f64 / 1000.0,
+                stats.meta_us as f64 / 1000.0,
+            );
+        }
+        Ok(out)
+    }
+
+    /// top-k 选择 + 排序：命中集远大于 k 时先 select_nth 定位分位点（O(H)），
+    /// 截断后再排前 k（O(k log k)），避免 O(H log H) 全量排序。
+    /// `search()` 传 k=limit；`search_paged()` 传 k=offset+limit，切页由调用方做。
+    fn sort_top_k(store: &IndexStore, hits: &[u32], q: &ParsedQuery, k: usize) -> Vec<u32> {
+        if k == 0 || hits.is_empty() {
+            return vec![];
+        }
+        let sort_by = effective_sort_field(store, q);
         // 不在建索引时做三次全局排序；此处仅对命中集排序（与原先「全局序上扫描」等价）。
-        // 命中集远大于 limit 时，用堆只保留前 limit 条，避免 O(n log n) 全量排序。
-        let ordered: Vec<u32> = match sort_by {
+        match sort_by {
             SortField::Size => {
-                let v = hits.as_slice();
+                let v = hits;
                 if v.is_empty() {
                     vec![]
                 } else {
@@ -647,12 +797,12 @@ impl SearchEngine {
                         let sb = store.entries[*b as usize].size;
                         if desc { sb.cmp(&sa) } else { sa.cmp(&sb) }
                     };
-                    select_top_k_then_sort(&mut out, limit, cmp);
+                    select_top_k_then_sort(&mut out, k, cmp);
                     out
                 }
             }
             SortField::Modified => {
-                let v = hits.as_slice();
+                let v = hits;
                 if v.is_empty() {
                     vec![]
                 } else {
@@ -663,12 +813,12 @@ impl SearchEngine {
                         let sb = store.entries[*b as usize].mtime;
                         if desc { sb.cmp(&sa) } else { sa.cmp(&sb) }
                     };
-                    select_top_k_then_sort(&mut out, limit, cmp);
+                    select_top_k_then_sort(&mut out, k, cmp);
                     out
                 }
             }
             SortField::Created => {
-                let v = hits.as_slice();
+                let v = hits;
                 if v.is_empty() {
                     vec![]
                 } else {
@@ -679,7 +829,7 @@ impl SearchEngine {
                         let sb = store.entries[*b as usize].ctime;
                         if desc { sb.cmp(&sa) } else { sa.cmp(&sb) }
                     };
-                    select_top_k_then_sort(&mut out, limit, cmp);
+                    select_top_k_then_sort(&mut out, k, cmp);
                     out
                 }
             }
@@ -687,7 +837,7 @@ impl SearchEngine {
             // 1852 hit + limit 1000 在 release 下要 ~600ms，是 GUI 主要慢源）。
             // 改为直接用 names_buf 的借用切片做字节序比较，并用 select_nth_unstable_by 取前 k。
             SortField::Name => {
-                let v = hits.as_slice();
+                let v = hits;
                 if v.is_empty() {
                     vec![]
                 } else {
@@ -702,81 +852,141 @@ impl SearchEngine {
                             na.cmp(nb)
                         }
                     };
-                    select_top_k_then_sort(&mut out, limit, cmp);
+                    select_top_k_then_sort(&mut out, k, cmp);
                     out
                 }
             }
-            // Path 排序：entry_display_path 返回 owned String 没法借用，
-            // 但通过 select_nth_unstable_by 至少把 N 全排序换成 k 全排序 + N 一次 partition。
+            // Path 排序：entry_display_path 每次调用都走父链 walk + format!，
+            // 若放在 cmp 里就是 O(k log k) 次路径重建（大命中集下比 Name 排序慢一个量级）。
+            // Schwartzian：路径 key 一次性算好（并行），之后只比较 String；
+            // key 构建失败回退空串，与旧 cmp 里 `unwrap_or_default` 语义一致。
             SortField::Path => {
-                let v = hits.as_slice();
+                let v = hits;
                 if v.is_empty() {
                     vec![]
                 } else {
-                    let mut out = v.to_vec();
                     let desc = q.sort_desc;
-                    let cmp = |a: &u32, b: &u32| -> std::cmp::Ordering {
-                        let pa = store.entry_display_path(*a as usize).unwrap_or_default();
-                        let pb = store.entry_display_path(*b as usize).unwrap_or_default();
-                        if desc {
-                            pb.cmp(&pa)
-                        } else {
-                            pa.cmp(&pb)
-                        }
-                    };
-                    select_top_k_then_sort(&mut out, limit, cmp);
-                    out
+                    let mut keyed: Vec<(u32, String)> = v
+                        .par_iter()
+                        // 小命中集不切分，理由同 finalize 构建。
+                        .with_min_len(1024)
+                        .map(|&idx| {
+                            let p = store
+                                .entry_display_path(idx as usize)
+                                .unwrap_or_default();
+                            (idx, p)
+                        })
+                        .collect();
+                    let mut cmp_key =
+                        |a: &(u32, String), b: &(u32, String)| -> std::cmp::Ordering {
+                            if desc {
+                                b.1.cmp(&a.1)
+                            } else {
+                                a.1.cmp(&b.1)
+                            }
+                        };
+                    if keyed.len() > k {
+                        let pivot = k - 1;
+                        keyed.select_nth_unstable_by(pivot, &mut cmp_key);
+                        keyed.truncate(k);
+                    }
+                    keyed.sort_unstable_by(&mut cmp_key);
+                    keyed.into_iter().map(|(idx, _)| idx).collect()
                 }
             }
-        };
-        let _sort_us = _t_sort.elapsed().as_micros();
+        }
+    }
+
+/// 当页构建：已排序的 idx 切片 → `SearchHit`（name/path/highlight/meta）。
+    /// 每 hit 相互独立，并行（rayon 对 indexed 源 collect 保序）；pin matcher
+    /// 每线程 clone（`map_init`），`with_min_len` 保小页不切分。
+    /// 错误整体返回 Err（并行下具体哪一个先报不确定，但实践中不可达）。
+    fn build_hit_page(
+        store: &IndexStore,
+        page: &[u32],
+        q: &ParsedQuery,
+        opt: &SearchOptions,
+        overlay: &MetaOverlay,
+        pin_res: &PinList<'_>,
+        dbg: bool,
+    ) -> Result<(Vec<SearchHit>, PageBuildStats)> {
         let _t_build = std::time::Instant::now();
-        let mut out = Vec::with_capacity(ordered.len());
-        let mut _path_us: u128 = 0;
-        let mut _hl_us: u128 = 0;
-        let mut _meta_us: u128 = 0;
-        for idx in ordered {
-            let e = &store.entries[idx as usize];
-            let name = store.name_str(e)?.to_string();
-            let name_bytes = store.name_bytes(e);
-            let _t = if _dbg_fin { Some(std::time::Instant::now()) } else { None };
-            let name_highlight = highlight_name_for_query(&name, name_bytes, q, opt, pin_res);
-            if let Some(t) = _t {
-                _hl_us += t.elapsed().as_micros();
-            }
-            let _t = if _dbg_fin { Some(std::time::Instant::now()) } else { None };
-            let (size, mtime, _) = effective_meta(overlay, store, idx);
-            if let Some(t) = _t {
-                _meta_us += t.elapsed().as_micros();
-            }
-            let _t = if _dbg_fin { Some(std::time::Instant::now()) } else { None };
-            let path = store.entry_display_path(idx as usize)?;
-            if let Some(t) = _t {
-                _path_us += t.elapsed().as_micros();
-            }
-            out.push(SearchHit {
-                entry_idx: idx,
-                name,
-                path,
-                size,
-                mtime,
-                name_highlight,
-            });
-        }
-        if _dbg_fin {
-            eprintln!(
-                "[finalize] sort_field={:?} hits_total={} returned={} sort={:.2}ms build={:.2}ms (path={:.2}ms hl={:.2}ms meta={:.2}ms)",
-                sort_by,
-                _hits_total,
-                out.len(),
-                _sort_us as f64 / 1000.0,
-                _t_build.elapsed().as_micros() as f64 / 1000.0,
-                _path_us as f64 / 1000.0,
-                _hl_us as f64 / 1000.0,
-                _meta_us as f64 / 1000.0,
-            );
-        }
-        Ok(out)
+        // 高亮 needle / Finder / 正则 per-query 预计算一次（见 PreparedHighlight），
+        // 不再每 hit 重复小写 + 构建 Finder + 编译正则。
+        let prepared = PreparedHighlight::build(q);
+        // finalize 构建并行化：每 hit 的 name / path / highlight / meta 相互独立；
+        // store 与 overlay 只读共享（fused_scan 已是同模式），rayon 对 indexed 源
+        // collect 保序，返回顺序与串行循环完全一致。pin matcher 每线程 clone 一份，
+        // 避免多线程共享同一 IbRegex 内部 cache pool 的锁竞争（见 build_pinyin_matcher）。
+        // 错误语义：仍整体返回 Err（并行下具体哪一个先报不确定，但这些错误在实践中
+        // 不可达——名字必为合法 UTF-8、下标必在界内）。
+        let path_us = AtomicU64::new(0);
+        let hl_us = AtomicU64::new(0);
+        let meta_us = AtomicU64::new(0);
+        let out: Vec<SearchHit> = page
+            .into_par_iter()
+            // 小命中集不切分（单线程跑，免掉 rayon 切分/合并开销；行为与串行一致）。
+            // per-hit 约 1–2µs，1024 条 ≈ 1–2ms，低于此规模并行无收益。
+            .with_min_len(1024)
+            .map_init(
+                || pin_res.to_vec(),
+                |pin_local, &idx| -> Result<SearchHit> {
+                    let e = &store.entries[idx as usize];
+                    let name = store.name_str(e)?.to_string();
+                    let name_bytes = store.name_bytes(e);
+                    let pin_slice: &PinList<'_> = pin_local.as_slice();
+                    let _t = if dbg {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
+                    let name_highlight =
+                        highlight_name_for_query(&name, name_bytes, q, opt, pin_slice, &prepared);
+                    if let Some(t) = _t {
+                        hl_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
+                    let _t = if dbg {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
+                    let (size, mtime, _) = effective_meta(overlay, store, idx);
+                    if let Some(t) = _t {
+                        meta_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
+                    let _t = if dbg {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
+                    let path = store.entry_display_path(idx as usize)?;
+                    if let Some(t) = _t {
+                        path_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
+                    Ok(SearchHit {
+                        entry_idx: idx,
+                        name,
+                        path,
+                        size,
+                        mtime,
+                        name_highlight,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+        let stats = PageBuildStats {
+            path_us: path_us.load(Ordering::Relaxed) as u128,
+            hl_us: hl_us.load(Ordering::Relaxed) as u128,
+            meta_us: meta_us.load(Ordering::Relaxed) as u128,
+            build_us: _t_build.elapsed().as_micros(),
+        };
+        Ok((out, stats))
+    }
+
+    /// FRN → entry 下标（后台 stat worker 等外部增量用；墓碑条目也会返回下标，
+    /// 调用方自行决定是否跳过）。
+    pub fn entry_idx_by_frn(&self, frn: u64) -> Option<usize> {
+        self.store.read().frn_to_entry.get_idx(frn).map(|i| i as usize)
     }
 
     pub fn index_store(&self) -> parking_lot::RwLockReadGuard<'_, IndexStore> {
@@ -842,6 +1052,7 @@ impl SearchEngine {
         let mut g = self.store.write();
         g.patch_entry_metadata(idx, size, mtime, ctime)?;
         drop(g);
+        self.bump_revision();
         self.metadata_overlay.put(
             idx,
             size,
@@ -860,6 +1071,7 @@ impl SearchEngine {
         let mut g = self.store.write();
         g.metadata_ready = ready;
         drop(g);
+        self.bump_revision();
         if ready {
             self.clear_backfill_progress();
             self.metadata_overlay.clear();
@@ -974,7 +1186,8 @@ fn collect_pinyin_needles(q: &ParsedQuery, opt: &SearchOptions) -> Vec<String> {
 ///
 /// 注意：lita::Regex 是 `Send + Sync + Clone`，文档建议「在每个线程上 clone 一份」以避免
 /// 内部 cache pool 的 spin-lock 竞争（短 haystack + 大并发场景）。
-/// 本项目目前先用共享引用，若后续 bench 看到锁争用再改成 per-thread clone。
+/// 本项目已实现 per-thread clone：`fused_scan_pinyin_par` 的 fold identity 与
+/// `finalize_hits` 的 `map_init` 在每线程各持一份 clone，只读共享零竞争。
 #[cfg(feature = "pinyin")]
 fn build_pinyin_matcher(needle: &str) -> Result<IbRegex<'_>> {
     // PinyinNotation::Ascii = 全拼（machuntian）
@@ -1350,37 +1563,42 @@ where
     let _t_par = std::time::Instant::now();
     let _n_threads = if _dbg { rayon::current_num_threads() } else { 0 };
 
+    // pin matcher 每线程 clone 一份：lita::Regex 内部有 cache pool，多线程共享
+    // 同一实例会在短 haystack + 大并发下自旋竞争（上游文档建议 per-thread clone）。
+    // fold 的 identity 在每线程（及切分）调用一次，clone 数有界；匹配语义与共享引用一致。
     let result = ids
-        .fold(Vec::new, |mut acc, idx| {
+        .fold(
+            || (Vec::new(), pin_res.to_vec()),
+            |(mut acc, pin_local), idx| {
             let e = unsafe { store.entries.get_unchecked(idx as usize) };
             if e.is_deleted() {
-                return acc;
+                return (acc, pin_local);
             }
             if check_deleted_bm && store.deleted.contains(idx) {
-                return acc;
+                return (acc, pin_local);
             }
             let is_dir = e.is_dir_entry();
             if only_files && is_dir {
-                return acc;
+                return (acc, pin_local);
             }
             if only_dirs && !is_dir {
-                return acc;
+                return (acc, pin_local);
             }
             if attrib_must != 0 {
                 let a = e.attrs & 0xff;
                 if (a & attrib_must) != attrib_must {
-                    return acc;
+                    return (acc, pin_local);
                 }
             }
             if any_size_filter {
                 if let Some(v) = size_min {
                     if e.size < v {
-                        return acc;
+                        return (acc, pin_local);
                     }
                 }
                 if let Some(v) = size_max {
                     if e.size > v {
-                        return acc;
+                        return (acc, pin_local);
                     }
                 }
             }
@@ -1388,22 +1606,22 @@ where
                 let (_, mt, ct) = entry_meta_for_filter(overlay, store, idx);
                 if let Some(v) = mtime_min {
                     if mt < v {
-                        return acc;
+                        return (acc, pin_local);
                     }
                 }
                 if let Some(v) = mtime_max {
                     if mt > v {
-                        return acc;
+                        return (acc, pin_local);
                     }
                 }
                 if let Some(v) = ctime_min {
                     if ct < v {
-                        return acc;
+                        return (acc, pin_local);
                     }
                 }
                 if let Some(v) = ctime_max {
                     if ct > v {
-                        return acc;
+                        return (acc, pin_local);
                     }
                 }
             }
@@ -1412,21 +1630,26 @@ where
             let name_bytes = store.name_bytes(e);
             // SAFETY：建索引阶段已保证 entry.name 是合法 UTF-8（FRN→name 通过 OS API 取的 wide string 转过来）。
             let name_str = unsafe { std::str::from_utf8_unchecked(name_bytes) };
-            for re in pin_res.iter() {
+            // 用本线程 clone 的 matcher（pin_local），不碰共享实例的内部 cache pool。
+            for re in pin_local.iter() {
                 if re.find(name_str).is_none() {
-                    return acc;
+                    return (acc, pin_local);
                 }
             }
             acc.push(idx);
-            acc
+            (acc, pin_local)
         })
-        .reduce(Vec::new, |mut a, mut b| {
-            if a.len() < b.len() {
-                std::mem::swap(&mut a, &mut b);
-            }
-            a.extend_from_slice(&b);
-            a
-        });
+        .reduce(
+            || (Vec::new(), pin_res.to_vec()),
+            |(mut a, pa), (mut b, _pb)| {
+                if a.len() < b.len() {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                a.extend_from_slice(&b);
+                (a, pa)
+            },
+        )
+        .0;
     if _dbg {
         eprintln!(
             "[fused_scan_pinyin] entries={} hits={} threads={} took={:.2}ms needles={}",
@@ -1460,21 +1683,11 @@ fn entry_matches_ext_candidates(store: &IndexStore, idx: u32, ext_src: &[String]
     ext_src.iter().any(|want| want == &got)
 }
 
-fn initial_candidates(store: &IndexStore, q: &ParsedQuery) -> Vec<u32> {
-    let ext_src: Vec<String> = if !q.ext_list.is_empty() {
-        q.ext_list.clone()
-    } else if let Some(ref e) = q.ext {
-        vec![e.clone()]
-    } else {
-        Vec::new()
-    };
-
-    if ext_src.is_empty() {
-        return (0..store.entries.len() as u32).collect();
-    }
-
+/// ext 256 桶位图并集（粗筛：不同扩展名会碰撞，调用方须再精确校验）。
+/// 返回 None = 没有任何桶命中（调用方按空候选处理）；无 ext 约束的场景不调本函数。
+fn ext_union_ids(store: &IndexStore, ext_src: &[String]) -> Option<Vec<u32>> {
     let mut acc: Option<RoaringBitmap> = None;
-    for ext in &ext_src {
+    for ext in ext_src {
         let h = hash_ext8(&format!("x.{ext}")) as usize;
         if let Some(bm) = &store.ext_filter[h] {
             acc = Some(match acc {
@@ -1486,13 +1699,129 @@ fn initial_candidates(store: &IndexStore, q: &ParsedQuery) -> Vec<u32> {
             });
         }
     }
+    acc.map(|b| b.iter().collect())
+}
 
-    acc.map(|b| {
-        b.iter()
-            .filter(|&idx| entry_matches_ext_candidates(store, idx, &ext_src))
-            .collect()
-    })
-    .unwrap_or_default()
+/// slow path 属性过滤的单遍并行实现（替代原来的 6 次串行全表 retain）。
+///
+/// 原链（deleted → dir/file → size → mtime/ctime ×4 → attrib）每遍都全表扫，
+/// regex/ext 类查询光这几遍在 8.5M 下就几百 ms。这里按 fused_scan 的模式一次过：
+/// - 有 ext 约束：起点是 ext 桶位图并集（精确后缀校验并入同一谓词——与原来
+///   `initial_candidates` 先精确校验再逐项 retain 等价，同为 AND，结果集与顺序一致）；
+/// - 无 ext：直接并行扫 `0..N` range，避免先 `collect` 全表下标再过滤。
+///
+/// 语义与原 retain 链逐条对齐（含 `metadata_ready` 门控 size、overlay 时间源、
+/// deleted 位图必查）。结果顺序：ext 起点保持位图迭代序，全表起点保持下标升序
+/// （par filter / fold+reduce 保序），与原来一致。
+fn slow_attr_candidates(store: &IndexStore, overlay: &MetaOverlay, q: &ParsedQuery) -> Vec<u32> {
+    let ext_src: Vec<String> = if !q.ext_list.is_empty() {
+        q.ext_list.clone()
+    } else if let Some(ref e) = q.ext {
+        vec![e.clone()]
+    } else {
+        Vec::new()
+    };
+    // 时间阈值 FILETIME→unix 秒，循环外一次（与 fused_scan_par 一致）。
+    let mtime_min = q.mtime_min.map(crate::index::filetime_to_unix_secs);
+    let mtime_max = q.mtime_max.map(crate::index::filetime_to_unix_secs);
+    let ctime_min = q.ctime_min.map(crate::index::filetime_to_unix_secs);
+    let ctime_max = q.ctime_max.map(crate::index::filetime_to_unix_secs);
+    let any_time_filter = mtime_min.is_some()
+        || mtime_max.is_some()
+        || ctime_min.is_some()
+        || ctime_max.is_some();
+    let metadata_ready = store.metadata_ready;
+
+    let pred = |idx: u32| -> bool {
+        let Some(e) = store.entries.get(idx as usize) else {
+            return false;
+        };
+        // deleted（slow path 保持原语义：位图必查，不做 is_empty 短路）。
+        if store.deleted.contains(idx) || e.is_deleted() {
+            return false;
+        }
+        let is_dir = e.is_dir_entry();
+        if q.only_files && is_dir {
+            return false;
+        }
+        if q.only_dirs && !is_dir {
+            return false;
+        }
+        if metadata_ready {
+            if let Some(v) = q.size_min {
+                if e.size < v {
+                    return false;
+                }
+            }
+            if let Some(v) = q.size_max {
+                if e.size > v {
+                    return false;
+                }
+            }
+        }
+        if any_time_filter {
+            let (_, mt, ct) = entry_meta_for_filter(overlay, store, idx);
+            if let Some(v) = mtime_min {
+                if mt < v {
+                    return false;
+                }
+            }
+            if let Some(v) = mtime_max {
+                if mt > v {
+                    return false;
+                }
+            }
+            if let Some(v) = ctime_min {
+                if ct < v {
+                    return false;
+                }
+            }
+            if let Some(v) = ctime_max {
+                if ct > v {
+                    return false;
+                }
+            }
+        }
+        if q.attrib_must != 0 {
+            let a = e.attrs & 0xff;
+            if (a & q.attrib_must) != q.attrib_must {
+                return false;
+            }
+        }
+        if !ext_src.is_empty() && !entry_matches_ext_candidates(store, idx, &ext_src) {
+            return false;
+        }
+        true
+    };
+
+    // 有 ext 约束但没有任何桶命中 → 空候选（与原 `unwrap_or_default` 一致），
+    // 绝不能回退全表扫描。
+    let base: Option<Vec<u32>> = if ext_src.is_empty() {
+        None
+    } else {
+        Some(ext_union_ids(store, &ext_src).unwrap_or_default())
+    };
+    match base {
+        Some(ids) => ids.into_par_iter().filter(|&idx| pred(idx)).collect(),
+        None => {
+            let n = store.entries.len() as u32;
+            (0..n)
+                .into_par_iter()
+                .fold(Vec::new, |mut a, idx| {
+                    if pred(idx) {
+                        a.push(idx);
+                    }
+                    a
+                })
+                .reduce(Vec::new, |mut a, mut b| {
+                    if a.len() < b.len() {
+                        std::mem::swap(&mut a, &mut b);
+                    }
+                    a.extend_from_slice(&b);
+                    a
+                })
+        }
+    }
 }
 
 fn path_matches_drive_prefix(
@@ -1599,13 +1928,28 @@ fn path_depth(store: &IndexStore, entry_idx: usize) -> u32 {
     b.iter().filter(|&&c| c == b'\\').count() as u32 + 1
 }
 
-/// 父目录 FRN -> 直接子项数量（文件与子目录）
+/// 父目录 FRN -> 直接子项数量（文件与子目录）。
+/// per-parent 计数并行（每线程局部表 + 合并；8.5M 下串行约 0.3–0.5s），
+/// 之后 dir_idx→FRN 映射仍串行（dirs 量级小）。仅 child:/empty: 查询触发。
 fn child_count_map(store: &IndexStore) -> HashMap<u64, u32> {
-    let mut per_parent_idx: HashMap<u32, u32> = HashMap::new();
-    for i in 0..store.entries.len() {
-        let di = store.entries[i].dir_idx;
-        *per_parent_idx.entry(di).or_insert(0) += 1;
-    }
+    let n = store.entries.len();
+    let per_parent_idx: HashMap<u32, u32> = (0..n)
+        .into_par_iter()
+        .fold(HashMap::new, |mut m, i| {
+            if let Some(e) = store.entries.get(i) {
+                *m.entry(e.dir_idx).or_insert(0) += 1;
+            }
+            m
+        })
+        .reduce(HashMap::new, |mut a, mut b| {
+            if a.len() < b.len() {
+                std::mem::swap(&mut a, &mut b);
+            }
+            for (k, v) in b {
+                *a.entry(k).or_insert(0) += v;
+            }
+            a
+        });
     let mut out: HashMap<u64, u32> = HashMap::new();
     for (di, c) in per_parent_idx {
         if let Some(d) = store.dirs.get(di as usize) {
@@ -1919,6 +2263,62 @@ where
     v.sort_unstable_by(&mut cmp);
 }
 
+/// finalize 阶段一次性备好的高亮 needle（per-query 构建一次，per-hit 只读共享）。
+///
+/// 背景：`highlight_name_for_query` 曾在每个 hit 上重复做三件事——needle 小写分配
+/// （`to_ascii_lowercase().into_bytes()`）、`memmem::Finder::new` 构建、正则查询下
+/// `Regex::new` 编译。limit=5000 时就是 5000×N 次重复，占 build 阶段约一半。
+/// 此结构把它们全部提到循环外；行为与之前逐 hit 现算完全一致：
+/// - `terms` 与 `q.name_terms`（或退化 `[q.substring]`）**下标一一对齐**（含空串占位），
+///   保证 `pin_res[i]` 的拼音 matcher 映射不变；
+/// - 空 needle 跳过（旧 `needle_byte_ranges_for_name_match` 对空串返回空区间）；
+/// - 正则编译失败时为 None → 无高亮（旧代码 `if let Ok(re)` 同语义；且搜索阶段
+///   早已对非法正则报错返回，走到 finalize 的正则必合法）。
+struct PreparedHighlight {
+    terms: Vec<Option<HighlightTerm>>,
+    regex: Option<Regex>,
+}
+
+struct HighlightTerm {
+    needle: Vec<u8>,
+    finder: memmem::Finder<'static>,
+}
+
+impl PreparedHighlight {
+    fn build(q: &ParsedQuery) -> Self {
+        let mut terms = Vec::new();
+        if q.regex_pattern.is_none() && q.glob_pattern.is_none() {
+            let mut push = |s: &str| {
+                let needle = if q.case_sensitive {
+                    s.as_bytes().to_vec()
+                } else {
+                    s.to_ascii_lowercase().into_bytes()
+                };
+                terms.push(if needle.is_empty() {
+                    None
+                } else {
+                    Some(HighlightTerm {
+                        finder: memmem::Finder::new(&needle).into_owned(),
+                        needle,
+                    })
+                });
+            };
+            if !q.name_terms.is_empty() {
+                for t in &q.name_terms {
+                    push(t);
+                }
+            } else if let Some(ref s) = q.substring {
+                push(s);
+            }
+        }
+        let regex = q
+            .regex_pattern
+            .as_ref()
+            .and_then(|pat| Regex::new(pat).ok());
+        Self { terms, regex }
+    }
+}
+
 /// 与 `name_match_phase` 使用同一套字面 / `ib_matcher` 拼音规则，生成文件名高亮区间（UTF-8 字节 → Unicode 字符下标）。
 ///
 /// `pin_res` 与 `q.name_terms`（或 `[q.substring]`）一一对应：第 i 个 needle 对应 `pin_res[i]`。
@@ -1930,10 +2330,12 @@ fn highlight_name_for_query(
     q: &ParsedQuery,
     opt: &SearchOptions,
     pin_res: &PinList<'_>,
+    prep: &PreparedHighlight,
 ) -> Vec<[u32; 2]> {
     let mut byte_ranges: Vec<(usize, usize)> = Vec::new();
-    if let Some(ref pat) = q.regex_pattern {
-        if let Ok(re) = Regex::new(pat) {
+    if q.regex_pattern.is_some() {
+        // 正则只编译一次（prep）；旧代码每 hit `Regex::new` 一次。
+        if let Some(ref re) = prep.regex {
             if let Some(m) = re.find(name_bytes) {
                 byte_ranges.push((m.start(), m.end()));
             }
@@ -1943,51 +2345,21 @@ fn highlight_name_for_query(
     if q.glob_pattern.is_some() {
         return vec![];
     }
-    if !q.name_terms.is_empty() {
-        for (i, term) in q.name_terms.iter().enumerate() {
-            let nb = if q.case_sensitive {
-                term.as_bytes().to_vec()
-            } else {
-                term.to_ascii_lowercase().into_bytes()
-            };
-            #[cfg(feature = "pinyin")]
-            let pin_re: Option<&IbRegexUnit<'_>> = pin_res.get(i);
-            #[cfg(not(feature = "pinyin"))]
-            let pin_re: Option<&IbRegexUnit<'_>> = {
-                let _ = pin_res;
-                let _ = i;
-                None
-            };
-            byte_ranges.extend(needle_byte_ranges_for_name_match(
-                name, name_bytes, &nb, q, opt, pin_re,
-            ));
-        }
-    } else {
-        let needle_bs = q
-            .substring
-            .as_ref()
-            .map(|s| {
-                if q.case_sensitive {
-                    s.as_bytes().to_vec()
-                } else {
-                    s.to_ascii_lowercase().into_bytes()
-                }
-            })
-            .unwrap_or_default();
+    // prep.terms 与 name_terms / [substring] 下标对齐，pin_res[i] 映射与旧代码一致。
+    for (i, slot) in prep.terms.iter().enumerate() {
+        let Some(term) = slot else {
+            continue;
+        };
         #[cfg(feature = "pinyin")]
-        let pin_re: Option<&IbRegexUnit<'_>> = pin_res.first();
+        let pin_re: Option<&IbRegexUnit<'_>> = pin_res.get(i);
         #[cfg(not(feature = "pinyin"))]
         let pin_re: Option<&IbRegexUnit<'_>> = {
             let _ = pin_res;
+            let _ = i;
             None
         };
         byte_ranges.extend(needle_byte_ranges_for_name_match(
-            name,
-            name_bytes,
-            &needle_bs,
-            q,
-            opt,
-            pin_re,
+            name, name_bytes, term, q, opt, pin_re,
         ));
     }
     byte_ranges_to_char_ranges_merged(name, byte_ranges)
@@ -2052,18 +2424,17 @@ fn merge_byte_ranges(mut v: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     out
 }
 
-fn find_all_literal_substrings(haystack: &[u8], needle: &[u8]) -> Vec<(usize, usize)> {
-    if needle.is_empty() {
+fn find_all_literal_substrings(haystack: &[u8], term: &HighlightTerm) -> Vec<(usize, usize)> {
+    if term.needle.is_empty() {
         return vec![];
     }
-    let finder = memmem::Finder::new(needle);
     let mut out = Vec::new();
     let mut pos = 0usize;
     while pos < haystack.len() {
         let slice = &haystack[pos..];
-        if let Some(off) = finder.find(slice) {
+        if let Some(off) = term.finder.find(slice) {
             let start = pos + off;
-            let end = start + needle.len();
+            let end = start + term.needle.len();
             out.push((start, end));
             pos = start + 1;
         } else {
@@ -2081,14 +2452,14 @@ fn find_all_literal_substrings(haystack: &[u8], needle: &[u8]) -> Vec<(usize, us
 fn needle_byte_ranges_for_name_match(
     name: &str,
     name_bytes: &[u8],
-    needle_bs: &[u8],
+    term: &HighlightTerm,
     q: &ParsedQuery,
     #[allow(unused_variables)]
     opt: &SearchOptions,
     #[cfg_attr(not(feature = "pinyin"), allow(unused_variables))]
     pin_re: Option<&IbRegexUnit<'_>>,
 ) -> Vec<(usize, usize)> {
-    if needle_bs.is_empty() {
+    if term.needle.is_empty() {
         return vec![];
     }
     if q.regex_pattern.is_some() || q.glob_pattern.is_some() {
@@ -2104,7 +2475,7 @@ fn needle_byte_ranges_for_name_match(
             let mut ranges = Vec::new();
             // 1) 字面子串：在「混合 needle」（英文 + 拼音首字母）下确保字面命中也被高亮。
             //    fused_scan_pinyin 已经命中本条，所以一定有至少一个匹配区间（字面或拼音）。
-            ranges.extend(find_all_literal_substrings(name_bytes, needle_bs));
+            ranges.extend(find_all_literal_substrings(name_bytes, term));
             // 2) lita 的拼音/混合匹配区间：只有 1 个 leftmost match（lita 不暴露 find_iter）。
             //    对中文文件名「马春天」+ needle "mct"，lita.find 会返回整段 "马春天" 的字节区间。
             if let Some(m) = re.find(name_str) {
@@ -2117,10 +2488,10 @@ fn needle_byte_ranges_for_name_match(
     }
     let mut ranges = Vec::new();
     if q.case_sensitive {
-        ranges.extend(find_all_literal_substrings(name_bytes, needle_bs));
+        ranges.extend(find_all_literal_substrings(name_bytes, term));
     } else {
         let h: Vec<u8> = name.to_ascii_lowercase().into_bytes();
-        ranges.extend(find_all_literal_substrings(&h, needle_bs));
+        ranges.extend(find_all_literal_substrings(&h, term));
     }
     merge_byte_ranges(ranges)
 }

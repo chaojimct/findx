@@ -254,7 +254,8 @@ impl FileEntry {
     }
 }
 
-/// 主索引
+/// 主索引（P0-2 单卷重建需要整体克隆：读锁下 memcpy，搜索不阻塞）。
+#[derive(Clone)]
 pub struct IndexStore {
     pub names_buf: Vec<u8>,
     pub entries: Vec<FileEntry>,
@@ -856,6 +857,51 @@ impl IndexStore {
                     return Ok(());
                 }
                 self.upsert_raw_entry(entry)?;
+                Ok(())
+            }
+            ChangeEvent::CreatePending {
+                file_id,
+                file_id_128,
+                parent_id,
+                name,
+                attrs,
+                is_dir,
+            } => {
+                if self.excluded_for_raw(*parent_id, name) {
+                    return Ok(());
+                }
+                if self.frn_to_entry.contains_key(file_id) {
+                    // 已有条目（迟到的 RENAME_NEW_NAME / 重复 CREATE）：只搬名字/父链，
+                    // 保留已有 size/mtime/ctime，再把 attrs 同步到最新。
+                    self.apply_rename_mapped(*file_id, *parent_id, name)?;
+                    if let Some(&idx) = self.frn_to_entry.get(file_id) {
+                        if !self.deleted.contains(idx) {
+                            if let Some(e) = self.entries.get_mut(idx as usize) {
+                                let eh = e.ext_hash_u8();
+                                e.attrs = FileEntry::pack_attrs_from_windows_file(*attrs)
+                                    | ((eh as u32) << 8);
+                                if *is_dir {
+                                    e.attrs |= FileEntry::ATTR_IS_DIR;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // 全新条目：先以 0 元数据入库保证名字立即可搜，
+                    // 真实 size/mtime 由后台 stat worker 经 DataOrMeta 补上。
+                    let raw = RawEntry {
+                        file_id: *file_id,
+                        file_id_128: *file_id_128,
+                        parent_id: *parent_id,
+                        name: name.clone(),
+                        size: 0,
+                        mtime: 0,
+                        ctime: 0,
+                        attrs: *attrs,
+                        is_dir: *is_dir,
+                    };
+                    self.upsert_raw_entry(&raw)?;
+                }
                 Ok(())
             }
             ChangeEvent::Rename {

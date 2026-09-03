@@ -1,5 +1,5 @@
 use findx2_core::index::{filetime_to_unix_secs, hash_ext8, IndexBuilder, IndexStore};
-use findx2_core::platform::RawEntry;
+use findx2_core::platform::{ChangeEvent, RawEntry};
 use findx2_core::{load_index_bin, save_index_bin, QueryParser, SearchEngine, SearchOptions};
 #[test]
 fn query_parse_ext() {
@@ -523,4 +523,64 @@ fn starts_with_ends_with_trigram_pruning_matches_full_scan() {
     assert_eq!(md_count, 3, "readme.md / already_read.md / 覆盖readme.md");
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// P0：CreatePending 先以 0 元数据入库（名字立刻可搜），DataOrMeta 再补 size，
+/// 且不得清掉已有名字。对应 USN watch 热路径「先可见、后台 stat」。
+#[test]
+fn create_pending_searchable_then_stat_refresh() {
+    const ROOT: u64 = 5;
+    let dirs = vec![RawEntry {
+        file_id: ROOT,
+        file_id_128: None,
+        parent_id: 0,
+        name: "C:".into(),
+        size: 0,
+        mtime: 0,
+        ctime: 0,
+        attrs: 0x10,
+        is_dir: true,
+    }];
+    let store = IndexBuilder::new(b'C', 1, 1, 1)
+        .build_from_raw(vec![], dirs, true)
+        .unwrap();
+    let engine = SearchEngine::new(store);
+    {
+        let mut g = engine.index_store_mut();
+        g.apply_change_event(&ChangeEvent::CreatePending {
+            file_id: 42,
+            file_id_128: None,
+            parent_id: ROOT,
+            name: "burst.tmp".into(),
+            attrs: 0x20,
+            is_dir: false,
+        })
+        .unwrap();
+    }
+    engine.note_external_mutation();
+    let pq = QueryParser::parse("burst").unwrap();
+    let (hits, total) = engine
+        .search(&pq, &SearchOptions::default())
+        .expect("search after CreatePending");
+    assert_eq!(total, 1, "CreatePending 入库后名字应立刻可搜");
+    assert_eq!(hits[0].name, "burst.tmp");
+    assert_eq!(hits[0].size, 0);
+
+    {
+        let mut g = engine.index_store_mut();
+        g.apply_change_event(&ChangeEvent::DataOrMeta {
+            file_id: 42,
+            size: Some(4096),
+            mtime: Some(findx2_core::index::unix_secs_to_filetime(1_700_000_000)),
+            ctime: None,
+        })
+        .unwrap();
+    }
+    engine.note_external_mutation();
+    let (hits, _) = engine
+        .search(&pq, &SearchOptions::default())
+        .expect("search after DataOrMeta");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].name, "burst.tmp", "补 meta 不得改名");
+    assert_eq!(hits[0].size, 4096);
 }

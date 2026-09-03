@@ -51,11 +51,10 @@ pub type DirMetaRec = (u64, u64, u64, u64);
 #[cfg(not(windows))]
 pub type DirMetaRec = (u64, u64, u64, u64);
 
-/// syscall 缓冲区大小。256 K：对绝大多数目录一次 syscall 吃完；
-/// 对 node_modules/.cache 这种数千文件大目录，syscall 数从 4~5 次降到 1~2 次。
-/// 每个 rayon 任务只持有一份 buf，并发开销 = threads × 256K = ~5 MB，可接受。
+/// syscall 缓冲区大小。1MB：普通目录一次吃完，node_modules 这类大目录也少几次往返。
+/// 每个 rayon 任务一份 buf；HDD 2 线程 ≈ 2MB，SSD 十余线程 ≈ 十几 MB，可接受。
 #[cfg(windows)]
-const BUF_CAP: usize = 256 * 1024;
+const BUF_CAP: usize = 1024 * 1024;
 /// 每个 rayon 任务承担的目录数下限。目录级 syscall 已经很便宜，切过细反而浪费。
 #[cfg(windows)]
 const MIN_DIRS_PER_CHUNK: usize = 1024;
@@ -136,8 +135,7 @@ pub fn fetch_dir_meta_batched(
                 }
             };
 
-            // 单 chunk 里所有 dir 共享 64K syscall buf，避免每次都重 alloc 64K 堆内存。
-            // 注意要 u64-aligned（FILE_ID_BOTH_DIR_INFO 里 LARGE_INTEGER 必须 8B 对齐）。
+            // 单 chunk 里所有 dir 共享 1MB syscall buf（u64 对齐，FILE_ID_BOTH_DIR_INFO 要求）。
             let mut buf: Vec<u64> = vec![0u64; BUF_CAP / 8];
             let mut out: Vec<DirMetaRec> = Vec::with_capacity(chunk.len() * 6);
 

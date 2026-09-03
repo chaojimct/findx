@@ -14,6 +14,9 @@ pub enum IpcRequest {
         pinyin: bool,
         #[serde(default = "default_limit")]
         limit: usize,
+        /// 分页偏移（排序后切片 `[offset, offset+limit)`）。缺省 0，老客户端照常工作。
+        #[serde(default)]
+        offset: usize,
     },
     Status,
     Ping,
@@ -64,6 +67,10 @@ pub enum IpcResponse {
         /// GUI 在该状态下应显示「索引加载中…」而不是「管道超时」。
         #[serde(default)]
         loading: bool,
+        /// USN 监听故障描述（`None` = 各卷增量正常）。watch 中断/重建时 service 侧设置，
+        /// GUI 状态栏展示。`#[serde(default)]` 保持与旧版 service 的兼容。
+        #[serde(default)]
+        watch_error: Option<String>,
     },
     Pong,
     Error {
@@ -97,6 +104,7 @@ mod tests {
             query: "foo".into(),
             pinyin: false,
             limit: 100,
+            offset: 0,
         })
         .unwrap();
         let r: IpcRequest = serde_json::from_str(&j).unwrap();
@@ -105,10 +113,21 @@ mod tests {
                 query,
                 pinyin,
                 limit,
+                offset,
             } => {
                 assert_eq!(query, "foo");
                 assert!(!pinyin);
                 assert_eq!(limit, 100);
+                assert_eq!(offset, 0);
+            }
+            _ => panic!(),
+        }
+        // 老客户端不带 offset 也能解析（向后兼容）。
+        let r2: IpcRequest = serde_json::from_str(r#"{"type":"search","query":"x"}"#).unwrap();
+        match r2 {
+            IpcRequest::Search { offset, limit, .. } => {
+                assert_eq!(offset, 0);
+                assert_eq!(limit, 500);
             }
             _ => panic!(),
         }

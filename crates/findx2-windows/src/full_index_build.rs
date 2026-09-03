@@ -58,8 +58,23 @@ fn index_one_volume(
         .unwrap_or('C')
         .to_ascii_uppercase() as u8;
     let serial = crate::get_volume_serial_number(volume_trim)?;
-    let usn = crate::UsnJournalWatcher::new(volume_trim).probe()?;
-    let builder = IndexBuilder::new(letter, serial, usn.journal_id, usn.next_usn);
+    // ReFS/无 journal 卷：probe 失败不断整个建库（此前 `?` 直接让多卷构建全挂），
+    // journal 游标记 0 = 该卷无增量（watch 线程会报错并进健康上报，由用户决定）。
+    // P2 ReFS 审计结论：枚举有 walkdir 回退、metadata 有 OpenFileById，唯独 journal 体系
+    // （USN 不可用）需要这层降级。
+    let (journal_id, next_usn) = match crate::UsnJournalWatcher::new(volume_trim).probe() {
+        Ok(usn) => (usn.journal_id, usn.next_usn),
+        Err(e) => {
+            findx2_core::progress!(
+                "卷 {} USN journal 不可用（{e}，如 ReFS/未格式化 journal）：该卷建库后无增量更新",
+                volume_trim
+            );
+            (0, 0)
+        }
+    };
+    // 建库顺手保障 journal（P0-3；有管理员才成功，否则内部降级跳过）。
+    let _ = crate::ensure_usn_journal(volume_trim);
+    let builder = IndexBuilder::new(letter, serial, journal_id, next_usn);
     findx2_core::progress!(
         "正在构建卷 {} 的内存索引结构（百万级时排序可能需数分钟，请见下方进度）…",
         volume_trim
@@ -92,7 +107,18 @@ pub fn build_full_disk_index(
         .iter()
         .filter_map(|s| normalize_excluded_dir(s))
         .collect();
-    let threads = max_scan_threads.max(1).min(vol_list.len().max(1));
+    // P1-5：HDD 卷串行（多磁头并行只会互相抢寻道）；SSD 卷仍可并行。
+    let (ssd_vols, hdd_vols): (Vec<String>, Vec<String>) = vol_list.iter().cloned().partition(|v| {
+        !crate::volume_incurs_seek_penalty(v)
+    });
+    if !hdd_vols.is_empty() {
+        findx2_core::progress!(
+            "建库画像：SSD {} 卷并行 / HDD {} 卷串行",
+            ssd_vols.len(),
+            hdd_vols.len()
+        );
+    }
+    let threads = max_scan_threads.max(1).min(ssd_vols.len().max(1));
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
@@ -157,36 +183,42 @@ pub fn build_full_disk_index(
             .ok()
     };
 
-    let part: Vec<findx2_core::Result<IndexStore>> = pool.install(|| {
-        vol_list
-            .par_iter()
-            .map(|v| {
-                let vol_s = v.trim();
-                let r = index_one_volume(vol_s, full_stat, metadata_ready);
-                if let Ok(ref store) = r {
-                    let added = store.entry_count() as u64;
-                    let entries_so_far =
-                        entries_accumulated.fetch_add(added, Ordering::Relaxed) + added;
-                    let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    let _ = write_index_progress(
-                        progress_path.as_ref(),
-                        &serde_json::json!({
-                            "phase": "scanning",
-                            "volumes_total": total_vols,
-                            "volumes_completed": c,
-                            "current_volume": vol_s,
-                            "entries_indexed": entries_so_far,
-                            "message": format!(
-                                "卷 {} 已入索引（{}/{} 卷，累计约 {} 条）",
-                                vol_s, c, total_vols, entries_so_far
-                            ),
-                        }),
-                    );
-                }
-                r
-            })
-            .collect()
-    });
+    let scan_one = |v: &String| -> findx2_core::Result<IndexStore> {
+        let vol_s = v.trim();
+        let r = index_one_volume(vol_s, full_stat, metadata_ready);
+        if let Ok(ref store) = r {
+            let added = store.entry_count() as u64;
+            let entries_so_far =
+                entries_accumulated.fetch_add(added, Ordering::Relaxed) + added;
+            let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = write_index_progress(
+                progress_path.as_ref(),
+                &serde_json::json!({
+                    "phase": "scanning",
+                    "volumes_total": total_vols,
+                    "volumes_completed": c,
+                    "current_volume": vol_s,
+                    "entries_indexed": entries_so_far,
+                    "message": format!(
+                        "卷 {} 已入索引（{}/{} 卷，累计约 {} 条）",
+                        vol_s, c, total_vols, entries_so_far
+                    ),
+                }),
+            );
+        }
+        r
+    };
+
+    let mut part: Vec<findx2_core::Result<IndexStore>> = Vec::with_capacity(vol_list.len());
+    if !ssd_vols.is_empty() {
+        let ssd_part: Vec<findx2_core::Result<IndexStore>> = pool.install(|| {
+            ssd_vols.par_iter().map(scan_one).collect()
+        });
+        part.extend(ssd_part);
+    }
+    for v in &hdd_vols {
+        part.push(scan_one(v));
+    }
 
     // 扫描全部完成，停 ticker；后续 merging/writing 阶段进度由各自显式 write_index_progress 推送。
     ticker_stop.store(true, Ordering::Relaxed);

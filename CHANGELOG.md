@@ -2,6 +2,18 @@
 
 本文档记录 **FindX 2.x**（Rust / Tauri / Windows）面向用户的显著变更。版本号与 GUI 安装包、Git 标签 `v*` 对齐。
 
+## [Unreleased]
+
+### 索引创建与实时更新（HDD / 大批量复制专项）
+
+- **USN 事件合并 + 延迟 stat**：watch 热路径不再同步 `OpenFileById`；同 FRN 批内去重，create 先入库（名字立刻可搜），size/mtime 由后台 worker 补。大批量复制/解压时不再把增量线程卡在随机寻道上。
+- **Watch 保活**：`StartUsn < FirstUsn` / Journal ID 变化 / `ERROR_JOURNAL_ENTRY_DELETED` 视为断档，触发单卷重建并指数退避重启；故障文案经 IPC `watch_error` 进 GUI 状态栏。
+- **Ensure Journal**：启动时 `FSCTL_CREATE_USN_JOURNAL`，默认 Journal 过小则放大（已更大的用户配置不动）。
+- **阻塞式 READ + HDD 自适应**：空闲不再 500ms 轮询；回填按卷判 seek 惩罚（HDD 2 线程、SSD 高并发）；建库时 HDD 卷串行、SSD 仍并行；MFT 枚举缓冲 SSD 1MB / HDD 4MB，回填目录枚举缓冲 1MB；MFT 碎片超阈值只提示、不整理。
+- **Journal 将满进状态栏**：剩余不足跨度 5% 时 GUI 提示，停机过久会触发全量重建。
+- **ReFS / 无 journal 卷**：建库不再因 journal 探测失败整盘挂掉；该卷跳过增量监听并提示需手动重建。
+- **回填断点续跑**：每卷完成后写 `<index>.overlay.bin` 边车，重启后过滤已完成条目再续跑。
+
 ## [2.1.2] - 2026-09-02
 
 ### 优化
@@ -42,6 +54,7 @@
 
 - 仓库根目录补充 **MIT** 全文许可（`LICENSE`），与 `Cargo.toml` 工作区 `MIT OR Apache-2.0` 声明在 README 中说明对应关系。
 
+[Unreleased]: https://github.com/chaojimct/findx/compare/v2.1.2...HEAD
 [2.1.2]: https://github.com/chaojimct/findx/compare/v2.1.1...v2.1.2
 [2.1.1]: https://github.com/chaojimct/findx/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/chaojimct/findx/compare/v2.0.1...v2.1.0

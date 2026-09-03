@@ -351,7 +351,22 @@ fn run() -> Result<()> {
                 match rx.recv_timeout(Duration::from_secs(1)) {
                     Ok(msg) => match msg {
                         findx2_windows::UsnWatchMsg::Event(ev) => {
-                            store.apply_change_event(&ev)?;
+                            // CreatePending 在 service 侧由后台补 meta；CLI 前台watch 保持旧语义：
+                            // 新建条目立刻同步拉一次 meta（CLI 本来就是管理员+前台，无后台线程）。
+                            if let findx2_core::ChangeEvent::CreatePending {
+                                file_id,
+                                file_id_128,
+                                ..
+                            } = &ev
+                            {
+                                store.apply_change_event(&ev)?;
+                                sync_fetch_one(&volume, *file_id, *file_id_128, &mut store);
+                            } else {
+                                store.apply_change_event(&ev)?;
+                            }
+                        }
+                        findx2_windows::UsnWatchMsg::StatRefresh { file_id, file_id_128 } => {
+                            sync_fetch_one(&volume, file_id, file_id_128, &mut store);
                         }
                         findx2_windows::UsnWatchMsg::Checkpoint {
                             journal_id,
@@ -404,6 +419,38 @@ fn run() -> Result<()> {
 
 /// `watch` 调试模式：trigram 增量超阈值时同步重建边车（watch 是单线程串行，
 /// 构建期间无并发 apply，构建完成后 pending 可直接清零）。
+/// CLI watch：同步拉一条 meta 并写回（service 侧走后台 worker，这里前台直接拉，
+/// 保持与旧行为一致的完整 meta）。
+#[cfg(windows)]
+fn sync_fetch_one(
+    volume: &str,
+    file_id: u64,
+    file_id_128: Option<[u8; 16]>,
+    store: &mut findx2_core::IndexStore,
+) {
+    let dev = if volume.starts_with(r"\\.\") {
+        volume.to_string()
+    } else {
+        format!(
+            r"\\.\{}:",
+            volume.trim_end_matches([':', '\\'])
+        )
+    };
+    let frns = [file_id];
+    let ids = [file_id_128];
+    let idx = [0usize];
+    let updates =
+        findx2_windows::fill_metadata_by_id_pooled(&dev, &frns, &ids, &idx, None, None);
+    for (_, size, mt, ct) in updates {
+        let _ = store.apply_change_event(&findx2_core::ChangeEvent::DataOrMeta {
+            file_id,
+            size: Some(size),
+            mtime: Some(mt),
+            ctime: Some(ct),
+        });
+    }
+}
+
 fn maybe_rebuild_trigram_cli(store: &mut findx2_core::IndexStore, index: &std::path::Path) {
     if !store.tri_pending_overflow() {
         return;

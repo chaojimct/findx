@@ -26,6 +26,17 @@ pub enum ChangeEvent {
     Create {
         entry: RawEntry,
     },
+    /// 快速建条目（USN watch 热路径）：只带名字/父链/属性，不带 size/mtime/ctime。
+    /// 元数据由后台 stat worker 补（`UsnWatchMsg::StatRefresh`），watch 线程永不阻塞在
+    /// `OpenFileById` 上。已存在条目只更新名字/父链/属性，**不**清零已有元数据。
+    CreatePending {
+        file_id: u64,
+        file_id_128: Option<[u8; 16]>,
+        parent_id: u64,
+        name: String,
+        attrs: u32,
+        is_dir: bool,
+    },
     Delete {
         file_id: u64,
     },

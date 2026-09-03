@@ -14,6 +14,11 @@ pub enum Error {
     #[error("平台扫描: {0}")]
     Platform(String),
 
+    /// USN Journal 断档：游标已被覆写（`StartUsn < FirstUsn` / `ERROR_JOURNAL_ENTRY_DELETED`）
+    /// 或 Journal 重建导致 ID 变化。调用方应触发全量重建，而非继续增量。
+    #[error("USN 日志断档，需全量重建: {0}")]
+    JournalGap(String),
+
     #[error("UTF-8 无效")]
     Utf8(#[from] std::str::Utf8Error),
 

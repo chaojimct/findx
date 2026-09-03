@@ -190,6 +190,7 @@ fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse {
             backfill_done: 0,
             backfill_total: 0,
             loading: true,
+            watch_error: crate::run::watch_error_summary(),
         },
         (IpcRequest::Search { .. }, None) => IpcResponse::Error {
             message: "索引加载中，请稍候…".into(),
@@ -199,9 +200,10 @@ fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse {
                 query,
                 pinyin,
                 limit,
+                offset,
             },
             Some(eng),
-        ) => match crate::run::search_ipc(&eng, &query, pinyin, limit) {
+        ) => match crate::run::search_ipc(&eng, &query, pinyin, limit, offset) {
             Ok((hits, total, elapsed_ms)) => IpcResponse::SearchResult {
                 hits,
                 total,
@@ -235,6 +237,7 @@ fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse {
                         backfill_done,
                         backfill_total,
                         loading: false,
+                        watch_error: crate::run::watch_error_summary(),
                     }
                 }
                 None => IpcResponse::StatusResult {
@@ -248,6 +251,7 @@ fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse {
                     backfill_done: backfill.0,
                     backfill_total: backfill.1,
                     loading: true,
+                    watch_error: crate::run::watch_error_summary(),
                 },
             }
         }

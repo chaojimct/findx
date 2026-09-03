@@ -29,6 +29,8 @@ gui/src-tauri/gen/
 
 # Publish / release output
 /publish/
+/dist/
+/installer/stage/
 
 # Native build output
 /native/findx-engine/target/

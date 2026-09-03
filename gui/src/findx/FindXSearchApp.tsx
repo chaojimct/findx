@@ -263,6 +263,10 @@ export default function FindXSearchApp() {
   const [sizeMin, setSizeMin] = useState("");
   const [sizeMax, setSizeMax] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
+  // 服务端匹配总数（分页时 > hits.length；无限滚动用它判断还有没有下一页）。
+  const [matchTotal, setMatchTotal] = useState(0);
+  // 翻页请求单 flight 守卫（与 searchSeq 配合：新查询会让旧翻页回包作废）。
+  const loadingMoreRef = useRef(false);
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState("就绪");
   const [indexLine, setIndexLine] = useState("索引: …");
@@ -458,6 +462,9 @@ export default function FindXSearchApp() {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const ROW_HEIGHT = 32;
   const OVERSCAN = 8;
+  // 分页大小：首屏 + 滚动预取。服务端排序后按 [offset, offset+PAGE_SIZE) 切片；
+  // 滚动接近底部自动追加（无限滚动），searchLimit 作为自动加载总上限。
+  const PAGE_SIZE = 250;
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportH, setViewportH] = useState(600);
   useEffect(() => {
@@ -673,41 +680,72 @@ export default function FindXSearchApp() {
     };
   }, [loadSettings]);
 
-  const runSearch = useCallback(async () => {
+  const runSearch = useCallback(async (offset: number, append: boolean) => {
     const query = fullQuery.trim();
     if (!query) {
       setHits([]);
+      setMatchTotal(0);
       setStatus("就绪");
       setSelected(null);
       return;
     }
     const seq = ++searchSeq.current;
-    setLoading(true);
-    setStatus("搜索中…");
-    // 每次重新搜索（含防抖自动搜）时清空列表选中，避免仍指向旧排序/旧结果中的行号。
-    setSelected(null);
+    if (!append) {
+      setLoading(true);
+      setStatus("搜索中…");
+      // 每次重新搜索（含防抖自动搜）时清空列表选中，避免仍指向旧排序/旧结果中的行号。
+      setSelected(null);
+    }
     try {
+      // 表头排序走服务端（`sort:` 修饰），保证分页全局有序；
+      // 不再前端排序（分页下前端只能看到子集，排出来是错的）。
+      // 服务端默认 Name 升序，与 sortCol=null 时的历史行为一致。
+      // 注意：查询语言要求修饰符在裸词之前（`test sort:path` 会解析失败），
+      // 所以拼在最前面；用户手写的 sort: 会被表头选择覆盖（去掉再拼）。
+      const sortToken =
+        sortCol === null
+          ? ""
+          : `sort:${sortCol === "mtime" ? "modified" : sortCol}${sortAsc ? "" : ":desc"}`;
+      const serverQuery = sortToken
+        ? `${sortToken} ${query.replace(/(^|\s)sort:\S+("[^"]*")?/g, "$1").trim().replace(/\s+/g, " ")}`
+        : query;
       const resp = await invoke<{ hits: SearchHit[]; total: number; elapsedMs: number }>(
         "search_files",
         {
-          query,
+          query: serverQuery,
           pinyin: settings.pinyinDefault,
-          limit: settings.searchLimit,
+          limit: PAGE_SIZE,
+          offset,
         },
       );
       if (seq !== searchSeq.current) return;
       const rows = resp.hits;
-      setHits(rows);
-      const ms = Number.isFinite(resp.elapsedMs) ? resp.elapsedMs : 0;
       const total = Number.isFinite(resp.total) ? resp.total : rows.length;
-      // 与 Everything 左下角语义一致：「匹配 N 条」是真实总数；rows.length 是 limit 截断后实际渲染的条数。
-      // 当 total 受 limit 截断时，加「显示前 K 条」提示，避免用户误以为只有 K 个匹配。
-      const head = total === rows.length
-        ? `匹配 ${total.toLocaleString()} 条`
-        : `匹配 ${total.toLocaleString()} 条 · 显示前 ${rows.length.toLocaleString()} 条`;
-      setStatus(ms > 0 ? `${head} · ${ms} ms` : head);
+      const shown = (append ? hits.length : 0) + rows.length;
+      if (append) {
+        setHits((prev) => [...prev, ...rows]);
+      } else {
+        setHits(rows);
+        // 新查询回到顶部（虚拟列表按 scrollTop 切片，不重置会停在旧位置）。
+        const el = tableScrollRef.current;
+        if (el) el.scrollTop = 0;
+        setScrollTop(0);
+      }
+      setMatchTotal(total);
+      const ms = Number.isFinite(resp.elapsedMs) ? resp.elapsedMs : 0;
+      // 与 Everything 左下角语义一致：「匹配 N 条」是真实总数；已显示是已加载页累计。
+      const ceiling = settings.searchLimit > 0 ? settings.searchLimit : Number.MAX_SAFE_INTEGER;
+      const hasMore = shown < total && shown < ceiling;
+      const head =
+        total === 0
+          ? "无匹配"
+          : shown >= total || !hasMore
+            ? `匹配 ${total.toLocaleString()} 条`
+            : `匹配 ${total.toLocaleString()} 条 · 已显示 ${shown.toLocaleString()} 条 · 下滑加载更多`;
+      const capped = shown < total && !hasMore && shown >= ceiling;
+      setStatus(ms > 0 ? `${head}${capped ? " · 已达加载上限" : ""} · ${ms} ms` : head);
       const rawOnly = q.trim();
-      if (rawOnly) {
+      if (rawOnly && !append) {
         setHistory((prev) => {
           const next = [rawOnly, ...prev.filter((x) => x !== rawOnly)].slice(0, MAX_HISTORY);
           localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
@@ -716,53 +754,50 @@ export default function FindXSearchApp() {
       }
     } catch (e) {
       if (seq === searchSeq.current) {
-        setHits([]);
-        setSelected(null);
+        if (!append) {
+          setHits([]);
+          setMatchTotal(0);
+          setSelected(null);
+        }
         setStatus(`错误: ${String(e)}`);
       }
     } finally {
-      if (seq === searchSeq.current) setLoading(false);
+      if (seq === searchSeq.current && !append) setLoading(false);
     }
-  }, [fullQuery, q, settings.pinyinDefault, settings.searchLimit]);
+  }, [fullQuery, q, settings.pinyinDefault, settings.searchLimit, sortCol, sortAsc]);
 
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
     // 搜索延迟已到亚毫秒级（trigram 剪枝后 0.3–3ms），250ms 是为慢全表扫描设计的；
     // 60ms 既跟手又能在连续击键间合并掉中间态（Everything 同类即时刷新手感）。
     debounceRef.current = setTimeout(() => {
-      void runSearch();
+      void runSearch(0, false);
     }, 60);
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
   }, [fullQuery, runSearch]);
 
-  const sortedHits = useMemo(() => {
-    if (!sortCol) return hits;
-    const arr = [...hits];
-    const cmp = (a: SearchHit, b: SearchHit) => {
-      let va: string | number = 0;
-      let vb: string | number = 0;
-      if (sortCol === "name") {
-        va = a.name.toLowerCase();
-        vb = b.name.toLowerCase();
-      } else if (sortCol === "path") {
-        va = a.path.toLowerCase();
-        vb = b.path.toLowerCase();
-      } else if (sortCol === "size") {
-        va = a.size;
-        vb = b.size;
-      } else {
-        va = a.modifiedUnix;
-        vb = b.modifiedUnix;
-      }
-      if (va < vb) return sortAsc ? -1 : 1;
-      if (va > vb) return sortAsc ? 1 : -1;
-      return 0;
-    };
-    arr.sort(cmp);
-    return arr;
-  }, [hits, sortCol, sortAsc]);
+  // 无限滚动：接近底部且服务端还有更多时自动取下一页（同 query，offset=hits.length）。
+  // 服务端按 revision 缓存无序命中，翻页只做 top-(offset+PAGE) 选择 + 当页构建，不重扫。
+  useEffect(() => {
+    const ceiling = settings.searchLimit > 0 ? settings.searchLimit : Number.MAX_SAFE_INTEGER;
+    const hasMore = hits.length < matchTotal && hits.length < ceiling;
+    if (!hasMore || loadingMoreRef.current || hits.length === 0) return;
+    const totalH = hits.length * ROW_HEIGHT;
+    if (scrollTop + viewportH > totalH - ROW_HEIGHT * 24) {
+      loadingMoreRef.current = true;
+      void runSearch(hits.length, true).finally(() => {
+        loadingMoreRef.current = false;
+      });
+    }
+  }, [scrollTop, viewportH, hits, matchTotal, settings.searchLimit, runSearch]);
+
+  // 排序走服务端（runSearch 里拼 `sort:` 修饰），此处直接用服务端顺序；
+  // 分页下前端只能看到子集，前端再排会破坏全局有序，故不再前端排序。
+  // （行为变化：点击列头 name 升序原来是前端 toLowerCase 排，现在是服务端字节序，
+  // 与未点击时的默认 Name 排序一致。）
+  const sortedHits = hits;
 
   const onHeaderClick = (col: SortCol) => {
     if (col === null) return;
@@ -850,7 +885,7 @@ export default function FindXSearchApp() {
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter") void runSearch();
+                  if (e.key === "Enter") void runSearch(0, false);
                   if (e.key === "Escape") {
                     if (q) setQ("");
                     else setHistOpen(false);
@@ -888,7 +923,7 @@ export default function FindXSearchApp() {
           >
             🕐
           </button>
-          <button type="button" className="fx-btn-icon fx-btn-search" onClick={() => void runSearch()}>
+          <button type="button" className="fx-btn-icon fx-btn-search" onClick={() => void runSearch(0, false)}>
             搜索
           </button>
         </div>

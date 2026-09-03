@@ -76,7 +76,10 @@ mod imp {
         }
     }
 
-    const BUF_SIZE: usize = 256 * 1024;
+    /// 枚举缓冲：SSD 1MB / HDD 4MB。MFT 顺序读 100MB/s+，瓶颈在 ioctl 往返；
+    /// HDD 更大缓冲减少寻道间隙（文献 64KB→1MB 是质变，1→4MB 再砍往返）。
+    const BUF_SIZE_SSD: usize = 1024 * 1024;
+    const BUF_SIZE_HDD: usize = 4 * 1024 * 1024;
     /// MFT ioctl 每若干批打印一次进度
     const MFT_PROGRESS_EVERY_BATCHES: u64 = 32;
     /// 目录遍历回退时每若干条打印一次
@@ -173,11 +176,18 @@ mod imp {
             LowUsn: 0,
             HighUsn: high_usn,
         };
+        let enum_buf = if crate::volume_incurs_seek_penalty(root) {
+            findx2_core::progress!("卷画像：HDD（seek 惩罚），MFT 枚举缓冲 4MB");
+            BUF_SIZE_HDD
+        } else {
+            BUF_SIZE_SSD
+        };
         let r = enum_usn_data_loop(
             h,
             v0,
             std::mem::size_of::<MFT_ENUM_DATA_V0>() as u32,
             "V0",
+            enum_buf,
         );
         let (mut files, mut dirs, ok) = r?;
 
@@ -199,6 +209,7 @@ mod imp {
                 v1,
                 std::mem::size_of::<MFT_ENUM_DATA_V1>() as u32,
                 "V1",
+                enum_buf,
             );
             if let Ok((f, d, ok2)) = r2 {
                 if ok2 && (!f.is_empty() || !d.is_empty()) {
@@ -415,11 +426,12 @@ mod imp {
         mut input: T,
         input_len: u32,
         stage: &'static str,
+        buf_size: usize,
     ) -> findx2_core::Result<(Vec<RawEntry>, Vec<RawEntry>, bool)> {
         let mut files = Vec::new();
         let mut dirs = Vec::new();
         let mut had_enum_batch = false;
-        let mut buf = vec![0u8; BUF_SIZE];
+        let mut buf = vec![0u8; buf_size.max(64 * 1024)];
         let mut batch_idx: u64 = 0;
 
         loop {

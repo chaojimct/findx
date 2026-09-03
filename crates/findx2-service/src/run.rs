@@ -21,6 +21,170 @@ pub(crate) struct RunFlags {
     pub extra_excluded_dirs: Vec<String>,
 }
 
+/// 各卷 USN 监听健康状态（P0-2 watch 保活）。
+/// - `None` = 该卷监听正常；
+/// - `Some(msg)` = 中断/重建中，`msg` 为人类可读原因（透出到 IPC Status → GUI 状态栏）。
+/// service 单进程单例，用全局静态足够；读写只在 watch 线程与 Status 查询时发生。
+fn watch_health() -> &'static Mutex<std::collections::HashMap<char, String>> {
+    static HEALTH: OnceLock<Mutex<std::collections::HashMap<char, String>>> = OnceLock::new();
+    HEALTH.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 设置/清除某卷监听故障。`None` = 恢复正常。
+pub(crate) fn set_watch_error(volume_letter: char, err: Option<String>) {
+    let key = volume_letter.to_ascii_uppercase();
+    if let Ok(mut g) = watch_health().lock() {
+        match err {
+            Some(msg) => {
+                g.insert(key, msg);
+            }
+            None => {
+                g.remove(&key);
+            }
+        }
+    }
+}
+
+/// 聚合所有卷的监听故障（Status 上报；空串 = 全部正常）。
+pub(crate) fn watch_error_summary() -> Option<String> {
+    let g = watch_health().lock().ok()?;
+    if g.is_empty() {
+        return None;
+    }
+    let mut items: Vec<String> = g.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+    items.sort();
+    Some(items.join("; "))
+}
+
+/// 全卷重建冻结集（P0-2 JournalGap 重建协议，按卷独立）。
+/// 置位期间：该卷 watch 线程排空管道但不 apply、不推进 last_usn（事件靠 journal 重放补回，
+/// 见 `rebuild_volume`）；其它卷不受影响。重建稀有，全局一个集合足够。
+fn rebuild_frozen_volumes() -> &'static Mutex<std::collections::HashSet<char>> {
+    static FROZEN: OnceLock<Mutex<std::collections::HashSet<char>>> = OnceLock::new();
+    FROZEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn freeze_volume(letter: char, on: bool) {
+    let key = letter.to_ascii_uppercase();
+    if let Ok(mut g) = rebuild_frozen_volumes().lock() {
+        if on {
+            g.insert(key);
+        } else {
+            g.remove(&key);
+        }
+    }
+}
+
+fn is_volume_frozen(letter: char) -> bool {
+    rebuild_frozen_volumes()
+        .lock()
+        .map(|g| g.contains(&letter.to_ascii_uppercase()))
+        .unwrap_or(false)
+}
+
+/// 后台 stat worker：消费 `UsnWatchMsg::StatRefresh`，批量 `OpenFileById` 后写回。
+/// watch 线程永不 stat 的另一半——随机 IO 在这里按 FRN 排序后批量消化，
+/// bulk 风暴时名字秒级可见、meta 随后追上（SSD 秒级、HDD 分钟级，但绝不卡住增量）。
+/// 无权限（非管理员）时 fill 恒空：排空丢弃，只记一次日志（文件本身已由 CreatePending 入库）。
+fn spawn_stat_worker(
+    engine: Arc<SearchEngine>,
+    volume_device_path: String,
+) -> std::sync::mpsc::Sender<(u64, Option<[u8; 16]>)> {
+    let (tx, rx) = std::sync::mpsc::channel::<(u64, Option<[u8; 16]>)>();
+    std::thread::Builder::new()
+        .name("findx2-stat-worker".into())
+        .spawn(move || {
+            use std::collections::HashMap;
+            // FRN 去重（同文件多次变更只 stat 最后一次；value 无意义，占位）。
+            let mut pending: HashMap<u64, Option<[u8; 16]>> = HashMap::new();
+            let mut logged_no_perm = false;
+            // 主循环退出条件只有进程退出；recv_timeout 节拍顺带做批量超时。
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_millis(1000)) {
+                    Ok((frn, id128)) => {
+                        if pending.len() < 500_000 {
+                            pending.insert(frn, id128);
+                        }
+                        // 攒够一批就刷（5000 条或 1 秒超时，取先到者）。
+                        if pending.len() >= 5000 {
+                            drain_stat_batch(&engine, &volume_device_path, &mut pending, &mut logged_no_perm);
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if !pending.is_empty() {
+                            drain_stat_batch(&engine, &volume_device_path, &mut pending, &mut logged_no_perm);
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                // 兜底：队列过大（极端风暴）时强制刷盘，避免内存无限涨。
+                if pending.len() >= 50_000 {
+                    drain_stat_batch(&engine, &volume_device_path, &mut pending, &mut logged_no_perm);
+                }
+            }
+            // 退出前把剩余的刷完（进程退出场景基本走不到，保底）。
+            if !pending.is_empty() {
+                drain_stat_batch(&engine, &volume_device_path, &mut pending, &mut logged_no_perm);
+            }
+        })
+        .ok();
+    tx
+}
+
+fn drain_stat_batch(
+    engine: &Arc<SearchEngine>,
+    volume_device_path: &str,
+    pending: &mut std::collections::HashMap<u64, Option<[u8; 16]>>,
+    logged_no_perm: &mut bool,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    // 注：重建冻结期无需特殊处理——合并后旧条目下标不变（新条目追加在后），
+    // patch 到墓碑/旧条目无害；新文件的 StatRefresh 在旧布局查不到会被跳过，
+    // journal 重放会重新排队。见 rebuild_volume 设计注释。
+    // 按 FRN 排序后批量 stat：MFT 记录号即 FRN 低 48 位，排序≈顺序读，HDD 友好。
+    let mut frns: Vec<u64> = pending.keys().copied().collect();
+    frns.sort_unstable();
+    let id128s: Vec<Option<[u8; 16]>> = frns.iter().map(|f| pending[f]).collect();
+    let indices: Vec<usize> = (0..frns.len()).collect();
+    let updates = findx2_windows::fill_metadata_by_id_pooled(
+        volume_device_path,
+        &frns,
+        &id128s,
+        &indices,
+        None,
+        None,
+    );
+    pending.clear();
+    if updates.is_empty() {
+        // 全失败：大概率无权限。节流日志（只记一次），否则每秒刷屏。
+        if !*logged_no_perm {
+            *logged_no_perm = true;
+            tracing::warn!(
+                "stat worker：批量 stat 持续失败（卷 {}，可能无管理员权限），新文件 size/mtime 将保持 0",
+                volume_device_path
+            );
+        }
+        return;
+    }
+    // FRN → entry_idx 映射一次查完（读锁），再逐条 patch（写锁短持 + revision）。
+    // idx 下标稳定（entries 只追加不压缩；删除只打墓碑），映射与 patch 之间无需重查。
+    // 注：墓碑条目也会被 patch（无害：搜索过滤在前；且多为“删后 stat 迟到”的无害写）。
+    let targets: Vec<(usize, u64, u64, u64)> = updates
+        .iter()
+        .filter_map(|(local_idx, size, mtime, ctime)| {
+            let frn = *frns.get(*local_idx)?;
+            let idx = engine.entry_idx_by_frn(frn)?;
+            Some((idx, *size, *mtime, *ctime))
+        })
+        .collect();
+    for (idx, size, mtime, ctime) in targets {
+        // patch_entry_metadata 内部 bump revision（分页缓存失效正确）。
+        let _ = engine.patch_entry_metadata(idx, size, mtime, ctime);
+    }
+}
+
 /// 串行化 `index.bin` 写盘：service 启动时按卷数 spawn 多个 USN watch 线程，
 /// 每个线程都按 `save_interval_secs` 周期写**同一份** `index.bin`。旧实现没锁，
 /// 三个卷在同一刻同时调 `save_index_bin` 会互相截断把文件写坏，下次启动报
@@ -220,6 +384,24 @@ pub(crate) fn run_foreground(
     };
 
     let save_iv = save_interval_secs.max(1);
+    // P0-3 journal 保障 + P1-6 MFT 碎片预警（每卷一次，需管理员；失败只记日志）：
+    // journal 太小是“长期运行后静默丢变更”的根因，Everything 同款做法。
+    for (vol_path, letter) in &volumes_watch {
+        match findx2_windows::ensure_usn_journal(vol_path) {
+            Ok(true) => info!("卷 {letter} USN journal 已保障（创建/放大到 512MB）"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("卷 {letter} journal 保障失败: {e}"),
+        }
+        if let Some(n) = findx2_windows::mft_extent_count(vol_path) {
+            if n > 64 {
+                tracing::warn!(
+                    "卷 {letter} $MFT 碎片 {n} 段（>64）：首遍枚举在 HDD 上会明显变慢，空闲时可整理碎片"
+                );
+            } else {
+                info!("卷 {letter} $MFT 碎片 {n} 段");
+            }
+        }
+    }
     for (vol_path, letter) in volumes_watch {
         let index_for_watch = index.clone();
         let engine_watch = engine.clone();
@@ -261,27 +443,31 @@ fn usn_watch_loop(
     index_path: PathBuf,
     save_interval_secs: u64,
 ) -> anyhow::Result<()> {
-    let vol_meta = {
+    let letter = (volume_letter as char).to_ascii_uppercase();
+    // 初始 resume 由下面的 make_worker 每次重读（重建后游标已更新），这里不再预读。
+    // P2 ReFS/无 journal 卷：journal_id==0 表示建库时就不可用，不启动监听
+    //（否则 query 恒失败→无限重启刷屏）。状态进健康上报，用户可见。
+    {
         let g = engine.index_store();
-        g.volumes.iter().find(|v| {
-            (v.volume_letter as char).to_ascii_uppercase()
-                == (volume_letter as char).to_ascii_uppercase()
-        })
-            .cloned()
-            .or_else(|| g.volumes.first().cloned())
-            .ok_or_else(|| anyhow::anyhow!("索引中无卷元数据"))?
-    };
+        let no_journal = g
+            .volumes
+            .iter()
+            .find(|v| (v.volume_letter as char).to_ascii_uppercase() == letter)
+            .map(|v| v.usn_journal_id == 0)
+            .unwrap_or(false);
+        if no_journal {
+            set_watch_error(
+                letter,
+                Some("该卷无 USN journal（如 ReFS），不做增量监听；改动需手动重建".into()),
+            );
+            info!("卷 {letter} 无 USN journal，跳过增量监听");
+            return Ok(());
+        }
+    }
 
-    let resume = findx2_windows::UsnResume {
-        journal_id: vol_meta.usn_journal_id,
-        start_usn: vol_meta.last_usn,
-    };
-
-    let (tx, rx) = mpsc::channel::<findx2_windows::UsnWatchMsg>();
-    let vol_path = volume_path.clone();
-    let worker = std::thread::spawn(move || {
-        let _ = findx2_windows::usn_watch_forever(&vol_path, Some(resume), tx);
-    });
+    // 后台 stat worker（watch 线程只解析 journal，stat 全走这里；volume 固定，随 loop 常驻）。
+    let vol_dev = format!(r"\\.\{}:", volume_letter as char);
+    let stat_tx = spawn_stat_worker(engine.clone(), vol_dev);
 
     let save_every = Duration::from_secs(save_interval_secs);
     let mut last_save = Instant::now();
@@ -315,6 +501,9 @@ fn usn_watch_loop(
             // g 在每个 chunk 末尾自动释放，下个 chunk 会重新拿写锁——
             // search reader 有机会在两次写锁之间插进来。
         }
+        // 直接改 store 绕过了 engine 的写入方法：手动推进 revision，使分页缓存失效。
+        // 一批只 bump 一次（不必每条）， Staleness 窗口 ≤ 一次 flush。
+        engine.note_external_mutation();
         let ms = t0.elapsed().as_millis();
         if ms > 100 {
             // 超过 100ms 的 flush 大概率是历史回放或大批增量；记下来便于复盘。
@@ -322,7 +511,62 @@ fn usn_watch_loop(
         }
     };
 
+    // P0-2 保活：worker 死亡不结束本线程，而是判因重启。
+    // - JournalGap（ID 变化/游标被覆写）→ 全卷重建后用新游标续跑（≤3 次，防疯狂 wrap 死循环）；
+    // - 其它错误/panic → 指数退避重启；
+    // - 健康状态实时进 watch_health → IPC Status → GUI 状态栏。
+    let mut backoff = Duration::from_secs(1);
+    let mut gap_rebuilds: u32 = 0;
+    // journal 覆写预警（P2）：每次 checkpoint 查 FirstUsn（QUERY 一次 ioctl，很轻）。
+
+    // worker 启动闭包：每次都重读最新游标（重建后 journal 游标已更新）。
+    // 返回 None = 卷元数据都没了（索引被换），退避后外层重试。
+    let make_worker = |tx: mpsc::Sender<findx2_windows::UsnWatchMsg>|
+        -> Option<std::thread::JoinHandle<findx2_core::Result<()>>>
+    {
+        let vol_meta = {
+            let g = engine.index_store();
+            g.volumes
+                .iter()
+                .find(|v| {
+                    (v.volume_letter as char).to_ascii_uppercase() == letter
+                })
+                .cloned()
+                .or_else(|| g.volumes.first().cloned())
+        }?;
+        let resume = findx2_windows::UsnResume {
+            journal_id: vol_meta.usn_journal_id,
+            start_usn: vol_meta.last_usn,
+        };
+        let vol_path = volume_path.clone();
+        Some(std::thread::spawn(move || {
+            findx2_windows::usn_watch_forever(&vol_path, Some(resume), tx)
+        }))
+    };
+
+    // worker 持有发送端，主循环只收不发；重启时整套重建（resume 重读新游标）。
+    let mut rx: mpsc::Receiver<findx2_windows::UsnWatchMsg>;
+    let mut worker = {
+        let (tx0, rx0) = mpsc::channel::<findx2_windows::UsnWatchMsg>();
+        rx = rx0;
+        match make_worker(tx0) {
+            Some(w) => w,
+            None => {
+                set_watch_error(letter, Some("索引中无卷元数据，等待…".into()));
+                return Err(anyhow::anyhow!("索引中无卷元数据"));
+            }
+        }
+    };
+
     loop {
+        // 重建冻结期（本卷）：排空丢弃，不 apply 不推进游标；journal 重放会补回。
+        // 其它卷不受影响（标志按卷）。
+        if is_volume_frozen(letter) {
+            pending.clear();
+            while rx.try_recv().is_ok() {}
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
         match rx.recv_timeout(flush_every) {
             Ok(msg) => match msg {
                 findx2_windows::UsnWatchMsg::Event(ev) => {
@@ -333,6 +577,11 @@ fn usn_watch_loop(
                     if pending.len() >= USN_BATCH_MAX_EVENTS {
                         flush_pending(&mut pending);
                     }
+                }
+                findx2_windows::UsnWatchMsg::StatRefresh { file_id, file_id_128 } => {
+                    // 路由给后台 stat worker（watch 线程永不 stat）；发送失败（worker 退出）
+                    // 则丢弃——下次同文件变更会重新排队，极端下靠全量重建兜底。
+                    let _ = stat_tx.send((file_id, file_id_128));
                 }
                 findx2_windows::UsnWatchMsg::Checkpoint {
                     journal_id,
@@ -347,6 +596,17 @@ fn usn_watch_loop(
                         v.usn_journal_id = journal_id;
                         v.last_usn = next_usn;
                     }
+                    // 存活确认：收到 journal 心跳即视为健康，复位退避/重建计数。
+                    backoff = Duration::from_secs(1);
+                    gap_rebuilds = 0;
+                    if let Some(w) = probe_journal_wrap_warning(&volume_path, letter, next_usn)
+                    {
+                        set_watch_error(letter, Some(w));
+                    } else {
+                        set_watch_error(letter, None);
+                    }
+                    // 注：这里只改 USN 游标，不影响搜索结果/排序，故不 bump revision
+                    //（否则每次 checkpoint 都会误杀分页缓存）。真正改条目的是上面的 flush_pending。
                     // 回填未完成时不写盘：overlay 不在 index.bin 里，写出去的还是
                     // 和回填前一模一样的 549MB 旧数据，纯纯浪费磁盘 IO（30s 一次 = 每分钟 1GB），
                     // 而且会和正在做 NtQueryDirectoryFile 的 backfill 抢同一块物理盘的 IO 通道，
@@ -368,20 +628,223 @@ fn usn_watch_loop(
                     maybe_rebuild_trigram(&engine, &index_path);
                 }
             },
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // worker 死了：join 判因后重启（先排空残留消息已由 Disconnected 语义保证）。
+                flush_pending(&mut pending);
+                let exit = worker.join();
+                let reason = match &exit {
+                    Ok(Ok(())) => "watch 线程异常返回（理论不可达）".to_string(),
+                    Ok(Err(e)) => format!("{e}"),
+                    Err(_) => "watch 线程 panic".to_string(),
+                };
+                let is_gap = matches!(
+                    &exit,
+                    Ok(Err(findx2_core::Error::JournalGap(_)))
+                );
+                if is_gap && gap_rebuilds < 3 {
+                    gap_rebuilds += 1;
+                    set_watch_error(
+                        letter,
+                        Some(format!("USN 日志断档，全卷重建中（{gap_rebuilds}/3）…")),
+                    );
+                    error!("卷 {letter} {reason}，触发全卷重建");
+                    if let Err(re) = rebuild_volume(&engine, letter, &index_path) {
+                        set_watch_error(
+                            letter,
+                            Some(format!("重建失败: {re}，退避重试…")),
+                        );
+                        error!("卷 {letter} 重建失败: {re:#}");
+                    } else {
+                        info!("卷 {letter} 重建完成，恢复增量监听");
+                        set_watch_error(letter, None);
+                        gap_rebuilds = 0;
+                    }
+                } else if is_gap {
+                    set_watch_error(
+                        letter,
+                        Some("USN 断档且自动重建已达上限，请手动重建索引".into()),
+                    );
+                    error!("卷 {letter} USN 断档重建达上限，监听线程退出");
+                    return Err(anyhow::anyhow!("卷 {letter} USN 断档重建达上限"));
+                } else {
+                    set_watch_error(letter, Some(format!("监听中断，重试中: {reason}")));
+                    error!("卷 {letter} {reason}，退避重启监听");
+                }
+                // 重建 worker（resume 重读：重建后游标已回绕到 frozen 点）。
+                // 任一分支都必须重建 worker 或直接返回，否则下轮循环用的是已 move 的旧句柄。
+                match make_worker({
+                    let (tx_new, rx_new) = mpsc::channel::<findx2_windows::UsnWatchMsg>();
+                    rx = rx_new;
+                    tx_new
+                }) {
+                    Some(w) => {
+                        worker = w;
+                    }
+                    None => {
+                        return Err(anyhow::anyhow!("卷 {letter} 重启监听时索引中无卷元数据"));
+                    }
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+                continue;
+            }
         }
         if !pending.is_empty() && batch_started.elapsed() >= flush_every {
             flush_pending(&mut pending);
         }
-        if worker.is_finished() {
-            break;
+    }
+}
+
+/// 单卷全量重建（JournalGap 后的退路；调用方 usn_watch_loop 负责 freeze/解冻之外的全部）。
+///
+/// 协议（重建期间零丢失）：
+/// 1. 入口即 `freeze_volume(letter)`：watch 线程排空丢弃、不推进游标；
+/// 2. 记下内存 `last_usn` 为 frozen 点（pending 已排空、checkpoint 先 flush 的不变量
+///    保证 frozen ≤ 所有丢弃事件的 USN，重放全覆盖）；
+/// 3. 重新 MFT 枚举 + build 新 store（数分钟，无锁；旧索引继续服务）；
+/// 4. 读锁下克隆旧 store → 离线（无锁）：旧卷区间墓碑 + 摘除旧 VolumeState → merge
+///    （新 store 后挂，FRN 冲突归新；excluded_dirs 从旧 store 恢复）；
+/// 5. 写锁换入（µs）+ revision bump + `last_usn` 回绕到 frozen 点；
+/// 6. 全量落盘 + trigram 边车重建；解冻后 worker 重建，用回绕游标从 journal 重放补齐
+///    （重复事件幂等：Create→upsert 更新、Delete 缺失→ok、Rename→ok）。
+/// 任何一步失败都解冻并返回 Err（外层退避重试；3 次后放弃并上报，需手动重建）。
+fn rebuild_volume(
+    engine: &Arc<SearchEngine>,
+    volume_letter: char,
+    index_path: &Path,
+) -> anyhow::Result<()> {
+    let letter = volume_letter.to_ascii_uppercase();
+    let vol_str = format!("{letter}:");
+    freeze_volume(letter, true);
+    // 作用域守卫：任何返回路径都解冻（成功/失败一律）。
+    struct Unfreeze(char);
+    impl Drop for Unfreeze {
+        fn drop(&mut self) {
+            freeze_volume(self.0, false);
         }
     }
+    let _unfreeze = Unfreeze(letter);
 
-    flush_pending(&mut pending);
-    let _ = worker.join();
-    persist_index(&engine, &index_path)?;
+    let frozen: u64 = {
+        let g = engine.index_store();
+        g.volumes
+            .iter()
+            .find(|v| (v.volume_letter as char).to_ascii_uppercase() == letter)
+            .map(|v| v.last_usn)
+            .unwrap_or(0)
+    };
+    info!("卷 {letter} 开始全量重建（frozen 游标 {frozen}，旧索引继续服务）…");
+
+    // 1) 重新扫描（fast 首遍；size/mtime 由回填补——合并后 ready=false 会自动触发）。
+    let (files, dirs) = findx2_windows::scan_volume_fast(&vol_str)
+        .map_err(|e| anyhow::anyhow!("卷 {letter} MFT 重枚举失败: {e}"))?;
+    let serial = findx2_windows::get_volume_serial_number(&vol_str).unwrap_or(0);
+    let usn = findx2_windows::UsnJournalWatcher::new(&vol_str)
+        .probe()
+        .map_err(|e| anyhow::anyhow!("卷 {letter} journal 探测失败: {e}"))?;
+    let fresh = findx2_core::IndexBuilder::new(letter as u8, serial, usn.journal_id, usn.next_usn)
+        .build_from_raw(files, dirs, false)
+        .map_err(|e| anyhow::anyhow!("卷 {letter} 索引构建失败: {e}"))?;
+    info!(
+        "卷 {letter} 重枚举完成：{} 条（旧索引仍在服务，开始离线合并）…",
+        fresh.entry_count()
+    );
+
+    // 2) 读锁下克隆（memcpy 级，搜索不阻塞）→ 离线墓碑旧区间 + 合并。
+    let old_snapshot = { engine.index_store().clone() };
+    let merged = merge_rebuilt_volume(old_snapshot, fresh, letter)?;
+
+    // 3) 写锁换入 + 游标回绕 + revision。
+    {
+        let mut g = engine.index_store_mut();
+        *g = merged;
+        if let Some(v) = g
+            .volumes
+            .iter_mut()
+            .find(|v| (v.volume_letter as char).to_ascii_uppercase() == letter)
+        {
+            v.last_usn = frozen;
+        }
+    }
+    engine.note_external_mutation();
+
+    // 4) 落盘 + trigram 重建（合并后 trigram=None，先回全表扫描，重建完自动切回剪枝）。
+    persist_index(engine, index_path)?;
+    spawn_trigram_rebuild(engine.clone(), index_path.to_path_buf(), "单卷重建后边车重建");
+    info!("卷 {letter} 重建完成（已回绕到 frozen={frozen} 重放），恢复增量监听");
     Ok(())
+}
+
+/// 离线合并：旧卷区间墓碑 + 摘除旧 VolumeState + 新 store 后挂合并。
+fn merge_rebuilt_volume(
+    mut old: findx2_core::IndexStore,
+    fresh: findx2_core::IndexStore,
+    letter: char,
+) -> anyhow::Result<findx2_core::IndexStore> {
+    // 旧卷区间（按 first_entry_idx 排序后定位）。
+    let mut ranges: Vec<(char, u32)> = old
+        .volumes
+        .iter()
+        .map(|v| {
+            (
+                (v.volume_letter as char).to_ascii_uppercase(),
+                v.first_entry_idx,
+            )
+        })
+        .collect();
+    ranges.sort_by_key(|(_, idx)| *idx);
+    let (start, end) = match ranges.iter().position(|(l, _)| *l == letter) {
+        Some(p) => {
+            let s = ranges[p].1 as usize;
+            let e = if p + 1 < ranges.len() {
+                ranges[p + 1].1 as usize
+            } else {
+                old.entries.len()
+            };
+            (s, e.min(old.entries.len()))
+        }
+        None => {
+            // 卷不在旧索引里（理论上重建只发生在已有卷，防御性：纯追加）。
+            info!("卷 {letter} 不在旧索引中，重建退化为纯追加合并");
+            (0, 0)
+        }
+    };
+    for i in start..end {
+        old.delete_entry(i as u32);
+    }
+    old.volumes
+        .retain(|v| (v.volume_letter as char).to_ascii_uppercase() != letter);
+    let excluded = old.excluded_dirs.clone();
+    let mut merged = findx2_core::merge_index_stores(vec![old, fresh])
+        .map_err(|e| anyhow::anyhow!("卷 {letter} 索引合并失败: {e}"))?;
+    merged.excluded_dirs = excluded;
+    Ok(merged)
+}
+
+/// P2 journal 覆写预警：查询 FirstUsn，剩余不足跨度 5% 时返回状态栏文案。
+/// 服务仍正常，但停机稍久就会断档——提前让用户看到。
+fn probe_journal_wrap_warning(
+    volume_path: &str,
+    letter: char,
+    cursor_usn: u64,
+) -> Option<String> {
+    let Ok((_, first, next)) = findx2_windows::query_journal_state(volume_path) else {
+        return None;
+    };
+    if next <= first {
+        return None;
+    }
+    let span = (next - first) as u64;
+    let remaining = (next as u64).saturating_sub(cursor_usn);
+    if remaining < span / 20 {
+        tracing::warn!(
+            "卷 {letter} USN journal 剩余不足 (剩余 {remaining}/{span})：停机稍久将触发全量重建，考虑放大 journal"
+        );
+        return Some(format!(
+            "USN journal 将满（剩余 {remaining}/{span}），停机过久会触发全量重建"
+        ));
+    }
+    None
 }
 
 pub(crate) fn persist_index(engine: &SearchEngine, path: &Path) -> anyhow::Result<()> {
@@ -402,27 +865,37 @@ pub(crate) fn persist_index(engine: &SearchEngine, path: &Path) -> anyhow::Resul
 }
 
 /// 共享给 Everything IPC 与管道：解析查询并搜索。
+/// `limit`/`offset` 语义：排序后取 `[offset, offset+limit)` 页；`limit=0` 沿用旧语义
+/// 回退 query 解析默认值（1000）。调用方（GUI）负责 clamp。
 pub(crate) fn search_ipc(
     engine: &SearchEngine,
     query: &str,
     pinyin: bool,
     limit_override: usize,
+    offset: usize,
 ) -> Result<(Vec<findx2_ipc::SearchHitDto>, u32, u32), String> {
     let started = std::time::Instant::now();
     let t_parse = std::time::Instant::now();
-    let mut pq = QueryParser::parse(query).map_err(|e| e.to_string())?;
-    if limit_override > 0 {
-        pq.limit = limit_override.min(u32::MAX as usize) as u32;
-    }
+    let pq = QueryParser::parse(query).map_err(|e| e.to_string())?;
+    // 兼容旧语义：limit=0 表示“未指定”，回退 query 解析默认值（此前 `if limit_override > 0` 跳过覆盖）。
+    let lim = if limit_override == 0 {
+        pq.limit as usize
+    } else {
+        limit_override
+    };
     let parse_ms = t_parse.elapsed().as_micros() as u64;
     let t_search = std::time::Instant::now();
+    // pq.limit 不再参与截断（分页由 offset/limit 切片），search_paged 内只用它之外的字段。
     let (hits, total) = engine
-        .search(
+        .search_paged(
+            query,
             &pq,
             &SearchOptions {
                 allow_pinyin: pinyin,
                 ..Default::default()
             },
+            offset,
+            lim,
         )
         .map_err(|e| e.to_string())?;
     let search_us = t_search.elapsed().as_micros() as u64;

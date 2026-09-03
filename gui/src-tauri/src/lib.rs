@@ -392,6 +392,7 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
                 backfill_done,
                 backfill_total,
                 loading,
+                watch_error,
                 ..
             })) => {
                 // **关键自愈逻辑**：service 已经在线、index 已经有数据，那"是否在建库"就只能由 service
@@ -433,10 +434,12 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
                 indexing_message: idx_snap.message.clone(),
                 indexing_entries_indexed: idx_snap.entries_indexed,
                 indexing_current_volume: idx_snap.current_volume.clone(),
+                // USN 监听故障（增量中断/重建中）走 last_error 通道进状态栏；
+                // loading 提示优先（索引都没加载完时故障信息没意义）。
                 last_error: if loading {
                     Some("索引加载中…（service 已启动，正在反序列化 index.bin）".into())
                 } else {
-                    None
+                    watch_error
                 },
             }
             }
@@ -851,6 +854,7 @@ async fn search_files(
     min_created_unix: Option<i64>,
     max_created_unix: Option<i64>,
     limit: Option<u32>,
+    offset: Option<u32>,
     pinyin: Option<bool>,
 ) -> Result<SearchResponse, String> {
     #[cfg(target_os = "windows")]
@@ -871,11 +875,14 @@ async fn search_files(
         let lim = limit
             .unwrap_or(settings.search_limit)
             .clamp(1, 8192) as usize;
+        // offset 不设上限（由 total 决定是否有更多页）；越界时 service 返回空页。
+        let off = offset.unwrap_or(0) as usize;
         let (dtos, total, elapsed_ms) = pipe::ipc_search_with_pipe_name(
             pipe_name,
             q,
             pinyin.unwrap_or(settings.pinyin_default),
             lim,
+            off,
         )
         .await?;
         Ok(SearchResponse {
@@ -896,6 +903,7 @@ async fn search_files(
             min_created_unix,
             max_created_unix,
             limit,
+            offset,
             pinyin,
         );
         let _ = SearchResponse {

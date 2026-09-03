@@ -85,6 +85,8 @@ fn spawn_final_persist(engine: Arc<SearchEngine>, path: std::path::PathBuf) {
                 return;
             }
             drop(store);
+            // 终态已落盘：断点边车使命完成，删除（下次回填从头也不怕，因为 ready=true 不会再回填）。
+            delete_overlay_sidecar(&path);
             info!(
                 "终态落盘：index.bin 已写盘（写盘耗时 {:?}，全程 {:?}）",
                 t1.elapsed(),
@@ -98,6 +100,113 @@ fn spawn_final_persist(engine: Arc<SearchEngine>, path: std::path::PathBuf) {
 fn backfill_loop(_engine: Arc<SearchEngine>, _index_path: std::path::PathBuf) -> anyhow::Result<()> {
     warn!("非 Windows 平台不支持后台元数据回填");
     Ok(())
+}
+
+/// 单卷待回填集合（P1-5 按卷画像独立建池时跨函数传递）。
+struct VolPending {
+    files: Vec<(usize, u64)>,
+    dirs: Vec<u64>,
+}
+
+/// overlay 断点边车 `<index>.overlay.bin`（P2 回填续跑）。
+/// 格式（LE）：magic "FXOV" u32 + version u32(1) + entry_count u64 + count u64 +
+/// 每条 24B（idx u64, size u64, mtime_secs u32, ctime_secs u32）。
+/// 原子落盘（tmp + rename）；entry_count 对不上直接丢弃（索引换过）。
+const OVERLAY_MAGIC: u32 = 0x4658_4F56;
+const OVERLAY_VERSION: u32 = 1;
+
+fn overlay_sidecar_path(index_path: &std::path::Path) -> std::path::PathBuf {
+    let mut p = index_path.as_os_str().to_owned();
+    p.push(".overlay.bin");
+    std::path::PathBuf::from(p)
+}
+
+fn save_overlay_sidecar(
+    engine: &Arc<SearchEngine>,
+    index_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let entry_count = engine.index_store().entry_count();
+    let snap = engine.metadata_overlay_snapshot();
+    let path = overlay_sidecar_path(index_path);
+    let mut buf = Vec::with_capacity(24 + snap.len() * 24);
+    buf.extend_from_slice(&OVERLAY_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&OVERLAY_VERSION.to_le_bytes());
+    buf.extend_from_slice(&(entry_count as u64).to_le_bytes());
+    buf.extend_from_slice(&(snap.len() as u64).to_le_bytes());
+    for (idx, size, mtime, ctime) in &snap {
+        buf.extend_from_slice(&(*idx as u64).to_le_bytes());
+        buf.extend_from_slice(&size.to_le_bytes());
+        buf.extend_from_slice(&mtime.to_le_bytes());
+        buf.extend_from_slice(&ctime.to_le_bytes());
+    }
+    let tmp = path.with_extension("overlay.tmp");
+    std::fs::write(&tmp, &buf)?;
+    std::fs::rename(&tmp, &path)?;
+    info!(
+        "回填断点已保存：{} 条 overlay（{}MB）",
+        snap.len(),
+        buf.len() / (1024 * 1024)
+    );
+    Ok(())
+}
+
+/// 加载断点边车（entry_count 对不上就丢弃）；返回载入条数。
+fn load_overlay_sidecar(
+    engine: &Arc<SearchEngine>,
+    index_path: &std::path::Path,
+) -> anyhow::Result<usize> {
+    let path = overlay_sidecar_path(index_path);
+    let body = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return Ok(0),
+    };
+    if body.len() < 24 {
+        return Ok(0);
+    }
+    let magic = u32::from_le_bytes(body[0..4].try_into().unwrap());
+    let ver = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    let entry_count = u64::from_le_bytes(body[8..16].try_into().unwrap()) as usize;
+    let count = u64::from_le_bytes(body[16..24].try_into().unwrap()) as usize;
+    let current = engine.index_store().entry_count();
+    if magic != OVERLAY_MAGIC || ver != OVERLAY_VERSION || entry_count != current {
+        info!("断点边车版本/规模不符（已删），从头回填");
+        let _ = std::fs::remove_file(&path);
+        return Ok(0);
+    }
+    if body.len() < 24 + count * 24 {
+        return Ok(0);
+    }
+    let mut batch: Vec<(usize, u64, u64, u64)> = Vec::with_capacity(8192);
+    let mut loaded = 0usize;
+    for i in 0..count {
+        let o = 24 + i * 24;
+        let idx = u64::from_le_bytes(body[o..o + 8].try_into().unwrap()) as usize;
+        let size = u64::from_le_bytes(body[o + 8..o + 16].try_into().unwrap());
+        let mtime = u32::from_le_bytes(body[o + 16..o + 20].try_into().unwrap());
+        let ctime = u32::from_le_bytes(body[o + 20..o + 24].try_into().unwrap());
+        // overlay 存 unix 秒；extend 接口吃 FILETIME，转回去（秒级无损）。
+        batch.push((
+            idx,
+            size,
+            findx2_core::index::unix_secs_to_filetime(mtime),
+            findx2_core::index::unix_secs_to_filetime(ctime),
+        ));
+        if batch.len() >= 8192 {
+            engine.extend_metadata_overlay_batch(&batch);
+            loaded += batch.len();
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        engine.extend_metadata_overlay_batch(&batch);
+        loaded += batch.len();
+    }
+    info!("断点续跑：载入 overlay {} 条", loaded);
+    Ok(loaded)
+}
+
+fn delete_overlay_sidecar(index_path: &std::path::Path) {
+    let _ = std::fs::remove_file(overlay_sidecar_path(index_path));
 }
 
 #[cfg(windows)]
@@ -119,20 +228,12 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
     let total_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
-    // CPU-2：留 2 个核给 search/USN/IPC 已经够用。
-    // 之前 CPU/2 太保守——回填的瓶颈在磁盘 IO 而不是 CPU，多放线程能让磁盘队列更深，
-    // HDD 上 NtQueryDirectoryFile 的吞吐能提一档。
-    let backfill_threads = total_threads.saturating_sub(2).max(2).min(total_threads);
-    let backfill_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(backfill_threads)
-        .thread_name(|i| format!("findx2-backfill-{i}"))
-        .build()
-        .map_err(|e| anyhow::anyhow!("创建回填专属线程池失败：{e}"))?;
+    // P1-5 HDD 自适应：seek 惩罚盘用小并发（磁头抖动是 HDD 第一杀手，2 线程顺序
+    // 往往比 14 线程随机快数倍）；SSD 保持 CPU-2 打满队列。池按卷建（各卷画像不同）。
+    let ssd_threads = total_threads.saturating_sub(2).max(2).min(total_threads);
     info!(
-        "回填专属线程池已建：threads={}/{}（剩余 {} 留给 search）",
-        backfill_threads,
-        total_threads,
-        total_threads - backfill_threads
+        "回填线程配置：SSD 卷 {} 线程 / HDD 卷 2 线程（剩余留给 search）",
+        ssd_threads,
     );
 
     let total_entries = engine.index_store().entry_count();
@@ -150,10 +251,6 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
     // SRW Lock 一旦让 writer 排队，**所有后续 reader（包括 search）也会排队**——结果就是
     // "回填一启动 GUI 完全卡死"。因此把扫描拆成 N 个分段，每段读锁拿出来 ~64K 条 entry 就立刻
     // 放锁、给 search/USN write 一个调度窗口、再续。
-    struct VolPending {
-        files: Vec<(usize, u64)>,
-        dirs: Vec<u64>,
-    }
     let mut by_volume: std::collections::BTreeMap<char, VolPending> =
         std::collections::BTreeMap::new();
     let mut total_pending = 0usize;
@@ -200,8 +297,21 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
         by_volume.len()
     );
 
+    // P2 断点续跑：先载入 overlay 边车，再把已完成的条目从待补集合剔除。
+    // overlay 是完成记录本身（只增不改），天然防撕裂：快照只在单卷 quiesce 后落盘，
+    // 载入的多余条目无害（正确的 meta），缺的会重新回填。
+    if load_overlay_sidecar(&engine, &index_path).unwrap_or(0) > 0 {
+        for (_letter, slot) in by_volume.iter_mut() {
+            slot.files
+                .retain(|(idx, _)| !engine.metadata_overlay_has(*idx));
+        }
+        total_pending = by_volume.values().map(|v| v.files.len()).sum();
+        info!("断点过滤后剩余待补 {} 条", total_pending);
+    }
+
     if total_pending == 0 {
         info!("无需回填，触发终态落盘（异步线程）");
+        delete_overlay_sidecar(&index_path);
         spawn_final_persist(engine, index_path);
         return Ok(());
     }
@@ -211,21 +321,62 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
     let global_done = Arc::new(AtomicUsize::new(0));
 
     // 2) 逐卷：先走 NtQueryDirectoryFile 批量快路径，剩余未命中的走 OpenFileById 兜底。
-    //    **整个循环包在专属线程池 install 里**，让内部所有 rayon par_iter 都走专属池，
-    //    不污染全局池（search 走全局池）。
-    backfill_pool.install(|| -> anyhow::Result<()> {
+    //    每卷独立专属池（线程数按卷画像：HDD 2 线程顺序、SSD 高并发），子函数里的 par_iter
+    //    自动走当前池——search 永远走全局池，互不抢占。
     for (letter, pending) in &by_volume {
         if pending.files.is_empty() {
             continue;
         }
         let vol_path = format!("\\\\.\\{}:", letter);
+        let is_hdd = findx2_windows::volume_incurs_seek_penalty(&format!("{letter}:"));
+        let vol_threads = if is_hdd {
+            2
+        } else {
+            ssd_threads
+        };
+        let backfill_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(vol_threads)
+            .thread_name(|i| format!("findx2-backfill-{i}"))
+            .build()
+            .map_err(|e| anyhow::anyhow!("创建回填专属线程池失败：{e}"))?;
         info!(
-            "回填 卷 {}: 待补文件 {} 条，驱动目录 {} 个 ({})",
+            "回填 卷 {}: 待补文件 {} 条，驱动目录 {} 个 ({})，画像={}，线程={}",
             letter,
             pending.files.len(),
             pending.dirs.len(),
             vol_path,
+            if is_hdd { "HDD" } else { "SSD" },
+            vol_threads,
         );
+        backfill_pool.install(|| {
+            backfill_one_volume(
+                &engine,
+                *letter,
+                &vol_path,
+                pending,
+                cancel.clone(),
+                &global_done,
+                total_pending,
+            )
+        })?;
+        // P2 断点：每卷完成后落一次 overlay（该卷已 quiesce，快照一致）。
+        // HDD 上 136MB 写 ~10-20 秒，后台线程跑，不阻塞 search。
+        if let Err(e) = save_overlay_sidecar(&engine, &index_path) {
+            tracing::warn!("断点边车保存失败: {e:#}");
+        }
+    }
+
+    /// 单卷回填主体（P1-5：调用方已按卷画像建好专属池，整个函数跑在 `install` 里，
+    /// 内部所有 par_iter 自动走该池）。
+    fn backfill_one_volume(
+        engine: &Arc<SearchEngine>,
+        letter: char,
+        vol_path: &str,
+        pending: &VolPending,
+        cancel: Arc<AtomicBool>,
+        global_done: &AtomicUsize,
+        _total_pending: usize,
+    ) -> anyhow::Result<()> {
 
         // 建"待回填 FRN 集合"，用于在 NtQueryDirectoryFile 阶段筛选只要的子项。
         let needed: std::collections::HashSet<u64> =
@@ -271,7 +422,7 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
         let vol_files = pending.files.len() as u64;
         let _vol_dirs = dir_frns.len().max(1) as u64;
         let last_reported = std::sync::atomic::AtomicU64::new(0);
-        let engine_cb = engine.clone();
+        let engine_cb = Arc::clone(engine);
         let progress_cb = move |cur: usize, total: usize| {
             // 把 [0..vol_dirs] 映射到 [0..vol_files]，单调推进。
             let projected = (cur as u64).saturating_mul(vol_files) / (total.max(1) as u64);
@@ -373,9 +524,8 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
             }
         }
         info!("回填 卷 {} 完成", letter);
+        Ok(())
     }
-    Ok(())
-    })?;
 
     // 3) 终态落盘异步化。
     //    回填扫描循环到此结束，所有元数据都在 overlay 里。
