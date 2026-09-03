@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [2.1.5] - 2026-09-03
+
+### 修复
+
+- **安装器注册服务失败（退出码 2）**：`findx2-service install --index ...` 里 `--index` 写在子命令后面，clap 不认父级参数，安装器重试 15 次全失败。父级参数改为 `global`，安装脚本改为 `--index … install`。
+
 ## [2.1.4] - 2026-09-03
 
 ### 修复
@@ -67,7 +73,8 @@
 
 - 仓库根目录补充 **MIT** 全文许可（`LICENSE`），与 `Cargo.toml` 工作区 `MIT OR Apache-2.0` 声明在 README 中说明对应关系。
 
-[Unreleased]: https://github.com/chaojimct/findx/compare/v2.1.4...HEAD
+[Unreleased]: https://github.com/chaojimct/findx/compare/v2.1.5...HEAD
+[2.1.5]: https://github.com/chaojimct/findx/compare/v2.1.4...v2.1.5
 [2.1.4]: https://github.com/chaojimct/findx/compare/v2.1.3...v2.1.4
 [2.1.3]: https://github.com/chaojimct/findx/compare/v2.1.2...v2.1.3
 [2.1.2]: https://github.com/chaojimct/findx/compare/v2.1.1...v2.1.2

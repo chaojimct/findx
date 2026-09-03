@@ -7,7 +7,7 @@
 ; 与 v1 的 FindX.iss 类似：多任务（服务注册、PATH、桌面快捷方式、安装后启动），无 .NET 检测。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.1.4"
+  #define MyAppVersion "2.1.5"
 #endif
 
 #define MyAppName      "FindX"
@@ -177,7 +177,8 @@ begin
     WaitSearchServiceGone(8000);
   end;
 
-  Params := 'install --index ' + #34 + IndexPath + #34;
+  { 参数必须能被 clap 吃到：旧写法 `install --index` 在未设 global 时直接 exit 2 }
+  Params := '--index ' + #34 + IndexPath + #34 + ' install';
   for Attempt := 1 to 15 do
   begin
     if Exec(AppDir + '\findx2-service.exe', Params, '', SW_HIDE, ewWaitUntilTerminated, R) and (R = 0) then
@@ -194,7 +195,7 @@ begin
     MsgBox('注册 Windows 服务 {#MyServiceName} 失败。' + #13#10 +
       'USN 增量监听需要该服务以 SYSTEM 运行，否则状态栏会报「打开卷失败: 拒绝访问」。' + #13#10 + #13#10 +
       '请卸载后以管理员重装，或手动执行：' + #13#10 +
-      AppDir + '\findx2-service.exe install --index "' + IndexPath + '"' + #13#10 +
+      AppDir + '\findx2-service.exe --index "' + IndexPath + '" install' + #13#10 +
       'sc start {#MyServiceName}', mbError, MB_OK);
     Exit;
   end;

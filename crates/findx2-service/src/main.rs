@@ -60,7 +60,15 @@ fn try_main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    let cli = cli::Cli::parse();
+    let cli = match cli::Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            let path = std::env::temp_dir().join(SERVICE_LAST_ERROR_FILENAME);
+            let text = format!("{e}");
+            let _ = std::fs::write(&path, &text);
+            e.exit();
+        }
+    };
 
     if matches!(cli.cmd, Some(cli::ServiceCmd::Install)) {
         return win_service::install(
