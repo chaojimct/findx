@@ -1,13 +1,9 @@
-//! findx2 常驻服务：`install` | `uninstall` | `--service`（SCM）| 默认前台。
+//! findx2 常驻服务：Windows 命名管道 / Unix socket；默认前台运行。
 
-#[cfg(not(windows))]
-fn main() {
-    eprintln!("findx2-service 仅支持 Windows");
-    std::process::exit(1);
-}
-
-#[cfg(windows)]
 mod cli;
+mod ipc_dispatch;
+mod watch_health;
+
 #[cfg(windows)]
 mod everything_ipc;
 #[cfg(windows)]
@@ -21,14 +17,16 @@ mod win_service;
 #[cfg(windows)]
 mod session_spawn;
 
-#[cfg(windows)]
+#[cfg(unix)]
+mod unix_server;
+#[cfg(unix)]
+mod run_unix;
+
 use clap::Parser;
 
 /// 与 GUI 超时提示一致：进程启动失败或 run_foreground 返回 Err 时写入，便于无控制台时排查。
-#[cfg(windows)]
 pub(crate) const SERVICE_LAST_ERROR_FILENAME: &str = "findx2-service-last-error.txt";
 
-#[cfg(windows)]
 fn main() {
     if let Err(e) = try_main() {
         let path = std::env::temp_dir().join(SERVICE_LAST_ERROR_FILENAME);
@@ -39,9 +37,7 @@ fn main() {
     }
 }
 
-#[cfg(windows)]
 struct LocalTimer;
-#[cfg(windows)]
 impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
     fn format_time(
         &self,
@@ -51,7 +47,6 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
     }
 }
 
-#[cfg(windows)]
 fn try_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -72,44 +67,68 @@ fn try_main() -> anyhow::Result<()> {
         }
     };
 
-    if matches!(cli.cmd, Some(cli::ServiceCmd::Install)) {
-        return win_service::install(
-            cli.index.clone(),
-            cli.volume.clone(),
-            cli.pipe.clone(),
+    #[cfg(windows)]
+    {
+        if matches!(cli.cmd, Some(cli::ServiceCmd::Install)) {
+            return win_service::install(
+                cli.index.clone(),
+                cli.volume.clone(),
+                cli.pipe.clone(),
+                cli.save_interval_secs,
+                cli.full_stat,
+                cli.max_scan_threads,
+                cli.no_everything_ipc,
+                cli.no_backfill,
+                cli.exclude_dir.clone(),
+            );
+        }
+        if matches!(cli.cmd, Some(cli::ServiceCmd::Uninstall)) {
+            return win_service::uninstall();
+        }
+
+        if cli.everything_host {
+            return everything_ipc::run_everything_host_via_pipe(cli.pipe);
+        }
+
+        if cli.service {
+            return win_service::dispatch();
+        }
+
+        let _ = std::fs::remove_file(std::env::temp_dir().join(SERVICE_LAST_ERROR_FILENAME));
+
+        return run::run_foreground(
+            cli.index,
+            cli.volume,
+            cli.pipe,
             cli.save_interval_secs,
             cli.full_stat,
             cli.max_scan_threads,
-            cli.no_everything_ipc,
-            cli.no_backfill,
-            cli.exclude_dir.clone(),
+            run::RunFlags {
+                no_everything_ipc: cli.no_everything_ipc,
+                no_backfill: cli.no_backfill,
+                extra_excluded_dirs: cli.exclude_dir,
+            },
         );
     }
-    if matches!(cli.cmd, Some(cli::ServiceCmd::Uninstall)) {
-        return win_service::uninstall();
+
+    #[cfg(unix)]
+    {
+        if cli.cmd.is_some() {
+            anyhow::bail!("install/uninstall 仅支持 Windows 服务");
+        }
+        let _ = std::fs::remove_file(std::env::temp_dir().join(SERVICE_LAST_ERROR_FILENAME));
+        return run_unix::run_foreground(
+            cli.index,
+            cli.volume,
+            cli.pipe,
+            cli.save_interval_secs,
+            cli.exclude_dir,
+        );
     }
 
-    if cli.everything_host {
-        return everything_ipc::run_everything_host_via_pipe(cli.pipe);
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = cli;
+        anyhow::bail!("findx2-service 不支持当前平台");
     }
-
-    if cli.service {
-        return win_service::dispatch();
-    }
-
-    let _ = std::fs::remove_file(std::env::temp_dir().join(SERVICE_LAST_ERROR_FILENAME));
-
-    run::run_foreground(
-        cli.index,
-        cli.volume,
-        cli.pipe,
-        cli.save_interval_secs,
-        cli.full_stat,
-        cli.max_scan_threads,
-        run::RunFlags {
-            no_everything_ipc: cli.no_everything_ipc,
-            no_backfill: cli.no_backfill,
-            extra_excluded_dirs: cli.exclude_dir,
-        },
-    )
 }

@@ -138,7 +138,11 @@ impl FrnIdxMap {
     }
 }
 
-/// 每卷 USN / 持久化元数据
+/// 每卷增量游标 / 持久化元数据（跨平台）。
+///
+/// Windows：`volume_letter` + `volume_serial` + USN journal；`root_prefix` 为 `C:\`。
+/// Unix：`volume_letter == 0`，`volume_id` 为 APFS UUID / `st_dev`，`root_prefix` 为挂载点。
+/// `usn_journal_id` / `last_usn` 在非 NTFS 上分别表示 watch 世代与事件游标。
 #[derive(Debug, Clone)]
 pub struct VolumeState {
     pub volume_letter: u8,
@@ -147,6 +151,122 @@ pub struct VolumeState {
     pub last_usn: u64,
     /// 该卷在全局 `entries` 中的起始下标
     pub first_entry_idx: u32,
+    /// 显示与排除规则用的根前缀：`C:\` 或 `/System/Volumes/Data`
+    pub root_prefix: String,
+    /// 稳定卷身份：盘符 / APFS UUID / `st_dev` 十进制
+    pub volume_id: String,
+}
+
+impl VolumeState {
+    pub fn windows(
+        letter: u8,
+        serial: u32,
+        journal_id: u64,
+        last_usn: u64,
+        first_entry_idx: u32,
+    ) -> Self {
+        let c = letter as char;
+        Self {
+            volume_letter: letter,
+            volume_serial: serial,
+            usn_journal_id: journal_id,
+            last_usn,
+            first_entry_idx,
+            root_prefix: format!("{}:\\", c),
+            volume_id: format!("{}", c.to_ascii_uppercase()),
+        }
+    }
+
+    pub fn unix(
+        volume_id: impl Into<String>,
+        root_prefix: impl Into<String>,
+        watch_gen: u64,
+        watch_cursor: u64,
+        first_entry_idx: u32,
+    ) -> Self {
+        Self {
+            volume_letter: 0,
+            volume_serial: 0,
+            usn_journal_id: watch_gen,
+            last_usn: watch_cursor,
+            first_entry_idx,
+            root_prefix: root_prefix.into(),
+            volume_id: volume_id.into(),
+        }
+    }
+
+    /// v5 盘符记录补全 `root_prefix` / `volume_id`。
+    pub fn infer_legacy_windows_identity(&mut self) {
+        if !self.root_prefix.is_empty() {
+            return;
+        }
+        if self.volume_letter != 0 && (self.volume_letter as char).is_ascii_alphabetic() {
+            let c = self.volume_letter as char;
+            self.root_prefix = format!("{}:\\", c);
+            if self.volume_id.is_empty() {
+                self.volume_id = format!("{}", c.to_ascii_uppercase());
+            }
+        }
+    }
+
+    pub fn is_unix(&self) -> bool {
+        self.root_prefix.starts_with('/')
+            || (self.volume_letter == 0 && self.root_prefix.contains('/'))
+    }
+
+    pub fn path_sep_byte(&self) -> u8 {
+        if self.is_unix() {
+            b'/'
+        } else {
+            b'\\'
+        }
+    }
+}
+
+/// 卷前缀 + 目录物化路径（内部目录段仍可能用 `\`）。
+pub(crate) fn compose_volume_dir_path(vol: &VolumeState, dir_path: &[u8]) -> String {
+    let dir = String::from_utf8_lossy(dir_path);
+    if vol.is_unix() {
+        let rel = dir.replace('\\', "/");
+        join_unix_prefix(&vol.root_prefix, &rel)
+    } else {
+        let letter = if vol.volume_letter == 0 {
+            'C'
+        } else {
+            (vol.volume_letter as char).to_ascii_uppercase()
+        };
+        let mut s = String::with_capacity(2 + dir.len());
+        s.push(letter);
+        s.push(':');
+        s.push_str(&dir);
+        s
+    }
+}
+
+pub(crate) fn join_unix_prefix(root_prefix: &str, rel: &str) -> String {
+    let rel = rel.trim_start_matches(['/', '\\']);
+    let prefix = root_prefix.trim_end_matches('/');
+    if rel.is_empty() {
+        if prefix.is_empty() {
+            "/".into()
+        } else {
+            prefix.to_string()
+        }
+    } else if prefix.is_empty() {
+        format!("/{rel}")
+    } else {
+        format!("{prefix}/{rel}")
+    }
+}
+
+pub(crate) fn paths_excluded(full: &str, ex: &str, sep: u8) -> bool {
+    let full = full.to_ascii_lowercase();
+    let ex = ex.trim_end_matches(['\\', '/']).to_ascii_lowercase();
+    if full == ex {
+        return true;
+    }
+    let sep = sep as char;
+    full.starts_with(&format!("{ex}{sep}"))
 }
 
 /// 目录项（路径重建）
@@ -310,6 +430,13 @@ pub fn normalize_excluded_dir(input: &str) -> Option<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return None;
+    }
+    if trimmed.starts_with('/') {
+        let mut s = trimmed.to_ascii_lowercase();
+        while s.len() > 1 && s.ends_with('/') {
+            s.pop();
+        }
+        return Some(s);
     }
     let mut s: String = trimmed
         .chars()
@@ -573,24 +700,11 @@ impl IndexStore {
             if self.entries[idx].is_deleted() {
                 continue;
             }
-            // 重建条目完整路径（小写带盘符）。多卷场景下 volume_letter_for_entry 走的是 first_entry_idx 段表，正确。
-            let letter = self.volume_letter_for_entry(idx).to_ascii_lowercase();
-            let dir_idx = self.entries[idx].dir_idx;
-            let dir_path = self.resolve_dir_path_lower(dir_idx);
-            let name_bs = self.name_bytes(&self.entries[idx]);
-            let name_lc = std::str::from_utf8(name_bs)
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            let mut full = String::with_capacity(dir_path.len() + name_lc.len() + 4);
-            full.push(letter);
-            full.push(':');
-            full.push_str(std::str::from_utf8(dir_path.as_ref()).unwrap_or(""));
-            if !full.ends_with('\\') {
-                full.push('\\');
-            }
-            full.push_str(&name_lc);
+            let vol = self.volume_for_entry(idx);
+            let full = self.entry_full_path_lower(idx);
+            let sep = vol.map(|v| v.path_sep_byte()).unwrap_or(b'\\');
             for ex in &normalized {
-                if full == *ex || full.starts_with(&format!("{ex}\\")) {
+                if paths_excluded(&full, ex, sep) {
                     self.deleted.insert(idx as u32);
                     self.entries[idx].attrs |= FileEntry::ATTR_DELETED;
                     marked += 1;
@@ -810,21 +924,21 @@ impl IndexStore {
             return false;
         };
         let parent_path = self.resolve_dir_path_lower(parent_dir_idx);
-        // resolve_dir_path_lower 不带盘符，根据 dir_idx 反查所属卷盘符。
-        let letter = self.volume_letter_for_dir_idx(parent_dir_idx).to_ascii_lowercase();
-        let mut full = String::with_capacity(parent_path.len() + raw_name.len() + 4);
-        full.push(letter);
-        full.push(':');
-        full.push_str(std::str::from_utf8(parent_path.as_ref()).unwrap_or(""));
-        if !full.ends_with('\\') {
-            full.push('\\');
+        let vol = self
+            .volumes
+            .first()
+            .cloned()
+            .unwrap_or_else(|| VolumeState::windows(b'C', 0, 0, 0, 0));
+        let mut full = compose_volume_dir_path(&vol, parent_path.as_ref());
+        let sep = vol.path_sep_byte() as char;
+        if !full.ends_with(sep) && !full.is_empty() {
+            full.push(sep);
         }
         for c in raw_name.chars() {
             full.push(c.to_ascii_lowercase());
         }
         for ex in &self.excluded_dirs {
-            // 前缀命中：`c:\windows\winsxs` 对 `c:\windows\winsxs\foo.dll` 与目录自身都生效。
-            if full == *ex || full.starts_with(&format!("{ex}\\")) {
+            if paths_excluded(&full, ex, vol.path_sep_byte()) {
                 return true;
             }
         }
@@ -833,6 +947,7 @@ impl IndexStore {
 
     /// 通过 dir_idx 反查所属卷盘符；多卷场景里用 first_entry_idx 段判定不准（dirs 没有这个段标），
     /// 这里走回退策略：dir 的 frn 可能在某卷的 dir 树里，找不到时回退到第一卷。
+    #[allow(dead_code)]
     fn volume_letter_for_dir_idx(&self, _dir_idx: u32) -> char {
         // 当前 dirs 与 entries 是同卷线性段，这里没有显式的 dir 段表；
         // 简化：沿用「第一卷」盘符（实际多卷下 USN watch 是按卷各自跑，不会跨卷投递事件，
@@ -942,27 +1057,97 @@ impl IndexStore {
         }
     }
 
-    /// 按 `VolumeState.first_entry_idx` 段选择盘符（多卷合并索引）。
-    pub fn volume_letter_for_entry(&self, idx: usize) -> char {
+    /// 按 `VolumeState.first_entry_idx` 段选择卷（多卷合并索引）。
+    pub fn volume_for_entry(&self, idx: usize) -> Option<&VolumeState> {
+        if self.volumes.is_empty() {
+            return None;
+        }
         let idx = idx as u32;
-        let mut letter = self.volumes.first().map(|v| v.volume_letter).unwrap_or(b'C');
-        for v in &self.volumes {
+        let mut chosen = 0usize;
+        for (i, v) in self.volumes.iter().enumerate() {
             if idx >= v.first_entry_idx {
-                letter = v.volume_letter;
+                chosen = i;
             }
         }
-        (letter as char).to_ascii_uppercase()
+        self.volumes.get(chosen)
     }
 
-    /// 重建 `C:\path\file` 显示路径（目录/文件条目均支持）
+    /// 按 `VolumeState.first_entry_idx` 段选择盘符（多卷合并索引）。
+    pub fn volume_letter_for_entry(&self, idx: usize) -> char {
+        self.volume_for_entry(idx)
+            .map(|v| {
+                if v.volume_letter == 0 {
+                    'C'
+                } else {
+                    (v.volume_letter as char).to_ascii_uppercase()
+                }
+            })
+            .unwrap_or('C')
+    }
+
+    /// 条目完整小写路径（含卷前缀），供排除规则与 `path:` 过滤。
+    pub fn entry_full_path_lower(&self, idx: usize) -> String {
+        let Some(vol) = self.volume_for_entry(idx) else {
+            return String::new();
+        };
+        let Some(e) = self.entries.get(idx) else {
+            return String::new();
+        };
+        let name_lc = std::str::from_utf8(self.name_bytes(e))
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if e.is_dir_entry() {
+            let fr = self.frns.get(idx).copied().unwrap_or(0);
+            if let Some(&di) = self.dir_index.get(&fr) {
+                let dir = self.resolve_dir_path_lower(di);
+                return compose_volume_dir_path(vol, dir.as_ref()).to_ascii_lowercase();
+            }
+        }
+        let dir = self.resolve_dir_path_lower(e.dir_idx);
+        let mut full = compose_volume_dir_path(vol, dir.as_ref());
+        let sep = vol.path_sep_byte() as char;
+        if !full.ends_with(sep) && !full.is_empty() {
+            full.push(sep);
+        }
+        full.push_str(&name_lc);
+        full.to_ascii_lowercase()
+    }
+
+    /// 重建 `C:\path\file` 或 Unix `/prefix/path/file` 显示路径
     pub fn entry_display_path(&self, idx: usize) -> crate::Result<String> {
+        let vol = self.volume_for_entry(idx);
+        let unix = vol.map(|v| v.is_unix()).unwrap_or(false);
         let letter = self.volume_letter_for_entry(idx);
         let e = self
             .entries
             .get(idx)
             .ok_or_else(|| crate::Error::Platform("条目下标越界".into()))?;
         let name = self.name_str(e)?.to_string();
-        if e.is_dir_entry() {
+        if unix {
+            let prefix = vol.map(|v| v.root_prefix.as_str()).unwrap_or("/");
+            if e.is_dir_entry() {
+                let fr = self.frns.get(idx).copied().unwrap_or(0);
+                if let Some(&di) = self.dir_index.get(&fr) {
+                    let pbytes = self.resolve_dir_path_lower(di);
+                    if !pbytes.is_empty() {
+                        let p = std::str::from_utf8(pbytes.as_ref())?.replace('\\', "/");
+                        return Ok(join_unix_prefix(prefix, &p));
+                    }
+                }
+                return Ok(join_unix_prefix(prefix, &name));
+            }
+            let pbytes = self.resolve_dir_path_lower(e.dir_idx);
+            let dir = if pbytes.is_empty() {
+                join_unix_prefix(prefix, "")
+            } else {
+                join_unix_prefix(prefix, &std::str::from_utf8(pbytes.as_ref())?.replace('\\', "/"))
+            };
+            if dir.ends_with('/') {
+                Ok(format!("{dir}{name}"))
+            } else {
+                Ok(format!("{dir}/{name}"))
+            }
+        } else if e.is_dir_entry() {
             // 关键热路径修复：原先 self.dirs.iter().position(...) 是 O(D) 线性扫描，
             // 1000 个目录 hits × 100 万 dirs ≈ 10 亿次比较 ≈ 600ms（实测「android」就被这个挡住）。
             // dir_index 已是 FRN→dirs 下标的 FxHashMap，直接 O(1) 查询即可。
@@ -974,14 +1159,15 @@ impl IndexStore {
                     return Ok(format!("{}{}{}", letter, ':', p));
                 }
             }
-            return Ok(format!("{}:\\{}", letter, name));
-        }
-        let pbytes = self.resolve_dir_path_lower(e.dir_idx);
-        if !pbytes.is_empty() {
-            let p = std::str::from_utf8(pbytes.as_ref())?;
-            Ok(format!("{}{}{}\\{}", letter, ':', p, name))
-        } else {
             Ok(format!("{}:\\{}", letter, name))
+        } else {
+            let pbytes = self.resolve_dir_path_lower(e.dir_idx);
+            if !pbytes.is_empty() {
+                let p = std::str::from_utf8(pbytes.as_ref())?;
+                Ok(format!("{}{}{}\\{}", letter, ':', p, name))
+            } else {
+                Ok(format!("{}:\\{}", letter, name))
+            }
         }
     }
 
@@ -1084,16 +1270,46 @@ pub struct IndexBuilder {
     volume_serial: u32,
     usn_journal_id: u64,
     last_usn: u64,
+    root_prefix: String,
+    volume_id: String,
 }
 
 impl IndexBuilder {
     pub fn new(volume_letter: u8, volume_serial: u32, usn_journal_id: u64, last_usn: u64) -> Self {
+        let c = volume_letter as char;
         Self {
             volume_letter,
             volume_serial,
             usn_journal_id,
             last_usn,
+            root_prefix: if volume_letter != 0 {
+                format!("{}:\\", c)
+            } else {
+                String::new()
+            },
+            volume_id: if volume_letter != 0 {
+                format!("{}", c.to_ascii_uppercase())
+            } else {
+                String::new()
+            },
         }
+    }
+
+    pub fn with_unix_volume(
+        mut self,
+        volume_id: impl Into<String>,
+        root_prefix: impl Into<String>,
+    ) -> Self {
+        self.volume_letter = 0;
+        self.volume_id = volume_id.into();
+        self.root_prefix = root_prefix.into();
+        self
+    }
+
+    pub fn with_watch_cursor(mut self, watch_gen: u64, watch_cursor: u64) -> Self {
+        self.usn_journal_id = watch_gen;
+        self.last_usn = watch_cursor;
+        self
     }
 
     /// 从 `RawEntry` 列表构建索引（单卷简化版：假定 `parent_id` 已能解析为目录 FRN）
@@ -1324,6 +1540,8 @@ impl IndexBuilder {
             usn_journal_id: self.usn_journal_id,
             last_usn: self.last_usn,
             first_entry_idx,
+            root_prefix: self.root_prefix.clone(),
+            volume_id: self.volume_id.clone(),
         }];
 
         // BFS 临时表 → 紧凑 sorted FrnIdxMap；hashbrown 在这里立刻释放。

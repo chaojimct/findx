@@ -31,6 +31,7 @@ export default function SettingsWindow() {
   );
   const [rebuildBusy, setRebuildBusy] = useState(false);
   const [availableDrives, setAvailableDrives] = useState<string[]>([]);
+  const [hostOs, setHostOs] = useState<string>("windows");
   const [uiThemePref, setUiThemePref] = useState<UiThemePref>(() => loadUiThemePref());
   const [systemDark, setSystemDark] = useState(
     () => window.matchMedia("(prefers-color-scheme: dark)").matches,
@@ -98,13 +99,22 @@ export default function SettingsWindow() {
     let aborted = false;
     void (async () => {
       try {
-        const drives = await invoke<Array<{ letter: string; canOpenVolume?: boolean }>>("list_drives");
+        const [drives, os] = await Promise.all([
+          invoke<Array<{ letter: string; canOpenVolume?: boolean }>>("list_drives"),
+          invoke<string>("host_platform").catch(() => "windows"),
+        ]);
         if (!aborted) {
+          setHostOs(os);
           setAvailableDrives(
             drives
               .map((d) => d.letter.trim())
               .filter(Boolean)
-              .map((s) => (s.endsWith(":") ? s : `${s}:`)),
+              .map((s) => {
+                if (os === "windows") {
+                  return s.endsWith(":") ? s : `${s}:`;
+                }
+                return s;
+              }),
           );
         }
       } catch {
@@ -250,7 +260,7 @@ export default function SettingsWindow() {
         <div className="fx-settings-scroll">
         {settingsTab === "index" && (
           <div>
-            <label>索引磁盘（不勾选 = 全盘）</label>
+            <label>{hostOs === "windows" ? "索引磁盘（不勾选 = 全盘）" : "索引范围（不勾选 = 默认挂载点）"}</label>
             <div className="fx-drives">
               {availableDrives.length === 0 && (
                 <span className="fx-hint">（加载磁盘列表中…）</span>
@@ -293,7 +303,7 @@ export default function SettingsWindow() {
               rows={4}
             />
             <p className="fx-hint">
-              排除规则会写入 index.exclude.json，service 启动 / USN 增量都会过滤；
+              排除规则会写入 index.exclude.json，服务启动与增量监听都会过滤；
               修改后需要点「重建索引」才能彻底清掉历史已入库条目。
             </p>
 
@@ -368,6 +378,8 @@ export default function SettingsWindow() {
 
         {settingsTab === "service" && (
           <div>
+            {hostOs === "windows" ? (
+              <>
             <label>启动模式</label>
             <div className="fx-settings-row" style={{ marginTop: 0, marginBottom: 12 }}>
               <label style={{ fontWeight: "normal", margin: 0 }}>
@@ -389,7 +401,15 @@ export default function SettingsWindow() {
                 单体 UAC 模式（每次启动会请求管理员授权）
               </label>
             </div>
+              </>
+            ) : (
+              <p className="fx-hint">
+                macOS / Linux 以用户进程常驻（LaunchAgent / systemd --user），完整磁盘访问或 root
+                才能扫整盘；未授权时只索引可见目录。
+              </p>
+            )}
 
+            {hostOs === "windows" && (
             <label>
               <input
                 type="checkbox"
@@ -400,6 +420,7 @@ export default function SettingsWindow() {
               />{" "}
               开启 Everything SDK 兼容窗口（IbEverythingExt 等老客户端依赖）
             </label>
+            )}
 
             <label>
               <input
@@ -483,13 +504,13 @@ export default function SettingsWindow() {
               value={settings.indexPath}
               onChange={(e) => setSettings((s) => ({ ...s, indexPath: e.target.value }))}
             />
-            <label>命名管道名</label>
+            <label>{hostOs === "windows" ? "命名管道名" : "IPC 套接字名"}</label>
             <input
               type="text"
               value={settings.pipeName}
               onChange={(e) => setSettings((s) => ({ ...s, pipeName: e.target.value }))}
             />
-            <label>findx2-service.exe 路径（可空）</label>
+            <label>findx2-service 路径（可空）</label>
             <input
               type="text"
               value={settings.serviceExePath}
@@ -497,7 +518,7 @@ export default function SettingsWindow() {
                 setSettings((s) => ({ ...s, serviceExePath: e.target.value }))
               }
             />
-            <label>USN 落盘间隔（秒）</label>
+            <label>增量落盘间隔（秒）</label>
             <input
               type="number"
               min={1}

@@ -3,15 +3,11 @@
 //! 服务进程一启动就先把管道挂上去；`index.bin` 加载完成前，`Search` 返回 `Error("索引加载中…")`，
 //! `Status` 返回 `loading=true`，让 GUI 立刻知道「服务在、索引还没就绪」而不是「管道超时」。
 
-use std::sync::{Arc, RwLock};
-
-use findx2_core::SearchEngine;
 use findx2_ipc::{IpcRequest, IpcResponse};
 use tokio::io::{split, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, info, warn};
 
-/// 加载完成前为 `None`；`run_foreground` 在 `load_index_bin` 之后注入。
-pub(crate) type EngineSlot = Arc<RwLock<Option<Arc<SearchEngine>>>>;
+use crate::ipc_dispatch::{process_request, req_kind_label, EngineSlot};
 
 /// 命名管道的关键参数集中在这里，避免散在每次 create 处。
 /// - `max_instances=254`：tokio `ServerOptions::max_instances` 接受 1..=254；
@@ -212,103 +208,4 @@ async fn handle_client(
     }
 
     Ok(())
-}
-
-fn req_kind_label(r: &IpcRequest) -> &'static str {
-    match r {
-        IpcRequest::Ping => "Ping",
-        IpcRequest::Status => "Status",
-        IpcRequest::Search { .. } => "Search",
-    }
-}
-
-fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse {
-    let engine = slot.read().ok().and_then(|g| g.clone());
-    match (req, engine) {
-        (IpcRequest::Ping, _) => IpcResponse::Pong,
-        (IpcRequest::Status, None) => IpcResponse::StatusResult {
-            entry_count: 0,
-            dir_count: 0,
-            last_usn: 0,
-            journal_id: 0,
-            volume_letter: None,
-            healthy: false,
-            metadata_ready: false,
-            backfill_done: 0,
-            backfill_total: 0,
-            loading: true,
-            watch_error: crate::run::watch_error_summary(),
-            backfill_error: None,
-        },
-        (IpcRequest::Search { .. }, None) => IpcResponse::Error {
-            message: "索引加载中，请稍候…".into(),
-        },
-        (
-            IpcRequest::Search {
-                query,
-                pinyin,
-                limit,
-                offset,
-            },
-            Some(eng),
-        ) => match crate::run::search_ipc(&eng, &query, pinyin, limit, offset) {
-            Ok((hits, total, elapsed_ms)) => IpcResponse::SearchResult {
-                hits,
-                total,
-                elapsed_ms,
-            },
-            Err(message) => IpcResponse::Error { message },
-        },
-        (IpcRequest::Status, Some(eng)) => {
-            // 关键：用 try_read 而不是 read。回填线程在挪动 `metadata_overlay` → 主索引时
-            // 会拿 store **write** lock；SRW 调度下后续 reader 会被排队到 writer 之后，
-            // Status 那条管道就开始累积、超时——GUI 状态栏出现 "管道状态查询超时"，看上去像服务挂了。
-            // 拿不到锁就退化成 backfill-only 快照（loading=true 复用 GUI 的"加载中"提示），
-            // 比"卡 5s 超时"体验好得多。
-            let backfill = eng.backfill_progress_snapshot();
-            let backfill_error = eng.backfill_error_snapshot();
-            match eng.try_index_store() {
-                Some(g) => {
-                    let vol = g.volumes.first();
-                    let (backfill_done, backfill_total) = if g.metadata_ready {
-                        (0u64, 0u64)
-                    } else {
-                        backfill
-                    };
-                    IpcResponse::StatusResult {
-                        entry_count: g.entry_count() as u64,
-                        dir_count: g.dirs.len() as u64,
-                        last_usn: vol.map(|v| v.last_usn).unwrap_or(0),
-                        journal_id: vol.map(|v| v.usn_journal_id).unwrap_or(0),
-                        volume_letter: vol.map(|v| v.volume_letter as char),
-                        healthy: true,
-                        metadata_ready: g.metadata_ready,
-                        backfill_done,
-                        backfill_total,
-                        loading: false,
-                        watch_error: crate::run::watch_error_summary(),
-                        backfill_error: if g.metadata_ready {
-                            None
-                        } else {
-                            backfill_error
-                        },
-                    }
-                }
-                None => IpcResponse::StatusResult {
-                    entry_count: 0,
-                    dir_count: 0,
-                    last_usn: 0,
-                    journal_id: 0,
-                    volume_letter: None,
-                    healthy: true,
-                    metadata_ready: false,
-                    backfill_done: backfill.0,
-                    backfill_total: backfill.1,
-                    loading: true,
-                    watch_error: crate::run::watch_error_summary(),
-                    backfill_error,
-                },
-            }
-        }
-    }
 }

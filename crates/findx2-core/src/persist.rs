@@ -66,6 +66,16 @@ impl IndexHeader {
     }
 }
 
+fn write_counted_str<W: Write>(f: &mut W, s: &str) -> Result<()> {
+    let bytes = s.as_bytes();
+    if bytes.len() > u16::MAX as usize {
+        return Err(crate::Error::Persist("卷身份字符串过长".into()));
+    }
+    f.write_all(&(bytes.len() as u16).to_le_bytes())?;
+    f.write_all(bytes)?;
+    Ok(())
+}
+
 fn serialize_volume(v: &VolumeState) -> [u8; 32] {
     let mut o = [0u8; 32];
     o[0] = v.volume_letter;
@@ -83,6 +93,8 @@ fn deserialize_volume(b: &[u8; 32]) -> VolumeState {
         usn_journal_id: u64::from_le_bytes(b[8..16].try_into().unwrap()),
         last_usn: u64::from_le_bytes(b[16..24].try_into().unwrap()),
         first_entry_idx: u32::from_le_bytes(b[24..28].try_into().unwrap()),
+        root_prefix: String::new(),
+        volume_id: String::new(),
     }
 }
 
@@ -95,8 +107,11 @@ const FORMAT_VERSION_V4: u32 = 4;
 /// v5：FileEntry 紧凑布局（mtime/ctime u64 FILETIME → u32 unix-secs，40B → 32B）。
 /// 8.5M 文件可省 ~68 MB 持久化体积，内存同样减半。
 const FORMAT_VERSION_V5: u32 = 5;
+/// v6：volumes 32 字节记录之后、`names_buf` 之前追加每卷 `root_prefix` / `volume_id` 长度前缀字符串。
+/// v5 仍可加载（按盘符合成 `C:\`）。新库一律写 v6。
+const FORMAT_VERSION_V6: u32 = 6;
 /// 当前写入的版本。
-const FORMAT_VERSION_CURRENT: u32 = FORMAT_VERSION_V5;
+const FORMAT_VERSION_CURRENT: u32 = FORMAT_VERSION_V6;
 /// 快速首遍建库未完成元数据回填（`IndexStore.metadata_ready == false`）
 const FLAG_METADATA_PENDING: u32 = 1;
 
@@ -191,6 +206,10 @@ pub fn write_index_bin<W: Write>(w: &mut W, store: &IndexStore) -> Result<()> {
 
     for v in &store.volumes {
         f.write_all(&serialize_volume(v))?;
+    }
+    for v in &store.volumes {
+        write_counted_str(f, &v.root_prefix)?;
+        write_counted_str(f, &v.volume_id)?;
     }
 
     f.write_all(&store.names_buf)?;
@@ -396,6 +415,19 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
         let mut a = [0u8; 32];
         a.copy_from_slice(chunk);
         volumes.push(deserialize_volume(&a));
+    }
+
+    if hdr.version >= FORMAT_VERSION_V6 {
+        for v in &mut volumes {
+            let n = u16::from_le_bytes(take(2)?.try_into().unwrap()) as usize;
+            v.root_prefix = String::from_utf8_lossy(take(n)?).into_owned();
+            let n = u16::from_le_bytes(take(2)?.try_into().unwrap()) as usize;
+            v.volume_id = String::from_utf8_lossy(take(n)?).into_owned();
+        }
+    } else {
+        for v in &mut volumes {
+            v.infer_legacy_windows_identity();
+        }
     }
 
     let names_buf = take(hdr.names_buf_len as usize)?.to_vec();

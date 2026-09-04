@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "npm run build && npm run bundle:win-exes",
+    "beforeBuildCommand": "npm run build && npm run bundle:native-bins",
     "frontendDist": "../dist"
   },
   "app": {
@@ -92,11 +92,6 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ],
-    "resources": {
-      "bundled/findx2.exe": "bin/findx2.exe",
-      "bundled/fx.exe": "bin/fx.exe",
-      "bundled/findx2-service.exe": "bin/findx2-service.exe"
-    }
+    ]
   }
 }

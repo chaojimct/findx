@@ -1,0 +1,10 @@
+{
+  "bundle": {
+    "targets": ["deb", "appimage"],
+    "resources": {
+      "bundled/findx2": "bin/findx2",
+      "bundled/fx": "bin/fx",
+      "bundled/findx2-service": "bin/findx2-service"
+    }
+  }
+}

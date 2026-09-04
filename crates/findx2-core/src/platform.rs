@@ -54,12 +54,45 @@ pub enum ChangeEvent {
     },
 }
 
-/// 初始全量扫描
+/// 增量游标：Windows 为 JournalId + NextUsn；macOS 为 FSEvents 世代 + eventId；
+/// Linux fanotify 无持久 journal，世代在进程启动时递增，游标可为 0。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WatchCursor {
+    pub watch_gen: u64,
+    pub watch_cursor: u64,
+}
+
+/// 初始全量扫描。热路径应走 `scan_into`，避免百万级 `Vec` 峰值。
 pub trait VolumeScanner: Send + Sync {
-    fn scan(&self, volume: &str) -> Result<Vec<RawEntry>>;
+    fn scan_into(
+        &self,
+        volume: &str,
+        out: &mut dyn FnMut(RawEntry) -> Result<()>,
+    ) -> Result<WatchCursor>;
+
+    fn scan(&self, volume: &str) -> Result<Vec<RawEntry>> {
+        let mut out = Vec::new();
+        self.scan_into(volume, &mut |e| {
+            out.push(e);
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 
 /// 增量实时监控（可选，MVP 可先返回不支持）
 pub trait ChangeWatcher: Send + Sync {
     fn watch(&self, tx: Sender<ChangeEvent>) -> Result<()>;
+
+    /// 带断点续跑的监听。断档（FSEvents MustScan / USN JournalGap）应返回 `Error::JournalGap`。
+    fn watch_from(
+        &self,
+        volume: &str,
+        cursor: WatchCursor,
+        tx: Sender<ChangeEvent>,
+    ) -> Result<WatchCursor> {
+        let _ = (volume, cursor);
+        self.watch(tx)?;
+        Ok(WatchCursor::default())
+    }
 }
