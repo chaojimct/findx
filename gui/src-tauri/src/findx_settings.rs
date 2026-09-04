@@ -212,11 +212,21 @@ fn resolve_service_exe(base: &Path, settings: &FindxGuiSettings) -> Result<PathB
     )
 }
 
-fn service_exe_search_paths(base: &Path) -> [PathBuf; 2] {
-    [
-        base.join("findx2-service.exe"),
-        base.join("resources").join("bin").join("findx2-service.exe"),
-    ]
+fn service_exe_search_paths(base: &Path) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        vec![
+            base.join("findx2-service.exe"),
+            base.join("resources").join("bin").join("findx2-service.exe"),
+        ]
+    }
+    #[cfg(not(windows))]
+    {
+        vec![
+            base.join("findx2-service"),
+            base.join("resources").join("bin").join("findx2-service"),
+        ]
+    }
 }
 
 fn cli_name_paths(base: &Path, name: &str) -> [PathBuf; 2] {
@@ -228,7 +238,12 @@ fn cli_name_paths(base: &Path, name: &str) -> [PathBuf; 2] {
 
 /// 与 `findx2-service` 同目录的 `findx2` / `fx` 命令行（建索引子进程）
 pub fn resolve_cli_exe(base: &Path, settings: &FindxGuiSettings) -> Option<PathBuf> {
-    for name in ["findx2.exe", "fx.exe"] {
+    let names = if cfg!(windows) {
+        ["findx2.exe", "fx.exe"].as_slice()
+    } else {
+        ["findx2", "fx"].as_slice()
+    };
+    for name in names {
         for p in cli_name_paths(base, name).into_iter() {
             if p.exists() {
                 return Some(p);
@@ -237,7 +252,7 @@ pub fn resolve_cli_exe(base: &Path, settings: &FindxGuiSettings) -> Option<PathB
     }
     if let Ok(svc) = resolve_service_exe(base, settings) {
         let parent = svc.parent()?;
-        for name in ["findx2.exe", "fx.exe"] {
+        for name in names {
             let p = parent.join(name);
             if p.exists() {
                 return Some(p);
@@ -627,8 +642,24 @@ pub fn spawn_findx_service_process<R: Runtime>(app: tauri::AppHandle<R>) -> Resu
     }
     #[cfg(not(windows))]
     {
-        let _ = (exe, index, vol, pipe);
-        Err("当前平台请自行启动 findx2-service（或后续接入 TCP）。".into())
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("--index")
+            .arg(index.as_os_str())
+            .arg("--volume")
+            .arg(vol)
+            .arg("--pipe")
+            .arg(pipe);
+        if !settings.enable_metadata_backfill {
+            cmd.arg("--no-backfill");
+        }
+        for d in &settings.excluded_dirs {
+            if !d.trim().is_empty() {
+                cmd.arg("--exclude-dir").arg(d);
+            }
+        }
+        cmd.spawn()
+            .map_err(|e| format!("启动 findx2-service 失败: {e}"))?;
+        Ok(())
     }
 }
 
@@ -646,7 +677,11 @@ pub(crate) fn stop_findx_service_detached() {
 }
 
 #[cfg(not(windows))]
-pub(crate) fn stop_findx_service_detached() {}
+pub(crate) fn stop_findx_service_detached() {
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "findx2-service"])
+        .spawn();
+}
 
 #[tauri::command]
 pub fn stop_findx_service() -> Result<(), String> {
@@ -663,6 +698,9 @@ pub fn stop_findx_service() -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        Err("当前平台未实现停止服务进程。".into())
+        let _ = std::process::Command::new("pkill")
+            .args(["-x", "findx2-service"])
+            .status();
+        Ok(())
     }
 }

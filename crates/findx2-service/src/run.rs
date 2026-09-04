@@ -8,8 +8,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use findx2_core::{save_index_bin, QueryParser, SearchEngine, SearchOptions};
+use findx2_core::{save_index_bin, SearchEngine};
 use tracing::{error, info};
+
+use crate::watch_health::set_watch_error;
 
 /// 运行时开关：来自 CLI（`--no-everything-ipc` / `--no-backfill` / `--exclude-dir`）。
 /// 抽 struct 而不是继续加位置参数，是因为 `run_foreground` 已经 5 个参数了，再扩会失控。
@@ -19,41 +21,6 @@ pub(crate) struct RunFlags {
     pub no_backfill: bool,
     /// CLI 注入的排除目录（与 sidecar 里的取并集，由 IndexStore 持有运行时副本）。
     pub extra_excluded_dirs: Vec<String>,
-}
-
-/// 各卷 USN 监听健康状态（P0-2 watch 保活）。
-/// - `None` = 该卷监听正常；
-/// - `Some(msg)` = 中断/重建中，`msg` 为人类可读原因（透出到 IPC Status → GUI 状态栏）。
-/// service 单进程单例，用全局静态足够；读写只在 watch 线程与 Status 查询时发生。
-fn watch_health() -> &'static Mutex<std::collections::HashMap<char, String>> {
-    static HEALTH: OnceLock<Mutex<std::collections::HashMap<char, String>>> = OnceLock::new();
-    HEALTH.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-}
-
-/// 设置/清除某卷监听故障。`None` = 恢复正常。
-pub(crate) fn set_watch_error(volume_letter: char, err: Option<String>) {
-    let key = volume_letter.to_ascii_uppercase();
-    if let Ok(mut g) = watch_health().lock() {
-        match err {
-            Some(msg) => {
-                g.insert(key, msg);
-            }
-            None => {
-                g.remove(&key);
-            }
-        }
-    }
-}
-
-/// 聚合所有卷的监听故障（Status 上报；空串 = 全部正常）。
-pub(crate) fn watch_error_summary() -> Option<String> {
-    let g = watch_health().lock().ok()?;
-    if g.is_empty() {
-        return None;
-    }
-    let mut items: Vec<String> = g.iter().map(|(k, v)| format!("{k}: {v}")).collect();
-    items.sort();
-    Some(items.join("; "))
 }
 
 /// 全卷重建冻结集（P0-2 JournalGap 重建协议，按卷独立）。
@@ -279,7 +246,7 @@ pub(crate) fn run_foreground(
     // 关键：管道在 load_index_bin 之前就开起来。
     // 大索引（千万级）反序列化要十几秒甚至几十秒，旧顺序下 GUI / IPC 会一直撞「管道超时」。
     // 现在改为：先挂 EngineSlot（None）→ 起 pipe 线程 → 加载索引 → 注入 Some(engine)。
-    let slot: crate::pipe_server::EngineSlot = Arc::new(RwLock::new(None));
+    let slot: crate::ipc_dispatch::EngineSlot = Arc::new(RwLock::new(None));
 
     let pipe_path_join = normalize_pipe_path(&pipe_name);
     let slot_pipe = slot.clone();
@@ -892,76 +859,4 @@ pub(crate) fn persist_index(engine: &SearchEngine, path: &Path) -> anyhow::Resul
     save_index_bin(path, &store)?;
     drop(guard);
     Ok(())
-}
-
-/// 共享给 Everything IPC 与管道：解析查询并搜索。
-/// `limit`/`offset` 语义：排序后取 `[offset, offset+limit)` 页；`limit=0` 沿用旧语义
-/// 回退 query 解析默认值（1000）。调用方（GUI）负责 clamp。
-pub(crate) fn search_ipc(
-    engine: &SearchEngine,
-    query: &str,
-    pinyin: bool,
-    limit_override: usize,
-    offset: usize,
-) -> Result<(Vec<findx2_ipc::SearchHitDto>, u32, u32), String> {
-    let started = std::time::Instant::now();
-    let t_parse = std::time::Instant::now();
-    let pq = QueryParser::parse(query).map_err(|e| e.to_string())?;
-    // 兼容旧语义：limit=0 表示“未指定”，回退 query 解析默认值（此前 `if limit_override > 0` 跳过覆盖）。
-    let lim = if limit_override == 0 {
-        pq.limit as usize
-    } else {
-        limit_override
-    };
-    let parse_ms = t_parse.elapsed().as_micros() as u64;
-    let t_search = std::time::Instant::now();
-    // pq.limit 不再参与截断（分页由 offset/limit 切片），search_paged 内只用它之外的字段。
-    let (hits, total) = engine
-        .search_paged(
-            query,
-            &pq,
-            &SearchOptions {
-                allow_pinyin: pinyin,
-                ..Default::default()
-            },
-            offset,
-            lim,
-        )
-        .map_err(|e| e.to_string())?;
-    let search_us = t_search.elapsed().as_micros() as u64;
-    let t_format = std::time::Instant::now();
-    let store = engine.index_store();
-    let dtos: Vec<findx2_ipc::SearchHitDto> = hits
-        .into_iter()
-        .map(|h| {
-            let is_directory = store
-                .entries
-                .get(h.entry_idx as usize)
-                .map(|e| e.is_dir_entry())
-                .unwrap_or(false);
-            findx2_ipc::SearchHitDto {
-                entry_idx: h.entry_idx,
-                name: h.name,
-                path: h.path,
-                size: h.size,
-                mtime: h.mtime,
-                is_directory,
-                name_highlight: h.name_highlight,
-            }
-        })
-        .collect();
-    let format_us = t_format.elapsed().as_micros() as u64;
-    let elapsed_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
-    findx2_core::progress!(
-        "search [{}] -> {} hits / total {} : parse {}μs · core {}μs ({:.2}ms) · format {}μs · sum {}ms",
-        query,
-        dtos.len(),
-        total,
-        parse_ms,
-        search_us,
-        (search_us as f64) / 1000.0,
-        format_us,
-        elapsed_ms
-    );
-    Ok((dtos, total, elapsed_ms))
 }

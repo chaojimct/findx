@@ -95,11 +95,16 @@ mod imp {
     pub struct MftScanner;
 
     impl VolumeScanner for MftScanner {
-        fn scan(&self, volume: &str) -> findx2_core::Result<Vec<RawEntry>> {
+        fn scan_into(
+            &self,
+            volume: &str,
+            out: &mut dyn FnMut(RawEntry) -> findx2_core::Result<()>,
+        ) -> findx2_core::Result<findx2_core::WatchCursor> {
             let (files, dirs) = scan_volume(volume)?;
-            let mut out = files;
-            out.extend(dirs);
-            Ok(out)
+            for e in dirs.into_iter().chain(files) {
+                out(e)?;
+            }
+            Ok(findx2_core::WatchCursor::default())
         }
     }
 
@@ -946,7 +951,7 @@ mod imp {
 pub use imp::*;
 
 #[cfg(not(windows))]
-use findx2_core::{Error, RawEntry, Result, VolumeScanner};
+use findx2_core::{Error, RawEntry, Result, VolumeScanner, WatchCursor};
 
 #[cfg(not(windows))]
 pub static SCAN_LIVE_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -956,7 +961,11 @@ pub struct MftScanner;
 
 #[cfg(not(windows))]
 impl VolumeScanner for MftScanner {
-    fn scan(&self, _volume: &str) -> Result<Vec<RawEntry>> {
+    fn scan_into(
+        &self,
+        _volume: &str,
+        _out: &mut dyn FnMut(RawEntry) -> Result<()>,
+    ) -> Result<WatchCursor> {
         Err(Error::Platform("findx2-windows 仅在 Windows 上可用".into()))
     }
 }

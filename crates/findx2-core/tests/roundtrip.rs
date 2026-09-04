@@ -584,3 +584,49 @@ fn create_pending_searchable_then_stat_refresh() {
     assert_eq!(hits[0].name, "burst.tmp", "补 meta 不得改名");
     assert_eq!(hits[0].size, 4096);
 }
+
+#[test]
+fn index_v6_unix_volume_roundtrip() {
+    let dirs = vec![RawEntry {
+        file_id: 100,
+        file_id_128: None,
+        parent_id: 0,
+        name: "Users".into(),
+        size: 0,
+        mtime: 0,
+        ctime: 0,
+        attrs: 0x10,
+        is_dir: true,
+    }];
+    let files = vec![RawEntry {
+        file_id: 1,
+        file_id_128: None,
+        parent_id: 100,
+        name: "note.txt".into(),
+        size: 10,
+        mtime: 1,
+        ctime: 1,
+        attrs: 0,
+        is_dir: false,
+    }];
+    let store = IndexBuilder::new(0, 0, 7, 99)
+        .with_unix_volume("apfs-uuid", "/System/Volumes/Data")
+        .build_from_raw(files, dirs, true)
+        .unwrap();
+    let mut tmp = std::env::temp_dir();
+    tmp.push("findx2_test_index_v6_unix.bin");
+    save_index_bin(&tmp, &store).unwrap();
+    let loaded: IndexStore = load_index_bin(&tmp).unwrap();
+    let _ = std::fs::remove_file(&tmp);
+    let v = loaded.volumes.first().expect("volume");
+    assert_eq!(v.root_prefix, "/System/Volumes/Data");
+    assert_eq!(v.volume_id, "apfs-uuid");
+    assert_eq!(v.usn_journal_id, 7);
+    assert_eq!(v.last_usn, 99);
+    let path = loaded.entry_display_path(0).unwrap();
+    assert!(
+        path.contains("Users") || path.contains("note.txt"),
+        "unix display path: {path}"
+    );
+    assert!(path.starts_with('/'), "unix path must be absolute: {path}");
+}

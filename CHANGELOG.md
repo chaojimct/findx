@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+### 功能
+
+- **跨平台索引骨架**：`index.bin` 升级为 v6（卷身份 + 根路径前缀，兼容只读加载 v5）。macOS 用 getattrlistbulk + FSEvents，Linux 用目录遍历 + fanotify/inotify；服务在 Unix 上走域套接字，GUI 设置改为挂载点与「增量监听」文案。Windows MFT/USN 行为不变。
+- **CI 与跨平台打包**：PR / `main` 在 Windows、macOS、Linux 跑测试并编译 GUI。打 `v*` 标签时除原有 Inno 安装包外，同时产出 macOS dmg 与 Linux deb/AppImage，并附带各平台 CLI tarball。
+
 ## [2.1.6] - 2026-09-03
 
 ### 修复

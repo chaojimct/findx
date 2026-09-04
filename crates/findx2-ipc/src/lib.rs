@@ -1,8 +1,44 @@
-//! findx2 自有 IPC 协议：命名管道上的 JSON 行协议。
+//! findx2 自有 IPC 协议：命名管道 / Unix socket 上的 JSON 行协议。
 //!
 //! 单条请求/响应为一行 UTF-8 JSON（便于 `BufRead::read_line`）。
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
+
+/// Unix 域套接字路径。`name` 为设置里的管道名（默认 `findx2`），可含 `.sock` 后缀。
+pub fn unix_socket_path(name: &str) -> PathBuf {
+    let trimmed = name.trim();
+    let file = if trimmed.is_empty() {
+        "findx2.sock".to_string()
+    } else if trimmed.ends_with(".sock") {
+        trimmed.to_string()
+    } else if trimmed.contains('/') {
+        return PathBuf::from(trimmed);
+    } else {
+        format!("{trimmed}.sock")
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let dir = PathBuf::from(home).join("Library/Application Support/FindX");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(file)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+            if !runtime.is_empty() {
+                return PathBuf::from(runtime).join(file);
+            }
+        }
+        std::env::temp_dir().join(file)
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(file)
+    }
+}
 
 /// 客户端 → 服务端的请求。
 #[derive(Debug, Clone, Serialize, Deserialize)]

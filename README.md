@@ -6,7 +6,7 @@
 
 | 资源 | 链接 |
 | --- | --- |
-| **发行版与安装包 (Windows Inno 向导 .exe)** | [GitHub Releases](https://github.com/chaojimct/findx/releases) |
+| **发行版（Windows 安装包 / macOS dmg / Linux deb·AppImage）** | [GitHub Releases](https://github.com/chaojimct/findx/releases) |
 | **产品/介绍页 (GitHub Pages)** | <https://chaojimct.github.io/findx/> |
 | **v1 源码归档 (.NET, 只读对照)** | 分支 [`findx-v1`](https://github.com/chaojimct/findx/tree/findx-v1)（最后一版为 `44d1d38`） |
 
@@ -17,15 +17,27 @@
 
 **首次开启 Pages**：若 [站点](https://chaojimct.github.io/findx/) 未自动更新，请在仓库 **Settings → Pages** 中把 **Source** 选为 **GitHub Actions**（本仓库已含 [`.github/workflows/pages.yml`](.github/workflows/pages.yml)）。
 
-**自动发版**：对 `v*` 标签（例如 `v2.1.0`）推送会触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，在 `windows-latest` 上 `tauri build --no-bundle` 产出程序与 `resources` 后，用 **[Inno Setup 6](https://jrsoftware.org/isinfo.php)** 执行 [`installer/FindX.iss`](installer/FindX.iss) 打 **`FindX-<ver>-setup.exe`**，并（在 tag 场景下）上传到 [Release](https://github.com/chaojimct/findx/releases)。
+**CI**：push / PR 走 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，在 Windows / macOS / Linux 上跑工作区测试并编译 GUI。
+
+**自动发版**：对 `v*` 标签（例如 `v2.1.6`）推送会触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，三端并行打包后汇总到 [Release](https://github.com/chaojimct/findx/releases)：
+
+- **Windows**：`tauri build --no-bundle` + Inno Setup → `FindX-<ver>-setup.exe`
+- **macOS**：Tauri `app` + `dmg`（当前 runner 为 Apple Silicon），另附 CLI/服务 tarball
+- **Linux**：Tauri `deb` + `AppImage`，另附 CLI/服务 tarball
 
 ## Windows 安装包（Inno Setup，与 v1 同宗）
 
-- **流程**：`gui` 下 `npm run tauri build -- --no-bundle`（仍会跑 `beforeBuild` 与 `bundle:win-exes` 将 CLI/服务打进 `resources`）→ `npm run inno:stage` 将 `target/release` 同步到 `installer/stage` → 用 `ISCC` 编译 [`installer/FindX.iss`](installer/FindX.iss)（CI 中通过 `choco install innosetup` 与 `iscc /DMyAppVersion=...` 完成）。产出文件名为 **`FindX-<version>-setup.exe`**，发布于仓库根 `dist/`。
+- **流程**：`gui` 下 `npm run tauri build -- --no-bundle`（`beforeBuild` 会跑 `bundle:native-bins`，把 CLI/服务打进 `resources`）→ `npm run inno:stage` 将 `target/release` 同步到 `installer/stage` → 用 `ISCC` 编译 [`installer/FindX.iss`](installer/FindX.iss)（CI 中通过 `choco install innosetup` 与 `iscc /DMyAppVersion=...` 完成）。产出文件名为 **`FindX-<version>-setup.exe`**，发布于仓库根 `dist/`。
 - **向导内容**：**中/英**、**开始菜单/桌面**、**是否注册 `FindX2Search` 服务**（默认开）、**是否把安装目录加入系统 PATH**（方便直接运行 `findx2` / `fx`）、**是否安装后启动 FindX**。逻辑在 [`FindX.iss` 的 `[Code]`](installer/FindX.iss)（安装后执行 `findx2-service install`、`sc start`、写 `FindX.installed` 等），风格对齐旧仓库 [`findx-v1:installer/FindX.iss`](https://github.com/chaojimct/findx/blob/findx-v1/installer/FindX.iss)。
 - **与 GUI 的约定**：若选择安装服务，安装器会在 `FindX` 同目录写 **`FindX.installed`**，首次无本地设置时 GUI 会采用 **ProgramData 索引 + 服务模式**（见 `findx_settings.rs`）。若**不**选服务，则不写该标记，便于便携/单机模式。
 - **本地手搓安装包**（已装 [Inno Setup 6](https://jrsoftware.org/isdl.php) 且已把 `ISCC` 加进 `PATH`）：`cd gui` → `npm run tauri:dir` → `npm run inno:stage` → `cd ../installer` → `iscc /DMyAppVersion=x.y.z FindX.iss`；`Languages\*.isl` 已随仓库放在 `installer/Languages/`，不依赖 Inno 安装目录下的 `compiler:Languages`（与 CI 一致）。版本号与 `tauri.conf.json` / tag 保持一致即可（输出在仓库根 `dist/`）。
-- **占位 exe**：`gui/src-tauri/bundled/*.exe` 仍为**占位**，满足 tauri 资源路径校验；正式构建由 `bundle:win-exes` 用 release 可执行文件覆盖。
+- **占位文件**：`gui/src-tauri/bundled/` 下的 sidecar 仍为**占位**，满足 tauri 资源路径校验；正式构建由 `bundle:native-bins` 用本机 release 可执行文件覆盖。Windows 资源在 `tauri.windows.conf.json`，macOS / Linux 分别在对应平台 conf。
+
+## macOS / Linux 打包
+
+- 本机：`cd gui` → `npm ci` → `npm run tauri build`。macOS 产出 dmg，Linux 产出 deb 与 AppImage（需 webkit2gtk 4.1 / gtk3 等系统依赖）。
+- CI 打出的包**未做 Apple 公证 / 代码签名**；macOS 首次打开可能需要在「隐私与安全性」里允许。
+- sidecar（`findx2` / `fx` / `findx2-service`）随 GUI 打进 `bin/`，与 Windows 安装布局一致。
 
 ## 功能概览（v2）
 
@@ -225,7 +237,7 @@ trigram 剪枝有两个边车：`<index>.tri`（倒排表，构建/重建时原�
 ## 版本号（GUI / 安装包）
 
 - Tauri 与 GUI 以 **`gui/src-tauri/tauri.conf.json`** 与 **`gui/src-tauri/Cargo.toml`** 的 `version` 为准。  
-- **Inno** 安装包版本在 CI 中由 **`/DMyAppVersion=`** 传入 [`installer/FindX.iss`](installer/FindX.iss)（与 tag 如 `v2.1.0` 的纯数字部分一致即可）；`iss` 内 `#define MyAppVersion` 为本地无参数编译时的默认。
+- **Inno** 安装包版本在 CI 中由 **`/DMyAppVersion=`** 传入 [`installer/FindX.iss`](installer/FindX.iss)（与 tag 如 `v2.1.6` 的纯数字部分一致即可）；`iss` 内 `#define MyAppVersion` 为本地无参数编译时的默认。macOS / Linux 包版本直接取 Tauri `version`。
 
 变更记录见仓库根目录 [`CHANGELOG.md`](CHANGELOG.md)。
 

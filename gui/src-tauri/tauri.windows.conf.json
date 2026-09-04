@@ -1,0 +1,10 @@
+{
+  "bundle": {
+    "targets": [],
+    "resources": {
+      "bundled/findx2.exe": "bin/findx2.exe",
+      "bundled/fx.exe": "bin/fx.exe",
+      "bundled/findx2-service.exe": "bin/findx2-service.exe"
+    }
+  }
+}

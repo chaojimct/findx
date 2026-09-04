@@ -22,6 +22,12 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rayon = "1.10"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+findx2-macos = { path = "../findx2-macos" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+findx2-linux = { path = "../findx2-linux" }
+
 [target.'cfg(windows)'.dependencies]
 findx2-windows = { path = "../findx2-windows" }
 windows-service = "0.7"

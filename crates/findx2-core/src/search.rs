@@ -1843,9 +1843,19 @@ fn path_matches_drive_prefix(
     drive: Option<char>,
     path_prefix: Option<&str>,
 ) -> bool {
-    let vol_letter = store
-        .volumes
-        .first()
+    let vol = store.volume_for_entry(entry_idx);
+    let unix = vol.map(|v| v.is_unix()).unwrap_or(false);
+
+    if unix {
+        if let Some(pref_in) = path_prefix {
+            let needle = pref_in.replace('\\', "/").to_ascii_lowercase();
+            let full = store.entry_full_path_lower(entry_idx).replace('\\', "/");
+            return memmem::find(full.as_bytes(), needle.as_bytes()).is_some();
+        }
+        return true;
+    }
+
+    let vol_letter = vol
         .map(|v| v.volume_letter as char)
         .unwrap_or('C');
     let letter = drive.unwrap_or(vol_letter).to_ascii_uppercase();
@@ -1860,7 +1870,7 @@ fn path_matches_drive_prefix(
     }
 
     if let Some(want) = drive {
-        let stored = store.volumes.first().map(|v| v.volume_letter).unwrap_or(b'C');
+        let stored = vol.map(|v| v.volume_letter).unwrap_or(b'C');
         (stored as char).to_ascii_uppercase() == want.to_ascii_uppercase()
     } else {
         true
@@ -1893,9 +1903,17 @@ fn path_full_lower(store: &IndexStore, entry_idx: usize, nowfn: bool) -> Vec<u8>
     if nowfn {
         return name_s.as_bytes().to_vec();
     }
-    let letter = store
-        .volumes
-        .first()
+    let vol = store.volume_for_entry(entry_idx);
+    if vol.map(|v| v.is_unix()).unwrap_or(false) {
+        let mut full = store.entry_full_path_lower(entry_idx).into_bytes();
+        for b in &mut full {
+            if *b == b'\\' {
+                *b = b'/';
+            }
+        }
+        return full;
+    }
+    let letter = vol
         .map(|v| v.volume_letter as char)
         .unwrap_or('C')
         .to_ascii_lowercase() as u8;

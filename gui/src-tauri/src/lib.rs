@@ -41,7 +41,7 @@ mod win_file_context_menu;
 #[cfg(windows)]
 mod win_preview;
 
-#[cfg(target_os = "windows")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod pipe;
 
 /// 主窗口在首帧 WebView 页面加载完成后再 `show`，避免启动时出现空白壳窗口闪烁。
@@ -77,7 +77,6 @@ struct IndexStatus {
     last_error: Option<String>,
 }
 
-#[cfg(target_os = "windows")]
 #[derive(Clone, Default)]
 struct IndexingProgressSnap {
     phase: Option<String>,
@@ -90,7 +89,6 @@ struct IndexingProgressSnap {
 
 /// `cargo build` 常见同时存在 `target/debug` 与 `target/release`；若 GUI 与 CLI 不在同一 profile，
 /// 进度文件可能写在「另一套」目录，需互为回退，否则 `indexing` 恒为 false、右下角不刷新。
-#[cfg(target_os = "windows")]
 fn sibling_target_profile_dir(base: &Path) -> Option<PathBuf> {
     let name = base.file_name()?.to_str()?;
     let parent = base.parent()?;
@@ -103,7 +101,6 @@ fn sibling_target_profile_dir(base: &Path) -> Option<PathBuf> {
     None
 }
 
-#[cfg(target_os = "windows")]
 fn resolve_indexing_json_path(
     base: &Path,
     settings: &findx_settings::FindxGuiSettings,
@@ -121,7 +118,6 @@ fn resolve_indexing_json_path(
     primary
 }
 
-#[cfg(target_os = "windows")]
 fn load_indexing_progress_snap(
     base: &Path,
     settings: &findx_settings::FindxGuiSettings,
@@ -167,7 +163,6 @@ static INDEX_BUILD: Mutex<IndexBuildState> = Mutex::new(IndexBuildState {
     pending_auto_start: false,
 });
 
-#[cfg(target_os = "windows")]
 pub(crate) fn mark_pending_auto_index_build(pending: bool) {
     if let Ok(mut g) = INDEX_BUILD.lock() {
         g.pending_auto_start = pending;
@@ -335,7 +330,7 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
         .map(|g| (g.running, g.pending_auto_start))
         .unwrap_or((false, false));
 
-    #[cfg(target_os = "windows")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let settings = findx_settings::load_findx_settings(app.clone())
             .unwrap_or_else(|_| findx_settings::FindxGuiSettings::default());
@@ -493,7 +488,7 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
             },
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         let _ = app;
         IndexStatus {
@@ -509,7 +504,7 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
             indexing_message: None,
             indexing_entries_indexed: None,
             indexing_current_volume: None,
-            last_error: Some("FindX2 GUI 当前需 Windows.".into()),
+            last_error: Some("当前平台不支持索引服务.".into()),
         }
     }
 }
@@ -625,12 +620,12 @@ fn spawn_service_after_index_build<R: Runtime>(
     }
 }
 
-/// 服务需先 `load_index.bin` 再监听管道；大索引可能需数分钟，过短会导致 GUI 误判「管道不存在」。
-#[cfg(target_os = "windows")]
+/// 服务需先加载 index.bin 再监听端点；大索引可能需数分钟。
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const SERVICE_PIPE_WAIT_SECS: u64 = 300;
 
-/// 提权启动 findx2-service 后，管道未必立即可连；轮询直至就绪或超时。
-#[cfg(target_os = "windows")]
+/// 启动 findx2-service 后轮询直至就绪或超时。
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 async fn wait_for_service_pipe(pipe_name: &str, max_secs: u64) -> Result<(), String> {
     let pn = if pipe_name.trim().is_empty() {
         "findx2"
@@ -683,7 +678,88 @@ pub(crate) async fn auto_start_flow<R: Runtime>(app: tauri::AppHandle<R>) -> Res
 }
 
 #[cfg(not(target_os = "windows"))]
-async fn auto_start_flow<R: Runtime>(_app: tauri::AppHandle<R>) -> Result<(), String> {
+pub(crate) async fn auto_start_flow<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), String> {
+    let settings = findx_settings::load_findx_settings(app.clone())?;
+    if !settings.auto_start_service {
+        return Ok(());
+    }
+    ensure_service_running(app).await
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn start_indexing_impl<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    drive_override: Option<String>,
+) -> Result<IndexStatus, String> {
+    {
+        let st = INDEX_BUILD.lock().map_err(|e| e.to_string())?;
+        if st.running {
+            return Err("已有建索引任务在运行".into());
+        }
+    }
+    let settings = findx_settings::load_findx_settings(app.clone())?;
+    let base = findx_settings::exe_resource_dir();
+    let cli = findx_settings::resolve_cli_exe(&base, &settings).ok_or_else(|| {
+        "未找到 findx2 命令行（请与 GUI 放在同一目录）".to_string()
+    })?;
+    let index = findx_settings::resolve_index_path(&base, &settings);
+    let mut cli_args: Vec<String> = vec![
+        "index".into(),
+        "--output".into(),
+        index.to_string_lossy().into_owned(),
+    ];
+    if let Some(d) = drive_override.filter(|s| !s.trim().is_empty()) {
+        cli_args.push("--volume".into());
+        cli_args.push(d.trim().to_string());
+    } else if !settings.drives.is_empty() {
+        cli_args.push("--volumes".into());
+        cli_args.push(settings.drives.join(","));
+    }
+    for d in &settings.excluded_dirs {
+        if d.trim().is_empty() {
+            continue;
+        }
+        cli_args.push("--exclude-dir".into());
+        cli_args.push(d.clone());
+    }
+    if let Ok(mut st) = INDEX_BUILD.lock() {
+        st.running = true;
+    }
+    let app_done = app.clone();
+    std::thread::spawn(move || {
+        let status = std::process::Command::new(&cli)
+            .args(&cli_args)
+            .status();
+        if let Ok(mut st) = INDEX_BUILD.lock() {
+            st.running = false;
+        }
+        if matches!(status, Ok(s) if s.success()) {
+            let _ = findx_settings::spawn_findx_service_process(app_done);
+        }
+    });
+    Ok(fetch_index_status(app).await)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) async fn ensure_service_running<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), String> {
+    let base = findx_settings::exe_resource_dir();
+    let settings = findx_settings::load_findx_settings(app.clone())?;
+    let index = findx_settings::resolve_index_path(&base, &settings);
+    if !index.exists() {
+        start_indexing_impl(app.clone(), None).await?;
+        return Ok(());
+    }
+    let pipe_name = settings.pipe_name.trim();
+    let pipe_name = if pipe_name.is_empty() {
+        "findx2"
+    } else {
+        pipe_name
+    };
+    if pipe::ipc_status_for_pipe_name(pipe_name).await.is_ok() {
+        return Ok(());
+    }
+    findx_settings::spawn_findx_service_process(app)?;
+    wait_for_service_pipe(pipe_name, SERVICE_PIPE_WAIT_SECS).await?;
     Ok(())
 }
 
@@ -772,14 +848,6 @@ async fn start_indexing_impl<R: Runtime>(
     Ok(fetch_index_status(app).await)
 }
 
-#[cfg(not(target_os = "windows"))]
-async fn start_indexing_impl<R: Runtime>(
-    _app: tauri::AppHandle<R>,
-    _drive_override: Option<String>,
-) -> Result<IndexStatus, String> {
-    Err("FindX2 GUI 建索引当前仅支持 Windows.".into())
-}
-
 /// 若尚无 `index.bin` 则先触发首遍建索引（默认全盘），否则直接拉起 findx2-service。
 #[cfg(target_os = "windows")]
 pub(crate) async fn ensure_service_running(app: tauri::AppHandle) -> Result<(), String> {
@@ -804,21 +872,9 @@ pub(crate) async fn ensure_service_running(app: tauri::AppHandle) -> Result<(), 
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
-pub(crate) async fn ensure_service_running(_app: tauri::AppHandle) -> Result<(), String> {
-    Err("FindX2 索引服务仅支持 Windows".into())
-}
-
-#[cfg(target_os = "windows")]
 #[tauri::command]
 async fn start_findx_service(app: tauri::AppHandle) -> Result<(), String> {
     ensure_service_running(app).await
-}
-
-#[cfg(not(target_os = "windows"))]
-#[tauri::command]
-async fn start_findx_service(_app: tauri::AppHandle) -> Result<(), String> {
-    Err("FindX2 索引服务仅支持 Windows".into())
 }
 
 #[tauri::command]
@@ -858,7 +914,7 @@ async fn search_files(
     offset: Option<u32>,
     pinyin: Option<bool>,
 ) -> Result<SearchResponse, String> {
-    #[cfg(target_os = "windows")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let _ = (min_size, max_size, min_created_unix, max_created_unix);
         let settings = findx_settings::load_findx_settings(app.clone())
@@ -893,7 +949,7 @@ async fn search_files(
         })
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         let _ = (
             app,
@@ -907,12 +963,7 @@ async fn search_files(
             offset,
             pinyin,
         );
-        let _ = SearchResponse {
-            hits: vec![],
-            total: 0,
-            elapsed_ms: 0,
-        };
-        Err("FindX2 GUI 搜索当前仅支持 Windows.".to_string())
+        Err("当前平台不支持搜索.".to_string())
     }
 }
 
@@ -1233,57 +1284,121 @@ fn list_drives() -> Result<Vec<DriveInfo>, String> {
 
     #[cfg(not(target_os = "windows"))]
     {
+        unix_list_mounts()
+    }
+}
+
+#[tauri::command]
+fn host_platform() -> String {
+    std::env::consts::OS.to_string()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unix_list_mounts() -> Result<Vec<DriveInfo>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut out = Vec::new();
+        let data = "/System/Volumes/Data";
+        if std::path::Path::new(data).is_dir() {
+            out.push(DriveInfo {
+                letter: data.to_string(),
+                path: format!("{data}/"),
+                filesystem: "apfs".into(),
+                drive_type: "fixed".into(),
+                is_ntfs: false,
+                can_open_volume: true,
+            });
+        }
+        out.push(DriveInfo {
+            letter: "/".into(),
+            path: "/".into(),
+            filesystem: "apfs".into(),
+            drive_type: "fixed".into(),
+            is_ntfs: false,
+            can_open_volume: true,
+        });
+        if let Ok(home) = std::env::var("HOME") {
+            out.push(DriveInfo {
+                letter: home.clone(),
+                path: home,
+                filesystem: "apfs".into(),
+                drive_type: "fixed".into(),
+                is_ntfs: false,
+                can_open_volume: true,
+            });
+        }
+        Ok(out)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut out = Vec::new();
+        if let Ok(text) = std::fs::read_to_string("/proc/self/mounts") {
+            for line in text.lines() {
+                let mut it = line.split_whitespace();
+                let _spec = it.next();
+                let Some(dir) = it.next() else { continue };
+                let Some(fstype) = it.next() else { continue };
+                if matches!(
+                    fstype,
+                    "proc" | "sysfs" | "devtmpfs" | "devpts" | "cgroup" | "cgroup2" | "tmpfs"
+                        | "overlay" | "squashfs"
+                ) {
+                    continue;
+                }
+                if dir == "/proc" || dir == "/sys" || dir == "/dev" || dir == "/run" {
+                    continue;
+                }
+                out.push(DriveInfo {
+                    letter: dir.to_string(),
+                    path: format!("{}/", dir.trim_end_matches('/')),
+                    filesystem: fstype.to_string(),
+                    drive_type: "fixed".into(),
+                    is_ntfs: fstype.eq_ignore_ascii_case("ntfs"),
+                    can_open_volume: true,
+                });
+            }
+        }
+        if out.is_empty() {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+            out.push(DriveInfo {
+                letter: home.clone(),
+                path: home,
+                filesystem: String::new(),
+                drive_type: "fixed".into(),
+                is_ntfs: false,
+                can_open_volume: true,
+            });
+        }
+        Ok(out)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
         Err("磁盘列表当前未实现.".to_string())
     }
 }
 
 #[tauri::command]
 fn open_file(app: tauri::AppHandle, path: String) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        use std::path::PathBuf;
-
-        let target = PathBuf::from(path);
-        if !target.exists() {
-            return Err("File does not exist on disk.".to_string());
-        }
-
-        let target_path = target.to_string_lossy().into_owned();
-        app.opener()
-            .open_path(target_path, None::<&str>)
-            .map_err(|err| format!("Failed to open file: {err}"))?;
-        Ok(())
+    let target = std::path::PathBuf::from(&path);
+    if !target.exists() {
+        return Err("File does not exist on disk.".to_string());
     }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (app, path);
-        Err("File open is only supported on Windows.".to_string())
-    }
+    app.opener()
+        .open_path(path, None::<&str>)
+        .map_err(|err| format!("Failed to open file: {err}"))?;
+    Ok(())
 }
 
 #[tauri::command]
 fn reveal_in_folder(app: tauri::AppHandle, path: String) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        use std::path::PathBuf;
-
-        let target = PathBuf::from(path);
-        if !target.exists() {
-            return Err("File does not exist on disk.".to_string());
-        }
-
-        app.opener()
-            .reveal_item_in_dir(&target)
-            .map_err(|err| format!("Failed to reveal file in folder: {err}"))?;
-        Ok(())
+    let target = std::path::PathBuf::from(&path);
+    if !target.exists() {
+        return Err("File does not exist on disk.".to_string());
     }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (app, path);
-        Err("Folder reveal is only supported on Windows.".to_string())
-    }
+    app.opener()
+        .reveal_item_in_dir(&target)
+        .map_err(|err| format!("Failed to reveal file in folder: {err}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1747,6 +1862,7 @@ pub fn run() {
             delete_path,
             rename_path,
             list_drives,
+            host_platform,
             open_file,
             reveal_in_folder,
             show_hits_context_menu,

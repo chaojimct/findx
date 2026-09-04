@@ -1,0 +1,13 @@
+{
+  "bundle": {
+    "targets": ["app", "dmg"],
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    },
+    "resources": {
+      "bundled/findx2": "bin/findx2",
+      "bundled/fx": "bin/fx",
+      "bundled/findx2-service": "bin/findx2-service"
+    }
+  }
+}

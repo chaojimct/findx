@@ -1405,6 +1405,24 @@ pub fn setup(app: &mut App<tauri::Wry>) -> tauri::Result<()> {
         });
     }
 
+    #[cfg(not(windows))]
+    {
+        if let Ok(settings) = crate::findx_settings::load_findx_settings(app.handle().clone()) {
+            let base = crate::findx_settings::exe_resource_dir();
+            let index = crate::findx_settings::resolve_index_path(&base, &settings);
+            if settings.auto_start_service && !index.exists() {
+                crate::mark_pending_auto_index_build(true);
+            }
+        }
+        let handle = app.handle().clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(err) = crate::auto_start_flow(handle).await {
+                log_desktop_error("auto_start_flow", &err);
+                crate::mark_pending_auto_index_build(false);
+            }
+        });
+    }
+
     Ok(())
 }
 

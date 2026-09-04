@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "版本号（如 2.1.0）"
+        description: "版本号（如 2.1.6）"
         required: true
-        default: "2.1.0"
+        default: "2.1.6"
 
 permissions:
   contents: write
@@ -18,22 +18,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.VERSION }}
+    steps:
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          echo "VERSION=$V" >> "$GITHUB_OUTPUT"
+          echo "version=$V"
+
   build-windows:
+    needs: meta
     runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Resolve version
-        id: ver
-        shell: pwsh
-        run: |
-          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-            $v = "${{ github.event.inputs.version }}"
-          } else {
-            $v = ("${{ github.ref_name }}").TrimStart("v")
-          }
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "VERSION=$v"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -95,7 +101,7 @@ jobs:
         shell: pwsh
         run: |
           choco install innosetup -y
-          $v = "${{ steps.ver.outputs.VERSION }}"
+          $v = "${{ needs.meta.outputs.version }}"
           $ws = $env:GITHUB_WORKSPACE
           $stageScript = Join-Path $ws "installer\stage-inno.ps1"
           & $stageScript -RepoRoot $ws
@@ -133,13 +139,155 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: findx-${{ steps.ver.outputs.VERSION }}-windows
+          name: findx-windows
           path: dist/*
 
+  build-macos:
+    needs: meta
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: gui/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust target cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install frontend dependencies
+        working-directory: gui
+        run: npm ci
+
+      - name: 构建 Tauri（app + dmg，含 CLI/服务 sidecar）
+        working-directory: gui
+        run: npm run tauri build
+
+      - name: Collect artifacts
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          shopt -s nullglob
+          dmg=(target/release/bundle/dmg/*.dmg)
+          if [ ${#dmg[@]} -eq 0 ]; then
+            echo "未找到 dmg，bundle 目录："
+            find target/release/bundle -maxdepth 3 -type f -print || true
+            exit 1
+          fi
+          cp "${dmg[@]}" dist/
+          case "$(uname -m)" in
+            arm64|aarch64) ARCH=aarch64 ;;
+            x86_64) ARCH=x64 ;;
+            *) ARCH="$(uname -m)" ;;
+          esac
+          tar -C target/release -czf "dist/FindX-${VERSION}-macos-${ARCH}-cli.tar.gz" findx2 fx findx2-service
+          ls -la dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: findx-macos
+          path: dist/*
+
+  build-linux:
+    needs: meta
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Linux Tauri 系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            libfuse2t64 \
+            file
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: gui/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust target cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install frontend dependencies
+        working-directory: gui
+        run: npm ci
+
+      - name: 构建 Tauri（deb + AppImage，含 CLI/服务 sidecar）
+        working-directory: gui
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: npm run tauri build
+
+      - name: Collect artifacts
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          shopt -s nullglob
+          found=0
+          for f in target/release/bundle/deb/*.deb target/release/bundle/appimage/*.AppImage; do
+            cp "$f" dist/
+            found=1
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "未找到 deb/AppImage，bundle 目录："
+            find target/release/bundle -maxdepth 4 -type f -print || true
+            exit 1
+          fi
+          tar -C target/release -czf "dist/FindX-${VERSION}-linux-x64-cli.tar.gz" findx2 fx findx2-service
+          ls -la dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: findx-linux
+          path: dist/*
+
+  publish:
+    needs: [meta, build-windows, build-macos, build-linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: findx-*
+          merge-multiple: true
+          path: dist
+
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          name: FindX ${{ steps.ver.outputs.VERSION }}
+          name: FindX ${{ needs.meta.outputs.version }}
           files: dist/*
           generate_release_notes: true

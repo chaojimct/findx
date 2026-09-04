@@ -150,22 +150,6 @@ fn run() -> Result<()> {
             progress_file,
             exclude_dir,
         } => {
-            #[cfg(not(windows))]
-            {
-                let _ = (
-                    volume,
-                    volumes,
-                    output,
-                    full_stat,
-                    max_scan_threads,
-                    progress_file,
-                    exclude_dir,
-                );
-                return Err(findx2_core::Error::Platform(
-                    "`findx2 index` 需要 Windows 与管理员权限".into(),
-                ));
-            }
-
             #[cfg(windows)]
             {
                 findx2_windows::build_full_disk_index(
@@ -177,6 +161,28 @@ fn run() -> Result<()> {
                     volumes,
                     exclude_dir,
                 )?;
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                let _ = (full_stat, max_scan_threads, progress_file);
+                let roots = match (volumes, volume) {
+                    (Some(vs), _) if !vs.is_empty() => vs,
+                    (_, Some(v)) => vec![v],
+                    _ => Vec::new(),
+                };
+                findx2_macos::build_full_disk_index(&output, roots, exclude_dir)?;
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                let _ = (full_stat, max_scan_threads, progress_file);
+                let roots = match (volumes, volume) {
+                    (Some(vs), _) if !vs.is_empty() => vs,
+                    (_, Some(v)) => vec![v],
+                    _ => Vec::new(),
+                };
+                findx2_linux::build_full_disk_index(&output, roots, exclude_dir)?;
             }
         }
         Commands::Search {
@@ -313,8 +319,13 @@ fn run() -> Result<()> {
             println!("目录数: {}", store.dirs.len());
             if let Some(v) = store.volumes.first() {
                 println!(
-                    "卷 {} serial={} journal_id={} last_usn={}",
-                    v.volume_letter as char, v.volume_serial, v.usn_journal_id, v.last_usn
+                    "卷 letter={} id={} prefix={} serial={} journal_id={} last_usn={}",
+                    v.volume_letter as char,
+                    v.volume_id,
+                    v.root_prefix,
+                    v.volume_serial,
+                    v.usn_journal_id,
+                    v.last_usn
                 );
             }
         }

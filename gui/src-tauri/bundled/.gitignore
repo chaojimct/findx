@@ -1,1 +1,2 @@
-# 占位 0 字节 .exe 已纳入版本库；`npm run bundle:win-exes` 在 Windows 上会用 release 构建覆盖
+# 占位 0 字节文件已纳入版本库，满足 tauri resources 路径校验。
+# `npm run bundle:native-bins` 会用本机 release 可执行文件覆盖（Windows 带 .exe，Unix 无后缀）。
