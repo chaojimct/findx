@@ -599,6 +599,19 @@ fn hydrate_cloud_file_best_effort(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 屏幕矩形是否在 `tol` 物理像素内相等（避免亚像素/DPI 取整抖动反复 SetWindowPos）。
+fn rect_almost_eq(a: RECT, b: RECT, tol: i32) -> bool {
+    (a.left - b.left).abs() <= tol
+        && (a.top - b.top).abs() <= tol
+        && (a.right - b.right).abs() <= tol
+        && (a.bottom - b.bottom).abs() <= tol
+}
+
+fn rect_size_almost_eq(a: RECT, b: RECT, tol: i32) -> bool {
+    ((a.right - a.left) - (b.right - b.left)).abs() <= tol
+        && ((a.bottom - a.top) - (b.bottom - b.top)).abs() <= tol
+}
+
 /// 把「webview 客户区像素坐标」转换为「屏幕物理像素坐标」。
 /// owner 是 webview 容器 HWND。
 fn client_to_screen_rect(owner: HWND, x: i32, y: i32, w: i32, h: i32) -> RECT {
@@ -753,6 +766,8 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
             if let Some(st) = g.as_mut() {
                 if st.path == path {
                     let rect = screen_rect;
+                    let pos_unchanged = rect_almost_eq(st.last_screen_rect, rect, 1);
+                    let size_unchanged = rect_size_almost_eq(st.last_screen_rect, rect, 1);
                     st.owner_top_hwnd = top_hwnd;
                     st.owner_webview_hwnd = webview;
                     st.last_client_x = x;
@@ -762,7 +777,7 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
                     st.last_screen_rect = rect;
                     let host = st.host_hwnd;
                     let handler = st.handler.clone();
-                    Some((host, handler, rect))
+                    Some((host, handler, rect, pos_unchanged, size_unchanged))
                 } else {
                     None
                 }
@@ -770,31 +785,35 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
                 None
             }
         };
-        if let Some((host, handler, rect)) = maybe {
+        if let Some((host, handler, rect, pos_unchanged, size_unchanged)) = maybe {
             unsafe {
                 use windows::Win32::UI::WindowsAndMessaging::IsWindow;
                 if IsWindow(Some(host)).as_bool() {
-                    // host 是 system-aware：屏幕坐标按 system/monitor 反向缩放，
-                    // 故传入 SetWindowPos 的 (x,y,w,h) 必须先 ×(system/monitor) 预补偿。
-                    use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
-                    let sys = GetDpiForSystem().max(96);
-                    let mon = GetDpiForWindow(top_hwnd).max(96);
-                    let f = sys as f64 / mon as f64;
-                    let sx = (rect.left as f64 * f).round() as i32;
-                    let sy = (rect.top as f64 * f).round() as i32;
-                    let sw = (((rect.right - rect.left) as f64) * f).round() as i32;
-                    let sh = (((rect.bottom - rect.top) as f64) * f).round() as i32;
-                    let _sys_aware_guard = SystemAwareGuard::enter();
-                    let _ = SetWindowPos(
-                        host, None, sx, sy, sw.max(1), sh.max(1),
-                        SET_WINDOW_POS_FLAGS(SWP_NOZORDER.0 | SWP_NOACTIVATE.0),
-                    );
-                    let inner = host_phys_to_sys_inner(
-                        top_hwnd,
-                        rect.right - rect.left,
-                        rect.bottom - rect.top,
-                    );
-                    let _ = handler.SetRect(&inner);
+                    // 矩形未变就不要再碰 HWND / IPreviewHandler：列表滚动会反复
+                    // 走到这里，无意义的 SetRect 会把 Office/WPS/PDF 子窗口打成白屏。
+                    if !pos_unchanged || !size_unchanged {
+                        use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+                        let sys = GetDpiForSystem().max(96);
+                        let mon = GetDpiForWindow(top_hwnd).max(96);
+                        let f = sys as f64 / mon as f64;
+                        let sx = (rect.left as f64 * f).round() as i32;
+                        let sy = (rect.top as f64 * f).round() as i32;
+                        let sw = (((rect.right - rect.left) as f64) * f).round() as i32;
+                        let sh = (((rect.bottom - rect.top) as f64) * f).round() as i32;
+                        let _sys_aware_guard = SystemAwareGuard::enter();
+                        let _ = SetWindowPos(
+                            host, None, sx, sy, sw.max(1), sh.max(1),
+                            SET_WINDOW_POS_FLAGS(SWP_NOZORDER.0 | SWP_NOACTIVATE.0),
+                        );
+                        if !size_unchanged {
+                            let inner = host_phys_to_sys_inner(
+                                top_hwnd,
+                                rect.right - rect.left,
+                                rect.bottom - rect.top,
+                            );
+                            let _ = handler.SetRect(&inner);
+                        }
+                    }
                     let _ = ShowWindow(host, SW_SHOW);
                 }
             }
@@ -995,6 +1014,9 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
 /// 仅同步当前承载窗口的位置/大小（拖动分隔条 / resize 时高频调用，开销极小）。
 /// `css_*` = 前端 `getBoundingClientRect`（CSS 逻辑像素），`dpr` = `window.devicePixelRatio`。
 /// 坐标基准 = Tauri 顶级窗口客户区。
+///
+/// 矩形未变时直接返回：列表滚动会经 capture 阶段的 scroll 事件打到这里，
+/// 对 IPreviewHandler 反复 `SetRect` 会把 prevhost 子窗口打成白屏。
 pub fn set_bounds(top_hwnd: HWND, css_x: f64, css_y: f64, css_w: f64, css_h: f64, dpr: f64) -> Result<(), String> {
     let scale = if dpr.is_finite() && dpr > 0.0 { dpr } else { 1.0 };
     let x = (css_x * scale).round() as i32;
@@ -1007,6 +1029,11 @@ pub fn set_bounds(top_hwnd: HWND, css_x: f64, css_y: f64, css_w: f64, css_h: f64
     let host_handler = {
         let mut g = PREVIEW_STATE.lock().map_err(|e| e.to_string())?;
         if let Some(st) = g.as_mut() {
+            let pos_unchanged = rect_almost_eq(st.last_screen_rect, r, 1);
+            let size_unchanged = rect_size_almost_eq(st.last_screen_rect, r, 1);
+            if pos_unchanged && size_unchanged {
+                return Ok(());
+            }
             st.owner_top_hwnd = top_hwnd;
             st.owner_webview_hwnd = webview;
             st.last_client_x = x;
@@ -1014,12 +1041,12 @@ pub fn set_bounds(top_hwnd: HWND, css_x: f64, css_y: f64, css_w: f64, css_h: f64
             st.last_client_w = w;
             st.last_client_h = h;
             st.last_screen_rect = r;
-            Some((st.host_hwnd, st.handler.clone()))
+            Some((st.host_hwnd, st.handler.clone(), !size_unchanged))
         } else {
             None
         }
     };
-    if let Some((host, handler)) = host_handler {
+    if let Some((host, handler, size_changed)) = host_handler {
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::IsWindow;
             if IsWindow(Some(host)).as_bool() {
@@ -1037,7 +1064,10 @@ pub fn set_bounds(top_hwnd: HWND, css_x: f64, css_y: f64, css_w: f64, css_h: f64
                     host, None, sx, sy, sw.max(1), sh.max(1),
                     SET_WINDOW_POS_FLAGS(SWP_NOZORDER.0 | SWP_NOACTIVATE.0),
                 );
-                let _ = handler.SetRect(&inner);
+                // 尺寸没变只挪位置：不要 SetRect，部分处理器会因此卸载子窗口。
+                if size_changed {
+                    let _ = handler.SetRect(&inner);
+                }
             }
         }
     }
@@ -1063,4 +1093,27 @@ pub fn unload_preview() -> Result<(), String> {
     let mut g = PREVIEW_STATE.lock().map_err(|e| e.to_string())?;
     *g = None;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r(l: i32, t: i32, w: i32, h: i32) -> RECT {
+        RECT { left: l, top: t, right: l + w, bottom: t + h }
+    }
+
+    #[test]
+    fn rect_almost_eq_tolerates_one_pixel() {
+        assert!(rect_almost_eq(r(10, 20, 100, 200), r(10, 20, 100, 200), 1));
+        assert!(rect_almost_eq(r(10, 20, 100, 200), r(11, 20, 99, 200), 1));
+        assert!(!rect_almost_eq(r(10, 20, 100, 200), r(13, 20, 100, 200), 1));
+    }
+
+    #[test]
+    fn rect_size_almost_eq_ignores_origin() {
+        assert!(rect_size_almost_eq(r(0, 0, 320, 480), r(80, 40, 320, 480), 1));
+        assert!(rect_size_almost_eq(r(0, 0, 320, 480), r(0, 0, 321, 479), 1));
+        assert!(!rect_size_almost_eq(r(0, 0, 320, 480), r(0, 0, 320, 500), 1));
+    }
 }

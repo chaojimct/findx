@@ -16,7 +16,8 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
  *
  * 关键坑：原生子窗口会**盖在 WebView 之上**，所以：
  * - 关闭面板 / 路径变成不可预览类型 → 必须 invoke preview_hide({unload: true})；
- * - 滚动外层容器、resize 主窗口、拖动分隔条 → 必须重新算矩形并 invoke preview_set_bounds。
+ * - 祖先容器滚动、resize 主窗口、拖动分隔条 → 必须重新算矩形并 invoke preview_set_bounds。
+ * - 列表等**兄弟**容器滚动不要同步：预览面板坐标没变，反复 SetRect 会把 prevhost 打成白屏。
  */
 
 const TEXT_EXTS = new Set([
@@ -73,6 +74,26 @@ function formatPreviewTimestamp(unixSec: number | null | undefined): string {
     duration /= amount;
   }
   return cal;
+}
+
+type CssBounds = { x: number; y: number; w: number; h: number; dpr: number };
+
+function boundsUnchanged(a: CssBounds, b: CssBounds): boolean {
+  return (
+    Math.abs(a.x - b.x) < 1 &&
+    Math.abs(a.y - b.y) < 1 &&
+    Math.abs(a.w - b.w) < 1 &&
+    Math.abs(a.h - b.h) < 1 &&
+    Math.abs(a.dpr - b.dpr) < 0.01
+  );
+}
+
+/** 滚动事件的 target 是否会带动预览挂载点位移（祖先滚动）。列表等兄弟容器返回 false。 */
+function scrollMovesPreview(target: EventTarget | null, mount: HTMLElement): boolean {
+  if (target === document || target === document.documentElement || target === document.body) {
+    return true;
+  }
+  return target instanceof Node && target.contains(mount);
 }
 
 /** 在会长时间阻塞主线程的 invoke 之前让出两帧，确保「加载中 / 云同步」遮罩先被绘制。 */
@@ -162,6 +183,8 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
 
   /** 拖动分隔条时 `preview_set_bounds` 极高频；合并到下一帧，减少与 prevhost 的交错重入导致的花屏/白块。 */
   const boundsRafRef = useRef<number | null>(null);
+  /** 上次已下发的挂载矩形；列表滚动时 getBoundingClientRect 亚像素抖动也不要重复 invoke。 */
+  const lastBoundsRef = useRef<CssBounds | null>(null);
 
   // -------- 原生预览：把 nativeMountRef 的矩形发给 Rust（CSS 逻辑像素，与 getBoundingClientRect 一致）--------
   // 物理像素与 DPI 换算在 Rust 侧用 `GetDpiForWindow(实际 WebView HWND)` 完成，避免与扩展屏/混用 DPI 下的
@@ -171,14 +194,19 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
     if (!el) return;
     const r = el.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return;
+    const dpr = window.devicePixelRatio || 1;
+    const next = { x: r.left, y: r.top, w: r.width, h: r.height, dpr };
+    const prev = lastBoundsRef.current;
+    if (prev && boundsUnchanged(prev, next)) return;
+    lastBoundsRef.current = next;
     // dpr 是 webview 实际使用的 device-pixel-ratio——这是 CSS→物理像素 唯一权威值。
     // 由前端报告而不是 Rust 用 GetDpiForWindow 猜，避免跨屏 / 启动瞬间监视器 DPI 与 webview dpr 不一致。
     void invoke("preview_set_bounds", {
-      x: r.left,
-      y: r.top,
-      w: r.width,
-      h: r.height,
-      dpr: window.devicePixelRatio || 1,
+      x: next.x,
+      y: next.y,
+      w: next.w,
+      h: next.h,
+      dpr: next.dpr,
     }).catch(() => {});
   }, []);
 
@@ -194,6 +222,7 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
   // useLayoutEffect 保证 DOM commit 之后、浏览器绘制之前跑：mount div 一定已经 attach，ref 就绪。
   useLayoutEffect(() => {
     let alive = true;
+    lastBoundsRef.current = null;
     setErrMsg(null);
     setImgUrl(null);
     setTextBody(null);
@@ -264,6 +293,13 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
           h: Math.max(1, r.height),
           dpr: window.devicePixelRatio || 1,
         };
+        lastBoundsRef.current = {
+          x: args.x,
+          y: args.y,
+          w: args.w,
+          h: args.h,
+          dpr: args.dpr,
+        };
         await doubleRaf();
         if (!alive) return;
         try {
@@ -297,8 +333,13 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
     const ro = new ResizeObserver(() => schedulePushBounds());
     ro.observe(el);
     const onResize = () => schedulePushBounds();
+    const onScroll = (e: Event) => {
+      // 列表滚动条是预览面板的兄弟，坐标不变；再去 SetRect 会把系统预览打成白屏。
+      if (!scrollMovesPreview(e.target, el)) return;
+      schedulePushBounds();
+    };
     window.addEventListener("resize", onResize);
-    window.addEventListener("scroll", onResize, true);
+    window.addEventListener("scroll", onScroll, true);
 
     const win = getCurrentWindow();
     let unlistenMoved: (() => void) | null = null;
@@ -312,7 +353,7 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
       boundsRafRef.current = null;
       ro.disconnect();
       window.removeEventListener("resize", onResize);
-      window.removeEventListener("scroll", onResize, true);
+      window.removeEventListener("scroll", onScroll, true);
       unlistenMoved?.();
       unlistenResized?.();
     };

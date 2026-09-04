@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **预览面板滚动后空白**：已打开系统预览时拖动结果列表滚动条，会把未变化的矩形反复交给 `IPreviewHandler::SetRect`，Office / WPS / PDF 等处理器的子窗口会被打成白屏。列表现在视为兄弟滚动并忽略；矩形未变不再 `SetWindowPos` / `SetRect`。
+
 ## [2.2.0] - 2026-09-04
 
 ### 功能
