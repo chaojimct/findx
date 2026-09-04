@@ -6,6 +6,10 @@
 
 ## [2.2.2] - 2026-09-04
 
+### 构建
+
+- **macOS 发版编译失败**：`load_findx_settings` 里 `serde_json::from_str` 在非 Windows 上推不出类型（`error[E0282]`）。补上 `FindxGuiSettings` 标注。
+
 ### 功能
 
 - **跨平台 / 兜底文档预览**：Windows 仍优先走系统 `IPreviewHandler`；没有预览器、或 macOS / Linux 上的 PDF / Word / Excel / PPTX / OFD，改用内置 `@file-viewer`。老格式 `.ppt` 不走内置引擎，避免水印。图片预览不再限制为仅 Windows。

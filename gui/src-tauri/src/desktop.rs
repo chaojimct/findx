@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    ffi::c_void,
     io::ErrorKind,
-    mem::size_of,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -21,6 +19,8 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_window_state::{
     AppHandleExt as WindowStateAppHandleExt, StateFlags, WindowExt as WindowStateWindowExt,
 };
+#[cfg(windows)]
+use std::{ffi::c_void, mem::size_of};
 #[cfg(windows)]
 use windows::Win32::{
     Foundation::COLORREF,

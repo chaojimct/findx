@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::webview::PageLoadEvent;
+#[cfg(windows)]
 use tauri::Manager;
 use tauri::Runtime;
 use tauri_plugin_opener::OpenerExt;
