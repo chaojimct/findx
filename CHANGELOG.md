@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-09-04
+
 ### 功能
 
 - **跨平台索引骨架**：`index.bin` 升级为 v6（卷身份 + 根路径前缀，兼容只读加载 v5）。macOS 用 getattrlistbulk + FSEvents，Linux 用目录遍历 + fanotify/inotify；服务在 Unix 上走域套接字，GUI 设置改为挂载点与「增量监听」文案。Windows MFT/USN 行为不变。
@@ -84,7 +86,8 @@
 
 - 仓库根目录补充 **MIT** 全文许可（`LICENSE`），与 `Cargo.toml` 工作区 `MIT OR Apache-2.0` 声明在 README 中说明对应关系。
 
-[Unreleased]: https://github.com/chaojimct/findx/compare/v2.1.6...HEAD
+[Unreleased]: https://github.com/chaojimct/findx/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/chaojimct/findx/compare/v2.1.6...v2.2.0
 [2.1.6]: https://github.com/chaojimct/findx/compare/v2.1.5...v2.1.6
 [2.1.5]: https://github.com/chaojimct/findx/compare/v2.1.4...v2.1.5
 [2.1.4]: https://github.com/chaojimct/findx/compare/v2.1.3...v2.1.4

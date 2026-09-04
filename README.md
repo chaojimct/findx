@@ -19,7 +19,7 @@
 
 **CI**：push / PR 走 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，在 Windows / macOS / Linux 上跑工作区测试并编译 GUI。
 
-**自动发版**：对 `v*` 标签（例如 `v2.1.6`）推送会触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，三端并行打包后汇总到 [Release](https://github.com/chaojimct/findx/releases)：
+**自动发版**：对 `v*` 标签（例如 `v2.2.0`）推送会触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，三端并行打包后汇总到 [Release](https://github.com/chaojimct/findx/releases)：
 
 - **Windows**：`tauri build --no-bundle` + Inno Setup → `FindX-<ver>-setup.exe`
 - **macOS**：Tauri `app` + `dmg`（当前 runner 为 Apple Silicon），另附 CLI/服务 tarball
@@ -237,7 +237,7 @@ trigram 剪枝有两个边车：`<index>.tri`（倒排表，构建/重建时原�
 ## 版本号（GUI / 安装包）
 
 - Tauri 与 GUI 以 **`gui/src-tauri/tauri.conf.json`** 与 **`gui/src-tauri/Cargo.toml`** 的 `version` 为准。  
-- **Inno** 安装包版本在 CI 中由 **`/DMyAppVersion=`** 传入 [`installer/FindX.iss`](installer/FindX.iss)（与 tag 如 `v2.1.6` 的纯数字部分一致即可）；`iss` 内 `#define MyAppVersion` 为本地无参数编译时的默认。macOS / Linux 包版本直接取 Tauri `version`。
+- **Inno** 安装包版本在 CI 中由 **`/DMyAppVersion=`** 传入 [`installer/FindX.iss`](installer/FindX.iss)（与 tag 如 `v2.2.0` 的纯数字部分一致即可）；`iss` 内 `#define MyAppVersion` 为本地无参数编译时的默认。macOS / Linux 包版本直接取 Tauri `version`。
 
 变更记录见仓库根目录 [`CHANGELOG.md`](CHANGELOG.md)。
 

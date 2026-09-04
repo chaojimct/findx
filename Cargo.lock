@@ -1262,7 +1262,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-gui"
-version = "2.1.6"
+version = "2.2.0"
 dependencies = [
  "arboard",
  "base64 0.22.1",
