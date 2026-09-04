@@ -10,10 +10,16 @@ use findx2_core::index::unix_secs_to_filetime;
 use findx2_core::{progress, RawEntry, Result, VolumeScanner, WatchCursor};
 use libc::{
     attrlist, getattrlistbulk, open, timespec, ATTR_BIT_MAP_COUNT, ATTR_CMN_CRTIME,
-    ATTR_CMN_ERROR, ATTR_CMN_FILEID, ATTR_CMN_MODTIME, ATTR_CMN_NAME, ATTR_CMN_OBJTYPE,
-    ATTR_CMN_PARENTID, ATTR_CMN_RETURNED_ATTRS, ATTR_FILE_DATALENGTH, O_DIRECTORY, O_RDONLY,
-    VDIR, VLNK, VREG,
+    ATTR_CMN_FILEID, ATTR_CMN_MODTIME, ATTR_CMN_NAME, ATTR_CMN_OBJTYPE, ATTR_CMN_PARENTID,
+    ATTR_CMN_RETURNED_ATTRS, ATTR_FILE_DATALENGTH, O_DIRECTORY, O_RDONLY,
 };
+
+/// `sys/attr.h`：libc 未导出 `ATTR_CMN_ERROR`。
+const ATTR_CMN_ERROR: u32 = 0x2000_0000;
+/// `sys/vnode.h`：`fsobj_type_t` / vnode 类型，libc 未导出。
+const VREG: u32 = 1;
+const VDIR: u32 = 2;
+const VLNK: u32 = 5;
 
 const SKIP_NAMES: &[&str] = &[
     ".",
@@ -119,7 +125,7 @@ fn scan_dirfd(dirfd: i32, out: &mut dyn FnMut(RawEntry) -> Result<()>, n: &mut u
         let count = unsafe {
             getattrlistbulk(
                 dirfd,
-                &mut attrs,
+                &mut attrs as *mut attrlist as *mut libc::c_void,
                 buf.as_mut_ptr() as *mut libc::c_void,
                 buf.len(),
                 0,
@@ -190,7 +196,7 @@ fn parse_record(rec: &[u8]) -> Option<(RawEntry, bool, bool)> {
     p = align4(p);
 
     let mut name = String::new();
-    let mut objtype: u32 = VREG as u32;
+    let mut objtype: u32 = VREG;
     let mut cr: timespec = unsafe { std::mem::zeroed() };
     let mut md: timespec = unsafe { std::mem::zeroed() };
     let mut file_id = 0u64;
@@ -281,8 +287,8 @@ fn parse_record(rec: &[u8]) -> Option<(RawEntry, bool, bool)> {
         size = i64::from_ne_bytes(rec[p..p + 8].try_into().ok()?).max(0) as u64;
     }
 
-    let is_dir = objtype == VDIR as u32;
-    let is_link = objtype == VLNK as u32;
+    let is_dir = objtype == VDIR;
+    let is_link = objtype == VLNK;
     if name.is_empty() {
         return None;
     }

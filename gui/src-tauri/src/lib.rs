@@ -77,7 +77,6 @@ struct IndexStatus {
     last_error: Option<String>,
 }
 
-#[cfg(target_os = "windows")]
 #[derive(Clone, Default)]
 struct IndexingProgressSnap {
     phase: Option<String>,
@@ -90,7 +89,6 @@ struct IndexingProgressSnap {
 
 /// `cargo build` 常见同时存在 `target/debug` 与 `target/release`；若 GUI 与 CLI 不在同一 profile，
 /// 进度文件可能写在「另一套」目录，需互为回退，否则 `indexing` 恒为 false、右下角不刷新。
-#[cfg(target_os = "windows")]
 fn sibling_target_profile_dir(base: &Path) -> Option<PathBuf> {
     let name = base.file_name()?.to_str()?;
     let parent = base.parent()?;
@@ -103,7 +101,6 @@ fn sibling_target_profile_dir(base: &Path) -> Option<PathBuf> {
     None
 }
 
-#[cfg(target_os = "windows")]
 fn resolve_indexing_json_path(
     base: &Path,
     settings: &findx_settings::FindxGuiSettings,
@@ -121,7 +118,6 @@ fn resolve_indexing_json_path(
     primary
 }
 
-#[cfg(target_os = "windows")]
 fn load_indexing_progress_snap(
     base: &Path,
     settings: &findx_settings::FindxGuiSettings,
@@ -167,7 +163,6 @@ static INDEX_BUILD: Mutex<IndexBuildState> = Mutex::new(IndexBuildState {
     pending_auto_start: false,
 });
 
-#[cfg(target_os = "windows")]
 pub(crate) fn mark_pending_auto_index_build(pending: bool) {
     if let Ok(mut g) = INDEX_BUILD.lock() {
         g.pending_auto_start = pending;
@@ -683,7 +678,7 @@ pub(crate) async fn auto_start_flow<R: Runtime>(app: tauri::AppHandle<R>) -> Res
 }
 
 #[cfg(not(target_os = "windows"))]
-async fn auto_start_flow<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), String> {
+pub(crate) async fn auto_start_flow<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), String> {
     let settings = findx_settings::load_findx_settings(app.clone())?;
     if !settings.auto_start_service {
         return Ok(());
@@ -746,7 +741,7 @@ async fn start_indexing_impl<R: Runtime>(
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) async fn ensure_service_running(app: tauri::AppHandle) -> Result<(), String> {
+pub(crate) async fn ensure_service_running<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), String> {
     let base = findx_settings::exe_resource_dir();
     let settings = findx_settings::load_findx_settings(app.clone())?;
     let index = findx_settings::resolve_index_path(&base, &settings);

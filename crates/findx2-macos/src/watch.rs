@@ -311,7 +311,7 @@ fn lstat_ino(path: &str) -> Option<(u64, u64, String, u64, u64, u64, bool)> {
     if unsafe { lstat(c.as_ptr(), &mut st) } != 0 {
         return None;
     }
-    let mode = st.st_mode as u32;
+    let mode = st.st_mode;
     let is_dir = (mode & S_IFMT) == S_IFDIR;
     if !is_dir && (mode & S_IFMT) != S_IFREG {
         // 仍索引 symlink 为条目但不跟随
@@ -326,8 +326,8 @@ fn lstat_ino(path: &str) -> Option<(u64, u64, String, u64, u64, u64, bool)> {
         parent,
         name,
         st.st_size as u64,
-        unix_secs_to_filetime(st.st_mtimespec.tv_sec.max(0) as u32),
-        unix_secs_to_filetime(st.st_ctimespec.tv_sec.max(0) as u32),
+        unix_secs_to_filetime(st.st_mtime.max(0) as u32),
+        unix_secs_to_filetime(st.st_ctime.max(0) as u32),
         is_dir,
     ))
 }
