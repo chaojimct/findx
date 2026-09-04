@@ -163,6 +163,18 @@ static INDEX_BUILD: Mutex<IndexBuildState> = Mutex::new(IndexBuildState {
     pending_auto_start: false,
 });
 
+static LAST_INDEX_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+pub(crate) fn set_last_index_error(msg: Option<String>) {
+    if let Ok(mut g) = LAST_INDEX_ERROR.lock() {
+        *g = msg;
+    }
+}
+
+fn take_last_index_error() -> Option<String> {
+    LAST_INDEX_ERROR.lock().ok().and_then(|g| g.clone())
+}
+
 pub(crate) fn mark_pending_auto_index_build(pending: bool) {
     if let Ok(mut g) = INDEX_BUILD.lock() {
         g.pending_auto_start = pending;
@@ -345,6 +357,23 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
         // 残留 json 的真假留给下面 service Status 兜底判定（healthy 即覆盖）。
         let build_active = local_indexing || pending_auto_start;
         if !index_path.exists() && !indexing_json_active {
+            if build_active {
+                return IndexStatus {
+                    indexing: true,
+                    ready: false,
+                    indexed_count: 0,
+                    metadata_ready: true,
+                    backfill_done: 0,
+                    backfill_total: 0,
+                    indexing_phase: Some("scan".into()),
+                    indexing_volumes_total: None,
+                    indexing_volumes_done: None,
+                    indexing_message: Some(format!("正在创建索引 {}", index_path.display())),
+                    indexing_entries_indexed: None,
+                    indexing_current_volume: None,
+                    last_error: None,
+                };
+            }
             return IndexStatus {
                 indexing: false,
                 ready: false,
@@ -358,10 +387,12 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
                 indexing_message: None,
                 indexing_entries_indexed: None,
                 indexing_current_volume: None,
-                last_error: Some(format!(
-                    "尚无索引 {}（首次启动会自动建索引；若以管理员启动仍失败请检查终端日志）",
-                    index_path.display()
-                )),
+                last_error: Some(take_last_index_error().unwrap_or_else(|| {
+                    format!(
+                        "尚无索引 {}（首次启动会自动建索引）",
+                        index_path.display()
+                    )
+                })),
             };
         }
 
@@ -640,8 +671,18 @@ async fn wait_for_service_pipe(pipe_name: &str, max_secs: u64) -> Result<(), Str
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     Err(format!(
-        "等待 findx2-service 就绪超时（{} 秒内命名管道仍未建立）。大索引加载较慢时请多等一会或重试「启动服务」。若进程已崩溃，请查看 %TEMP%\\findx2-service-last-error.txt 。",
-        max_secs
+        "等待 findx2-service 就绪超时（{} 秒内仍未建立 IPC）。大索引加载较慢时请多等一会或重试「启动服务」。{}",
+        max_secs,
+        {
+            #[cfg(windows)]
+            {
+                r"若进程已崩溃，请查看 %TEMP%\findx2-service-last-error.txt"
+            }
+            #[cfg(not(windows))]
+            {
+                "若进程已崩溃，请查看 ~/Library/Application Support/FindX/findx2-service.log 或系统临时目录下 findx2-service-last-error.txt"
+            }
+        }
     ))
 }
 
@@ -700,15 +741,21 @@ async fn start_indexing_impl<R: Runtime>(
     let settings = findx_settings::load_findx_settings(app.clone())?;
     let base = findx_settings::exe_resource_dir();
     let cli = findx_settings::resolve_cli_exe(&base, &settings).ok_or_else(|| {
-        "未找到 findx2 命令行（请与 GUI 放在同一目录）".to_string()
+        "未找到 findx2 命令行（安装包应在 Contents/Resources/bin 提供 sidecar）".to_string()
     })?;
     let index = findx_settings::resolve_index_path(&base, &settings);
+    if let Some(parent) = index.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!("无法创建索引目录 {}: {e}", parent.display())
+        })?;
+    }
+    let progress_path = index.with_extension("indexing.json");
     let mut cli_args: Vec<String> = vec![
         "index".into(),
         "--output".into(),
         index.to_string_lossy().into_owned(),
     ];
-    if let Some(d) = drive_override.filter(|s| !s.trim().is_empty()) {
+    if let Some(d) = drive_override.filter(|s| !s.trim().is_empty() && s.trim() != "C:") {
         cli_args.push("--volume".into());
         cli_args.push(d.trim().to_string());
     } else if !settings.drives.is_empty() {
@@ -722,19 +769,44 @@ async fn start_indexing_impl<R: Runtime>(
         cli_args.push("--exclude-dir".into());
         cli_args.push(d.clone());
     }
+    cli_args.push("--progress-file".into());
+    cli_args.push(progress_path.to_string_lossy().into_owned());
     if let Ok(mut st) = INDEX_BUILD.lock() {
+        st.pending_auto_start = false;
         st.running = true;
     }
+    set_last_index_error(None);
     let app_done = app.clone();
+    let work_dir = index
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let log_path = work_dir.join("findx2-index.log");
     std::thread::spawn(move || {
-        let status = std::process::Command::new(&cli)
-            .args(&cli_args)
-            .status();
+        let mut cmd = std::process::Command::new(&cli);
+        cmd.args(&cli_args).current_dir(&work_dir);
+        findx_settings::unix_configure_detached_child(&mut cmd, Some(&log_path));
+        let status = cmd.status();
         if let Ok(mut st) = INDEX_BUILD.lock() {
             st.running = false;
         }
-        if matches!(status, Ok(s) if s.success()) {
-            let _ = findx_settings::spawn_findx_service_process(app_done);
+        match status {
+            Ok(s) if s.success() => {
+                set_last_index_error(None);
+                if let Err(e) = findx_settings::spawn_findx_service_process(app_done) {
+                    set_last_index_error(Some(e));
+                }
+            }
+            Ok(s) => {
+                set_last_index_error(Some(format!(
+                    "建索引失败（退出码 {:?}），详见 {}",
+                    s.code(),
+                    log_path.display()
+                )));
+            }
+            Err(e) => {
+                set_last_index_error(Some(format!("无法启动 findx2: {e}")));
+            }
         }
     });
     Ok(fetch_index_status(app).await)
@@ -1643,6 +1715,27 @@ async fn preview_set_bounds(
 }
 
 #[tauri::command]
+async fn preview_raise(window: tauri::WebviewWindow) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        window
+            .run_on_main_thread(move || {
+                let _ = tx.send(win_preview::raise_preview());
+            })
+            .map_err(|e| format!("调度主线程失败: {e}"))?;
+        rx.await
+            .map_err(|_| "主线程结果通道已断开".to_string())
+            .and_then(|inner| inner)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        Ok(())
+    }
+}
+
+#[tauri::command]
 async fn preview_hide(window: tauri::WebviewWindow, unload: Option<bool>) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -1734,69 +1827,60 @@ fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
 
 #[tauri::command]
 fn load_preview_data_url(path: String) -> Result<String, String> {
-    #[cfg(target_os = "windows")]
-    {
-        use std::fs;
-        use std::path::PathBuf;
+    use std::fs;
+    use std::path::PathBuf;
 
-        let file_path = PathBuf::from(path);
-        if !file_path.exists() {
-            return Err("Preview target does not exist.".to_string());
-        }
-        if !file_path.is_file() {
-            return Err("Preview target is not a file.".to_string());
-        }
-
-        let extension = file_path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-
-        let mime = match extension.as_str() {
-            "png" => "image/png",
-            "jpg" | "jpeg" => "image/jpeg",
-            "gif" => "image/gif",
-            "webp" => "image/webp",
-            "bmp" => "image/bmp",
-            "ico" => "image/x-icon",
-            "pdf" => "application/pdf",
-            "mp4" => "video/mp4",
-            "webm" => "video/webm",
-            "mov" => "video/quicktime",
-            "m4v" => "video/x-m4v",
-            "avi" => "video/x-msvideo",
-            "mkv" => "video/x-matroska",
-            "wmv" => "video/x-ms-wmv",
-            _ => return Err("Preview not supported for this file type.".to_string()),
-        };
-
-        let metadata = fs::metadata(&file_path)
-            .map_err(|err| format!("Preview metadata read failed: {err}"))?;
-        let max_preview_bytes = match mime {
-            "application/pdf" => 8 * 1024 * 1024_u64,
-            "video/mp4" | "video/webm" | "video/quicktime" | "video/x-m4v" | "video/x-msvideo"
-            | "video/x-matroska" | "video/x-ms-wmv" => 20 * 1024 * 1024_u64,
-            _ => 12 * 1024 * 1024_u64,
-        };
-
-        if metadata.len() > max_preview_bytes {
-            return Err(format!(
-                "Preview skipped: file too large ({} bytes).",
-                metadata.len()
-            ));
-        }
-
-        let bytes = fs::read(&file_path).map_err(|err| format!("Preview read failed: {err}"))?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-        Ok(format!("data:{mime};base64,{encoded}"))
+    let file_path = PathBuf::from(path);
+    if !file_path.exists() {
+        return Err("预览目标不存在。".to_string());
+    }
+    if !file_path.is_file() {
+        return Err("预览目标不是文件。".to_string());
     }
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = path;
-        Err("Preview loading is only supported on Windows.".to_string())
+    let extension = file_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let mime = match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "pdf" => "application/pdf",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "m4v" => "video/x-m4v",
+        "avi" => "video/x-msvideo",
+        "mkv" => "video/x-matroska",
+        "wmv" => "video/x-ms-wmv",
+        _ => return Err("此文件类型不支持图片预览。".to_string()),
+    };
+
+    let metadata =
+        fs::metadata(&file_path).map_err(|err| format!("读取预览元数据失败: {err}"))?;
+    let max_preview_bytes = match mime {
+        "application/pdf" => 8 * 1024 * 1024_u64,
+        "video/mp4" | "video/webm" | "video/quicktime" | "video/x-m4v" | "video/x-msvideo"
+        | "video/x-matroska" | "video/x-ms-wmv" => 20 * 1024 * 1024_u64,
+        _ => 12 * 1024 * 1024_u64,
+    };
+
+    if metadata.len() > max_preview_bytes {
+        return Err(format!(
+            "文件过大，已跳过内嵌预览（{} 字节）。",
+            metadata.len()
+        ));
     }
+
+    let bytes = fs::read(&file_path).map_err(|err| format!("读取预览失败: {err}"))?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:{mime};base64,{encoded}"))
 }
 
 /// 检测本机是否存在 FindX v1 的遗留痕迹，用于决定是否展示 v2 升级说明弹窗。
@@ -1876,6 +1960,7 @@ pub fn run() {
             preview_fallback_file_info,
             preview_show,
             preview_set_bounds,
+            preview_raise,
             preview_hide,
             findx_settings::load_findx_settings,
             findx_settings::save_findx_settings,
@@ -1905,6 +1990,14 @@ pub fn run() {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             {
                 desktop::handle_window_event(window, event);
+            }
+            #[cfg(windows)]
+            {
+                if matches!(event, tauri::WindowEvent::Moved(_)) {
+                    if let Ok(hwnd) = window.hwnd() {
+                        let _ = win_preview::follow_owner(hwnd);
+                    }
+                }
             }
         })
         .run(tauri::generate_context!())

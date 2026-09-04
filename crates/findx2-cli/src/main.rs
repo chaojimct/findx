@@ -167,8 +167,20 @@ fn run() -> Result<()> {
             {
                 let _ = (full_stat, max_scan_threads, progress_file);
                 let roots = match (volumes, volume) {
-                    (Some(vs), _) if !vs.is_empty() => vs,
-                    (_, Some(v)) => vec![v],
+                    (Some(vs), _) if !vs.is_empty() => vs
+                        .into_iter()
+                        .filter(|s| {
+                            let t = s.trim();
+                            !t.is_empty() && !t.eq_ignore_ascii_case("C:") && t != r"C:\"
+                        })
+                        .collect(),
+                    (_, Some(v))
+                        if !v.trim().is_empty()
+                            && !v.eq_ignore_ascii_case("C:")
+                            && v != r"C:\" =>
+                    {
+                        vec![v]
+                    }
                     _ => Vec::new(),
                 };
                 findx2_macos::build_full_disk_index(&output, roots, exclude_dir)?;

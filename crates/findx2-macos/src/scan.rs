@@ -67,14 +67,30 @@ impl VolumeScanner for MacosVolumeScanner {
         volume: &str,
         out: &mut dyn FnMut(RawEntry) -> Result<()>,
     ) -> Result<WatchCursor> {
-        let root = if volume.is_empty() {
+        let root = if volume.is_empty() || volume.eq_ignore_ascii_case("C:") || volume.eq_ignore_ascii_case(r"C:\") {
             default_scan_root()
         } else {
             volume.to_string()
         };
         progress!("macOS 扫描：打开 {} …", root);
         let mut n = 0u64;
-        scan_tree(Path::new(&root), out, &mut n)?;
+        if let Err(e) = scan_tree(Path::new(&root), out, &mut n) {
+            let home = std::env::var("HOME").unwrap_or_default();
+            if !home.is_empty() && root != home {
+                progress!("无法打开 {}（{}），改扫 {}", root, e, home);
+                n = 0;
+                scan_tree(Path::new(&home), out, &mut n)?;
+            } else {
+                return Err(e);
+            }
+        }
+        if n == 0 {
+            let home = std::env::var("HOME").unwrap_or_default();
+            if !home.is_empty() && root != home {
+                progress!("扫描 {} 得到 0 条，改扫 {}", root, home);
+                scan_tree(Path::new(&home), out, &mut n)?;
+            }
+        }
         progress!("macOS 扫描完成：{} 条", n);
         Ok(WatchCursor {
             watch_gen: 1,

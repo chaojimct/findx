@@ -36,8 +36,10 @@
 ## macOS / Linux 打包
 
 - 本机：`cd gui` → `npm ci` → `npm run tauri build`。macOS 产出 dmg，Linux 产出 deb 与 AppImage（需 webkit2gtk 4.1 / gtk3 等系统依赖）。
-- CI 打出的包**未做 Apple 公证 / 代码签名**；macOS 首次打开可能需要在「隐私与安全性」里允许。
-- sidecar（`findx2` / `fx` / `findx2-service`）随 GUI 打进 `bin/`，与 Windows 安装布局一致。
+- CI 打出的 macOS 包为 **Apple Silicon**，**未做 Apple 公证 / 代码签名**。首次打开请右键「打开」，或到「隐私与安全性」里允许。
+- sidecar（`findx2` / `fx` / `findx2-service`）打进 `Contents/Resources/bin/`（Linux 为包内 `bin/`）。
+- **索引文件**写在用户数据目录：macOS 为 `~/Library/Application Support/FindX/index.bin`，不要放进 `.app` 包内。
+- 若要搜到「桌面 / 文稿 / 下载」，到 **系统设置 → 隐私与安全性 → 完全磁盘访问权限** 勾选 FindX。
 
 ## 功能概览（v2）
 

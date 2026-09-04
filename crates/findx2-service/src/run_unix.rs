@@ -53,25 +53,21 @@ pub(crate) fn run_foreground(
         *g = Some(engine.clone());
     }
 
+    let volume = normalize_unix_volume(&volume);
     let roots: Vec<String> = {
         let g = engine.index_store();
         let from_index: Vec<String> = g
             .volumes
             .iter()
-            .map(|v| {
-                if v.root_prefix.is_empty() || v.root_prefix == "/" {
-                    volume.clone()
-                } else {
-                    v.root_prefix.clone()
-                }
-            })
+            .map(|v| watch_root_for_volume(&v.root_prefix, &volume))
             .collect();
         if from_index.is_empty() {
-            vec![volume.clone()]
+            vec![watch_root_for_volume("", &volume)]
         } else {
             from_index
         }
     };
+    info!("Unix 监听根路径：{:?}", roots);
 
     let (tx, rx) = mpsc::channel::<ChangeEvent>();
     let watch_roots = roots.clone();
@@ -133,12 +129,51 @@ fn persist(engine: &SearchEngine, path: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// clap 在 Unix 上仍默认 `--volume C:`；把它当成「未指定」，走平台默认扫描根。
+pub(crate) fn normalize_unix_volume(volume: &str) -> String {
+    let v = volume.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("C:") || v.eq_ignore_ascii_case(r"C:\") {
+        String::new()
+    } else {
+        v.to_string()
+    }
+}
+
+fn default_unix_watch_root() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        findx2_macos::default_scan_root()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        findx2_linux::default_scan_root()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "/".into()
+    }
+}
+
+/// Data 卷在索引里的 `root_prefix` 是 `/`（给用户看的路径），监听必须落到真实扫描根，
+/// 绝不能把 Windows 默认盘符 `C:` 交给 FSEvents。
+fn watch_root_for_volume(root_prefix: &str, volume: &str) -> String {
+    let prefix = root_prefix.trim();
+    if prefix.len() > 1 {
+        return prefix.to_string();
+    }
+    let vol = normalize_unix_volume(volume);
+    if !vol.is_empty() {
+        return vol;
+    }
+    default_unix_watch_root()
+}
+
 fn build_unix_index(
     output: &PathBuf,
     volume: &str,
     extra_excluded: &[String],
 ) -> anyhow::Result<findx2_core::IndexStore> {
-    let roots = if volume.is_empty() || volume == "C:" {
+    let roots = if normalize_unix_volume(volume).is_empty() {
         Vec::new()
     } else {
         volume
@@ -172,7 +207,10 @@ fn platform_watch(
 ) -> findx2_core::Result<WatchCursor> {
     #[cfg(target_os = "macos")]
     {
-        let root = roots.first().cloned().unwrap_or_else(|| "/".into());
+        let root = roots
+            .first()
+            .cloned()
+            .unwrap_or_else(default_unix_watch_root);
         return findx2_macos::watch_loop(&root, cursor, tx);
     }
     #[cfg(target_os = "linux")]

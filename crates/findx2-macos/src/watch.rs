@@ -45,6 +45,15 @@ type CFAllocatorRef = *const c_void;
 type CFRunLoopRef = *mut c_void;
 type CFRunLoopMode = CFStringRef;
 
+#[repr(C)]
+struct CFArrayCallBacks {
+    version: isize,
+    retain: *const c_void,
+    release: *const c_void,
+    copy_description: *const c_void,
+    equal: *const c_void,
+}
+
 #[link(name = "CoreServices", kind = "framework")]
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
@@ -87,9 +96,10 @@ extern "C" {
         alloc: CFAllocatorRef,
         values: *const *const c_void,
         numValues: isize,
-        callbacks: *const c_void,
+        callbacks: *const CFArrayCallBacks,
     ) -> CFArrayRef;
     fn CFRelease(cf: *const c_void);
+    static kCFTypeArrayCallBacks: CFArrayCallBacks;
 }
 
 const KCF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
@@ -154,7 +164,9 @@ pub fn watch_loop(root: &str, cursor: WatchCursor, tx: Sender<ChangeEvent>) -> R
             return Err(findx2_core::Error::Platform("CFString 创建失败".into()));
         }
         let values = [cf_path as *const c_void];
-        let arr = CFArrayCreate(ptr::null(), values.as_ptr(), 1, ptr::null());
+        // kCFTypeArrayCallBacks 会 retain CFString；callbacks=NULL 时 CFRelease(cf_path)
+        // 会立刻释放，FSEventStreamCreate 读到悬空指针。
+        let arr = CFArrayCreate(ptr::null(), values.as_ptr(), 1, &kCFTypeArrayCallBacks);
         CFRelease(cf_path);
         if arr.is_null() {
             let _ = Box::from_raw(info);

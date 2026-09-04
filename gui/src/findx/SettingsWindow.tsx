@@ -498,7 +498,11 @@ export default function SettingsWindow() {
               深色模式背景为纯黑 #000；主窗口列表列宽可在表头分隔条上拖拽，比例会记住。
             </p>
 
-            <label>索引文件（默认 index.bin，与程序同目录）</label>
+            <label>
+              {hostOs === "windows"
+                ? "索引文件（默认 index.bin，与程序同目录；正式安装走 ProgramData）"
+                : "索引文件（默认写入用户数据目录，勿放在 .app 包内）"}
+            </label>
             <input
               type="text"
               value={settings.indexPath}

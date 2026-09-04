@@ -3,6 +3,7 @@ node_modules/
 
 # Frontend build outputs
 dist/
+public/file-viewer/
 dist-ssr/
 *.tsbuildinfo
 

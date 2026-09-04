@@ -1,23 +1,21 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ViewerPreview } from "./ViewerPreview";
+import { fileExt, viewerCanPreview } from "./viewerPreviewSupport";
 
 /**
- * Windows 资源管理器风格的预览面板。
+ * 预览面板调度：
+ * 1. 文件夹/未选中 → 提示；
+ * 2. 图片：前端 `<img src="data:..">`；
+ * 3. 文本/源码：读前 64KB；
+ * 4. Windows 且系统有 IPreviewHandler → 原生 HWND（与资源管理器同一套）；
+ * 5. 非 Windows，或系统预览失败且属于 Office/PDF 等 → `@file-viewer` 浏览器引擎；
+ * 6. 仍不行 → 文件信息卡片。
  *
- * 渲染策略（按优先级）：
- * 1. 文件夹/不存在 → 提示；
- * 2. 图片：前端 `<img src="data:..">`（Rust 已实现 load_preview_data_url）——
- *    比 prevhost 更轻、不会盖住后续 React 内容；
- * 3. 文本/源码/markdown 等：调 load_preview_text 读前 64KB 直接显示；
- * 4. 其它（PDF/Office/视频/带预览处理器的 zip / 7z / dwg / ai …）：
- *    调 preview_show 让 Rust 创建 STATIC 子 HWND + IPreviewHandler，与 Explorer 一模一样；
- *    我们这里仅负责把面板的客户区矩形传过去，并在 resize / 面板关闭时同步。
- *
- * 关键坑：原生子窗口会**盖在 WebView 之上**，所以：
- * - 关闭面板 / 路径变成不可预览类型 → 必须 invoke preview_hide({unload: true})；
- * - 祖先容器滚动、resize 主窗口、拖动分隔条 → 必须重新算矩形并 invoke preview_set_bounds。
- * - 列表等**兄弟**容器滚动不要同步：预览面板坐标没变，反复 SetRect 会把 prevhost 打成白屏。
+ * 原生子窗口会盖在 WebView 之上：关面板 / 切到非 native 必须 unload。
+ * 主窗口拖动由 Rust `follow_owner`（WindowEvent::Moved）同步位置，不要走 JS onMoved IPC。
+ * 只有面板尺寸变了才 `preview_set_bounds`（会 SetRect）。列表滚动只 `preview_raise` 抬 Z 序。
  */
 
 const TEXT_EXTS = new Set([
@@ -31,7 +29,7 @@ const IMAGE_EXTS = new Set([
   "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico",
 ]);
 
-type PreviewMode = "none" | "image" | "text" | "native";
+type PreviewMode = "none" | "image" | "text" | "native" | "viewer";
 
 type PreviewFallbackFileInfo = {
   size: number;
@@ -76,18 +74,6 @@ function formatPreviewTimestamp(unixSec: number | null | undefined): string {
   return cal;
 }
 
-type CssBounds = { x: number; y: number; w: number; h: number; dpr: number };
-
-function boundsUnchanged(a: CssBounds, b: CssBounds): boolean {
-  return (
-    Math.abs(a.x - b.x) < 1 &&
-    Math.abs(a.y - b.y) < 1 &&
-    Math.abs(a.w - b.w) < 1 &&
-    Math.abs(a.h - b.h) < 1 &&
-    Math.abs(a.dpr - b.dpr) < 0.01
-  );
-}
-
 /** 滚动事件的 target 是否会带动预览挂载点位移（祖先滚动）。列表等兄弟容器返回 false。 */
 function scrollMovesPreview(target: EventTarget | null, mount: HTMLElement): boolean {
   if (target === document || target === document.documentElement || target === document.body) {
@@ -105,13 +91,12 @@ function doubleRaf(): Promise<void> {
   });
 }
 
-function classifyByExt(path: string, isDir: boolean): PreviewMode {
+function classifyByExt(path: string, isDir: boolean, isWindows: boolean): PreviewMode {
   if (!path || isDir) return "none";
-  const i = path.lastIndexOf(".");
-  if (i < 0) return "native";
-  const ext = path.slice(i + 1).toLowerCase();
+  const ext = fileExt(path);
   if (IMAGE_EXTS.has(ext)) return "image";
   if (TEXT_EXTS.has(ext)) return "text";
+  if (!isWindows) return viewerCanPreview(path) ? "viewer" : "none";
   return "native";
 }
 
@@ -177,37 +162,57 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
   const [errMsg, setErrMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [fallbackMeta, setFallbackMeta] = useState<PreviewFallbackFileInfo | null>(null);
+  const [isWindows, setIsWindows] = useState(true);
+  const [viewerFallback, setViewerFallback] = useState(false);
+  const [viewerReady, setViewerReady] = useState(false);
+  const [viewerArmed, setViewerArmed] = useState(false);
 
-  const mode: PreviewMode = useMemo(() => classifyByExt(path ?? "", isDirectory), [path, isDirectory]);
+  useEffect(() => {
+    invoke<string>("host_platform")
+      .then((os) => setIsWindows(os === "windows"))
+      .catch(() => setIsWindows(true));
+  }, []);
+
+  const mode: PreviewMode = useMemo(
+    () => classifyByExt(path ?? "", isDirectory, isWindows),
+    [path, isDirectory, isWindows],
+  );
+  const showViewer = mode === "viewer" || viewerFallback;
+  const showNative = mode === "native" && !viewerFallback;
   const cloudLabel = useMemo(() => (path ? cloudStorageLabel(path) : null), [path]);
 
-  /** 拖动分隔条时 `preview_set_bounds` 极高频；合并到下一帧，减少与 prevhost 的交错重入导致的花屏/白块。 */
+  /** 分隔条 / resize 合并到下一帧；同时串行化 invoke，避免 IPC 排队交错 SetRect。 */
   const boundsRafRef = useRef<number | null>(null);
-  /** 上次已下发的挂载矩形；列表滚动时 getBoundingClientRect 亚像素抖动也不要重复 invoke。 */
-  const lastBoundsRef = useRef<CssBounds | null>(null);
+  const boundsInflightRef = useRef(false);
+  const boundsDirtyRef = useRef(false);
+  const raiseTimerRef = useRef<number | null>(null);
 
-  // -------- 原生预览：把 nativeMountRef 的矩形发给 Rust（CSS 逻辑像素，与 getBoundingClientRect 一致）--------
-  // 物理像素与 DPI 换算在 Rust 侧用 `GetDpiForWindow(实际 WebView HWND)` 完成，避免与扩展屏/混用 DPI 下的
-  // `window.devicePixelRatio` 或 Tauri scaleFactor 与 Win32 `ClientToScreen` 不一致。
+  // 只在预览面板客户区尺寸/偏移变了时调用。主窗口拖动不要走这里。
   const pushBounds = useCallback(() => {
     const el = nativeMountRef.current;
     if (!el) return;
     const r = el.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return;
-    const dpr = window.devicePixelRatio || 1;
-    const next = { x: r.left, y: r.top, w: r.width, h: r.height, dpr };
-    const prev = lastBoundsRef.current;
-    if (prev && boundsUnchanged(prev, next)) return;
-    lastBoundsRef.current = next;
-    // dpr 是 webview 实际使用的 device-pixel-ratio——这是 CSS→物理像素 唯一权威值。
-    // 由前端报告而不是 Rust 用 GetDpiForWindow 猜，避免跨屏 / 启动瞬间监视器 DPI 与 webview dpr 不一致。
+    if (boundsInflightRef.current) {
+      boundsDirtyRef.current = true;
+      return;
+    }
+    boundsInflightRef.current = true;
     void invoke("preview_set_bounds", {
-      x: next.x,
-      y: next.y,
-      w: next.w,
-      h: next.h,
-      dpr: next.dpr,
-    }).catch(() => {});
+      x: r.left,
+      y: r.top,
+      w: r.width,
+      h: r.height,
+      dpr: window.devicePixelRatio || 1,
+    })
+      .catch(() => {})
+      .finally(() => {
+        boundsInflightRef.current = false;
+        if (boundsDirtyRef.current) {
+          boundsDirtyRef.current = false;
+          pushBounds();
+        }
+      });
   }, []);
 
   const schedulePushBounds = useCallback(() => {
@@ -218,21 +223,33 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
     });
   }, [pushBounds]);
 
+  const scheduleRaise = useCallback(() => {
+    if (raiseTimerRef.current != null) window.clearTimeout(raiseTimerRef.current);
+    raiseTimerRef.current = window.setTimeout(() => {
+      raiseTimerRef.current = null;
+      void invoke("preview_raise").catch(() => {});
+    }, 160);
+  }, []);
+
   // -------- 路径或模式变化 → 切换预览源 --------
   // useLayoutEffect 保证 DOM commit 之后、浏览器绘制之前跑：mount div 一定已经 attach，ref 就绪。
   useLayoutEffect(() => {
     let alive = true;
-    lastBoundsRef.current = null;
     setErrMsg(null);
     setImgUrl(null);
     setTextBody(null);
+    setViewerFallback(false);
+    setViewerReady(false);
+    setViewerArmed(false);
+
+    let debounce: number | undefined;
 
     if (!path || mode === "none") {
       void invoke("preview_hide", { unload: true }).catch(() => {});
-      return;
-    }
-
-    if (mode === "image") {
+      if (path && !isDirectory) {
+        setErrMsg("当前平台暂无此类型的预览");
+      }
+    } else if (mode === "image") {
       void invoke("preview_hide", { unload: true }).catch(() => {});
       setBusy(true);
       invoke<string>("load_preview_data_url", { path })
@@ -243,10 +260,7 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
           if (alive) setErrMsg(String(e));
         })
         .finally(() => alive && setBusy(false));
-      return;
-    }
-
-    if (mode === "text") {
+    } else if (mode === "text") {
       void invoke("preview_hide", { unload: true }).catch(() => {});
       setBusy(true);
       invoke<string>("load_preview_text", { path, maxBytes: 64 * 1024 })
@@ -257,14 +271,18 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
           if (alive) setErrMsg(String(e));
         })
         .finally(() => alive && setBusy(false));
-      return;
-    }
-
+    } else if (mode === "viewer") {
+      void invoke("preview_hide", { unload: true }).catch(() => {});
+      setBusy(true);
+      debounce = window.setTimeout(() => {
+        if (alive) setViewerArmed(true);
+      }, 250);
+    } else {
     // native：先 250ms 防抖（用户快速划列表时不要每次都启 prevhost），再用 rAF 稳一帧后读矩形。
     // useLayoutEffect 已能拿到 ref，但有时 layout 尺寸还未稳定（父级 grid/flex），
     // 用 rAF 稳一帧并加重试，避免发出 0×0 矩形导致 prevhost 渲染到不可见区域。
     setBusy(true);
-    const debounce = window.setTimeout(() => {
+    debounce = window.setTimeout(() => {
       if (!alive) return;
       let attempts = 0;
       const tryShow = async () => {
@@ -293,71 +311,73 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
           h: Math.max(1, r.height),
           dpr: window.devicePixelRatio || 1,
         };
-        lastBoundsRef.current = {
-          x: args.x,
-          y: args.y,
-          w: args.w,
-          h: args.h,
-          dpr: args.dpr,
-        };
         await doubleRaf();
         if (!alive) return;
         try {
           await invoke("preview_show", args);
-          if (alive) setErrMsg(null);
-        } catch (e) {
           if (alive) {
-            setErrMsg(String(e));
-            void invoke("preview_hide", { unload: true }).catch(() => {});
+            setErrMsg(null);
+            setBusy(false);
           }
-        } finally {
-          if (alive) setBusy(false);
+        } catch (e) {
+          if (!alive) return;
+          void invoke("preview_hide", { unload: true }).catch(() => {});
+          if (path && viewerCanPreview(path)) {
+            setViewerFallback(true);
+            setViewerReady(false);
+            setErrMsg(null);
+            setBusy(true);
+          } else {
+            setErrMsg(String(e));
+            setBusy(false);
+          }
         }
       };
       requestAnimationFrame(() => void tryShow());
     }, 250);
+    }
 
     return () => {
       alive = false;
-      window.clearTimeout(debounce);
+      if (debounce != null) window.clearTimeout(debounce);
     };
-  }, [path, mode]);
+  }, [path, mode, isDirectory]);
 
-  // -------- 面板尺寸 / 滚动 / 主窗口 resize / 主窗口移动时跟随 --------
-  // 因为预览宿主是独立顶级 WS_POPUP（被 WebView2 DComp 合成层逼出来的唯一可行方案），
-  // 所以主窗口移动时 popup 不会自动跟随，必须监听 Tauri onMoved / onResized 重发坐标。
+  // 面板自身尺寸（分隔条 / 窗口缩放）才同步矩形。拖动主窗口由 Rust follow_owner 处理。
   useEffect(() => {
-    if (mode !== "native") return;
+    if (!showNative) return;
     const el = nativeMountRef.current;
     if (!el) return;
     const ro = new ResizeObserver(() => schedulePushBounds());
     ro.observe(el);
     const onResize = () => schedulePushBounds();
     const onScroll = (e: Event) => {
-      // 列表滚动条是预览面板的兄弟，坐标不变；再去 SetRect 会把系统预览打成白屏。
-      if (!scrollMovesPreview(e.target, el)) return;
-      schedulePushBounds();
+      if (scrollMovesPreview(e.target, el)) {
+        schedulePushBounds();
+        return;
+      }
+      // 列表滚动：坐标不变，只在停稳后抬 Z 序，防止 WebView2 DComp 把 popup 盖住。
+      scheduleRaise();
     };
     window.addEventListener("resize", onResize);
     window.addEventListener("scroll", onScroll, true);
 
     const win = getCurrentWindow();
-    let unlistenMoved: (() => void) | null = null;
     let unlistenResized: (() => void) | null = null;
-    win.onMoved(() => schedulePushBounds()).then((u) => { unlistenMoved = u; }).catch(() => {});
     win.onResized(() => schedulePushBounds()).then((u) => { unlistenResized = u; }).catch(() => {});
     schedulePushBounds();
 
     return () => {
       if (boundsRafRef.current != null) cancelAnimationFrame(boundsRafRef.current);
       boundsRafRef.current = null;
+      if (raiseTimerRef.current != null) window.clearTimeout(raiseTimerRef.current);
+      raiseTimerRef.current = null;
       ro.disconnect();
       window.removeEventListener("resize", onResize);
       window.removeEventListener("scroll", onScroll, true);
-      unlistenMoved?.();
       unlistenResized?.();
     };
-  }, [mode, path, schedulePushBounds]);
+  }, [showNative, schedulePushBounds, scheduleRaise]);
 
   // -------- 预览失败：从磁盘读取元数据，用于降级信息卡片 --------
   useEffect(() => {
@@ -404,7 +424,7 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
         {path && !isDirectory && mode === "text" && textBody !== null && (
           <pre className="fx-preview-text">{textBody}</pre>
         )}
-        {path && !isDirectory && mode === "native" && (
+        {path && !isDirectory && showNative && (
           <div className="fx-preview-native-stack">
             {/* mount 仅在 native 栈内挂载，Rust 把 HWND 对齐到此矩形 */}
             <div ref={nativeMountRef} className="fx-preview-native-mount" />
@@ -428,7 +448,7 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
                 </div>
               </div>
             )}
-            {errMsg && path && (
+            {errMsg && (
               <div className="fx-preview-fallback-host fx-preview-fallback-host--native">
                 <PreviewFallbackCard path={path} reason={errMsg} meta={fallbackMeta} />
               </div>
@@ -436,7 +456,38 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
           </div>
         )}
 
-        {errMsg && path && mode !== "native" && (
+        {path && !isDirectory && showViewer && !errMsg && (
+          <div className="fx-preview-native-stack">
+            {(viewerArmed || viewerFallback) && (
+              <div className="fx-preview-viewer">
+                <ViewerPreview
+                  path={path}
+                  onError={(message) => {
+                    setErrMsg(message);
+                    setBusy(false);
+                  }}
+                  onReady={() => {
+                    setViewerReady(true);
+                    setBusy(false);
+                  }}
+                />
+              </div>
+            )}
+            {busy && !viewerReady && (
+              <div className="fx-preview-native-overlay" aria-live="polite">
+                <span className="fx-preview-spin" aria-hidden />
+                <div className="fx-preview-native-overlay-text">
+                  <span className="fx-preview-native-overlay-title">预览</span>
+                  <span className="fx-preview-native-overlay-desc">
+                    {viewerFallback ? "系统预览不可用，正在加载内置预览…" : "正在加载内置预览…"}
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {errMsg && path && !showNative && (
           <div className="fx-preview-fallback-host">
             <PreviewFallbackCard path={path} reason={errMsg} meta={fallbackMeta} />
           </div>

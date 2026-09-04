@@ -70,11 +70,63 @@ pub struct FindxGuiSettings {
     pub save_interval_secs: u64,
 }
 
+/// Unix 可写数据目录：macOS 为 `~/Library/Application Support/FindX`，
+/// Linux 为 `$XDG_DATA_HOME/FindX` 或 `~/.local/share/FindX`。
+/// 不要把 `index.bin` 写进 `.app/Contents/MacOS`（安装到 /Applications 后只读）。
+#[cfg(not(windows))]
+pub fn unix_user_data_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        PathBuf::from(home).join("Library/Application Support/FindX")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            if !xdg.is_empty() {
+                return PathBuf::from(xdg).join("FindX");
+            }
+        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        PathBuf::from(home).join(".local/share/FindX")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        std::env::temp_dir().join("FindX")
+    }
+}
+
+#[cfg(not(windows))]
+fn unix_default_index_path() -> PathBuf {
+    unix_user_data_dir().join("index.bin")
+}
+
+#[cfg(not(windows))]
+fn index_path_needs_unix_migrate(index_path: &str, base: &Path) -> bool {
+    let trimmed = index_path.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let resolved = if Path::new(trimmed).is_absolute() {
+        PathBuf::from(trimmed)
+    } else {
+        base.join(trimmed)
+    };
+    let s = resolved.to_string_lossy();
+    !Path::new(trimmed).is_absolute() || s.contains(".app/Contents/")
+}
+
 impl Default for FindxGuiSettings {
     fn default() -> Self {
         Self {
+            #[cfg(windows)]
             index_path: "index.bin".into(),
+            #[cfg(not(windows))]
+            index_path: unix_default_index_path().to_string_lossy().into_owned(),
+            #[cfg(windows)]
             volume: "C:".into(),
+            #[cfg(not(windows))]
+            volume: String::new(),
             pipe_name: "findx2".into(),
             pinyin_default: true,
             service_exe_path: String::new(),
@@ -152,7 +204,12 @@ pub fn load_findx_settings<R: Runtime>(app: tauri::AppHandle<R>) -> Result<Findx
         if let Some(s) = settings_for_nsis_installed_layout() {
             return Ok(s);
         }
-        return Ok(FindxGuiSettings::default());
+        let s = FindxGuiSettings::default();
+        #[cfg(not(windows))]
+        {
+            let _ = save_findx_settings(app.clone(), s.clone());
+        }
+        return Ok(s);
     }
     let s = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let parsed = serde_json::from_str(&s).map_err(|e| e.to_string())?;
@@ -162,7 +219,21 @@ pub fn load_findx_settings<R: Runtime>(app: tauri::AppHandle<R>) -> Result<Findx
     }
     #[cfg(not(windows))]
     {
-        Ok(parsed)
+        let mut s = parsed;
+        let before_index = s.index_path.clone();
+        let before_vol = s.volume.clone();
+        let base = exe_resource_dir();
+        if index_path_needs_unix_migrate(&s.index_path, &base) {
+            s.index_path = unix_default_index_path().to_string_lossy().into_owned();
+        }
+        if s.volume.trim().eq_ignore_ascii_case("C:") || s.volume.trim().eq_ignore_ascii_case(r"C:\")
+        {
+            s.volume.clear();
+        }
+        if s.index_path != before_index || s.volume != before_vol {
+            let _ = save_findx_settings(app.clone(), s.clone());
+        }
+        Ok(s)
     }
 }
 
@@ -203,37 +274,129 @@ fn resolve_service_exe(base: &Path, settings: &FindxGuiSettings) -> Result<PathB
     }
     for candidate in service_exe_search_paths(base).into_iter() {
         if candidate.exists() {
-            return Ok(candidate);
+            #[cfg(unix)]
+            {
+                return Ok(ensure_unix_executable(&candidate));
+            }
+            #[cfg(not(unix))]
+            {
+                return Ok(candidate);
+            }
         }
     }
     Err(
-        "未找到 findx2-service.exe，请将可执行文件与 FindX2 同目录、resources\\bin 下，或于设置中指定存在的路径。"
+        "未找到 findx2-service，请确认安装包内含 CLI/服务 sidecar（macOS 在 Contents/Resources/bin）。"
             .into(),
     )
 }
 
-fn service_exe_search_paths(base: &Path) -> Vec<PathBuf> {
-    #[cfg(windows)]
-    {
-        vec![
-            base.join("findx2-service.exe"),
-            base.join("resources").join("bin").join("findx2-service.exe"),
-        ]
+/// GUI 可执行目录、Tauri `bin/` sidecar、macOS `Contents/Resources/bin`、Linux `/usr/lib/FindX`。
+fn sidecar_dir_candidates(base: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !dirs.iter().any(|x| x == &p) {
+            dirs.push(p);
+        }
+    };
+    push(base.to_path_buf());
+    push(base.join("bin"));
+    push(base.join("resources").join("bin"));
+    if let Some(parent) = base.parent() {
+        push(parent.join("Resources").join("bin"));
+        push(parent.join("Resources").join("resources").join("bin"));
+        push(parent.join("Resources"));
+        push(parent.join("lib").join("FindX"));
+        push(parent.join("lib").join("FindX").join("bin"));
+        push(parent.join("lib").join("tools.findx.gui"));
+        push(parent.join("lib").join("tools.findx.gui").join("bin"));
     }
-    #[cfg(not(windows))]
-    {
-        vec![
-            base.join("findx2-service"),
-            base.join("resources").join("bin").join("findx2-service"),
-        ]
-    }
+    dirs
 }
 
-fn cli_name_paths(base: &Path, name: &str) -> [PathBuf; 2] {
-    [
-        base.join(name),
-        base.join("resources").join("bin").join(name),
-    ]
+fn service_exe_search_paths(base: &Path) -> Vec<PathBuf> {
+    let name = if cfg!(windows) {
+        "findx2-service.exe"
+    } else {
+        "findx2-service"
+    };
+    sidecar_dir_candidates(base)
+        .into_iter()
+        .map(|d| d.join(name))
+        .collect()
+}
+
+fn cli_name_paths(base: &Path, name: &str) -> Vec<PathBuf> {
+    sidecar_dir_candidates(base)
+        .into_iter()
+        .map(|d| d.join(name))
+        .collect()
+}
+
+#[cfg(unix)]
+fn ensure_unix_executable(path: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return path.to_path_buf();
+    };
+    if meta.permissions().mode() & 0o111 != 0 {
+        #[cfg(target_os = "macos")]
+        strip_macos_quarantine(path);
+        return path.to_path_buf();
+    }
+    let mut perm = meta.permissions();
+    perm.set_mode(perm.mode() | 0o755);
+    if std::fs::set_permissions(path, perm).is_ok() {
+        #[cfg(target_os = "macos")]
+        strip_macos_quarantine(path);
+        return path.to_path_buf();
+    }
+    let dest_dir = unix_user_data_dir().join("bin");
+    let _ = std::fs::create_dir_all(&dest_dir);
+    let name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("findx2"));
+    let dest = dest_dir.join(name);
+    if std::fs::copy(path, &dest).is_ok() {
+        if let Ok(copied) = std::fs::metadata(&dest) {
+            let mut p = copied.permissions();
+            p.set_mode(0o755);
+            let _ = std::fs::set_permissions(&dest, p);
+        }
+        #[cfg(target_os = "macos")]
+        strip_macos_quarantine(&dest);
+        return dest;
+    }
+    path.to_path_buf()
+}
+
+#[cfg(target_os = "macos")]
+fn strip_macos_quarantine(path: &Path) {
+    let _ = std::process::Command::new("xattr")
+        .args(["-d", "com.apple.quarantine"])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(unix)]
+pub(crate) fn unix_configure_detached_child(cmd: &mut std::process::Command, log_path: Option<&Path>) {
+    use std::os::unix::process::CommandExt;
+    cmd.stdin(std::process::Stdio::null());
+    cmd.process_group(0);
+    if let Some(p) = log_path {
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+        {
+            if let Ok(cloned) = file.try_clone() {
+                cmd.stdout(std::process::Stdio::from(cloned));
+            }
+            cmd.stderr(std::process::Stdio::from(file));
+        }
+    }
 }
 
 /// 与 `findx2-service` 同目录的 `findx2` / `fx` 命令行（建索引子进程）
@@ -246,7 +409,14 @@ pub fn resolve_cli_exe(base: &Path, settings: &FindxGuiSettings) -> Option<PathB
     for name in names {
         for p in cli_name_paths(base, name).into_iter() {
             if p.exists() {
-                return Some(p);
+                #[cfg(unix)]
+                {
+                    return Some(ensure_unix_executable(&p));
+                }
+                #[cfg(not(unix))]
+                {
+                    return Some(p);
+                }
             }
         }
     }
@@ -255,7 +425,14 @@ pub fn resolve_cli_exe(base: &Path, settings: &FindxGuiSettings) -> Option<PathB
         for name in names {
             let p = parent.join(name);
             if p.exists() {
-                return Some(p);
+                #[cfg(unix)]
+                {
+                    return Some(ensure_unix_executable(&p));
+                }
+                #[cfg(not(unix))]
+                {
+                    return Some(p);
+                }
             }
         }
     }
@@ -644,11 +821,13 @@ pub fn spawn_findx_service_process<R: Runtime>(app: tauri::AppHandle<R>) -> Resu
     {
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("--index")
-            .arg(index.as_os_str())
-            .arg("--volume")
-            .arg(vol)
-            .arg("--pipe")
-            .arg(pipe);
+            .arg(index.as_os_str());
+        if !vol.is_empty() && vol != "C:" {
+            cmd.arg("--volume").arg(vol);
+        }
+        cmd.arg("--pipe").arg(pipe);
+        cmd.arg("--save-interval-secs")
+            .arg(settings.save_interval_secs.max(1).to_string());
         if !settings.enable_metadata_backfill {
             cmd.arg("--no-backfill");
         }
@@ -657,6 +836,8 @@ pub fn spawn_findx_service_process<R: Runtime>(app: tauri::AppHandle<R>) -> Resu
                 cmd.arg("--exclude-dir").arg(d);
             }
         }
+        let log = unix_user_data_dir().join("findx2-service.log");
+        unix_configure_detached_child(&mut cmd, Some(&log));
         cmd.spawn()
             .map_err(|e| format!("启动 findx2-service 失败: {e}"))?;
         Ok(())
@@ -679,7 +860,7 @@ pub(crate) fn stop_findx_service_detached() {
 #[cfg(not(windows))]
 pub(crate) fn stop_findx_service_detached() {
     let _ = std::process::Command::new("pkill")
-        .args(["-f", "findx2-service"])
+        .args(["-x", "findx2-service"])
         .spawn();
 }
 

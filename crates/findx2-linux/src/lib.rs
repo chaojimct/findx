@@ -119,6 +119,9 @@ pub fn build_full_disk_index(
             store.mark_excluded_entries(&excluded);
             let _ = save_exclude_sidecar(output, &excluded);
         }
+        if let Some(parent) = output.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         save_index_bin(output, &store)?;
         Ok(store)
     }

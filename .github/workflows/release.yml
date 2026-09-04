@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "版本号（如 2.2.0）"
+        description: "版本号（如 2.2.2）"
         required: true
-        default: "2.2.0"
+        default: "2.2.2"
 
 permissions:
   contents: write
@@ -171,6 +171,39 @@ jobs:
       - name: 构建 Tauri（app + dmg，含 CLI/服务 sidecar）
         working-directory: gui
         run: npm run tauri build
+
+      - name: 校验 .app 内 sidecar 可执行且非占位
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=$(find target/release/bundle -name 'FindX.app' -type d | head -1)
+          if [ -z "$APP" ]; then
+            echo "未找到 FindX.app"
+            find target/release/bundle -maxdepth 5 -print || true
+            exit 1
+          fi
+          echo "APP=$APP"
+          found=0
+          while IFS= read -r p; do
+            sz=$(stat -f%z "$p")
+            echo "sidecar $p size=$sz"
+            if [ "$sz" -lt 100000 ]; then
+              echo "sidecar 过小，仍是占位文件: $p"
+              exit 1
+            fi
+            chmod +x "$p" || true
+            found=$((found + 1))
+          done < <(find "$APP" \( -name findx2 -o -name fx -o -name findx2-service \) -type f)
+          if [ "$found" -lt 3 ]; then
+            echo "期望至少 3 个 sidecar，实际 $found。Contents 目录："
+            find "$APP/Contents" -type f | head -80
+            exit 1
+          fi
+          test -x "$APP/Contents/MacOS/FindX" || test -x "$APP/Contents/MacOS/findx2-gui" || {
+            echo "未找到主程序 MacOS/FindX"
+            ls -la "$APP/Contents/MacOS" || true
+            exit 1
+          }
 
       - name: Collect artifacts
         shell: bash

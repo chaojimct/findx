@@ -119,7 +119,7 @@ fn try_main() -> anyhow::Result<()> {
         let _ = std::fs::remove_file(std::env::temp_dir().join(SERVICE_LAST_ERROR_FILENAME));
         return run_unix::run_foreground(
             cli.index,
-            cli.volume,
+            run_unix::normalize_unix_volume(&cli.volume),
             cli.pipe,
             cli.save_interval_secs,
             cli.exclude_dir,

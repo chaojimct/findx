@@ -1220,7 +1220,7 @@ export default function FindXSearchApp() {
           <button
             type="button"
             className={`fx-btn-icon ${previewOpen ? "active" : ""}`}
-            title={previewOpen ? "关闭预览面板" : "打开预览面板（系统预览）"}
+            title={previewOpen ? "关闭预览面板" : "打开预览面板"}
             onClick={() => setPreviewOpen((v) => !v)}
           >
             👁

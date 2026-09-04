@@ -3,7 +3,7 @@
  * Windows：findx2.exe / fx.exe / findx2-service.exe
  * Unix：findx2 / fx / findx2-service（无后缀）
  */
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
@@ -35,5 +35,15 @@ for (const f of bins) {
     );
   }
   copyFileSync(src, join(outDir, f));
-  console.log(`[bundle-native-bins] 已复制 ${f}`);
+  const dest = join(outDir, f);
+  const sz = statSync(dest).size;
+  if (sz < 100_000) {
+    throw new Error(
+      `[bundle-native-bins] ${dest} 只有 ${sz} 字节，仍是占位文件。请确认 cargo release 已产出真实二进制。`,
+    );
+  }
+  if (!isWin) {
+    chmodSync(dest, 0o755);
+  }
+  console.log(`[bundle-native-bins] 已复制 ${f} (${sz} bytes)`);
 }

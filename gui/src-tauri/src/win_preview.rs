@@ -39,9 +39,8 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::Graphics::Gdi::{ClientToScreen, InvalidateRect, UpdateWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CreateWindowExW, DestroyWindow, EnumChildWindows, GetClassNameW, SetWindowPos,
-    ShowWindow, HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOZORDER,
-    SW_HIDE, SW_SHOW, WS_CLIPCHILDREN, WS_POPUP,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    ShowWindow, HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_HIDE, SW_SHOW, WS_CLIPCHILDREN, WS_POPUP, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 use windows::Win32::Foundation::POINT;
 
@@ -141,15 +140,65 @@ struct PreviewState {
     last_client_h: i32,
     /// 上一帧 popup 屏幕坐标，用于变化检测，避免无意义 SetWindowPos。
     last_screen_rect: RECT,
+    /// 换文件时复用宿主：只 Unload 处理器，不 DestroyWindow。关面板才销毁。
+    destroy_host_on_drop: bool,
 }
 
 impl Drop for PreviewState {
     fn drop(&mut self) {
         unsafe {
-            // 即使 Unload 失败也要继续销毁窗口，避免泄漏。
             let _ = self.handler.Unload();
-            if !self.host_hwnd.is_invalid() {
+            if self.destroy_host_on_drop && !self.host_hwnd.is_invalid() {
                 let _ = DestroyWindow(self.host_hwnd);
+            }
+        }
+    }
+}
+
+/// 换文件时取出仍可用的宿主 HWND，并 Unload 旧处理器（不拆窗口）。
+/// 拆了再建是空白循环的根因：新 popup 初始能画，随后 SetWindowPos/raise 就把 prevhost 子窗口打掉。
+struct RecycledHost {
+    hwnd: HWND,
+    last_screen_rect: RECT,
+}
+
+fn take_reusable_host() -> Result<Option<RecycledHost>, String> {
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+    let mut g = PREVIEW_STATE.lock().map_err(|e| e.to_string())?;
+    let Some(st) = g.as_mut() else {
+        return Ok(None);
+    };
+    let alive = unsafe { IsWindow(Some(st.host_hwnd)).as_bool() };
+    if !alive {
+        st.destroy_host_on_drop = false;
+        *g = None;
+        return Ok(None);
+    }
+    st.destroy_host_on_drop = false;
+    let recycled = RecycledHost {
+        hwnd: st.host_hwnd,
+        last_screen_rect: st.last_screen_rect,
+    };
+    *g = None;
+    plog!(
+        "[findx2-preview] recycle host hwnd=0x{:X}",
+        recycled.hwnd.0 as usize
+    );
+    Ok(Some(recycled))
+}
+
+/// 取出后若后续失败，把没挂上新处理器的宿主拆掉，避免空 popup 泄漏。
+struct HostRecycleGuard(Option<RecycledHost>);
+impl HostRecycleGuard {
+    fn take(&mut self) -> Option<RecycledHost> {
+        self.0.take()
+    }
+}
+impl Drop for HostRecycleGuard {
+    fn drop(&mut self) {
+        if let Some(rec) = self.0.take() {
+            unsafe {
+                let _ = DestroyWindow(rec.hwnd);
             }
         }
     }
@@ -612,6 +661,90 @@ fn rect_size_almost_eq(a: RECT, b: RECT, tol: i32) -> bool {
         && ((a.bottom - a.top) - (b.bottom - b.top)).abs() <= tol
 }
 
+/// 把 popup 挪到 `screen_rect`（物理屏幕像素）。只 `SetWindowPos`，不碰 IPreviewHandler。
+/// 高频拖动主窗口时必须走这条，反复 `SetRect` 会把 Office/WPS/PDF 子窗口打成白屏。
+fn position_host(host: HWND, top_hwnd: HWND, screen_rect: RECT) {
+    unsafe {
+        use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+        if !IsWindow(Some(host)).as_bool() {
+            return;
+        }
+        let sys = GetDpiForSystem().max(96);
+        let mon = GetDpiForWindow(top_hwnd).max(96);
+        let f = sys as f64 / mon as f64;
+        let sx = (screen_rect.left as f64 * f).round() as i32;
+        let sy = (screen_rect.top as f64 * f).round() as i32;
+        let sw = (((screen_rect.right - screen_rect.left) as f64) * f).round() as i32;
+        let sh = (((screen_rect.bottom - screen_rect.top) as f64) * f).round() as i32;
+        let _sys_aware_guard = SystemAwareGuard::enter();
+        let _ = SetWindowPos(
+            host,
+            None,
+            sx,
+            sy,
+            sw.max(1),
+            sh.max(1),
+            SET_WINDOW_POS_FLAGS(SWP_NOZORDER.0 | SWP_NOACTIVATE.0),
+        );
+    }
+}
+
+/// 主窗口移动时：用上次前端给的客户区偏移重算屏幕坐标，只挪 popup。
+/// 必须在主线程、Tauri `WindowEvent::Moved` 里同步调用，不要再绕 JS IPC。
+pub fn follow_owner(top_hwnd: HWND) -> Result<(), String> {
+    let (host, r) = {
+        let mut g = PREVIEW_STATE.lock().map_err(|e| e.to_string())?;
+        let Some(st) = g.as_mut() else {
+            return Ok(());
+        };
+        if !st.owner_top_hwnd.is_invalid() && st.owner_top_hwnd != top_hwnd {
+            return Ok(());
+        }
+        let r = client_to_screen_rect(
+            top_hwnd,
+            st.last_client_x,
+            st.last_client_y,
+            st.last_client_w,
+            st.last_client_h,
+        );
+        if rect_almost_eq(st.last_screen_rect, r, 1) {
+            return Ok(());
+        }
+        st.owner_top_hwnd = top_hwnd;
+        st.last_screen_rect = r;
+        (st.host_hwnd, r)
+    };
+    position_host(host, top_hwnd, r);
+    Ok(())
+}
+
+/// WebView2 滚动合成后 popup 可能掉到 DComp 层下面；只抬 Z 序，不改位置/尺寸、不 SetRect。
+pub fn raise_preview() -> Result<(), String> {
+    let host = {
+        let g = PREVIEW_STATE.lock().map_err(|e| e.to_string())?;
+        g.as_ref().map(|st| st.host_hwnd)
+    };
+    if let Some(host) = host {
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+            if IsWindow(Some(host)).as_bool() {
+                let _ = SetWindowPos(
+                    host,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SET_WINDOW_POS_FLAGS(SWP_NOMOVE.0 | SWP_NOSIZE.0 | SWP_NOACTIVATE.0),
+                );
+                let _ = ShowWindow(host, SW_SHOW);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 把「webview 客户区像素坐标」转换为「屏幕物理像素坐标」。
 /// owner 是 webview 容器 HWND。
 fn client_to_screen_rect(owner: HWND, x: i32, y: i32, w: i32, h: i32) -> RECT {
@@ -786,47 +919,28 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
             }
         };
         if let Some((host, handler, rect, pos_unchanged, size_unchanged)) = maybe {
-            unsafe {
-                use windows::Win32::UI::WindowsAndMessaging::IsWindow;
-                if IsWindow(Some(host)).as_bool() {
-                    // 矩形未变就不要再碰 HWND / IPreviewHandler：列表滚动会反复
-                    // 走到这里，无意义的 SetRect 会把 Office/WPS/PDF 子窗口打成白屏。
-                    if !pos_unchanged || !size_unchanged {
-                        use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
-                        let sys = GetDpiForSystem().max(96);
-                        let mon = GetDpiForWindow(top_hwnd).max(96);
-                        let f = sys as f64 / mon as f64;
-                        let sx = (rect.left as f64 * f).round() as i32;
-                        let sy = (rect.top as f64 * f).round() as i32;
-                        let sw = (((rect.right - rect.left) as f64) * f).round() as i32;
-                        let sh = (((rect.bottom - rect.top) as f64) * f).round() as i32;
-                        let _sys_aware_guard = SystemAwareGuard::enter();
-                        let _ = SetWindowPos(
-                            host, None, sx, sy, sw.max(1), sh.max(1),
-                            SET_WINDOW_POS_FLAGS(SWP_NOZORDER.0 | SWP_NOACTIVATE.0),
-                        );
-                        if !size_unchanged {
-                            let inner = host_phys_to_sys_inner(
-                                top_hwnd,
-                                rect.right - rect.left,
-                                rect.bottom - rect.top,
-                            );
-                            let _ = handler.SetRect(&inner);
-                        }
-                    }
-                    let _ = ShowWindow(host, SW_SHOW);
+            if !pos_unchanged || !size_unchanged {
+                position_host(host, top_hwnd, rect);
+            }
+            if !size_unchanged {
+                let inner = host_phys_to_sys_inner(
+                    top_hwnd,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                );
+                let _sys_aware_guard = SystemAwareGuard::enter();
+                unsafe {
+                    let _ = handler.SetRect(&inner);
                 }
+            }
+            unsafe {
+                let _ = ShowWindow(host, SW_SHOW);
             }
             return Ok(());
         }
     }
 
-    // 2. 先释放上一个（drop 会 Unload + DestroyWindow）
-    {
-        let mut g = PREVIEW_STATE.lock().map_err(|e| e.to_string())?;
-        *g = None;
-    }
-
+    // 2. 先确认新文件有处理器，再卸旧 handler（找不到处理器时旧预览先留着，由前端 hide）。
     // 3. 找处理器：优先 HKCR 合并视图（与 Explorer 一致），但 HKCU 优先级更高
     //    会被某些应用（如 WPS）写入伪 IPreviewHandler 覆盖，因此还要准备一个 HKLM
     //    机器级回退 CLSID，CoCreateInstance 失败时再用机器级真处理器（如 Office）重试。
@@ -838,6 +952,10 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
         "[findx2-preview] clsid primary={:?} hklm_fallback={:?}",
         clsid_primary, clsid_fallback
     );
+
+    // 换文件：只 Unload 旧处理器，复用宿主 HWND（与 Explorer 预览窗格一致）。
+    // 拆窗再建会出现「第二个文件先能看、一拖/一滚就白，再换又好」的循环。
+    let mut recycled_guard = HostRecycleGuard(take_reusable_host()?);
 
     // 内联辅助：基于一个 CLSID 尝试 CoCreateInstance（按位数智能选 ctx）。
     let try_create = |clsid: &GUID| -> Result<IPreviewHandler, String> {
@@ -925,13 +1043,13 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
         }
     };
 
-    // 5. Initialize
+    // 5. Initialize（失败时 HostRecycleGuard 会拆掉已取出的宿主）
     unsafe {
         initialize_handler(&handler, p)?;
     }
     plog!("[findx2-preview] Initialize ok");
 
-    // 6. 创建承载窗口
+    // 6. 复用或创建承载窗口
     //    host **也**在 system-aware 上下文中创建——这样 host 被永久标记为 system-aware，
     //    在 monitor_dpi != system_dpi 的屏（例如扩展屏 100% + 主屏 200%）上，
     //    Windows 会自动把 host 内容按 monitor/system 缩放显示，
@@ -956,7 +1074,12 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
             bottom: (screen_rect.bottom as f64 * factor).round() as i32,
         }
     };
-    let host = {
+    let host = if let Some(rec) = recycled_guard.take() {
+        if !rect_almost_eq(rec.last_screen_rect, screen_rect, 1) {
+            position_host(rec.hwnd, top_hwnd, screen_rect);
+        }
+        rec.hwnd
+    } else {
         let _sys_aware_guard = SystemAwareGuard::enter();
         unsafe { create_host_window(top_hwnd, popup_screen_rect)? }
     };
@@ -971,25 +1094,34 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
         popup_screen_rect.bottom - popup_screen_rect.top,
     );
     // 与处理器交互（SetWindow / DoPreview / SetRect）也在 system-aware 下。
-    let _sys_aware_guard = SystemAwareGuard::enter();
-    unsafe {
-        handler
-            .SetWindow(host, &inner)
-            .map_err(|e| format!("IPreviewHandler::SetWindow 失败: {e}"))?;
-        handler
-            .DoPreview()
-            .map_err(|e| format!("IPreviewHandler::DoPreview 失败: {e}"))?;
-        // 部分预览处理器（WPS、Office）DoPreview 后才创建自己的子窗口；
-        // 这时再调一次 SetRect 触发它把内容布局到我们容器里，并强制重绘。
-        let _ = handler.SetRect(&inner);
-        let _ = ShowWindow(host, SW_SHOW);
-        let _ = BringWindowToTop(host);
-        let _ = InvalidateRect(Some(host), None, true);
-        let _ = UpdateWindow(host);
-        plog!(
-            "[findx2-preview] DoPreview ok, host shown at ({}x{})",
-            inner.right, inner.bottom
-        );
+    let attached = {
+        let _sys_aware_guard = SystemAwareGuard::enter();
+        unsafe {
+            (|| -> Result<(), String> {
+                handler
+                    .SetWindow(host, &inner)
+                    .map_err(|e| format!("IPreviewHandler::SetWindow 失败: {e}"))?;
+                handler
+                    .DoPreview()
+                    .map_err(|e| format!("IPreviewHandler::DoPreview 失败: {e}"))?;
+                let _ = handler.SetRect(&inner);
+                let _ = ShowWindow(host, SW_SHOW);
+                let _ = BringWindowToTop(host);
+                let _ = InvalidateRect(Some(host), None, true);
+                let _ = UpdateWindow(host);
+                plog!(
+                    "[findx2-preview] DoPreview ok, host shown at ({}x{})",
+                    inner.right, inner.bottom
+                );
+                Ok(())
+            })()
+        }
+    };
+    if let Err(e) = attached {
+        unsafe {
+            let _ = DestroyWindow(host);
+        }
+        return Err(e);
     }
 
     let mut g = PREVIEW_STATE.lock().map_err(|e| e.to_string())?;
@@ -1004,10 +1136,11 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
         last_client_w: w,
         last_client_h: h,
         last_screen_rect: screen_rect,
+        destroy_host_on_drop: true,
     });
     drop(g);
-    // 位置仅由主线程 `preview_set_bounds`（及前端 ResizeObserver / onMoved）驱动；
-    // 勿在后台线程对主线程创建的 HWND 调 SetWindowPos，否则会破坏 prevhost/WebView2 子窗口绘制（数秒后白屏）。
+    // 拖动主窗口：由 follow_owner（Tauri WindowEvent::Moved，主线程同步）跟随。
+    // 面板尺寸变化：前端 ResizeObserver / onResized → set_bounds，仅此时才 SetRect。
     Ok(())
 }
 
@@ -1025,7 +1158,6 @@ pub fn set_bounds(top_hwnd: HWND, css_x: f64, css_y: f64, css_w: f64, css_h: f64
     let h = ((css_h * scale).round() as i32).max(1);
     let webview = HWND::default();
     let r = client_to_screen_rect(top_hwnd, x, y, w, h);
-    let inner = host_phys_to_sys_inner(top_hwnd, r.right - r.left, r.bottom - r.top);
     let host_handler = {
         let mut g = PREVIEW_STATE.lock().map_err(|e| e.to_string())?;
         if let Some(st) = g.as_mut() {
@@ -1047,27 +1179,12 @@ pub fn set_bounds(top_hwnd: HWND, css_x: f64, css_y: f64, css_w: f64, css_h: f64
         }
     };
     if let Some((host, handler, size_changed)) = host_handler {
-        unsafe {
-            use windows::Win32::UI::WindowsAndMessaging::IsWindow;
-            if IsWindow(Some(host)).as_bool() {
-                // host 是 system-aware，SetWindowPos 坐标先按 system/monitor 预补偿。
-                use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
-                let sys = GetDpiForSystem().max(96);
-                let mon = GetDpiForWindow(top_hwnd).max(96);
-                let f = sys as f64 / mon as f64;
-                let sx = (r.left as f64 * f).round() as i32;
-                let sy = (r.top as f64 * f).round() as i32;
-                let sw = (((r.right - r.left) as f64) * f).round() as i32;
-                let sh = (((r.bottom - r.top) as f64) * f).round() as i32;
-                let _sys_aware_guard = SystemAwareGuard::enter();
-                let _ = SetWindowPos(
-                    host, None, sx, sy, sw.max(1), sh.max(1),
-                    SET_WINDOW_POS_FLAGS(SWP_NOZORDER.0 | SWP_NOACTIVATE.0),
-                );
-                // 尺寸没变只挪位置：不要 SetRect，部分处理器会因此卸载子窗口。
-                if size_changed {
-                    let _ = handler.SetRect(&inner);
-                }
+        position_host(host, top_hwnd, r);
+        if size_changed {
+            let inner = host_phys_to_sys_inner(top_hwnd, r.right - r.left, r.bottom - r.top);
+            let _sys_aware_guard = SystemAwareGuard::enter();
+            unsafe {
+                let _ = handler.SetRect(&inner);
             }
         }
     }

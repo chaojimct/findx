@@ -4,8 +4,23 @@
 
 ## [Unreleased]
 
+## [2.2.2] - 2026-09-04
+
+### 功能
+
+- **跨平台 / 兜底文档预览**：Windows 仍优先走系统 `IPreviewHandler`；没有预览器、或 macOS / Linux 上的 PDF / Word / Excel / PPTX / OFD，改用内置 `@file-viewer`。老格式 `.ppt` 不走内置引擎，避免水印。图片预览不再限制为仅 Windows。
+
 ### 修复
 
+- **换文件后预览一拖/一滚就空白**：换文件时拆掉旧 HWND 再新建，第二个宿主先能画、随后 `SetWindowPos` 就把 prevhost 子窗口打掉，再换又恢复，形成循环。改为复用同一个预览宿主，只更换 `IPreviewHandler`（与资源管理器一致）。拖动主窗口改为 Rust `WindowEvent::Moved` 只挪位置；列表滚动停稳后只抬 Z 序。
+
+## [2.2.1] - 2026-09-04
+
+### 修复
+
+- **macOS 索引一直为 0**：2.2.0 把 `index.bin` 写进 `.app/Contents/MacOS`（装到 /Applications 后只读），且 GUI 找不到 `Contents/Resources/bin` 里的 CLI sidecar。改为 `~/Library/Application Support/FindX`，补齐 sidecar 查找与执行位；建库失败会显示在状态栏。
+- **macOS 增量监听误用 `C:`**：服务 clap 默认 `--volume C:`，Data 卷在索引里的前缀又是 `/`，FSEvents 会去听一个不存在的路径并触发反复重建。Unix 把 `C:` 当成未指定，监听落到 `/System/Volumes/Data`。
+- **FSEvents 监听可能崩溃**：`CFArrayCreate` 未 retain 路径字符串就 `CFRelease`，随后创建 stream 读悬空指针。改为 `kCFTypeArrayCallBacks`。
 - **预览面板滚动后空白**：已打开系统预览时拖动结果列表滚动条，会把未变化的矩形反复交给 `IPreviewHandler::SetRect`，Office / WPS / PDF 等处理器的子窗口会被打成白屏。列表现在视为兄弟滚动并忽略；矩形未变不再 `SetWindowPos` / `SetRect`。
 
 ## [2.2.0] - 2026-09-04
@@ -90,7 +105,9 @@
 
 - 仓库根目录补充 **MIT** 全文许可（`LICENSE`），与 `Cargo.toml` 工作区 `MIT OR Apache-2.0` 声明在 README 中说明对应关系。
 
-[Unreleased]: https://github.com/chaojimct/findx/compare/v2.2.0...HEAD
+[Unreleased]: https://github.com/chaojimct/findx/compare/v2.2.2...HEAD
+[2.2.2]: https://github.com/chaojimct/findx/compare/v2.2.1...v2.2.2
+[2.2.1]: https://github.com/chaojimct/findx/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/chaojimct/findx/compare/v2.1.6...v2.2.0
 [2.1.6]: https://github.com/chaojimct/findx/compare/v2.1.5...v2.1.6
 [2.1.5]: https://github.com/chaojimct/findx/compare/v2.1.4...v2.1.5

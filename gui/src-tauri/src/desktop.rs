@@ -1400,6 +1400,7 @@ pub fn setup(app: &mut App<tauri::Wry>) -> tauri::Result<()> {
         tauri::async_runtime::spawn(async move {
             if let Err(err) = crate::auto_start_flow(handle).await {
                 log_desktop_error("auto_start_flow", &err);
+                crate::set_last_index_error(Some(err.clone()));
                 crate::mark_pending_auto_index_build(false);
             }
         });
@@ -1418,6 +1419,7 @@ pub fn setup(app: &mut App<tauri::Wry>) -> tauri::Result<()> {
         tauri::async_runtime::spawn(async move {
             if let Err(err) = crate::auto_start_flow(handle).await {
                 log_desktop_error("auto_start_flow", &err);
+                crate::set_last_index_error(Some(err.clone()));
                 crate::mark_pending_auto_index_build(false);
             }
         });
