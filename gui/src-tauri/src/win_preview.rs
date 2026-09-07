@@ -38,8 +38,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::Graphics::Gdi::{ClientToScreen, InvalidateRect, UpdateWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CreateWindowExW, DestroyWindow, EnumChildWindows, GetClassNameW, SetWindowPos,
-    ShowWindow, HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    BringWindowToTop, CreateWindowExW, DestroyWindow, EnumChildWindows, GetClassNameW,
+    SetWindowPos, ShowWindow, HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE,
     SWP_NOZORDER, SW_HIDE, SW_SHOW, WS_CLIPCHILDREN, WS_POPUP, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 use windows::Win32::Foundation::POINT;
@@ -164,14 +164,15 @@ struct RecycledHost {
 
 fn take_reusable_host() -> Result<Option<RecycledHost>, String> {
     use windows::Win32::UI::WindowsAndMessaging::IsWindow;
-    let mut g = PREVIEW_STATE.lock().map_err(|e| e.to_string())?;
-    let Some(st) = g.as_mut() else {
-        return Ok(None);
+    let mut st = {
+        let mut g = PREVIEW_STATE.lock().map_err(|e| e.to_string())?;
+        match g.take() {
+            Some(st) => st,
+            None => return Ok(None),
+        }
     };
     let alive = unsafe { IsWindow(Some(st.host_hwnd)).as_bool() };
     if !alive {
-        st.destroy_host_on_drop = false;
-        *g = None;
         return Ok(None);
     }
     st.destroy_host_on_drop = false;
@@ -179,9 +180,15 @@ fn take_reusable_host() -> Result<Option<RecycledHost>, String> {
         hwnd: st.host_hwnd,
         last_screen_rect: st.last_screen_rect,
     };
-    *g = None;
+    // 锁外 Unload。32 位 inproc（WPS/PDF）的子 HWND 本进程 DestroyWindow 拆不掉，
+    // 这是正常现象，不是脏宿主。上一版因此放弃复用、整窗重建，正好走出
+    // 「好（复用）→ 坏（新建后 2–3 秒白屏）→ 好 → 坏」。
+    drop(st);
+    unsafe {
+        let _ = ShowWindow(recycled.hwnd, SW_HIDE);
+    }
     plog!(
-        "[findx2-preview] recycle host hwnd=0x{:X}",
+        "[findx2-preview] recycle host hwnd=0x{:X} (unload only, keep host)",
         recycled.hwnd.0 as usize
     );
     Ok(Some(recycled))
@@ -715,11 +722,19 @@ pub fn follow_owner(top_hwnd: HWND) -> Result<(), String> {
         st.last_screen_rect = r;
         (st.host_hwnd, r)
     };
+    plog!(
+        "[findx2-preview] follow_owner hwnd=0x{:X} screen=({},{},{}x{})",
+        host.0 as usize,
+        r.left,
+        r.top,
+        r.right - r.left,
+        r.bottom - r.top
+    );
     position_host(host, top_hwnd, r);
     Ok(())
 }
 
-/// WebView2 滚动合成后 popup 可能掉到 DComp 层下面；只抬 Z 序，不改位置/尺寸、不 SetRect。
+/// 仅保证 popup 可见。不要 HWND_TOP：换文件后的 handler 会被抬 Z 序打成白屏。
 pub fn raise_preview() -> Result<(), String> {
     let host = {
         let g = PREVIEW_STATE.lock().map_err(|e| e.to_string())?;
@@ -729,15 +744,6 @@ pub fn raise_preview() -> Result<(), String> {
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::IsWindow;
             if IsWindow(Some(host)).as_bool() {
-                let _ = SetWindowPos(
-                    host,
-                    Some(HWND_TOP),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SET_WINDOW_POS_FLAGS(SWP_NOMOVE.0 | SWP_NOSIZE.0 | SWP_NOACTIVATE.0),
-                );
                 let _ = ShowWindow(host, SW_SHOW);
             }
         }
@@ -1074,14 +1080,13 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
             bottom: (screen_rect.bottom as f64 * factor).round() as i32,
         }
     };
-    let host = if let Some(rec) = recycled_guard.take() {
-        if !rect_almost_eq(rec.last_screen_rect, screen_rect, 1) {
-            position_host(rec.hwnd, top_hwnd, screen_rect);
-        }
-        rec.hwnd
+    let (host, reposition_after, was_recycled) = if let Some(rec) = recycled_guard.take() {
+        // 挂上新 handler 之前不要 SetWindowPos：空宿主一挪，随后 DoPreview 的子窗口会立刻白。
+        let need = !rect_almost_eq(rec.last_screen_rect, screen_rect, 1);
+        (rec.hwnd, need, true)
     } else {
         let _sys_aware_guard = SystemAwareGuard::enter();
-        unsafe { create_host_window(top_hwnd, popup_screen_rect)? }
+        (unsafe { create_host_window(top_hwnd, popup_screen_rect)? }, false, false)
     };
     let host_phys_w = (screen_rect.right - screen_rect.left).max(1);
     let host_phys_h = (screen_rect.bottom - screen_rect.top).max(1);
@@ -1106,12 +1111,14 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
                     .map_err(|e| format!("IPreviewHandler::DoPreview 失败: {e}"))?;
                 let _ = handler.SetRect(&inner);
                 let _ = ShowWindow(host, SW_SHOW);
-                let _ = BringWindowToTop(host);
-                let _ = InvalidateRect(Some(host), None, true);
-                let _ = UpdateWindow(host);
+                if !was_recycled {
+                    let _ = BringWindowToTop(host);
+                    let _ = InvalidateRect(Some(host), None, true);
+                    let _ = UpdateWindow(host);
+                }
                 plog!(
-                    "[findx2-preview] DoPreview ok, host shown at ({}x{})",
-                    inner.right, inner.bottom
+                    "[findx2-preview] DoPreview ok, host shown at ({}x{}) recycled={}",
+                    inner.right, inner.bottom, was_recycled
                 );
                 Ok(())
             })()
@@ -1122,6 +1129,9 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
             let _ = DestroyWindow(host);
         }
         return Err(e);
+    }
+    if reposition_after {
+        position_host(host, top_hwnd, screen_rect);
     }
 
     let mut g = PREVIEW_STATE.lock().map_err(|e| e.to_string())?;
@@ -1179,6 +1189,15 @@ pub fn set_bounds(top_hwnd: HWND, css_x: f64, css_y: f64, css_w: f64, css_h: f64
         }
     };
     if let Some((host, handler, size_changed)) = host_handler {
+        plog!(
+            "[findx2-preview] set_bounds hwnd=0x{:X} screen=({},{},{}x{}) size_changed={}",
+            host.0 as usize,
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            size_changed
+        );
         position_host(host, top_hwnd, r);
         if size_changed {
             let inner = host_phys_to_sys_inner(top_hwnd, r.right - r.left, r.bottom - r.top);
@@ -1198,6 +1217,7 @@ pub fn hide_preview() -> Result<(), String> {
         g.as_ref().map(|st| st.host_hwnd)
     };
     if let Some(host) = host {
+        plog!("[findx2-preview] hide hwnd=0x{:X}", host.0 as usize);
         unsafe {
             let _ = ShowWindow(host, SW_HIDE);
         }
@@ -1207,6 +1227,7 @@ pub fn hide_preview() -> Result<(), String> {
 
 /// 彻底卸载（关闭面板时调用，释放 prevhost 进程占用）。
 pub fn unload_preview() -> Result<(), String> {
+    plog!("[findx2-preview] unload");
     let mut g = PREVIEW_STATE.lock().map_err(|e| e.to_string())?;
     *g = None;
     Ok(())

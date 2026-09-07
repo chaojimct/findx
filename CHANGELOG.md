@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [2.2.3] - 2026-09-07
+
+### 修复
+
+- **换文件后预览好→坏循环、静置 2–3 秒空白**：32 位 PDF/WPS 预览卸下来后子窗口拆不掉，误判为脏宿主并整窗重建，新宿主先能画、数秒后白屏。改为换文件只 `Unload`、始终复用同一 HWND；列表滚动不再抬 Z 序；系统预览失败时只隐藏、不卸宿主。
+
 ## [2.2.2] - 2026-09-04
 
 ### 构建
@@ -109,7 +115,8 @@
 
 - 仓库根目录补充 **MIT** 全文许可（`LICENSE`），与 `Cargo.toml` 工作区 `MIT OR Apache-2.0` 声明在 README 中说明对应关系。
 
-[Unreleased]: https://github.com/chaojimct/findx/compare/v2.2.2...HEAD
+[Unreleased]: https://github.com/chaojimct/findx/compare/v2.2.3...HEAD
+[2.2.3]: https://github.com/chaojimct/findx/compare/v2.2.2...v2.2.3
 [2.2.2]: https://github.com/chaojimct/findx/compare/v2.2.1...v2.2.2
 [2.2.1]: https://github.com/chaojimct/findx/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/chaojimct/findx/compare/v2.1.6...v2.2.0

@@ -15,7 +15,7 @@ import { fileExt, viewerCanPreview } from "./viewerPreviewSupport";
  *
  * 原生子窗口会盖在 WebView 之上：关面板 / 切到非 native 必须 unload。
  * 主窗口拖动由 Rust `follow_owner`（WindowEvent::Moved）同步位置，不要走 JS onMoved IPC。
- * 只有面板尺寸变了才 `preview_set_bounds`（会 SetRect）。列表滚动只 `preview_raise` 抬 Z 序。
+ * 只有面板尺寸变了才 `preview_set_bounds`（会 SetRect）。列表滚动不要抬 Z 序。
  */
 
 const TEXT_EXTS = new Set([
@@ -185,7 +185,6 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
   const boundsRafRef = useRef<number | null>(null);
   const boundsInflightRef = useRef(false);
   const boundsDirtyRef = useRef(false);
-  const raiseTimerRef = useRef<number | null>(null);
 
   // 只在预览面板客户区尺寸/偏移变了时调用。主窗口拖动不要走这里。
   const pushBounds = useCallback(() => {
@@ -222,14 +221,6 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
       pushBounds();
     });
   }, [pushBounds]);
-
-  const scheduleRaise = useCallback(() => {
-    if (raiseTimerRef.current != null) window.clearTimeout(raiseTimerRef.current);
-    raiseTimerRef.current = window.setTimeout(() => {
-      raiseTimerRef.current = null;
-      void invoke("preview_raise").catch(() => {});
-    }, 160);
-  }, []);
 
   // -------- 路径或模式变化 → 切换预览源 --------
   // useLayoutEffect 保证 DOM commit 之后、浏览器绘制之前跑：mount div 一定已经 attach，ref 就绪。
@@ -321,7 +312,8 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
           }
         } catch (e) {
           if (!alive) return;
-          void invoke("preview_hide", { unload: true }).catch(() => {});
+          // 只隐藏，不要 unload：否则会拆掉还能复用的宿主，下一次又走「新建 HWND」进入好→坏循环。
+          void invoke("preview_hide", { unload: false }).catch(() => {});
           if (path && viewerCanPreview(path)) {
             setViewerFallback(true);
             setViewerReady(false);
@@ -354,10 +346,8 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
     const onScroll = (e: Event) => {
       if (scrollMovesPreview(e.target, el)) {
         schedulePushBounds();
-        return;
       }
-      // 列表滚动：坐标不变，只在停稳后抬 Z 序，防止 WebView2 DComp 把 popup 盖住。
-      scheduleRaise();
+      // 列表滚动不要 raise/SetWindowPos：换文件后的新 handler 会被抬 Z 序打成白屏。
     };
     window.addEventListener("resize", onResize);
     window.addEventListener("scroll", onScroll, true);
@@ -370,14 +360,12 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
     return () => {
       if (boundsRafRef.current != null) cancelAnimationFrame(boundsRafRef.current);
       boundsRafRef.current = null;
-      if (raiseTimerRef.current != null) window.clearTimeout(raiseTimerRef.current);
-      raiseTimerRef.current = null;
       ro.disconnect();
       window.removeEventListener("resize", onResize);
       window.removeEventListener("scroll", onScroll, true);
       unlistenResized?.();
     };
-  }, [showNative, schedulePushBounds, scheduleRaise]);
+  }, [showNative, schedulePushBounds]);
 
   // -------- 预览失败：从磁盘读取元数据，用于降级信息卡片 --------
   useEffect(() => {
