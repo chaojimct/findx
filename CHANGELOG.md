@@ -4,6 +4,23 @@
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-09-07
+
+### 功能
+
+- **Unix 建库加速**：Linux 用 `getdents64` + `openat` 并行扫盘，macOS 同样走目录工作队列；默认 fast 首遍不 stat，后台再补大小与时间。扫描根入库后回填能拼出真实路径。
+- **Unix 元数据回填**：服务在 Linux / macOS 上按原始大小写拼路径做 `stat`，写入 overlay，不跟搜索抢全局线程池。`--full-stat` / `--no-backfill` 已接到 Unix 服务与 GUI。
+- **拼音语法对齐 Windows**：全拼 / 简拼、`;py` `;en` `;np`、`file:` `folder:` `startwith:` `endwith:` `path:` `parent:`、`|` 与 `!` 均可叠拼音。Unix 支持 `/home/foo`、`~/Documents`。CLI 默认编进并开启拼音。
+
+### 优化
+
+- **mmap 预取**：Unix 用 `posix_madvise(WILLNEED)`，与 Windows `PrefetchVirtualMemory` 对齐。
+- **Unix trigram 边车**：建库后写 `<index>.tri`，服务启动缺失时补建，拼音剪枝与 Windows 一致。
+
+### 修复
+
+- **设置文案**：不再写仓库里没有的 LaunchAgent / systemd；排除目录示例按平台；macOS 完全磁盘访问、Linux 无特权降级 inotify 会进状态栏。退出应用时 Unix 也会停掉索引进程。
+
 ## [2.2.3] - 2026-09-07
 
 ### 修复
@@ -115,7 +132,8 @@
 
 - 仓库根目录补充 **MIT** 全文许可（`LICENSE`），与 `Cargo.toml` 工作区 `MIT OR Apache-2.0` 声明在 README 中说明对应关系。
 
-[Unreleased]: https://github.com/chaojimct/findx/compare/v2.2.3...HEAD
+[Unreleased]: https://github.com/chaojimct/findx/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/chaojimct/findx/compare/v2.2.3...v2.3.0
 [2.2.3]: https://github.com/chaojimct/findx/compare/v2.2.2...v2.2.3
 [2.2.2]: https://github.com/chaojimct/findx/compare/v2.2.1...v2.2.2
 [2.2.1]: https://github.com/chaojimct/findx/compare/v2.2.0...v2.2.1

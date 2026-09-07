@@ -31,7 +31,7 @@ impl Drop for BackfillRunningGuard {
 
 use findx2_core::{save_index_bin, SearchEngine};
 use tracing::{error, info};
-#[cfg(not(windows))]
+#[cfg(unix)]
 use tracing::warn;
 
 /// 是否启用后台元数据回填。默认 **on**；可用 `FINDX2_DISABLE_BACKFILL=1` 关掉
@@ -126,13 +126,163 @@ fn spawn_final_persist(engine: Arc<SearchEngine>, path: std::path::PathBuf) {
         .ok();
 }
 
-#[cfg(not(windows))]
-fn backfill_loop(_engine: Arc<SearchEngine>, _index_path: std::path::PathBuf) -> anyhow::Result<()> {
-    warn!("非 Windows 平台不支持后台元数据回填");
+#[cfg(unix)]
+fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> anyhow::Result<()> {
+    use findx2_core::index::unix_secs_to_filetime;
+    use std::os::unix::fs::MetadataExt;
+
+    let total_entries = engine.index_store().entry_count();
+    engine.set_backfill_error(None);
+    engine.set_backfill_total(total_entries as u64);
+    info!("Unix 后台回填启动：索引共 {total_entries} 条，收集待补文件 …");
+
+    let mut pending: Vec<(usize, String)> = Vec::new();
+    const SCAN_CHUNK: usize = 65_536;
+    let mut start = 0usize;
+    while start < total_entries {
+        let end = (start + SCAN_CHUNK).min(total_entries);
+        {
+            let g = engine.index_store();
+            for i in start..end {
+                let Some(e) = g.entries.get(i) else { break };
+                if e.is_dir_entry() || e.size != 0 {
+                    continue;
+                }
+                if let Some(path) = unix_entry_fs_path(&g, i) {
+                    pending.push((i, path));
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+        start = end;
+    }
+
+    if load_overlay_sidecar(&engine, &index_path).unwrap_or(0) > 0 {
+        pending.retain(|(idx, _)| !engine.metadata_overlay_has(*idx));
+    }
+
+    if pending.is_empty() {
+        info!("Unix 回填：无需补元数据，触发终态落盘");
+        delete_overlay_sidecar(&index_path);
+        spawn_final_persist(engine, index_path);
+        return Ok(());
+    }
+
+    let total_pending = pending.len();
+    engine.set_backfill_total(total_pending as u64);
+    info!("Unix 回填：待补 {total_pending} 条，按目录批量 stat");
+
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .saturating_sub(1)
+        .clamp(2, 8);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("findx2-unix-backfill-{i}"))
+        .build()
+        .map_err(|e| anyhow::anyhow!("创建 Unix 回填线程池失败：{e}"))?;
+
+    let done = Arc::new(AtomicUsize::new(0));
+    const BATCH: usize = 512;
+    pool.install(|| {
+        use rayon::prelude::*;
+        pending.par_chunks(BATCH).for_each(|chunk| {
+            let mut batch: Vec<(usize, u64, u64, u64)> = Vec::with_capacity(chunk.len());
+            for &(idx, ref path) in chunk {
+                let Ok(meta) = std::fs::symlink_metadata(path) else {
+                    continue;
+                };
+                if meta.file_type().is_dir() {
+                    continue;
+                }
+                batch.push((
+                    idx,
+                    meta.len(),
+                    unix_secs_to_filetime(meta.mtime().max(0) as u32),
+                    unix_secs_to_filetime(meta.ctime().max(0) as u32),
+                ));
+            }
+            if !batch.is_empty() {
+                let n = batch.len();
+                engine.extend_metadata_overlay_batch(&batch);
+                let d = done.fetch_add(n, Ordering::Relaxed) + n;
+                engine.reset_backfill_done_to(d as u64);
+            }
+        });
+    });
+
+    if let Err(e) = save_overlay_sidecar(&engine, &index_path) {
+        warn!("Unix 回填断点边车保存失败: {e:#}");
+    }
+    info!(
+        "Unix 回填完成：{} / {total_pending} 条已写入 overlay",
+        done.load(Ordering::Relaxed)
+    );
+    spawn_final_persist(engine, index_path);
     Ok(())
 }
 
+/// 用原始大小写名字沿父链拼 Unix 路径（小写物化路径在大小写敏感盘上打不开）。
+#[cfg(unix)]
+fn unix_entry_fs_path(store: &findx2_core::IndexStore, idx: usize) -> Option<String> {
+    let prefix = store.volume_for_entry(idx)?.root_prefix.clone();
+    let e = store.entries.get(idx)?;
+    let mut segs: Vec<String> = Vec::new();
+    if e.is_dir_entry() {
+        let fr = store.frns.get(idx).copied().unwrap_or(0);
+        let mut di = *store.dir_index.get(&fr)?;
+        loop {
+            let d = store.dirs.get(di as usize)?;
+            if let Some(n) = unix_dir_name(store, d) {
+                if !n.is_empty() {
+                    segs.push(n.to_string());
+                }
+            }
+            if d.parent_idx == 0 {
+                break;
+            }
+            di = d.parent_idx;
+        }
+    } else {
+        segs.push(store.name_str(e).ok()?.to_string());
+        let mut di = e.dir_idx;
+        while (di as usize) < store.dirs.len() {
+            let d = store.dirs.get(di as usize)?;
+            if let Some(n) = unix_dir_name(store, d) {
+                if !n.is_empty() {
+                    segs.push(n.to_string());
+                }
+            }
+            if d.parent_idx == 0 {
+                break;
+            }
+            di = d.parent_idx;
+        }
+    }
+    segs.reverse();
+    let rel = segs.join("/");
+    let prefix = prefix.trim_end_matches('/');
+    if rel.is_empty() {
+        Some(if prefix.is_empty() { "/".into() } else { prefix.to_string() })
+    } else if prefix.is_empty() || prefix == "/" {
+        Some(format!("/{rel}"))
+    } else {
+        Some(format!("{prefix}/{rel}"))
+    }
+}
+
+#[cfg(unix)]
+fn unix_dir_name<'a>(store: &'a findx2_core::IndexStore, d: &findx2_core::index::DirEntry) -> Option<&'a str> {
+    let start = d.name_offset as usize;
+    let end = start + d.name_len as usize;
+    let raw = store.names_buf.get(start..end)?;
+    let raw = raw.strip_suffix(&[0]).unwrap_or(raw);
+    std::str::from_utf8(raw).ok()
+}
+
 /// 单卷待回填集合（P1-5 按卷画像独立建池时跨函数传递）。
+#[cfg(windows)]
 struct VolPending {
     files: Vec<(usize, u64)>,
     dirs: Vec<u64>,

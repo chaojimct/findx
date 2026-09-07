@@ -10,7 +10,6 @@ mod everything_ipc;
 mod pipe_server;
 #[cfg(windows)]
 mod run;
-#[cfg(windows)]
 mod backfill;
 #[cfg(windows)]
 mod win_service;
@@ -123,6 +122,9 @@ fn try_main() -> anyhow::Result<()> {
             cli.pipe,
             cli.save_interval_secs,
             cli.exclude_dir,
+            cli.full_stat,
+            cli.no_backfill,
+            cli.max_scan_threads,
         );
     }
 

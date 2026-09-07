@@ -682,21 +682,38 @@ impl SearchEngine {
                 not_n.to_ascii_lowercase().into_bytes()
             };
             let finder = memmem::Finder::new(&nb);
+            #[cfg(feature = "pinyin")]
+            let pin_not = if opt.allow_pinyin && !q.no_pinyin && !q.case_sensitive {
+                build_pinyin_matcher(not_n).ok()
+            } else {
+                None
+            };
             hits.retain(|&idx| {
-                let nb = store.name_bytes(&store.entries[idx as usize]);
+                let raw = store.name_bytes(&store.entries[idx as usize]);
                 let nb = if q.case_sensitive {
-                    CowBytes::Borrowed(nb)
+                    CowBytes::Borrowed(raw)
                 } else {
-                    let lo: Vec<u8> = std::str::from_utf8(nb)
+                    let lo: Vec<u8> = std::str::from_utf8(raw)
                         .map(|s| s.to_ascii_lowercase().into_bytes())
-                        .unwrap_or_else(|_| nb.iter().map(|b| b.to_ascii_lowercase()).collect());
+                        .unwrap_or_else(|_| raw.iter().map(|b| b.to_ascii_lowercase()).collect());
                     CowBytes::Owned(lo)
                 };
-                finder.find(nb.as_ref()).is_none()
+                if finder.find(nb.as_ref()).is_some() {
+                    return false;
+                }
+                #[cfg(feature = "pinyin")]
+                if let Some(re) = pin_not.as_ref() {
+                    if let Ok(name) = std::str::from_utf8(raw) {
+                        if re.find(name).is_some() {
+                            return false;
+                        }
+                    }
+                }
+                true
             });
         }
 
-        hits = apply_post_name_filters(store, q, hits)?;
+        hits = apply_post_name_filters(store, q, opt, hits)?;
 
         if let (Some(lo), Some(hi)) = (q.depth_min, q.depth_max) {
             hits.retain(|&idx| {
@@ -1178,21 +1195,26 @@ fn collect_pinyin_needles(q: &ParsedQuery, opt: &SearchOptions) -> Vec<String> {
     if !trigger {
         return Vec::new();
     }
+    let mut out: Vec<String> = Vec::new();
     if !q.name_terms.is_empty() {
-        q.name_terms
-            .iter()
-            .filter(|s| !s.is_empty())
-            .cloned()
-            .collect()
+        out.extend(q.name_terms.iter().filter(|s| !s.is_empty()).cloned());
     } else if let Some(s) = q.substring.as_ref() {
-        if s.is_empty() {
-            Vec::new()
-        } else {
-            vec![s.clone()]
+        if !s.is_empty() {
+            out.push(s.clone());
         }
-    } else {
-        Vec::new()
     }
+    // startwith/endwith 与 Windows 一样走拼音：`startwith:bei` 能命中「北京」
+    if let Some(s) = q.starts_with.as_ref() {
+        if !s.is_empty() && !out.iter().any(|x| x == s) {
+            out.push(s.clone());
+        }
+    }
+    if let Some(s) = q.ends_with.as_ref() {
+        if !s.is_empty() && !out.iter().any(|x| x == s) {
+            out.push(s.clone());
+        }
+    }
+    out
 }
 
 /// 一次性编译拼音 matcher，下游 par_iter / highlight 全部复用。
@@ -1927,27 +1949,38 @@ fn path_full_lower(store: &IndexStore, entry_idx: usize, nowfn: bool) -> Vec<u8>
     full
 }
 
-/// `parent:` / `infolder:`：父目录路径与给定路径**精确一致**（忽略大小写、首尾 `\`），对齐 Everything。
-fn match_parent_path_exact(store: &IndexStore, entry_idx: usize, parent_needle: &str) -> bool {
+fn path_key(s: &str) -> String {
+    s.replace('\\', "/")
+        .trim_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn parent_path_haystack(store: &IndexStore, entry_idx: usize) -> String {
     let e = &store.entries[entry_idx];
-    let dir_full = store.resolve_dir_path_lower(e.dir_idx);
-    let path_s = std::str::from_utf8(dir_full.as_ref())
-        .map(|s| s.trim_matches('\\').to_ascii_lowercase())
-        .unwrap_or_default();
-    let needle = parent_needle
-        .trim_matches('\\')
-        .trim()
-        .to_ascii_lowercase();
-    path_s == needle
+    let dir = store.resolve_dir_path_lower(e.dir_idx);
+    if let Some(vol) = store.volume_for_entry(entry_idx) {
+        if vol.is_unix() {
+            return path_key(&crate::index::compose_volume_dir_path(vol, dir.as_ref()));
+        }
+    }
+    std::str::from_utf8(dir.as_ref())
+        .map(|s| path_key(s))
+        .unwrap_or_default()
+}
+
+/// `parent:` / `infolder:`：父目录路径与给定路径**精确一致**（忽略大小写、斜杠方向）。
+fn match_parent_path_exact(store: &IndexStore, entry_idx: usize, parent_needle: &str) -> bool {
+    parent_path_haystack(store, entry_idx) == path_key(parent_needle)
 }
 
 /// `parentcontains:`：仅在**父目录路径**（不含文件名）中做子串匹配（旧行为，非 Everything 默认）。
 fn match_parent_path(store: &IndexStore, entry_idx: usize, parent_needle: &str) -> bool {
-    let e = &store.entries[entry_idx];
-    let dir_full = store.resolve_dir_path_lower(e.dir_idx);
-    let norm_needle = parent_needle.trim_matches('\\').to_ascii_lowercase();
-    let needle_b = norm_needle.as_bytes();
-    memmem::find(dir_full.as_ref(), needle_b).is_some()
+    let hay = parent_path_haystack(store, entry_idx);
+    let needle = path_key(parent_needle);
+    if needle.is_empty() {
+        return true;
+    }
+    hay.contains(&needle)
 }
 
 /// 目录深度（按 `\` 分段，至少为 1）
@@ -2167,32 +2200,77 @@ fn name_match_phase(
 fn apply_post_name_filters(
     store: &IndexStore,
     q: &ParsedQuery,
+    opt: &SearchOptions,
     mut hits: Vec<u32>,
 ) -> Result<Vec<u32>> {
+    #[cfg(feature = "pinyin")]
+    let pin_start = if opt.allow_pinyin && !q.no_pinyin {
+        q.starts_with
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(build_pinyin_matcher)
+            .transpose()?
+    } else {
+        None
+    };
+    #[cfg(feature = "pinyin")]
+    let pin_end = if opt.allow_pinyin && !q.no_pinyin {
+        q.ends_with
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(build_pinyin_matcher)
+            .transpose()?
+    } else {
+        None
+    };
+    #[cfg(not(feature = "pinyin"))]
+    let _ = opt;
+
     if let Some(ref sw) = q.starts_with {
         let swb = sw.as_bytes();
         hits.retain(|&idx| {
             let n = store.name_bytes(&store.entries[idx as usize]);
             if q.case_sensitive {
-                n.starts_with(swb)
-            } else {
-                n.eq_ignore_ascii_case(swb)
-                    || std::str::from_utf8(n)
-                        .map(|s| s.to_ascii_lowercase().starts_with(sw))
-                        .unwrap_or(false)
+                return n.starts_with(swb);
             }
+            let lit = std::str::from_utf8(n)
+                .map(|s| s.to_ascii_lowercase().starts_with(sw))
+                .unwrap_or(false);
+            if lit {
+                return true;
+            }
+            #[cfg(feature = "pinyin")]
+            if let Some(re) = pin_start.as_ref() {
+                if let Ok(name) = std::str::from_utf8(n) {
+                    if let Some(m) = re.find(name) {
+                        return m.start() == 0;
+                    }
+                }
+            }
+            false
         });
     }
     if let Some(ref ew) = q.ends_with {
         hits.retain(|&idx| {
             let n = store.name_bytes(&store.entries[idx as usize]);
             if q.case_sensitive {
-                n.ends_with(ew.as_bytes())
-            } else {
-                std::str::from_utf8(n)
-                    .map(|s| s.to_ascii_lowercase().ends_with(ew.as_str()))
-                    .unwrap_or(false)
+                return n.ends_with(ew.as_bytes());
             }
+            let lit = std::str::from_utf8(n)
+                .map(|s| s.to_ascii_lowercase().ends_with(ew.as_str()))
+                .unwrap_or(false);
+            if lit {
+                return true;
+            }
+            #[cfg(feature = "pinyin")]
+            if let Some(re) = pin_end.as_ref() {
+                if let Ok(name) = std::str::from_utf8(n) {
+                    if let Some(m) = re.find(name) {
+                        return m.end() == name.len();
+                    }
+                }
+            }
+            false
         });
     }
     if q.len_min.is_some() || q.len_max.is_some() {

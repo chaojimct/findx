@@ -1248,6 +1248,7 @@ dependencies = [
  "fxhash",
  "glob",
  "ib-matcher",
+ "libc",
  "memchr",
  "memmap2",
  "parking_lot",
@@ -1262,7 +1263,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-gui"
-version = "2.2.3"
+version = "2.3.0"
 dependencies = [
  "arboard",
  "base64 0.22.1",

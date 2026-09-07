@@ -52,7 +52,7 @@ use crate::Result;
 const TRI_MAGIC: u32 = u32::from_le_bytes(*b"FTRI");
 const TRI_VERSION: u32 = 1;
 
-/// 给一段 mmap 区域发预取提示（Windows 8+ `PrefetchVirtualMemory`，其他平台 / 老系统 no-op）。
+/// 给一段 mmap 区域发预取提示（Windows 8+ `PrefetchVirtualMemory`，Unix `posix_madvise`）。
 ///
 /// 动机：mmap 挂载后首次访问要吃逐页 page fault——49.8 MiB 的边车 ≈ 12k 次 fault，
 /// 表现为「服务启动后第一查比后续慢一个量级」。该 API 让内核一次性把整段顺序读入页缓存。
@@ -107,7 +107,21 @@ pub(crate) fn prefetch_mmap(bytes: &[u8]) {
             unsafe { f(-1, 1, &entry, 0) };
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        if bytes.is_empty() {
+            return;
+        }
+        // POSIX_MADV_WILLNEED：提示内核尽快把这段顺序读进页缓存，失败无害。
+        unsafe {
+            let _ = libc::posix_madvise(
+                bytes.as_ptr() as *mut libc::c_void,
+                bytes.len(),
+                libc::POSIX_MADV_WILLNEED,
+            );
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         let _ = bytes;
     }

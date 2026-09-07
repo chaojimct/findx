@@ -212,10 +212,17 @@ impl QueryParser {
                 break;
             }
 
+            // Unix 绝对路径：`/Users/foo weixin` 与 `path:` 一样做路径过滤，不把 `/...` 当拼音词。
+            if is_unix_path_token(token) {
+                q.path_match = Some(expand_home(token).to_ascii_lowercase());
+                continue;
+            }
+
             // `!keyword`
             if let Some(inner) = token.strip_prefix('!').map(str::trim) {
+                let inner = take_pinyin_suffix(&mut q, inner);
                 if !inner.is_empty() {
-                    q.not_substring = Some(norm_case(&q, inner.to_string()));
+                    q.not_substring = Some(norm_case(&q, inner));
                 }
                 continue;
             }
@@ -300,31 +307,13 @@ fn apply_func(q: &mut ParsedQuery, key: &str, val: &str) -> std::result::Result<
             q.regex_pattern = Some(val.to_string());
         }
         "path" => {
-            q.path_match = Some(val.trim().to_ascii_lowercase());
+            q.path_match = Some(expand_home(val.trim()).to_ascii_lowercase());
         }
         "parent" | "infolder" => {
-            let mut p = val.replace('/', "\\").to_ascii_lowercase();
-            if p.len() >= 2 {
-                let b = p.as_bytes();
-                if b[0].is_ascii_alphabetic() && b[1] == b':' {
-                    q.drive = Some(p.as_bytes()[0].to_ascii_uppercase() as char);
-                    p = p[2..].trim_start_matches('\\').to_string();
-                }
-            }
-            q.parent_path = Some(p.trim_matches('\\').to_string());
-            q.parent_path_substring = false;
+            apply_parent_path(q, val, false);
         }
         "parentcontains" => {
-            let mut p = val.replace('/', "\\").to_ascii_lowercase();
-            if p.len() >= 2 {
-                let b = p.as_bytes();
-                if b[0].is_ascii_alphabetic() && b[1] == b':' {
-                    q.drive = Some(p.as_bytes()[0].to_ascii_uppercase() as char);
-                    p = p[2..].trim_start_matches('\\').to_string();
-                }
-            }
-            q.parent_path = Some(p.trim_matches('\\').to_string());
-            q.parent_path_substring = true;
+            apply_parent_path(q, val, true);
         }
         "nosubfolders" => {
             let v = val.trim().to_ascii_lowercase();
@@ -332,33 +321,11 @@ fn apply_func(q: &mut ParsedQuery, key: &str, val: &str) -> std::result::Result<
         }
         "file" => {
             q.only_files = true;
-            let v = val.trim();
-            if !v.is_empty() {
-                if v.contains('*') || v.contains('?') {
-                    q.glob_pattern = Some(v.to_string());
-                } else {
-                    let tnorm = norm_case(q, v.to_string());
-                    q.name_terms.push(tnorm.clone());
-                    if q.substring.is_none() {
-                        q.substring = Some(tnorm);
-                    }
-                }
-            }
+            apply_named_needle(q, val);
         }
         "folder" => {
             q.only_dirs = true;
-            let v = val.trim();
-            if !v.is_empty() {
-                if v.contains('*') || v.contains('?') {
-                    q.glob_pattern = Some(v.to_string());
-                } else {
-                    let tnorm = norm_case(q, v.to_string());
-                    q.name_terms.push(tnorm.clone());
-                    if q.substring.is_none() {
-                        q.substring = Some(tnorm);
-                    }
-                }
-            }
+            apply_named_needle(q, val);
         }
         "case" => {
             let v = val.trim().to_ascii_lowercase();
@@ -373,8 +340,18 @@ fn apply_func(q: &mut ParsedQuery, key: &str, val: &str) -> std::result::Result<
             let v = val.trim().to_ascii_lowercase();
             q.whole_filename = v != "0" && v != "false" && v != "no";
         }
-        "startwith" => q.starts_with = Some(norm_case(q, val.to_string())),
-        "endwith" => q.ends_with = Some(norm_case(q, val.to_string())),
+        "startwith" => {
+            let v = take_pinyin_suffix(q, val.trim());
+            if !v.is_empty() {
+                q.starts_with = Some(norm_case(q, v));
+            }
+        }
+        "endwith" => {
+            let v = take_pinyin_suffix(q, val.trim());
+            if !v.is_empty() {
+                q.ends_with = Some(norm_case(q, v));
+            }
+        }
         "len" => parse_len(q, val)?,
         "attrib" => q.attrib_must |= parse_attrib_letters(val),
         "sort" => parse_sort(q, val)?,
@@ -917,6 +894,75 @@ fn split_path_token(s: &str) -> (&str, &str) {
         i += 1;
     }
     (s, "")
+}
+
+fn is_unix_path_token(token: &str) -> bool {
+    token.starts_with('/') || token == "~" || token.starts_with("~/")
+}
+
+fn expand_home(token: &str) -> String {
+    if token != "~" && !token.starts_with("~/") {
+        return token.to_string();
+    }
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+    if home.is_empty() {
+        return token.to_string();
+    }
+    let home = home.trim_end_matches(['/', '\\']);
+    if token == "~" {
+        home.to_string()
+    } else {
+        format!("{home}{}", &token[1..])
+    }
+}
+
+/// `file:beijing;py` / `startwith:wei;en` 与裸词 `;py` `;en` `;np` 对齐。
+fn take_pinyin_suffix(q: &mut ParsedQuery, raw: &str) -> String {
+    if let Some((base, suf)) = raw.rsplit_once(';') {
+        match suf {
+            "py" => {
+                q.pinyin_only = true;
+                return base.to_string();
+            }
+            "en" | "np" => {
+                q.no_pinyin = true;
+                return base.to_string();
+            }
+            _ => {}
+        }
+    }
+    raw.to_string()
+}
+
+fn apply_named_needle(q: &mut ParsedQuery, val: &str) {
+    let v = take_pinyin_suffix(q, val.trim());
+    if v.is_empty() {
+        return;
+    }
+    if v.contains('*') || v.contains('?') {
+        q.glob_pattern = Some(v);
+        return;
+    }
+    let tnorm = norm_case(q, v);
+    q.name_terms.push(tnorm.clone());
+    if q.substring.is_none() {
+        q.substring = Some(tnorm);
+    }
+}
+
+fn apply_parent_path(q: &mut ParsedQuery, val: &str, substring: bool) {
+    let mut p = expand_home(val.trim()).replace('\\', "/").to_ascii_lowercase();
+    if p.len() >= 2 {
+        let b = p.as_bytes();
+        if b[0].is_ascii_alphabetic() && b[1] == b':' {
+            q.drive = Some(p.as_bytes()[0].to_ascii_uppercase() as char);
+            p = p[2..].trim_start_matches('/').to_string();
+        }
+    }
+    q.parent_path = Some(p.trim_matches('/').to_string());
+    q.parent_path_substring = substring;
 }
 
 fn next_token(s: &str) -> (&str, &str) {

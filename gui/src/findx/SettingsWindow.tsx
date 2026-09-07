@@ -288,7 +288,15 @@ export default function SettingsWindow() {
               })}
             </div>
 
-            <label>排除目录（每行一个完整路径，例如 C:\Windows\WinSxS）</label>
+            <label>
+              排除目录（每行一个完整路径，例如{" "}
+              {hostOs === "windows"
+                ? "C:\\Windows\\WinSxS"
+                : hostOs === "darwin" || hostOs === "macos"
+                  ? "/System/Volumes/Data/private/var/folders"
+                  : "/usr/share"}
+              ）
+            </label>
             <textarea
               value={(settings.excludedDirs ?? []).join("\n")}
               onChange={(e) =>
@@ -306,6 +314,18 @@ export default function SettingsWindow() {
               排除规则会写入 index.exclude.json，服务启动与增量监听都会过滤；
               修改后需要点「重建索引」才能彻底清掉历史已入库条目。
             </p>
+            {(hostOs === "darwin" || hostOs === "macos") && (
+              <p className="fx-hint">
+                macOS 扫整盘需要「系统设置 → 隐私与安全性 → 完全磁盘访问权限」勾选 FindX；
+                未授权时会改扫家目录，状态栏会提示原因。
+              </p>
+            )}
+            {hostOs === "linux" && (
+              <p className="fx-hint">
+                Linux 默认跳过 /proc、/sys、/dev 等虚拟挂载。无 CAP_SYS_ADMIN 时增量会降级为
+                inotify（非整盘实时），状态栏会提示。
+              </p>
+            )}
 
             <label>
               <input
@@ -317,6 +337,11 @@ export default function SettingsWindow() {
               />{" "}
               开启时间/大小元数据回填（默认开启）
             </label>
+            <p className="fx-hint">
+              {hostOs === "windows"
+                ? "Windows：fast 首遍走 MFT，后台按目录补齐大小与时间。"
+                : "macOS / Linux：fast 首遍只收文件名（不 stat），后台再按路径补齐大小与时间。"}
+            </p>
             {!(settings.enableMetadataBackfill ?? true) && (
               <p className="fx-warn">
                 ⚠ 关闭后 fast 首遍扫到的文件 size/mtime 将一直为 0，「按大小/时间」筛选与排序失效；
@@ -333,6 +358,11 @@ export default function SettingsWindow() {
               />{" "}
               首次建库直接读全量元数据（更慢，但即时可用）
             </label>
+            {hostOs !== "windows" && (
+              <p className="fx-hint">
+                开启后扫描时同步 statx / getattrlist，建库更慢，但按大小/时间筛选立刻准确。
+              </p>
+            )}
 
             <div className="fx-settings-row">
               <button
@@ -362,6 +392,14 @@ export default function SettingsWindow() {
               />{" "}
               默认拼音匹配
             </label>
+            <p className="fx-hint">
+              与 Windows 相同：全拼 <code>beijing</code>、简拼 <code>bj</code>、
+              <code>;py</code> 强制拼音、<code>;en</code>/<code>;np</code> 关拼音。
+              <code>ext:</code> <code>file:</code> <code>folder:</code> <code>startwith:</code>{" "}
+              <code>endwith:</code> <code>path:</code> <code>parent:</code> <code>|</code>{" "}
+              <code>!</code> 均可叠拼音。Unix 路径用 <code>/home/foo</code> 或{" "}
+              <code>~/Documents</code>，不要写成盘符。
+            </p>
             <label>结果条数上限</label>
             <input
               type="text"
@@ -404,8 +442,9 @@ export default function SettingsWindow() {
               </>
             ) : (
               <p className="fx-hint">
-                macOS / Linux 以用户进程常驻（LaunchAgent / systemd --user），完整磁盘访问或 root
-                才能扫整盘；未授权时只索引可见目录。
+                当前由 GUI 以当前用户拉起 findx2-service，并不是 LaunchAgent / systemd 安装。
+                退出应用时会结束该进程；需要开机自启请自行添加登录项或用户级 systemd。
+                无完全磁盘访问或 CAP_SYS_ADMIN 时只能索引可见目录，增量可能降级。
               </p>
             )}
 

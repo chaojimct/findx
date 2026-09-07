@@ -17,6 +17,9 @@ pub(crate) fn run_foreground(
     pipe_name: String,
     save_interval_secs: u64,
     extra_excluded: Vec<String>,
+    full_stat: bool,
+    no_backfill: bool,
+    max_scan_threads: usize,
 ) -> anyhow::Result<()> {
     let socket = findx2_ipc::unix_socket_path(&pipe_name);
     info!("Unix 服务：index={} socket={}", index.display(), socket.display());
@@ -40,7 +43,7 @@ pub(crate) fn run_foreground(
         load_index_bin(&index)?
     } else {
         info!("index.bin 不存在，开始全量建库…");
-        build_unix_index(&index, &volume, &extra_excluded)?
+        build_unix_index(&index, &volume, &extra_excluded, full_stat, max_scan_threads)?
     };
     if !extra_excluded.is_empty() {
         store.excluded_dirs = extra_excluded.clone();
@@ -51,6 +54,31 @@ pub(crate) fn run_foreground(
     {
         let mut g = slot.write().map_err(|e| anyhow::anyhow!("{e}"))?;
         *g = Some(engine.clone());
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(note) = findx2_macos::take_scan_note() {
+        set_watch_error_id("macos", Some(note));
+    }
+    if engine.index_store().trigram.is_none() {
+        let eng = engine.clone();
+        let idx = index.clone();
+        let _ = std::thread::Builder::new()
+            .name("findx2-trigram-rebuild".into())
+            .spawn(move || {
+                if let Err(e) = eng.rebuild_trigram_sidecar(&idx) {
+                    warn!("trigram：启动补建失败: {e}");
+                } else {
+                    info!("trigram：启动补建完成");
+                }
+            });
+    }
+    if no_backfill {
+        info!("已通过 --no-backfill 关闭后台元数据回填");
+        engine.set_backfill_error(Some(
+            "元数据回填已关闭（设置或 --no-backfill）；时间与大小筛选可能不准".into(),
+        ));
+    } else {
+        crate::backfill::spawn_backfill(engine.clone(), index.clone());
     }
 
     let volume = normalize_unix_volume(&volume);
@@ -103,11 +131,16 @@ pub(crate) fn run_foreground(
                     }
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                #[cfg(target_os = "linux")]
+                if let Some(note) = findx2_linux::take_watch_note() {
+                    set_watch_error_id("linux", Some(note));
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 error!("监听通道断开，尝试重建卷…");
                 set_watch_error_id("unix", Some("增量监听中断，正在重建".into()));
-                match rebuild_unix(&engine, &index, &roots) {
+                match rebuild_unix(&engine, &index, &roots, full_stat, max_scan_threads) {
                     Ok(()) => set_watch_error_id("unix", None),
                     Err(e) => {
                         set_watch_error_id("unix", Some(e.to_string()));
@@ -118,6 +151,17 @@ pub(crate) fn run_foreground(
         }
         if last_save.elapsed() >= save_every {
             persist(&engine, &index)?;
+            if engine.index_store().tri_pending_overflow() {
+                let eng = engine.clone();
+                let idx = index.clone();
+                let _ = std::thread::Builder::new()
+                    .name("findx2-trigram-rebuild".into())
+                    .spawn(move || {
+                        if let Err(e) = eng.rebuild_trigram_sidecar(&idx) {
+                            warn!("trigram：增量重建失败: {e}");
+                        }
+                    });
+            }
             last_save = Instant::now();
         }
     }
@@ -172,6 +216,8 @@ fn build_unix_index(
     output: &PathBuf,
     volume: &str,
     extra_excluded: &[String],
+    full_stat: bool,
+    max_scan_threads: usize,
 ) -> anyhow::Result<findx2_core::IndexStore> {
     let roots = if normalize_unix_volume(volume).is_empty() {
         Vec::new()
@@ -185,17 +231,17 @@ fn build_unix_index(
     let exclude = extra_excluded.to_vec();
     #[cfg(target_os = "macos")]
     {
-        return findx2_macos::build_full_disk_index(output, roots, exclude)
+        return findx2_macos::build_full_disk_index(output, roots, exclude, full_stat, max_scan_threads)
             .map_err(|e| anyhow::anyhow!("{e}"));
     }
     #[cfg(target_os = "linux")]
     {
-        return findx2_linux::build_full_disk_index(output, roots, exclude)
+        return findx2_linux::build_full_disk_index(output, roots, exclude, full_stat, max_scan_threads)
             .map_err(|e| anyhow::anyhow!("{e}"));
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (output, roots, exclude);
+        let _ = (output, roots, exclude, full_stat, max_scan_threads);
         anyhow::bail!("当前 Unix 平台未实现建库");
     }
 }
@@ -224,13 +270,23 @@ fn platform_watch(
     }
 }
 
-fn rebuild_unix(engine: &Arc<SearchEngine>, index: &PathBuf, roots: &[String]) -> anyhow::Result<()> {
+fn rebuild_unix(
+    engine: &Arc<SearchEngine>,
+    index: &PathBuf,
+    roots: &[String],
+    full_stat: bool,
+    max_scan_threads: usize,
+) -> anyhow::Result<()> {
     info!("Unix 卷重建：{:?}", roots);
-    let fresh = build_unix_index(index, &roots.join(","), &[])?;
+    let fresh = build_unix_index(index, &roots.join(","), &[], full_stat, max_scan_threads)?;
     {
         let mut g = engine.index_store_mut();
         *g = fresh;
     }
     persist(engine, index)?;
+    #[cfg(target_os = "macos")]
+    if let Some(note) = findx2_macos::take_scan_note() {
+        set_watch_error_id("macos", Some(note));
+    }
     Ok(())
 }

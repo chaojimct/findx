@@ -14,7 +14,7 @@ name = "fx"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["pinyin"]
 pinyin = ["findx2-core/pinyin"]
 
 [dependencies]

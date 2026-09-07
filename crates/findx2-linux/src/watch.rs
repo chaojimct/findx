@@ -5,12 +5,24 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use findx2_core::index::unix_secs_to_filetime;
 use findx2_core::{ChangeEvent, ChangeWatcher, Result, WatchCursor};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+
+static LAST_WATCH_NOTE: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn take_watch_note() -> Option<String> {
+    LAST_WATCH_NOTE.lock().ok().and_then(|mut g| g.take())
+}
+
+fn set_watch_note(msg: impl Into<String>) {
+    if let Ok(mut g) = LAST_WATCH_NOTE.lock() {
+        *g = Some(msg.into());
+    }
+}
 
 pub struct LinuxChangeWatcher {
     pub roots: Vec<String>,
@@ -56,6 +68,9 @@ pub fn watch_loop(roots: &[String], cursor: WatchCursor, tx: Sender<ChangeEvent>
         });
     }
     findx2_core::progress!("Linux：fanotify 不可用（无 CAP_SYS_ADMIN），降级 inotify（非整盘实时）");
+    set_watch_note(
+        "无 CAP_SYS_ADMIN，增量已降级为 inotify（非整盘实时；重启可能漏事件）",
+    );
     watch_inotify(roots, tx)?;
     Ok(WatchCursor {
         watch_gen: cursor.watch_gen.saturating_add(1).max(1),

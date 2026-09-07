@@ -56,8 +56,8 @@ enum Commands {
         query: String,
         #[arg(long)]
         json: bool,
-        /// 启用拼音（需构建时启用 findx2-core 的 `pinyin` feature）
-        #[arg(long, default_value_t = false)]
+        /// 启用拼音（默认开启，与 GUI 一致；`--pinyin=false` 关闭）
+        #[arg(long, default_value_t = true)]
         pinyin: bool,
         /// 输出列（默认全部）
         #[arg(long, value_delimiter = ',', alias = "cols")]
@@ -81,7 +81,7 @@ enum Commands {
         query: String,
         #[arg(long)]
         json: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = true)]
         pinyin: bool,
         #[arg(long, default_value_t = 500)]
         limit: usize,
@@ -165,7 +165,7 @@ fn run() -> Result<()> {
 
             #[cfg(target_os = "macos")]
             {
-                let _ = (full_stat, max_scan_threads, progress_file);
+                let _ = progress_file;
                 let roots = match (volumes, volume) {
                     (Some(vs), _) if !vs.is_empty() => vs
                         .into_iter()
@@ -183,18 +183,30 @@ fn run() -> Result<()> {
                     }
                     _ => Vec::new(),
                 };
-                findx2_macos::build_full_disk_index(&output, roots, exclude_dir)?;
+                findx2_macos::build_full_disk_index(
+                    &output,
+                    roots,
+                    exclude_dir,
+                    full_stat,
+                    max_scan_threads,
+                )?;
             }
 
             #[cfg(target_os = "linux")]
             {
-                let _ = (full_stat, max_scan_threads, progress_file);
+                let _ = progress_file;
                 let roots = match (volumes, volume) {
                     (Some(vs), _) if !vs.is_empty() => vs,
                     (_, Some(v)) => vec![v],
                     _ => Vec::new(),
                 };
-                findx2_linux::build_full_disk_index(&output, roots, exclude_dir)?;
+                findx2_linux::build_full_disk_index(
+                    &output,
+                    roots,
+                    exclude_dir,
+                    full_stat,
+                    max_scan_threads,
+                )?;
             }
         }
         Commands::Search {

@@ -587,6 +587,9 @@ fn install_args_for_settings(settings: &FindxGuiSettings, index: &Path, vol: &st
     if !settings.enable_everything_ipc {
         params.push_str(" --no-everything-ipc");
     }
+    if settings.first_index_full_metadata {
+        params.push_str(" --full-stat");
+    }
     if !settings.enable_metadata_backfill {
         params.push_str(" --no-backfill");
     }
@@ -636,6 +639,9 @@ fn start_service_mode_process(
             .creation_flags(CREATE_NO_WINDOW);
         if !settings.enable_everything_ipc {
             cmd.arg("--no-everything-ipc");
+        }
+        if settings.first_index_full_metadata {
+            cmd.arg("--full-stat");
         }
         if !settings.enable_metadata_backfill {
             cmd.arg("--no-backfill");
@@ -759,6 +765,9 @@ pub fn spawn_findx_service_process<R: Runtime>(app: tauri::AppHandle<R>) -> Resu
         if !settings.enable_everything_ipc {
             cmd.arg("--no-everything-ipc");
         }
+        if settings.first_index_full_metadata {
+            cmd.arg("--full-stat");
+        }
         if !settings.enable_metadata_backfill {
             cmd.arg("--no-backfill");
         }
@@ -800,6 +809,9 @@ pub fn spawn_findx_service_process<R: Runtime>(app: tauri::AppHandle<R>) -> Resu
                 if !settings.enable_everything_ipc {
                     params.push_str(" --no-everything-ipc");
                 }
+                if settings.first_index_full_metadata {
+                    params.push_str(" --full-stat");
+                }
                 if !settings.enable_metadata_backfill {
                     params.push_str(" --no-backfill");
                 }
@@ -828,6 +840,9 @@ pub fn spawn_findx_service_process<R: Runtime>(app: tauri::AppHandle<R>) -> Resu
         cmd.arg("--pipe").arg(pipe);
         cmd.arg("--save-interval-secs")
             .arg(settings.save_interval_secs.max(1).to_string());
+        if settings.first_index_full_metadata {
+            cmd.arg("--full-stat");
+        }
         if !settings.enable_metadata_backfill {
             cmd.arg("--no-backfill");
         }

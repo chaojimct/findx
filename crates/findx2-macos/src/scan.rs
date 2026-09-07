@@ -1,17 +1,20 @@
 //! macOS：`getattrlistbulk` 按目录批量拉 inode / 名字 / 时间 / 大小。
 //! 只扫 Data 卷（或用户指定根），不读文件内容（避免把 iCloud 占位拉回本地）。
 
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use findx2_core::index::unix_secs_to_filetime;
 use findx2_core::{progress, RawEntry, Result, VolumeScanner, WatchCursor};
 use libc::{
-    attrlist, getattrlistbulk, open, timespec, ATTR_BIT_MAP_COUNT, ATTR_CMN_CRTIME,
-    ATTR_CMN_FILEID, ATTR_CMN_MODTIME, ATTR_CMN_NAME, ATTR_CMN_OBJTYPE, ATTR_CMN_PARENTID,
-    ATTR_CMN_RETURNED_ATTRS, ATTR_FILE_DATALENGTH, O_DIRECTORY, O_RDONLY,
+    attrlist, fstat, getattrlistbulk, open, stat as libc_stat, timespec, ATTR_BIT_MAP_COUNT,
+    ATTR_CMN_CRTIME, ATTR_CMN_FILEID, ATTR_CMN_MODTIME, ATTR_CMN_NAME, ATTR_CMN_OBJTYPE,
+    ATTR_CMN_PARENTID, ATTR_CMN_RETURNED_ATTRS, ATTR_FILE_DATALENGTH, O_DIRECTORY, O_RDONLY,
 };
 
 /// `sys/attr.h`：libc 未导出 `ATTR_CMN_ERROR`。
@@ -59,7 +62,31 @@ pub fn current_fsevents_id() -> u64 {
     crate::watch::current_event_id()
 }
 
-pub struct MacosVolumeScanner;
+pub struct MacosVolumeScanner {
+    pub full_stat: bool,
+    pub max_threads: usize,
+}
+
+impl Default for MacosVolumeScanner {
+    fn default() -> Self {
+        Self {
+            full_stat: false,
+            max_threads: 0,
+        }
+    }
+}
+
+static LAST_SCAN_NOTE: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn take_scan_note() -> Option<String> {
+    LAST_SCAN_NOTE.lock().ok().and_then(|mut g| g.take())
+}
+
+fn set_scan_note(msg: impl Into<String>) {
+    if let Ok(mut g) = LAST_SCAN_NOTE.lock() {
+        *g = Some(msg.into());
+    }
+}
 
 impl VolumeScanner for MacosVolumeScanner {
     fn scan_into(
@@ -73,24 +100,22 @@ impl VolumeScanner for MacosVolumeScanner {
             volume.to_string()
         };
         progress!("macOS 扫描：打开 {} …", root);
-        let mut n = 0u64;
-        if let Err(e) = scan_tree(Path::new(&root), out, &mut n) {
-            let home = std::env::var("HOME").unwrap_or_default();
-            if !home.is_empty() && root != home {
-                progress!("无法打开 {}（{}），改扫 {}", root, e, home);
-                n = 0;
-                scan_tree(Path::new(&home), out, &mut n)?;
-            } else {
-                return Err(e);
+        let first = scan_tree_parallel(Path::new(&root), self.full_stat, self.max_threads, out);
+        let n = match first {
+            Ok(n) if n > 0 => n,
+            other => {
+                let home = std::env::var("HOME").unwrap_or_default();
+                if home.is_empty() || root == home {
+                    other?
+                } else {
+                    set_scan_note(
+                        "未能扫描整盘（需要「系统设置 → 隐私与安全性 → 完全磁盘访问权限」勾选 FindX），已改扫家目录",
+                    );
+                    progress!("无法打开或枚举 {}，改扫 {}", root, home);
+                    scan_tree_parallel(Path::new(&home), self.full_stat, self.max_threads, out)?
+                }
             }
-        }
-        if n == 0 {
-            let home = std::env::var("HOME").unwrap_or_default();
-            if !home.is_empty() && root != home {
-                progress!("扫描 {} 得到 0 条，改扫 {}", root, home);
-                scan_tree(Path::new(&home), out, &mut n)?;
-            }
-        }
+        };
         progress!("macOS 扫描完成：{} 条", n);
         Ok(WatchCursor {
             watch_gen: 1,
@@ -108,7 +133,34 @@ pub fn default_scan_root() -> String {
     }
 }
 
-fn scan_tree(root: &Path, out: &mut dyn FnMut(RawEntry) -> Result<()>, n: &mut u64) -> Result<()> {
+struct DirJob {
+    fd: i32,
+}
+
+struct Queue {
+    jobs: Mutex<VecDeque<DirJob>>,
+    wait: Condvar,
+    inflight: AtomicUsize,
+}
+
+fn resolve_threads(max_threads: usize) -> usize {
+    let auto = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16);
+    if max_threads == 0 {
+        auto
+    } else {
+        max_threads.clamp(1, 16)
+    }
+}
+
+fn scan_tree_parallel(
+    root: &Path,
+    full_stat: bool,
+    max_threads: usize,
+    out: &mut dyn FnMut(RawEntry) -> Result<()>,
+) -> Result<u64> {
     let c_path = CString::new(root.as_os_str().as_bytes())
         .map_err(|_| findx2_core::Error::Platform("扫描根路径含 NUL".into()))?;
     let fd = unsafe { open(c_path.as_ptr(), O_RDONLY | O_DIRECTORY) };
@@ -119,22 +171,107 @@ fn scan_tree(root: &Path, out: &mut dyn FnMut(RawEntry) -> Result<()>, n: &mut u
             std::io::Error::last_os_error()
         )));
     }
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    scan_dirfd(owned.as_raw_fd(), out, n)
+    let mut st: libc_stat = unsafe { std::mem::zeroed() };
+    if unsafe { fstat(fd, &mut st) } != 0 {
+        unsafe { libc::close(fd) };
+        return Err(findx2_core::Error::Platform(format!(
+            "fstat {}: {}",
+            root.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    let root_ino = st.st_ino;
+    let threads = resolve_threads(max_threads);
+    progress!(
+        "macOS 扫描：{} 线程，{}",
+        threads,
+        if full_stat { "带元数据" } else { "fast（稍后回填）" }
+    );
+    let q = Arc::new(Queue {
+        jobs: Mutex::new(VecDeque::from([DirJob { fd }])),
+        wait: Condvar::new(),
+        inflight: AtomicUsize::new(1),
+    });
+    let counted = Arc::new(AtomicU64::new(0));
+    let shards: Arc<Mutex<Vec<Vec<RawEntry>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let q = Arc::clone(&q);
+            let shards = Arc::clone(&shards);
+            let counted = Arc::clone(&counted);
+            scope.spawn(move || {
+                let mut local = Vec::<RawEntry>::new();
+                loop {
+                    let job = {
+                        let mut guard = q.jobs.lock().unwrap();
+                        loop {
+                            if let Some(j) = guard.pop_front() {
+                                break j;
+                            }
+                            if q.inflight.load(Ordering::Acquire) == 0 {
+                                q.wait.notify_all();
+                                if let Ok(mut g) = shards.lock() {
+                                    g.push(std::mem::take(&mut local));
+                                }
+                                return;
+                            }
+                            guard = q.wait.wait(guard).unwrap();
+                        }
+                    };
+                    enumerate_dirfd(job.fd, full_stat, &q, &mut local, &counted);
+                    let left = q.inflight.fetch_sub(1, Ordering::AcqRel) - 1;
+                    if left == 0 {
+                        q.wait.notify_all();
+                    }
+                }
+            });
+        }
+    });
+
+    out(RawEntry {
+        file_id: root_ino,
+        file_id_128: None,
+        parent_id: 0,
+        name: String::new(),
+        size: 0,
+        mtime: 0,
+        ctime: 0,
+        attrs: 0x10,
+        is_dir: true,
+    })?;
+    let mut n = 1u64;
+    let mut acc = shards.lock().unwrap();
+    for batch in acc.drain(..) {
+        for e in batch {
+            out(e)?;
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
-fn scan_dirfd(dirfd: i32, out: &mut dyn FnMut(RawEntry) -> Result<()>, n: &mut u64) -> Result<()> {
+fn enumerate_dirfd(
+    dirfd: i32,
+    full_stat: bool,
+    q: &Queue,
+    local: &mut Vec<RawEntry>,
+    counted: &AtomicU64,
+) {
+    let owned = unsafe { OwnedFd::from_raw_fd(dirfd) };
+    let dirfd = owned.as_raw_fd();
     let mut attrs: attrlist = unsafe { std::mem::zeroed() };
     attrs.bitmapcount = ATTR_BIT_MAP_COUNT as u16;
     attrs.commonattr = ATTR_CMN_RETURNED_ATTRS
         | ATTR_CMN_NAME
         | ATTR_CMN_ERROR
         | ATTR_CMN_OBJTYPE
-        | ATTR_CMN_CRTIME
-        | ATTR_CMN_MODTIME
         | ATTR_CMN_FILEID
         | ATTR_CMN_PARENTID;
-    attrs.fileattr = ATTR_FILE_DATALENGTH;
+    if full_stat {
+        attrs.commonattr |= ATTR_CMN_CRTIME | ATTR_CMN_MODTIME;
+        attrs.fileattr = ATTR_FILE_DATALENGTH;
+    }
 
     let mut buf = vec![0u8; 256 * 1024];
     loop {
@@ -147,16 +284,9 @@ fn scan_dirfd(dirfd: i32, out: &mut dyn FnMut(RawEntry) -> Result<()>, n: &mut u
                 0,
             )
         };
-        if count < 0 {
-            return Err(findx2_core::Error::Platform(format!(
-                "getattrlistbulk: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        if count == 0 {
+        if count <= 0 {
             break;
         }
-        let mut kids: Vec<(i32, bool)> = Vec::new();
         let mut off = 0usize;
         for _ in 0..count {
             if off + 4 > buf.len() {
@@ -170,10 +300,10 @@ fn scan_dirfd(dirfd: i32, out: &mut dyn FnMut(RawEntry) -> Result<()>, n: &mut u
             if let Some((entry, is_dir, is_link)) = parse_record(rec) {
                 if !should_skip_name(&entry.name) {
                     let name_c = CString::new(entry.name.as_bytes()).ok();
-                    out(entry)?;
-                    *n += 1;
-                    if *n % 100_000 == 0 {
-                        progress!("macOS 扫描：已枚举 {} 条 …", n);
+                    local.push(entry);
+                    let n = counted.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n % 100_000 == 0 {
+                        progress!("macOS 扫描：已枚举 {n} 条 …");
                     }
                     if is_dir && !is_link {
                         if let Some(c) = name_c {
@@ -181,20 +311,17 @@ fn scan_dirfd(dirfd: i32, out: &mut dyn FnMut(RawEntry) -> Result<()>, n: &mut u
                                 libc::openat(dirfd, c.as_ptr(), O_RDONLY | O_DIRECTORY)
                             };
                             if child >= 0 {
-                                kids.push((child, true));
+                                q.inflight.fetch_add(1, Ordering::AcqRel);
+                                q.jobs.lock().unwrap().push_back(DirJob { fd: child });
+                                q.wait.notify_one();
                             }
                         }
                     }
                 }
             }
-        off += rec_len;
-        }
-        for (child_fd, _) in kids {
-            let owned = unsafe { OwnedFd::from_raw_fd(child_fd) };
-            let _ = scan_dirfd(owned.as_raw_fd(), out, n);
+            off += rec_len;
         }
     }
-    Ok(())
 }
 
 fn align4(p: usize) -> usize {

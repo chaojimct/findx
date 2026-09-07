@@ -13,7 +13,7 @@ pub use scan::{
     LinuxVolumeScanner,
 };
 #[cfg(target_os = "linux")]
-pub use watch::{watch_loop, LinuxChangeWatcher};
+pub use watch::{take_watch_note, watch_loop, LinuxChangeWatcher};
 
 #[cfg(not(target_os = "linux"))]
 pub struct LinuxVolumeScanner;
@@ -63,14 +63,21 @@ pub fn volume_id_for_path(path: &str) -> String {
     path.to_string()
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn take_watch_note() -> Option<String> {
+    None
+}
+
 pub fn build_full_disk_index(
     output: &std::path::Path,
     roots: Vec<String>,
     exclude_dir: Vec<String>,
+    full_stat: bool,
+    max_scan_threads: usize,
 ) -> Result<findx2_core::IndexStore> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (output, roots, exclude_dir);
+        let _ = (output, roots, exclude_dir, full_stat, max_scan_threads);
         return Err(findx2_core::Error::Platform(
             "findx2-linux 仅在 Linux 上可用".into(),
         ));
@@ -92,7 +99,11 @@ pub fn build_full_disk_index(
             findx2_core::progress!("Linux 建库：{}", root);
             let mut files = Vec::new();
             let mut dirs = Vec::new();
-            let cursor = LinuxVolumeScanner.scan_into(root, &mut |e| {
+            let scanner = LinuxVolumeScanner {
+                full_stat,
+                max_threads: max_scan_threads,
+            };
+            let cursor = scanner.scan_into(root, &mut |e| {
                 if e.is_dir {
                     dirs.push(e);
                 } else {
@@ -102,7 +113,7 @@ pub fn build_full_disk_index(
             })?;
             let store = IndexBuilder::new(0, 0, cursor.watch_gen, cursor.watch_cursor)
                 .with_unix_volume(volume_id_for_path(root), display_root_prefix(root))
-                .build_from_raw(files, dirs, true)?;
+                .build_from_raw(files, dirs, full_stat)?;
             stores.push(store);
         }
         let mut store = if stores.len() == 1 {
@@ -123,6 +134,9 @@ pub fn build_full_disk_index(
             let _ = std::fs::create_dir_all(parent);
         }
         save_index_bin(output, &store)?;
+        if let Err(e) = findx2_core::build_trigram_sidecar(&store, output) {
+            findx2_core::progress!("trigram 边车构建失败（搜索将回退全表扫描）: {e}");
+        }
         Ok(store)
     }
 }

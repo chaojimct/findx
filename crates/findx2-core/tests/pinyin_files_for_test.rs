@@ -157,6 +157,80 @@ fn pinyin_only_and_no_pinyin_modifiers() {
 }
 
 #[test]
+fn pinyin_file_folder_and_startwith_syntax() {
+    let engine = engine_from_fixture();
+    let n = names(&engine, "file:shanghai", true);
+    assert_hit_contains(&n, "陆家嘴");
+    assert!(n.iter().all(|s| !s.is_empty()));
+    let n = names(&engine, "startwith:bei", true);
+    assert_hit_contains(&n, "北京");
+    let n = names(&engine, "file:beijing;py", true);
+    assert_hit_contains(&n, "北京");
+}
+
+#[test]
+fn pinyin_not_excludes_chinese_name() {
+    let engine = engine_from_fixture();
+    let n = names(&engine, "ext:txt !beijing", true);
+    assert!(
+        !n.iter().any(|s| s.contains("北京")),
+        "拼音排除应去掉北京：{n:?}"
+    );
+}
+
+fn unix_engine_from_fixture() -> SearchEngine {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../files_for_test");
+    const ROOT_FRN: u64 = 100;
+    let dirs = vec![RawEntry {
+        file_id: ROOT_FRN,
+        file_id_128: None,
+        parent_id: 0,
+        name: String::new(),
+        size: 0,
+        mtime: 0,
+        ctime: 0,
+        attrs: 0x10,
+        is_dir: true,
+    }];
+    let mut files: Vec<RawEntry> = Vec::new();
+    let mut id: u64 = 10_000;
+    for e in std::fs::read_dir(&dir).expect("read_dir") {
+        let e = e.expect("dirent");
+        if !e.metadata().expect("metadata").is_file() {
+            continue;
+        }
+        files.push(RawEntry {
+            file_id: id,
+            file_id_128: None,
+            parent_id: ROOT_FRN,
+            name: e.file_name().to_string_lossy().into_owned(),
+            size: 1,
+            mtime: 1,
+            ctime: 1,
+            attrs: 0,
+            is_dir: false,
+        });
+        id += 1;
+    }
+    let store = IndexBuilder::new(0, 0, 1, 1)
+        .with_unix_volume("dev:test", "/tmp/findx-fixture")
+        .build_from_raw(files, dirs, true)
+        .expect("unix build_from_raw");
+    SearchEngine::new(store)
+}
+
+#[test]
+fn unix_path_syntax_with_pinyin() {
+    let engine = unix_engine_from_fixture();
+    let n = names(&engine, "/tmp/findx-fixture shanghai", true);
+    assert_hit_contains(&n, "陆家嘴");
+    let n = names(&engine, "path:/tmp/findx-fixture beijing", true);
+    assert_hit_contains(&n, "北京");
+    let n = names(&engine, "parent:/tmp/findx-fixture beijing", true);
+    assert_hit_contains(&n, "北京");
+}
+
+#[test]
 fn pinyin_disabled_no_match_on_chinese_name() {
     let engine = engine_from_fixture();
     let n = names(&engine, "beijing", false);

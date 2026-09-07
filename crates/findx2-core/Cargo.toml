@@ -26,6 +26,9 @@ serde_json = "1"
 thiserror = "1"
 ib-matcher = { version = "0.4", optional = true, features = ["regex", "pinyin"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [[bench]]
 name = "search_perf"
 harness = false

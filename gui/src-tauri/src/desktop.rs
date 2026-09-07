@@ -1021,10 +1021,7 @@ fn register_app_shortcut<R: Runtime>(
 }
 
 fn quit_background_app<R: Runtime>(app: &AppHandle<R>) {
-    #[cfg(windows)]
-    {
-        crate::findx_settings::stop_findx_service_detached();
-    }
+    crate::findx_settings::stop_findx_service_detached();
     if let Err(err) = persist_full_window_state_snapshot(app) {
         log_desktop_error("persist the desktop window layout before quitting", &err);
     }

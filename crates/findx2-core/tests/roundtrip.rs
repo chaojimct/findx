@@ -54,6 +54,31 @@ fn query_dm_gt_date_with_keyword_threshold_unix_sane() {
 
 /// GUI 类型筛选拼成 `folder: 关键词` / `file: 关键词`，冒号右侧须参与文件名匹配，不得仅保留类型位。
 #[test]
+fn query_unix_path_token_and_modifiers() {
+    let q = QueryParser::parse("/tmp/findx-fixture shanghai").unwrap();
+    assert_eq!(q.path_match.as_deref(), Some("/tmp/findx-fixture"));
+    assert!(q.name_terms.iter().any(|t| t == "shanghai"));
+
+    let q = QueryParser::parse("parent:/Users/foo beijing").unwrap();
+    assert_eq!(q.parent_path.as_deref(), Some("users/foo"));
+    assert!(!q.parent_path_substring);
+    assert!(q.name_terms.iter().any(|t| t == "beijing"));
+
+    let q = QueryParser::parse(r"parent:C:\Users\foo").unwrap();
+    assert_eq!(q.drive, Some('C'));
+    assert_eq!(q.parent_path.as_deref(), Some("users/foo"));
+
+    let q = QueryParser::parse("file:beijing;py").unwrap();
+    assert!(q.only_files);
+    assert!(q.pinyin_only);
+    assert!(q.name_terms.iter().any(|t| t == "beijing"));
+
+    let q = QueryParser::parse("startwith:bei;py").unwrap();
+    assert_eq!(q.starts_with.as_deref(), Some("bei"));
+    assert!(q.pinyin_only);
+}
+
+#[test]
 fn query_folder_file_modifier_keeps_keyword() {
     let q = QueryParser::parse("folder: 149").unwrap();
     assert!(q.only_dirs);
