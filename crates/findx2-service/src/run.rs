@@ -9,8 +9,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use findx2_core::{save_index_bin, SearchEngine};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
+use crate::load_state;
 use crate::watch_health::set_watch_error;
 
 /// 运行时开关：来自 CLI（`--no-everything-ipc` / `--no-backfill` / `--exclude-dir`）。
@@ -274,12 +275,45 @@ pub(crate) fn run_foreground(
 
     info!("加载索引 {:?}", index);
     let load_t0 = Instant::now();
-    let mut store = findx2_core::load_index_bin(&index)?;
+    // 千万级库要几十秒到几分钟；把阶段推进落到 load_state，Status IPC 才不是静默的
+    // 「加载中」——见 load_state 模块注释。
+    let mut store = match findx2_core::load_index_bin_with_progress(&index, &|p| {
+        load_state::note_phase(p);
+    }) {
+        Ok(s) => {
+            load_state::note_entry_count(s.entry_count() as u64);
+            load_state::note_finished();
+            s
+        }
+        Err(e) => {
+            load_state::note_finished();
+            return Err(e.into());
+        }
+    };
     info!(
         "索引加载完成：{} 条目（耗时 {:.2}s）",
         store.entry_count(),
         load_t0.elapsed().as_secs_f64()
     );
+
+    // 墓碑健康度体检：墓碑是只标记不删除的条目，会一直占 entries(32B)+frns(8B)，
+    // 且搜索热路径要逐条判 is_deleted()。超阈值时明确告知用户可压缩，而不是让它悄悄烂下去。
+    if store.should_compact() {
+        let n = store.entry_count();
+        let tomb = store.deleted.len();
+        let pct = (store.tombstone_ratio() * 100.0).round() as u64;
+        warn!("索引墓碑比偏高：{tomb} / {n}（{pct}%），建议压缩索引以回收空间");
+        // 挂在第一个卷的监听状态上：墓碑是全局的，但状态栏按卷显示，挂哪都一样。
+        if let Some(v) = store.volumes.first() {
+            let letter = (v.volume_letter as char).to_ascii_uppercase();
+            set_watch_error(
+                letter,
+                Some(format!(
+                    "索引 {pct}% 条目是墓碑（{tomb}/{n}），建议「压缩索引」回收空间"
+                )),
+            );
+        }
+    }
 
     // 合并 CLI 追加的排除目录到 store；并把命中条目一次性打墓碑，避免「sidecar 没改，CLI 临时加目录」时旧数据漏网。
     if !flags.extra_excluded_dirs.is_empty() {
@@ -762,45 +796,32 @@ fn rebuild_volume(
     Ok(())
 }
 
-/// 离线合并：旧卷区间墓碑 + 摘除旧 VolumeState + 新 store 后挂合并。
+/// 离线合并：**物理摘除**旧卷数据（不打墓碑）+ 新 store 后挂合并。
+///
+/// 历史：这里原本对旧卷区间逐条 `delete_entry`（只打墓碑不删除），因为物理删除
+/// 要牵动 `frns` / `dir_idx` / `dir_index` / `dir_path_ranges` 全套下标，当时判断
+/// 「重建成本高、容易破坏不变量」而选择打墓碑。代价是**条目数只增不减**：
+/// 每次全卷重建都把整卷旧数据留成永不回收的垃圾，实测某库 3.09 亿条目里 98.75%
+/// 是墓碑、17.7 GB 里约 16.5 GB 是废数据、加载要 80 s。
+///
+/// 现在 core 提供了 [`findx2_core::IndexStore::remove_volume_entries`]，用「先算保留集、
+/// 再整体重写」的方式统一重映射全部下标（不是逐个 remove），所以既物理回收了空间，
+/// 又不必手工维护下标一致性。
 fn merge_rebuilt_volume(
     mut old: findx2_core::IndexStore,
     fresh: findx2_core::IndexStore,
     letter: char,
 ) -> anyhow::Result<findx2_core::IndexStore> {
-    // 旧卷区间（按 first_entry_idx 排序后定位）。
-    let mut ranges: Vec<(char, u32)> = old
-        .volumes
-        .iter()
-        .map(|v| {
-            (
-                (v.volume_letter as char).to_ascii_uppercase(),
-                v.first_entry_idx,
-            )
-        })
-        .collect();
-    ranges.sort_by_key(|(_, idx)| *idx);
-    let (start, end) = match ranges.iter().position(|(l, _)| *l == letter) {
-        Some(p) => {
-            let s = ranges[p].1 as usize;
-            let e = if p + 1 < ranges.len() {
-                ranges[p + 1].1 as usize
-            } else {
-                old.entries.len()
-            };
-            (s, e.min(old.entries.len()))
-        }
-        None => {
-            // 卷不在旧索引里（理论上重建只发生在已有卷，防御性：纯追加）。
-            info!("卷 {letter} 不在旧索引中，重建退化为纯追加合并");
-            (0, 0)
-        }
-    };
-    for i in start..end {
-        old.delete_entry(i as u32);
+    let removed = old.remove_volume_entries(letter);
+    if removed == 0 {
+        info!("卷 {letter} 不在旧索引中，重建退化为纯追加合并");
+    } else {
+        info!(
+            "卷 {letter} 旧数据已物理摘除 {} 条（不打墓碑），旧库剩余 {} 条",
+            removed,
+            old.entry_count()
+        );
     }
-    old.volumes
-        .retain(|v| (v.volume_letter as char).to_ascii_uppercase() != letter);
     let excluded = old.excluded_dirs.clone();
     let mut merged = findx2_core::merge_index_stores(vec![old, fresh])
         .map_err(|e| anyhow::anyhow!("卷 {letter} 索引合并失败: {e}"))?;

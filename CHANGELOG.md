@@ -4,6 +4,72 @@
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-09-21
+
+### 功能
+
+- **`path:` 查询提速约 6.9×（实测 414 万条目库 6553.7 ms → 950.2 ms）**：现代 v6 索引为省内存**刻意不物化**目录全路径（与 Everything 一致），旧实现对每条命中沿 `dir_idx` 父链重建路径再匹配，400 万条目级实测 5.8–6.5 s。现在改为**两段式过滤**：按查询临时建一张「目录下标 → 小写目录路径」表（目录仅约 55 万、路径算一次就够），再用 needle 的「跨分隔符变体」（`s\alice` → `s` / `alice`）在名字与目录上标记直接命中并沿父链传播出候选超集，最后只在候选上精确拼路径校验。新增回归测试 `path_two_phase_filter_matches_naive_full_path_scan` 以朴素全路径扫描为基准，10 组查询（含骑缝跨分隔符、首尾分隔符、目录条目自身等边界）逐用例比对等价；其余 10 项查询无回归。
+- **设置页一键「压缩索引」**：此前压缩只能手动停服务、管理员终端跑 `findx2 compact`、再重启服务。现在 GUI 编排全程：自动停服务 → 提权运行 `findx2 compact`（已提权则直接执行；UAC 被取消也会把服务拉回，不会把用户留在「服务已停」状态）→ 自动重启服务 → 展示前后文件体积与回收量。Windows 走 `ShellExecute runas`，macOS / Linux 直接以当前用户运行（数据目录本就可写）。CLI 侧灾难性损失守卫（压缩后存活条目数异常时拒绝落盘）继续生效。
+- **设置页「索引体检」**：service 经 IPC `Status` 新增上报 `tombstone_count`（墓碑数，旧版 service 未上报时为空）。设置页显示墓碑占比；条目 ≥ 10 万且占比 > 25% 时给出「建议压缩」警示，与 service 自身体检（`should_compact`）同阈值。
+
+### 修复
+
+- **Unix 卷 `path:` 查询漏报全部命中**：两段式过滤的候选表只含目录相对路径，而 Unix 的 haystack 是
+  `root_prefix + / + 目录路径 + / + 名字`——「needle 跨过 root_prefix 与目录路径边界」的命中不被变体
+  覆盖，候选集为空导致一无所获（`unix_path_syntax_with_pinyin` 抓到）。现 Unix 卷直接回退全量精确
+  校验（保守但正确），并新增等价性回归 `path_unix_volume_matches_naive_full_path_scan` 逐 needle 对齐。
+- **Unix/macOS 设置页「重建索引」误报「仅支持 Windows」**：`start_indexing_impl` 的 Unix 分支（遍历建库、日志、自动拉服务）此前已完整实现，但 `rebuild_index` 的非 Windows 分支却直接返回错误未接入。现已接入：停 service（pkill）→ 删 `index.bin` 与 sidecar → 走既有 Unix 建库流程。
+
+### 其他
+
+- 清理编译警告：`win_preview` 两个保留的 WebView2 宿主定位函数标注 `allow(dead_code)`（独立顶级窗口方案后不再调用，留作排查窗口层级）、闭包多余的 `mut`；`desktop` 的 `WindowMode::Quick` 标注保留原因（quick 布局已退役，为旧窗口状态文件反序列化兼容保留）。
+
+## [2.4.0] - 2026-09-21
+
+### 功能
+
+- **索引加载过程可见**：此前 service 加载已存在的 `index.bin`（十万到上亿条目）期间，`Status` 只回报一个静止的 `loading=true`，界面长期显示「索引: 建库中」，与「卡死」无法区分。现在 core 的 `load_index_bin_with_progress` 会在每个阶段回调，service 把它落成进程级快照并经 IPC 透出 `loading_stage` / `loading_elapsed_secs` / `loading_phase_done` / `loading_phase_total`；状态栏显示真实阶段、已耗时与条目数，例如「索引: 加载中 · 解析条目（3/8 阶段，已 42s，共 3.1 亿条）」。字段全部 `#[serde(default)]`，与旧版 service / 旧版 GUI 双向兼容。
+- **设置页「随系统启动」开关**：登录时自动启动 FindX 托盘界面，走 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，无需管理员、幂等、失败可回报（写后立即回读校验）。真源是注册表，设置文件里的 `auto_start_app` 只是记录。非 Windows 平台明确返回「暂不支持」，不静默失败。
+
+### 修复
+
+- **frns 段计数上限过紧，3 亿条目级索引被判「损坏」而拒绝加载**：`persist.rs` 用一个固定常量 `64 * 1024 * 1024`（6710 万）给 `frns` 段的计数字段设上限，而该字段**设计上恒等于 `entry_count`**。本机实测索引为 309,031,075 条，远超该常量 → 加载直接返回 `Persist("frns 计数异常（过大）")`。叠加当时的加载过程不可观测（见上），界面表现就是「一直卡在建库中」。现改为**相对 `entry_count`** 的阈值（`entry_count × 8 + 1 MiB`），既能挡住乱字节/段错位解出的天文数字，也不会再误杀合法大库。`index_layout_probe` 示例的阈值标注同步改为同一个公式。
+
+- **墓碑只增不减，索引被撑爆（本机实测 98.75% 是墓碑）**：索引重建走「旧卷区间整段打墓碑 + 新条目后挂」的合并策略
+  （`findx2-service/src/run.rs` 的 `merge_rebuilt_volume` → `old.delete_entry(i)`），**只标记不物理删除**。
+  每次全卷重建都把该卷全部旧条目原地留为墓碑，条目数只增不减。本机 `index.bin` 实测：
+  309,031,075 条中 305,160,707 条是墓碑（98.75%），**存活仅 3,870,368 条**，即约 **80 条墓碑撑 1 条有效数据**；
+  文件 17.72 GB 中约 **16.5 GB 是废数据**；加载 **55–83 s**；内存下界约 21.9 GB，31 GB 机器上直接撞墙
+  （`names_buf` 的 `to_vec()` 一次就要 4.6 GB）；搜索热路径 `fused_scan` 要对 3.09 亿条逐个判 `is_deleted()`。
+  本版从**三个层面**一并解决：
+  1. **新增物理压缩 `IndexStore::compact_tombstones`**：把墓碑条目从索引里真正删掉，并统一重映射所有
+     与之耦合的下标（`entries` / `frns` / `dirs` / `dir_idx` / `dir_index` / `frn_to_entry` / `ext_filter` /
+     `dir_path_ranges` / `volumes[].first_entry_idx` / `tri_pending` / `cjk_names`），做完清零 `deleted`。
+     实现走「先算保留集、再整体重写」而不是逐个 `remove`，既避免 O(n²)，也不会漏改下标。
+  2. **掐断墓碑的产生源**：`merge_rebuilt_volume` 不再对旧卷逐条打墓碑，改为
+     `IndexStore::remove_volume_entries(letter)` —— 把该卷区间从 `entries` / `frns` **物理摘除**后
+     再走上面同一套重映射。全卷重建从此不再留下永不回收的垃圾。
+  3. **可日用入口 + 健康度体检**：
+     - `findx2 compact --index <index.bin> [--dry-run]` 一键压缩 + 原子落盘 + 自动重建 trigram 边车；
+     - `findx2 status` 增加墓碑数与占比展示；
+     - service 在加载完成后做体检，墓碑比超 25%（且条目数 ≥ 10 万）时落 `warn!` 并在状态栏提示
+       「索引 N% 条目是墓碑（tomb/n），建议「压缩索引」回收空间」。
+  回归测试 `compact_tombstones_keeps_index_consistent_and_search_equivalent` 逐项钉住：平行数组等长、
+  `ext_filter` 每桶下标与 `ext_hash` 一致、每条存活条目能解析出路径、`frn_to_entry` 与 `frns` 双向一致、
+  搜索等价（存活条目仍命中、墓碑条目消失、父目录被删的条目连带消失）、压缩后存盘→加载往返自洽。
+
+### 说明
+
+- **本开关只管托盘界面**：索引服务 `FindX2Search` 由 SCM 按 `AutoStart` 拉起，与这个开关无关；勾掉它不会停掉索引。
+- **压缩需要先停索引服务**：`index.bin` 归 `FindX2Search`（SYSTEM）所有，普通用户身份下无法独占写入。
+  压缩前请先停服务（`Stop-Service FindX2Search`，需管理员），压缩完再启动。
+
+### 修正的既有认知
+
+- **排除目录并不缩小索引体积**：`mark_excluded_entries` 同样只打墓碑（`index.rs` 注释已自述「索引体积没省」）。
+  因此想靠「把 `C:\Windows\WinSxS` 之类加进排除列表」来瘦身是无效的；必须走重建 + 在 USN 增量层用 sidecar 挡住。
+  现在也可以直接用 `findx2 compact` 把这批墓碑物理回收掉。
+
 ## [2.3.0] - 2026-09-07
 
 ### 功能
@@ -132,7 +198,9 @@
 
 - 仓库根目录补充 **MIT** 全文许可（`LICENSE`），与 `Cargo.toml` 工作区 `MIT OR Apache-2.0` 声明在 README 中说明对应关系。
 
-[Unreleased]: https://github.com/chaojimct/findx/compare/v2.3.0...HEAD
+[Unreleased]: https://github.com/chaojimct/findx/compare/v2.4.0...HEAD
+[2.4.1]: https://github.com/chaojimct/findx/compare/v2.4.0...v2.4.1
+[2.4.0]: https://github.com/chaojimct/findx/compare/v2.3.0...v2.4.0
 [2.3.0]: https://github.com/chaojimct/findx/compare/v2.2.3...v2.3.0
 [2.2.3]: https://github.com/chaojimct/findx/compare/v2.2.2...v2.2.3
 [2.2.2]: https://github.com/chaojimct/findx/compare/v2.2.1...v2.2.2

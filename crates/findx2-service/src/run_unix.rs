@@ -5,10 +5,11 @@ use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use findx2_core::{load_index_bin, save_index_bin, ChangeEvent, SearchEngine, WatchCursor};
+use findx2_core::{save_index_bin, ChangeEvent, SearchEngine, WatchCursor};
 use tracing::{error, info, warn};
 
 use crate::ipc_dispatch::EngineSlot;
+use crate::load_state;
 use crate::watch_health::set_watch_error_id;
 
 pub(crate) fn run_foreground(
@@ -40,7 +41,21 @@ pub(crate) fn run_foreground(
         })?;
 
     let mut store = if index.exists() {
-        load_index_bin(&index)?
+        // 与 Windows 侧一致：阶段推进写进 load_state，Unix socket 的 Status 才不静默。
+        let r = findx2_core::load_index_bin_with_progress(&index, &|p| {
+            load_state::note_phase(p);
+        });
+        match r {
+            Ok(s) => {
+                load_state::note_entry_count(s.entry_count() as u64);
+                load_state::note_finished();
+                s
+            }
+            Err(e) => {
+                load_state::note_finished();
+                return Err(e.into());
+            }
+        }
     } else {
         info!("index.bin 不存在，开始全量建库…");
         build_unix_index(&index, &volume, &extra_excluded, full_stat, max_scan_threads)?

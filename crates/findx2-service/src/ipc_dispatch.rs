@@ -19,20 +19,30 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
     let engine = slot.read().ok().and_then(|g| g.clone());
     match (req, engine) {
         (IpcRequest::Ping, _) => IpcResponse::Pong,
-        (IpcRequest::Status, None) => IpcResponse::StatusResult {
-            entry_count: 0,
-            dir_count: 0,
-            last_usn: 0,
-            journal_id: 0,
-            volume_letter: None,
-            healthy: false,
-            metadata_ready: false,
-            backfill_done: 0,
-            backfill_total: 0,
-            loading: true,
-            watch_error: crate::watch_health::watch_error_summary(),
-            backfill_error: None,
-        },
+        (IpcRequest::Status, None) => {
+            // 只取一次快照：分三次取可能在两帧之间跨越阶段切换，导致同一响应里的
+            // 阶段名与阶段序号对不上。
+            let l = crate::load_state::snapshot();
+            IpcResponse::StatusResult {
+                entry_count: 0,
+                dir_count: 0,
+                last_usn: 0,
+                journal_id: 0,
+                volume_letter: None,
+                healthy: false,
+                metadata_ready: false,
+                backfill_done: 0,
+                backfill_total: 0,
+                loading: true,
+                loading_stage: l.as_ref().map(|s| crate::load_state::progress_line_of(s)),
+                loading_elapsed_secs: l.as_ref().map(|s| s.started.elapsed().as_secs()),
+                loading_phase_done: l.as_ref().map(|s| s.phases_done),
+                loading_phase_total: l.as_ref().map(|s| s.phases_total),
+                watch_error: crate::watch_health::watch_error_summary(),
+                backfill_error: None,
+                tombstone_count: None,
+            }
+        }
         (IpcRequest::Search { .. }, None) => IpcResponse::Error {
             message: "索引加载中，请稍候…".into(),
         },
@@ -74,28 +84,44 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                         backfill_done,
                         backfill_total,
                         loading: false,
+                        // 索引已可用，加载阶段信息不再有意义。
+                        loading_stage: None,
+                        loading_elapsed_secs: None,
+                        loading_phase_done: None,
+                        loading_phase_total: None,
                         watch_error: crate::watch_health::watch_error_summary(),
                         backfill_error: if g.metadata_ready {
                             None
                         } else {
                             backfill_error
                         },
+                        tombstone_count: Some(g.deleted.len() as u64),
                     }
                 }
-                None => IpcResponse::StatusResult {
-                    entry_count: 0,
-                    dir_count: 0,
-                    last_usn: 0,
-                    journal_id: 0,
-                    volume_letter: None,
-                    healthy: true,
-                    metadata_ready: false,
-                    backfill_done: backfill.0,
-                    backfill_total: backfill.1,
-                    loading: true,
-                    watch_error: crate::watch_health::watch_error_summary(),
-                    backfill_error,
-                },
+                None => {
+                    let l = crate::load_state::snapshot();
+                    IpcResponse::StatusResult {
+                        entry_count: 0,
+                        dir_count: 0,
+                        last_usn: 0,
+                        journal_id: 0,
+                        volume_letter: None,
+                        healthy: true,
+                        metadata_ready: false,
+                        backfill_done: backfill.0,
+                        backfill_total: backfill.1,
+                        loading: true,
+                        loading_stage: l
+                            .as_ref()
+                            .map(|s| crate::load_state::progress_line_of(s)),
+                        loading_elapsed_secs: l.as_ref().map(|s| s.started.elapsed().as_secs()),
+                        loading_phase_done: l.as_ref().map(|s| s.phases_done),
+                        loading_phase_total: l.as_ref().map(|s| s.phases_total),
+                        watch_error: crate::watch_health::watch_error_summary(),
+                        backfill_error,
+                        tombstone_count: None,
+                    }
+                }
             }
         }
     }

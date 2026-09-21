@@ -27,8 +27,8 @@ pub mod meta_overlay;
 pub mod persist;
 
 pub use persist::{
-    exclude_sidecar_path, load_exclude_sidecar, load_index_bin, save_exclude_sidecar,
-    save_index_bin, save_index_zst, write_index_bin,
+    exclude_sidecar_path, load_exclude_sidecar, load_index_bin, load_index_bin_with_progress,
+    save_exclude_sidecar, save_index_bin, save_index_zst, write_index_bin, LoadPhase,
 };
 pub mod platform;
 pub mod query;

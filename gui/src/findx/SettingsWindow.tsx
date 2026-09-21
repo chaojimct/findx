@@ -3,7 +3,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import "./findx.css";
-import type { AppUpdateInfo, FindxGuiSettings, RunMode, UiThemePref } from "./findxGuiTypes";
+import type { AppUpdateInfo, AutostartState, FindxGuiSettings, RunMode, UiThemePref } from "./findxGuiTypes";
 import { UI_THEME_KEY, loadUiThemePref } from "./findxGuiTypes";
 
 /**
@@ -25,6 +25,7 @@ export default function SettingsWindow() {
     enableMetadataBackfill: true,
     enableEverythingIpc: true,
     saveIntervalSecs: 30,
+    autoStartApp: false,
   });
   const [settingsTab, setSettingsTab] = useState<"index" | "search" | "service" | "advanced">(
     "index",
@@ -37,6 +38,19 @@ export default function SettingsWindow() {
     () => window.matchMedia("(prefers-color-scheme: dark)").matches,
   );
   const [hint, setHint] = useState("");
+  /**
+   * 「随系统启动」的真源是注册表，不是设置文件。
+   * 因此单独存一份状态，进入设置页时从后端回读，避免显示与实际相反。
+   */
+  const [autostart, setAutostart] = useState<AutostartState>({
+    enabled: false,
+    supported: true,
+  });
+  const [autostartBusy, setAutostartBusy] = useState(false);
+  /** 索引体检（墓碑统计）：进入设置页与压缩完成后各拉一次。null = 服务未上报/未运行 */
+  const [idxEntries, setIdxEntries] = useState<number | null>(null);
+  const [tombCount, setTombCount] = useState<number | null>(null);
+  const [compactBusy, setCompactBusy] = useState(false);
 
   useEffect(() => {
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
@@ -82,18 +96,73 @@ export default function SettingsWindow() {
     }
   }, []);
 
+  /**
+   * 从后端回读自启真值（注册表）。与 loadSettings 分开，因为二者数据源不同：
+   * 设置文件可能被别处改过，而注册表才是「按下去会不会真开机启动」的答案。
+   */
+  const loadAutostart = useCallback(async () => {
+    try {
+      setAutostart(await invoke<AutostartState>("get_autostart_state"));
+    } catch {
+      /* 读不到就保持上一次状态，不臆造 enabled=true */
+    }
+  }, []);
+
+  /**
+   * 拉取墓碑统计（来自 service 内存里的 IndexStore，经 IPC Status 透传）。
+   * 服务不在跑 / 旧版 service 未上报时保持 null，UI 显示「未知」而不是编造数字。
+   */
+  const loadIndexHealth = useCallback(async () => {
+    try {
+      const st = await invoke<{
+        ready?: boolean;
+        indexedCount?: number;
+        tombstoneCount?: number | null;
+      }>("index_status");
+      setIdxEntries(typeof st.indexedCount === "number" ? st.indexedCount : null);
+      setTombCount(typeof st.tombstoneCount === "number" ? st.tombstoneCount : null);
+    } catch {
+      /* 保持上一次状态 */
+    }
+  }, []);
+
+  const toggleAutostart = async (enable: boolean) => {
+    if (autostartBusy) return;
+    setAutostartBusy(true);
+    try {
+      const s = await invoke<AutostartState>("set_autostart", { enable });
+      setAutostart(s);
+      setHint(
+        s.enabled
+          ? "已开启：下次登录 Windows 时自动启动 FindX 托盘"
+          : "已关闭：登录时不再自动启动 FindX",
+      );
+      window.setTimeout(() => setHint(""), 3000);
+    } catch (e) {
+      setHint(`设置开机启动失败: ${String(e)}`);
+      // 失败后回读真值，避免 UI 停留在一个假的勾选态。
+      await loadAutostart();
+    } finally {
+      setAutostartBusy(false);
+    }
+  };
+
   useEffect(() => {
     void loadSettings();
+    void loadAutostart();
+    void loadIndexHealth();
     let unlisten: (() => void) | undefined;
     void listen("findx2-settings-reload", () => {
       void loadSettings();
+      void loadAutostart();
+      void loadIndexHealth();
     }).then((fn) => {
       unlisten = fn;
     });
     return () => {
       unlisten?.();
     };
-  }, [loadSettings]);
+  }, [loadSettings, loadAutostart, loadIndexHealth]);
 
   useEffect(() => {
     let aborted = false;
@@ -190,6 +259,31 @@ export default function SettingsWindow() {
       setHint(`重建失败: ${String(e)}`);
     } finally {
       setRebuildBusy(false);
+    }
+  };
+
+  /** 一键压缩索引：后端编排「停服务 → 提权 findx2 compact → 重启服务」，返回结果摘要。 */
+  const compactIdx = async () => {
+    if (compactBusy) return;
+    if (
+      !confirm(
+        "压缩会短暂停止索引服务（搜索暂时不可用），并请求一次管理员授权。" +
+          "有效数据不会被删除，只物理移除墓碑残留。继续？",
+      )
+    )
+      return;
+    setCompactBusy(true);
+    setHint("正在压缩索引…（完成后会自动重启索引服务）");
+    try {
+      const r = await invoke<{ ok: boolean; message: string }>("compact_index");
+      setHint(r.message);
+      if (!r.ok) window.setTimeout(() => setHint(""), 10000);
+    } catch (e) {
+      setHint(`压缩失败: ${String(e)}`);
+    } finally {
+      setCompactBusy(false);
+      // 服务重启后要重新加载 index.bin（秒级），立即查多半是 loading，延迟再拉。
+      window.setTimeout(() => void loadIndexHealth(), 4000);
     }
   };
 
@@ -377,6 +471,40 @@ export default function SettingsWindow() {
                 会停止服务、删除现有 index.bin、按当前设置重新扫描。
               </span>
             </div>
+
+            {(() => {
+              const tomb = tombCount;
+              const entries = idxEntries;
+              const ratio =
+                tomb != null && entries != null && entries > 0 ? tomb / entries : null;
+              const suggest =
+                ratio != null && entries != null && entries >= 100_000 && ratio > 0.25;
+              return (
+                <>
+                  <div className="fx-settings-row">
+                    <button
+                      type="button"
+                      onClick={() => void compactIdx()}
+                      disabled={compactBusy || rebuildBusy || tomb === 0}
+                    >
+                      {compactBusy ? "压缩中…" : "压缩索引"}
+                    </button>
+                    <span className="fx-hint" style={{ alignSelf: "center" }}>
+                      {tomb == null
+                        ? "墓碑情况未知（服务未运行或旧版本未上报）；压缩可物理移除删除/排除留下的占位残留。"
+                        : tomb === 0
+                          ? "没有墓碑，无需压缩。"
+                          : `共 ${(entries ?? 0).toLocaleString()} 条，其中墓碑 ${tomb.toLocaleString()}（${((ratio ?? 0) * 100).toFixed(1)}%）。`}
+                    </span>
+                  </div>
+                  {suggest && (
+                    <p className="fx-warn">
+                      ⚠ 墓碑占比已超过 25%，占着内存与文件体积还拖慢加载，建议压缩回收。
+                    </p>
+                  )}
+                </>
+              );
+            })()}
           </div>
         )}
 
@@ -471,6 +599,34 @@ export default function SettingsWindow() {
               />{" "}
               GUI 启动时自动拉起索引服务
             </label>
+
+            <label>
+              <input
+                type="checkbox"
+                checked={autostart.enabled}
+                disabled={!autostart.supported || autostartBusy}
+                onChange={(e) => void toggleAutostart(e.target.checked)}
+              />{" "}
+              随系统启动（登录时自动启动 FindX 托盘）
+            </label>
+            {autostart.supported ? (
+              <p className="fx-hint" style={{ marginTop: -4, marginBottom: 8 }}>
+                {hostOs === "windows"
+                  ? `写入当前用户的登录启动项（HKCU\\...\\Run），不需要管理员权限。${
+                      autostart.command ? `当前记录：${autostart.command}` : ""
+                    }`
+                  : "由本程序管理开机启动。"}
+              </p>
+            ) : (
+              <p className="fx-hint" style={{ marginTop: -4, marginBottom: 8 }}>
+                {autostart.unsupportedReason ?? "当前平台暂不支持此项。"}
+              </p>
+            )}
+
+            <p className="fx-hint" style={{ marginTop: 8, marginBottom: 0 }}>
+              注意：本开关只管 FindX 的托盘界面。索引服务在「服务模式」下由 Windows
+              服务管理器随系统启动，与这里的设置无关。
+            </p>
 
             <div className="fx-settings-row">
               <button type="button" onClick={() => void startSvc()}>

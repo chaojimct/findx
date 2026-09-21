@@ -108,6 +108,22 @@ pub enum IpcResponse {
         /// GUI 在该状态下应显示「索引加载中…」而不是「管道超时」。
         #[serde(default)]
         loading: bool,
+        /// `loading == true` 时的加载阶段文案，例如 `解析条目（3/8 阶段，已 42s，共 3.1 亿条）`。
+        /// `None` = 旧版 service 未上报，或已加载完成。
+        ///
+        /// 千万级库的 `load_index_bin` 要几十秒到几分钟；没有这个字段时 GUI 只能显示一个
+        /// 静止的「加载中」，与「卡死」无法区分。
+        #[serde(default)]
+        loading_stage: Option<String>,
+        /// 加载已耗时（秒）；`None` = 未上报。
+        #[serde(default)]
+        loading_elapsed_secs: Option<u64>,
+        /// 加载进度百分比的分子/分母（当前实现按"阶段"计：第几阶段 / 共几阶段）。
+        /// 前端可用于画细进度条；`None` = 未上报。用 u32 而非 float，避免 JSON 浮点比较。
+        #[serde(default)]
+        loading_phase_done: Option<u32>,
+        #[serde(default)]
+        loading_phase_total: Option<u32>,
         /// USN 监听故障描述（`None` = 各卷增量正常）。watch 中断/重建时 service 侧设置，
         /// GUI 状态栏展示。`#[serde(default)]` 保持与旧版 service 的兼容。
         #[serde(default)]
@@ -115,6 +131,11 @@ pub enum IpcResponse {
         /// 元数据回填被关闭或失败时的说明（`None` = 回填正常推进或已完成）。
         #[serde(default)]
         backfill_error: Option<String>,
+        /// 墓碑条目数（已删除/排除/卷重建留下的「只标记不删除」残留）。
+        /// `None` = 旧版 service 未上报；GUI 设置页据此显示「建议压缩」与一键压缩入口。
+        /// 阈值约定见 `IndexStore::should_compact`（≥10 万条目且墓碑比 >25%）。
+        #[serde(default)]
+        tombstone_count: Option<u64>,
     },
     Pong,
     Error {

@@ -115,6 +115,34 @@
 | `startwith:config`（1000 hits） | 82.20 ms | **4.10 ms** | **20.0x** |
 | `startwith:jisuanqi`（0 hits） | 76.88 ms | **0.00 ms** | >10⁴x |
 
+## `path:` 查询两段式过滤
+
+现代 v6 索引为省内存**刻意不物化**目录全路径（与 Everything 一致，`dir_paths_buf` 仅 v2–v4 旧格式
+回填时存在）。旧实现做 `path:` 查询时对**每条命中**沿 `dir_idx` 父链重建小写全路径再子串匹配，
+带堆分配的父链回溯乘上命中数就是灾难：414 万条目库实测 **6.5 s**。
+
+两段式的关键观察：目录只有 ~55 万，而条目有 ~414 万——**同一目录下所有条目的目录路径完全相同**，
+路径算一次就够：
+
+1. **候选超集**：按查询临时建一张「目录下标 → 小写目录路径」表（单遍正向扫描，复用 `parent_idx < i`
+   拓扑序）。needle 若出现在 `盘符:目录\名字` 里，要么完整落在某组件内部，要么跨过分隔符——
+   被跨过的每个分隔符位置把左右两段（`s\alice` → `s`、`alice`）加入**变体表**。名字（大小写无关）
+   或目录路径含任一变体的目录直接命中，命中性沿父链向下传播（带记忆，O(目录数)），得到候选集。
+2. **精确校验**：只在候选条目上拼全路径做 memmem，结果与朴素全路径扫描**逐条等价**。
+
+回归测试 `path_two_phase_filter_matches_naive_full_path_scan` 以朴素扫描为基准，10 组查询钉住
+骑缝跨分隔符（`s\alice`）、首/尾分隔符（`\alice`、`projects\`）、目录条目自身（haystack 用
+`e.dir_idx` 指向的父路径）等边界。
+
+实测 414 万条目 / 55.4 万目录库（`ROUNDS=9 cargo run --release -p findx2-core --example perf_suite -- <index.bin>`）：
+
+| 查询 | 改前 | 改后 |
+| --- | --- | --- |
+| `path:users`（~1.2 万 hits） | **6553.7 ms** | **950.2 ms**（约 6.9x） |
+
+其余 10 项查询（子串 / ext / folder / startwith / endwith / 拼音 / 排序）全部无回归；剩余成本是
+名字侧 O(n) 变体扫描，未上名字倒排索引前这就是下界。
+
 ## 建索引与元数据回填
 
 CLI / service 默认走 **fast 首遍**：
@@ -242,6 +270,117 @@ trigram 剪枝有两个边车：`<index>.tri`（倒排表，构建/重建时原�
 - **Inno** 安装包版本在 CI 中由 **`/DMyAppVersion=`** 传入 [`installer/FindX.iss`](installer/FindX.iss)（与 tag 如 `v2.2.0` 的纯数字部分一致即可）；`iss` 内 `#define MyAppVersion` 为本地无参数编译时的默认。macOS / Linux 包版本直接取 Tauri `version`。
 
 变更记录见仓库根目录 [`CHANGELOG.md`](CHANGELOG.md)。
+
+## 随系统启动
+
+设置页「随系统启动」勾选后，登录时自动拉起 FindX 托盘界面。实现走当前用户的
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，**不需要管理员权限**；写入后立即回读校验，
+失败会在界面回报而不是静默吞掉。真源是注册表，设置文件里的 `auto_start_app` 只是记录。
+
+两点容易混：
+
+- **这个开关只管托盘界面**（`FindX.exe`）。索引服务 `FindX2Search` 由 SCM 按 `AutoStart` 拉起，
+  与开关无关；把它勾掉不会停掉索引。
+- 非 Windows 平台该开关明确返回「暂不支持」，不做假动作。
+
+同一页面另有一个「GUI 启动时自动拉起索引服务」，管的是 GUI 与会话内索引进程的关系，不是登录自启。
+
+## 索引加载的可观测性
+
+`index.bin` 加载（`load_index_bin`）要逐段反序列化并重建 trigram，条目多时可达几十秒到几分钟。
+这期间 service 已监听命名管道，但引擎槽还是空的，`Status` 回报 `loading=true`。
+2.4.0 起这段不再是一个静止的「加载中」：
+
+| 字段 | 含义 |
+| --- | --- |
+| `loading_stage` | 当前阶段文案，含阶段序号、已耗时、条目数 |
+| `loading_elapsed_secs` | 加载已耗时（秒） |
+| `loading_phase_done` / `loading_phase_total` | 第几 / 共几阶段 |
+
+八个阶段依次为：打开索引文件 → 读文件头 → 解析条目 → 解析目录 → 解析 FRN → 构建索引表 →
+过滤器 → CJK 位图。字段全部 `#[serde(default)]`，旧版 service 不报这些字段时 GUI 退回
+「加载中（已 Ns）」，旧版 GUI 遇到新 service 则忽略多余字段。
+
+状态栏示例：`索引: 加载中 · 解析条目（3/8 阶段，已 42s，共 3.1 亿条）`。
+
+### 超大索引的容量约束与回收
+
+历史上一份 `C:\ProgramData\FindX\index.bin` 曾膨胀到 **3.09 亿条目 / 17.72 GB**，
+按当时的内存布局下界约 **21.9 GB**：
+
+| 组成 | 估算 |
+| --- | --- |
+| `entries`（3.09 亿 × 32 B） | 9.21 GB |
+| `names_buf` | 4.63 GB |
+| `MetaOverlay`（3.09 亿 × 16 B，非惰性） | 4.60 GB |
+| `FrnIdxMap` | ≈3.45 GB |
+
+物理内存不足时加载与随后的元数据回填会持续换页，耗时以分钟计。
+
+#### 为什么会有 3.09 亿条目：墓碑只增不减
+
+索引重建过去走「旧卷区间整段打墓碑 + 新条目后挂」的合并策略
+（`findx2-service/src/run.rs` 的 `merge_rebuilt_volume` → `old.delete_entry(i)`），
+**只标记不物理删除**。每次全卷重建都把该卷全部旧条目原地留为墓碑，条目数只增不减。
+
+本机实测该份索引：
+
+| 指标 | 实测值 |
+| --- | --- |
+| 条目总数 | 309,031,075 |
+| 其中墓碑 | 305,160,707（**98.75%**） |
+| 存活条目 | **3,870,368** |
+| 墓碑 : 有效 | 约 **80 : 1** |
+| 磁盘占用 | 61.6 字节/条目（17.72 GB） |
+| 加载耗时 | **55–83 s** |
+
+也就是说这份 17.7 GB 的索引里，约 16.5 GB 是废数据，真正有效的不到 4 百万条。
+`fused_scan` 还要对全部 3.09 亿条逐个判 `is_deleted()`，实测 `readme` 子串查询
+**31–44 ms**。
+
+**已从三个层面解决**（2026-09-21 实测：删除重建后 **4,078,467 条目 / 234 MB**，
+加载 **0.35 s**，常驻 **375 MB**，建库仅 **25.3 s**）：
+
+1. **物理压缩 `IndexStore::compact_tombstones`**：把墓碑条目从索引里真正删掉，并统一重映射所有
+   与之耦合的下标。走「先算保留集、再整体重写」而不是逐个 `remove`——后者既 O(n²)，又极易漏改某个下标。
+
+   | 下标 | 处理 |
+   | --- | --- |
+   | `entries` / `frns` | 按保留集重写；**条目区与 FRN 区一起缩** |
+   | `dirs` | 墓碑目录连带移除（否则父链会指向已消失的目录） |
+   | `entries[].dir_idx` / `dirs[].parent_idx` | 查目录映射表重映射；**父目录被删的条目一并丢弃** |
+   | `dir_index` / `frn_to_entry` | 按新下标重建 |
+   | `ext_filter` | 按新下标重建（每桶要求升序，重建更稳） |
+   | `dir_path_ranges` | 按目录映射表搬运（`dir_paths_buf` 保留原偏移，不重排） |
+   | `volumes[].first_entry_idx` | 按条目映射表重定位；整卷皆墓碑则贴到末尾 |
+   | `deleted` | 清空 |
+   | `tri_pending` / `cjk_names` / `trigram` | 按新下标重映射；trigram 边车整体重建 |
+
+   `names_buf` 是**共享的**（名字 intern 后多条目录复用同一段字节），所以不做逐字节日志式回收——
+   那需要给每个名字引用计数，收益不抵复杂度；只回收墓碑条目独占的 `entries` + `frns` 已是大头。
+
+2. **掐断产生源**：`merge_rebuilt_volume` 改为 `IndexStore::remove_volume_entries(letter)`，
+   把该卷区间从 `entries` / `frns` **物理摘除**后再走同一套重映射。全卷重建从此不再留垃圾。
+
+3. **可日用入口 + 体检**：`findx2 compact --index <index.bin> [--dry-run]` 一键压缩（原子落盘 +
+   自动重建 `.tri` 边车）；`findx2 status` 展示墓碑数与占比；service 加载完成后若墓碑比超 25%
+   （且条目数 ≥ 10 万）就 `warn!` 并在状态栏提示「建议压缩索引回收空间」。
+   2.4.1 起 GUI 设置页也有一键「压缩索引」：自动停服务 → 提权跑 CLI（UAC 被取消也会把服务拉回）
+   → 自动重启服务 → 展示回收量；设置页同时显示墓碑占比（service 经 IPC 上报 `tombstone_count`）。
+
+> 也可以手动压缩（需管理员终端）：`Stop-Service FindX2Search` → `findx2 compact --index C:\ProgramData\FindX\index.bin` → 启回服务。
+> CLI 侧带**灾难性损失守卫**：压缩后存活条目数若少于「压缩前 − 墓碑数」则拒绝落盘，原索引不动。
+
+其余可继续压的方向（**尚未实施**）：
+
+1. 缩小索引范围（例如只索引用户目录 + 常用盘），从源头压条目数；**注意给 `excluded_dirs` 加目录是无效的**
+   ——`mark_excluded_entries` 同样只打墓碑，不缩体积（见 `index.rs` 注释自述）。真要让排除目录不占体积，
+   得重建 + 在 USN 增量层用 sidecar 挡住，或事后跑一次 `findx2 compact`。
+2. `MetaOverlay` 改惰性结构，省下与条目数成正比的 4.6 GB。
+3. 加载改为 mmap 惰性映射，避免整段 `memcpy` 进堆。
+
+在此之前，勾选「随系统启动」会让登录后更早开始这段加载，首查可用时间相应前移，
+但可用时间点本身不变。
 
 ## 许可证
 

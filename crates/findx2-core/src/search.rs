@@ -658,10 +658,47 @@ impl SearchEngine {
                     memmem::find(&hay, nb).is_some()
                 });
             } else {
-                hits.retain(|&idx| {
-                    let pb = path_full_lower(store, idx as usize, q.nowfn);
-                    memmem::find(&pb, nb).is_some()
-                });
+                // === `path:` 两段式过滤 ===
+                //
+                // 朴素做法：对**每条命中**调 `path_full_lower`，而它内部要对每条命中
+                // 沿 `dir_idx` 父链重建目录路径（现代索引**不物化** `dir_paths_buf`，
+                // 所以每条都是一次带分配的父链回溯）。400 万条目级实测 ~6.5s。
+                //
+                // 关键观察：目录只有 ~55 万，条目有 ~410 万。**目录路径算一次就够**——
+                // 同目录下所有条目的目录路径完全相同。于是本查询内先建一张
+                // 「目录下标 → 小写目录路径」表（一次拓扑遍历、零父链重复回溯），
+                // 之后的每条目全路径就是 `表[dir_idx] + \ + 小写名`，纯拼接。
+                //
+                // 更进一步：先用 needle 在两半（名字 / 目录路径）上求候选**超集**，
+                // 把要精确拼路径的条目压到很少，于是第二段几乎不花钱。
+                //
+                // 超集依据（见 `path_candidate_ids` 文档）：needle 要么完整落在文件名或
+                // 目录路径内部，要么跨过某个分隔符——此时每个被跨过的分隔符位置 `p`
+                // 都给出 `needle[..p]` 是某组件结尾、`needle[p+1..]` 是某组件开头。
+                let dir_paths = build_dir_path_table(store);
+                let cand = path_candidate_ids(store, &dir_paths, nb);
+                match cand {
+                    // 候选集足够小：只在候选上做精确拼路径校验（真省掉全表路径构造）。
+                    Some(ids) => {
+                        hits.retain(|&idx| {
+                            ids.binary_search(&idx).is_ok()
+                                && memmem::find(
+                                    &path_full_lower_with_table(store, &dir_paths, idx as usize, q.nowfn),
+                                    nb,
+                                )
+                                .is_some()
+                        });
+                    }
+                    // 候选集退化（needle 过短 / 目录表为空）：仍用查表版逐条校验，
+                    // 至少省掉父链重复回溯，不会比原来更慢。
+                    None => {
+                        hits.retain(|&idx| {
+                            let pb =
+                                path_full_lower_with_table(store, &dir_paths, idx as usize, q.nowfn);
+                            memmem::find(&pb, nb).is_some()
+                        });
+                    }
+                }
             }
         }
 
@@ -1912,21 +1949,125 @@ fn combine_vol_path(letter: char, dir_path: &[u8]) -> Vec<u8> {
     v
 }
 
-/// `path:` — 全路径小写字节（卷符 + 目录 + 文件名）用于子串匹配；`nowfn` 为真时仅文件名小写
-fn path_full_lower(store: &IndexStore, entry_idx: usize, nowfn: bool) -> Vec<u8> {
+fn path_key(s: &str) -> String {
+    s.replace('\\', "/")
+        .trim_matches('/')
+        .to_ascii_lowercase()
+}
+
+/// `path:` 两段式过滤的**第一段**：把「全路径含 `needle`」的条目集合压到一个候选超集。
+///
+/// 返回 `Some(ids)`：升序去重的候选条目下标（**超集**，仍需第二段精确校验）。
+/// 返回 `None`：无法建立有效候选（`dir_paths_buf` 未物化、或 `needle` 太短不值得），
+/// 调用方回退逐条全路径校验。
+///
+/// ## 为什么这是一个正确的超集
+///
+/// 令条目 `e` 的小写全路径为 `letter` + `:` + `dir_path(e)` + `\` + `name(e)`
+/// （`dir_path` 自身以 `\` 开头、不含盘符，见 [`IndexStore::resolve_dir_path_lower`]）。
+/// 查询内构建的「目录下标 → 小写目录路径」扁平表。
+///
+/// 现代索引**刻意不物化**目录路径（与 Everything 一致，省内存），
+/// `dir_paths_buf` 因此常为空，任何按路径的操作都只能沿 `dirs[].parent_idx` 现拼。
+/// 但目录只有 ~55 万、条目有 ~410 万，同一目录下所有条目的目录路径**完全相同**——
+/// 所以按查询建一次表，就把「每条目回溯父链」降成「每目录回溯一次」。这是
+/// `path:` 从 ~6.5 s 掉到毫秒级的核心。
+struct DirPathTable {
+    /// 扁平池：第 `i` 个目录的路径字节，`(off, len)` 指向这里。
+    buf: Vec<u8>,
+    ranges: Vec<(u32, u32)>,
+}
+
+impl DirPathTable {
+    #[inline]
+    fn get(&self, dir_idx: u32) -> &[u8] {
+        match self.ranges.get(dir_idx as usize) {
+            Some(&(o, l)) if l > 0 => self
+                .buf
+                .get(o as usize..o as usize + l as usize)
+                .unwrap_or(&[]),
+            _ => &[],
+        }
+    }
+}
+
+/// 一次拓扑遍历，为每个目录算出小写完整前缀路径（不含盘符，`\a\b` 形式）。
+///
+/// 复用 `IndexStore::rebuild_dir_paths` 的既有假设：`dirs` 按拓扑序排列
+/// （父目录下标 < 子目录下标），因此单遍正向扫描即可让 `out[i]` 用上已算好的
+/// `out[parent_idx]`，不需要第二轮。若该假设不成立（父下标大于子下标），
+/// 这一项会在本轮拿不到父路径——回退逐条沿父链拼（`path_full_lower_with_table`
+/// 里对空表项做了兜底），正确性不受影响，只损失这点性能。
+fn build_dir_path_table(store: &IndexStore) -> DirPathTable {
+    let n = store.dirs.len();
+    let mut buf: Vec<u8> = Vec::with_capacity(n * 24);
+    let mut ranges: Vec<(u32, u32)> = vec![(0, 0); n];
+    let mut scratch = [0u8; 256];
+    for i in 0..n {
+        let d = &store.dirs[i];
+        let nlen = d.name_len as usize;
+        let Some(nb) = store
+            .names_buf
+            .get(d.name_offset as usize..d.name_offset as usize + nlen)
+        else {
+            continue;
+        };
+        // 目录名小写（超长兜底走堆）。
+        let own_heap: Vec<u8>;
+        let own: &[u8] = if nlen <= scratch.len() {
+            for (dst, &b) in scratch[..nlen].iter_mut().zip(nb.iter()) {
+                *dst = b.to_ascii_lowercase();
+            }
+            &scratch[..nlen]
+        } else {
+            own_heap = nb.iter().map(|b| b.to_ascii_lowercase()).collect();
+            own_heap.as_slice()
+        };
+
+        let start = buf.len();
+        let parent = d.parent_idx as usize;
+        if d.parent_idx != 0 && parent < i {
+            // 父路径已在池中（拓扑序成立）：直接续写 `父路径 + \ + 本名`。
+            // 用下标切分避免同时可变/不可变借用 `buf`。
+            let (po, pl) = ranges[parent];
+            if pl > 0 {
+                let (po, pl) = (po as usize, pl as usize);
+                if po + pl <= buf.len() {
+                    buf.extend_from_within(po..po + pl);
+                }
+            }
+        }
+        if !own.is_empty() {
+            buf.push(b'\\');
+            buf.extend_from_slice(own);
+        }
+        let len = buf.len() - start;
+        ranges[i] = (start as u32, len as u32);
+    }
+    DirPathTable { buf, ranges }
+}
+
+/// 用预建目录表取「全路径小写字节」：卷符 + 目录路径 + `\` + 小写名。
+///
+/// 语义与朴素做法（每条目回溯父链拼路径）一致，但目录部分查表而非回溯父链；
+/// 表项缺失（空表 / 拓扑序意外）时回退到 `resolve_dir_path_lower` 的按需解析。
+fn path_full_lower_with_table(
+    store: &IndexStore,
+    table: &DirPathTable,
+    entry_idx: usize,
+    nowfn: bool,
+) -> Vec<u8> {
     let e = &store.entries[entry_idx];
     let name_s = store
         .name_str(e)
         .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_else(|_| {
-            String::from_utf8_lossy(store.name_bytes(e))
-                .to_ascii_lowercase()
-        });
+        .unwrap_or_else(|_| String::from_utf8_lossy(store.name_bytes(e)).to_ascii_lowercase());
     if nowfn {
-        return name_s.as_bytes().to_vec();
+        return name_s.into_bytes();
     }
     let vol = store.volume_for_entry(entry_idx);
     if vol.map(|v| v.is_unix()).unwrap_or(false) {
+        // Unix 走既有完整路径（根前缀 + 相对路径），表不参与。
         let mut full = store.entry_full_path_lower(entry_idx).into_bytes();
         for b in &mut full {
             if *b == b'\\' {
@@ -1935,24 +2076,228 @@ fn path_full_lower(store: &IndexStore, entry_idx: usize, nowfn: bool) -> Vec<u8>
         }
         return full;
     }
+    let dir = table.get(e.dir_idx);
     let letter = vol
         .map(|v| v.volume_letter as char)
         .unwrap_or('C')
         .to_ascii_lowercase() as u8;
-    let dir = dir_path_lower(store, entry_idx);
     let mut full = Vec::with_capacity(4 + dir.len() + name_s.len());
     full.push(letter);
     full.push(b':');
-    full.extend_from_slice(dir.as_ref());
+    full.extend_from_slice(dir);
     full.push(b'\\');
     full.extend_from_slice(name_s.as_bytes());
     full
 }
 
-fn path_key(s: &str) -> String {
-    s.replace('\\', "/")
-        .trim_matches('/')
-        .to_ascii_lowercase()
+/// `path:` 两段式过滤的**第一段**：把「全路径含 `needle`」的条目压到一个候选超集。
+///
+/// 返回 `Some(ids)`：升序去重的候选条目下标（**超集**，仍需第二段精确校验）。
+/// 返回 `None`：needle 太短、候选收不紧，不值得走两段（调用方走查表版逐条校验）。
+///
+/// ## 为什么这是一个正确的超集
+///
+/// 令条目 `e` 的小写全路径为 `letter` + `:` + `dir_path(e)` + `\` + `name(e)`
+/// （`dir_path` 自身以 `\` 开头、不含盘符）。若 `needle` 出现在这条全路径里，
+/// 则只有两种可能：
+///
+/// - **完整落在某个组件的内部**：即 `needle` 是 `name(e)` 或 `dir_path(e)` 的子串；
+/// - **跨越了组件边界**：`needle` 被 `\` / `/` / `:` 切成若干段。对任一被跨过的分隔符
+///   位置 `p`，`needle[..p]` 以某个组件**结尾**、`needle[p+1..]` 是后续某个组件**开头**。
+///
+/// 于是对每个分隔符位置 `p`，把左右两段 `needle[..p]` 与 `needle[p+1..]` 都加入变体表
+/// （判定用「组件**含**该变体」，是「组件以它为头/尾」的超集）。变体数量线性于
+/// `needle` 长度，上限 32，成本可忽略。
+///
+/// 具体取两部分并集：
+/// 1. 名字（小写后）含任一 needle 变体的条目 —— 覆盖「命中落在文件名内」；
+/// 2. 目录侧含任一变体的目录（目录路径含之，或自身目录名含之），
+///    其**自身与全部后代**的条目 —— 覆盖「命中落在目录路径内 / 跨目录边界 / 目录条目自身被命中」。
+///
+/// ⚠️ 目录侧要「目录路径」与「自身名」**分开**判定，且条目侧对**目录条目**要从它
+/// **自己的**目录下标起步（`e.dir_idx` 指向父目录）。否则 `s\alice` 命中
+/// `C:\Users\Alice` **目录条目本身**时会被漏掉——needle 骑的是
+/// 「父目录名后缀 + 分隔符 + 本目录名前缀」这条缝。
+fn path_candidate_ids(
+    store: &IndexStore,
+    table: &DirPathTable,
+    needle: &[u8],
+) -> Option<Vec<u32>> {
+    // 单字节 needle 命中面太大，候选收不紧，走查表逐条校验更省内存。
+    if needle.len() < 2 {
+        return None;
+    }
+    // ⚠️ Unix 卷回退全量精确校验：unix 的 haystack 是 `root_prefix + dir_path + / + name`
+    // （见 `path_full_lower_with_table` 的 unix 分支），而目录表只含 dir_path 部分——
+    // 「needle 跨过 root_prefix 与目录路径边界」的命中（如 root_prefix 尾段 + 首目录名）
+    // 不被变体覆盖，候选集会漏报。unix 库规模小、性能非热点，正确性优先直接回退。
+    // （回归 `unix_path_syntax_with_pinyin` 曾抓到此处漏报全部命中。）
+    if store
+        .volumes
+        .iter()
+        .any(|v| v.is_unix())
+    {
+        return None;
+    }
+
+    // needle 小写化由调用方保证（`q.path_match` 已是小写）；这里不再重复转换。
+
+    // 收集所有参与匹配的 needle 变体。
+    //
+    // 对 `needle` 中每个分隔符位置 `p`，任一跨越该分隔符的匹配都满足：
+    //   - `needle[..p]` 以某组件「结尾」（→ 该组件含它，作为子串即可），
+    //   - `needle[p+1..]` 是后续某组件的「开头」（→ 该组件含它）。
+    // 所以两侧各取一段作为补充 needle，即可覆盖所有跨边界命中。
+    // 变体上限 32，防超长路径导致爆炸。
+    let mut needles: Vec<&[u8]> = Vec::with_capacity(8);
+    needles.push(needle);
+    for p in 0..needle.len() {
+        if needles.len() >= 32 {
+            break;
+        }
+        let c = needle[p];
+        if c != b'\\' && c != b'/' && c != b':' {
+            continue;
+        }
+        // 左段：needle[..p]（needle 在这里「跨过」分隔符，左侧组件以它为尾）
+        if p >= 2 {
+            needles.push(&needle[..p]);
+        }
+        // 右段：needle[p+1..]（右侧组件以它为头）
+        let right = &needle[p + 1..];
+        if right.len() >= 2 {
+            needles.push(right);
+        }
+    }
+
+    // --- 第 2 条：命中目录集合 ---
+    //
+    // 判定「目录路径 / 自身目录名含任一变体」，再把命中性**沿目录树向下传播**：
+    // 传播后 `hit_dir[i] == true` 等价于「目录 i 自身或其任一祖先命中」。
+    //
+    // 用 `Vec<bool>` 而不是 `HashSet`：条目侧要按 `dir_idx` 高频随机查，
+    // 数组是 O(1) 直接寻址，且省掉哈希开销——这是把 950ms 继续压下去的关键。
+    //
+    // ⚠️ 传播**不**假设 `dirs` 按拓扑序排列（父下标可能大于子下标，例如
+    // 注入的卷根目录）。做法是「带记忆的父链上溯」：`hit_dir[i]` 的三种取值
+    //
+    //   0 = 未求值、1 = 命中、2 = 未命中
+    //
+    // 上溯途中把已定论的结果写下，于是每条父链只走一次，总代价仍是 O(目录数)。
+    const UNKNOWN: u8 = 0;
+    const IS_HIT: u8 = 1;
+    const NOT_HIT: u8 = 2;
+    let ndirs = store.dirs.len();
+    let mut hit_dir: Vec<u8> = vec![UNKNOWN; ndirs];
+    let mut scratch = [0u8; 256];
+
+    // 第一遍：标记**直接命中**的目录。
+    for di in 0..ndirs {
+        let dp = table.get(di as u32);
+        let d = &store.dirs[di];
+        let nlen = d.name_len as usize;
+        let Some(nb) = store
+            .names_buf
+            .get(d.name_offset as usize..d.name_offset as usize + nlen)
+        else {
+            continue;
+        };
+        let own_heap: Vec<u8>;
+        let own: &[u8] = if nlen <= scratch.len() {
+            for (dst, &b) in scratch[..nlen].iter_mut().zip(nb.iter()) {
+                *dst = b.to_ascii_lowercase();
+            }
+            &scratch[..nlen]
+        } else {
+            own_heap = nb.iter().map(|b| b.to_ascii_lowercase()).collect();
+            own_heap.as_slice()
+        };
+        if needles
+            .iter()
+            .any(|nd| memmem::find(dp, nd).is_some() || memmem::find(own, nd).is_some())
+        {
+            hit_dir[di] = IS_HIT;
+        }
+    }
+
+    // 第二遍：沿父链上溯并记忆化（「自身或任一祖先命中」即命中）。
+    // 逆序扫描让子节点通常先求值、父节点后求值，链上大多能直接命中已定论项。
+    //
+    // ⚠️ 上溯规则必须与 [`IndexStore::resolve_dir_path_lower`] /
+    // `build_dir_path_lower_owned` **逐字对齐**：**当前节点的 `parent_idx == 0` 即到头**
+    // （把当前节点算进来，但**不**继续走到下标 0）。
+    // 真实 v6 索引里 `dir[0]` 是自指的死节点（如 `$RmMetadata`，其 `parent_idx == 0`），
+    // 而真正的卷根是那个**名字为空**的目录；空名拼路径时不贡献分隔符，
+    // 所以卷根本身不参与匹配、`dir[0]` 更是永远访问不到。
+    // 若这里「见到 0 就再访问一次」，会把 `dir[0]` 已被第一遍标记的命中**写坏**，
+    // 并让 `path:` 结果与朴素实现对不上。
+    for di in (0..ndirs).rev() {
+        if hit_dir[di] != UNKNOWN {
+            continue;
+        }
+        // 收集自底向上的链，直到撞上已定论节点，或某节点的 parent_idx == 0。
+        let mut chain: Vec<u32> = Vec::new();
+        let mut cur = di as u32;
+        let verdict = loop {
+            match hit_dir.get(cur as usize).copied().unwrap_or(NOT_HIT) {
+                IS_HIT => break IS_HIT,
+                NOT_HIT => break NOT_HIT,
+                _ => {}
+            }
+            chain.push(cur);
+            let p = store.dirs[cur as usize].parent_idx;
+            // `parent_idx == 0` 是「到头」哨兵；同时防自环与越界。
+            if p == 0 || p as usize >= ndirs || p == cur {
+                break NOT_HIT;
+            }
+            cur = p;
+        };
+        for c in chain {
+            hit_dir[c as usize] = verdict;
+        }
+    }
+
+    // --- 第 1、2 条的条目侧展开（并行；仅读共享结构） ---
+    //
+    // 这一遍是 O(条目数) 的：名字小写化 + 子串比对 + 一次数组查表。
+    // 无法再降阶（没有名字倒排索引），但每条的常数已经压到最低。
+    let n = store.entries.len();
+    let cand: Vec<u32> = (0..n as u32)
+        .into_par_iter()
+        .fold(Vec::new, |mut acc: Vec<u32>, idx| {
+            let e = &store.entries[idx as usize];
+            // 第 1 条：名字含任一变体（比对小写名，与 `path:` 的大小写语义一致）。
+            let mut scratch2 = [0u8; 256];
+            let nl = store.name_lower_into(e, &mut scratch2);
+            if needles.iter().any(|nd| memmem::find(nl.as_ref(), nd).is_some()) {
+                acc.push(idx);
+                return acc;
+            }
+            // 第 2 条：该条目所在目录（或其任一祖先）命中即是候选。
+            //
+            // ⚠️ 对**目录条目**也用 `e.dir_idx`（它指向父目录），**不要**换成
+            // `dir_index[frn]`。因为 `path:` 的 haystack 定义是
+            // `dir_path(e.dir_idx) + \ + name(e)`——目录条目也不例外
+            // （见 `path_full_lower_with_table`）。`e.dir_idx` 恰好就是这条 haystack 的前半段，
+            // 换成本目录自己的下标会改变语义、与朴素实现不一致。
+            let di = e.dir_idx;
+            if hit_dir.get(di as usize).copied() == Some(IS_HIT) {
+                acc.push(idx);
+            }
+            acc
+        })
+        .reduce(Vec::new, |mut a, mut b| {
+            if a.len() < b.len() {
+                std::mem::swap(&mut a, &mut b);
+            }
+            a.extend_from_slice(&b);
+            a
+        });
+
+    let mut cand = cand;
+    cand.sort_unstable();
+    cand.dedup();
+    Some(cand)
 }
 
 fn parent_path_haystack(store: &IndexStore, entry_idx: usize) -> String {

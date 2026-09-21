@@ -468,6 +468,8 @@ fn probe_clsid(clsid: &GUID) -> ClsidInfo {
 }
 
 /// EnumChildWindows 回调用来定位 WebView2 的真实窗口（命中即写入 OUT 参数并停止枚举）。
+/// 当前 DComp 预览走独立顶级窗口方案，不再需要穿透找宿主 HWND；保留供排查窗口层级时复用。
+#[allow(dead_code)]
 unsafe extern "system" fn enum_find_webview2(hwnd: HWND, lparam: windows::Win32::Foundation::LPARAM) -> windows::core::BOOL {
     let mut buf = [0u16; 128];
     let n = unsafe { GetClassNameW(hwnd, &mut buf) };
@@ -491,6 +493,8 @@ unsafe extern "system" fn enum_find_webview2(hwnd: HWND, lparam: windows::Win32:
 }
 
 /// 找 Tauri 顶级窗口里的 WebView2 容器 HWND；找不到就回退顶级 HWND。
+/// 保留原因同 `enum_find_webview2`。
+#[allow(dead_code)]
 fn find_webview_host(top: HWND) -> HWND {
     let mut found: HWND = HWND(std::ptr::null_mut());
     let lparam = windows::Win32::Foundation::LPARAM(&mut found as *mut HWND as isize);
@@ -971,7 +975,7 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
             clsid, info.has_64, info.has_32, info.has_inproc_server, info.has_local_server, info.handler_only
         );
         let mut attempts: Vec<CLSCTX> = Vec::new();
-        let mut push = |c: CLSCTX, list: &mut Vec<CLSCTX>| {
+        let push = |c: CLSCTX, list: &mut Vec<CLSCTX>| {
             if !list.iter().any(|x| x.0 == c.0) {
                 list.push(c);
             }

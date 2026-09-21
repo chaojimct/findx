@@ -57,6 +57,9 @@ static WINDOW_STATE_SAVE_ENABLED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 #[derive(Clone, Copy)]
 enum WindowMode {
     Full,
+    /// 历史 quick 布局已退役（`open_quick_window` 已退化为打开主窗口），
+    /// 但持久化的窗口状态文件里可能还存着 "quick"，为反序列化兼容保留该变体。
+    #[allow(dead_code)]
     Quick,
 }
 

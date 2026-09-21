@@ -569,6 +569,11 @@ export default function FindXSearchApp() {
         indexingMessage?: string;
         indexingEntriesIndexed?: number;
         indexingCurrentVolume?: string;
+        /** service 侧 index.bin 加载阶段文案（旧版 service 为 undefined） */
+        loadingStage?: string;
+        loadingElapsedSecs?: number;
+        loadingPhaseDone?: number;
+        loadingPhaseTotal?: number;
         lastError?: string;
       }>("index_status");
       const raw = st as Record<string, unknown>;
@@ -600,16 +605,30 @@ export default function FindXSearchApp() {
               return p ?? "";
           }
         };
-        const segs: string[] = ["索引: 建库中"];
-        if (phase) segs.push(`阶段 ${phaseZh(phase)}`);
-        if (entries != null && !Number.isNaN(entries)) segs.push(`已收录约 ${entries.toLocaleString()} 条`);
-        if (vt != null && vt > 0 && vd != null) segs.push(`卷进度 ${vd}/${vt}`);
-        if (curVol) segs.push(`当前卷 ${curVol}`);
-        if (msg) segs.push(msg);
-        if (segs.length === 1) {
-          segs.push("（读取 index.indexing.json，完成后将自动启动服务）");
+        // 两种截然不同的 `indexing=true`：
+        //   1) 真在建库（本地跑 CLI），进度来自 index.indexing.json；
+        //   2) service 已起、正在反序列化已存在的 index.bin（loadingStage 有值）。
+        // 混成一句「建库中」会让上亿条目的加载看起来像卡死——见 2.4.0 CHANGELOG。
+        const stage = st.loadingStage?.trim();
+        if (stage && !phase && entries == null) {
+          // loadingStage 形如 `解析条目（3/8 阶段，已 42s，共 3.1 亿条）`，已是完整描述。
+          setIndexLine(`索引: 加载中 · ${stage}`);
+        } else if (!phase && entries == null && st.loadingElapsedSecs != null) {
+          // 旧版 service 不上报 loadingStage：至少显示已耗时，别让用户以为卡死。
+          setIndexLine(`索引: 加载中（已 ${st.loadingElapsedSecs}s）· 完成后自动可用`);
+        } else {
+          const segs: string[] = ["索引: 建库中"];
+          if (phase) segs.push(`阶段 ${phaseZh(phase)}`);
+          if (entries != null && !Number.isNaN(entries)) segs.push(`已收录约 ${entries.toLocaleString()} 条`);
+          if (vt != null && vt > 0 && vd != null) segs.push(`卷进度 ${vd}/${vt}`);
+          if (curVol) segs.push(`当前卷 ${curVol}`);
+          if (msg) segs.push(msg);
+          if (stage) segs.push(stage);
+          if (segs.length === 1) {
+            segs.push("（读取 index.indexing.json，完成后将自动启动服务）");
+          }
+          setIndexLine(segs.join(" · "));
         }
-        setIndexLine(segs.join(" · "));
       } else if (st.lastError) {
         setIndexLine(`索引: ${indexedCount.toLocaleString()} 条 · ${st.lastError}`);
       } else if (st.metadataReady === false) {

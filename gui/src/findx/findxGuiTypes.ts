@@ -17,6 +17,16 @@ export type FindxGuiSettings = {
   enableMetadataBackfill?: boolean;
   enableEverythingIpc?: boolean;
   saveIntervalSecs?: number;
+  /**
+   * 随系统启动 GUI（登录时自动拉起托盘）。
+   *
+   * Windows 写 `HKCU\...\CurrentVersion\Run`（无需管理员）；
+   * 由 Rust 侧 `autostart_*` 命令读写，不依赖第三方插件。
+   *
+   * 注意与 `autoStartService` 区分：后者是「GUI 起来后自动拉索引服务」，
+   * 本项是「开机让 GUI 自己起来」。服务本身在服务模式下由 SCM 开机自启，与本项无关。
+   */
+  autoStartApp?: boolean;
 };
 
 export type UiThemePref = "light" | "dark" | "system";
@@ -32,6 +42,18 @@ export function loadUiThemePref(): UiThemePref {
   }
   return "light";
 }
+
+/** 与 Rust `autostart::AutostartState` 对应（「随系统启动」开关的真实状态）。 */
+export type AutostartState = {
+  /** 是否已启用且指向当前 exe */
+  enabled: boolean;
+  /** 注册表里记录的命令行（仅 Windows） */
+  command?: string;
+  /** 平台是否支持由 FindX 管理自启 */
+  supported: boolean;
+  /** 不支持的原因，直接展示 */
+  unsupportedReason?: string;
+};
 
 /** 与 Rust `app_update::AppUpdateInfo` 对应（GitHub Releases 检测） */
 export type AppUpdateInfo = {

@@ -753,11 +753,339 @@ impl IndexStore {
         }
     }
 
+    /// 墓碑比是否已超过建议压缩的健康度阈值。
+    ///
+    /// 墓碑是 USN 删除 / 排除目录 / 卷重建留下的「只标记不删除」条目；它们占满
+    /// `entries`（32 B/条）以及与之对齐的 `frns`（8 B/条），并且搜索热路径要逐条
+    /// 判 `is_deleted()`。经验上超过 25% 就是纯负担，超过 50% 已经该压缩了。
+    ///
+    /// 小库不报警：几百条的墓碑不值得为它跑一次全量压缩。
+    pub fn should_compact(&self) -> bool {
+        const MIN_ENTRIES: usize = 100_000;
+        const RATIO: f64 = 0.25;
+        self.entries.len() >= MIN_ENTRIES && self.tombstone_ratio() > RATIO
+    }
+
+    /// 物理压缩：把墓碑条目从索引里真正删掉，并重建所有与之耦合的下标。
+    ///
+    /// ## 为什么要做
+    ///
+    /// 删除（USN `FILE_DELETE`、排除目录、卷重建）只调 `delete_entry` 打标记，
+    /// 条目仍占 `entries` 的 32 B 与 `frns` 的 8 B。全卷重建会对整卷旧条目打墓碑，
+    /// 于是条目数 **只增不减** —— 实测某库 3.09 亿条目里 98.75% 是墓碑，
+    /// 17.7 GB 文件里约 16.5 GB 是废数据，加载要 80 s、内存下界 21.9 GB。
+    ///
+    /// `names_buf` 是**共享的**（名字 intern 后多条目录复用同一段字节），所以这里
+    /// 不做逐字节日志式回收 —— 那需要给每个名字引用计数，收益不抵复杂度。
+    /// 只释放「墓碑条目所独占的那部分」就已经把大头（entries + frns）拿回来了。
+    ///
+    /// ## 做法
+    ///
+    /// 「先算保留集、再整体重写」，而不是逐个 `remove`（后者是 O(n²) 且极易把
+    /// 某个下标漏改）。一趟建立 `old→new` 映射，然后所有下标按同一张表搬运：
+    ///
+    /// | 下标 | 处理 |
+    /// | --- | --- |
+    /// | `entries` / `frns` | 按保留集重写；**条目区与 FRN 区一起缩** |
+    /// | `dirs` | 墓碑目录连带移除（否则父链会指向已消失的目录） |
+    /// | `entries[].dir_idx` | 查目录映射表重映射；**父目录被删的条目一并丢弃** |
+    /// | `dirs[].parent_idx` | 同上 |
+    /// | `dir_index` / `frn_to_entry` | 按新下标重建 |
+    /// | `ext_filter` | 按新下标重建（每桶本来就要求有序，重建更稳） |
+    /// | `dir_path_ranges` | 按目录映射表搬运（`dir_paths_buf` 保留原偏移，不重排） |
+    /// | `volumes[].first_entry_idx` | 按条目映射表重定位；卷空了就摘掉 |
+    /// | `deleted` | 清空（墓碑已物理消失） |
+    /// | `tri_pending` / `cjk_names` | 按新下标重映射（trigram 边车靠上层重建） |
+    ///
+    /// `names_buf` 与 `dir_paths_buf` 原样保留 —— 偏移不变，所以所有
+    /// `name_offset` / `name_len` 都不需要改。
+    ///
+    /// 返回**被移除的墓碑条目数**；没有墓碑时返回 0 且不做任何分配。
+    pub fn compact_tombstones(&mut self) -> usize {
+        if self.deleted.is_empty() {
+            return 0;
+        }
+        let n_old = self.entries.len();
+
+        // —— 1. 条目保留判据 ——
+        // 不用 `deleted` 位图单独判断：`is_deleted()` 同时覆盖 ATTR_DELETED 位，
+        // 与搜索热路径 `fused_scan` 的过滤口径保持一致，避免「压缩后反而多出条目」。
+        let mut entry_map: Vec<u32> = vec![u32::MAX; n_old];
+        let mut keep_entries: Vec<u32> = Vec::with_capacity(n_old.saturating_sub(self.deleted.len() as usize));
+        for (i, e) in self.entries.iter().enumerate() {
+            if e.is_deleted() {
+                continue;
+            }
+            entry_map[i] = keep_entries.len() as u32;
+            keep_entries.push(i as u32);
+        }
+        if keep_entries.len() == n_old {
+            return 0; // 位图非空但没有任何条目真的带删除标记，无需动
+        }
+
+        // —— 2. 目录保留判据：目录自身不是墓碑，且父链能一路走到根 ——
+        // 父目录被打掉的目录必须连带丢弃，否则 `dir_idx` 会指向一个已不存在的目录，
+        // 路径解析会退化成空串（比丢弃更糟：搜索结果路径丢失且难排查）。
+        let mut dir_map: Vec<u32> = vec![u32::MAX; self.dirs.len()];
+        let mut dir_alive: Vec<bool> = vec![false; self.dirs.len()];
+        // 迭代到不动点：父链最长 N 层，但每轮至少定死一批，实际两三轮就收敛。
+        for _ in 0..self.dirs.len().min(64) {
+            let mut changed = false;
+            for i in 0..self.dirs.len() {
+                if dir_alive[i] {
+                    continue;
+                }
+                let d = &self.dirs[i];
+                // 与条目同口径：目录要么是它自己的墓碑位，要么父链断掉
+                let self_ok = match self.frn_to_entry.get(&d.frn) {
+                    Some(&ei) => !self.entries[ei as usize].is_deleted(),
+                    // 目录不在 entries 里（历史 v2/v3 布局）：只能靠父链判断
+                    None => true,
+                };
+                if !self_ok {
+                    continue;
+                }
+                let parent_ok = d.parent_idx == 0
+                    || (d.parent_idx as usize) < self.dirs.len() && dir_alive[d.parent_idx as usize];
+                if parent_ok {
+                    dir_alive[i] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut n_dirs_kept = 0u32;
+        for i in 0..self.dirs.len() {
+            if dir_alive[i] {
+                dir_map[i] = n_dirs_kept;
+                n_dirs_kept += 1;
+            }
+        }
+
+        // —— 3. 条目二次过滤：父目录已被丢弃的条目也丢掉 ——
+        // 目录区一般远小于条目区（本机 4127 个 vs 3.09 亿），这一步实际很少命中；
+        // 但做了才能保证 `dir_idx` 永远指向存活目录。
+        let keep_entries: Vec<u32> = keep_entries
+            .into_iter()
+            .filter(|&i| {
+                let d = self.entries[i as usize].dir_idx as usize;
+                d == 0 || (d < dir_map.len() && dir_map[d] != u32::MAX)
+            })
+            .collect();
+        if keep_entries.len() == n_old {
+            return 0;
+        }
+        // 重算最终映射（上一步可能又丢了一批）
+        entry_map.fill(u32::MAX);
+        for (new_i, &old_i) in keep_entries.iter().enumerate() {
+            entry_map[old_i as usize] = new_i as u32;
+        }
+
+        // —— 4. 重写 entries / frns ——
+        let n_new = keep_entries.len();
+        let mut new_entries: Vec<FileEntry> = Vec::with_capacity(n_new);
+        let mut new_frns: Vec<u64> = Vec::with_capacity(n_new);
+        for &old_i in &keep_entries {
+            let oi = old_i as usize;
+            let mut e = self.entries[oi];
+            if e.dir_idx != 0 {
+                e.dir_idx = dir_map[e.dir_idx as usize];
+            }
+            new_entries.push(e);
+            new_frns.push(self.frns.get(oi).copied().unwrap_or(0));
+        }
+
+        // —— 5. 重写 dirs ——
+        let mut new_dirs: Vec<DirEntry> = Vec::with_capacity(n_dirs_kept as usize);
+        let mut new_dir_path_ranges: Vec<(u32, u32)> = Vec::with_capacity(n_dirs_kept as usize);
+        for (i, d) in self.dirs.iter().enumerate() {
+            if !dir_alive[i] {
+                continue;
+            }
+            let mut d = d.clone();
+            if d.parent_idx != 0 {
+                d.parent_idx = dir_map[d.parent_idx as usize];
+            }
+            new_dirs.push(d);
+            // dir_paths_buf 原样保留，偏移不变，所以 range 直接搬（缺失则补 (0,0)）
+            new_dir_path_ranges.push(
+                self.dir_path_ranges
+                    .get(i)
+                    .copied()
+                    .unwrap_or((0, 0)),
+            );
+        }
+
+        // —— 6. 重建两个映射表 ——
+        let mut dir_index: FrnIdxMap = FrnIdxMap::with_capacity(new_dirs.len());
+        for (i, d) in new_dirs.iter().enumerate() {
+            dir_index.push_unsorted(d.frn, i as u32);
+        }
+        dir_index.finalize_build();
+
+        let mut frn_to_entry: FrnIdxMap = FrnIdxMap::with_capacity(new_frns.len());
+        for (i, fr) in new_frns.iter().enumerate() {
+            if *fr != 0 {
+                frn_to_entry.push_unsorted(*fr, i as u32);
+            }
+        }
+        frn_to_entry.finalize_build();
+
+        // —— 7. 重建 ext_filter（每桶要求升序，重建比搬运更不易出错）——
+        let mut ext_counts = [0usize; 256];
+        for e in new_entries.iter() {
+            ext_counts[e.ext_hash_u8() as usize] += 1;
+        }
+        let mut ext_buckets: Vec<Vec<u32>> =
+            ext_counts.iter().map(|&c| Vec::with_capacity(c)).collect();
+        for (i, e) in new_entries.iter().enumerate() {
+            ext_buckets[e.ext_hash_u8() as usize].push(i as u32);
+        }
+        let ext_vec: Vec<Option<RoaringBitmap>> = ext_buckets
+            .into_par_iter()
+            .map(|ids| {
+                if ids.is_empty() {
+                    None
+                } else {
+                    Some(
+                        RoaringBitmap::from_sorted_iter(ids.into_iter())
+                            .expect("ext bucket already sorted by construction"),
+                    )
+                }
+            })
+            .collect();
+        let ext_filter: [Option<RoaringBitmap>; 256] = ext_vec
+            .try_into()
+            .unwrap_or_else(|_| std::array::from_fn(|_| None));
+
+        // —— 8. 位图重映射 ——
+        let remap = |bm: &RoaringBitmap| -> RoaringBitmap {
+            let mut out = RoaringBitmap::new();
+            out.extend(
+                bm.iter()
+                    .filter(|i| (*i as usize) < entry_map.len())
+                    .map(|i| entry_map[i as usize])
+                    .filter(|m| *m != u32::MAX),
+            );
+            out
+        };
+        let new_tri_pending = remap(&self.tri_pending);
+        let new_cjk = remap(&self.cjk_names);
+
+        // —— 9. volumes.first_entry_idx 重定位 ——
+        let mut new_volumes: Vec<VolumeState> = Vec::with_capacity(self.volumes.len());
+        for v in self.volumes.iter() {
+            let first = v.first_entry_idx as usize;
+            let new_first = if first >= entry_map.len() {
+                n_new as u32
+            } else if entry_map[first] != u32::MAX {
+                entry_map[first]
+            } else {
+                // 该卷首个条目是墓碑：往后找最近一个存活条目作为新区间起点。
+                match (first..entry_map.len()).find(|&i| entry_map[i] != u32::MAX) {
+                    Some(i) => entry_map[i],
+                    None => n_new as u32, // 整卷都是墓碑：区间为空，起点贴着末尾
+                }
+            };
+            let mut v = v.clone();
+            v.first_entry_idx = new_first;
+            new_volumes.push(v);
+        }
+
+        // —— 10. 落到 self ——
+        self.entries = new_entries;
+        self.frns = new_frns;
+        self.dirs = new_dirs;
+        self.dir_path_ranges = new_dir_path_ranges;
+        self.dir_index = dir_index;
+        self.frn_to_entry = frn_to_entry;
+        self.ext_filter = ext_filter;
+        self.deleted = RoaringBitmap::new();
+        self.tri_pending = new_tri_pending;
+        self.cjk_names = new_cjk;
+        self.volumes = new_volumes;
+
+        // trigram 边车的 posting 用的是**旧下标**，压缩后全部失效 —— 整体禁用，
+        // 由上层重建（`build_trigram_sidecar`），期间搜索回退全表扫描（正确性不受影响）。
+        self.trigram = None;
+
+        n_old - n_new
+    }
+
     fn ext_remove_idx(&mut self, idx: u32, ext8: u8) {
         let h = ext8 as usize;
         if let Some(bm) = self.ext_filter[h].as_mut() {
             bm.remove(idx);
         }
+    }
+
+    /// 摘下某个卷的全部条目与目录，**并物理丢弃**（不像 [`Self::delete_entry`] 只打墓碑）。
+    ///
+    /// 专供「全卷重建」用：旧卷数据整个会被重新扫描出来的新结果替换，
+    /// 打墓碑只会把它留成永不回收的垃圾（这正是索引被撑到 3 亿条目的根因）。
+    /// 这里把该卷区间从 `entries` / `frns` 里剔掉，再走 [`Self::compact_tombstones`]
+    /// 的统一重映射，保证 `dir_idx` / `first_entry_idx` / 位图全部自洽。
+    ///
+    /// ## 区间推算法的硬约束（真实事故）
+    ///
+    /// 卷区间靠 `volumes[].first_entry_idx` 排序后取「本卷起点 → 下一卷起点」推断。
+    /// 当索引只有一个卷、且它的 `first_entry_idx == 0` 时，这个区间会退化成
+    /// `0..entry_count`，即**覆盖整库**。此时「摘掉该卷」在语义上等于「清空索引」——
+    /// 绝不能照做，否则一次重建就把全库数据抹光。所以区间覆盖整库时**直接拒绝**，
+    /// 返回 0 且不做任何改动；调用方（`merge_rebuilt_volume`）会退化为纯追加合并。
+    ///
+    /// `letter`：卷盘符（大小写不敏感）。返回移除的条目数；卷不存在或拒绝时返回 0。
+    pub fn remove_volume_entries(&mut self, letter: char) -> usize {
+        let up = letter.to_ascii_uppercase();
+        let mut ranges: Vec<(char, u32)> = self
+            .volumes
+            .iter()
+            .map(|v| {
+                (
+                    (v.volume_letter as char).to_ascii_uppercase(),
+                    v.first_entry_idx,
+                )
+            })
+            .collect();
+        ranges.sort_by_key(|(_, idx)| *idx);
+        let (start, end) = match ranges.iter().position(|(l, _)| *l == up) {
+            Some(p) => {
+                let s = ranges[p].1 as usize;
+                let e = if p + 1 < ranges.len() {
+                    ranges[p + 1].1 as usize
+                } else {
+                    self.entries.len()
+                };
+                (s, e.min(self.entries.len()))
+            }
+            None => return 0,
+        };
+        if start >= end {
+            return 0;
+        }
+        // 区间覆盖整库 → 拒绝。见上方「区间推算法的硬约束」。
+        if start == 0 && end >= self.entries.len() {
+            debug_assert!(
+                self.volumes.len() <= 1 || self.volumes.iter().all(|v| v.first_entry_idx == 0),
+                "区间覆盖整库通常意味着只有单卷；异常卷表也不该被摘空"
+            );
+            return 0;
+        }
+
+        // 该卷的条目与目录一并打墓碑（目录条目也在 entries 区间内，`delete_entry` 已覆盖）；
+        // 父链已断的目录与其挂靠条目由 `compact_tombstones` 的可达性裁决统一丢弃。
+        for i in start..end {
+            self.delete_entry(i as u32);
+        }
+        let removed = end - start;
+        // 摘掉该卷的 VolumeState，避免压缩后残留一个空区间。
+        self.volumes
+            .retain(|v| (v.volume_letter as char).to_ascii_uppercase() != up);
+        // 统一重映射。
+        self.compact_tombstones();
+        removed
     }
 
     fn ext_insert_idx(&mut self, idx: u32, ext8: u8) {

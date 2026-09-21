@@ -372,6 +372,58 @@ const _: () = assert!(std::mem::size_of::<FileEntry>() == FILE_ENTRY_V5_DISK_SIZ
 ///
 /// 兼容 v2/v3/v4：跳过尾部三段 `*_order`；v3 entries.attrs 全 0，按 dirs 表回填 `ATTR_IS_DIR`。
 pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
+    load_index_bin_with_progress(path, &|_| {})
+}
+
+/// 加载阶段进度回调。
+///
+/// 千万级库（`entry_count` 上亿、`index.bin` 十几 GB）的反序列化要几十秒到几分钟，
+/// 期间 service 的命名管道虽已挂起但必然返回 `loading=true`；调用方（service）需要一个
+/// 可观测的「加载到哪儿了」信号，否则上层只能显示一个不会动的「加载中」。
+///
+/// - `phase`：阶段名，见 `LoadPhase`；
+/// - `done`/`total`：该阶段的完成量/总量（`total` 为 0 表示未知）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadPhase {
+    /// 打开 + mmap + 预取（`index.bin` 十几 GB 时预取页缓存本身就要十几秒）
+    Open,
+    /// 解析文件头 / 卷表
+    Header,
+    /// 条目段（entries）
+    Entries,
+    /// 目录段（dirs）
+    Dirs,
+    /// FRN 表
+    Frns,
+    /// 目录索引 / FRN 索引排序（rayon 并行）
+    Indexes,
+    /// 尾部过滤段（ext_filter / deleted）
+    Filters,
+    /// 拼音候选位图
+    CjkBitmap,
+}
+
+impl LoadPhase {
+    /// 中文短标签，直接进 GUI 状态栏。
+    pub fn label(self) -> &'static str {
+        match self {
+            LoadPhase::Open => "打开索引文件",
+            LoadPhase::Header => "读取文件头",
+            LoadPhase::Entries => "解析条目",
+            LoadPhase::Dirs => "解析目录",
+            LoadPhase::Frns => "解析 FRN",
+            LoadPhase::Indexes => "构建索引表",
+            LoadPhase::Filters => "读取过滤段",
+            LoadPhase::CjkBitmap => "构建拼音位图",
+        }
+    }
+}
+
+/// 与 [`load_index_bin`] 相同，但在各阶段边界回调 `on_phase`。
+pub fn load_index_bin_with_progress(
+    path: &Path,
+    on_phase: &dyn Fn(LoadPhase),
+) -> Result<IndexStore> {
     let started = std::time::Instant::now();
     let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     crate::progress!(
@@ -379,6 +431,7 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
         path.display(),
         bytes as f64 / (1024.0 * 1024.0)
     );
+    on_phase(LoadPhase::Open);
     let file = File::open(path)?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
     let mm: &[u8] = &mmap[..];
@@ -402,6 +455,7 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
     let mut h = [0u8; 64];
     h.copy_from_slice(hdr_bytes);
     let (hdr, nvol) = IndexHeader::read(&h)?;
+    on_phase(LoadPhase::Header);
     if hdr.version > FORMAT_VERSION_CURRENT {
         return Err(crate::Error::Persist(format!(
             "索引版本 {} 高于当前可识别 {}，请升级 findx2",
@@ -453,6 +507,7 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
     }
 
     let n_entries = hdr.entry_count as usize;
+    on_phase(LoadPhase::Entries);
     let mut entries: Vec<FileEntry> = Vec::with_capacity(n_entries);
     if n_entries > 0 {
         if hdr.version >= FORMAT_VERSION_V5 {
@@ -469,6 +524,7 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
         }
     }
 
+    on_phase(LoadPhase::Dirs);
     let dirs_section = take(hdr.dir_count as usize * 24)?;
     let mut dirs = Vec::with_capacity(hdr.dir_count as usize);
     for chunk in dirs_section.chunks_exact(24) {
@@ -480,11 +536,24 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
         });
     }
 
+    on_phase(LoadPhase::Frns);
     let frns: Vec<u64> = if hdr.version >= FORMAT_VERSION_V2 {
         let n_stored = u64::from_le_bytes(take(8)?.try_into().unwrap()) as usize;
-        const MAX_FRN: usize = 64 * 1024 * 1024;
-        if n_stored > MAX_FRN {
-            return Err(crate::Error::Persist("frns 计数异常（过大）".into()));
+        // 这道检查只用来挡"明显是垃圾/错位"的计数，**不是业务容量限制**。
+        //
+        // 它曾经是 `64 * 1024 * 1024`（6710 万）。而 `frns` 段的长度设计上恒等于
+        // `entry_count`，于是 3 亿条目级的真实库（实测 309,031,075）被直接误判为损坏，
+        // 界面表现为"卡在建库中" —— 索引没坏，是上限设小了。
+        //
+        // 阈值取 `entry_count` 的 8 倍加一段常量余量：合法布局下 `n_stored == entry_count`，
+        // 留出倍数是为了容忍历史版本写入的略长/略短段（下方 reconcile 会重新对齐）。
+        // 这比固定常量更贴合"挡住天文数字"的原意 —— 乱字节解出的计数通常比真实
+        // 条目数高出若干数量级，而不是刚好落在同一个量级。
+        let frns_cap = n_entries.saturating_mul(8).saturating_add(1 << 20);
+        if n_stored > frns_cap {
+            return Err(crate::Error::Persist(format!(
+                "frns 计数异常（过大）：计数 {n_stored}，entry_count {n_entries}"
+            )));
         }
         let section = take(n_stored * 8)?;
         let mut v: Vec<u64> = vec![0u64; n_stored];
@@ -528,6 +597,7 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
         }
     }
 
+    on_phase(LoadPhase::Filters);
     let mut ext_filter: [Option<RoaringBitmap>; 256] = std::array::from_fn(|_| None);
     for slot in &mut ext_filter {
         let len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
@@ -545,6 +615,7 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
     let deleted = RoaringBitmap::deserialize_from(del_blob)
         .map_err(|e| crate::Error::Persist(e.to_string()))?;
 
+    on_phase(LoadPhase::Indexes);
     // 加载阶段同样走 sorted Vec（push_unsorted + finalize_build），
     // 比 hashbrown 在 8.5M 条目下省 ~100MB RSS、且加载更快（无 hash 计算）。
     let mut dir_index: crate::index::FrnIdxMap =
@@ -647,6 +718,7 @@ pub fn load_index_bin(path: &Path) -> Result<IndexStore> {
         excluded_dirs: Vec::new(),
     };
     // 拼音候选剪枝位图：并行扫一遍名字（1.15M 条目 ~10ms，8.5M ~100ms），之后 USN 增量维护。
+    on_phase(LoadPhase::CjkBitmap);
     store.rebuild_cjk_bitmap();
 
     if hdr.version < FORMAT_VERSION_V2 {

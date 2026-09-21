@@ -34,6 +34,7 @@ use windows::{
 mod desktop;
 
 mod app_update;
+mod autostart;
 mod findx_settings;
 #[cfg(windows)]
 mod elevate;
@@ -75,6 +76,23 @@ struct IndexStatus {
     indexing_entries_indexed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     indexing_current_volume: Option<String>,
+    /// service 侧 `index.bin` 加载阶段文案，例如
+    /// `解析条目（3/8 阶段，已 42s，共 3.1 亿条）`。
+    ///
+    /// 千万级库的反序列化要几十秒到几分钟；此前状态栏只显示静止的「加载中」，
+    /// 与「卡死」无法区分（见 2.4.0 CHANGELOG）。旧版 service 不上报时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loading_stage: Option<String>,
+    /// 加载已耗时（秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loading_elapsed_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loading_phase_done: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loading_phase_total: Option<u32>,
+    /// 墓碑条目数（旧版 service 未上报时为 None）。设置页据此显示「建议压缩」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tombstone_count: Option<u64>,
     last_error: Option<String>,
 }
 
@@ -372,6 +390,11 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
                     indexing_message: Some(format!("正在创建索引 {}", index_path.display())),
                     indexing_entries_indexed: None,
                     indexing_current_volume: None,
+                    loading_stage: None,
+                    loading_elapsed_secs: None,
+                    loading_phase_done: None,
+                    loading_phase_total: None,
+                    tombstone_count: None,
                     last_error: None,
                 };
             }
@@ -388,6 +411,11 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
                 indexing_message: None,
                 indexing_entries_indexed: None,
                 indexing_current_volume: None,
+                loading_stage: None,
+                loading_elapsed_secs: None,
+                loading_phase_done: None,
+                loading_phase_total: None,
+                tombstone_count: None,
                 last_error: Some(take_last_index_error().unwrap_or_else(|| {
                     format!(
                         "尚无索引 {}（首次启动会自动建索引）",
@@ -419,8 +447,13 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
                 backfill_done,
                 backfill_total,
                 loading,
+                loading_stage,
+                loading_elapsed_secs,
+                loading_phase_done,
+                loading_phase_total,
                 watch_error,
                 backfill_error,
+                tombstone_count,
                 ..
             })) => {
                 // **关键自愈逻辑**：service 已经在线、index 已经有数据，那"是否在建库"就只能由 service
@@ -462,6 +495,11 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
                 indexing_message: idx_snap.message.clone(),
                 indexing_entries_indexed: idx_snap.entries_indexed,
                 indexing_current_volume: idx_snap.current_volume.clone(),
+                loading_stage,
+                loading_elapsed_secs,
+                loading_phase_done,
+                loading_phase_total,
+                tombstone_count,
                 // USN 监听故障（增量中断/重建中）走 last_error 通道进状态栏；
                 // loading 提示优先（索引都没加载完时故障信息没意义）。
                 last_error: if loading {
@@ -484,6 +522,11 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
                 indexing_message: idx_snap.message.clone(),
                 indexing_entries_indexed: idx_snap.entries_indexed,
                 indexing_current_volume: idx_snap.current_volume.clone(),
+                loading_stage: None,
+                loading_elapsed_secs: None,
+                loading_phase_done: None,
+                loading_phase_total: None,
+                tombstone_count: None,
                 last_error: Some("管道响应异常".into()),
             },
             Ok(Err(e)) => IndexStatus {
@@ -499,6 +542,11 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
                 indexing_message: idx_snap.message.clone(),
                 indexing_entries_indexed: idx_snap.entries_indexed,
                 indexing_current_volume: idx_snap.current_volume.clone(),
+                loading_stage: None,
+                loading_elapsed_secs: None,
+                loading_phase_done: None,
+                loading_phase_total: None,
+                tombstone_count: None,
                 last_error: Some(e),
             },
             Err(_) => IndexStatus {
@@ -514,6 +562,11 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
                 indexing_message: idx_snap.message.clone(),
                 indexing_entries_indexed: idx_snap.entries_indexed,
                 indexing_current_volume: idx_snap.current_volume.clone(),
+                loading_stage: None,
+                loading_elapsed_secs: None,
+                loading_phase_done: None,
+                loading_phase_total: None,
+                tombstone_count: None,
                 last_error: Some(
                     "管道状态查询超时（建库时仍可看上方进度；若持续请检查服务是否已启动）".into(),
                 ),
@@ -536,6 +589,11 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
             indexing_message: None,
             indexing_entries_indexed: None,
             indexing_current_volume: None,
+            loading_stage: None,
+            loading_elapsed_secs: None,
+            loading_phase_done: None,
+            loading_phase_total: None,
+            tombstone_count: None,
             last_error: Some("当前平台不支持索引服务.".into()),
         }
     }
@@ -1079,8 +1137,275 @@ async fn rebuild_index(app: tauri::AppHandle) -> Result<IndexStatus, String> {
 
 #[cfg(not(target_os = "windows"))]
 #[tauri::command]
-async fn rebuild_index(_app: tauri::AppHandle) -> Result<IndexStatus, String> {
-    Err("FindX2 GUI 重建索引当前仅支持 Windows.".into())
+async fn rebuild_index(app: tauri::AppHandle) -> Result<IndexStatus, String> {
+    {
+        let st = INDEX_BUILD.lock().map_err(|e| e.to_string())?;
+        if st.running {
+            return Err("已有建索引任务在运行，无法重建".into());
+        }
+    }
+    // Unix 没有 Windows 服务/SYSTEM 的概念，但 service 进程仍持有 index.bin 句柄（USN 等价的
+    // watch 落盘），先 pkill 再删文件。stop_findx_service 内部就是 pkill（跨平台封装）。
+    let _ = findx_settings::stop_findx_service();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let settings = findx_settings::load_findx_settings(app.clone())?;
+    let base = findx_settings::exe_resource_dir();
+    let index = findx_settings::resolve_index_path(&base, &settings);
+    let _ = std::fs::remove_file(&index);
+    // sidecar 命名约定与 findx2-core::persist::exclude_sidecar_path 一致（同 Windows 版）。
+    {
+        let mut p = index.as_os_str().to_owned();
+        p.push(".exclude.json");
+        let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+    }
+    let _ = std::fs::remove_file(index.with_extension("indexing.json"));
+
+    // start_indexing_impl 的 Unix 分支是完整实现（遍历建库 + 日志 + 自动拉服务）。
+    start_indexing_impl(app, None).await
+}
+
+/// 一键压缩的结果（设置页展示）。`ok` 要求压缩与重启服务都成功。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactResult {
+    ok: bool,
+    bytes_before: u64,
+    bytes_after: u64,
+    /// 服务是否已成功拉回（失败时提示用户去「服务模式」手动启动）。
+    service_restarted: bool,
+    message: String,
+}
+
+fn format_bytes_short(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * KB;
+    const GB: f64 = 1024.0 * MB;
+    let b = n as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{n} B")
+    }
+}
+
+/// 一键压缩索引（设置页「索引」tab）：停服务 → 提权运行 `findx2 compact --index` → 重启服务。
+///
+/// 编排要点：
+/// - 压缩是**写** index.bin（临时文件 + rename 覆盖），service 进程持有写句柄，
+///   必须先 `taskkill` 停掉再跑 CLI（与 `rebuild_index` 相同的停等间隔）。
+/// - `C:\ProgramData\FindX` 的写入需要管理员 → 复用 `run_index_cli_blocking`
+///   （已提权直接跑；未提权弹一次 UAC，用户取消时返回 false）。
+/// - **无论压缩成败（包括 UAC 被取消），都会尝试把服务拉回来**，
+///   否则压缩失败一次就要用户手动去「服务模式」点启动。
+/// - 回收量由 GUI 侧前后 stat 文件大小得出，不依赖 CLI stdout（ShellExecute 拿不到输出）。
+/// - CLI 侧另有灾难性损失守卫（存活 < 压缩前-墓碑 时拒绝落盘），此处无需重复校验。
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn compact_index(app: tauri::AppHandle) -> Result<CompactResult, String> {
+    {
+        let st = INDEX_BUILD.lock().map_err(|e| e.to_string())?;
+        if st.running {
+            return Err("已有建索引任务在运行，无法压缩".into());
+        }
+    }
+    let settings = findx_settings::load_findx_settings(app.clone())?;
+    let base = findx_settings::exe_resource_dir();
+    let index = findx_settings::resolve_index_path(&base, &settings);
+    if !index.exists() {
+        return Err(format!(
+            "索引文件不存在: {}（先建库再压缩）",
+            index.display()
+        ));
+    }
+    let cli = findx_settings::resolve_cli_exe(&base, &settings).ok_or_else(|| {
+        "未找到 findx2.exe（请放在与 FindX2 GUI / findx2-service 相同目录）".to_string()
+    })?;
+
+    {
+        let mut st = INDEX_BUILD.lock().map_err(|e| e.to_string())?;
+        st.running = true;
+    }
+
+    let work = cli
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let args = vec![
+        "compact".to_string(),
+        "--index".to_string(),
+        index.to_string_lossy().into_owned(),
+    ];
+    let cli_for_task = cli.clone();
+
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        let bytes_before = std::fs::metadata(&index).map(|m| m.len()).unwrap_or(0);
+
+        // 停 service：压缩要 rename 覆盖 index.bin，服务进程持有句柄时不许动。
+        let _ = findx_settings::stop_findx_service();
+        std::thread::sleep(std::time::Duration::from_millis(800));
+
+        let ok = run_index_cli_blocking(&cli_for_task, &args, &work);
+
+        let bytes_after = std::fs::metadata(&index).map(|m| m.len()).unwrap_or(0);
+        (ok, bytes_before, bytes_after)
+    })
+    .await
+    .map_err(|e| {
+        if let Ok(mut st) = INDEX_BUILD.lock() {
+            st.running = false;
+        }
+        format!("压缩任务执行失败: {e}")
+    })?;
+
+    if let Ok(mut st) = INDEX_BUILD.lock() {
+        st.running = false;
+    }
+
+    // 统一出口：把服务拉回来（service 模式走 sc start / 提权 install；standalone 走直接 spawn）。
+    let service_restarted = findx_settings::spawn_findx_service_process(app).is_ok();
+
+    let (ok, bytes_before, bytes_after) = res;
+    let freed = bytes_before.saturating_sub(bytes_after);
+    let service_note = if service_restarted {
+        "服务已重新启动"
+    } else {
+        "服务重启失败，请到「服务模式」手动启动"
+    };
+    let message = if ok {
+        if freed > 0 {
+            format!(
+                "压缩完成，回收 {}；{service_note}。",
+                format_bytes_short(freed)
+            )
+        } else {
+            format!(
+                "没有墓碑，无需压缩（文件 {}）；{service_note}。",
+                format_bytes_short(bytes_after)
+            )
+        }
+    } else {
+        format!(
+            "压缩未执行成功（可能取消了管理员授权，或 CLI 侧守卫拒绝落盘）；索引未被改动，{service_note}。"
+        )
+    };
+
+    Ok(CompactResult {
+        ok: ok && service_restarted,
+        bytes_before,
+        bytes_after,
+        service_restarted,
+        message,
+    })
+}
+
+/// Unix 版一键压缩：无 UAC/服务句柄锁（用户数据目录 GUI 可写），直接同步跑 CLI。
+///
+/// 与 Windows 版的差异：
+/// - 不需要提权（`~/Library/Application Support/FindX` 或 `$XDG_DATA_HOME/FindX` 归当前用户）；
+/// - service 是 GUI 的子进程（pkill 停），而非 SCM 管理的系统服务；
+/// - CLI 输出重定向到 `findx2-index.log`，退出码判定成败。
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+async fn compact_index(app: tauri::AppHandle) -> Result<CompactResult, String> {
+    {
+        let st = INDEX_BUILD.lock().map_err(|e| e.to_string())?;
+        if st.running {
+            return Err("已有建索引任务在运行，无法压缩".into());
+        }
+    }
+    let settings = findx_settings::load_findx_settings(app.clone())?;
+    let base = findx_settings::exe_resource_dir();
+    let index = findx_settings::resolve_index_path(&base, &settings);
+    if !index.exists() {
+        return Err(format!("索引文件不存在: {}（先建库再压缩）", index.display()));
+    }
+    let cli = findx_settings::resolve_cli_exe(&base, &settings)
+        .ok_or_else(|| "未找到 findx2 命令行（安装包应在资源目录 bin 提供 sidecar）".to_string())?;
+
+    {
+        let mut st = INDEX_BUILD.lock().map_err(|e| e.to_string())?;
+        st.running = true;
+    }
+
+    let work = cli
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let log_path = work.join("findx2-index.log");
+    let args = vec![
+        "compact".to_string(),
+        "--index".to_string(),
+        index.to_string_lossy().into_owned(),
+    ];
+
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        let bytes_before = std::fs::metadata(&index).map(|m| m.len()).unwrap_or(0);
+
+        // 停 service（GUI 子进程，pkill）再压缩；unix stop_findx_service 内部即 pkill。
+        let _ = findx_settings::stop_findx_service();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let mut cmd = std::process::Command::new(&cli);
+        cmd.args(&args).current_dir(&work);
+        findx_settings::unix_configure_detached_child(&mut cmd, Some(&log_path));
+        let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+
+        let bytes_after = std::fs::metadata(&index).map(|m| m.len()).unwrap_or(0);
+        (ok, bytes_before, bytes_after)
+    })
+    .await
+    .map_err(|e| {
+        if let Ok(mut st) = INDEX_BUILD.lock() {
+            st.running = false;
+        }
+        format!("压缩任务执行失败: {e}")
+    })?;
+
+    if let Ok(mut st) = INDEX_BUILD.lock() {
+        st.running = false;
+    }
+
+    // 统一出口：把服务拉回来（unix spawn_findx_service_process 为 GUI 直接 spawn 子进程）。
+    let service_restarted = findx_settings::spawn_findx_service_process(app).is_ok();
+
+    let (ok, bytes_before, bytes_after) = res;
+    let freed = bytes_before.saturating_sub(bytes_after);
+    let service_note = if service_restarted {
+        "服务已重新启动"
+    } else {
+        "服务重启失败，请查看 findx2-index.log 或重启应用"
+    };
+    let message = if ok {
+        if freed > 0 {
+            format!(
+                "压缩完成，回收 {}；{service_note}。",
+                format_bytes_short(freed)
+            )
+        } else {
+            format!(
+                "没有墓碑，无需压缩（文件 {}）；{service_note}。",
+                format_bytes_short(bytes_after)
+            )
+        }
+    } else {
+        format!(
+            "压缩未执行成功（详见 {log}）；索引未被改动，{service_note}。",
+            log = log_path.display()
+        )
+    };
+
+    Ok(CompactResult {
+        ok: ok && service_restarted,
+        bytes_before,
+        bytes_after,
+        service_restarted,
+        message,
+    })
 }
 
 /// 切换运行模式（service ↔ standalone-UAC）：
@@ -1136,6 +1461,32 @@ async fn apply_run_mode_change(app: tauri::AppHandle, target: String) -> Result<
     shell_execute_runas(&service_exe, Some(&params), &work, true)
         .map_err(|e| format!("提权执行 `findx2-service` 失败: {e}"))?;
     Ok(())
+}
+
+/// 读「随系统启动」开关的当前状态（以注册表为唯一真源，不信任设置文件里的缓存值）。
+#[tauri::command]
+fn get_autostart_state() -> autostart::AutostartState {
+    autostart::read()
+}
+
+/// 开关「随系统启动」。写 `HKCU\...\Run`，无需管理员。
+///
+/// 同时把结果同步进设置文件（`autoStartApp`）——那只是给 UI 用的缓存，
+/// 真正的判定永远是 `get_autostart_state`。
+#[tauri::command]
+fn set_autostart(
+    app: tauri::AppHandle,
+    enable: bool,
+) -> Result<autostart::AutostartState, String> {
+    let state = autostart::apply(enable)?;
+    // 设置文件写失败不该让整次操作失败：注册表已经改成功了，UI 只要拿到真实状态即可。
+    if let Ok(mut s) = findx_settings::load_findx_settings(app.clone()) {
+        if s.auto_start_app != state.enabled {
+            s.auto_start_app = state.enabled;
+            let _ = findx_settings::save_findx_settings(app, s);
+        }
+    }
+    Ok(state)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1955,6 +2306,8 @@ pub fn run() {
             start_native_file_drag,
             open_external_url,
             app_update::check_app_update,
+            get_autostart_state,
+            set_autostart,
             load_preview_data_url,
             detect_legacy_v1_installation,
             load_preview_text,
@@ -1968,6 +2321,7 @@ pub fn run() {
             start_findx_service,
             findx_settings::stop_findx_service,
             rebuild_index,
+            compact_index,
             apply_run_mode_change,
             restart_app,
             desktop::get_desktop_settings,

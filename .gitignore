@@ -45,3 +45,9 @@ gui/src-tauri/gen/
 *.temp
 *.pid
 
+# WorkBuddy 本地工作数据（记忆/临时脚本），不属于仓库
+.workbuddy/
+
+# git 修复期间的损坏现场备份（确认无误后物理删除）
+.git.broken/
+

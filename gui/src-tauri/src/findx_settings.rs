@@ -68,6 +68,11 @@ pub struct FindxGuiSettings {
     /// USN 落盘间隔（秒）。默认 30；调低增加写盘频率（更安全但更耗 IO）。
     #[serde(default = "default_save_interval")]
     pub save_interval_secs: u64,
+    /// 「随系统启动」的**缓存标记**。真源是 `HKCU\...\Run` 里的注册表值，
+    /// 由 `autostart::read()` 判定；这里只为让设置在 UI 上可序列化。
+    /// 不要用它决定是否自启——注册表才是唯一权威。
+    #[serde(default)]
+    pub auto_start_app: bool,
 }
 
 /// Unix 可写数据目录：macOS 为 `~/Library/Application Support/FindX`，
@@ -139,6 +144,7 @@ impl Default for FindxGuiSettings {
             enable_metadata_backfill: true,
             enable_everything_ipc: true,
             save_interval_secs: default_save_interval(),
+            auto_start_app: false,
         }
     }
 }

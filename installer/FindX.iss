@@ -7,7 +7,7 @@
 ; 与 v1 的 FindX.iss 类似：多任务（服务注册、PATH、桌面快捷方式、安装后启动），无 .NET 检测。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.3.0"
+  #define MyAppVersion "2.4.1"
 #endif
 
 #define MyAppName      "FindX"
@@ -20,6 +20,9 @@
 #define MyServiceName  "FindX2Search"
 ; 与 GUI 内约定一致：存在该文件时首启用 ProgramData 索引 + 服务模式
 #define MyInstalledMarker "FindX.installed"
+; 「随系统启动」在 HKCU\...\Run 下的值名。改这里必须同步改 gui/src-tauri/src/autostart.rs
+; 的 RUN_VALUE_NAME，否则卸载时清不掉。
+#define MyRunValueName "FindX"
 
 [Setup]
 AppId={{7E8A9B0C-1D2E-3F4A-5B6C-7D8E9F0A1B2C}
@@ -226,8 +229,13 @@ end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
-  if CurUninstallStep = usPostUninstall then
+  if CurUninstallStep = usPostUninstall then begin
     RemoveFromPath(ExpandConstant('{app}'));
+    // 「随系统启动」写的是 HKCU\...\Run 下的 FindX 值（见 gui/src-tauri/src/autostart.rs）。
+    // 不删的话，卸载后每次登录 Windows 都会去拉起一个已经不存在的 exe，弹找不到文件的错误。
+    // RegDeleteValue 对不存在的值返回非 0，但这里是"本来就没开"的正常情况，忽略返回值。
+    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#MyRunValueName}');
+  end;
 end;
 
 // 与 v1 一样：有旧版本占用时强杀

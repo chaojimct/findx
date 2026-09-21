@@ -68,6 +68,16 @@ enum Commands {
         #[arg(short, long, default_value = "index.bin")]
         index: std::path::PathBuf,
     },
+    /// 压缩索引：物理移除墓碑条目（删除 / 排除 / 卷重建留下的「只标记不删除」残留），
+    /// 重建全部下标并原子落盘。墓碑比高时（`status` 会提示）用它回收空间与加载时间。
+    Compact {
+        /// index.bin 路径
+        #[arg(short, long, default_value = "index.bin")]
+        index: std::path::PathBuf,
+        /// 只报告墓碑情况，不实际压缩
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     /// 连接 findx2-service 命名管道搜索（失败且指定 `--index` 时回退本地索引）
     #[cfg(windows)]
     Remote {
@@ -341,6 +351,16 @@ fn run() -> Result<()> {
             let store = load_index_bin(&index)?;
             println!("条目数: {}", store.entry_count());
             println!("目录数: {}", store.dirs.len());
+            let tomb = store.deleted.len();
+            println!(
+                "墓碑数: {tomb}（{:.2}%）{}",
+                store.tombstone_ratio() * 100.0,
+                if store.should_compact() {
+                    " ← 建议执行 `findx2 compact`"
+                } else {
+                    ""
+                }
+            );
             if let Some(v) = store.volumes.first() {
                 println!(
                     "卷 letter={} id={} prefix={} serial={} journal_id={} last_usn={}",
@@ -352,6 +372,74 @@ fn run() -> Result<()> {
                     v.last_usn
                 );
             }
+        }
+        Commands::Compact { index, dry_run } => {
+            let t0 = std::time::Instant::now();
+            let mut store = load_index_bin(&index)?;
+            let n_before = store.entry_count();
+            let tomb = store.deleted.len() as usize;
+            let bytes_before = std::fs::metadata(&index).map(|m| m.len()).unwrap_or(0);
+
+            println!("压缩前: {n_before} 条目，其中墓碑 {tomb}（{:.2}%）",
+                store.tombstone_ratio() * 100.0);
+            println!("文件大小: {:.2} GB", bytes_before as f64 / 1073741824.0);
+
+            if dry_run {
+                println!("--dry-run：不实际压缩。");
+                return Ok(());
+            }
+            if tomb == 0 {
+                println!("没有墓碑，无需压缩。");
+                return Ok(());
+            }
+
+            let removed = store.compact_tombstones();
+            println!(
+                "已移除 {removed} 条墓碑 → 剩余 {} 条目（耗时 {:.1}s）",
+                store.entry_count(),
+                t0.elapsed().as_secs_f64()
+            );
+
+            // 灾难性损失守卫：压缩只该删墓碑，存活条目必须原样保留。
+            // 若剩余条目数明显少于「压缩前 - 墓碑数」，说明保留集算法出了偏差
+            // （历史上就发生过一次区间推断把整库当墓碑清空的事故），
+            // 此时**绝不落盘**，原文件保持不动。
+            let expected_survivors = n_before.saturating_sub(tomb);
+            let actual = store.entry_count();
+            if actual < expected_survivors {
+                return Err(findx2_core::Error::Persist(format!(
+                    "压缩结果异常：预期保留 {expected_survivors} 条（{n_before} - {tomb} 墓碑），\
+                     实际只剩 {actual} 条。已放弃落盘，原索引未改动。这是 bug，请反馈。"
+                )));
+            }
+
+            // 原子落盘：先写同目录临时文件，再 rename 覆盖。避免压缩中途崩溃留下半截索引。
+            let dir = index.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let tmp = dir.join(format!(
+                "{}.compact.tmp",
+                index
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "index.bin".into())
+            ));
+            save_index_bin(&tmp, &store)?;
+            std::fs::rename(&tmp, &index)?;
+
+            // trigram 边车的 posting 用的是旧下标，压缩后必须重建（否则剪枝会漏报）。
+            store.trigram = None;
+            match findx2_core::build_trigram_sidecar(&store, &index) {
+                Ok(()) => println!("trigram 边车已重建。"),
+                // 剪枝层缺失只影响性能，搜索会回退全表扫描，不阻断压缩结果。
+                Err(e) => println!("trigram 边车重建失败（搜索将回退全表扫描）: {e}"),
+            }
+
+            let bytes_after = std::fs::metadata(&index).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "压缩后: {} 条目，文件 {:.2} GB（回收 {:.2} GB）",
+                store.entry_count(),
+                bytes_after as f64 / 1073741824.0,
+                (bytes_before.saturating_sub(bytes_after)) as f64 / 1073741824.0
+            );
         }
         #[cfg(windows)]
         Commands::Watch {
