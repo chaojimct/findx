@@ -1337,6 +1337,8 @@ async fn compact_index(app: tauri::AppHandle) -> Result<CompactResult, String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let log_path = work.join("findx2-index.log");
+    // 闭包会 move log_path，外层拼错误消息要用的显示串先算好。
+    let log_display = log_path.display().to_string();
     let args = vec![
         "compact".to_string(),
         "--index".to_string(),
@@ -1395,7 +1397,7 @@ async fn compact_index(app: tauri::AppHandle) -> Result<CompactResult, String> {
     } else {
         format!(
             "压缩未执行成功（详见 {log}）；索引未被改动，{service_note}。",
-            log = log_path.display()
+            log = log_display
         )
     };
 
