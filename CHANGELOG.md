@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [2.4.2] - 2026-09-21
+
+### 功能
+
+- **`path:` 查询再提速 3.0×（实测 425 万条目库 950.2 ms → 313.2 ms）**：两段式过滤升级为**精确 / 疑似两级候选**。关键观察：needle 的命中要么完整落在某个路径组件内（名字 memmem 完整命中，或某祖先目录的目录路径含完整 needle——前缀含之则整条全路径含之，可直接判定），要么跨过分隔符（变体超集近似，需拼路径校验）。于是候选分成 `exact`（免拼路径直接放行）与 `check`（定向校验）两个位图：needle 不含分隔符时 `check` 恒空，第二段拼路径校验整体消失（`path:users` 这类高频形态直接吃满）。名字侧另接入既有 trigram 倒排：全部变体 ≥ 3 字节时先取位图并集超集，只对位图内条目做小写化 + memmem 精确分类；边车缺失 / 变体过短 / 候选过密（> 全表 1/3）时回退全库扫描。目录命中沿父链传播分级为「完整命中（子树精确）/ 仅变体命中（子树待校验）」，传播仍不依赖拓扑序（带记忆化父链上溯）。另有**小命中集直通**：hits ≤ 5 万（先输名字再 `path:` 精化的交互场景）直接逐条校验，免建表、免全库候选扫描。回归测试拆分两组：`path_two_phase_filter_matches_naive_full_path_scan`（既有 10 用例）+ 新增 `path_two_phase_large_hits_exact_check_split_matches_naive`（6 万条目、hits 超过小路阈值，强制走两段式主体；trigram 边车挂载 / 摘除双态 × 6 组 needle——含骑缝两侧段各仅 1 字节的 `a\d`——与朴素全路径扫描逐用例对齐）。
+- **修复骑缝 needle 两侧段仅 1 字节时漏报**：变体表原以 2 字节为下限，`path:a\d`（跨 `data\deep`）的左右段各只有 1 字节，全部被丢弃导致命中漏报（新等价性回归抓出，属 2.4.1 引入两段式时就存在的缺陷）。现骑缝段放宽到 1 字节也进表——单字节变体会放大候选面，超短骑缝查询走慢路，正确性优先。
+
 ## [2.4.1] - 2026-09-21
 
 ### 功能
@@ -199,6 +206,7 @@
 - 仓库根目录补充 **MIT** 全文许可（`LICENSE`），与 `Cargo.toml` 工作区 `MIT OR Apache-2.0` 声明在 README 中说明对应关系。
 
 [Unreleased]: https://github.com/chaojimct/findx/compare/v2.4.0...HEAD
+[2.4.2]: https://github.com/chaojimct/findx/compare/v2.4.1...v2.4.2
 [2.4.1]: https://github.com/chaojimct/findx/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/chaojimct/findx/compare/v2.3.0...v2.4.0
 [2.3.0]: https://github.com/chaojimct/findx/compare/v2.2.3...v2.3.0

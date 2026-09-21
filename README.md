@@ -130,18 +130,31 @@
    或目录路径含任一变体的目录直接命中，命中性沿父链向下传播（带记忆，O(目录数)），得到候选集。
 2. **精确校验**：只在候选条目上拼全路径做 memmem，结果与朴素全路径扫描**逐条等价**。
 
-回归测试 `path_two_phase_filter_matches_naive_full_path_scan` 以朴素扫描为基准，10 组查询钉住
-骑缝跨分隔符（`s\alice`）、首/尾分隔符（`\alice`、`projects\`）、目录条目自身（haystack 用
-`e.dir_idx` 指向的父路径）等边界。
+2.4.2 起两段式升级为**精确 / 疑似两级候选**：
 
-实测 414 万条目 / 55.4 万目录库（`ROUNDS=9 cargo run --release -p findx2-core --example perf_suite -- <index.bin>`）：
+- **两级分界**：完整落在组件内的命中可精确判定（名字 memmem 完整 needle；祖先目录路径含完整
+  needle 则其子树整条全路径含之），只有跨分隔符的变体近似才需要拼路径校验。候选因此分成
+  `exact`（直接放行，免拼路径）与 `check`（定向校验）两个位图——**needle 不含分隔符时 `check`
+  恒空，第二段校验整体消失**（`path:users` 这类高频形态直接吃满）。
+- **trigram 名字剪枝**：全部变体 ≥ 3 字节时先查既有 trigram 倒排取位图并集超集，条目侧只对位图内
+  条目做小写化 + memmem；边车缺失 / 候选过密（> 全表 1/3）时回退全库扫描。
+- **小命中集直通**：hits ≤ 5 万（先输名字再 `path:` 精化的交互场景）直接逐条校验，免建表、
+  免全库候选扫描。
+- **骑缝段 1 字节也进变体表**：`path:a\d`（跨 `data\deep`）两侧段各仅 1 字节，低于旧下限会漏报
+  （等价性回归抓出），已放宽——正确性优先，超短骑缝查询走慢路。
 
-| 查询 | 改前 | 改后 |
-| --- | --- | --- |
-| `path:users`（~1.2 万 hits） | **6553.7 ms** | **950.2 ms**（约 6.9x） |
+回归测试两组钉住等价：`path_two_phase_filter_matches_naive_full_path_scan`（10 组查询：骑缝跨分隔符
+`c:\us`、`s\alice`，首/尾分隔符，目录条目自身等边界）与 `path_two_phase_large_hits_exact_check_split_matches_naive`
+（6 万条目、hits 超过小路阈值强制走两段式主体；trigram 挂载 / 摘除双态 × 6 组 needle）。
 
-其余 10 项查询（子串 / ext / folder / startwith / endwith / 拼音 / 排序）全部无回归；剩余成本是
-名字侧 O(n) 变体扫描，未上名字倒排索引前这就是下界。
+实测 414–425 万条目库（`ROUNDS=9 cargo run --release -p findx2-core --example perf_suite -- <index.bin>`）：
+
+| 查询 | 朴素实现 | 两段式（2.4.1） | 两级候选 + trigram（2.4.2） |
+| --- | --- | --- | --- |
+| `path:users`（~1.2 万 hits） | **6553.7 ms** | **950.2 ms**（约 6.9x） | **313.2 ms**（约 21x） |
+
+其余 10 项查询（子串 / ext / folder / startwith / endwith / 拼音 / 排序）全部无回归；剩余成本为
+建表 + 目录侧判定 + 全库一遍轻量展开（每条仅一次数组查表）+ hits 遍历，约 300 ms 量级。
 
 ## 建索引与元数据回填
 
