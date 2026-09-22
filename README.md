@@ -375,11 +375,14 @@ trigram 剪枝有两个边车：`<index>.tri`（倒排表，构建/重建时原�
 2. **掐断产生源**：`merge_rebuilt_volume` 改为 `IndexStore::remove_volume_entries(letter)`，
    把该卷区间从 `entries` / `frns` **物理摘除**后再走同一套重映射。全卷重建从此不再留垃圾。
 
-3. **可日用入口 + 体检**：`findx2 compact --index <index.bin> [--dry-run]` 一键压缩（原子落盘 +
-   自动重建 `.tri` 边车）；`findx2 status` 展示墓碑数与占比；service 加载完成后若墓碑比超 25%
-   （且条目数 ≥ 10 万）就 `warn!` 并在状态栏提示「建议压缩索引回收空间」。
+3. **可日用入口 + 体检 + 自动压缩**：`findx2 compact --index <index.bin> [--dry-run]` 一键压缩（原子落盘 +
+   自动重建 `.tri` 边车）；`findx2 status` 展示墓碑数与占比。
    2.4.1 起 GUI 设置页也有一键「压缩索引」：自动停服务 → 提权跑 CLI（UAC 被取消也会把服务拉回）
    → 自动重启服务 → 展示回收量；设置页同时显示墓碑占比（service 经 IPC 上报 `tombstone_count`）。
+   2.4.3 起无需手动：service 在**启动窗口内**（加载完成后、引擎挂上管道前的零并发空档）体检
+   命中即自动物理压缩 + 原子落盘，压缩期间状态栏显示「自动压缩墓碑」阶段；墓碑日积月累
+   每天只涨 2–4%，每次开机启动体检一次，占比永远到不了高水位。落盘失败只降级提示，
+   守卫触发（存活数 < 预期）拒绝以可疑索引启动，与 CLI 同一逻辑。
 
 > 也可以手动压缩（需管理员终端）：`Stop-Service FindX2Search` → `findx2 compact --index C:\ProgramData\FindX\index.bin` → 启回服务。
 > CLI 侧带**灾难性损失守卫**：压缩后存活条目数若少于「压缩前 − 墓碑数」则拒绝落盘，原索引不动。

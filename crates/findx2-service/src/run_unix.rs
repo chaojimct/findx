@@ -65,6 +65,19 @@ pub(crate) fn run_foreground(
         store.mark_excluded_entries(&extra_excluded);
     }
 
+    // 墓碑自动压缩（与 Windows 侧一致）：体检命中就在启动窗口内无感回收。
+    // tri 边车被置空后由下方「trigram.is_none() → 后台补建」路径接管。
+    if let crate::startup_compact::AutoCompactOutcome::Compacted { saved_ok, .. } =
+        crate::startup_compact::auto_compact_if_needed(&mut store, &index)?
+    {
+        if !saved_ok {
+            set_watch_error_id(
+                "compact",
+                Some("索引已自动压缩，但落盘失败（请检查磁盘空间）；下次启动将重试".into()),
+            );
+        }
+    }
+
     let engine = Arc::new(SearchEngine::new(store));
     {
         let mut g = slot.write().map_err(|e| anyhow::anyhow!("{e}"))?;

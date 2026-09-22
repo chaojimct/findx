@@ -37,6 +37,10 @@ struct LoadState {
     started: Mutex<Option<Instant>>,
     finished: Mutex<Option<Instant>>,
     entry_count: AtomicU64,
+    /// 启动自动压缩窗口（见 [`crate::startup_compact`]）：`(开始时刻, 目标墓碑数)`。
+    /// 加载收尾后引擎尚未挂上 EngineSlot，压缩就在这个空档跑 —— 对 Status 而言
+    /// 它是「第 9/9 阶段」，GUI 状态栏因此显示推进而不是静默。
+    compaction: Mutex<Option<(Instant, u64)>>,
 }
 
 fn state() -> &'static LoadState {
@@ -46,6 +50,7 @@ fn state() -> &'static LoadState {
         started: Mutex::new(None),
         finished: Mutex::new(None),
         entry_count: AtomicU64::new(0),
+        compaction: Mutex::new(None),
     })
 }
 
@@ -103,13 +108,39 @@ pub fn note_finished() {
     }
 }
 
-/// 取当前快照；仍在加载中返回 `Some`，已结束或未开始返回 `None`。
+/// 进入启动自动压缩窗口（加载收尾后、引擎挂上 EngineSlot 前）。
+pub fn note_compaction_started(tombstones: u64) {
+    if let Ok(mut g) = state().compaction.lock() {
+        *g = Some((Instant::now(), tombstones));
+    }
+}
+
+/// 离开压缩窗口（压缩完成、守卫失败或落盘异常收尾都调）。
+pub fn note_compaction_finished() {
+    if let Ok(mut g) = state().compaction.lock() {
+        *g = None;
+    }
+}
+
+/// 取当前快照；仍在加载中或压缩中返回 `Some`，其余返回 `None`。
 ///
 /// 两个锁分开取会留下一个并发窗口：可能在读到 `phase` 之后、读 `finished` 之前，
 /// 加载刚好收尾。此时按"已结束"处理——宁可漏报一次进行中，也不要把一个已经不再
 /// 推进的加载当成进行中报给上层（那正是用户看到的"卡死"）。
 pub fn snapshot() -> Option<LoadSnapshot> {
     let s = state();
+    // 压缩窗口：加载已收尾（phase 已清空）、压缩进行中。压缩排在加载收尾之后，
+    // 所以 finished 有值 + compaction 有值 = 用户此刻在等压缩而不是在等加载。
+    if s.finished.lock().ok().and_then(|g| *g).is_some() {
+        let (started, tomb) = s.compaction.lock().ok().and_then(|g| *g)?;
+        return Some(LoadSnapshot {
+            label: "自动压缩墓碑",
+            started,
+            phases_done: LOAD_PHASES.len() as u32 + 1,
+            phases_total: LOAD_PHASES.len() as u32 + 1,
+            entry_count: tomb,
+        });
+    }
     let phase = s.phase.lock().ok().and_then(|g| *g)?;
     if s.finished.lock().ok().and_then(|g| *g).is_some() {
         return None;
@@ -149,4 +180,29 @@ pub fn progress_line_of(snap: &LoadSnapshot) -> String {
     }
     s.push('）');
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_snapshot_lifecycle() {
+        // 压缩窗口只在「加载已收尾 + 压缩进行中」出现；结束后回到 None。
+        note_finished();
+        note_compaction_finished(); // 确保无残留
+        assert!(snapshot().is_none(), "压缩未开始时不得报快照");
+
+        note_compaction_started(123_456);
+        let snap = snapshot().expect("压缩进行中必须有快照");
+        assert_eq!(snap.label, "自动压缩墓碑");
+        assert_eq!(snap.phases_done, LOAD_PHASES.len() as u32 + 1);
+        assert_eq!(snap.phases_total, LOAD_PHASES.len() as u32 + 1);
+        assert_eq!(snap.entry_count, 123_456);
+        let line = progress_line_of(&snap);
+        assert!(line.contains("自动压缩墓碑"), "状态栏文案要含标签: {line}");
+
+        note_compaction_finished();
+        assert!(snapshot().is_none(), "压缩结束后不得再报快照");
+    }
 }

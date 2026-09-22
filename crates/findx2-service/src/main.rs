@@ -3,6 +3,7 @@
 mod cli;
 mod ipc_dispatch;
 mod load_state;
+mod startup_compact;
 mod watch_health;
 
 #[cfg(windows)]

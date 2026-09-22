@@ -9,7 +9,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use findx2_core::{save_index_bin, SearchEngine};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::load_state;
 use crate::watch_health::set_watch_error;
@@ -296,26 +296,8 @@ pub(crate) fn run_foreground(
         load_t0.elapsed().as_secs_f64()
     );
 
-    // 墓碑健康度体检：墓碑是只标记不删除的条目，会一直占 entries(32B)+frns(8B)，
-    // 且搜索热路径要逐条判 is_deleted()。超阈值时明确告知用户可压缩，而不是让它悄悄烂下去。
-    if store.should_compact() {
-        let n = store.entry_count();
-        let tomb = store.deleted.len();
-        let pct = (store.tombstone_ratio() * 100.0).round() as u64;
-        warn!("索引墓碑比偏高：{tomb} / {n}（{pct}%），建议压缩索引以回收空间");
-        // 挂在第一个卷的监听状态上：墓碑是全局的，但状态栏按卷显示，挂哪都一样。
-        if let Some(v) = store.volumes.first() {
-            let letter = (v.volume_letter as char).to_ascii_uppercase();
-            set_watch_error(
-                letter,
-                Some(format!(
-                    "索引 {pct}% 条目是墓碑（{tomb}/{n}），建议「压缩索引」回收空间"
-                )),
-            );
-        }
-    }
-
     // 合并 CLI 追加的排除目录到 store；并把命中条目一次性打墓碑，避免「sidecar 没改，CLI 临时加目录」时旧数据漏网。
+    // 注意顺序：先打排除墓碑，下面的启动自动压缩才能把新旧墓碑同轮回收。
     if !flags.extra_excluded_dirs.is_empty() {
         let mut union = store.excluded_dirs.clone();
         for d in &flags.extra_excluded_dirs {
@@ -330,6 +312,25 @@ pub(crate) fn run_foreground(
             info!("CLI 排除目录命中：{} 条历史条目已标记为已删除", marked);
         }
         store.excluded_dirs = union;
+    }
+
+    // 墓碑自动压缩：体检命中（≥10 万条目且墓碑比 >25%）就在启动窗口内无感回收，
+    // Status 显示「自动压缩墓碑」阶段（load_state 上报），GUI 状态栏可见。
+    // 落盘失败只降级提示（内存已回收，下次启动重试）；守卫触发则 Err 退出，
+    // 宁可不服务也不带可疑索引上线（历史事故教训，见 startup_compact 模块注释）。
+    match crate::startup_compact::auto_compact_if_needed(&mut store, &index)? {
+        crate::startup_compact::AutoCompactOutcome::Skipped => {}
+        crate::startup_compact::AutoCompactOutcome::Compacted { saved_ok, .. } => {
+            if !saved_ok {
+                if let Some(v) = store.volumes.first() {
+                    let letter = (v.volume_letter as char).to_ascii_uppercase();
+                    set_watch_error(
+                        letter,
+                        Some("索引已自动压缩，但落盘失败（请检查磁盘空间）；下次启动将重试".into()),
+                    );
+                }
+            }
+        }
     }
 
     let engine = Arc::new(SearchEngine::new(store));
