@@ -10,6 +10,11 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{
     DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
 };
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 use windows::Win32::System::RemoteDesktop::{
     ProcessIdToSessionId, WTSGetActiveConsoleSessionId, WTSQueryUserToken,
 };
@@ -118,5 +123,32 @@ unsafe fn create_process_in_session(
     created.map_err(|e| anyhow::anyhow!("CreateProcessAsUser: {e}"))?;
 
     let _ = CloseHandle(pi.hThread);
+
+    // 2.4.5：宿主挂进 KILL_ON_JOB_CLOSE 的 Job。服务进程退出（优雅停止/崩溃/硬杀）时
+    // job 句柄由 OS 关闭 → 宿主随之被杀。否则宿主成孤儿：服务每次重启泄漏一个
+    // --everything-host 进程，且它锁住服务 exe，阻碍升级时的 exe 替换。
+    // job 句柄故意不关——进程存活期间保持打开正是「退出即杀」的开关。
+    if let Err(e) = unsafe { assign_kill_on_close(pi.hProcess) } {
+        warn!("宿主未挂 kill-on-close Job（泄漏风险）: {e}");
+    }
+
     Ok(pi.hProcess)
+}
+
+/// 把进程挂进 kill-on-close Job（失败不阻断——宿主照常工作，只是退出时可能残留）。
+unsafe fn assign_kill_on_close(process: HANDLE) -> anyhow::Result<()> {
+    let job = CreateJobObjectW(None, PCWSTR::null())
+        .map_err(|e| anyhow::anyhow!("CreateJobObjectW: {e}"))?;
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    SetInformationJobObject(
+        job,
+        JobObjectExtendedLimitInformation,
+        &info as *const _ as *const core::ffi::c_void,
+        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+    )
+    .map_err(|e| anyhow::anyhow!("SetInformationJobObject: {e}"))?;
+    AssignProcessToJobObject(job, process)
+        .map_err(|e| anyhow::anyhow!("AssignProcessToJobObject: {e}"))?;
+    Ok(())
 }

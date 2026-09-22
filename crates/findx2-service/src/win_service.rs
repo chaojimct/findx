@@ -1,10 +1,18 @@
 //! Windows 服务安装、卸载与入口调度。
+//!
+//! 停止协议（2.4.5 起）：STOP 控制码 → 置 `stop` 标志 → 上报 StopPending（wait_hint 10s）
+//! → 等 run_foreground 线程收尾落盘（USN pending flush + persist，最多 10s）→ 上报 STOPPED。
+//! 之前直接 `process::exit(0)`：工作线程被腰斩（最多丢一个落盘间隔的内存增量，靠 journal
+//! 重放兜底），且 exit 若卡在 C runtime flush 就表现为「STOP 30s 无响应」。
+//! 关键节点全部落 `service-win.log`（ProgramData\FindX），为历史上无证据的 ExitCode 1067
+//! 留下证据链：下次启动失败时看日志断在哪一步。
 
 use clap::Parser;
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::error;
 use windows_service::{
@@ -23,6 +31,44 @@ use crate::cli::Cli;
 /// 与 `create_service` / `dispatcher::start` 一致的服务名。
 pub const SERVICE_NAME: &str = "FindX2Search";
 
+/// 分发层日志：service_main 各关键节点 append 一行，退出/崩溃时最后几行即现场。
+fn svc_log(msg: &str) {
+    let dir = match std::env::var_os("ProgramData") {
+        Some(pd) => PathBuf::from(pd).join("FindX"),
+        None => return,
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    let line = format!("[{stamp}] {msg}\n");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("service-win.log"))
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+}
+
+/// 上报服务状态（失败只记日志，不中断——状态机收尾尽力而为）。
+fn set_status(
+    handle: &windows_service::service_control_handler::ServiceStatusHandle,
+    state: ServiceState,
+    controls: ServiceControlAccept,
+    wait_hint: Duration,
+    exit_code: ServiceExitCode,
+) {
+    let r = handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: state,
+        controls_accepted: controls,
+        exit_code,
+        checkpoint: 0,
+        wait_hint,
+        process_id: None,
+    });
+    if let Err(e) = r {
+        error!("set_service_status({state:?}): {e}");
+    }
+}
+
 define_windows_service!(ffi_service_main, service_main_impl);
 
 pub fn dispatch() -> anyhow::Result<()> {
@@ -32,9 +78,11 @@ pub fn dispatch() -> anyhow::Result<()> {
 }
 
 fn service_main_impl(_arguments: Vec<OsString>) {
+    svc_log("service_main 进入");
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
+            svc_log(&format!("服务入口解析参数失败: {e}"));
             error!("服务入口解析参数失败: {e}");
             return;
         }
@@ -46,6 +94,7 @@ fn service_main_impl(_arguments: Vec<OsString>) {
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Stop | ServiceControl::Shutdown => {
+                svc_log("收到 STOP/SHUTDOWN 控制码");
                 stop_cb.store(true, Ordering::SeqCst);
                 ServiceControlHandlerResult::NoError
             }
@@ -57,20 +106,20 @@ fn service_main_impl(_arguments: Vec<OsString>) {
     let status_handle = match service_control_handler::register(SERVICE_NAME, event_handler) {
         Ok(h) => h,
         Err(e) => {
+            svc_log(&format!("register service handler 失败: {e}"));
             error!("register service handler: {e}");
             return;
         }
     };
 
-    let _ = status_handle.set_service_status(ServiceStatus {
-        service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::Running,
-        controls_accepted: ServiceControlAccept::STOP,
-        exit_code: ServiceExitCode::Win32(0),
-        checkpoint: 0,
-        wait_hint: Duration::default(),
-        process_id: None,
-    });
+    set_status(
+        &status_handle,
+        ServiceState::Running,
+        ServiceControlAccept::STOP,
+        Duration::default(),
+        ServiceExitCode::Win32(0),
+    );
+    svc_log("状态=Running 已上报");
 
     let idx = cli.index.clone();
     let vol = cli.volume.clone();
@@ -83,25 +132,73 @@ fn service_main_impl(_arguments: Vec<OsString>) {
         no_backfill: cli.no_backfill,
         extra_excluded_dirs: cli.exclude_dir.clone(),
     };
-    std::thread::spawn(move || {
-        if let Err(e) = crate::run::run_foreground(
-            idx,
-            vol,
-            pipe,
-            save,
-            full_stat,
-            max_scan_threads,
-            flags,
-        ) {
-            error!("run_foreground: {e}");
-        }
-    });
+    let runner = {
+        let stop_runner = stop.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = crate::run::run_foreground(
+                idx,
+                vol,
+                pipe,
+                save,
+                full_stat,
+                max_scan_threads,
+                flags,
+                stop_runner,
+            ) {
+                svc_log(&format!("run_foreground 失败: {e:#}"));
+                error!("run_foreground: {e}");
+            }
+            svc_log("run_foreground 线程返回");
+        })
+    };
+    svc_log("run_foreground 线程已启动");
 
+    // 主循环：等 STOP，同时监测工作线程自行退出（启动失败等异常路径也要结束状态机）。
     while !stop.load(Ordering::SeqCst) {
+        if runner.is_finished() {
+            svc_log("工作线程已自行退出（未收到 STOP）——上报 STOPPED");
+            set_status(
+                &status_handle,
+                ServiceState::Stopped,
+                ServiceControlAccept::empty(),
+                Duration::default(),
+                ServiceExitCode::Win32(0),
+            );
+            return;
+        }
         std::thread::sleep(Duration::from_millis(300));
     }
 
-    std::process::exit(0);
+    // 收到 STOP：告知 SCM 我们在收尾（落盘最多 ~10s），避免 30s 无响应被误判。
+    set_status(
+        &status_handle,
+        ServiceState::StopPending,
+        ServiceControlAccept::empty(),
+        Duration::from_secs(10),
+        ServiceExitCode::Win32(0),
+    );
+    svc_log("状态=StopPending 已上报，等待工作线程收尾（最多 10s）");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !runner.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if runner.is_finished() {
+        svc_log("工作线程收尾完成——上报 STOPPED，正常退出");
+        set_status(
+            &status_handle,
+            ServiceState::Stopped,
+            ServiceControlAccept::empty(),
+            Duration::default(),
+            ServiceExitCode::Win32(0),
+        );
+        // 正常 return：dispatcher 结束 → main 返回 → 进程退出。
+        // pipe/tokio 等 detached 线程由 OS 收割（命名管道句柄随进程关闭）。
+    } else {
+        // 兜底：落盘卡住（磁盘满/杀毒扫描）也不能让 SCM 干等——硬退，journal 重放兜底。
+        svc_log("等待工作线程超时（10s）——强制退出（journal 重放兜底）");
+        std::process::exit(0);
+    }
 }
 
 pub fn install(

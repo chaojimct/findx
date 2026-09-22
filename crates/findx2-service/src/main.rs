@@ -109,6 +109,8 @@ fn try_main() -> anyhow::Result<()> {
                 no_backfill: cli.no_backfill,
                 extra_excluded_dirs: cli.exclude_dir,
             },
+            // 控制台模式：无 Ctrl+C 优雅停（journal 重放兜底），传永不置位标志对齐签名。
+            run::never_stop_flag(),
         );
     }
 

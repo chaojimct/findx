@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+## [2.4.5] - 2026-09-22
+
+### 修复
+
+- **服务对 STOP 控制码无响应（2.4.3 已知问题，实测复现并修复）**：旧实现的停机完全靠 `process::exit(0)` 硬杀——工作线程被腰斩（最多丢一个落盘间隔的内存增量，靠 USN journal 重放兜底），exit 卡在 C runtime flush 时表现为「STOP 30 秒无响应」；且进程从未向 SCM 上报 STOPPED，`ExitCode` 一律记 1067（本机实测：0.5 秒即停但 ExitCode 1067，每次都复现）。现在走完整的优雅停止状态机：STOP → 置停机标志 → 上报 StopPending（wait_hint 10s）→ 工作线程 50ms 内检测标志，USN pending flush + 索引落盘后返回（每卷最多等 10s；元数据未就绪则跳过落盘）→ 主线程轮询等待 → 上报 STOPPED 正常退出；落盘卡死超 10s 仍硬退兜底（journal 重放）。实测：收到 STOP 到上报 STOPPED 约 0.4 秒、ExitCode 0、无残留进程。
+- **服务每次重启泄漏一个 Everything 宿主进程**：服务（SYSTEM）启动时会在交互用户会话拉起 Everything 兼容宿主（`--everything-host`，`session_spawn`），但停止时无人回收——宿主变孤儿进程逐次累积（实测 3 次 stop/start 泄漏 3 个），孤儿还会锁住服务 exe，阻碍升级时的手动替换（2.4.4 的安装器不受影响，其 PrepareToInstall 会强杀全部同名进程）。现宿主创建即挂入 `KILL_ON_JOB_CLOSE` 的 Job Object：服务进程退出（优雅停止/崩溃/强杀）时 OS 自动终止宿主。实测 STOP 后 findx2-service 进程归零，重启后恢复为 2 个（服务 + 宿主）。
+
+### 其他
+
+- **服务分发层落盘日志**：`service_main` 全程关键节点（进入/参数解析/注册回调/Running/收到 STOP/StopPending/收尾完成/超时强退）append 到 `%ProgramData%\FindX\service-win.log`——历史上 ExitCode 1067「事件日志无记录」无据可查，此后启动/停止失败看最后几行即知断在哪一步。
+
 ## [2.4.4] - 2026-09-22
 
 ### 功能
@@ -27,9 +38,7 @@
 
 - **启动体检顺序优化**：CLI 追加排除目录的墓碑标记挪到自动压缩之前——启动时两类墓碑（排除目录命中 + 历史删除）同轮回收，不会留到下次。
 
-### 已知问题
-
-- **服务对 STOP 控制码无响应**（实测 30 秒不停，只能强杀；强杀后 2 秒内立刻重启会因资源未释放而失败，ExitCode 1067 且事件日志无记录）。停服务的脚本需在强杀后等待 ≥ 5s 再启动。待修：服务主循环的优雅停止。
+> 「服务对 STOP 控制码无响应」已知问题已在 [2.4.5] 修复。
 
 ## [2.4.2] - 2026-09-21
 
@@ -233,6 +242,7 @@
 - 仓库根目录补充 **MIT** 全文许可（`LICENSE`），与 `Cargo.toml` 工作区 `MIT OR Apache-2.0` 声明在 README 中说明对应关系。
 
 [Unreleased]: https://github.com/chaojimct/findx/compare/v2.4.4...HEAD
+[2.4.5]: https://github.com/chaojimct/findx/compare/v2.4.4...v2.4.5
 [2.4.4]: https://github.com/chaojimct/findx/compare/v2.4.3...v2.4.4
 [2.4.3]: https://github.com/chaojimct/findx/compare/v2.4.2...v2.4.3
 [2.4.2]: https://github.com/chaojimct/findx/compare/v2.4.1...v2.4.2

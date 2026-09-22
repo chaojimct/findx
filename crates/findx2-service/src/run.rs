@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, RwLock};
@@ -226,6 +227,11 @@ fn maybe_rebuild_trigram(engine: &Arc<SearchEngine>, index: &Path) {
 }
 
 /// 前台运行。（非 Windows 下不提供本模块）
+/// 控制台模式用的「永不停止」标志：无 Ctrl+C 优雅停（journal 重放兜底），签名对齐服务模式。
+pub(crate) fn never_stop_flag() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
 pub(crate) fn run_foreground(
     index: PathBuf,
     _volume: String,
@@ -234,6 +240,7 @@ pub(crate) fn run_foreground(
     full_stat: bool,
     max_scan_threads: usize,
     flags: RunFlags,
+    stop: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let _ = (full_stat, max_scan_threads);
     if !index.exists() {
@@ -251,7 +258,8 @@ pub(crate) fn run_foreground(
 
     let pipe_path_join = normalize_pipe_path(&pipe_name);
     let slot_pipe = slot.clone();
-    let pipe_thread = std::thread::Builder::new()
+    // detached：不 join。停机时进程退出由 OS 收割，命名管道句柄随进程关闭。
+    let _pipe_thread = std::thread::Builder::new()
         .name("findx2-named-pipe".into())
         .spawn(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -333,6 +341,13 @@ pub(crate) fn run_foreground(
         }
     }
 
+    // 停止检查点：加载（可能几十秒）完成后若已收到 STOP，直接退出——
+    // 大库加载不可中断，这里保证至多多等一轮加载而不是整套启动流程走完。
+    if stop.load(Ordering::SeqCst) {
+        info!("加载完成后检测到停机指令，跳过启动直接退出");
+        return Ok(());
+    }
+
     let engine = Arc::new(SearchEngine::new(store));
     {
         let mut g = slot.write().expect("EngineSlot 写锁中毒");
@@ -411,21 +426,39 @@ pub(crate) fn run_foreground(
             }
         }
     }
+    let mut usn_handles: Vec<JoinHandle<()>> = Vec::new();
     for (vol_path, letter) in volumes_watch {
         let index_for_watch = index.clone();
         let engine_watch = engine.clone();
-        std::thread::spawn(move || {
-            if let Err(e) =
-                usn_watch_loop(engine_watch, vol_path, letter, index_for_watch, save_iv)
-            {
+        let stop_watch = stop.clone();
+        usn_handles.push(std::thread::spawn(move || {
+            if let Err(e) = usn_watch_loop(
+                engine_watch,
+                vol_path,
+                letter,
+                index_for_watch,
+                save_iv,
+                stop_watch,
+            ) {
                 error!("USN 监听线程退出 ({letter}): {e}");
             }
-        });
+        }));
     }
 
-    pipe_thread
-        .join()
-        .map_err(|_| anyhow::anyhow!("named pipe 线程异常结束"))?;
+    // 停机等待：STOP 置位（或控制台模式的永不置位标志）→ 等 USN 线程 flush+落盘后返回。
+    // pipe 线程 detached：进程退出时由 OS 收割（管道句柄随进程关闭）。
+    // 之前这里 `pipe_thread.join()` 永久阻塞，服务停止完全靠 win_service 的 process::exit 硬杀。
+    while !stop.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    info!("收到停机指令：等待 USN 线程 flush + 落盘（每卷最多 10s）…");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for h in usn_handles {
+        while !h.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    info!("停机收尾完成，run_foreground 退出");
     Ok(())
 }
 
@@ -451,6 +484,7 @@ fn usn_watch_loop(
     volume_letter: u8,
     index_path: PathBuf,
     save_interval_secs: u64,
+    stop: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let letter = (volume_letter as char).to_ascii_uppercase();
     // 初始 resume 由下面的 make_worker 每次重读（重建后游标已更新），这里不再预读。
@@ -568,6 +602,20 @@ fn usn_watch_loop(
     };
 
     loop {
+        // 停机检查：recv_timeout 只有 50ms 粒度，这里最多 50ms 响应一次。
+        // 退出前 flush 内存 pending（游标停在最后 Checkpoint，journal 重放覆盖剩余变更）
+        // 并落盘一次（metadata_ready 才写，与周期落盘同一守卫）。
+        if stop.load(Ordering::SeqCst) {
+            flush_pending(&mut pending);
+            if engine.metadata_ready() {
+                match persist_index(&engine, &index_path) {
+                    Ok(()) => info!("卷 {letter} 停机落盘完成"),
+                    Err(e) => error!("卷 {letter} 停机落盘失败（journal 重放兜底）: {e}"),
+                }
+            }
+            info!("卷 {letter} USN 监听线程停机退出");
+            return Ok(());
+        }
         // 重建冻结期（本卷）：排空丢弃，不 apply 不推进游标；journal 重放会补回。
         // 其它卷不受影响（标志按卷）。
         if is_volume_frozen(letter) {
