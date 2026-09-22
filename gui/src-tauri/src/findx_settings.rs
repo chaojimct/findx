@@ -73,6 +73,9 @@ pub struct FindxGuiSettings {
     /// 不要用它决定是否自启——注册表才是唯一权威。
     #[serde(default)]
     pub auto_start_app: bool,
+    /// 启动 GUI 后自动检查 GitHub 新版本（仅提示，不自动下载安装）。
+    #[serde(default = "default_true")]
+    pub auto_check_update: bool,
 }
 
 /// Unix 可写数据目录：macOS 为 `~/Library/Application Support/FindX`，
@@ -145,6 +148,7 @@ impl Default for FindxGuiSettings {
             enable_everything_ipc: true,
             save_interval_secs: default_save_interval(),
             auto_start_app: false,
+            auto_check_update: true,
         }
     }
 }

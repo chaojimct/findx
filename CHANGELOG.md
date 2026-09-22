@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+## [2.4.4] - 2026-09-22
+
+### 功能
+
+- **应用更新闭环（检测 → 下载 → 静默安装 → 自动重启）**：此前「检查更新」只能打开发行页让用户手动下载安装，现在全程内置。检测信息扩充（安装包直链、大小、600 字符内发行说明）；新增后台流式下载（64KB 分块写临时文件，`findx2-update-progress` 事件 200ms 节流上报进度，支持取消，完成后按 Content-Length 与发行元数据双重校验完整性，不一致即删包中止）；设置页新增进度条（百分比 + 已下载/总大小）与「取消下载」「安装更新并重启」按钮。安装走 `ShellExecute runas` 启动 Inno 安装器 `/VERYSILENT`（弹一次 UAC 授权），安装器自身负责强杀旧 GUI/服务 → 覆盖安装 → 重注册并启动服务 → 静默模式下自动启动新 GUI——服务与 GUI 均无需人工干预。启动临时文件按 URL 尾段命名、非 https 链接拒绝、< 1MB 的安装包拒绝执行。
+- **主窗口更新提示条升级**：既有「发现新版本」横幅的按钮从「前往下载」（跳浏览器）升级为「去更新」——发送 `findx2-open-settings-tab` 事件并唤起设置窗口「高级」标签，复用完整的下载进度/取消/安装 UI；自动检查逻辑保留（启动 3.5s 后检查、localStorage 24h 节流、可按版本忽略），并接入新增的「启动时自动检查更新」设置开关（默认开；关闭后仅停止自动检查，手动检查不受影响）。
+- **后端不再另起检查线程**：自动检查由前端统一负责（节流/忽略/开关逻辑成熟），Rust 侧只保留 check / download / install 三个原子命令，避免双端重复请求 GitHub API。
+
+### 兼容
+
+- 非 Windows 平台（macOS/Linux）无对应安装器：检测信息不含安装包直链，发现新版本时自动打开发行页手动下载；`install_downloaded_update` 明确返回不支持。
+
 ## [2.4.3] - 2026-09-22
 
 ### 功能
@@ -220,7 +232,8 @@
 
 - 仓库根目录补充 **MIT** 全文许可（`LICENSE`），与 `Cargo.toml` 工作区 `MIT OR Apache-2.0` 声明在 README 中说明对应关系。
 
-[Unreleased]: https://github.com/chaojimct/findx/compare/v2.4.0...HEAD
+[Unreleased]: https://github.com/chaojimct/findx/compare/v2.4.4...HEAD
+[2.4.4]: https://github.com/chaojimct/findx/compare/v2.4.3...v2.4.4
 [2.4.3]: https://github.com/chaojimct/findx/compare/v2.4.2...v2.4.3
 [2.4.2]: https://github.com/chaojimct/findx/compare/v2.4.1...v2.4.2
 [2.4.1]: https://github.com/chaojimct/findx/compare/v2.4.0...v2.4.1

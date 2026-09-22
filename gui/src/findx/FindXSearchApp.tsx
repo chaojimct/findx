@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "./findx.css";
@@ -514,6 +514,13 @@ export default function FindXSearchApp() {
       } catch {
         /* ignore */
       }
+      // 设置开关 autoCheckUpdate（默认开）：关掉后启动不自动检查（手动检查仍可用）。
+      try {
+        const s = await invoke<FindxGuiSettings>("load_findx_settings");
+        if (s.autoCheckUpdate === false) return;
+      } catch {
+        /* 读取失败按默认开启继续 */
+      }
       try {
         const info = await invoke<AppUpdateInfo>("check_app_update");
         if (cancelled) return;
@@ -870,11 +877,14 @@ export default function FindXSearchApp() {
               type="button"
               className="fx-btn-icon fx-btn-search"
               onClick={() => {
-                const u = updateBanner.releasePageUrl;
-                if (u) void invoke("open_external_url", { url: u }).catch(() => {});
+                // 跳设置页「高级」标签完成下载/安装（带进度条与静默安装），不再直接跳浏览器。
+                void emit("findx2-open-settings-tab", { tab: "advanced" })
+                  .catch(() => {})
+                  .then(() => invoke("show_settings_window"))
+                  .catch(() => {});
               }}
             >
-              前往下载
+              去更新
             </button>
             <button
               type="button"

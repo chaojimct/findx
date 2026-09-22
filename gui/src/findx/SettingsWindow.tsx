@@ -3,7 +3,15 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import "./findx.css";
-import type { AppUpdateInfo, AutostartState, FindxGuiSettings, RunMode, UiThemePref } from "./findxGuiTypes";
+import type {
+  AppUpdateInfo,
+  AutostartState,
+  FindxGuiSettings,
+  RunMode,
+  UiThemePref,
+  UpdateProgressEvent,
+  UpdateFinishedEvent,
+} from "./findxGuiTypes";
 import { UI_THEME_KEY, loadUiThemePref } from "./findxGuiTypes";
 
 /**
@@ -26,6 +34,7 @@ export default function SettingsWindow() {
     enableEverythingIpc: true,
     saveIntervalSecs: 30,
     autoStartApp: false,
+    autoCheckUpdate: true,
   });
   const [settingsTab, setSettingsTab] = useState<"index" | "search" | "service" | "advanced">(
     "index",
@@ -51,12 +60,54 @@ export default function SettingsWindow() {
   const [idxEntries, setIdxEntries] = useState<number | null>(null);
   const [tombCount, setTombCount] = useState<number | null>(null);
   const [compactBusy, setCompactBusy] = useState(false);
+  /** 应用更新：检测结果；下载走事件（findx2-update-progress/finished）驱动进度条 */
+  const [updInfo, setUpdInfo] = useState<AppUpdateInfo | null>(null);
+  /** true = 检查中或下载中（下载中由 dlProgress 非空区分） */
+  const [updBusy, setUpdBusy] = useState(false);
+  const [dlProgress, setDlProgress] = useState<UpdateProgressEvent | null>(null);
+  /** 下载完成后的安装包本地路径；非空时显示「安装更新并重启」 */
+  const [downloadedPath, setDownloadedPath] = useState<string | null>(null);
 
   useEffect(() => {
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
     const fn = () => setSystemDark(mq.matches);
     mq.addEventListener("change", fn);
     return () => mq.removeEventListener("change", fn);
+  }, []);
+
+  /** 应用更新：订阅后端下载进度/结束事件（下载线程 emit，200ms 节流）。 */
+  useEffect(() => {
+    const unProgress = listen<UpdateProgressEvent>("findx2-update-progress", (e) => {
+      setDlProgress(e.payload);
+    });
+    const unFinished = listen<UpdateFinishedEvent>("findx2-update-finished", (e) => {
+      setDlProgress(null);
+      setUpdBusy(false);
+      if (e.payload.ok && e.payload.path) {
+        setDownloadedPath(e.payload.path);
+        setHint("下载完成。点击「安装更新并重启」开始安装（会弹一次管理员授权）。");
+      } else {
+        setDownloadedPath(null);
+        setHint(e.payload.error ?? "下载失败");
+      }
+    });
+    return () => {
+      void unProgress.then((f) => f());
+      void unFinished.then((f) => f());
+    };
+  }, []);
+
+  /** 主窗口 banner「去更新」跳转：切到「高级」标签（下载/安装 UI 所在处）。 */
+  useEffect(() => {
+    const un = listen<{ tab: "index" | "search" | "service" | "advanced" }>(
+      "findx2-open-settings-tab",
+      (e) => {
+        setSettingsTab(e.payload.tab);
+      },
+    );
+    return () => {
+      void un.then((f) => f());
+    };
   }, []);
 
   const effectiveTheme = useMemo<"light" | "dark">(() => {
@@ -225,27 +276,81 @@ export default function SettingsWindow() {
   };
 
   const checkUpdateFromGithub = async () => {
+    setUpdBusy(true);
     setHint("正在从 GitHub 检查更新…");
     try {
       const info = await invoke<AppUpdateInfo>("check_app_update");
+      setUpdInfo(info);
       if (!info.ok) {
         setHint(info.error ?? "检查失败");
         return;
       }
-      if (info.hasUpdate && info.releasePageUrl) {
-        setHint(`发现新版本 ${info.latestVersion ?? ""}，正在打开发行页。`);
-        await invoke("open_external_url", { url: info.releasePageUrl });
+      if (info.hasUpdate) {
+        setHint(
+          info.downloadUrl
+            ? `发现新版本 ${info.latestVersion ?? ""}，可直接下载安装。`
+            : `发现新版本 ${info.latestVersion ?? ""}，本平台需手动下载，正在打开发行页。`,
+        );
+        if (!info.downloadUrl && info.releasePageUrl) {
+          await invoke("open_external_url", { url: info.releasePageUrl });
+        }
         return;
       }
       if (info.error) {
         setHint(info.error);
         return;
       }
-      setHint(`当前 ${info.currentVersion} 已是最新，或发行标签无法解析为语义化版本。`);
+      setHint(`当前 ${info.currentVersion} 已是最新。`);
+    } catch (e) {
+      setHint(String(e));
+    } finally {
+      setUpdBusy(false);
+    }
+  };
+
+  /** 开始下载安装包；进度由 findx2-update-progress 事件驱动。 */
+  const startDownload = async () => {
+    if (!updInfo?.downloadUrl) return;
+    setUpdBusy(true);
+    setDownloadedPath(null);
+    setDlProgress({ downloaded: 0, total: updInfo.assetSize ?? 0, percent: 0 });
+    try {
+      await invoke("download_app_update", {
+        url: updInfo.downloadUrl,
+        expectedSize: updInfo.assetSize ?? null,
+      });
+      setHint("正在下载更新…");
+    } catch (e) {
+      setUpdBusy(false);
+      setDlProgress(null);
+      setHint(String(e));
+    }
+  };
+
+  const cancelDownload = async () => {
+    try {
+      await invoke("cancel_update_download");
+      setHint("正在取消下载…");
     } catch (e) {
       setHint(String(e));
     }
   };
+
+  /** 以管理员授权运行静默安装器；安装器会自动重启 FindX（见 installer/FindX.iss）。 */
+  const installUpdate = async () => {
+    if (!downloadedPath) return;
+    setHint("正在启动安装…（请同意管理员授权；期间 FindX 自动关闭并在完成后重新启动）");
+    try {
+      await invoke("install_downloaded_update", { path: downloadedPath });
+      // wait_for_exit=true：走到这里说明安装器已退出且 GUI 未被杀（异常路径），提示手动处理。
+      setHint("安装器已退出但窗口仍在，请手动重启 FindX 生效。");
+    } catch (e) {
+      setHint(`未开始安装：${String(e)}`);
+    }
+  };
+
+  const fmtSize = (b: number) =>
+    b >= 1024 * 1024 ? `${(b / 1024 / 1024).toFixed(1)} MB` : `${(b / 1024).toFixed(0)} KB`;
 
   const rebuildIdx = async () => {
     if (rebuildBusy) return;
@@ -643,12 +748,79 @@ export default function SettingsWindow() {
           <div>
             <label>应用更新</label>
             <div className="fx-settings-row" style={{ marginBottom: 8 }}>
-              <button type="button" onClick={() => void checkUpdateFromGithub()}>
+              <button
+                type="button"
+                onClick={() => void checkUpdateFromGithub()}
+                disabled={updBusy}
+              >
                 从 GitHub 检查更新
               </button>
+              {updInfo?.hasUpdate && updInfo.downloadUrl && !updBusy && !downloadedPath && (
+                <button type="button" className="primary" onClick={() => void startDownload()}>
+                  下载 {updInfo.latestVersion}
+                  {updInfo.assetSize ? `（${fmtSize(updInfo.assetSize)}）` : ""}
+                </button>
+              )}
+              {updBusy && dlProgress && (
+                <button type="button" onClick={() => void cancelDownload()}>
+                  取消下载
+                </button>
+              )}
+              {downloadedPath && !updBusy && (
+                <button type="button" className="primary" onClick={() => void installUpdate()}>
+                  安装更新并重启
+                </button>
+              )}
             </div>
-            <p className="fx-hint" style={{ marginTop: -6, marginBottom: 16 }}>
-              请求 GitHub API 对比本程序版本与仓库{" "}
+
+            {dlProgress && (
+              <div style={{ marginBottom: 10 }}>
+                <div
+                  style={{
+                    height: 6,
+                    borderRadius: 3,
+                    overflow: "hidden",
+                    background: "rgba(127,127,127,0.25)",
+                  }}
+                >
+                  <div
+                    style={{
+                      height: "100%",
+                      width: `${Math.min(100, Math.max(0, dlProgress.percent))}%`,
+                      background: "#3b82f6",
+                      transition: "width 0.15s linear",
+                    }}
+                  />
+                </div>
+                <p className="fx-hint" style={{ marginTop: 4, marginBottom: 0 }}>
+                  {dlProgress.total > 0
+                    ? `正在下载 ${dlProgress.percent.toFixed(1)}%（${fmtSize(dlProgress.downloaded)} / ${fmtSize(dlProgress.total)}）`
+                    : `已下载 ${fmtSize(dlProgress.downloaded)}`}
+                </p>
+              </div>
+            )}
+
+            {updInfo?.hasUpdate && (
+              <p className="fx-hint" style={{ marginTop: 0, marginBottom: 8 }}>
+                发现新版本 {updInfo.latestVersion}（当前 {updInfo.currentVersion}）。
+                {updInfo.releaseNotes ? `更新说明：${updInfo.releaseNotes}` : ""}
+              </p>
+            )}
+
+            <label style={{ fontWeight: "normal", margin: "0 0 8px" }}>
+              <input
+                type="checkbox"
+                checked={settings.autoCheckUpdate ?? true}
+                onChange={(e) =>
+                  setSettings((s) => ({ ...s, autoCheckUpdate: e.target.checked }))
+                }
+              />{" "}
+              启动时自动检查更新（仅提示，不自动下载）
+            </label>
+
+            <p className="fx-hint" style={{ marginTop: 0, marginBottom: 16 }}>
+              更新流程：检查 → 下载（带进度）→ 静默安装（弹一次管理员授权）→ 自动重启，服务会随安装器自动恢复。
+              也可到仓库{" "}
               <a
                 href="https://github.com/chaojimct/findx/releases"
                 target="_blank"
@@ -656,7 +828,7 @@ export default function SettingsWindow() {
               >
                 chaojimct/findx
               </a>{" "}
-              的最新 Release（需联网）。
+              的 Releases 手动下载（需联网）。
             </p>
 
             <label>界面主题</label>

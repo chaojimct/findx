@@ -27,6 +27,8 @@ export type FindxGuiSettings = {
    * 本项是「开机让 GUI 自己起来」。服务本身在服务模式下由 SCM 开机自启，与本项无关。
    */
   autoStartApp?: boolean;
+  /** 启动 GUI 后自动检查 GitHub 新版本（仅提示，不自动下载安装）。 */
+  autoCheckUpdate?: boolean;
 };
 
 export type UiThemePref = "light" | "dark" | "system";
@@ -64,4 +66,24 @@ export type AppUpdateInfo = {
   hasUpdate: boolean;
   releasePageUrl?: string;
   publishedAt?: string;
+  /** Windows 安装器（FindX-*-setup.exe）直链；非 Windows 或资产缺失时缺省 */
+  downloadUrl?: string;
+  /** 安装包字节数 */
+  assetSize?: number;
+  /** 发行说明（截断到 600 字符） */
+  releaseNotes?: string;
+};
+
+/** 后端 `findx2-update-progress` 事件载荷 */
+export type UpdateProgressEvent = {
+  downloaded: number;
+  total: number;
+  percent: number;
+};
+
+/** 后端 `findx2-update-finished` 事件载荷 */
+export type UpdateFinishedEvent = {
+  ok: boolean;
+  path?: string;
+  error?: string;
 };
