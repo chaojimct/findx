@@ -229,15 +229,19 @@ impl SearchEngine {
         }
         let n = snap.len();
         let mut g = self.store.write();
-        for (idx, size, mtime, ctime) in &snap {
-            // patch_entry_metadata 入参 (size, mtime_FILETIME, ctime_FILETIME)，转回去。
-            g.patch_entry_metadata(
-                *idx,
-                *size,
-                crate::index::unix_secs_to_filetime(*mtime),
-                crate::index::unix_secs_to_filetime(*ctime),
-            )?;
-        }
+        // v6：overlay flush 一次几十万条，逐条进增量日志会爆炸；包成一次 FullResync，
+        // 下次 commit 走全量分段重写（回填完成时只发生一次）。
+        g.bulk_apply(|g| {
+            for (idx, size, mtime, ctime) in &snap {
+                // patch_entry_metadata 入参 (size, mtime_FILETIME, ctime_FILETIME)，转回去。
+                let _ = g.patch_entry_metadata(
+                    *idx,
+                    *size,
+                    crate::index::unix_secs_to_filetime(*mtime),
+                    crate::index::unix_secs_to_filetime(*ctime),
+                );
+            }
+        });
         drop(g);
         self.bump_revision();
         // 合并完不立刻 clear——并发 backfill 可能此刻还在 put 新条目，clear 会丢数据。
@@ -301,9 +305,12 @@ impl SearchEngine {
             return Ok(());
         }
         let mut g = self.store.write();
-        for &(idx, size, mtime, ctime) in updates {
-            g.patch_entry_metadata(idx, size, mtime, ctime)?;
-        }
+        // v6：批量 patch 同样走 FullResync（见 flush_metadata_overlay_into_store）。
+        g.bulk_apply(|g| {
+            for &(idx, size, mtime, ctime) in updates {
+                let _ = g.patch_entry_metadata(idx, size, mtime, ctime);
+            }
+        });
         drop(g);
         self.bump_revision();
         Ok(())

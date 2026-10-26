@@ -1123,6 +1123,13 @@ async fn rebuild_index(app: tauri::AppHandle) -> Result<IndexStatus, String> {
     let base = findx_settings::exe_resource_dir();
     let index = findx_settings::resolve_index_path(&base, &settings);
     let _ = std::fs::remove_file(&index);
+    // v6 增量存储目录（`<index>.v6/`）：重建时必须一起删，否则 service 会优先加载 stale 的 v6。
+    // 命名约定与 findx2-core::persist_v6::V6Layout::for_index 一致（OsString push ".v6"）。
+    {
+        let mut p = index.as_os_str().to_owned();
+        p.push(".v6");
+        let _ = std::fs::remove_dir_all(std::path::PathBuf::from(p));
+    }
     // sidecar 命名约定与 findx2-core::persist::exclude_sidecar_path 保持一致：`<index>.exclude.json`。
     // 这里手拼是为了不把 findx2-core 拉成 GUI 依赖（GUI 已经依赖 findx2-windows 间接拿到，但 lib 层不直接 use）。
     {

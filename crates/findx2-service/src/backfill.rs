@@ -29,7 +29,7 @@ impl Drop for BackfillRunningGuard {
     }
 }
 
-use findx2_core::{save_index_bin, SearchEngine};
+use findx2_core::SearchEngine;
 use tracing::{error, info};
 #[cfg(unix)]
 use tracing::warn;
@@ -83,11 +83,11 @@ pub(crate) fn spawn_backfill(engine: Arc<SearchEngine>, index_path: std::path::P
     }
 }
 
-/// 终态落盘：把 overlay 一次性 flush 进主索引并写盘 index.bin。
+/// 终态落盘：把 overlay 一次性 flush 进主索引并写盘（v6）。
 /// **只在回填彻底跑完时调用一次**——回填中途绝不落盘，避免持写锁阻塞 search。
 ///
-/// 写盘 549MB 用独立线程跑，不阻塞调用者；调用者立刻返回，service 后续的 search 不受影响。
-/// 写盘失败也不致命：下次启动 metadata_ready=false 会重新回填，无副作用。
+/// overlay flush 在 `bulk_apply` 里记一条 `FullResync`，`persist_index` 见到后走
+/// v6 全量分段重写（与旧 v5 一次 549MB 同量级，但一生一次）。独立线程跑，不阻塞调用者。
 fn spawn_final_persist(engine: Arc<SearchEngine>, path: std::path::PathBuf) {
     std::thread::Builder::new()
         .name("findx2-final-persist".into())
@@ -106,19 +106,17 @@ fn spawn_final_persist(engine: Arc<SearchEngine>, path: std::path::PathBuf) {
                     return;
                 }
             }
-            // 2) 写盘 index.bin（持读锁，HDD 上 549MB 可能 5-15 秒）。
+            // 2) v6 落盘：FullResync → 全量分段重写（持读锁，HDD 上数秒）。
             //    parking_lot 下 reader 共存，search 不受影响。
             let t1 = Instant::now();
-            let store = engine.index_store();
-            if let Err(e) = save_index_bin(&path, &store) {
-                error!("终态落盘：save_index_bin 失败: {e}");
+            if let Err(e) = crate::run::persist_index(&engine, &path) {
+                error!("终态落盘：persist_index 失败: {e:#}");
                 return;
             }
-            drop(store);
             // 终态已落盘：断点边车使命完成，删除（下次回填从头也不怕，因为 ready=true 不会再回填）。
             delete_overlay_sidecar(&path);
             info!(
-                "终态落盘：index.bin 已写盘（写盘耗时 {:?}，全程 {:?}）",
+                "终态落盘：v6 已写盘（写盘耗时 {:?}，全程 {:?}）",
                 t1.elapsed(),
                 t0.elapsed()
             );

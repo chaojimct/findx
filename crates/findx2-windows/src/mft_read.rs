@@ -1,14 +1,11 @@
-//! 通过卷句柄直读 $MFT，一次性提取所有 in-use 文件/目录的 size/mtime/ctime。
+//! 通过卷句柄直读 $MFT，一次性提取 in-use 文件/目录的 size/mtime/ctime。
 //!
-//! 优势：相比 `NtQueryDirectoryFile`（逐目录）+ `OpenFileById`（逐文件），直读 $MFT 只需一次
-//! 批量顺序读取，减少百万次系统调用。测试验证 mtime/ctime 与 Win32 API 逐位一致，
-//! 文件大小从 `$DATA` 属性（non-resident offset 0x30 / resident content_size）正确获取。
+//! 使用 `FSCTL_GET_NTFS_VOLUME_DATA` 获取 MFT 偏移和大小，
+//! 然后顺序读取 MFT 原始数据并解析每条记录。
 //!
-//! 设计：
-//! - 打开卷句柄 → `FSCTL_GET_NTFS_VOLUME_DATA` 获取 MFT 起始 LCN 和总长度
-//! - 顺序读取 MFT 原始数据 → 解析每条 MFT 记录的 `$STANDARD_INFORMATION` 和 `$DATA`
-//! - 仅处理 in-use 记录（flags bit 0 = 1），跳过 free/baad 记录
-//! - 返回 `HashMap<u64, (size, mtime, ctime)>`，key = MFT 记录号
+//! 注意：卷句柄上的 `ReadFile` 读取原始磁盘扇区，不走文件系统 extent 映射。
+//! 当 MFT 碎片化时，只能读到第一个连续 extent（通常覆盖 5-20% 的记录）。
+//! 剩余记录由调用方通过 NtQueryDirectoryFile 等方式补全。
 
 #[cfg(windows)]
 mod imp {
@@ -26,15 +23,11 @@ mod imp {
     use windows::Win32::System::IO::DeviceIoControl;
     use windows::core::PCWSTR;
 
-    /// MFT 记录 magic
     const MFT_MAGIC_FILE: &[u8; 4] = b"FILE";
     const MFT_MAGIC_BAAD: &[u8; 4] = b"BAAD";
-    /// 每次读取 MFT 的缓冲区大小（64 MB）
     const READ_BUF_SIZE: usize = 64 * 1024 * 1024;
-    /// MFT 记录默认大小（1024 字节），大部分 NTFS 卷使用此值
     const DEFAULT_RECORD_SIZE: usize = 1024;
 
-    /// 单条 MFT 记录解析出的元数据
     struct MftMeta {
         size: u64,
         mtime: u64,
@@ -43,15 +36,16 @@ mod imp {
 
     /// 直读 $MFT，返回 `(record_size, HashMap<record_number, (size, mtime, ctime)>)`。
     ///
-    /// `volume` 格式如 `"C:"` 或 `"C"` 或 `"\\\\.\\C:"`。
+    /// 通过卷句柄顺序读取 MFT 原始数据。当 MFT 碎片化时只覆盖第一个 extent，
+    /// 命中率取决于 MFT 碎片程度。调用方应通过 NtQueryDirectoryFile 补全未命中的文件。
     pub fn read_mft_metadata(
         volume: &str,
     ) -> windows::core::Result<(usize, HashMap<u64, (u64, u64, u64)>)> {
-        let path = normalize_volume_path(volume);
-        let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        let vol_path = normalize_volume_path(volume);
+        let vol_wide: Vec<u16> = vol_path.encode_utf16().chain(Some(0)).collect();
         let h = unsafe {
             CreateFileW(
-                PCWSTR(wide.as_ptr()),
+                PCWSTR(vol_wide.as_ptr()),
                 GENERIC_READ.0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 None,
@@ -66,7 +60,7 @@ mod imp {
         }
 
         let result = (|| -> windows::core::Result<(usize, HashMap<u64, (u64, u64, u64)>)> {
-            // 1. 获取卷信息：MFT 起始偏移和总长度
+            // 获取卷信息
             let mut vol_data_buf = vec![0u8; size_of::<NTFS_VOLUME_DATA_BUFFER>() + 256];
             let mut returned: u32 = 0;
             unsafe {
@@ -81,8 +75,8 @@ mod imp {
                     None,
                 )?;
             }
-
-            let vol_data = unsafe { &*(vol_data_buf.as_ptr() as *const NTFS_VOLUME_DATA_BUFFER) };
+            let vol_data =
+                unsafe { &*(vol_data_buf.as_ptr() as *const NTFS_VOLUME_DATA_BUFFER) };
             let mft_start_lcn = vol_data.MftStartLcn;
             let bytes_per_cluster = vol_data.BytesPerCluster as u64;
             let mft_offset: u64 = (mft_start_lcn as u64) * bytes_per_cluster;
@@ -96,14 +90,7 @@ mod imp {
                 mft_valid_len / (1024 * 1024),
             );
 
-            // 2. Seek 到 MFT 起始位置
-            let mut mft_buf = vec![0u8; READ_BUF_SIZE];
-            let mut meta_map: HashMap<u64, (u64, u64, u64)> = HashMap::new();
-            let mut total_read: u64 = 0;
-            let mut records_parsed: u64 = 0;
-            let mut records_in_use: u64 = 0;
-            let mut batch_idx: u64 = 0;
-
+            // Seek 到 MFT 起始位置
             unsafe {
                 let mut new_pos: i64 = 0;
                 SetFilePointerEx(h, mft_offset as i64, Some(&mut new_pos), FILE_BEGIN)?;
@@ -114,13 +101,19 @@ mod imp {
                 let mut probe = vec![0u8; 4096];
                 let mut bytes_read: u32 = 0;
                 unsafe {
-                    ReadFile(h, Some(probe.as_mut_slice()), Some(&mut bytes_read), None)?;
+                    ReadFile(
+                        h,
+                        Some(probe.as_mut_slice()),
+                        Some(&mut bytes_read),
+                        None,
+                    )?;
                 }
                 if bytes_read < 42 {
                     let _ = unsafe { CloseHandle(h) };
                     return Err(windows::core::Error::from_win32());
                 }
-                let rec_alloc = u32::from_le_bytes(probe[0x1C..0x20].try_into().unwrap()) as usize;
+                let rec_alloc =
+                    u32::from_le_bytes(probe[0x1C..0x20].try_into().unwrap()) as usize;
                 if rec_alloc >= 512 && rec_alloc <= 4096 {
                     rec_alloc
                 } else {
@@ -139,23 +132,29 @@ mod imp {
                 record_size,
             );
 
-            // 3. 顺序读取并解析 MFT 记录
-            //
-            // **重要**：ReadFile 返回的 `bytes_read` 不保证对齐到 `record_size`。
-            // 若 `total_read` 按 `bytes_read` 推进，后续批次的 `rec_num` 计算
-            // `(total_read + off) / record_size` 会偏移，导致目录等元数据错配。
-            // 因此只按实际消费的完整记录字节数推进，并 seek 回退未消费的尾部。
+            // 顺序读取并解析 MFT 记录
+            let mut mft_buf = vec![0u8; READ_BUF_SIZE];
+            let mut meta_map: HashMap<u64, (u64, u64, u64)> = HashMap::new();
+            let mut total_read: u64 = 0;
+            let mut records_parsed: u64 = 0;
+            let mut records_in_use: u64 = 0;
+            let mut batch_idx: u64 = 0;
+            let mut consecutive_empty: u32 = 0;
+
             while total_read < mft_valid_len {
-                let to_read = std::cmp::min(
-                    mft_buf.len() as u64,
-                    mft_valid_len - total_read,
-                ) as u32;
+                let to_read = std::cmp::min(mft_buf.len() as u64, mft_valid_len - total_read)
+                    as u32;
                 if to_read == 0 {
                     break;
                 }
                 let mut bytes_read: u32 = 0;
                 unsafe {
-                    ReadFile(h, Some(&mut mft_buf[..to_read as usize]), Some(&mut bytes_read), None)?;
+                    ReadFile(
+                        h,
+                        Some(&mut mft_buf[..to_read as usize]),
+                        Some(&mut bytes_read),
+                        None,
+                    )?;
                 }
                 if bytes_read == 0 {
                     break;
@@ -163,8 +162,8 @@ mod imp {
                 let data = &mft_buf[..bytes_read as usize];
                 batch_idx += 1;
 
-                // 解析本批次中的所有 MFT 记录
                 let mut off = 0usize;
+                let mut batch_parsed = 0u64;
                 while off + record_size <= data.len() {
                     let rec = &data[off..off + record_size];
                     let rec_num = (total_read + off as u64) / record_size as u64;
@@ -172,6 +171,7 @@ mod imp {
 
                     if let Some(meta) = parse_mft_record_for_meta(rec) {
                         records_parsed += 1;
+                        batch_parsed += 1;
                         if meta.size > 0 || meta.mtime > 0 || meta.ctime > 0 {
                             records_in_use += 1;
                             meta_map.insert(rec_num, (meta.size, meta.mtime, meta.ctime));
@@ -179,8 +179,21 @@ mod imp {
                     }
                 }
 
-                // 仅按完整记录的字节数推进，丢弃尾部不完整记录的字节。
-                // 通过 seek 回退，让下一次 ReadFile 从正确的位置开始。
+                // 连续空批次检测：如果连续 32 批没有解析到任何记录，说明已经
+                // 读过了 MFT 的有效数据区域（碎片化导致读到了非 MFT 数据）。
+                if batch_parsed == 0 {
+                    consecutive_empty += 1;
+                    if consecutive_empty >= 32 {
+                        findx2_core::progress!(
+                            "MFT 直读：连续 {} 批空数据，停止读取",
+                            consecutive_empty,
+                        );
+                        break;
+                    }
+                } else {
+                    consecutive_empty = 0;
+                }
+
                 let consumed = off as u64;
                 let unconsumed = bytes_read as u64 - consumed;
                 if unconsumed > 0 {
@@ -191,11 +204,15 @@ mod imp {
                 total_read += consumed;
 
                 if batch_idx % 8 == 0 {
+                    let pct = if mft_valid_len > 0 {
+                        (total_read * 100) / mft_valid_len
+                    } else {
+                        0
+                    };
                     findx2_core::progress!(
-                        "MFT 直读：已读 {}MB / {}MB ({}%)，已解析 {} 条，in_use {} 条",
+                        "MFT 直读：已读 {}MB ({}%)，已解析 {} 条，in_use {} 条",
                         total_read / (1024 * 1024),
-                        mft_valid_len / (1024 * 1024),
-                        (total_read * 100) / mft_valid_len.max(1),
+                        pct,
                         records_parsed,
                         records_in_use,
                     );
@@ -217,7 +234,6 @@ mod imp {
         result
     }
 
-    /// 解析单条 MFT 记录，提取 size/mtime/ctime（仅 in-use 记录）
     fn parse_mft_record_for_meta(record: &[u8]) -> Option<MftMeta> {
         if record.len() < 42 {
             return None;
@@ -232,7 +248,7 @@ mod imp {
 
         let flags = u16::from_le_bytes(record[0x16..0x18].try_into().ok()?);
         if (flags & 1) == 0 {
-            return None; // not in-use
+            return None;
         }
 
         let first_attr_off = u16::from_le_bytes(record[0x14..0x16].try_into().ok()?) as usize;
@@ -248,7 +264,8 @@ mod imp {
             if attr_type == 0x0000_0000 || attr_type == 0xFFFF_FFFF {
                 break;
             }
-            let attr_len = u32::from_le_bytes(record[off + 4..off + 8].try_into().ok()?) as usize;
+            let attr_len =
+                u32::from_le_bytes(record[off + 4..off + 8].try_into().ok()?) as usize;
             if attr_len < 24 || off + attr_len > record.len() {
                 break;
             }
@@ -258,14 +275,11 @@ mod imp {
 
             match attr_type {
                 0x10 => {
-                    // $STANDARD_INFORMATION — resident: mtime at +8, ctime at +0
                     if non_resident == 0 && attr_data.len() >= 24 {
-                        let content_size = u32::from_le_bytes(
-                            attr_data[16..20].try_into().ok()?,
-                        ) as usize;
-                        let content_off = u16::from_le_bytes(
-                            attr_data[20..22].try_into().ok()?,
-                        ) as usize;
+                        let content_size =
+                            u32::from_le_bytes(attr_data[16..20].try_into().ok()?) as usize;
+                        let content_off =
+                            u16::from_le_bytes(attr_data[20..22].try_into().ok()?) as usize;
                         let abs_off = off + content_off;
                         if abs_off + 48 <= record.len() && content_size >= 48 {
                             ctime = u64::from_le_bytes(
@@ -279,19 +293,14 @@ mod imp {
                     }
                 }
                 0x80 => {
-                    // $DATA — 文件大小
                     if non_resident == 0 {
-                        // resident: content_size 是文件大小
-                        let content_size = u32::from_le_bytes(
-                            attr_data[16..20].try_into().ok()?,
-                        ) as u64;
+                        let content_size =
+                            u32::from_le_bytes(attr_data[16..20].try_into().ok()?) as u64;
                         size = content_size;
                     } else {
-                        // non-resident: real_size 在 offset 0x30 (8B)
                         if attr_data.len() >= 0x38 {
-                            size = u64::from_le_bytes(
-                                attr_data[0x30..0x38].try_into().ok()?,
-                            );
+                            size =
+                                u64::from_le_bytes(attr_data[0x30..0x38].try_into().ok()?);
                         }
                     }
                 }
@@ -301,26 +310,28 @@ mod imp {
             off += attr_len;
         }
 
-        // 只返回至少找到 SI 的记录（说明是有效 in-use 记录）
         if !found_si {
             return None;
         }
         Some(MftMeta { size, mtime, ctime })
     }
 
-    /// 用 MFT 记录号查找元数据。FRN 低 48 位是 MFT 记录号。
     pub fn lookup_meta(
         meta_map: &HashMap<u64, (u64, u64, u64)>,
         frn: u64,
     ) -> Option<(u64, u64, u64)> {
-        // FRN 低 48 位是 MFT 记录号
         let rec_num = frn & 0x0000_FFFF_FFFF_FFFF;
         meta_map.get(&rec_num).copied()
     }
 
     fn normalize_volume_path(volume: &str) -> String {
         let v = volume.trim().trim_end_matches('\\');
-        if v.len() == 1 && v.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+        if v.len() == 1
+            && v.chars()
+                .next()
+                .map(|c| c.is_ascii_alphabetic())
+                .unwrap_or(false)
+        {
             format!(r"\\.\{}:", v.to_ascii_uppercase())
         } else if v.ends_with(':') && v.len() == 2 {
             format!(r"\\.\{}", v.to_ascii_uppercase())

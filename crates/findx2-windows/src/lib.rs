@@ -19,7 +19,7 @@ pub use nt_dir_query::{fetch_dir_meta_batched, DirMetaRec};
 #[cfg(windows)]
 pub use full_index_build::{build_full_disk_index, resolve_volume_list};
 #[cfg(windows)]
-pub use volumes::enumerate_local_drive_letters;
+pub use volumes::{enumerate_local_drive_letters, is_ssd};
 #[cfg(windows)]
 pub use usn::{
     ensure_usn_journal, get_volume_serial_number, mft_extent_count, query_journal_state,

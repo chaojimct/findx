@@ -123,9 +123,9 @@ const FILE_ENTRY_V4_DISK_SIZE: usize = 40;
 /// v5 紧凑布局，32 字节（与内存 FileEntry sizeof 一致）：
 /// `[0..8 size][8..12 mtime u32 unix-secs][12..16 ctime u32 unix-secs]
 ///  [16..20 name_offset][20..24 dir_idx][24..28 attrs][28..30 n_len][30..32 _pad]`
-const FILE_ENTRY_V5_DISK_SIZE: usize = 32;
+pub(crate) const FILE_ENTRY_V5_DISK_SIZE: usize = 32;
 
-fn file_entry_to_disk_bytes_v5(e: &FileEntry) -> [u8; FILE_ENTRY_V5_DISK_SIZE] {
+pub(crate) fn file_entry_to_disk_bytes_v5(e: &FileEntry) -> [u8; FILE_ENTRY_V5_DISK_SIZE] {
     let mut b = [0u8; FILE_ENTRY_V5_DISK_SIZE];
     b[0..8].copy_from_slice(&e.size.to_le_bytes());
     b[8..12].copy_from_slice(&e.mtime.to_le_bytes());
@@ -138,7 +138,7 @@ fn file_entry_to_disk_bytes_v5(e: &FileEntry) -> [u8; FILE_ENTRY_V5_DISK_SIZE] {
     b
 }
 
-fn file_entry_from_disk_bytes_v5(b: &[u8; FILE_ENTRY_V5_DISK_SIZE]) -> FileEntry {
+pub(crate) fn file_entry_from_disk_bytes_v5(b: &[u8; FILE_ENTRY_V5_DISK_SIZE]) -> FileEntry {
     FileEntry {
         size: u64::from_le_bytes(b[0..8].try_into().unwrap()),
         mtime: u32::from_le_bytes(b[8..12].try_into().unwrap()),
@@ -332,9 +332,16 @@ pub fn save_index_bin(path: &Path, store: &IndexStore) -> Result<()> {
         started.elapsed().as_secs_f64()
     );
 
-    // trigram pending 边车随主索引一起落盘：
-    // - 没有快照（边车从未构建）就不写，避免产生「有 pending 无快照」的中间态；
-    // - 写入顺序在 index.bin 之后 —— 崩溃窗口内的旧 pending 对旧 index.bin 仍是正确的超集。
+    // trigram pending 边车随主索引一起落盘（v5/v6 共用 helper，见 save_trigram_sidecars）。
+    save_trigram_sidecars(path, store);
+    Ok(())
+}
+
+/// trigram `.tri.pending` 边车落盘（v5 `save_index_bin` 与 v6 commit 共用）。
+///
+/// - 没有快照（边车从未构建）就不写，避免产生「有 pending 无快照」的中间态；
+/// - 调用方保证在主数据落盘**之后**调用 —— 崩溃窗口内的旧 pending 对旧主数据仍是正确的超集。
+pub(crate) fn save_trigram_sidecars(path: &Path, store: &IndexStore) {
     if store.trigram.is_some() {
         let snap = store
             .trigram
@@ -345,10 +352,68 @@ pub fn save_index_bin(path: &Path, store: &IndexStore) -> Result<()> {
             crate::progress!("trigram：pending 边车写入失败（下一轮重试）: {e}");
         }
     }
-    Ok(())
 }
 
-fn dir_entry_to_bytes(d: &DirEntry) -> [u8; 24] {
+/// trigram 边车挂载（v5 load 与 v6 load 共用）：`.tri` mmap + `.tri.pending`。
+/// 缺失/损坏一律静默降级（返回 `None`），上层回退全表扫描并后台重建。
+/// `entry_count` 用于校验 pending 快照与"快照之后新增条目"的尾部并入。
+pub(crate) fn mount_trigram_sidecars(
+    path: &Path,
+    entry_count: usize,
+) -> (Option<std::sync::Arc<crate::trigram::TrigramIndex>>, RoaringBitmap) {
+    let n_entries = entry_count as u32;
+    // trigram 边车挂载：`.tri` mmap + `.tri.pending`。缺失/损坏一律静默降级为全表扫描。
+    let mut trigram = match crate::trigram::TrigramIndex::load(&crate::trigram::tri_sidecar_path(path))
+    {
+        Ok(t) => t.map(std::sync::Arc::new),
+        Err(_) => None,
+    };
+    let mut tri_pending = RoaringBitmap::new();
+    if let Some(t) = trigram.as_ref() {
+        let tri_snap = t.snapshot_entry_count();
+        match crate::trigram::load_pending_sidecar(path) {
+            Some((bm, snap)) => {
+                if snap != tri_snap {
+                    // .tri 与 .tri.pending 落盘不同步：崩溃落在重建窗口内（.tri 已换新、
+                    // pending 还是旧快照配套数据）。此时 pending 内容对不上 .tri 的覆盖范围，
+                    // 有极小概率漏报 → 正确性优先，整体禁用剪枝（上层会后台重建）。
+                    crate::progress!(
+                        "trigram：pending 快照({snap}) 与 .tri 快照({tri_snap}) 不一致，本轮禁用剪枝",
+                    );
+                    trigram = None;
+                } else {
+                    tri_pending = bm;
+                    if snap as usize > entry_count {
+                        // 快照比当前库还大（异常状态，多半是回退了老 index.bin）：不可信，整体弃用。
+                        crate::progress!(
+                            "trigram：pending 快照({snap}) 大于条目数({n_entries})，忽略边车",
+                        );
+                        tri_pending = RoaringBitmap::new();
+                    }
+                }
+            }
+            None => {
+                // pending 丢失：改名条目无从知晓 → 保守起见放弃剪枝（上层启动后台重建）。
+                crate::progress!(
+                    "trigram：{} 缺失，本轮回退全表扫描（将后台重建）",
+                    crate::trigram::pending_sidecar_path(path).display()
+                );
+                trigram = None;
+            }
+        }
+    }
+    // 快照之后的尾部条目（构建后新增）一律视作 pending —— 与改名登记同一语义。
+    if let Some(t) = trigram.as_ref() {
+        let snap = t.snapshot_entry_count();
+        let total = n_entries;
+        if snap < total {
+            tri_pending.insert_range(snap..total);
+        }
+    }
+    (trigram, tri_pending)
+}
+
+pub(crate) fn dir_entry_to_bytes(d: &DirEntry) -> [u8; 24] {
     let mut b = [0u8; 24];
     b[0..8].copy_from_slice(&d.frn.to_le_bytes());
     b[8..12].copy_from_slice(&d.parent_idx.to_le_bytes());
@@ -359,6 +424,15 @@ fn dir_entry_to_bytes(d: &DirEntry) -> [u8; 24] {
 
 /// v5 磁盘 `FileEntry` 布局与内存布局逐字节一致的编译期保证（整段 memcpy 的前提）。
 const _: () = assert!(std::mem::size_of::<FileEntry>() == FILE_ENTRY_V5_DISK_SIZE);
+
+pub(crate) fn dir_entry_from_bytes(b: &[u8; 24]) -> DirEntry {
+    DirEntry {
+        frn: u64::from_le_bytes(b[0..8].try_into().unwrap()),
+        parent_idx: u32::from_le_bytes(b[8..12].try_into().unwrap()),
+        name_offset: u32::from_le_bytes(b[12..16].try_into().unwrap()),
+        name_len: u16::from_le_bytes(b[16..18].try_into().unwrap()),
+    }
+}
 
 /// 从 `index.bin` 加载。
 ///
@@ -650,54 +724,8 @@ pub fn load_index_bin_with_progress(
         true
     };
 
-    // trigram 边车挂载：`.tri` mmap + `.tri.pending`。缺失/损坏一律静默降级为全表扫描。
-    let mut trigram = match crate::trigram::TrigramIndex::load(&crate::trigram::tri_sidecar_path(path))
-    {
-        Ok(t) => t.map(std::sync::Arc::new),
-        Err(_) => None,
-    };
-    let mut tri_pending = RoaringBitmap::new();
-    if let Some(t) = trigram.as_ref() {
-        let tri_snap = t.snapshot_entry_count();
-        match crate::trigram::load_pending_sidecar(path) {
-            Some((bm, snap)) => {
-                if snap != tri_snap {
-                    // .tri 与 .tri.pending 落盘不同步：崩溃落在重建窗口内（.tri 已换新、
-                    // pending 还是旧快照配套数据）。此时 pending 内容对不上 .tri 的覆盖范围，
-                    // 有极小概率漏报 → 正确性优先，整体禁用剪枝（上层会后台重建）。
-                    crate::progress!(
-                        "trigram：pending 快照({snap}) 与 .tri 快照({tri_snap}) 不一致，本轮禁用剪枝",
-                    );
-                    trigram = None;
-                } else {
-                    tri_pending = bm;
-                    if snap as usize > n_entries {
-                        // 快照比当前库还大（异常状态，多半是回退了老 index.bin）：不可信，整体弃用。
-                        crate::progress!(
-                            "trigram：pending 快照({snap}) 大于条目数({n_entries})，忽略边车",
-                        );
-                        tri_pending = RoaringBitmap::new();
-                    }
-                }
-            }
-            None => {
-                // pending 丢失：改名条目无从知晓 → 保守起见放弃剪枝（上层启动后台重建）。
-                crate::progress!(
-                    "trigram：{} 缺失，本轮回退全表扫描（将后台重建）",
-                    crate::trigram::pending_sidecar_path(path).display()
-                );
-                trigram = None;
-            }
-        }
-    }
-    // 快照之后的尾部条目（构建后新增）一律视作 pending —— 与改名登记同一语义。
-    if let Some(t) = trigram.as_ref() {
-        let snap = t.snapshot_entry_count();
-        let total = n_entries as u32;
-        if snap < total {
-            tri_pending.insert_range(snap..total);
-        }
-    }
+    // trigram 边车挂载：`.tri` mmap + `.tri.pending`（v5/v6 共用 helper）。
+    let (trigram, tri_pending) = mount_trigram_sidecars(path, n_entries);
 
     let mut store = IndexStore {
         names_buf,
@@ -716,6 +744,7 @@ pub fn load_index_bin_with_progress(
         tri_pending,
         cjk_names: RoaringBitmap::new(),
         excluded_dirs: Vec::new(),
+        mutation_log: None,
     };
     // 拼音候选剪枝位图：并行扫一遍名字（1.15M 条目 ~10ms，8.5M ~100ms），之后 USN 增量维护。
     on_phase(LoadPhase::CjkBitmap);

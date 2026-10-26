@@ -297,7 +297,7 @@ pub struct DirEntry {
 ///  30..32  _pad       u16
 /// ```
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FileEntry {
     pub size: u64,
     /// 秒，自 1970-01-01 UTC；0 表示「未知」（mft 首遍未回填或老索引）。
@@ -414,6 +414,57 @@ pub struct IndexStore {
     /// 防止设置中"排除 C:\Windows"后 Windows Update 仍持续灌入新文件。
     /// 历史已入库的条目不会被回溯清理（用户应在改了排除目录后手动重建索引）。
     pub excluded_dirs: Vec<String>,
+    /// v6 增量持久化的变更日志。`None` = 不记录（建库期 / v5 只读场景零开销）；
+    /// `Some(vec)` = service 常驻期间记录每次变更，commit 时回放进分段文件后由调用方 drain。
+    /// `ext_filter` / `deleted` 位图不进日志——v6 从 `entries.attrs` + 名字重建，二者是纯派生数据。
+    pub mutation_log: Option<Vec<Mutation>>,
+}
+
+/// v6 增量持久化的单条变更记录。
+///
+/// 设计约束：
+/// - 只记录**定长段 + names 追加**所需的数据；`ext_filter`/`deleted` 不记（load 时重建）。
+/// - 记录携带回放所需的全部字节（名字拷贝），commit 时无需再读内存 store。
+/// - `FullResync` 是逃生舱：任何批量/非常规变更（overlay flush、排除目录墓碑）只记这一条，
+///   commit 见到它就走全量分段重写（仍远少于 v5 的单文件全量 + 原子 rename 开销，且低频）。
+#[derive(Debug, Clone)]
+pub enum Mutation {
+    /// `DataOrMeta` / 单条元数据 patch：只改 `entries[idx]` 的 size/mtime/ctime（16B 原地 pwrite）。
+    Meta {
+        idx: u32,
+        size: u64,
+        mtime: u32,
+        ctime: u32,
+    },
+    /// 整条 `entries[idx]` 原地替换（删除墓碑 / 复活 / 改名已存在条目）。
+    PatchEntry { idx: u32, entry: FileEntry },
+    /// 整条 `dirs[di]` 原地替换（目录改名）。
+    PatchDir { di: u32, dir: DirEntry },
+    /// 新文件：names 追加 + entries/frns 各追加一条。
+    PushFile {
+        entry: FileEntry,
+        frn: u64,
+        name: Vec<u8>,
+    },
+    /// 新目录：names 追加 + entries/frns/dirs/ranges 各追加一条。
+    PushDir {
+        entry: FileEntry,
+        frn: u64,
+        dir: DirEntry,
+        name: Vec<u8>,
+    },
+    /// 已存在文件改名/移动：names 追加 + `entries[idx]` 原地替换。
+    RepathFile { idx: u32, entry: FileEntry, name: Vec<u8> },
+    /// 已存在目录改名/移动：names 追加 + `entries[idx]` 与 `dirs[di]` 原地替换。
+    RepathDir {
+        idx: u32,
+        di: u32,
+        entry: FileEntry,
+        dir: DirEntry,
+        name: Vec<u8>,
+    },
+    /// 批量变更标记：commit 时放弃增量、走全量分段重写。
+    FullResync,
 }
 
 /// 名字是否含「拼音可命中」字节（任何 UTF-8 字节 ≥ 0xE2，即码点 ≥ U+2000 量级）。
@@ -523,6 +574,56 @@ impl IndexStore {
     pub fn tri_pending_overflow(&self) -> bool {
         let threshold = (self.entries.len() / 32).max(65_536);
         self.tri_pending.len() as usize > threshold
+    }
+
+    /// 开关 v6 变更记录。service 加载/转换完成后调 `set_track_mutations(true)`；
+    /// 建库期保持关闭零开销。
+    pub fn set_track_mutations(&mut self, on: bool) {
+        if on {
+            if self.mutation_log.is_none() {
+                self.mutation_log = Some(Vec::new());
+            }
+        } else {
+            self.mutation_log = None;
+        }
+    }
+
+    /// 取出并清空已记录的变更（commit 时调用）。未开启记录时返回空 vec。
+    pub fn take_mutations(&mut self) -> Vec<Mutation> {
+        self.mutation_log.as_mut().map(|v| std::mem::take(v)).unwrap_or_default()
+    }
+
+    /// 是否有未提交的变更。
+    pub fn has_pending_mutations(&self) -> bool {
+        self.mutation_log.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+    }
+
+    fn log_mut(&mut self, m: Mutation) {
+        if let Some(log) = self.mutation_log.as_mut() {
+            // FullResync 已在列时，后续增量无需再记（全量覆盖一切）。
+            if !matches!(log.last(), Some(Mutation::FullResync)) {
+                log.push(m);
+            }
+        }
+    }
+
+    /// 标记"下次 commit 走全量分段重写"。批量路径（overlay flush、排除目录墓碑）用它，
+    /// 避免产生百万条增量记录。
+    pub fn mark_full_resync(&mut self) {
+        if let Some(log) = self.mutation_log.as_mut() {
+            log.clear();
+            log.push(Mutation::FullResync);
+        }
+    }
+
+    /// 批量变更包装：闭包内关闭记录，结束后记一条 `FullResync`。
+    /// 用于 overlay flush 等"一次改几十万条"的场景。
+    pub fn bulk_apply(&mut self, f: impl FnOnce(&mut IndexStore)) {
+        let tracking = self.mutation_log.take();
+        f(self);
+        if tracking.is_some() {
+            self.mutation_log = Some(vec![Mutation::FullResync]);
+        }
     }
 
     pub fn name_bytes(&self, e: &FileEntry) -> &[u8] {
@@ -680,6 +781,8 @@ impl IndexStore {
         self.deleted.insert(idx);
         if let Some(e) = self.entries.get_mut(idx as usize) {
             e.attrs |= FileEntry::ATTR_DELETED;
+            let entry = *e;
+            self.log_mut(Mutation::PatchEntry { idx, entry });
         }
     }
 
@@ -720,6 +823,10 @@ impl IndexStore {
                 }
             }
         }
+        // v6：批量墓碑不逐条记日志，下次 commit 全量重写分段文件。
+        if marked > 0 {
+            self.mark_full_resync();
+        }
         marked as usize
     }
 
@@ -731,7 +838,7 @@ impl IndexStore {
         let eh = hash_ext8(&raw.name);
         let attrs = FileEntry::pack_attrs_from_windows_file(raw.attrs) | ((eh as u32) << 8);
         let new_idx = self.entries.len() as u32;
-        self.entries.push(FileEntry {
+        let entry = FileEntry {
             size: raw.size,
             mtime: filetime_to_unix_secs(raw.mtime),
             ctime: filetime_to_unix_secs(raw.ctime),
@@ -740,7 +847,8 @@ impl IndexStore {
             attrs,
             n_len: raw.name.len() as u16,
             _pad: 0,
-        });
+        };
+        self.entries.push(entry);
         let h = eh as usize;
         self.ext_filter[h]
             .get_or_insert_with(RoaringBitmap::new)
@@ -748,6 +856,11 @@ impl IndexStore {
         self.frns.push(raw.file_id);
         self.frn_to_entry.insert(raw.file_id, new_idx);
         self.note_name_change(new_idx);
+        self.log_mut(Mutation::PushFile {
+            entry,
+            frn: raw.file_id,
+            name: raw.name.as_bytes().to_vec(),
+        });
         new_idx
     }
 
@@ -920,6 +1033,9 @@ impl IndexStore {
         let Some(plan) = self.plan_compact() else {
             return 0;
         };
+        // v6：压缩是整批发替换（下标全变），增量日志无法表达 → 记 FullResync，
+        // 下次 commit 走全量分段重写。启动期 tracking 未开时此调用无影响。
+        self.mark_full_resync();
         let CompactPlan {
             keep_entries,
             dir_alive,
@@ -1173,7 +1289,7 @@ impl IndexStore {
         let eh = hash_ext8(&raw.name);
         let attrs = FileEntry::ATTR_IS_DIR | ((eh as u32) << 8);
         let new_idx = self.entries.len() as u32;
-        self.entries.push(FileEntry {
+        let entry = FileEntry {
             size: 0,
             mtime: filetime_to_unix_secs(raw.mtime),
             ctime: filetime_to_unix_secs(raw.ctime),
@@ -1182,11 +1298,24 @@ impl IndexStore {
             attrs,
             n_len: raw.name.len() as u16,
             _pad: 0,
-        });
+        };
+        let dir = DirEntry {
+            frn: raw.file_id,
+            parent_idx,
+            name_offset: name_off,
+            name_len: raw.name.len() as u16,
+        };
+        self.entries.push(entry);
         self.ext_insert_idx(new_idx, eh);
         self.frns.push(raw.file_id);
         self.frn_to_entry.insert(raw.file_id, new_idx);
         self.note_name_change(new_idx);
+        self.log_mut(Mutation::PushDir {
+            entry,
+            frn: raw.file_id,
+            dir,
+            name: raw.name.as_bytes().to_vec(),
+        });
         Ok(())
     }
 
@@ -1204,6 +1333,10 @@ impl IndexStore {
             self.deleted.remove(idx);
             if let Some(e) = self.entries.get_mut(idx as usize) {
                 e.attrs &= !FileEntry::ATTR_DELETED;
+            }
+            // v6 日志：复活先记一条，后续分支会再记最终态（幂等回放，多一条 32B pwrite，可接受）。
+            if let Some(e) = self.entries.get(idx as usize).copied() {
+                self.log_mut(Mutation::PatchEntry { idx, entry: e });
             }
         }
 
@@ -1237,6 +1370,19 @@ impl IndexStore {
                     }
                 }
                 self.ext_insert_idx(idx, eh);
+                // v6 日志：目录改名/移动 = names 追加 + 两条原地替换。
+                if let (Some(entry), Some(dir)) = (
+                    self.entries.get(idx as usize).copied(),
+                    self.dirs.get(di).cloned(),
+                ) {
+                    self.log_mut(Mutation::RepathDir {
+                        idx,
+                        di: di as u32,
+                        entry,
+                        dir,
+                        name: raw.name.as_bytes().to_vec(),
+                    });
+                }
             }
             self.note_name_change(idx);
             return Ok(());
@@ -1259,6 +1405,14 @@ impl IndexStore {
         self.ext_insert_idx(idx, eh);
         let _ = old;
         self.note_name_change(idx);
+        // v6 日志：文件改名/回填 = names 追加 + 整条替换。
+        if let Some(entry) = self.entries.get(idx as usize).copied() {
+            self.log_mut(Mutation::RepathFile {
+                idx,
+                entry,
+                name: raw.name.as_bytes().to_vec(),
+            });
+        }
         Ok(())
     }
 
@@ -1428,6 +1582,14 @@ impl IndexStore {
                         if let Some(c) = ctime {
                             e.ctime = filetime_to_unix_secs(*c);
                         }
+                        // v6 日志：16B 原地 patch（日常 mtime 抖动的主路径）。
+                        let (size, mtime, ctime) = (e.size, e.mtime, e.ctime);
+                        self.log_mut(Mutation::Meta {
+                            idx,
+                            size,
+                            mtime,
+                            ctime,
+                        });
                     }
                 }
                 Ok(())
@@ -1550,6 +1712,8 @@ impl IndexStore {
     }
 
     /// 回填元数据：更新 `size` / `mtime` / `ctime`；排序键在搜索收尾时按命中集现算，不再维护全局有序排列。
+    /// 注意：调用方若处于大批量场景（overlay flush），应包在 [`IndexStore::bulk_apply`] 里，
+    /// 否则每条都会进 v6 日志（几十万条记录）。
     pub fn patch_entry_metadata(
         &mut self,
         idx: usize,
@@ -1563,6 +1727,13 @@ impl IndexStore {
         e.size = size;
         e.mtime = filetime_to_unix_secs(mtime);
         e.ctime = filetime_to_unix_secs(ctime);
+        let (size, mtime, ctime) = (e.size, e.mtime, e.ctime);
+        self.log_mut(Mutation::Meta {
+            idx: idx as u32,
+            size,
+            mtime,
+            ctime,
+        });
         Ok(())
     }
 }
@@ -1947,6 +2118,7 @@ impl IndexBuilder {
             tri_pending: RoaringBitmap::new(),
             cjk_names: RoaringBitmap::new(),
             excluded_dirs: Vec::new(),
+            mutation_log: None,
         };
         store.rebuild_cjk_bitmap();
         Ok(store)
@@ -2092,6 +2264,7 @@ pub fn merge_index_stores(stores: Vec<IndexStore>) -> crate::Result<IndexStore> 
         tri_pending: RoaringBitmap::new(),
         cjk_names: RoaringBitmap::new(),
         excluded_dirs: Vec::new(),
+        mutation_log: None,
     };
     store.rebuild_cjk_bitmap();
     Ok(store)

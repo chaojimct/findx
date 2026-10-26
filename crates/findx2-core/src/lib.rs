@@ -25,11 +25,16 @@ pub mod error;
 pub mod index;
 pub mod meta_overlay;
 pub mod persist;
+pub mod persist_v6;
 
 pub use persist::{
     exclude_sidecar_path, load_exclude_sidecar, load_index_bin, load_index_bin_with_progress,
     save_exclude_sidecar, save_index_bin, save_index_zst, write_index_bin, LoadPhase,
 };
+pub use persist_v6::{
+    load_store_auto, v6_load, v6_save_full, v6_try_commit, CommitBatch, CommitOutcome, V6Layout,
+};
+
 pub mod platform;
 pub mod query;
 pub mod search;
@@ -37,7 +42,8 @@ pub mod trigram;
 
 pub use error::Error;
 pub use index::{
-    merge_index_stores, normalize_excluded_dir, FileEntry, IndexBuilder, IndexStore, VolumeState,
+    merge_index_stores, normalize_excluded_dir, FileEntry, IndexBuilder, IndexStore, Mutation,
+    VolumeState,
 };
 pub use platform::{ChangeEvent, ChangeWatcher, RawEntry, VolumeScanner, WatchCursor};
 pub use query::{ParsedQuery, QueryParser, SortField};

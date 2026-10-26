@@ -804,11 +804,7 @@ pub fn spawn_findx_service_process<R: Runtime>(app: tauri::AppHandle<R>) -> Resu
                         "直接启动 findx2-service 失败: {e}。当前为「服务模式」，请用 `findx2-service install` 注册为系统服务后由 SCM 启动；或在设置里切换为「单体 UAC 模式」。"
                     ));
                 }
-                if crate::elevate::process_is_elevated() {
-                    return Err(format!(
-                        "直接启动 findx2-service 失败: {e}。当前 FindX2 已以管理员运行，子进程应能继承权限，请检查 exe 是否被拦截、路径与 index.bin 是否正确。"
-                    ));
-                }
+                // Standalone 模式兜底：用 shell_execute_runas 提权拉起 service。
                 let mut params = format!(
                     "--index {} --volume {} --pipe {} --save-interval-secs {}",
                     quote_arg(&index.to_string_lossy()),
@@ -833,9 +829,9 @@ pub fn spawn_findx_service_process<R: Runtime>(app: tauri::AppHandle<R>) -> Resu
                     params.push_str(" --exclude-dir ");
                     params.push_str(&quote_arg(d));
                 }
-                shell_execute_runas(&exe, Some(&params), work, false)
-                    .map_err(|u| format!("直接启动失败: {e}；提权启动失败: {u}"))?;
-                Ok(())
+                return shell_execute_runas(&exe, Some(&params), work, false)
+                    .map(|_| ())
+                    .map_err(|u| format!("提权启动 findx2-service 失败: {u}"));
             }
         }
     }

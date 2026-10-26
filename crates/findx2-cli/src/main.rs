@@ -1,9 +1,10 @@
-//! findx2 命令行入口。
+﻿//! findx2 命令行入口。
 
 use clap::{Parser, Subcommand, ValueEnum};
 use findx2_core::{
-    ParsedQuery, QueryParser, Result, SearchEngine, SearchHit, SearchOptions, load_index_bin,
-    save_index_bin,
+    load_index_bin, load_index_bin_with_progress, load_store_auto, save_index_bin, v6_save_full,
+    v6_try_commit, CommitBatch, CommitOutcome, IndexStore, ParsedQuery, QueryParser, Result,
+    SearchEngine, SearchHit, SearchOptions, V6Layout,
 };
 #[cfg(windows)]
 mod remote;
@@ -227,7 +228,8 @@ fn run() -> Result<()> {
             columns,
         } => {
             let t_load = std::time::Instant::now();
-            let store = load_index_bin(&index)?;
+            // v6 优先：service 常驻后主 index.bin 不再更新。
+            let store = load_store_auto(&index)?;
             let load_ms = t_load.elapsed().as_millis();
             let entries_n = store.entries.len();
             let t_parse = std::time::Instant::now();
@@ -316,7 +318,7 @@ fn run() -> Result<()> {
                 Err(e) => {
                     if let Some(idx) = index {
                         eprintln!("连接服务失败（{e}），回退本地索引 …");
-                        let store = load_index_bin(&idx)?;
+                        let store = load_store_auto(&idx)?;
                         let mut pq: ParsedQuery = QueryParser::parse(&query)?;
                         pq.limit = limit.min(8192) as u32;
                         let engine = SearchEngine::new(store);
@@ -348,7 +350,8 @@ fn run() -> Result<()> {
             }
         }
         Commands::Status { index } => {
-            let store = load_index_bin(&index)?;
+            // v6 优先（service 常驻后 index.bin 主文件不再更新，读 v6 才准）。
+            let store = load_store_auto(&index)?;
             println!("条目数: {}", store.entry_count());
             println!("目录数: {}", store.dirs.len());
             let tomb = store.deleted.len();
@@ -448,7 +451,14 @@ fn run() -> Result<()> {
             volume,
             save_interval_secs,
         } => {
-            let mut store = load_index_bin(&index)?;
+            let mut store = load_store_auto(&index)?;
+            // v6 不存在时（v5 老库）一次性转换；watch 期间走增量提交。
+            let v6 = V6Layout::for_index(&index);
+            if !v6.manifest_exists() {
+                v6_save_full(&v6, &store)?;
+                eprintln!("[findx2] v5→v6 一次性转换完成，后续增量落盘");
+            }
+            store.set_track_mutations(true);
             let vol = store
                 .volumes
                 .first()
@@ -465,6 +475,7 @@ fn run() -> Result<()> {
             });
             let save_every = Duration::from_secs(save_interval_secs.max(1));
             let mut last_save = Instant::now();
+            let mut dirty = false;
             println!(
                 "开始监听 {volume} ，从 journal_id={} last_usn={} 续跑；每 {:?} 落盘",
                 vol.usn_journal_id,
@@ -488,9 +499,11 @@ fn run() -> Result<()> {
                             } else {
                                 store.apply_change_event(&ev)?;
                             }
+                            dirty = true;
                         }
                         findx2_windows::UsnWatchMsg::StatRefresh { file_id, file_id_128 } => {
                             sync_fetch_one(&volume, file_id, file_id_128, &mut store);
+                            dirty = true;
                         }
                         findx2_windows::UsnWatchMsg::Checkpoint {
                             journal_id,
@@ -500,22 +513,24 @@ fn run() -> Result<()> {
                                 v.usn_journal_id = journal_id;
                                 v.last_usn = next_usn;
                             }
-                            if last_save.elapsed() >= save_every {
-                                save_index_bin(&index, &store)?;
+                            if dirty && last_save.elapsed() >= save_every {
+                                v6_commit_store(&v6, &mut store)?;
                                 eprintln!("[findx2] 已保存 checkpoint last_usn={next_usn}");
                                 maybe_rebuild_trigram_cli(&mut store, &index);
                                 last_save = Instant::now();
+                                dirty = false;
                             }
                         }
                     },
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if last_save.elapsed() >= save_every {
-                            save_index_bin(&index, &store)?;
+                        if dirty && last_save.elapsed() >= save_every {
+                            v6_commit_store(&v6, &mut store)?;
                             eprintln!("[findx2] 定时落盘（游标） last_usn={}", {
                                 store.volumes.first().map(|v| v.last_usn).unwrap_or(0)
                             });
                             maybe_rebuild_trigram_cli(&mut store, &index);
                             last_save = Instant::now();
+                            dirty = false;
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -535,7 +550,7 @@ fn run() -> Result<()> {
                     ));
                 }
             }
-            save_index_bin(&index, &store)?;
+            v6_commit_store(&v6, &mut store)?;
         }
     }
     Ok(())
@@ -590,6 +605,42 @@ fn maybe_rebuild_trigram_cli(store: &mut findx2_core::IndexStore, index: &std::p
             }
         }
         Err(e) => eprintln!("[findx2] trigram 重建失败: {e}"),
+    }
+}
+
+/// v6 增量提交（CLI watch 用，store 裸奔无需锁）：drain 日志 → 增量回放 → NeedFull 降级全量。
+/// tri_pending 随主数据一起快照落盘（`.tri.pending` 边车），与 service 侧同协议。
+#[cfg(windows)]
+fn v6_commit_store(v6: &V6Layout, store: &mut IndexStore) -> Result<()> {
+    let (tri_snap, has_trigram) = match store.trigram.as_ref() {
+        Some(t) => (t.snapshot_entry_count(), true),
+        None => (0, false),
+    };
+    let batch = CommitBatch {
+        mutations: store.take_mutations(),
+        entry_count: store.entries.len(),
+        dir_count: store.dirs.len(),
+        names_len: store.names_buf.len(),
+        dir_paths_len: store.dir_paths_buf.len(),
+        metadata_ready: store.metadata_ready,
+        volumes: store.volumes.clone(),
+        tri_pending: store.tri_pending.clone(),
+        tri_snap,
+        has_trigram,
+    };
+    if batch.mutations.is_empty() {
+        return Ok(());
+    }
+    match v6_try_commit(v6, &batch)? {
+        CommitOutcome::Delta { applied, bytes, generation } => {
+            eprintln!("[findx2] v6 commit：{applied} 条 / {bytes} B / gen {generation}");
+            Ok(())
+        }
+        CommitOutcome::NeedFull { reason } => {
+            eprintln!("[findx2] v6 降级全量（{reason}）");
+            v6_save_full(v6, store)?;
+            Ok(())
+        }
     }
 }
 

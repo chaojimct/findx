@@ -51,3 +51,7 @@ gui/src-tauri/gen/
 # git 修复期间的损坏现场备份（确认无误后物理删除）
 .git.broken/
 
+# Local index artifacts (216MB+ / v6 segments, machine-local test data, never commit)
+/index.bin*
+/index.bin.v6/
+

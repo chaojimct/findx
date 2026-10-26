@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use findx2_core::{save_index_bin, SearchEngine};
+use findx2_core::{
+    load_index_bin_with_progress, v6_load, v6_save_full, v6_try_commit,
+    CommitBatch, CommitOutcome, SearchEngine, V6Layout,
+};
 use tracing::{error, info};
 
 use crate::load_state;
@@ -283,26 +286,53 @@ pub(crate) fn run_foreground(
 
     info!("加载索引 {:?}", index);
     let load_t0 = Instant::now();
-    // 千万级库要几十秒到几分钟；把阶段推进落到 load_state，Status IPC 才不是静默的
-    // 「加载中」——见 load_state 模块注释。
-    let mut store = match findx2_core::load_index_bin_with_progress(&index, &|p| {
-        load_state::note_phase(p);
-    }) {
+    // v6 优先（增量分段文件）；v5 老库或 v6 损坏时回退 v5 并重建 v6（自愈，一次性全量写）。
+    // v5 回退路径保留上游的 load_state 进度上报（千万级库加载要几十秒，Status 不能静默）。
+    let v6 = V6Layout::for_index(&index);
+    let mut store = match v6_load(&v6) {
         Ok(s) => {
             load_state::note_entry_count(s.entry_count() as u64);
             load_state::note_finished();
+            info!(
+                "索引加载完成：{} 条目（v6，耗时 {:.2}s）",
+                s.entry_count(),
+                load_t0.elapsed().as_secs_f64()
+            );
             s
         }
         Err(e) => {
+            if v6.manifest_exists() {
+                info!("v6 加载失败，回退 v5 并重建（{e:#}）");
+            }
+            let s = match load_index_bin_with_progress(&index, &|p| {
+                load_state::note_phase(p);
+            }) {
+                Ok(s) => {
+                    load_state::note_entry_count(s.entry_count() as u64);
+                    s
+                }
+                Err(e) => {
+                    load_state::note_finished();
+                    return Err(e.into());
+                }
+            };
+            info!(
+                "索引加载完成：{} 条目（v5，耗时 {:.2}s），开始 v6 转换…",
+                s.entry_count(),
+                load_t0.elapsed().as_secs_f64()
+            );
+            let t0 = Instant::now();
+            let gen = v6_save_full(&v6, &s)?;
             load_state::note_finished();
-            return Err(e.into());
+            info!(
+                "v5→v6 一次性转换完成（generation {gen}，耗时 {:.2}s）；后续增量落盘不再全量重写",
+                t0.elapsed().as_secs_f64()
+            );
+            s
         }
     };
-    info!(
-        "索引加载完成：{} 条目（耗时 {:.2}s）",
-        store.entry_count(),
-        load_t0.elapsed().as_secs_f64()
-    );
+    // v6 变更记录从此刻开始：之后的 mark/compact/USN 都会进日志，commit 时回放进分段文件。
+    store.set_track_mutations(true);
 
     // 合并 CLI 追加的排除目录到 store；并把命中条目一次性打墓碑，避免「sidecar 没改，CLI 临时加目录」时旧数据漏网。
     // 注意顺序：先打排除墓碑，下面的启动自动压缩才能把新旧墓碑同轮回收。
@@ -527,9 +557,10 @@ fn usn_watch_loop(
     // 拖太久），但每个 sub-batch 之间是新写锁——parking_lot 下让排队中的 search reader
     // 有插队窗口。
     const SUB_BATCH: usize = 512;
-    let flush_pending = |pending: &mut Vec<findx2_core::ChangeEvent>| {
+    // 返回实际 apply 的条数（0 = 无事发生），调用方据此置 dirty，避免空闲时也全量写盘。
+    let flush_pending = |pending: &mut Vec<findx2_core::ChangeEvent>| -> usize {
         if pending.is_empty() {
-            return;
+            return 0;
         }
         let total = pending.len();
         let t0 = Instant::now();
@@ -552,6 +583,44 @@ fn usn_watch_loop(
             // 超过 100ms 的 flush 大概率是历史回放或大批增量；记下来便于复盘。
             tracing::info!("USN flush 偏慢：{} 条 / {} ms", total, ms);
         }
+        total
+    };
+
+    // 脏计数：累计已 apply 但未提交的 ChangeEvent 条数。
+    // 纯 Checkpoint（游标推进但无事件）只更新内存里的 last_usn，不触发落盘。
+    // 提交条件 = 脏数达阈值（忙时及时落盘， bound 崩溃回放量）或间隔到（闲时兜底）。
+    // v6 单次提交只是 KB 级 patch + 一次 manifest rename，30s 节奏零压力。
+    const COMMIT_THRESHOLD: usize = 4096;
+    let mut dirty_count: usize = 0;
+
+    // 尝试按条件落盘：有脏 &&（量够 || 间隔到）&& 回填完成。返回后调用方按是否真实写入更新状态。
+    let try_maybe_persist = |dirty_count: &mut usize,
+                             last_save: &mut Instant,
+                             engine: &Arc<SearchEngine>,
+                             index_path: &PathBuf|
+     -> anyhow::Result<()> {
+        if *dirty_count == 0 {
+            return Ok(());
+        }
+        if !engine.metadata_ready() {
+            return Ok(());
+        }
+        // 回填未完成时不写盘：overlay 不在分段文件里，且此时 store 里的 size/mtime 还是旧的；
+        // 等回填完成后 spawn_final_persist 一次 FullResync 全量，期间脏计数在内存里攒着。
+        if *dirty_count < COMMIT_THRESHOLD && last_save.elapsed() < save_every {
+            return Ok(());
+        }
+        if persist_index(engine, index_path)? {
+            *dirty_count = 0;
+            *last_save = Instant::now();
+            // v6：主数据已落盘，按上游策略检查 trigram 增量阈值（后台重建，不阻塞）。
+            maybe_rebuild_trigram(engine, index_path);
+        } else {
+            // 另一卷线程正在提交，本轮跳过但保持计数 + 不重置计时器，
+            // 下个 flush 周期会立刻重试。
+            tracing::debug!("persist 跳过（另有提交者），保持 dirty 下轮重试");
+        }
+        Ok(())
     };
 
     // P0-2 保活：worker 死亡不结束本线程，而是判因重启。
@@ -609,7 +678,7 @@ fn usn_watch_loop(
             flush_pending(&mut pending);
             if engine.metadata_ready() {
                 match persist_index(&engine, &index_path) {
-                    Ok(()) => info!("卷 {letter} 停机落盘完成"),
+                    Ok(_) => info!("卷 {letter} 停机落盘完成"),
                     Err(e) => error!("卷 {letter} 停机落盘失败（journal 重放兜底）: {e}"),
                 }
             }
@@ -632,7 +701,7 @@ fn usn_watch_loop(
                     }
                     pending.push(ev);
                     if pending.len() >= USN_BATCH_MAX_EVENTS {
-                        flush_pending(&mut pending);
+                        dirty_count += flush_pending(&mut pending);
                     }
                 }
                 findx2_windows::UsnWatchMsg::StatRefresh { file_id, file_id_128 } => {
@@ -644,7 +713,7 @@ fn usn_watch_loop(
                     journal_id,
                     next_usn,
                 } => {
-                    flush_pending(&mut pending);
+                    dirty_count += flush_pending(&mut pending);
                     if let Some(v) = engine.index_store_mut().volumes.iter_mut().find(|x| {
                         (x.volume_letter as char).to_ascii_uppercase()
                             == (volume_letter as char).to_ascii_uppercase()
@@ -664,30 +733,20 @@ fn usn_watch_loop(
                     }
                     // 注：这里只改 USN 游标，不影响搜索结果/排序，故不 bump revision
                     //（否则每次 checkpoint 都会误杀分页缓存）。真正改条目的是上面的 flush_pending。
-                    // 回填未完成时不写盘：overlay 不在 index.bin 里，写出去的还是
-                    // 和回填前一模一样的 549MB 旧数据，纯纯浪费磁盘 IO（30s 一次 = 每分钟 1GB），
-                    // 而且会和正在做 NtQueryDirectoryFile 的 backfill 抢同一块物理盘的 IO 通道，
-                    // 直接把回填速度拖慢 30%+。回填完成后 spawn_final_persist 会写一次完整的。
-                    if engine.metadata_ready() && last_save.elapsed() >= save_every {
-                        persist_index(&engine, &index_path)?;
-                        last_save = Instant::now();
-                        maybe_rebuild_trigram(&engine, &index_path);
-                    }
+                    // v6：落盘走增量提交（KB 级），脏门控在 try_maybe_persist 里；
+                    // 回填未完成时不提交（overlay 不在分段文件里），回填终态一次 FullResync。
+                    try_maybe_persist(&mut dirty_count, &mut last_save, &engine, &index_path)?;
                 }
             },
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if !pending.is_empty() && batch_started.elapsed() >= flush_every {
-                    flush_pending(&mut pending);
+                    dirty_count += flush_pending(&mut pending);
                 }
-                if engine.metadata_ready() && last_save.elapsed() >= save_every {
-                    persist_index(&engine, &index_path)?;
-                    last_save = Instant::now();
-                    maybe_rebuild_trigram(&engine, &index_path);
-                }
+                try_maybe_persist(&mut dirty_count, &mut last_save, &engine, &index_path)?;
             },
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // worker 死了：join 判因后重启（先排空残留消息已由 Disconnected 语义保证）。
-                flush_pending(&mut pending);
+                dirty_count += flush_pending(&mut pending);
                 let exit = worker.join();
                 let reason = match &exit {
                     Ok(Ok(())) => "watch 线程异常返回（理论不可达）".to_string(),
@@ -759,7 +818,7 @@ fn usn_watch_loop(
             }
         }
         if !pending.is_empty() && batch_started.elapsed() >= flush_every {
-            flush_pending(&mut pending);
+            dirty_count += flush_pending(&mut pending);
         }
     }
 }
@@ -831,6 +890,11 @@ fn rebuild_volume(
     {
         let mut g = engine.index_store_mut();
         *g = merged;
+        // v6：整库换入后旧分段文件整体失效。恢复 tracking 并记 FullResync，
+        // 下次 commit 走全量分段重写（换入的 store 可能 tracking 已关/日志为空，
+        // 不显式标记就会静默分叉）。
+        g.set_track_mutations(true);
+        g.mark_full_resync();
         if let Some(v) = g
             .volumes
             .iter_mut()
@@ -995,21 +1059,65 @@ fn probe_journal_wrap_warning(
     None
 }
 
-pub(crate) fn persist_index(engine: &SearchEngine, path: &Path) -> anyhow::Result<()> {
-    // try_lock：同一时刻只允许一个卷线程进入 save_index_bin。
-    // 拿不到锁的线程说明已有人在写，本轮直接跳过；下一次 USN flush 周期它还会再来。
-    // 这样既保证文件一致（叠加 persist.rs 内的原子 rename），又不会在多卷场景重复写盘。
+pub(crate) fn persist_index(engine: &SearchEngine, path: &Path) -> anyhow::Result<bool> {
+    // v6 增量提交，分两步：
+    // 1. 短写锁：drain 日志 + 快照长度/游标（µs~ms 级；与 apply/Checkpoint 同一把写锁，
+    //    因此 manifest 游标永远不超前于已提交数据——崩溃回放只会重复，不会丢）。
+    // 2. 锁外文件 IO：原地 pwrite / 尾部 append（KB 级）+ sync + 原子 manifest。
+    // try_lock：同一时刻只允许一个卷线程提交；拿不到锁的保持 dirty 下轮重试。
+    // 返回值：true=本轮已处理（含"无事发生"），false=被跳过。
     let guard = match persist_lock().try_lock() {
         Ok(g) => g,
         Err(_) => {
-            tracing::debug!("persist_index: 另一卷线程正在写入 {}，本轮跳过", path.display());
-            return Ok(());
+            tracing::debug!("persist_index: 另一卷线程正在提交，本轮跳过");
+            return Ok(false);
         }
     };
-    let store = engine.index_store();
-    save_index_bin(path, &store)?;
+    let batch = {
+        let mut g = engine.index_store_mut();
+        let mutations = g.take_mutations();
+        if mutations.is_empty() {
+            return Ok(true);
+        }
+        // v6：同一把写锁下一次性快照（日志 + 长度 + 游标 + tri_pending），
+        // 保证 manifest 游标不超前于已提交数据。
+        let (tri_snap, has_trigram) = match g.trigram.as_ref() {
+            Some(t) => (t.snapshot_entry_count(), true),
+            None => (0, false),
+        };
+        CommitBatch {
+            mutations,
+            entry_count: g.entries.len(),
+            dir_count: g.dirs.len(),
+            names_len: g.names_buf.len(),
+            dir_paths_len: g.dir_paths_buf.len(),
+            metadata_ready: g.metadata_ready,
+            volumes: g.volumes.clone(),
+            tri_pending: g.tri_pending.clone(),
+            tri_snap,
+            has_trigram,
+        }
+    };
+    let v6 = V6Layout::for_index(path);
+    let t0 = Instant::now();
+    match v6_try_commit(&v6, &batch).map_err(|e| anyhow::anyhow!("{e:#}"))? {
+        CommitOutcome::Delta { applied, bytes, generation } => {
+            tracing::debug!(
+                "v6 commit：{applied} 条 / {bytes} B / gen {generation}（{:.1}ms）",
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        CommitOutcome::NeedFull { reason } => {
+            // 降级：全量分段重写（回填完成/批量墓碑/校验错位时，低频）。
+            // 持读锁做文件 IO（数秒），期间 USN 写被挡——与旧 v5 全量同代价，但只在低频路径触发。
+            info!("v6 commit 降级全量（{reason}），开始分段重写…");
+            let store = engine.index_store();
+            let gen = v6_save_full(&v6, &store).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+            info!("v6 全量重写完成（generation {gen}）");
+        }
+    }
     drop(guard);
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]

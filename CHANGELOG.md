@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [2.4.7] - 2026-10-27
+
+### 新增
+
+- **v6 增量持久化**：service 常驻落盘从「每 30s 全量重写 500MB+ `index.bin`」改为分段文件（`index.bin.v6/` 目录：entries/frns/dirs/names 独立段 + 原子 `manifest.json`）。日常变更（mtime 抖动、零星增删）只做 KB 级原地 patch/追加 + 一次 manifest 原子提交，sync 只刷实际动过的文件；`ext_filter`/`deleted` 位图改为 load 时从条目重建（纯派生数据，不再落盘，v6 目录比 `index.bin` 还小）。任务管理器里周期性 `0% CPU + 100MB/s` spike 消失；全量分段重写只在 v5 首次转换、回填终态、批量墓碑等低频路径触发。旧 `index.bin` 保留，首次启动自动转换，损坏自愈回退 v5；GUI 重建索引会连带清理 `.v6` 目录。
+
+### 修复
+
+- **空闲定时全量写盘**：USN 无变更时不再每 `save_interval_secs` 重写整个索引（dirty 计数门控 + 4096 条提交阈值；`persist_index` 跳过时不重置计时器、不清计数）。
+
 ## [2.4.6] - 2026-10-26
 
 ### 修复
@@ -250,6 +260,8 @@
 - 仓库根目录补充 **MIT** 全文许可（`LICENSE`），与 `Cargo.toml` 工作区 `MIT OR Apache-2.0` 声明在 README 中说明对应关系。
 
 [Unreleased]: https://github.com/chaojimct/findx/compare/v2.4.4...HEAD
+[2.4.7]: https://github.com/chaojimct/findx/compare/v2.4.6...v2.4.7
+[2.4.6]: https://github.com/chaojimct/findx/compare/v2.4.5...v2.4.6
 [2.4.5]: https://github.com/chaojimct/findx/compare/v2.4.4...v2.4.5
 [2.4.4]: https://github.com/chaojimct/findx/compare/v2.4.3...v2.4.4
 [2.4.3]: https://github.com/chaojimct/findx/compare/v2.4.2...v2.4.3

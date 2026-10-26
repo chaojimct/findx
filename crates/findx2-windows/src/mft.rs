@@ -265,55 +265,105 @@ mod imp {
             dirs.len()
         );
 
+        // SSD/HDD 检测：SSD 上 MFT 直读仅覆盖 5-20%（碎片化），直接用 NtQueryDirectoryFile
+        // 组合方案（99%+ 覆盖率）；HDD 上 MFT 直读仍有价值（顺序 I/O 快），保持原有策略。
+        let ssd = crate::volumes::is_ssd(root);
+        if ssd {
+            findx2_core::progress!("检测到 SSD，使用 NtQueryDirectoryFile 组合方案（跳过 MFT 直读）");
+        }
+
         if fast {
-            // fast 路径：保留 USN TimeStamp 作为 mtime/ctime 近似值（枚举时零 IO 就能拿到）；
-            // size 字段 USN 记录里没有，必须留 0，等 service 后台回填。
-            // backfill 判断条件是 `size==0 && !is_dir`，不以 mtime 为准。
-            for e in files.iter_mut() {
-                e.size = 0;
-            }
-        } else {
-            // 全量元数据：直读 $MFT，一次性提取所有文件的 size/mtime/ctime。
-            // 比 NtQueryDirectoryFile（逐目录）+ OpenFileById（逐文件）快得多——
-            // 只需一次批量顺序读取，避免百万次系统调用。
-            match crate::mft_read::read_mft_metadata(root) {
-                Ok((_record_size, meta_map)) => {
-                    let mut hit = 0usize;
-                    let mut miss_indices: Vec<usize> = Vec::new();
-                    for (i, e) in files.iter_mut().enumerate() {
-                        if let Some((sz, mt, ct)) = crate::mft_read::lookup_meta(&meta_map, e.file_id) {
-                            e.size = sz;
-                            e.mtime = mt;
-                            e.ctime = ct;
-                            hit += 1;
-                        } else {
-                            miss_indices.push(i);
+            if ssd {
+                // SSD fast 路径：MFT 直读覆盖率太低(5-20%)，直接用 NtQueryDirectoryFile 拿元数据。
+                // 比 MFT 直读+service 回填更快拿到完整数据。
+                backfill_via_dir_query_and_open_by_id(&path, &mut files, &dirs);
+            } else {
+                // HDD fast 路径：把 $MFT 当文件打开直读（NTFS 驱动自动处理 extent 映射），
+                // 一次性提取所有文件的 size/mtime/ctime，避免 service 后台回填。
+                match crate::mft_read::read_mft_metadata(root) {
+                    Ok((_record_size, mmap)) => {
+                        let mut hit = 0usize;
+                        for e in files.iter_mut() {
+                            if let Some((sz, mt, ct)) = crate::mft_read::lookup_meta(&mmap, e.file_id) {
+                                e.size = sz;
+                                e.mtime = mt;
+                                e.ctime = ct;
+                                hit += 1;
+                            }
+                        }
+                        for e in dirs.iter_mut() {
+                            if let Some((_sz, mt, ct)) = crate::mft_read::lookup_meta(&mmap, e.file_id) {
+                                e.mtime = mt;
+                                e.ctime = ct;
+                            }
+                        }
+                        let pct = hit * 100 / files.len().max(1);
+                        findx2_core::progress!(
+                            "fast 模式 MFT 直读命中：{}/{} ({}%)",
+                            hit,
+                            files.len(),
+                            pct,
+                        );
+                        if pct < 50 {
+                            findx2_core::progress!(
+                                "fast 模式 MFT 直读命中率偏低({}%)，可能存在 FRN 不匹配或 $MFT 记录缺失",
+                                pct,
+                            );
                         }
                     }
-                    // 目录也需要回填 mtime/ctime
-                    for e in dirs.iter_mut() {
-                        if let Some((_sz, mt, ct)) = crate::mft_read::lookup_meta(&meta_map, e.file_id) {
-                            e.mtime = mt;
-                            e.ctime = ct;
-                        }
-                    }
-                    findx2_core::progress!(
-                        "MFT 直读元数据命中率：{}/{} ({}%)，未命中 {} 条走 OpenFileById 兜底",
-                        hit,
-                        files.len(),
-                        hit * 100 / files.len().max(1),
-                        miss_indices.len(),
-                    );
-                    if !miss_indices.is_empty() {
-                        fill_files_metadata_open_by_indices(&path, &mut files, &miss_indices);
+                    Err(e) => {
+                        findx2_core::progress!("fast 模式 MFT 直读失败（{e}），元数据将由 service 后台回填");
                     }
                 }
-                Err(e) => {
-                    // MFT 直读失败时回退到 NtQueryDirectoryFile + OpenFileById
-                    findx2_core::progress!(
-                        "MFT 直读失败（{e}），回退到 NtQueryDirectoryFile + OpenFileById …",
-                    );
-                    backfill_via_dir_query_and_open_by_id(&path, &mut files, &dirs);
+            }
+        } else {
+            if ssd {
+                // SSD full-stat 路径：MFT 直读覆盖率太低，直接用 NtQueryDirectoryFile 组合方案。
+                // 一次扫描拿完整元数据，无需 backfill。
+                backfill_via_dir_query_and_open_by_id(&path, &mut files, &dirs);
+            } else {
+                // HDD full-stat 路径：直读 $MFT，一次性提取所有文件的 size/mtime/ctime。
+                // 比 NtQueryDirectoryFile（逐目录）+ OpenFileById（逐文件）快得多——
+                // 只需一次批量顺序读取，避免百万次系统调用。
+                match crate::mft_read::read_mft_metadata(root) {
+                    Ok((_record_size, meta_map)) => {
+                        let mut hit = 0usize;
+                        let mut miss_indices: Vec<usize> = Vec::new();
+                        for (i, e) in files.iter_mut().enumerate() {
+                            if let Some((sz, mt, ct)) = crate::mft_read::lookup_meta(&meta_map, e.file_id) {
+                                e.size = sz;
+                                e.mtime = mt;
+                                e.ctime = ct;
+                                hit += 1;
+                            } else {
+                                miss_indices.push(i);
+                            }
+                        }
+                        // 目录也需要回填 mtime/ctime
+                        for e in dirs.iter_mut() {
+                            if let Some((_sz, mt, ct)) = crate::mft_read::lookup_meta(&meta_map, e.file_id) {
+                                e.mtime = mt;
+                                e.ctime = ct;
+                            }
+                        }
+                        findx2_core::progress!(
+                            "MFT 直读元数据命中率：{}/{} ({}%)，未命中 {} 条走 OpenFileById 兜底",
+                            hit,
+                            files.len(),
+                            hit * 100 / files.len().max(1),
+                            miss_indices.len(),
+                        );
+                        if !miss_indices.is_empty() {
+                            fill_files_metadata_open_by_indices(&path, &mut files, &miss_indices);
+                        }
+                    }
+                    Err(e) => {
+                        // MFT 直读失败时回退到 NtQueryDirectoryFile + OpenFileById
+                        findx2_core::progress!(
+                            "MFT 直读失败（{e}），回退到 NtQueryDirectoryFile + OpenFileById …",
+                        );
+                        backfill_via_dir_query_and_open_by_id(&path, &mut files, &dirs);
+                    }
                 }
             }
         }
