@@ -983,6 +983,83 @@ fn compact_tombstones_keeps_index_consistent_and_search_equivalent() {
     );
 }
 
+/// 只给目录打墓碑、子文件不打标时，压缩会连带丢掉子文件。
+/// 保留计划必须把这些子文件算进去，不能只做「总数 − 墓碑数」。
+#[test]
+fn compact_survivor_count_drops_unmarked_children_of_deleted_dir() {
+    let dirs = vec![
+        RawEntry {
+            file_id: 10,
+            file_id_128: None,
+            parent_id: 0,
+            name: "Users".into(),
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            attrs: 0x10,
+            is_dir: true,
+        },
+        RawEntry {
+            file_id: 12,
+            file_id_128: None,
+            parent_id: 10,
+            name: "Gone".into(),
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            attrs: 0x10,
+            is_dir: true,
+        },
+    ];
+    let files = vec![
+        RawEntry {
+            file_id: 1,
+            file_id_128: None,
+            parent_id: 10,
+            name: "keep.txt".into(),
+            size: 100,
+            mtime: 1,
+            ctime: 1,
+            attrs: 0,
+            is_dir: false,
+        },
+        RawEntry {
+            file_id: 3,
+            file_id_128: None,
+            parent_id: 12,
+            name: "inside_gone_dir.txt".into(),
+            size: 100,
+            mtime: 1,
+            ctime: 1,
+            attrs: 0,
+            is_dir: false,
+        },
+    ];
+    let mut store = IndexBuilder::new(b'C', 1, 2, 3)
+        .build_from_raw(files, dirs, true)
+        .unwrap();
+    let gone = (0..store.entries.len())
+        .find(|&i| store.name_bytes(&store.entries[i]) == b"Gone")
+        .unwrap() as u32;
+    store.delete_entry(gone);
+
+    let naive = store.entry_count() - store.deleted.len() as usize;
+    let expected = store.compact_survivor_count();
+    assert!(
+        expected < naive,
+        "未打标的子文件必须从保留计划里剔除：naive={naive} expected={expected}"
+    );
+    let removed = store.compact_tombstones();
+    assert!(removed >= 2, "目录和它下面的文件都该消失，实际移除 {removed}");
+    assert_eq!(store.entry_count(), expected);
+    let still = (0..store.entries.len())
+        .any(|i| store.name_bytes(&store.entries[i]) == b"inside_gone_dir.txt");
+    assert!(!still, "父目录已删除的文件不能留在压缩结果里");
+    let kept = (0..store.entries.len())
+        .any(|i| store.name_bytes(&store.entries[i]) == b"keep.txt");
+    assert!(kept, "兄弟目录下的文件必须留下");
+}
+
 /// `remove_volume_entries` 的**区间安全**回归。
 ///
 /// 真实事故：对本机 3.09 亿条目的索引跑 `findx2 compact` 时，`remove_volume_entries`

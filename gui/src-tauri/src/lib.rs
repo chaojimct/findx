@@ -1203,7 +1203,7 @@ fn format_bytes_short(n: u64) -> String {
 /// - **无论压缩成败（包括 UAC 被取消），都会尝试把服务拉回来**，
 ///   否则压缩失败一次就要用户手动去「服务模式」点启动。
 /// - 回收量由 GUI 侧前后 stat 文件大小得出，不依赖 CLI stdout（ShellExecute 拿不到输出）。
-/// - CLI 侧另有灾难性损失守卫（存活 < 压缩前-墓碑 时拒绝落盘），此处无需重复校验。
+/// - CLI 侧另有灾难性损失守卫（存活少于保留计划时拒绝落盘），此处无需重复校验。
 #[cfg(target_os = "windows")]
 #[tauri::command]
 async fn compact_index(app: tauri::AppHandle) -> Result<CompactResult, String> {

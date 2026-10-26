@@ -15,6 +15,9 @@
 //!
 //! - 守卫触发（存活数 < 预期）：**Err 上抛，拒绝以可疑索引启动** —— 与 CLI
 //!   `compact` 的拒绝落盘同一逻辑，历史事故（区间推断清空整库）的教训。
+//!   预期值是 [`IndexStore::compact_survivor_count`]：未删除、且父目录链仍可达
+//!   的条目。父目录已是墓碑时，下面尚未单独打标的子条目会被连带丢掉，这是
+//!   压缩的正常结果，不能拿「总数 − 墓碑数」当预期（否则服务会拒绝启动）。
 //! - 落盘失败（磁盘满/权限）：内存里的压缩结果依然有效（搜索照常），只降级
 //!   提示，文件等下次启动再收口。
 //! - trigram 边车 posting 用旧下标，压缩后内存置 `None`；调用方既有的
@@ -73,16 +76,19 @@ fn compact_and_save(store: &mut IndexStore, index: &Path) -> anyhow::Result<Auto
     let n_before = store.entry_count();
     let tomb = store.deleted.len() as usize;
 
+    // 预期必须在压缩前算。父目录已删除的子条目不在墓碑位图里，但压缩会连带丢掉，
+    // 用「总数 − 墓碑数」会把这种正常结果误判成灾难性损失。
+    let expected = store.compact_survivor_count();
     let removed = store.compact_tombstones();
 
-    // 灾难性损失守卫（与 CLI compact 同一逻辑）：压缩只该删墓碑，存活条目必须
-    // 原样保留。触发即算法出了偏差 —— 绝不落盘，也不带病服务。
-    let expected = n_before.saturating_sub(tomb);
+    // 灾难性损失守卫（与 CLI compact 同一逻辑）：实际存活不得少于保留计划。
+    // 触发即重写把计划内的条目弄丢了 —— 绝不落盘，也不带病服务。
     let actual = store.entry_count();
     if actual < expected {
         return Err(anyhow::anyhow!(
-            "启动自动压缩守卫触发：预期保留 {expected} 条（{n_before} - {tomb} 墓碑），\
-             实际 {actual} 条。已放弃落盘且拒绝以可疑索引启动。这是 bug，请反馈。"
+            "启动自动压缩守卫触发：预期保留 {expected} 条（未删除且父目录仍可达），\
+             实际 {actual} 条（压缩前 {n_before}，墓碑 {tomb}）。\
+             已放弃落盘且拒绝以可疑索引启动。这是 bug，请反馈。"
         ));
     }
 
@@ -237,6 +243,67 @@ mod tests {
             .search(&pq, &findx2_core::SearchOptions::default())
             .unwrap();
         assert_eq!(hits.len(), 1, "存活条目压缩后必须仍可命中");
+        cleanup(&idx);
+    }
+
+    /// 父目录已是墓碑、子文件还没打标：压缩会连带丢掉子文件。
+    /// 旧守卫用「总数 − 墓碑数」当预期，这种正常结果会被拒绝，服务起不来。
+    ///
+    /// 子目录不能是 `dirs[0]`：压缩把 `dir_idx == 0` 当作根，不会因该槽位死亡而丢子条目。
+    #[test]
+    fn orphan_children_of_deleted_dir_do_not_trip_guard() {
+        const N: usize = 140_000;
+        const TOMBS: usize = 50_000;
+        let mut store = mk_store(N, TOMBS);
+        // 在 data 下挂一个未打标的子目录，再把该子目录打成墓碑。子文件自己不打标。
+        let side = findx2_core::platform::RawEntry {
+            file_id: 77,
+            file_id_128: None,
+            parent_id: 10,
+            name: "gone".into(),
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            attrs: 0x10,
+            is_dir: true,
+        };
+        let orphan = findx2_core::platform::RawEntry {
+            file_id: 78,
+            file_id_128: None,
+            parent_id: 77,
+            name: "orphan.log".into(),
+            size: 100,
+            mtime: 1,
+            ctime: 1,
+            attrs: 0,
+            is_dir: false,
+        };
+        // mk_store 已经建完，追加走增量接口，保证 gone 不是 dirs[0]。
+        store.append_dir_from_raw(&side).unwrap();
+        store.append_file_entry(&orphan);
+        let gone = (0..store.entries.len())
+            .find(|&j| store.name_bytes(&store.entries[j]) == b"gone")
+            .expect("gone 目录");
+        store.delete_entry(gone as u32);
+
+        let idx = temp_index_path("orphan");
+        findx2_core::save_index_bin(&idx, &store).unwrap();
+        let mut store = findx2_core::load_index_bin(&idx).unwrap();
+        assert!(store.should_compact());
+        let naive = store.entry_count() - store.deleted.len() as usize;
+        let expected = store.compact_survivor_count();
+        assert!(
+            expected < naive,
+            "连带丢弃必须让保留计划小于总数减墓碑：naive={naive} expected={expected}"
+        );
+
+        let out = auto_compact_if_needed(&mut store, &idx).unwrap();
+        assert!(
+            matches!(out, AutoCompactOutcome::Compacted { saved_ok: true, .. }),
+            "父目录连带删除不能触发守卫，实际 {out:?}"
+        );
+        assert_eq!(store.entry_count(), expected);
+        assert_eq!(store.deleted.len(), 0);
         cleanup(&idx);
     }
 }

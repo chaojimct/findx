@@ -456,6 +456,14 @@ pub fn normalize_excluded_dir(input: &str) -> Option<String> {
     Some(s)
 }
 
+/// [`IndexStore::plan_compact`] 的保留集。只在压缩路径内部使用。
+struct CompactPlan {
+    keep_entries: Vec<u32>,
+    dir_alive: Vec<bool>,
+    /// old dir idx → new dir idx；被丢弃的目录为 `u32::MAX`。
+    dir_map: Vec<u32>,
+}
+
 impl IndexStore {
     pub fn entry_count(&self) -> usize {
         self.entries.len()
@@ -766,6 +774,112 @@ impl IndexStore {
         self.entries.len() >= MIN_ENTRIES && self.tombstone_ratio() > RATIO
     }
 
+    /// 压缩后应保留的条目数，口径与 [`Self::compact_tombstones`] 相同。
+    ///
+    /// 不只是 `entry_count - deleted.len()`：父目录本身已是墓碑时，挂在下面、
+    /// 尚未单独打标的条目也会被连带丢弃（否则 `dir_idx` 会指向已消失的目录）。
+    /// 启动 / CLI 的灾难守卫必须用这个数，而不是「总数 − 墓碑数」，否则这种
+    /// 正常连带删除会被误判成整库损坏并拒绝启动。
+    ///
+    /// 没有任何墓碑、或位图与 `ATTR_DELETED` 对不上以至于压缩会空操作时，返回当前条目数。
+    pub fn compact_survivor_count(&self) -> usize {
+        match self.plan_compact() {
+            Some(plan) => plan.keep_entries.len(),
+            None => self.entries.len(),
+        }
+    }
+
+    /// 压缩保留计划。`None` = 这次是空操作（调用方应保持索引原样）。
+    fn plan_compact(&self) -> Option<CompactPlan> {
+        if self.deleted.is_empty() {
+            return None;
+        }
+        let n_old = self.entries.len();
+
+        // —— 1. 条目保留判据 ——
+        // 不用 `deleted` 位图单独判断：`is_deleted()` 同时覆盖 ATTR_DELETED 位，
+        // 与搜索热路径 `fused_scan` 的过滤口径保持一致，避免「压缩后反而多出条目」。
+        let mut keep_entries: Vec<u32> =
+            Vec::with_capacity(n_old.saturating_sub(self.deleted.len() as usize));
+        for (i, e) in self.entries.iter().enumerate() {
+            if e.is_deleted() {
+                continue;
+            }
+            keep_entries.push(i as u32);
+        }
+        if keep_entries.len() == n_old {
+            return None; // 位图非空但没有任何条目真的带删除标记，无需动
+        }
+
+        // —— 2. 目录保留判据：目录自身不是墓碑，且父链能一路走到根 ——
+        let (dir_alive, dir_map) = self.directory_retention();
+
+        // —— 3. 条目二次过滤：父目录已被丢弃的条目也丢掉 ——
+        // 目录区一般远小于条目区，这一步实际很少命中；
+        // 但做了才能保证 `dir_idx` 永远指向存活目录。
+        let keep_entries: Vec<u32> = keep_entries
+            .into_iter()
+            .filter(|&i| {
+                let d = self.entries[i as usize].dir_idx as usize;
+                d == 0 || (d < dir_map.len() && dir_map[d] != u32::MAX)
+            })
+            .collect();
+        if keep_entries.len() == n_old {
+            return None;
+        }
+        Some(CompactPlan {
+            keep_entries,
+            dir_alive,
+            dir_map,
+        })
+    }
+
+    /// 哪些目录压缩后还在，以及 old dir idx → new dir idx（丢弃的为 `u32::MAX`）。
+    ///
+    /// 父目录被打掉的目录必须连带丢弃，否则 `dir_idx` 会指向一个已不存在的目录，
+    /// 路径解析会退化成空串（比丢弃更糟：搜索结果路径丢失且难排查）。
+    fn directory_retention(&self) -> (Vec<bool>, Vec<u32>) {
+        let mut dir_map: Vec<u32> = vec![u32::MAX; self.dirs.len()];
+        let mut dir_alive: Vec<bool> = vec![false; self.dirs.len()];
+        // 迭代到不动点：父链最长 N 层，但每轮至少定死一批，实际两三轮就收敛。
+        for _ in 0..self.dirs.len().min(64) {
+            let mut changed = false;
+            for i in 0..self.dirs.len() {
+                if dir_alive[i] {
+                    continue;
+                }
+                let d = &self.dirs[i];
+                // 与条目同口径：目录要么是它自己的墓碑位，要么父链断掉
+                let self_ok = match self.frn_to_entry.get(&d.frn) {
+                    Some(&ei) => !self.entries[ei as usize].is_deleted(),
+                    // 目录不在 entries 里（历史 v2/v3 布局）：只能靠父链判断
+                    None => true,
+                };
+                if !self_ok {
+                    continue;
+                }
+                let parent_ok = d.parent_idx == 0
+                    || ((d.parent_idx as usize) < self.dirs.len()
+                        && dir_alive[d.parent_idx as usize]);
+                if parent_ok {
+                    dir_alive[i] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut n_dirs_kept = 0u32;
+        for i in 0..self.dirs.len() {
+            if dir_alive[i] {
+                dir_map[i] = n_dirs_kept;
+                n_dirs_kept += 1;
+            }
+        }
+        (dir_alive, dir_map)
+    }
+
     /// 物理压缩：把墓碑条目从索引里真正删掉，并重建所有与之耦合的下标。
     ///
     /// ## 为什么要做
@@ -800,85 +914,20 @@ impl IndexStore {
     /// `names_buf` 与 `dir_paths_buf` 原样保留 —— 偏移不变，所以所有
     /// `name_offset` / `name_len` 都不需要改。
     ///
-    /// 返回**被移除的墓碑条目数**；没有墓碑时返回 0 且不做任何分配。
+    /// 返回**被移除的条目数**（墓碑，加上父目录已被丢弃的连带条目）；没有墓碑时返回 0 且不做任何分配。
     pub fn compact_tombstones(&mut self) -> usize {
-        if self.deleted.is_empty() {
-            return 0;
-        }
         let n_old = self.entries.len();
-
-        // —— 1. 条目保留判据 ——
-        // 不用 `deleted` 位图单独判断：`is_deleted()` 同时覆盖 ATTR_DELETED 位，
-        // 与搜索热路径 `fused_scan` 的过滤口径保持一致，避免「压缩后反而多出条目」。
-        let mut entry_map: Vec<u32> = vec![u32::MAX; n_old];
-        let mut keep_entries: Vec<u32> = Vec::with_capacity(n_old.saturating_sub(self.deleted.len() as usize));
-        for (i, e) in self.entries.iter().enumerate() {
-            if e.is_deleted() {
-                continue;
-            }
-            entry_map[i] = keep_entries.len() as u32;
-            keep_entries.push(i as u32);
-        }
-        if keep_entries.len() == n_old {
-            return 0; // 位图非空但没有任何条目真的带删除标记，无需动
-        }
-
-        // —— 2. 目录保留判据：目录自身不是墓碑，且父链能一路走到根 ——
-        // 父目录被打掉的目录必须连带丢弃，否则 `dir_idx` 会指向一个已不存在的目录，
-        // 路径解析会退化成空串（比丢弃更糟：搜索结果路径丢失且难排查）。
-        let mut dir_map: Vec<u32> = vec![u32::MAX; self.dirs.len()];
-        let mut dir_alive: Vec<bool> = vec![false; self.dirs.len()];
-        // 迭代到不动点：父链最长 N 层，但每轮至少定死一批，实际两三轮就收敛。
-        for _ in 0..self.dirs.len().min(64) {
-            let mut changed = false;
-            for i in 0..self.dirs.len() {
-                if dir_alive[i] {
-                    continue;
-                }
-                let d = &self.dirs[i];
-                // 与条目同口径：目录要么是它自己的墓碑位，要么父链断掉
-                let self_ok = match self.frn_to_entry.get(&d.frn) {
-                    Some(&ei) => !self.entries[ei as usize].is_deleted(),
-                    // 目录不在 entries 里（历史 v2/v3 布局）：只能靠父链判断
-                    None => true,
-                };
-                if !self_ok {
-                    continue;
-                }
-                let parent_ok = d.parent_idx == 0
-                    || (d.parent_idx as usize) < self.dirs.len() && dir_alive[d.parent_idx as usize];
-                if parent_ok {
-                    dir_alive[i] = true;
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        let mut n_dirs_kept = 0u32;
-        for i in 0..self.dirs.len() {
-            if dir_alive[i] {
-                dir_map[i] = n_dirs_kept;
-                n_dirs_kept += 1;
-            }
-        }
-
-        // —— 3. 条目二次过滤：父目录已被丢弃的条目也丢掉 ——
-        // 目录区一般远小于条目区（本机 4127 个 vs 3.09 亿），这一步实际很少命中；
-        // 但做了才能保证 `dir_idx` 永远指向存活目录。
-        let keep_entries: Vec<u32> = keep_entries
-            .into_iter()
-            .filter(|&i| {
-                let d = self.entries[i as usize].dir_idx as usize;
-                d == 0 || (d < dir_map.len() && dir_map[d] != u32::MAX)
-            })
-            .collect();
-        if keep_entries.len() == n_old {
+        let Some(plan) = self.plan_compact() else {
             return 0;
-        }
-        // 重算最终映射（上一步可能又丢了一批）
-        entry_map.fill(u32::MAX);
+        };
+        let CompactPlan {
+            keep_entries,
+            dir_alive,
+            dir_map,
+        } = plan;
+
+        // 最终 old→new 映射。不在保留集里的下标保持 u32::MAX。
+        let mut entry_map: Vec<u32> = vec![u32::MAX; n_old];
         for (new_i, &old_i) in keep_entries.iter().enumerate() {
             entry_map[old_i as usize] = new_i as u32;
         }
@@ -898,8 +947,9 @@ impl IndexStore {
         }
 
         // —— 5. 重写 dirs ——
-        let mut new_dirs: Vec<DirEntry> = Vec::with_capacity(n_dirs_kept as usize);
-        let mut new_dir_path_ranges: Vec<(u32, u32)> = Vec::with_capacity(n_dirs_kept as usize);
+        let n_dirs_kept = dir_alive.iter().filter(|&&alive| alive).count();
+        let mut new_dirs: Vec<DirEntry> = Vec::with_capacity(n_dirs_kept);
+        let mut new_dir_path_ranges: Vec<(u32, u32)> = Vec::with_capacity(n_dirs_kept);
         for (i, d) in self.dirs.iter().enumerate() {
             if !dir_alive[i] {
                 continue;

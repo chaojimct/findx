@@ -393,6 +393,8 @@ fn run() -> Result<()> {
                 return Ok(());
             }
 
+            // 预期必须在压缩前算。父目录已删除的子条目不在墓碑位图里，但压缩会连带丢掉。
+            let expected_survivors = store.compact_survivor_count();
             let removed = store.compact_tombstones();
             println!(
                 "已移除 {removed} 条墓碑 → 剩余 {} 条目（耗时 {:.1}s）",
@@ -400,16 +402,15 @@ fn run() -> Result<()> {
                 t0.elapsed().as_secs_f64()
             );
 
-            // 灾难性损失守卫：压缩只该删墓碑，存活条目必须原样保留。
-            // 若剩余条目数明显少于「压缩前 - 墓碑数」，说明保留集算法出了偏差
-            // （历史上就发生过一次区间推断把整库当墓碑清空的事故），
-            // 此时**绝不落盘**，原文件保持不动。
-            let expected_survivors = n_before.saturating_sub(tomb);
+            // 灾难性损失守卫：实际存活不得少于保留计划（未删除且父目录仍可达）。
+            // 少于该数说明重写把计划内的条目弄丢了
+            // （历史上区间推断曾把整库当墓碑清空），此时**绝不落盘**，原文件保持不动。
             let actual = store.entry_count();
             if actual < expected_survivors {
                 return Err(findx2_core::Error::Persist(format!(
-                    "压缩结果异常：预期保留 {expected_survivors} 条（{n_before} - {tomb} 墓碑），\
-                     实际只剩 {actual} 条。已放弃落盘，原索引未改动。这是 bug，请反馈。"
+                    "压缩结果异常：预期保留 {expected_survivors} 条（未删除且父目录仍可达），\
+                     实际只剩 {actual} 条（压缩前 {n_before}，墓碑 {tomb}）。\
+                     已放弃落盘，原索引未改动。这是 bug，请反馈。"
                 )));
             }
 

@@ -714,7 +714,9 @@ fn usn_watch_loop(
                     } else {
                         info!("卷 {letter} 重建完成，恢复增量监听");
                         set_watch_error(letter, None);
-                        gap_rebuilds = 0;
+                        // 成功只说明新扫描已换入。若游标仍落在 journal 已覆写的
+                        // 区间，下一轮会立刻再断档。计数留到真正收到 Checkpoint
+                        // 再清零，否则状态栏永远停在「1/3」，重建会无限循环。
                     }
                 } else if is_gap {
                     set_watch_error(
@@ -769,10 +771,11 @@ fn usn_watch_loop(
 /// 2. 记下内存 `last_usn` 为 frozen 点（pending 已排空、checkpoint 先 flush 的不变量
 ///    保证 frozen ≤ 所有丢弃事件的 USN，重放全覆盖）；
 /// 3. 重新 MFT 枚举 + build 新 store（数分钟，无锁；旧索引继续服务）；
-/// 4. 读锁下克隆旧 store → 离线（无锁）：旧卷区间墓碑 + 摘除旧 VolumeState → merge
-///    （新 store 后挂，FRN 冲突归新；excluded_dirs 从旧 store 恢复）；
-/// 5. 写锁换入（µs）+ revision bump + `last_usn` 回绕到 frozen 点；
-/// 6. 全量落盘 + trigram 边车重建；解冻后 worker 重建，用回绕游标从 journal 重放补齐
+/// 4. 读锁下克隆旧 store → 离线（无锁）：多卷时摘除旧卷再合并；单卷时整库换成新扫描
+///    （`remove_volume_entries` 对「区间=整库」会拒绝，不能追加）。`excluded_dirs` 从旧库恢复；
+/// 5. 写锁换入（µs）+ revision bump。`frozen` 仍在 journal 可读范围才回绕重放，
+///    否则保留扫描结束时的 NextUsn（停机过久时旧游标已被覆写，回绕会立刻再断档）；
+/// 6. 全量落盘 + trigram 边车重建；解冻后 worker 从换入后的游标续听
 ///    （重复事件幂等：Create→upsert 更新、Delete 缺失→ok、Rename→ok）。
 /// 任何一步失败都解冻并返回 Err（外层退避重试；3 次后放弃并上报，需手动重建）。
 fn rebuild_volume(
@@ -792,13 +795,13 @@ fn rebuild_volume(
     }
     let _unfreeze = Unfreeze(letter);
 
-    let frozen: u64 = {
+    let (frozen, frozen_journal_id) = {
         let g = engine.index_store();
         g.volumes
             .iter()
             .find(|v| (v.volume_letter as char).to_ascii_uppercase() == letter)
-            .map(|v| v.last_usn)
-            .unwrap_or(0)
+            .map(|v| (v.last_usn, v.usn_journal_id))
+            .unwrap_or((0, 0))
     };
     info!("卷 {letter} 开始全量重建（frozen 游标 {frozen}，旧索引继续服务）…");
 
@@ -821,7 +824,10 @@ fn rebuild_volume(
     let old_snapshot = { engine.index_store().clone() };
     let merged = merge_rebuilt_volume(old_snapshot, fresh, letter)?;
 
-    // 3) 写锁换入 + 游标回绕 + revision。
+    // 3) 写锁换入 + 游标。
+    // 扫描期间的增量只有在 frozen 仍落在 journal 可读范围内时才回绕重放。
+    // 服务停太久、FirstUsn 已经越过 frozen 时，回绕会让下一轮立刻再断档，
+    // 全卷重建无限循环。这时新扫描自带的 NextUsn 才是能接上的游标。
     {
         let mut g = engine.index_store_mut();
         *g = merged;
@@ -830,7 +836,30 @@ fn rebuild_volume(
             .iter_mut()
             .find(|v| (v.volume_letter as char).to_ascii_uppercase() == letter)
         {
-            v.last_usn = frozen;
+            let fresh_usn = v.last_usn;
+            let resume = match findx2_windows::query_journal_state(&vol_str) {
+                Ok((jid, first, _)) => resume_usn_after_rebuild(
+                    frozen,
+                    frozen_journal_id,
+                    fresh_usn,
+                    jid,
+                    first,
+                ),
+                Err(e) => {
+                    info!(
+                        "卷 {letter} 重建后无法复查 journal（{e}），保留扫描游标 {fresh_usn}"
+                    );
+                    fresh_usn
+                }
+            };
+            if resume == frozen && resume != fresh_usn {
+                info!("卷 {letter} 回绕到 frozen={frozen} 重放扫描期间的增量");
+            } else if resume != frozen {
+                info!(
+                    "卷 {letter} 断档游标 {frozen} 已不可读，保留扫描结束时的游标 {resume}"
+                );
+            }
+            v.last_usn = resume;
         }
     }
     engine.note_external_mutation();
@@ -841,7 +870,7 @@ fn rebuild_volume(
     // 合并后 metadata_ready=false（fast 重枚举），必须重新拉起回填；旧 overlay 下标已失效。
     engine.clear_metadata_overlay();
     crate::backfill::spawn_backfill(Arc::clone(engine), index_path.to_path_buf());
-    info!("卷 {letter} 重建完成（已回绕到 frozen={frozen} 重放），恢复增量监听");
+    info!("卷 {letter} 重建完成（frozen={frozen}），恢复增量监听");
     Ok(())
 }
 
@@ -856,11 +885,40 @@ fn rebuild_volume(
 /// 现在 core 提供了 [`findx2_core::IndexStore::remove_volume_entries`]，用「先算保留集、
 /// 再整体重写」的方式统一重映射全部下标（不是逐个 remove），所以既物理回收了空间，
 /// 又不必手工维护下标一致性。
+///
+/// 单卷库例外：该卷区间就是整库，`remove_volume_entries` 会拒绝摘除（防止误清空）。
+/// 若这时仍走「追加合并」，每次全卷重建都把同一卷再挂一份，条目数翻倍，并且
+/// 断档未消除时会一直翻。单卷重建的结果就是这次扫描，直接换掉旧库。
 fn merge_rebuilt_volume(
-    mut old: findx2_core::IndexStore,
-    fresh: findx2_core::IndexStore,
+    old: findx2_core::IndexStore,
+    mut fresh: findx2_core::IndexStore,
     letter: char,
 ) -> anyhow::Result<findx2_core::IndexStore> {
+    let up = letter.to_ascii_uppercase();
+    let has_letter = old.volumes.iter().any(|v| {
+        (v.volume_letter as char).to_ascii_uppercase() == up
+    });
+    let sole = has_letter
+        && old
+            .volumes
+            .iter()
+            .all(|v| (v.volume_letter as char).to_ascii_uppercase() == up);
+    if sole {
+        info!(
+            "卷 {letter} 是索引中的唯一卷，整库替换为新扫描（{} 条 → {} 条）",
+            old.entry_count(),
+            fresh.entry_count()
+        );
+        fresh.excluded_dirs = old.excluded_dirs.clone();
+        let excluded = fresh.excluded_dirs.clone();
+        let marked = fresh.mark_excluded_entries(&excluded);
+        if marked > 0 {
+            info!("卷 {letter} 重建后重新套用排除目录，标记 {marked} 条");
+        }
+        return Ok(fresh);
+    }
+
+    let mut old = old;
     let removed = old.remove_volume_entries(letter);
     if removed == 0 {
         info!("卷 {letter} 不在旧索引中，重建退化为纯追加合并");
@@ -874,8 +932,31 @@ fn merge_rebuilt_volume(
     let excluded = old.excluded_dirs.clone();
     let mut merged = findx2_core::merge_index_stores(vec![old, fresh])
         .map_err(|e| anyhow::anyhow!("卷 {letter} 索引合并失败: {e}"))?;
-    merged.excluded_dirs = excluded;
+    merged.excluded_dirs = excluded.clone();
+    let marked = merged.mark_excluded_entries(&excluded);
+    if marked > 0 {
+        info!("卷 {letter} 重建后重新套用排除目录，标记 {marked} 条");
+    }
     Ok(merged)
+}
+
+/// 重建换入后用哪条 USN 续听。
+///
+/// `frozen` 仍在当前 journal 里（ID 相同且 `frozen >= FirstUsn`）时回绕，
+/// 重放扫描期间的增量。否则 journal 已经把这条游标覆写掉，回绕会让下一轮
+/// 立刻再报断档；改用扫描结束时读到的 `NextUsn`。
+fn resume_usn_after_rebuild(
+    frozen: u64,
+    frozen_journal_id: u64,
+    fresh_usn: u64,
+    live_journal_id: u64,
+    first_usn: i64,
+) -> u64 {
+    if frozen_journal_id == live_journal_id && (frozen as i64) >= first_usn {
+        frozen
+    } else {
+        fresh_usn
+    }
 }
 
 /// P2 journal 覆写预警：FirstUsn 逼近尚未读到的游标时返回状态栏文案。
@@ -929,4 +1010,80 @@ pub(crate) fn persist_index(engine: &SearchEngine, path: &Path) -> anyhow::Resul
     save_index_bin(path, &store)?;
     drop(guard);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{merge_rebuilt_volume, resume_usn_after_rebuild};
+    use findx2_core::{IndexBuilder, RawEntry};
+
+    fn tiny_store(letter: u8, journal: u64, usn: u64, name: &str) -> findx2_core::IndexStore {
+        let dirs = vec![RawEntry {
+            file_id: 100,
+            file_id_128: None,
+            parent_id: 0,
+            name: "Users".into(),
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            attrs: 0x10,
+            is_dir: true,
+        }];
+        let files = vec![RawEntry {
+            file_id: 1,
+            file_id_128: None,
+            parent_id: 100,
+            name: name.into(),
+            size: 10,
+            mtime: 1,
+            ctime: 1,
+            attrs: 0,
+            is_dir: false,
+        }];
+        IndexBuilder::new(letter, 1, journal, usn)
+            .build_from_raw(files, dirs, true)
+            .unwrap()
+    }
+
+    #[test]
+    fn sole_volume_rebuild_replaces_instead_of_appending() {
+        let mut old = tiny_store(b'C', 7, 100, "old.txt");
+        old.excluded_dirs = vec![r"C:\Users".into()];
+        let fresh = tiny_store(b'C', 7, 50_000, "new.txt");
+        let old_n = old.entry_count();
+        let fresh_n = fresh.entry_count();
+        let merged = merge_rebuilt_volume(old, fresh, 'C').unwrap();
+        assert_eq!(merged.entry_count(), fresh_n);
+        assert_ne!(merged.entry_count(), old_n + fresh_n);
+        assert_eq!(merged.volumes.len(), 1);
+        assert_eq!(merged.volumes[0].last_usn, 50_000);
+        assert_eq!(
+            merged.excluded_dirs,
+            vec![r"C:\Users".to_string()]
+        );
+        assert!(merged.deleted.len() > 0, "排除目录下的新扫描条目应被打墓碑");
+    }
+
+    #[test]
+    fn resume_usn_keeps_scan_cursor_when_frozen_was_overwritten() {
+        let fresh = 85_472_796_576u64;
+        let first = 84_474_593_280i64;
+        let frozen = 80_312_296_848u64;
+        assert_eq!(
+            resume_usn_after_rebuild(frozen, 9, fresh, 9, first),
+            fresh
+        );
+        assert_eq!(
+            resume_usn_after_rebuild(fresh, 9, fresh, 9, first),
+            fresh
+        );
+        assert_eq!(
+            resume_usn_after_rebuild(first as u64, 9, fresh, 9, first),
+            first as u64
+        );
+        assert_eq!(
+            resume_usn_after_rebuild(fresh, 1, fresh, 9, first),
+            fresh
+        );
+    }
 }
