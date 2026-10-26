@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [2.4.8] - 2026-10-27
+
+### 其他
+
+- 版本号例行递增，无功能变更（2.4.7 已包含 v6 增量持久化）。
+
 ## [2.4.7] - 2026-10-27
 
 ### 新增
@@ -260,6 +266,7 @@
 - 仓库根目录补充 **MIT** 全文许可（`LICENSE`），与 `Cargo.toml` 工作区 `MIT OR Apache-2.0` 声明在 README 中说明对应关系。
 
 [Unreleased]: https://github.com/chaojimct/findx/compare/v2.4.4...HEAD
+[2.4.8]: https://github.com/chaojimct/findx/compare/v2.4.7...v2.4.8
 [2.4.7]: https://github.com/chaojimct/findx/compare/v2.4.6...v2.4.7
 [2.4.6]: https://github.com/chaojimct/findx/compare/v2.4.5...v2.4.6
 [2.4.5]: https://github.com/chaojimct/findx/compare/v2.4.4...v2.4.5
