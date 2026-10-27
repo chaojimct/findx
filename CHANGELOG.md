@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [2.4.9] - 2026-10-27
+
+### 修复
+
+- **macOS/Linux CI 编译失败（E0433）**：`backfill` 终态落盘无条件引用 `crate::run`（仅 Windows 存在）；`CommitBatch` 等导入只在 Windows Watch 用到。已按平台门控拆分，非 Windows 走 v5 直写。
+- **CLI `compact` 与 v6 一致性**：service 常驻后主 `index.bin` 不再更新，compact 改读 `load_store_auto`（v6 优先），落盘时 v5/v6 双写。
+
 ## [2.4.8] - 2026-10-27
 
 ### 其他
@@ -266,6 +273,7 @@
 - 仓库根目录补充 **MIT** 全文许可（`LICENSE`），与 `Cargo.toml` 工作区 `MIT OR Apache-2.0` 声明在 README 中说明对应关系。
 
 [Unreleased]: https://github.com/chaojimct/findx/compare/v2.4.4...HEAD
+[2.4.9]: https://github.com/chaojimct/findx/compare/v2.4.8...v2.4.9
 [2.4.8]: https://github.com/chaojimct/findx/compare/v2.4.7...v2.4.8
 [2.4.7]: https://github.com/chaojimct/findx/compare/v2.4.6...v2.4.7
 [2.4.6]: https://github.com/chaojimct/findx/compare/v2.4.5...v2.4.6

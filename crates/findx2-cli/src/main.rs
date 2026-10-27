@@ -2,13 +2,13 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use findx2_core::{
-    load_index_bin, load_store_auto, save_index_bin, ParsedQuery, QueryParser, Result,
-    SearchEngine, SearchHit, SearchOptions,
+    load_store_auto, save_index_bin, ParsedQuery, QueryParser, Result,
+    SearchEngine, SearchHit, SearchOptions, V6Layout, v6_save_full,
 };
 /// Windows 常驻才用的增量提交类型（Watch/回填）：Unix/macOS 下 Watch 命令不存在，
 /// 这些导入只在 Windows 生效，避免非 Windows 构建报 unused_imports。
 #[cfg(windows)]
-use findx2_core::{CommitBatch, CommitOutcome, IndexStore, V6Layout, v6_save_full, v6_try_commit};
+use findx2_core::{CommitBatch, CommitOutcome, IndexStore, v6_try_commit};
 #[cfg(windows)]
 mod remote;
 #[cfg(windows)]
@@ -380,8 +380,9 @@ fn run() -> Result<()> {
             }
         }
         Commands::Compact { index, dry_run } => {
+            // v6 优先：service 常驻后主 index.bin 不再更新，直接读 v5 会是 stale 的。
             let t0 = std::time::Instant::now();
-            let mut store = load_index_bin(&index)?;
+            let mut store = load_store_auto(&index)?;
             let n_before = store.entry_count();
             let tomb = store.deleted.len() as usize;
             let bytes_before = std::fs::metadata(&index).map(|m| m.len()).unwrap_or(0);
@@ -401,6 +402,8 @@ fn run() -> Result<()> {
 
             // 预期必须在压缩前算。父目录已删除的子条目不在墓碑位图里，但压缩会连带丢掉。
             let expected_survivors = store.compact_survivor_count();
+            // v6：开 tracking，让 compact 记 FullResync（下标整体重写，增量日志无法表达）。
+            store.set_track_mutations(true);
             let removed = store.compact_tombstones();
             println!(
                 "已移除 {removed} 条墓碑 → 剩余 {} 条目（耗时 {:.1}s）",
@@ -431,6 +434,13 @@ fn run() -> Result<()> {
             ));
             save_index_bin(&tmp, &store)?;
             std::fs::rename(&tmp, &index)?;
+
+            // v6 分段与主文件同步：service 常驻只读 v6，不跟写就会静默失效。
+            let v6 = V6Layout::for_index(&index);
+            if v6.manifest_exists() {
+                v6_save_full(&v6, &store)?;
+                let _ = store.take_mutations();
+            }
 
             // trigram 边车的 posting 用的是旧下标，压缩后必须重建（否则剪枝会漏报）。
             store.trigram = None;
