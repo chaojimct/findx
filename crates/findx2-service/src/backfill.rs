@@ -106,12 +106,22 @@ fn spawn_final_persist(engine: Arc<SearchEngine>, path: std::path::PathBuf) {
                     return;
                 }
             }
-            // 2) v6 落盘：FullResync → 全量分段重写（持读锁，HDD 上数秒）。
-            //    parking_lot 下 reader 共存，search 不受影响。
+            // 2) 落盘（持读锁，HDD 上数秒；parking_lot 下 reader 共存，search 不受影响）。
+            //    Windows 走 v6：FullResync → 全量分段重写。
+            //    非 Windows（Unix 回填桩）走旧 v5 直写。
             let t1 = Instant::now();
+            #[cfg(windows)]
             if let Err(e) = crate::run::persist_index(&engine, &path) {
                 error!("终态落盘：persist_index 失败: {e:#}");
                 return;
+            }
+            #[cfg(not(windows))]
+            {
+                let store = engine.index_store();
+                if let Err(e) = findx2_core::save_index_bin(&path, &store) {
+                    error!("终态落盘：save_index_bin 失败: {e}");
+                    return;
+                }
             }
             // 终态已落盘：断点边车使命完成，删除（下次回填从头也不怕，因为 ready=true 不会再回填）。
             delete_overlay_sidecar(&path);
