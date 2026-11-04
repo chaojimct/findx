@@ -85,7 +85,7 @@ pub fn is_ssd(volume: &str) -> bool {
     let _ = unsafe { CloseHandle(h) };
 
     match ok {
-        Ok(()) => !descriptor.IncursSeekPenalty.as_bool(),
+        Ok(()) => !descriptor.IncursSeekPenalty,
         Err(_) => false,
     }
 }

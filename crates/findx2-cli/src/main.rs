@@ -3,8 +3,10 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use findx2_core::{
     load_store_auto, save_index_bin, ParsedQuery, QueryParser, Result,
-    SearchEngine, SearchHit, SearchOptions, V6Layout, v6_save_full,
+    SearchEngine, SearchOptions, V6Layout, v6_save_full,
 };
+#[cfg(windows)]
+use findx2_core::SearchHit;
 /// Windows 常驻才用的增量提交类型（Watch/回填）：Unix/macOS 下 Watch 命令不存在，
 /// 这些导入只在 Windows 生效，避免非 Windows 构建报 unused_imports。
 #[cfg(windows)]

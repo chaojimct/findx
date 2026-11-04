@@ -596,7 +596,7 @@ pub fn volume_incurs_seek_penalty(volume_path: &str) -> bool {
             None,
         )
     };
-    r.is_ok() && out.IncursSeekPenalty.0 != 0
+    r.is_ok() && out.IncursSeekPenalty
 }
 
 /// `$MFT` 自身的 extents 数（碎片度）。FRN 0 打开 MFT + `FSCTL_GET_RETRIEVAL_POINTERS`

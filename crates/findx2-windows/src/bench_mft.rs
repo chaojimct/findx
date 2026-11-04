@@ -2,6 +2,19 @@
 //!
 //! 用法：`cargo run --bin bench_mft -- --volume C`
 
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("bench_mft 仅支持 Windows 平台");
+    std::process::exit(1);
+}
+
+#[cfg(windows)]
+fn main() {
+    windows_impl::main_impl();
+}
+
+#[cfg(windows)]
+mod windows_impl {
 use std::mem::size_of;
 use std::time::Instant;
 
@@ -1158,7 +1171,7 @@ fn bench_mft_extents(volume: &str) -> (ExtentsResult, std::time::Duration) {
 // ============================================================
 // Main
 // ============================================================
-fn main() {
+pub fn main_impl() {
     let args: Vec<String> = std::env::args().collect();
     let volume = args
         .iter()
@@ -1270,3 +1283,4 @@ fn main() {
     println!("  2) NtQueryDirectoryFile 按目录批量获取 size (已很快)");
     println!("  -> 一次扫描拿到完整元数据，无需 backfill");
 }
+} // mod windows_impl
