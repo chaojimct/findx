@@ -122,6 +122,7 @@ fn v6_delta_commit_meta_patch_and_reload() {
             size: Some(11),
             mtime: Some(1_000_000_000),
             ctime: None,
+            create_if_missing: None,
         })
         .unwrap();
     let batch = batch_of(&mut store);
@@ -246,6 +247,7 @@ fn v6_empty_commit_is_noop_and_crash_tail_tolerated() {
             size: Some(21),
             mtime: None,
             ctime: None,
+            create_if_missing: None,
         })
         .unwrap();
     let batch = batch_of(&mut store);
@@ -279,6 +281,7 @@ fn v6_corrupt_manifest_falls_back_to_v5_and_commit_heals() {
             size: Some(77),
             mtime: None,
             ctime: None,
+            create_if_missing: None,
         })
         .unwrap();
     let batch = CommitBatch {
@@ -316,6 +319,7 @@ fn v6_full_resync_falls_back_to_rewrite() {
             size: Some(99),
             mtime: None,
             ctime: None,
+            create_if_missing: None,
         })
         .unwrap();
     store.mark_full_resync();

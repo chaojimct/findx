@@ -731,6 +731,7 @@ fn create_pending_searchable_then_stat_refresh() {
             size: Some(4096),
             mtime: Some(findx2_core::index::unix_secs_to_filetime(1_700_000_000)),
             ctime: None,
+            create_if_missing: None,
         })
         .unwrap();
     }
@@ -741,6 +742,158 @@ fn create_pending_searchable_then_stat_refresh() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].name, "burst.tmp", "补 meta 不得改名");
     assert_eq!(hits[0].size, 4096);
+}
+
+/// Create 漏事件后，DataOrMeta + create_if_missing 应把未知 inode 补进索引。
+#[test]
+fn data_or_meta_create_if_missing_backfills_unknown_inode() {
+    use findx2_core::CreateIfMissing;
+    const ROOT: u64 = 7;
+    let dirs = vec![RawEntry {
+        file_id: ROOT,
+        file_id_128: None,
+        parent_id: 0,
+        name: "C:".into(),
+        size: 0,
+        mtime: 0,
+        ctime: 0,
+        attrs: 0x10,
+        is_dir: true,
+    }];
+    let store = IndexBuilder::new(b'C', 1, 1, 1)
+        .build_from_raw(vec![], dirs, true)
+        .unwrap();
+    let engine = SearchEngine::new(store);
+    {
+        let mut g = engine.index_store_mut();
+        // 无 create_if_missing：未知 inode 仍应被忽略
+        g.apply_change_event(&ChangeEvent::DataOrMeta {
+            file_id: 99,
+            size: Some(12),
+            mtime: None,
+            ctime: None,
+            create_if_missing: None,
+        })
+        .unwrap();
+        assert!(g.frn_to_entry.get(&99).is_none());
+        // 带 create_if_missing：应入库并可搜
+        g.apply_change_event(&ChangeEvent::DataOrMeta {
+            file_id: 99,
+            size: Some(12),
+            mtime: Some(findx2_core::index::unix_secs_to_filetime(1_700_000_000)),
+            ctime: None,
+            create_if_missing: Some(CreateIfMissing {
+                parent_id: ROOT,
+                name: "missed-create.txt".into(),
+                attrs: 0x20,
+                is_dir: false,
+            }),
+        })
+        .unwrap();
+        assert!(g.frn_to_entry.get(&99).is_some());
+    }
+    engine.note_external_mutation();
+    let pq = QueryParser::parse("missed-create").unwrap();
+    let (hits, total) = engine
+        .search(&pq, &SearchOptions::default())
+        .expect("search after backfill");
+    assert_eq!(total, 1);
+    assert_eq!(hits[0].name, "missed-create.txt");
+    assert_eq!(hits[0].size, 12);
+}
+
+/// delete 后同 inode 再 CreatePending（Linux 复用 inode）必须复活墓碑。
+#[test]
+fn create_pending_revives_deleted_inode_reuse() {
+    const ROOT: u64 = 9;
+    const FID: u64 = 777;
+    let dirs = vec![RawEntry {
+        file_id: ROOT,
+        file_id_128: None,
+        parent_id: 0,
+        name: "C:".into(),
+        size: 0,
+        mtime: 0,
+        ctime: 0,
+        attrs: 0x10,
+        is_dir: true,
+    }];
+    let store = IndexBuilder::new(b'C', 1, 1, 1)
+        .build_from_raw(vec![], dirs, true)
+        .unwrap();
+    let engine = SearchEngine::new(store);
+    {
+        let mut g = engine.index_store_mut();
+        g.apply_change_event(&ChangeEvent::CreatePending {
+            file_id: FID,
+            file_id_128: None,
+            parent_id: ROOT,
+            name: "reuse.txt".into(),
+            attrs: 0x20,
+            is_dir: false,
+        })
+        .unwrap();
+        g.apply_change_event(&ChangeEvent::Delete { file_id: FID })
+            .unwrap();
+        assert!(g.deleted.contains(*g.frn_to_entry.get(&FID).unwrap()));
+        g.apply_change_event(&ChangeEvent::CreatePending {
+            file_id: FID,
+            file_id_128: None,
+            parent_id: ROOT,
+            name: "reuse.txt".into(),
+            attrs: 0x20,
+            is_dir: false,
+        })
+        .unwrap();
+        let idx = *g.frn_to_entry.get(&FID).unwrap();
+        assert!(!g.deleted.contains(idx), "复用 inode 后墓碑应被清除");
+    }
+    engine.note_external_mutation();
+    let pq = QueryParser::parse("reuse").unwrap();
+    let (_, total) = engine.search(&pq, &SearchOptions::default()).unwrap();
+    assert_eq!(total, 1, "复活后应可搜");
+}
+
+/// 重复 CreatePending（同名同父）不得追加 names 膨胀。
+#[test]
+fn create_pending_same_name_skips_rename_bloat() {
+    const ROOT: u64 = 8;
+    let dirs = vec![RawEntry {
+        file_id: ROOT,
+        file_id_128: None,
+        parent_id: 0,
+        name: "C:".into(),
+        size: 0,
+        mtime: 0,
+        ctime: 0,
+        attrs: 0x10,
+        is_dir: true,
+    }];
+    let store = IndexBuilder::new(b'C', 1, 1, 1)
+        .build_from_raw(vec![], dirs, true)
+        .unwrap();
+    let engine = SearchEngine::new(store);
+    let ev = ChangeEvent::CreatePending {
+        file_id: 55,
+        file_id_128: None,
+        parent_id: ROOT,
+        name: "stable.txt".into(),
+        attrs: 0x20,
+        is_dir: false,
+    };
+    {
+        let mut g = engine.index_store_mut();
+        g.apply_change_event(&ev).unwrap();
+        let names_len_after_first = g.names_buf.len();
+        for _ in 0..20 {
+            g.apply_change_event(&ev).unwrap();
+        }
+        assert_eq!(
+            g.names_buf.len(),
+            names_len_after_first,
+            "同名同父重复 CreatePending 不应追加 names"
+        );
+    }
 }
 
 #[test]

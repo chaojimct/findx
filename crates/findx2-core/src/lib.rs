@@ -45,7 +45,7 @@ pub use index::{
     merge_index_stores, normalize_excluded_dir, FileEntry, IndexBuilder, IndexStore, Mutation,
     VolumeState,
 };
-pub use platform::{ChangeEvent, ChangeWatcher, RawEntry, VolumeScanner, WatchCursor};
+pub use platform::{ChangeEvent, ChangeWatcher, CreateIfMissing, RawEntry, VolumeScanner, WatchCursor};
 pub use query::{ParsedQuery, QueryParser, SortField};
 pub use search::{BackfillProgress, SearchEngine, SearchHit, SearchOptions};
 pub use trigram::{

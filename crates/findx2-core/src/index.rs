@@ -1560,9 +1560,40 @@ impl IndexStore {
                     return Ok(());
                 }
                 if self.frn_to_entry.contains_key(file_id) {
-                    // 已有条目（迟到的 RENAME_NEW_NAME / 重复 CREATE）：只搬名字/父链，
+                    // Linux 上 delete+recreate 常复用同一 inode：墓碑条目必须复活，
+                    // 否则 apply_rename_mapped 对 deleted 直接 return，文件会永久搜不到。
+                    if let Some(&idx) = self.frn_to_entry.get(file_id) {
+                        if self.deleted.contains(idx) {
+                            let raw = RawEntry {
+                                file_id: *file_id,
+                                file_id_128: *file_id_128,
+                                parent_id: *parent_id,
+                                name: name.clone(),
+                                size: 0,
+                                mtime: 0,
+                                ctime: 0,
+                                attrs: *attrs,
+                                is_dir: *is_dir,
+                            };
+                            self.upsert_raw_entry(&raw)?;
+                            return Ok(());
+                        }
+                    }
+                    // 已有存活条目（迟到的 RENAME_NEW_NAME / 重复 CREATE）：只搬名字/父链，
                     // 保留已有 size/mtime/ctime，再把 attrs 同步到最新。
-                    self.apply_rename_mapped(*file_id, *parent_id, name)?;
+                    // 追赶扫描 / 重复 Create 时若父链与名字未变，跳过 rename，避免 names 膨胀。
+                    let skip_rename = if let Some(&idx) = self.frn_to_entry.get(file_id) {
+                        let e = &self.entries[idx as usize];
+                        let parent_dir = self.dir_index.get(parent_id).copied().unwrap_or(0);
+                        let same_parent = e.dir_idx == parent_dir;
+                        let same_name = self.name_bytes(e) == name.as_bytes();
+                        same_parent && same_name
+                    } else {
+                        false
+                    };
+                    if !skip_rename {
+                        self.apply_rename_mapped(*file_id, *parent_id, name)?;
+                    }
                     if let Some(&idx) = self.frn_to_entry.get(file_id) {
                         if !self.deleted.contains(idx) {
                             if let Some(e) = self.entries.get_mut(idx as usize) {
@@ -1612,8 +1643,42 @@ impl IndexStore {
                 size,
                 mtime,
                 ctime,
+                create_if_missing,
             } => {
+                let missing_or_tomb = match self.frn_to_entry.get(file_id) {
+                    None => true,
+                    Some(&idx) => self.deleted.contains(idx),
+                };
+                if missing_or_tomb {
+                    if let Some(c) = create_if_missing {
+                        if !self.excluded_for_raw(c.parent_id, &c.name) {
+                            let raw = RawEntry {
+                                file_id: *file_id,
+                                file_id_128: None,
+                                parent_id: c.parent_id,
+                                name: c.name.clone(),
+                                size: size.unwrap_or(0),
+                                mtime: mtime.unwrap_or(0),
+                                ctime: ctime.unwrap_or(0),
+                                attrs: c.attrs,
+                                is_dir: c.is_dir,
+                            };
+                            self.upsert_raw_entry(&raw)?;
+                        }
+                    }
+                    // 无回填信息或被排除：保持旧语义（静默忽略未知/墓碑 inode）。
+                    let still_bad = match self.frn_to_entry.get(file_id) {
+                        None => true,
+                        Some(&idx) => self.deleted.contains(idx),
+                    };
+                    if still_bad {
+                        return Ok(());
+                    }
+                }
                 if let Some(&idx) = self.frn_to_entry.get(file_id) {
+                    if self.deleted.contains(idx) {
+                        return Ok(());
+                    }
                     if let Some(e) = self.entries.get_mut(idx as usize) {
                         if let Some(s) = size {
                             e.size = *s;
@@ -1682,44 +1747,63 @@ impl IndexStore {
         if self.volumes.is_empty() {
             return None;
         }
-        
-        // 沿父链向上查找，直到找到某个目录属于某个卷的 first_entry_idx 范围
+
+        // 沿父链向上：只接受落在「本卷起点 → 下一卷起点」半开区间内的目录。
+        // 最后一卷之后追加的增量条目（含新建子目录）若用旧逻辑会被当成最后一卷，
+        // 导致 /home/box 下新建目录路径变成 /workspace/... 。
         let mut visited = 0usize;
         let safety_limit = self.dirs.len() + 1;
-        
+
         loop {
             visited += 1;
             if visited > safety_limit {
-                // 防止死循环，回退到按 idx 查找
                 return self.volume_for_entry(dir_idx as usize);
             }
-            
+
             let d = self.dirs.get(dir_idx as usize)?;
-            let dir_frn = d.frn;
-            
-            // 检查该目录的 frn 是否在 frn_to_entry 中，且在某个卷的范围内
-            if let Some(&entry_idx) = self.frn_to_entry.get(&dir_frn) {
-                // 尝试按 first_entry_idx 范围判断
-                for v in &self.volumes {
-                    if entry_idx >= v.first_entry_idx {
-                        // 检查下一个卷（如果有）是否更合适
-                        let is_best = self.volumes.iter()
-                            .filter(|nv| nv.first_entry_idx > v.first_entry_idx)
-                            .all(|nv| entry_idx < nv.first_entry_idx);
-                        if is_best {
-                            return Some(v);
-                        }
-                    }
+
+            if let Some(&entry_idx) = self.frn_to_entry.get(&d.frn) {
+                if let Some(v) = self.volume_for_entry_in_scan_segment(entry_idx) {
+                    return Some(v);
                 }
             }
-            
-            // 到达根目录（parent_idx == 0），选择第一个卷
-            if d.parent_idx == 0 {
+
+            // 到达卷根：根目录本身是建库时的条目，volume_for_entry 可靠。
+            if d.parent_idx == 0 || d.parent_idx == dir_idx {
+                if let Some(&entry_idx) = self.frn_to_entry.get(&d.frn) {
+                    return self.volume_for_entry(entry_idx as usize);
+                }
                 return self.volumes.first();
             }
-            
+
             dir_idx = d.parent_idx;
         }
+    }
+
+    /// 仅当 `entry_idx` 落在某卷的扫描段 `[first, next_first)` 时返回该卷。
+    /// 最后一卷没有 next_first：不在这里匹配（避免把增量条目误判进最后一卷），
+    /// 由调用方继续沿父链走到卷根再用 [`Self::volume_for_entry`]。
+    fn volume_for_entry_in_scan_segment(&self, entry_idx: u32) -> Option<&VolumeState> {
+        if self.volumes.is_empty() {
+            return None;
+        }
+        let mut order: Vec<usize> = (0..self.volumes.len()).collect();
+        order.sort_by_key(|&i| self.volumes[i].first_entry_idx);
+        for (pos, &vi) in order.iter().enumerate() {
+            let start = self.volumes[vi].first_entry_idx;
+            let end = order
+                .get(pos + 1)
+                .map(|&ni| self.volumes[ni].first_entry_idx);
+            match end {
+                Some(end) if entry_idx >= start && entry_idx < end => {
+                    return self.volumes.get(vi);
+                }
+                // 最后一段：跳过，迫使向上走到卷根
+                None => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     /// 按 `VolumeState.first_entry_idx` 段选择盘符（多卷合并索引）。

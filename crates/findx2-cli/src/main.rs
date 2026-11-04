@@ -601,6 +601,7 @@ fn sync_fetch_one(
             size: Some(size),
             mtime: Some(mt),
             ctime: Some(ct),
+            create_if_missing: None,
         });
     }
 }

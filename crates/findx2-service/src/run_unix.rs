@@ -150,14 +150,26 @@ pub(crate) fn run_foreground(
     let mut last_save = Instant::now();
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(ev) => {
-                if matches!(&ev, ChangeEvent::CreatePending { .. } | ChangeEvent::Create { .. } | ChangeEvent::Delete { .. } | ChangeEvent::Rename { .. } | ChangeEvent::DataOrMeta { .. })
-                {
-                    let mut g = engine.index_store_mut();
-                    if let Err(e) = g.apply_change_event(&ev) {
-                        warn!("应用增量失败: {e}");
+            Ok(first) => {
+                // 尽量排空通道，一批一把写锁，避免突发 Create 时每条事件各抢一次锁。
+                let mut batch = vec![first];
+                while let Ok(ev) = rx.try_recv() {
+                    batch.push(ev);
+                    if batch.len() >= 512 {
+                        break;
                     }
                 }
+                {
+                    let mut g = engine.index_store_mut();
+                    for ev in &batch {
+                        if let Err(e) = g.apply_change_event(ev) {
+                            warn!("应用增量失败: {e}");
+                        }
+                    }
+                }
+                // 直接改 store 绕过 engine 写入方法：推进 revision，使分页缓存失效。
+                // 漏 bump 时 GUI 反复搜同一词会一直命中旧页缓存，表现为「新建文件搜不到」。
+                engine.note_external_mutation();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 #[cfg(target_os = "linux")]

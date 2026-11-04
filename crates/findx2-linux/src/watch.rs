@@ -196,6 +196,12 @@ fn event_from_fd(fd: i32, mask: u64) -> Option<ChangeEvent> {
         size: Some(st.st_size as u64),
         mtime: Some(unix_secs_to_filetime(st.st_mtime.max(0) as u32)),
         ctime: Some(unix_secs_to_filetime(st.st_ctime.max(0) as u32)),
+        create_if_missing: Some(findx2_core::CreateIfMissing {
+            parent_id: parent,
+            name,
+            attrs: if is_dir { 0x10 } else { 0 },
+            is_dir,
+        }),
     })
 }
 
@@ -215,6 +221,7 @@ fn watch_inotify(roots: &[String], tx: Sender<ChangeEvent>) -> Result<()> {
     let tx2 = tx.clone();
     let cache: PathInodeCache = Arc::new(Mutex::new(HashMap::new()));
     let cache2 = cache.clone();
+    let roots_owned: Vec<String> = roots.to_vec();
     let mut watcher = RecommendedWatcher::new(
         move |res: notify::Result<notify::Event>| {
             if stop2.load(Ordering::Relaxed) {
@@ -223,9 +230,40 @@ fn watch_inotify(roots: &[String], tx: Sender<ChangeEvent>) -> Result<()> {
             let Ok(ev) = res else {
                 return;
             };
-            for path in ev.paths {
-                if let Some(ce) = notify_to_change(&path, ev.kind, &cache2) {
+            // inotify 队列溢出：后台追赶，避免在 notify 回调里同步扫大树再次撑爆队列。
+            if ev.need_rescan() {
+                set_watch_note(
+                    "inotify 队列溢出，已对监听根做追赶扫描（仍非 fanotify 整盘实时）",
+                );
+                let tx3 = tx2.clone();
+                let cache3 = cache2.clone();
+                let roots3 = roots_owned.clone();
+                let _ = std::thread::Builder::new()
+                    .name("findx2-inotify-catchup".into())
+                    .spawn(move || {
+                        for r in &roots3 {
+                            catch_up_tree(Path::new(r), &tx3, &cache3);
+                        }
+                    });
+                return;
+            }
+            for path in &ev.paths {
+                for ce in notify_to_changes(path, ev.kind, &cache2) {
                     let _ = tx2.send(ce);
+                }
+                // 新目录：watch 注册存在经典竞态。立即追赶 + 短延迟再追赶一次，
+                // 覆盖「mkdir 后立刻往里写文件」窗口；已存在条目走 CreatePending 快路径。
+                if matches!(ev.kind, EventKind::Create(notify::event::CreateKind::Folder)) {
+                    catch_up_tree(path, &tx2, &cache2);
+                    let path_delayed = path.clone();
+                    let tx_d = tx2.clone();
+                    let cache_d = cache2.clone();
+                    let _ = std::thread::Builder::new()
+                        .name("findx2-dir-catchup".into())
+                        .spawn(move || {
+                            std::thread::sleep(Duration::from_millis(150));
+                            catch_up_tree(&path_delayed, &tx_d, &cache_d);
+                        });
                 }
             }
         },
@@ -246,80 +284,184 @@ fn watch_inotify(roots: &[String], tx: Sender<ChangeEvent>) -> Result<()> {
     Ok(())
 }
 
-fn notify_to_change(path: &PathBuf, kind: EventKind, cache: &PathInodeCache) -> Option<ChangeEvent> {
-use notify::event::{ModifyKind, RemoveKind, RenameMode};
-    let name = path.file_name()?.to_string_lossy().into_owned();
+fn cache_insert(cache: &PathInodeCache, path: &Path, ino: u64) {
+    if let Ok(mut map) = cache.lock() {
+        map.insert(path.to_path_buf(), ino);
+        if map.len() > 100_000 {
+            let keys: Vec<_> = map.keys().take(50_000).cloned().collect();
+            for k in keys {
+                map.remove(&k);
+            }
+        }
+    }
+}
+
+fn notify_to_changes(path: &Path, kind: EventKind, cache: &PathInodeCache) -> Vec<ChangeEvent> {
+    use notify::event::{AccessKind, AccessMode, ModifyKind, RemoveKind, RenameMode};
+    let Some(name_os) = path.file_name() else {
+        return Vec::new();
+    };
+    let name = name_os.to_string_lossy().into_owned();
     if crate::scan::should_skip_name(&name) {
-        return None;
+        return Vec::new();
     }
     match kind {
         EventKind::Remove(RemoveKind::Any | RemoveKind::File | RemoveKind::Folder) => {
-            // 先尝试从缓存中获取 inode（文件可能已被删除）
             let ino = if let Ok(mut map) = cache.lock() {
                 map.remove(path).or_else(|| path_ino(path))
             } else {
                 path_ino(path)
             };
-            
             ino.map(|file_id| ChangeEvent::Delete { file_id })
+                .into_iter()
+                .collect()
+        }
+        // 移出监视树：路径已不存在，按删除处理。
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+            let ino = if let Ok(mut map) = cache.lock() {
+                map.remove(path).or_else(|| path_ino(path))
+            } else {
+                path_ino(path)
+            };
+            ino.map(|file_id| ChangeEvent::Delete { file_id })
+                .into_iter()
+                .collect()
         }
         EventKind::Create(_) => {
-            let ev = meta_create(path, name);
-            // 缓存新创建文件的 inode
-            if let Some(ChangeEvent::CreatePending { file_id, .. }) = &ev {
-                if let Ok(mut map) = cache.lock() {
-                    map.insert(path.clone(), *file_id);
-                    // 限制缓存大小，避免内存泄漏
-                    if map.len() > 100_000 {
-                        // 清理一半的条目（简单策略）
-                        let keys: Vec<_> = map.keys().take(50_000).cloned().collect();
-                        for k in keys {
-                            map.remove(&k);
-                        }
-                    }
+            let mut out = Vec::new();
+            if let Some(ev) = meta_create_retry(path, name) {
+                if let ChangeEvent::CreatePending { file_id, .. } = &ev {
+                    cache_insert(cache, path, *file_id);
                 }
+                out.push(ev);
             }
-            ev
+            out
         }
         EventKind::Modify(ModifyKind::Name(RenameMode::To | RenameMode::Both | RenameMode::Any)) => {
-            let ev = meta_rename(path, name);
-            // 更新缓存（文件被重命名到新路径）
-            if let Some(ChangeEvent::Rename { file_id, .. }) = &ev {
-                if let Ok(mut map) = cache.lock() {
-                    map.insert(path.clone(), *file_id);
+            let mut out = Vec::new();
+            if let Some(ev) = meta_rename(path, name.clone()) {
+                if let ChangeEvent::Rename { file_id, .. } = &ev {
+                    cache_insert(cache, path, *file_id);
                 }
+                out.push(ev);
+            } else if let Some(ev) = meta_create_retry(path, name.clone()) {
+                // rename-to 时若尚未在索引中，按创建补齐（跨监视树移入）。
+                if let ChangeEvent::CreatePending { file_id, .. } = &ev {
+                    cache_insert(cache, path, *file_id);
+                }
+                out.push(ev);
             }
-            ev
+            out
         }
-        EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_)) => {
-            let meta = std::fs::symlink_metadata(path).ok()?;
-            let ino = meta.ino();
-            // 更新缓存
-            if let Ok(mut map) = cache.lock() {
-                map.insert(path.clone(), ino);
+        EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_))
+        | EventKind::Access(AccessKind::Close(AccessMode::Write)) => {
+            // Modify / CloseWrite：带 create_if_missing，Create 漏事件时可回填。
+            match data_or_meta_with_backfill(path, name) {
+                Some(ev) => {
+                    if let ChangeEvent::DataOrMeta { file_id, .. } = &ev {
+                        cache_insert(cache, path, *file_id);
+                    }
+                    vec![ev]
+                }
+                None => Vec::new(),
             }
-            Some(ChangeEvent::DataOrMeta {
-                file_id: ino,
-                size: Some(meta.len()),
-                mtime: Some(unix_secs_to_filetime(meta.mtime().max(0) as u32)),
-                ctime: Some(unix_secs_to_filetime(meta.ctime().max(0) as u32)),
-            })
         }
+        EventKind::Access(_) => Vec::new(), // OPEN / Close(Read) 不处理，避免噪音
         _ => {
-            let ev = meta_create(path, name);
-            // 缓存 inode
-            if let Some(ChangeEvent::CreatePending { file_id, .. }) = &ev {
-                if let Ok(mut map) = cache.lock() {
-                    map.insert(path.clone(), *file_id);
+            let mut out = Vec::new();
+            if let Some(ev) = meta_create_retry(path, name) {
+                if let ChangeEvent::CreatePending { file_id, .. } = &ev {
+                    cache_insert(cache, path, *file_id);
                 }
+                out.push(ev);
             }
-            ev
+            out
+        }
+    }
+}
+
+fn data_or_meta_with_backfill(path: &Path, name: String) -> Option<ChangeEvent> {
+    use findx2_core::CreateIfMissing;
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    let parent = path
+        .parent()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.ino())
+        .unwrap_or(0);
+    let is_dir = meta.is_dir();
+    Some(ChangeEvent::DataOrMeta {
+        file_id: meta.ino(),
+        size: Some(meta.len()),
+        mtime: Some(unix_secs_to_filetime(meta.mtime().max(0) as u32)),
+        ctime: Some(unix_secs_to_filetime(meta.ctime().max(0) as u32)),
+        create_if_missing: Some(CreateIfMissing {
+            parent_id: parent,
+            name,
+            attrs: if is_dir { 0x10 } else { 0 },
+            is_dir,
+        }),
+    })
+}
+
+/// 新目录创建后、或 inotify 溢出时：遍历目录树，用 CreatePending 补漏（已存在条目走快路径）。
+fn catch_up_tree(dir: &Path, tx: &Sender<ChangeEvent>, cache: &PathInodeCache) {
+    let mut stack = vec![dir.to_path_buf()];
+    let mut seen = 0usize;
+    const MAX_CATCH_UP: usize = 50_000;
+    while let Some(cur) = stack.pop() {
+        let rd = match std::fs::read_dir(&cur) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for ent in rd.flatten() {
+            if seen >= MAX_CATCH_UP {
+                set_watch_note(format!(
+                    "inotify 追赶扫描达到上限 {MAX_CATCH_UP}，可能仍有遗漏"
+                ));
+                return;
+            }
+            let path = ent.path();
+            let name = ent.file_name().to_string_lossy().into_owned();
+            if crate::scan::should_skip_name(&name) {
+                continue;
+            }
+            let ft = match ent.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            if let Some(ev) = meta_create(&path, name) {
+                if let ChangeEvent::CreatePending { file_id, .. } = &ev {
+                    cache_insert(cache, &path, *file_id);
+                }
+                let _ = tx.send(ev);
+                seen += 1;
+            }
+            if ft.is_dir() {
+                stack.push(path);
+            }
         }
     }
 }
 
 fn path_ino(path: &Path) -> Option<u64> {
     std::fs::symlink_metadata(path).ok().map(|m| m.ino())
+}
+
+fn meta_create_retry(path: &Path, name: String) -> Option<ChangeEvent> {
+    // 短暂竞态：CREATE 到达时偶发 stat 失败，短重试。
+    for attempt in 0..3u32 {
+        if let Some(ev) = meta_create(path, name.clone()) {
+            return Some(ev);
+        }
+        if attempt + 1 < 3 {
+            std::thread::sleep(Duration::from_millis(1 << attempt));
+        }
+    }
+    None
 }
 
 fn meta_create(path: &Path, name: String) -> Option<ChangeEvent> {

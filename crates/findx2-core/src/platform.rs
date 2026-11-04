@@ -45,13 +45,25 @@ pub enum ChangeEvent {
         new_parent_id: u64,
         new_name: String,
     },
-    /// 文件大小或时间变化
+    /// 文件大小或时间变化。
+    /// `create_if_missing`：索引中尚无此 file_id 时，用父链/名字补建条目
+    ///（Linux inotify 降级路径上 Create 漏事件后，靠 Modify/CloseWrite 回填）。
     DataOrMeta {
         file_id: u64,
         size: Option<u64>,
         mtime: Option<u64>,
         ctime: Option<u64>,
+        create_if_missing: Option<CreateIfMissing>,
     },
+}
+
+/// `DataOrMeta` 回填建条目所需的最小身份信息（仅在索引缺失该 file_id 时使用）。
+#[derive(Debug, Clone)]
+pub struct CreateIfMissing {
+    pub parent_id: u64,
+    pub name: String,
+    pub attrs: u32,
+    pub is_dir: bool,
 }
 
 /// 增量游标：Windows 为 JournalId + NextUsn；macOS 为 FSEvents 世代 + eventId；
