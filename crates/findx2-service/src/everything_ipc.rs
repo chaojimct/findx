@@ -708,7 +708,7 @@ fn spawn_copydata_reply(reply_hwnd: HWND, my_hwnd: HWND, reply_msg: u32, buf: Ve
             let _ = SendMessageW(
                 reply_hwnd,
                 WM_COPYDATA,
-                WPARAM(my_raw),
+                Some(WPARAM(my_raw)),
                 LPARAM(p as isize),
             );
         }
