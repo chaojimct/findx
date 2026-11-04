@@ -12,8 +12,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# 必须启用 custom-protocol：否�?tauri �?build.rs 会把 cfg(dev) 置为真，
-# 正式包仍会走 devUrl�?27.0.0.1:1420），未开 Vite �?ERR_CONNECTION_REFUSED�?
+# 必须启用 custom-protocol：否则 tauri 的 build.rs 会把 cfg(dev) 置为真，
+# 正式包仍会走 devUrl（127.0.0.1:1420），未开 Vite 即 ERR_CONNECTION_REFUSED。
 tauri = { version = "2", features = ["custom-protocol", "protocol-asset", "tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-global-shortcut = "2"
