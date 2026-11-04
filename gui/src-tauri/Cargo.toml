@@ -9,16 +9,16 @@ name = "findx2_gui_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "=2.7.4", features = [] }
 
 [dependencies]
 # 必须启用 custom-protocol：否则 tauri 的 build.rs 会把 cfg(dev) 置为真，
 # 正式包仍会走 devUrl（127.0.0.1:1420），未开 Vite 即 ERR_CONNECTION_REFUSED。
-tauri = { version = "2", features = ["custom-protocol", "protocol-asset", "tray-icon"] }
-tauri-plugin-opener = "2"
-tauri-plugin-global-shortcut = "2"
-tauri-plugin-single-instance = "2"
-tauri-plugin-window-state = "2"
+tauri = { version = "=2.12.4", features = ["custom-protocol", "protocol-asset", "tray-icon"] }
+tauri-plugin-opener = "=2.7.2"
+tauri-plugin-global-shortcut = "=2.4.1"
+tauri-plugin-single-instance = "=2.5.5"
+tauri-plugin-window-state = "=2.5.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 semver = "1"

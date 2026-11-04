@@ -20,15 +20,15 @@
     "@file-viewer/renderer-presentation": "^3.0.0",
     "@file-viewer/renderer-spreadsheet": "^3.0.0",
     "@file-viewer/renderer-word": "^3.0.0",
-    "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/api": "2.12.4",
+    "@tauri-apps/plugin-opener": "2.7.2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
     "@file-viewer/assets-standard": "^3.0.0",
     "@file-viewer/vite-plugin": "^3.0.0",
-    "@tauri-apps/cli": "^2",
+    "@tauri-apps/cli": "2.12.4",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
