@@ -734,6 +734,48 @@ impl IndexStore {
         out
     }
 
+    /// 沿 `parent_idx` 自底向上拼目录路径（**保留原始大小写**），不含盘符。
+    /// Unix 平台使用此方法构建显示路径，确保 Path::new(path).exists() 在大小写敏感的文件系统上返回 true。
+    fn build_dir_path_original_case(&self, dir_idx: u32) -> Vec<u8> {
+        let mut cur = dir_idx as usize;
+        if cur >= self.dirs.len() {
+            return Vec::new();
+        }
+        let mut parts: Vec<Vec<u8>> = Vec::new();
+        let mut safety = self.dirs.len().saturating_add(1);
+        while safety > 0 {
+            safety -= 1;
+            let d = &self.dirs[cur];
+            let end = d.name_offset as usize + d.name_len as usize;
+            let name_bs = self
+                .names_buf
+                .get(d.name_offset as usize..end)
+                .unwrap_or(&[]);
+            parts.push(name_bs.to_vec());
+            if d.parent_idx == 0 {
+                break;
+            }
+            cur = d.parent_idx as usize;
+            if cur >= self.dirs.len() {
+                break;
+            }
+        }
+        parts.reverse();
+        let mut out = Vec::new();
+        for (i, seg) in parts.iter().enumerate() {
+            if i == 0 {
+                if !seg.is_empty() {
+                    out.push(b'/');  // Unix 使用 /
+                    out.extend_from_slice(seg);
+                }
+            } else {
+                out.push(b'/');
+                out.extend_from_slice(seg);
+            }
+        }
+        out
+    }
+
     /// 从目录拓扑物化 `dir_paths_buf`（旧版索引迁移、或需反复路径过滤时可调用；日常与 Everything 一致可不物化）
     pub fn rebuild_dir_paths(&mut self) {
         self.dir_paths_buf.clear();
@@ -1598,6 +1640,9 @@ impl IndexStore {
     }
 
     /// 按 `VolumeState.first_entry_idx` 段选择卷（多卷合并索引）。
+    /// 
+    /// **注意：** 对于增量追加的条目，此方法可能不准确（会选到最后一个卷）。
+    /// 如需精确解析，请使用 `volume_for_entry_by_parent`。
     pub fn volume_for_entry(&self, idx: usize) -> Option<&VolumeState> {
         if self.volumes.is_empty() {
             return None;
@@ -1610,6 +1655,71 @@ impl IndexStore {
             }
         }
         self.volumes.get(chosen)
+    }
+
+    /// 从父目录查找条目所属的卷（适用于增量追加的条目）。
+    /// 
+    /// 增量 Create/CreatePending 追加的条目会超出原始 first_entry_idx 范围，
+    /// `volume_for_entry` 会错误地选择最后一个卷。此方法通过父目录的所属卷来推导。
+    fn volume_for_entry_by_parent(&self, idx: usize) -> Option<&VolumeState> {
+        let e = self.entries.get(idx)?;
+        
+        // 对于目录条目，从 frn 查找 dir_idx
+        if e.is_dir_entry() {
+            let fr = self.frns.get(idx).copied().unwrap_or(0);
+            if let Some(&di) = self.dir_index.get(&fr) {
+                // 递归查找该目录的祖先，直到找到根目录
+                return self.volume_for_dir_idx(di);
+            }
+        }
+        
+        // 对于文件条目，从 dir_idx 查找父目录
+        self.volume_for_dir_idx(e.dir_idx)
+    }
+
+    /// 从目录 idx 查找所属的卷（递归向上直到找到根目录或匹配的卷）
+    fn volume_for_dir_idx(&self, mut dir_idx: u32) -> Option<&VolumeState> {
+        if self.volumes.is_empty() {
+            return None;
+        }
+        
+        // 沿父链向上查找，直到找到某个目录属于某个卷的 first_entry_idx 范围
+        let mut visited = 0usize;
+        let safety_limit = self.dirs.len() + 1;
+        
+        loop {
+            visited += 1;
+            if visited > safety_limit {
+                // 防止死循环，回退到按 idx 查找
+                return self.volume_for_entry(dir_idx as usize);
+            }
+            
+            let d = self.dirs.get(dir_idx as usize)?;
+            let dir_frn = d.frn;
+            
+            // 检查该目录的 frn 是否在 frn_to_entry 中，且在某个卷的范围内
+            if let Some(&entry_idx) = self.frn_to_entry.get(&dir_frn) {
+                // 尝试按 first_entry_idx 范围判断
+                for v in &self.volumes {
+                    if entry_idx >= v.first_entry_idx {
+                        // 检查下一个卷（如果有）是否更合适
+                        let is_best = self.volumes.iter()
+                            .filter(|nv| nv.first_entry_idx > v.first_entry_idx)
+                            .all(|nv| entry_idx < nv.first_entry_idx);
+                        if is_best {
+                            return Some(v);
+                        }
+                    }
+                }
+            }
+            
+            // 到达根目录（parent_idx == 0），选择第一个卷
+            if d.parent_idx == 0 {
+                return self.volumes.first();
+            }
+            
+            dir_idx = d.parent_idx;
+        }
     }
 
     /// 按 `VolumeState.first_entry_idx` 段选择盘符（多卷合并索引）。
@@ -1627,7 +1737,9 @@ impl IndexStore {
 
     /// 条目完整小写路径（含卷前缀），供排除规则与 `path:` 过滤。
     pub fn entry_full_path_lower(&self, idx: usize) -> String {
-        let Some(vol) = self.volume_for_entry(idx) else {
+        // 对于增量追加的条目，使用基于父目录的卷查找
+        let Some(vol) = self.volume_for_entry_by_parent(idx)
+            .or_else(|| self.volume_for_entry(idx)) else {
             return String::new();
         };
         let Some(e) = self.entries.get(idx) else {
@@ -1655,9 +1767,17 @@ impl IndexStore {
 
     /// 重建 `C:\path\file` 或 Unix `/prefix/path/file` 显示路径
     pub fn entry_display_path(&self, idx: usize) -> crate::Result<String> {
-        let vol = self.volume_for_entry(idx);
+        // 对于增量追加的条目，使用基于父目录的卷查找
+        let vol = self.volume_for_entry_by_parent(idx)
+            .or_else(|| self.volume_for_entry(idx));
         let unix = vol.map(|v| v.is_unix()).unwrap_or(false);
-        let letter = self.volume_letter_for_entry(idx);
+        let letter = vol.map(|v| {
+            if v.volume_letter == 0 {
+                'C'
+            } else {
+                (v.volume_letter as char).to_ascii_uppercase()
+            }
+        }).unwrap_or('C');
         let e = self
             .entries
             .get(idx)
@@ -1668,19 +1788,23 @@ impl IndexStore {
             if e.is_dir_entry() {
                 let fr = self.frns.get(idx).copied().unwrap_or(0);
                 if let Some(&di) = self.dir_index.get(&fr) {
-                    let pbytes = self.resolve_dir_path_lower(di);
+                    // Unix 使用保留原始大小写的路径
+                    let pbytes = self.build_dir_path_original_case(di);
                     if !pbytes.is_empty() {
-                        let p = std::str::from_utf8(pbytes.as_ref())?.replace('\\', "/");
+                        let p = std::str::from_utf8(&pbytes)
+                            .unwrap_or("")
+                            .replace('\\', "/");
                         return Ok(join_unix_prefix(prefix, &p));
                     }
                 }
                 return Ok(join_unix_prefix(prefix, &name));
             }
-            let pbytes = self.resolve_dir_path_lower(e.dir_idx);
+            // Unix 文件：使用保留原始大小写的目录路径
+            let pbytes = self.build_dir_path_original_case(e.dir_idx);
             let dir = if pbytes.is_empty() {
                 join_unix_prefix(prefix, "")
             } else {
-                join_unix_prefix(prefix, &std::str::from_utf8(pbytes.as_ref())?.replace('\\', "/"))
+                join_unix_prefix(prefix, std::str::from_utf8(&pbytes).unwrap_or(""))
             };
             if dir.ends_with('/') {
                 Ok(format!("{dir}{name}"))

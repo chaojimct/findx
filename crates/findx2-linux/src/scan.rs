@@ -415,9 +415,14 @@ fn open_child_dir(dirfd: i32, name: &str, root_dev: u64) -> Option<DirJob> {
 }
 
 pub fn volume_id_for_path(path: &str) -> String {
-    fs::metadata(path)
-        .map(|m| format!("dev:{}", m.dev()))
-        .unwrap_or_else(|_| path.to_string())
+    let canonical = std::fs::canonicalize(path)
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| path.to_string());
+    
+    fs::metadata(&canonical)
+        .map(|m| format!("dev:{}:{}", m.dev(), canonical))
+        .unwrap_or_else(|_| canonical)
 }
 
 pub fn display_root_prefix(scan_root: &str) -> String {

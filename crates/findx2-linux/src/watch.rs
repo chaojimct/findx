@@ -1,6 +1,7 @@
 //! Linux 增量：有特权走 fanotify（整挂载），否则 `notify`/inotify 盯用户选定根。
 //! 无持久 journal；进程重启会漏事件，启动时应做一次短窗口追赶或接受短暂不一致。
 
+use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -205,10 +206,15 @@ fn readlink_fd(fd: i32) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// 路径到 inode 的缓存，用于在删除事件时查找已删除文件的 inode
+type PathInodeCache = Arc<Mutex<HashMap<PathBuf, u64>>>;
+
 fn watch_inotify(roots: &[String], tx: Sender<ChangeEvent>) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
     let tx2 = tx.clone();
+    let cache: PathInodeCache = Arc::new(Mutex::new(HashMap::new()));
+    let cache2 = cache.clone();
     let mut watcher = RecommendedWatcher::new(
         move |res: notify::Result<notify::Event>| {
             if stop2.load(Ordering::Relaxed) {
@@ -218,7 +224,7 @@ fn watch_inotify(roots: &[String], tx: Sender<ChangeEvent>) -> Result<()> {
                 return;
             };
             for path in ev.paths {
-                if let Some(ce) = notify_to_change(&path, ev.kind) {
+                if let Some(ce) = notify_to_change(&path, ev.kind, &cache2) {
                     let _ = tx2.send(ce);
                 }
             }
@@ -240,7 +246,7 @@ fn watch_inotify(roots: &[String], tx: Sender<ChangeEvent>) -> Result<()> {
     Ok(())
 }
 
-fn notify_to_change(path: &PathBuf, kind: EventKind) -> Option<ChangeEvent> {
+fn notify_to_change(path: &PathBuf, kind: EventKind, cache: &PathInodeCache) -> Option<ChangeEvent> {
 use notify::event::{ModifyKind, RemoveKind, RenameMode};
     let name = path.file_name()?.to_string_lossy().into_owned();
     if crate::scan::should_skip_name(&name) {
@@ -248,23 +254,67 @@ use notify::event::{ModifyKind, RemoveKind, RenameMode};
     }
     match kind {
         EventKind::Remove(RemoveKind::Any | RemoveKind::File | RemoveKind::Folder) => {
-            let ino = path_ino(path)?;
-            Some(ChangeEvent::Delete { file_id: ino })
+            // 先尝试从缓存中获取 inode（文件可能已被删除）
+            let ino = if let Ok(mut map) = cache.lock() {
+                map.remove(path).or_else(|| path_ino(path))
+            } else {
+                path_ino(path)
+            };
+            
+            ino.map(|file_id| ChangeEvent::Delete { file_id })
         }
-        EventKind::Create(_) => meta_create(path, name),
+        EventKind::Create(_) => {
+            let ev = meta_create(path, name);
+            // 缓存新创建文件的 inode
+            if let Some(ChangeEvent::CreatePending { file_id, .. }) = &ev {
+                if let Ok(mut map) = cache.lock() {
+                    map.insert(path.clone(), *file_id);
+                    // 限制缓存大小，避免内存泄漏
+                    if map.len() > 100_000 {
+                        // 清理一半的条目（简单策略）
+                        let keys: Vec<_> = map.keys().take(50_000).cloned().collect();
+                        for k in keys {
+                            map.remove(&k);
+                        }
+                    }
+                }
+            }
+            ev
+        }
         EventKind::Modify(ModifyKind::Name(RenameMode::To | RenameMode::Both | RenameMode::Any)) => {
-            meta_rename(path, name)
+            let ev = meta_rename(path, name);
+            // 更新缓存（文件被重命名到新路径）
+            if let Some(ChangeEvent::Rename { file_id, .. }) = &ev {
+                if let Ok(mut map) = cache.lock() {
+                    map.insert(path.clone(), *file_id);
+                }
+            }
+            ev
         }
         EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_)) => {
             let meta = std::fs::symlink_metadata(path).ok()?;
+            let ino = meta.ino();
+            // 更新缓存
+            if let Ok(mut map) = cache.lock() {
+                map.insert(path.clone(), ino);
+            }
             Some(ChangeEvent::DataOrMeta {
-                file_id: meta.ino(),
+                file_id: ino,
                 size: Some(meta.len()),
                 mtime: Some(unix_secs_to_filetime(meta.mtime().max(0) as u32)),
                 ctime: Some(unix_secs_to_filetime(meta.ctime().max(0) as u32)),
             })
         }
-        _ => meta_create(path, name),
+        _ => {
+            let ev = meta_create(path, name);
+            // 缓存 inode
+            if let Some(ChangeEvent::CreatePending { file_id, .. }) = &ev {
+                if let Ok(mut map) = cache.lock() {
+                    map.insert(path.clone(), *file_id);
+                }
+            }
+            ev
+        }
     }
 }
 
