@@ -31,7 +31,7 @@ findx2-linux = { path = "../findx2-linux" }
 [target.'cfg(windows)'.dependencies]
 findx2-windows = { path = "../findx2-windows" }
 windows-service = "0.7"
-windows = { version = "0.61", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
