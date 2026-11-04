@@ -162,9 +162,9 @@ unsafe fn message_loop() -> windows::core::Result<()> {
         0,
         0,
         0,
-        HWND::default(),
+        Some(HWND::default()),
         None,
-        hi,
+        Some(hi),
         None,
     )
     .unwrap_or_default();
@@ -188,9 +188,9 @@ unsafe fn message_loop() -> windows::core::Result<()> {
             0,
             0,
             0,
-            HWND::default(),
+            Some(HWND::default()),
             None,
-            hi,
+            Some(hi),
             None,
         )
         .unwrap_or_default();
