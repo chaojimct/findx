@@ -56,7 +56,7 @@ mod imp {
         }?;
         if h.is_invalid() {
             let _ = unsafe { CloseHandle(h) };
-            return Err(windows::core::Error::from_win32());
+            return Err(windows::core::Error::last());
         }
 
         let result = (|| -> windows::core::Result<(usize, HashMap<u64, (u64, u64, u64)>)> {
@@ -110,7 +110,7 @@ mod imp {
                 }
                 if bytes_read < 42 {
                     let _ = unsafe { CloseHandle(h) };
-                    return Err(windows::core::Error::from_win32());
+                    return Err(windows::core::Error::last());
                 }
                 let rec_alloc =
                     u32::from_le_bytes(probe[0x1C..0x20].try_into().unwrap()) as usize;

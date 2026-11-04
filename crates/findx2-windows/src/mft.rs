@@ -504,7 +504,7 @@ mod imp {
                 )
             };
             if let Err(e) = ok {
-                if e.code() == HRESULT::from_win32(ERROR_HANDLE_EOF.0) {
+                if e.code() == ERROR_HANDLE_EOF.to_hresult() {
                     break;
                 }
                 return Err(findx2_core::Error::Platform(format!(
