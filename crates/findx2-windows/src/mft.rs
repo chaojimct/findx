@@ -10,7 +10,7 @@ mod imp {
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
     use walkdir::WalkDir;
-    use windows::core::{HRESULT, PCWSTR};
+    use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, ERROR_HANDLE_EOF, GENERIC_READ, GENERIC_WRITE, HANDLE};
     use windows::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CreateFileW, ExtendedFileIdType, FileIdType,

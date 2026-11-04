@@ -148,7 +148,7 @@ unsafe fn message_loop() -> windows::core::Result<()> {
         ..Default::default()
     };
     if RegisterClassExW(&wc_ipc) == 0 {
-        let err = windows::core::Error::last();
+        let err = windows::core::Error::from_thread();
         error!("RegisterClassEx EVERYTHING_TASKBAR_NOTIFICATION 失败: {err}");
         return Err(err);
     }
@@ -205,7 +205,7 @@ unsafe fn message_loop() -> windows::core::Result<()> {
 
     if hwnd.is_invalid() && hwnd_alt.is_invalid() {
         error!("Everything IPC：窗口创建失败");
-        return Err(windows::core::Error::last());
+        return Err(windows::core::Error::from_thread());
     }
 
     info!("Everything IPC 兼容层已启动");
