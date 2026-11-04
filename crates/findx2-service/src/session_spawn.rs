@@ -109,7 +109,7 @@ unsafe fn create_process_in_session(
     let created = CreateProcessAsUserW(
         Some(primary),
         PCWSTR(exe_w.as_ptr()),
-        PWSTR(cmd_w.as_mut_ptr()),
+        Some(PWSTR(cmd_w.as_mut_ptr())),
         None,
         None,
         false,

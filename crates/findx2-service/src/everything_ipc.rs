@@ -709,7 +709,7 @@ fn spawn_copydata_reply(reply_hwnd: HWND, my_hwnd: HWND, reply_msg: u32, buf: Ve
                 reply_hwnd,
                 WM_COPYDATA,
                 Some(WPARAM(my_raw)),
-                LPARAM(p as isize),
+                Some(LPARAM(p as isize)),
             );
         }
     });
