@@ -299,6 +299,7 @@ fn path_to_event(path: &str, flags: u32) -> Option<ChangeEvent> {
             size: Some(size),
             mtime: Some(mtime),
             ctime: Some(ctime),
+            create_if_missing: None,
         });
     }
     let _ = ITEM_IS_DIR;
