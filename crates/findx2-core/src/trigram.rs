@@ -241,7 +241,7 @@ impl TrigramIndex {
         if blobs.len() != blobs_len {
             return Ok(None);
         }
-        if !(table_region.as_ptr() as usize).is_multiple_of(std::mem::align_of::<TriRec>()) {
+        if (table_region.as_ptr() as usize) % std::mem::align_of::<TriRec>() != 0 {
             // mmap 基址按页对齐，头部 24B + 12B 记录恒 4 对齐；此分支实际不可达，防御性保留。
             return Ok(None);
         }

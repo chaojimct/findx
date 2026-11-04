@@ -636,7 +636,7 @@ pub fn load_index_bin_with_progress(
             // 同 bulk_copy_or_parse_v5：section 起点偏移由前面各段长度累加决定，
             // 不保证 8 对齐，未对齐的 memcpy 是 UB，必须先验再拷。
             let src_aligned =
-                (section.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u64>());
+                (section.as_ptr() as usize) % std::mem::align_of::<u64>() == 0;
             if cfg!(target_endian = "little") && src_aligned {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -784,7 +784,7 @@ fn bulk_copy_or_parse_v5(section: &[u8], entries: &mut Vec<FileEntry>) {
     // mmap 基址页对齐，但 section 在文件内的偏移由前面各段长度累加决定，
     // 不保证是 `align_of::<FileEntry>()`（8）的倍数；未对齐的 memcpy 是 UB
     // （debug 下被 unsafe precondition 检查直接 abort），必须先验再拷。
-    let src_aligned = (section.as_ptr() as usize).is_multiple_of(std::mem::align_of::<FileEntry>());
+    let src_aligned = (section.as_ptr() as usize) % std::mem::align_of::<FileEntry>() == 0;
     if src_aligned && n > 0 {
         unsafe {
             let dst = entries.as_mut_ptr();

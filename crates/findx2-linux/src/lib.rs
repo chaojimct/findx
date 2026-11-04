@@ -1,6 +1,6 @@
 //! Linux 后端：目录遍历建库 + fanotify / inotify 增量。
 
-use findx2_core::{ChangeEvent, ChangeWatcher, RawEntry, Result, VolumeScanner, WatchCursor};
+use findx2_core::{Result, VolumeScanner};
 
 #[cfg(target_os = "linux")]
 mod scan;
