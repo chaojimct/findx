@@ -2,6 +2,9 @@
 
 use findx2_core::{Result, VolumeScanner};
 
+#[cfg(not(target_os = "linux"))]
+use findx2_core::{ChangeEvent, ChangeWatcher, RawEntry, WatchCursor};
+
 #[cfg(target_os = "linux")]
 mod scan;
 #[cfg(target_os = "linux")]
