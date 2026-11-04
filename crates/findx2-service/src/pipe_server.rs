@@ -55,7 +55,7 @@ fn apply_local_client_acl(
         )?;
         let handle = HANDLE(server.as_raw_handle());
         let applied = SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, sd);
-        let _ = LocalFree(HLOCAL(sd.0));
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
         applied?;
     }
     Ok(())

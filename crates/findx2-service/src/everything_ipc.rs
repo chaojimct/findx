@@ -212,7 +212,7 @@ unsafe fn message_loop() -> windows::core::Result<()> {
 
     loop {
         let mut msg = MSG::default();
-        let r = GetMessageW(&mut msg, HWND::default(), 0, 0);
+        let r = GetMessageW(&mut msg, Some(HWND::default()), 0, 0);
         if !r.as_bool() {
             break;
         }
@@ -226,8 +226,8 @@ unsafe fn message_loop() -> windows::core::Result<()> {
     if !hwnd_alt.is_invalid() {
         let _ = DestroyWindow(hwnd_alt);
     }
-    let _ = UnregisterClassW(class_ipc, hi);
-    let _ = UnregisterClassW(class_alt, hi);
+    let _ = UnregisterClassW(class_ipc, Some(hi));
+    let _ = UnregisterClassW(class_alt, Some(hi));
 
     Ok(())
 }
