@@ -338,6 +338,39 @@ html {
   white-space: nowrap;
 }
 
+.fx-layout-diag {
+  position: fixed;
+  left: 8px;
+  bottom: 8px;
+  z-index: 80;
+  width: min(420px, calc(100vw - 16px));
+  max-height: 46vh;
+  overflow: auto;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid #d28a3a;
+  background: #fff8e8;
+  color: #1f1f1f;
+  font-size: 11px;
+  line-height: 1.35;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+
+.fx-layout-diag-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.fx-layout-diag pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, monospace;
+}
+
 .fx-table {
   width: 100%;
   border-collapse: collapse;

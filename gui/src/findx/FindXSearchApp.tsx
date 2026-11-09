@@ -23,6 +23,8 @@ import {
   visibleColumnIds,
   type ColId,
 } from "./resultTableLayout";
+import { LayoutDiag } from "./LayoutDiag";
+import { noteLayoutSample, recordSelectionReset } from "./devDiag";
 import { ResultNavigation } from "./resultNavigation";
 import { scrollTopForRow } from "./resultSelection";
 import { windowThemeColors } from "./themeColors";
@@ -294,6 +296,8 @@ export default function FindXSearchApp() {
   const [indexDetail, setIndexDetail] = useState<string | null>(null);
   const [showIndexDetail, setShowIndexDetail] = useState(false);
   const [selected, setSelected] = useState<number | null>(null);
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
   // 预览面板状态：默认开启 + 持久化宽度
   const [previewOpen, setPreviewOpen] = useState<boolean>(() => {
     try {
@@ -354,13 +358,50 @@ export default function FindXSearchApp() {
       const rootW = root?.clientWidth ?? 0;
       const docW = document.documentElement.clientWidth;
       const next = rootW > 0 && docW > 0 ? Math.min(rootW, docW) : rootW || docW;
+      const vv = window.visualViewport;
+      noteLayoutSample({
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        docClientWidth: docW,
+        docClientHeight: document.documentElement.clientHeight,
+        rootClientWidth: rootW,
+        rootClientHeight: root?.clientHeight ?? 0,
+        observerWidth: rootW,
+        devicePixelRatio: window.devicePixelRatio || 1,
+        screenWidth: window.screen?.width ?? 0,
+        screenHeight: window.screen?.height ?? 0,
+        screenAvailWidth: window.screen?.availWidth ?? 0,
+        screenAvailHeight: window.screen?.availHeight ?? 0,
+        visualViewportWidth: vv?.width ?? null,
+        visualViewportHeight: vv?.height ?? null,
+        visualViewportScale: vv?.scale ?? null,
+      });
       setContentWidth(next);
     };
     read();
+    const onWindowResize = () => {
+      const vv = window.visualViewport;
+      noteLayoutSample({
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        docClientWidth: document.documentElement.clientWidth,
+        docClientHeight: document.documentElement.clientHeight,
+        devicePixelRatio: window.devicePixelRatio || 1,
+        visualViewportWidth: vv?.width ?? null,
+        visualViewportHeight: vv?.height ?? null,
+        visualViewportScale: vv?.scale ?? null,
+      });
+    };
     const ro = new ResizeObserver(read);
     if (root) ro.observe(root);
     ro.observe(document.documentElement);
-    return () => ro.disconnect();
+    window.addEventListener("resize", onWindowResize);
+    window.visualViewport?.addEventListener("resize", onWindowResize);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", onWindowResize);
+      window.visualViewport?.removeEventListener("resize", onWindowResize);
+    };
   }, []);
   useEffect(() => {
     const prev = prevContentWidth.current;
@@ -746,6 +787,7 @@ export default function FindXSearchApp() {
       setHits([]);
       setMatchTotal(0);
       setStatus("就绪");
+      recordSelectionReset("查询变空", selectedRef.current);
       setSelected(null);
       return;
     }
@@ -754,6 +796,7 @@ export default function FindXSearchApp() {
       setLoading(true);
       setStatus("搜索中…");
       // 每次重新搜索（含防抖自动搜）时清空列表选中，避免仍指向旧排序/旧结果中的行号。
+      recordSelectionReset("重新查询", selectedRef.current);
       setSelected(null);
     }
     try {
@@ -817,6 +860,7 @@ export default function FindXSearchApp() {
         if (!append) {
           setHits([]);
           setMatchTotal(0);
+          recordSelectionReset("查询失败", selectedRef.current);
           setSelected(null);
         }
         setStatus(`错误: ${String(e)}`);
@@ -915,6 +959,16 @@ export default function FindXSearchApp() {
         onSelect={setSelected}
         onOpen={() => void openSelected()}
         searchInputRef={searchInputRef}
+      />
+      <LayoutDiag
+        decisionWidth={contentWidth}
+        previewWidth={previewWidth}
+        savedSidebar={sidebarOpen}
+        savedPreview={previewOpen}
+        sidebarForce={sidebarForce}
+        previewForce={previewForce}
+        selected={selected}
+        resultsCount={sortedHits.length}
       />
       {updateBanner?.releasePageUrl && updateBanner.latestVersion && (
         <div className="fx-update-banner" role="status">

@@ -52,12 +52,6 @@ const FAILED: AppUpdateInfo = {
   error: "模拟失败：更新源没有响应。这不是一次真实的检查。",
 };
 
-const CURRENT: AppUpdateInfo = {
-  ok: true,
-  hasUpdate: false,
-  currentVersion: "2.4.10",
-};
-
 function Shell({
   hint,
   children,

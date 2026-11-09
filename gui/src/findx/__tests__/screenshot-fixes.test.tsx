@@ -19,6 +19,7 @@ import {
   columnPixelWidths,
   NAME_COLUMN_MIN_PX,
   resolvePanelOpen,
+  explainPanels,
   resolvePanels,
   visibleColumnIds,
 } from "../resultTableLayout";
@@ -180,6 +181,43 @@ describe("窄表列和面板", () => {
     ).toEqual({ sidebar: true, preview: true });
   });
 
+  it("诊断理由和折叠结果一致，阈值没有被放大", () => {
+    const widths = [437, 647, 800, 959, 1200];
+    for (const contentWidth of widths) {
+      const args = {
+        contentWidth,
+        previewWidth: 360,
+        savedSidebar: true,
+        savedPreview: true,
+        sidebarForce: null,
+        previewForce: null,
+      } as const;
+      const explained = explainPanels(args);
+      expect({ sidebar: explained.sidebar, preview: explained.preview }).toEqual(resolvePanels(args));
+    }
+    const narrow = explainPanels({
+      contentWidth: 647,
+      previewWidth: 360,
+      savedSidebar: true,
+      savedPreview: true,
+      sidebarForce: null,
+      previewForce: null,
+    });
+    expect(narrow.previewReason).toContain("647px < 900px");
+    expect(narrow.sidebarReason).toContain("647px < 760px");
+    const wide = explainPanels({
+      contentWidth: 1200,
+      previewWidth: 360,
+      savedSidebar: true,
+      savedPreview: true,
+      sidebarForce: null,
+      previewForce: null,
+    });
+    expect(wide.preview).toBe(true);
+    expect(wide.sidebar).toBe(true);
+    expect(wide.previewReason).toContain("1200px >= 900px");
+  });
+
   it("窄窗口自动收起面板，手动打开可以盖过自动策略", () => {
     expect(
       resolvePanelOpen({ windowWidth: 646, savedOpen: true, forced: null, kind: "preview" }),
@@ -284,6 +322,9 @@ describe("jsdom：更新夹具只验证结构，不测量像素，也不是原�
     expect(readSrc("../../App.tsx")).toContain("import.meta.env.DEV");
     const css = readSrc("../settings-window.css");
     expect(css).toMatch(/\.fx-settings-footer\s*\{[^}]*height:\s*56px/s);
+    expect(css).toMatch(/\.fx-fixture-page\s*\{[^}]*height:\s*100%/s);
+    expect(css).toMatch(/\.fx-fixture-shell\s*\{[^}]*min-height:\s*0/s);
+    expect(css).not.toMatch(/\.fx-fixture-shell\s*\{[^}]*height:\s*480px/s);
     expect(css).toMatch(/\.fx-update-release-notes\s*\{[^}]*max-height:\s*240px/s);
     expect(css).toMatch(/\.fx-update-release-notes\s*\{[^}]*white-space:\s*pre-wrap/s);
 

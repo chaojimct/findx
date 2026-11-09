@@ -207,3 +207,64 @@ export function resolvePanels(args: {
   }
   return { sidebar, preview };
 }
+
+function panelReason(
+  kind: "sidebar" | "preview",
+  contentWidth: number,
+  savedOpen: boolean,
+  forced: "show" | "hide" | null,
+  closedForName: boolean,
+): string {
+  const limit = kind === "preview" ? PREVIEW_AUTO_HIDE_BELOW : SIDEBAR_AUTO_HIDE_BELOW;
+  const name = kind === "preview" ? "预览" : "侧栏";
+  if (forced === "show") return `${name}开：本次手动打开，不看宽度`;
+  if (forced === "hide") return `${name}关：本次手动关闭`;
+  if (closedForName) {
+    return `${name}关：内容宽 ${contentWidth}px 时两侧同时展开会挤掉名称列（下限 ${NAME_READABLE_PX}px）`;
+  }
+  if (contentWidth < limit) return `${name}关：决策宽度 ${contentWidth}px < ${limit}px`;
+  if (savedOpen) return `${name}开：决策宽度 ${contentWidth}px >= ${limit}px，且保存的偏好是展开`;
+  return `${name}关：决策宽度 ${contentWidth}px >= ${limit}px，保存的偏好是关闭`;
+}
+
+/** 与 resolvePanels 同一套判断，另附中文理由。阈值不在这里改。 */
+export function explainPanels(args: {
+  contentWidth: number;
+  previewWidth: number;
+  savedSidebar: boolean;
+  savedPreview: boolean;
+  sidebarForce: "show" | "hide" | null;
+  previewForce: "show" | "hide" | null;
+}): { sidebar: boolean; preview: boolean; sidebarReason: string; previewReason: string } {
+  const decided = resolvePanels(args);
+  const previewBefore = resolvePanelOpen({
+    windowWidth: args.contentWidth,
+    savedOpen: args.savedPreview,
+    forced: args.previewForce,
+    kind: "preview",
+  });
+  const sidebarBefore = resolvePanelOpen({
+    windowWidth: args.contentWidth,
+    savedOpen: args.savedSidebar,
+    forced: args.sidebarForce,
+    kind: "sidebar",
+  });
+  return {
+    sidebar: decided.sidebar,
+    preview: decided.preview,
+    previewReason: panelReason(
+      "preview",
+      args.contentWidth,
+      args.savedPreview,
+      args.previewForce,
+      previewBefore && !decided.preview && args.previewForce !== "hide",
+    ),
+    sidebarReason: panelReason(
+      "sidebar",
+      args.contentWidth,
+      args.savedSidebar,
+      args.sidebarForce,
+      sidebarBefore && !decided.sidebar && args.sidebarForce !== "hide",
+    ),
+  };
+}
