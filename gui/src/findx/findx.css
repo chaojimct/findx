@@ -1,75 +1,25 @@
-/* 浅色 / 深色（全黑底）由 html[data-fx-theme] 切换；侧栏约 210px、强调色可随主题略调 */
+/* 设计令牌已移至 design-tokens.css */
 
-:root[data-fx-theme="light"],
-:root:not([data-fx-theme]) {
-  color-scheme: light;
-  --fx-bg: #fafafa;
-  --fx-white: #ffffff;
-  --fx-border: #d8d8d8;
-  --fx-border-soft: #e8e8e8;
-  --fx-text: #222;
-  --fx-muted: #888;
-  --fx-sub: #555;
-  --fx-accent: #0078d4;
-  --fx-accent-soft: #dceefb;
-  --fx-hover: #f5f5f5;
-  --fx-row-sel: #e3f2fd;
-  --fx-search-box-bg: #f5f5f5;
-  --fx-placeholder: #aaa;
-  --fx-sidebar-section: #999;
-  --fx-filter-fg: #333;
-  --fx-filter-hover-bg: #e8e8e8;
-  --fx-time-hover-bg: #f0f0f0;
-  --fx-dot-border: #999;
-  --fx-input-border: #d0d0d0;
-  --fx-input-bg: #fbfbfb;
-  --fx-th-bg: #f3f3f3;
-  --fx-th-fg: #555;
-  --fx-cell-line: #ebebeb;
-  --fx-hit-bg: #ffecb3;
-  --fx-hit-fg: #0d47a1;
-  --fx-btn-ghost-bg: #f0f0f0;
-  --fx-settings-btn-bg: #f5f5f5;
-  --fx-drives-bg: #fafafa;
-  --fx-scrollbar-track: #eaeaea;
-  --fx-scrollbar-thumb: #a8a8a8;
-  --fx-scrollbar-thumb-hover: #888888;
-}
-
-/* 深色：背景/面板统一纯黑 #000，靠细边框与对比度分层 */
-:root[data-fx-theme="dark"] {
-  color-scheme: dark;
-  --fx-bg: #000000;
-  --fx-white: #000000;
-  --fx-border: #2a2a2a;
-  --fx-border-soft: #1a1a1a;
-  --fx-text: #ececec;
-  --fx-muted: #9a9a9a;
-  --fx-sub: #c4c4c4;
-  --fx-accent: #4da3ff;
-  --fx-accent-soft: rgba(77, 163, 255, 0.18);
-  --fx-hover: #121212;
-  --fx-row-sel: #0d2847;
-  --fx-search-box-bg: #0a0a0a;
-  --fx-placeholder: #777;
-  --fx-sidebar-section: #888;
-  --fx-filter-fg: #ddd;
-  --fx-filter-hover-bg: #1a1a1a;
-  --fx-time-hover-bg: #141414;
-  --fx-dot-border: #666;
-  --fx-input-border: #333;
-  --fx-input-bg: #0a0a0a;
-  --fx-th-bg: #000000;
-  --fx-th-fg: #b8b8b8;
-  --fx-cell-line: #1c1c1c;
-  --fx-hit-bg: #6a5400;
-  --fx-hit-fg: #fff8e1;
-  --fx-btn-ghost-bg: #1a1a1a;
-  --fx-settings-btn-bg: #141414;
-  --fx-drives-bg: #0a0a0a;
-  --fx-scrollbar-track: #0a0a0a;
-  --fx-scrollbar-thumb: #3a3a3a;
-  --fx-scrollbar-thumb-hover: #555555;
+/* 兼容性映射:旧变量名 → 新令牌 */
+:root {
+  --fx-white: var(--fx-surface);
+  --fx-text: var(--fx-text-primary);
+  --fx-muted: var(--fx-text-tertiary);
+  --fx-sub: var(--fx-text-secondary);
+  --fx-row-sel: var(--fx-row-selected);
+  --fx-sidebar-section: var(--fx-text-tertiary);
+  --fx-filter-fg: var(--fx-text-primary);
+  --fx-filter-hover-bg: var(--fx-hover);
+  --fx-time-hover-bg: var(--fx-hover);
+  --fx-dot-border: var(--fx-text-tertiary);
+  --fx-input-border: var(--fx-border);
+  --fx-input-bg: var(--fx-surface-raised);
+  --fx-th-bg: var(--fx-surface);
+  --fx-th-fg: var(--fx-text-secondary);
+  --fx-cell-line: var(--fx-border-soft);
+  --fx-btn-ghost-bg: var(--fx-surface-raised);
+  --fx-settings-btn-bg: var(--fx-surface-raised);
+  --fx-drives-bg: var(--fx-surface-raised);
 }
 
 body {

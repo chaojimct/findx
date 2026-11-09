@@ -1,0 +1,293 @@
+/**
+ * FindX 设置窗口布局样式
+ * 固定头部(标题+标签栏) + 可滚动内容 + 固定底栏(保存/关闭)
+ */
+
+.fx-settings-window-root {
+  box-sizing: border-box;
+  min-height: 100vh;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--fx-surface);
+  color: var(--fx-text-primary);
+  font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+  font-size: var(--fx-text-base);
+  overflow: hidden;
+}
+
+.fx-settings-window-container {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ===== 固定头部 ===== */
+
+.fx-settings-header {
+  flex-shrink: 0;
+  padding: var(--fx-space-xl) var(--fx-space-xl) 0;
+  border-bottom: 1px solid var(--fx-border-soft);
+  background: var(--fx-surface);
+}
+
+.fx-settings-title-row {
+  display: flex;
+  align-items: center;
+  gap: var(--fx-space-sm);
+  margin-bottom: var(--fx-space-sm);
+}
+
+.fx-settings-title {
+  margin: 0;
+  font-size: var(--fx-text-xl);
+  font-weight: 600;
+  line-height: var(--fx-leading-tight);
+  color: var(--fx-text-primary);
+}
+
+.fx-settings-dirty-indicator {
+  color: var(--fx-accent);
+  font-size: var(--fx-text-md);
+  line-height: 1;
+}
+
+.fx-settings-header-hint {
+  margin: 0 0 var(--fx-space-md);
+  padding: var(--fx-space-sm) var(--fx-space-md);
+  background: var(--fx-accent-soft);
+  border-left: 3px solid var(--fx-accent);
+  border-radius: var(--fx-radius-sm);
+  font-size: var(--fx-text-sm);
+}
+
+/* ===== 标签栏 ===== */
+
+.fx-settings-tabs {
+  display: flex;
+  gap: var(--fx-space-xs);
+  margin-bottom: -1px;
+}
+
+.fx-settings-tab {
+  padding: var(--fx-space-sm) var(--fx-space-lg);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  color: var(--fx-text-tertiary);
+  font-size: var(--fx-text-base);
+  font-weight: 500;
+  line-height: var(--fx-leading-tight);
+  cursor: pointer;
+  transition: all var(--fx-transition-fast);
+  user-select: none;
+}
+
+.fx-settings-tab:hover:not([aria-selected="true"]) {
+  color: var(--fx-text-primary);
+  background: var(--fx-hover);
+}
+
+.fx-settings-tab[aria-selected="true"] {
+  color: var(--fx-accent);
+  border-bottom-color: var(--fx-accent);
+  font-weight: 600;
+}
+
+/* ===== 可滚动内容区 ===== */
+
+.fx-settings-content-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: var(--fx-space-xl);
+}
+
+.fx-settings-content-scroll > div {
+  max-width: var(--fx-settings-content-max-width);
+  margin: 0 auto;
+}
+
+/* ===== 固定底栏 ===== */
+
+.fx-settings-footer {
+  flex-shrink: 0;
+  padding: var(--fx-space-md) var(--fx-space-xl);
+  border-top: 1px solid var(--fx-border-soft);
+  background: var(--fx-surface);
+}
+
+.fx-settings-footer-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: var(--fx-space-sm);
+}
+
+/* ===== 更新状态卡片 (在Advanced标签内) ===== */
+
+.fx-update-card {
+  padding: var(--fx-space-lg);
+  border: 1px solid var(--fx-border);
+  border-radius: var(--fx-radius-lg);
+  background: var(--fx-surface-raised);
+  margin-bottom: var(--fx-space-xl);
+}
+
+.fx-update-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--fx-space-md);
+}
+
+.fx-update-card-title {
+  font-size: var(--fx-text-md);
+  font-weight: 600;
+  color: var(--fx-text-primary);
+  margin: 0;
+}
+
+.fx-update-card-status {
+  font-size: var(--fx-text-sm);
+  color: var(--fx-text-tertiary);
+}
+
+.fx-update-card-actions {
+  display: flex;
+  gap: var(--fx-space-sm);
+  flex-wrap: wrap;
+  margin-bottom: var(--fx-space-md);
+}
+
+.fx-update-progress {
+  margin-bottom: var(--fx-space-md);
+}
+
+.fx-update-progress-bar-bg {
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--fx-border-soft);
+}
+
+.fx-update-progress-bar {
+  height: 100%;
+  background: var(--fx-accent);
+  transition: width 150ms linear;
+}
+
+.fx-update-progress-text {
+  font-size: var(--fx-text-xs);
+  color: var(--fx-text-tertiary);
+  margin-top: var(--fx-space-xs);
+}
+
+.fx-update-release-notes {
+  max-height: 240px;
+  overflow-y: auto;
+  padding: var(--fx-space-md);
+  border: 1px solid var(--fx-border-soft);
+  border-radius: var(--fx-radius-sm);
+  background: var(--fx-bg);
+  font-size: var(--fx-text-sm);
+  line-height: var(--fx-leading-relaxed);
+  color: var(--fx-text-secondary);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.fx-update-release-notes h1,
+.fx-update-release-notes h2,
+.fx-update-release-notes h3 {
+  font-size: var(--fx-text-md);
+  font-weight: 600;
+  margin: var(--fx-space-md) 0 var(--fx-space-sm);
+  color: var(--fx-text-primary);
+}
+
+.fx-update-release-notes h1:first-child,
+.fx-update-release-notes h2:first-child,
+.fx-update-release-notes h3:first-child {
+  margin-top: 0;
+}
+
+.fx-update-release-notes p {
+  margin: var(--fx-space-sm) 0;
+}
+
+.fx-update-release-notes ul,
+.fx-update-release-notes ol {
+  margin: var(--fx-space-sm) 0;
+  padding-left: var(--fx-space-xl);
+}
+
+.fx-update-release-notes li {
+  margin: var(--fx-space-xs) 0;
+}
+
+.fx-update-release-notes code {
+  padding: 2px var(--fx-space-xs);
+  background: var(--fx-surface-raised);
+  border: 1px solid var(--fx-border-soft);
+  border-radius: 3px;
+  font-family: ui-monospace, monospace;
+  font-size: 0.9em;
+}
+
+.fx-update-release-notes pre {
+  padding: var(--fx-space-md);
+  background: var(--fx-surface-raised);
+  border: 1px solid var(--fx-border-soft);
+  border-radius: var(--fx-radius-sm);
+  overflow-x: auto;
+  margin: var(--fx-space-sm) 0;
+}
+
+.fx-update-release-notes pre code {
+  padding: 0;
+  background: none;
+  border: none;
+}
+
+.fx-update-release-notes a {
+  color: var(--fx-accent);
+  text-decoration: none;
+}
+
+.fx-update-release-notes a:hover {
+  text-decoration: underline;
+}
+
+/* ===== 其他设置项样式 ===== */
+
+.fx-drives-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--fx-space-sm);
+  padding: var(--fx-space-md);
+  max-height: 120px;
+  overflow-y: auto;
+  border: 1px solid var(--fx-border);
+  border-radius: var(--fx-radius-sm);
+  background: var(--fx-surface-raised);
+}
+
+.fx-drives-list label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--fx-space-xs);
+  font-weight: normal;
+  margin: 0;
+}
+
+.fx-action-row {
+  display: flex;
+  gap: var(--fx-space-sm);
+  align-items: center;
+  flex-wrap: wrap;
+}

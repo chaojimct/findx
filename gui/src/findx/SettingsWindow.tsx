@@ -1,8 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import "./design-tokens.css";
 import "./findx.css";
+import "./settings-window.css";
+import { Button, Checkbox, Input, Textarea, RadioGroup, SettingsRow, Hint } from "./components/UIComponents";
 import type {
   AppUpdateInfo,
   AutostartState,
@@ -36,6 +39,9 @@ export default function SettingsWindow() {
     autoStartApp: false,
     autoCheckUpdate: true,
   });
+  const [originalSettings, setOriginalSettings] = useState<FindxGuiSettings | null>(null);
+  const [isDirty, setIsDirty] = useState(false);
+  const settingsRef = useRef(settings);
   const [settingsTab, setSettingsTab] = useState<"index" | "search" | "service" | "advanced">(
     "index",
   );
@@ -126,6 +132,14 @@ export default function SettingsWindow() {
   }, [effectiveTheme, uiThemePref]);
 
   useEffect(() => {
+    settingsRef.current = settings;
+    if (originalSettings) {
+      const changed = JSON.stringify(settings) !== JSON.stringify(originalSettings);
+      setIsDirty(changed);
+    }
+  }, [settings, originalSettings]);
+
+  useEffect(() => {
     const isDark = effectiveTheme === "dark";
     const bg = isDark ? "#000000" : "#fafafa";
     const titleBar = isDark ? "#000000" : "#ebebeb";
@@ -142,6 +156,8 @@ export default function SettingsWindow() {
     try {
       const s = await invoke<FindxGuiSettings>("load_findx_settings");
       setSettings(s);
+      setOriginalSettings(s);
+      setIsDirty(false);
     } catch {
       /* ignore */
     }
@@ -250,6 +266,8 @@ export default function SettingsWindow() {
     try {
       await invoke("save_findx_settings", { settings });
       await emit("findx2-settings-saved", {});
+      setOriginalSettings(settings);
+      setIsDirty(false);
       setHint("设置已保存");
       window.setTimeout(() => setHint(""), 2500);
     } catch (e) {
@@ -414,6 +432,13 @@ export default function SettingsWindow() {
 
   /** 禁止 close() 销毁窗口（否则再次 show_settings_window 会失败）；隐藏即可反复打开 */
   const closeWindow = () => {
+    if (isDirty) {
+      if (!confirm("设置已修改但未保存,确定要关闭吗？未保存的更改将丢失。")) {
+        return;
+      }
+      setSettings(originalSettings ?? settings);
+      setIsDirty(false);
+    }
     void (async () => {
       try {
         await invoke("hide_settings_window");
@@ -427,36 +452,39 @@ export default function SettingsWindow() {
 
   return (
     <div className="fx-settings-window-root">
-      <div className="fx-settings fx-settings--dialog">
-        <h2>FindX2 设置</h2>
-        {hint ? (
-          <p className="fx-hint" style={{ marginTop: -4, marginBottom: 8 }}>
-            {hint}
-          </p>
-        ) : null}
-        <div className="fx-settings-tabs" role="tablist">
-          {(
-            [
-              ["index", "索引"],
-              ["search", "搜索"],
-              ["service", "服务模式"],
-              ["advanced", "高级"],
-            ] as const
-          ).map(([k, label]) => (
-            <button
-              key={k}
-              type="button"
-              role="tab"
-              aria-selected={settingsTab === k}
-              className="fx-settings-tab"
-              onClick={() => setSettingsTab(k)}
-            >
-              {label}
-            </button>
-          ))}
+      <div className="fx-settings-window-container">
+        {/* 固定头部:标题+标签栏 */}
+        <div className="fx-settings-header">
+          <div className="fx-settings-title-row">
+            <h2 className="fx-settings-title">FindX2 设置</h2>
+            {isDirty && <span className="fx-settings-dirty-indicator" title="有未保存的更改">●</span>}
+          </div>
+          {hint && <Hint variant="info" className="fx-settings-header-hint">{hint}</Hint>}
+          <div className="fx-settings-tabs" role="tablist">
+            {(
+              [
+                ["index", "索引"],
+                ["search", "搜索"],
+                ["service", "服务模式"],
+                ["advanced", "高级"],
+              ] as const
+            ).map(([k, label]) => (
+              <button
+                key={k}
+                type="button"
+                role="tab"
+                aria-selected={settingsTab === k}
+                className="fx-settings-tab"
+                onClick={() => setSettingsTab(k)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
         </div>
 
-        <div className="fx-settings-scroll">
+        {/* 可滚动内容区 */}
+        <div className="fx-settings-content-scroll">
         {settingsTab === "index" && (
           <div>
             <label>{hostOs === "windows" ? "索引磁盘（不勾选 = 全盘）" : "索引范围（不勾选 = 默认挂载点）"}</label>
@@ -746,90 +774,104 @@ export default function SettingsWindow() {
 
         {settingsTab === "advanced" && (
           <div>
-            <label>应用更新</label>
-            <div className="fx-settings-row" style={{ marginBottom: 8 }}>
-              <button
-                type="button"
-                onClick={() => void checkUpdateFromGithub()}
-                disabled={updBusy}
-              >
-                从 GitHub 检查更新
-              </button>
-              {updInfo?.hasUpdate && updInfo.downloadUrl && !updBusy && !downloadedPath && (
-                <button type="button" className="primary" onClick={() => void startDownload()}>
-                  下载 {updInfo.latestVersion}
-                  {updInfo.assetSize ? `（${fmtSize(updInfo.assetSize)}）` : ""}
-                </button>
-              )}
-              {updBusy && dlProgress && (
-                <button type="button" onClick={() => void cancelDownload()}>
-                  取消下载
-                </button>
-              )}
-              {downloadedPath && !updBusy && (
-                <button type="button" className="primary" onClick={() => void installUpdate()}>
-                  安装更新并重启
-                </button>
-              )}
-            </div>
-
-            {dlProgress && (
-              <div style={{ marginBottom: 10 }}>
-                <div
-                  style={{
-                    height: 6,
-                    borderRadius: 3,
-                    overflow: "hidden",
-                    background: "rgba(127,127,127,0.25)",
-                  }}
-                >
-                  <div
-                    style={{
-                      height: "100%",
-                      width: `${Math.min(100, Math.max(0, dlProgress.percent))}%`,
-                      background: "#3b82f6",
-                      transition: "width 0.15s linear",
-                    }}
-                  />
-                </div>
-                <p className="fx-hint" style={{ marginTop: 4, marginBottom: 0 }}>
-                  {dlProgress.total > 0
-                    ? `正在下载 ${dlProgress.percent.toFixed(1)}%（${fmtSize(dlProgress.downloaded)} / ${fmtSize(dlProgress.total)}）`
-                    : `已下载 ${fmtSize(dlProgress.downloaded)}`}
-                </p>
+            {/* 应用更新卡片 */}
+            <div className="fx-update-card">
+              <div className="fx-update-card-header">
+                <h3 className="fx-update-card-title">应用更新</h3>
+                {updBusy && !dlProgress && (
+                  <span className="fx-update-card-status">检查中...</span>
+                )}
+                {updBusy && dlProgress && (
+                  <span className="fx-update-card-status">下载中...</span>
+                )}
+                {!updBusy && downloadedPath && (
+                  <span className="fx-update-card-status">已下载,可安装</span>
+                )}
+                {!updBusy && updInfo && !updInfo.hasUpdate && (
+                  <span className="fx-update-card-status">已是最新</span>
+                )}
               </div>
-            )}
 
-            {updInfo?.hasUpdate && (
-              <p className="fx-hint" style={{ marginTop: 0, marginBottom: 8 }}>
-                发现新版本 {updInfo.latestVersion}（当前 {updInfo.currentVersion}）。
-                {updInfo.releaseNotes ? `更新说明：${updInfo.releaseNotes}` : ""}
-              </p>
-            )}
+              <div className="fx-update-card-actions">
+                <Button
+                  onClick={() => void checkUpdateFromGithub()}
+                  disabled={updBusy}
+                  size="sm"
+                >
+                  {updBusy && !dlProgress ? "检查中..." : "检查更新"}
+                </Button>
+                {updInfo?.hasUpdate && updInfo.downloadUrl && !updBusy && !downloadedPath && (
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={() => void startDownload()}
+                  >
+                    下载 {updInfo.latestVersion}
+                    {updInfo.assetSize ? ` (${fmtSize(updInfo.assetSize)})` : ""}
+                  </Button>
+                )}
+                {updBusy && dlProgress && (
+                  <Button size="sm" onClick={() => void cancelDownload()}>
+                    取消下载
+                  </Button>
+                )}
+                {downloadedPath && !updBusy && (
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={() => void installUpdate()}
+                  >
+                    安装更新并重启
+                  </Button>
+                )}
+              </div>
 
-            <label style={{ fontWeight: "normal", margin: "0 0 8px" }}>
-              <input
-                type="checkbox"
+              {dlProgress && (
+                <div className="fx-update-progress">
+                  <div className="fx-update-progress-bar-bg">
+                    <div
+                      className="fx-update-progress-bar"
+                      style={{
+                        width: `${Math.min(100, Math.max(0, dlProgress.percent))}%`,
+                      }}
+                    />
+                  </div>
+                  <p className="fx-update-progress-text">
+                    {dlProgress.total > 0
+                      ? `${dlProgress.percent.toFixed(1)}% (${fmtSize(dlProgress.downloaded)} / ${fmtSize(dlProgress.total)})`
+                      : `已下载 ${fmtSize(dlProgress.downloaded)}`}
+                  </p>
+                </div>
+              )}
+
+              {updInfo?.hasUpdate && updInfo.releaseNotes && (
+                <div className="fx-update-release-notes">
+                  <p><strong>新版本 {updInfo.latestVersion}</strong>（当前 {updInfo.currentVersion}）</p>
+                  <p>{updInfo.releaseNotes}</p>
+                </div>
+              )}
+
+              <Checkbox
                 checked={settings.autoCheckUpdate ?? true}
-                onChange={(e) =>
-                  setSettings((s) => ({ ...s, autoCheckUpdate: e.target.checked }))
+                onChange={(checked) =>
+                  setSettings((s) => ({ ...s, autoCheckUpdate: checked }))
                 }
-              />{" "}
-              启动时自动检查更新（仅提示，不自动下载）
-            </label>
+                label="启动时自动检查更新（仅提示，不自动下载）"
+              />
 
-            <p className="fx-hint" style={{ marginTop: 0, marginBottom: 16 }}>
-              更新流程：检查 → 下载（带进度）→ 静默安装（弹一次管理员授权）→ 自动重启，服务会随安装器自动恢复。
-              也可到仓库{" "}
-              <a
-                href="https://github.com/chaojimct/findx/releases"
-                target="_blank"
-                rel="noreferrer"
-              >
-                chaojimct/findx
-              </a>{" "}
-              的 Releases 手动下载（需联网）。
-            </p>
+              <Hint variant="info">
+                更新流程：检查 → 下载（带进度）→ 静默安装（弹一次管理员授权）→ 自动重启。
+                也可到{" "}
+                <a
+                  href="https://github.com/chaojimct/findx/releases"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  GitHub Releases
+                </a>{" "}
+                手动下载。
+              </Hint>
+            </div>
 
             <label>界面主题</label>
             <div className="fx-settings-row" style={{ marginTop: 4, marginBottom: 14 }}>
@@ -905,19 +947,17 @@ export default function SettingsWindow() {
         )}
         </div>
 
-        <footer className="fx-settings-footer-bar">
+        {/* 固定底栏:保存/关闭按钮 */}
+        <div className="fx-settings-footer">
           <div className="fx-settings-footer-actions">
-            <button type="button" className="primary" onClick={() => void saveSettings()}>
+            <Button variant="primary" onClick={() => void saveSettings()}>
               保存
-            </button>
-            <button type="button" onClick={closeWindow}>
+            </Button>
+            <Button onClick={closeWindow}>
               关闭
-            </button>
+            </Button>
           </div>
-          {/* <p className="fx-hint fx-settings-footer-note">
-            侧栏条件与搜索框关键词以空格组合。建索引与启动服务需访问卷设备时会弹出 Windows UAC 授权提权。
-          </p> */}
-        </footer>
+        </div>
       </div>
     </div>
   );

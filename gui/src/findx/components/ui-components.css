@@ -1,0 +1,263 @@
+/**
+ * FindX 共享UI组件样式
+ */
+
+/* ===== 按钮 ===== */
+
+.fx-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--fx-space-sm);
+  font-family: inherit;
+  font-size: var(--fx-text-base);
+  font-weight: 500;
+  line-height: var(--fx-leading-tight);
+  border: 1px solid var(--fx-border);
+  border-radius: var(--fx-radius-md);
+  background: var(--fx-surface-raised);
+  color: var(--fx-text-primary);
+  cursor: pointer;
+  transition: all var(--fx-transition-fast);
+  user-select: none;
+  white-space: nowrap;
+}
+
+.fx-btn--sm {
+  height: var(--fx-control-sm);
+  padding: 0 var(--fx-space-md);
+  font-size: var(--fx-text-sm);
+}
+
+.fx-btn--md {
+  height: var(--fx-control-md);
+  padding: 0 var(--fx-space-lg);
+}
+
+.fx-btn--lg {
+  height: var(--fx-control-lg);
+  padding: 0 var(--fx-space-xl);
+  font-size: var(--fx-text-md);
+}
+
+.fx-btn:hover:not(:disabled) {
+  background: var(--fx-hover);
+  border-color: var(--fx-text-tertiary);
+}
+
+.fx-btn:active:not(:disabled) {
+  background: var(--fx-pressed);
+}
+
+.fx-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--fx-focus-ring);
+}
+
+.fx-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.fx-btn--primary {
+  background: var(--fx-accent);
+  color: #ffffff;
+  border-color: var(--fx-accent);
+}
+
+.fx-btn--primary:hover:not(:disabled) {
+  background: var(--fx-accent-hover);
+  border-color: var(--fx-accent-hover);
+}
+
+.fx-btn--ghost {
+  background: transparent;
+  border-color: transparent;
+}
+
+.fx-btn--ghost:hover:not(:disabled) {
+  background: var(--fx-hover);
+  border-color: transparent;
+}
+
+/* ===== 输入框 ===== */
+
+.fx-input,
+.fx-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: inherit;
+  font-size: var(--fx-text-base);
+  line-height: var(--fx-leading-normal);
+  padding: var(--fx-space-sm) var(--fx-space-md);
+  border: 1px solid var(--fx-border);
+  border-radius: var(--fx-radius-sm);
+  background: var(--fx-surface-raised);
+  color: var(--fx-text-primary);
+  transition: all var(--fx-transition-fast);
+}
+
+.fx-input {
+  height: var(--fx-control-md);
+}
+
+.fx-input[type="number"] {
+  width: auto;
+  min-width: 80px;
+}
+
+.fx-input:hover:not(:disabled),
+.fx-textarea:hover:not(:disabled) {
+  border-color: var(--fx-text-tertiary);
+}
+
+.fx-input:focus,
+.fx-textarea:focus {
+  outline: none;
+  border-color: var(--fx-accent);
+  box-shadow: var(--fx-focus-ring);
+}
+
+.fx-input:disabled,
+.fx-textarea:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.fx-input::placeholder,
+.fx-textarea::placeholder {
+  color: var(--fx-placeholder);
+}
+
+.fx-textarea {
+  resize: vertical;
+  min-height: 80px;
+  font-family: ui-monospace, "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+  font-size: var(--fx-text-sm);
+}
+
+/* ===== 复选框 ===== */
+
+.fx-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--fx-space-sm);
+  cursor: pointer;
+  font-size: var(--fx-text-base);
+  line-height: var(--fx-leading-normal);
+  color: var(--fx-text-primary);
+  user-select: none;
+}
+
+.fx-checkbox input[type="checkbox"] {
+  width: var(--fx-icon-base);
+  height: var(--fx-icon-base);
+  cursor: pointer;
+  accent-color: var(--fx-accent);
+}
+
+.fx-checkbox-label {
+  flex: 1;
+}
+
+/* ===== 单选框 ===== */
+
+.fx-radio-group {
+  display: flex;
+  gap: var(--fx-space-md);
+}
+
+.fx-radio-group--column {
+  flex-direction: column;
+}
+
+.fx-radio-group--row {
+  flex-direction: row;
+  flex-wrap: wrap;
+}
+
+.fx-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--fx-space-sm);
+  cursor: pointer;
+  font-size: var(--fx-text-base);
+  line-height: var(--fx-leading-normal);
+  color: var(--fx-text-primary);
+  user-select: none;
+}
+
+.fx-radio input[type="radio"] {
+  width: var(--fx-icon-base);
+  height: var(--fx-icon-base);
+  cursor: pointer;
+  accent-color: var(--fx-accent);
+}
+
+.fx-radio-label {
+  flex: 1;
+}
+
+/* ===== 设置行容器 ===== */
+
+.fx-settings-row-container {
+  display: flex;
+  flex-direction: column;
+  gap: var(--fx-space-xs);
+  margin-bottom: var(--fx-space-lg);
+}
+
+.fx-settings-label {
+  display: block;
+  font-size: var(--fx-text-sm);
+  font-weight: 600;
+  line-height: var(--fx-leading-tight);
+  color: var(--fx-text-primary);
+  margin-bottom: var(--fx-space-xs);
+}
+
+.fx-settings-hint {
+  font-size: var(--fx-text-xs);
+  line-height: var(--fx-leading-relaxed);
+  color: var(--fx-text-tertiary);
+  margin: var(--fx-space-xs) 0 0;
+}
+
+.fx-settings-warning {
+  font-size: var(--fx-text-xs);
+  line-height: var(--fx-leading-relaxed);
+  color: var(--fx-warning);
+  margin: var(--fx-space-xs) 0 0;
+  padding: var(--fx-space-sm) var(--fx-space-md);
+  background: color-mix(in srgb, var(--fx-warning) 10%, transparent);
+  border-left: 3px solid var(--fx-warning);
+  border-radius: var(--fx-radius-sm);
+}
+
+/* ===== 提示消息 ===== */
+
+.fx-hint {
+  font-size: var(--fx-text-xs);
+  line-height: var(--fx-leading-relaxed);
+  margin: var(--fx-space-sm) 0;
+}
+
+.fx-hint--info {
+  color: var(--fx-text-tertiary);
+}
+
+.fx-hint--warning {
+  color: var(--fx-warning);
+}
+
+.fx-hint--error {
+  color: var(--fx-error);
+}
+
+/* ===== 分隔线 ===== */
+
+.fx-separator {
+  height: 1px;
+  background: var(--fx-border-soft);
+  margin: var(--fx-space-lg) 0;
+}

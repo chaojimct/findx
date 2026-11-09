@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import "./design-tokens.css";
 import "./findx.css";
 import type { AppUpdateInfo, FindxGuiSettings, UiThemePref } from "./findxGuiTypes";
 import { UI_THEME_KEY, loadUiThemePref } from "./findxGuiTypes";
@@ -270,6 +271,8 @@ export default function FindXSearchApp() {
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState("就绪");
   const [indexLine, setIndexLine] = useState("索引: …");
+  const [indexLineShort, setIndexLineShort] = useState("索引: …");
+  const [showIndexDetail, setShowIndexDetail] = useState(false);
   const [selected, setSelected] = useState<number | null>(null);
   // 预览面板状态：默认开启 + 持久化宽度
   const [previewOpen, setPreviewOpen] = useState<boolean>(() => {
@@ -617,12 +620,13 @@ export default function FindXSearchApp() {
         //   2) service 已起、正在反序列化已存在的 index.bin（loadingStage 有值）。
         // 混成一句「建库中」会让上亿条目的加载看起来像卡死——见 2.4.0 CHANGELOG。
         const stage = st.loadingStage?.trim();
+        let fullLine: string;
         if (stage && !phase && entries == null) {
           // loadingStage 形如 `解析条目（3/8 阶段，已 42s，共 3.1 亿条）`，已是完整描述。
-          setIndexLine(`索引: 加载中 · ${stage}`);
+          fullLine = `索引: 加载中 · ${stage}`;
         } else if (!phase && entries == null && st.loadingElapsedSecs != null) {
           // 旧版 service 不上报 loadingStage：至少显示已耗时，别让用户以为卡死。
-          setIndexLine(`索引: 加载中（已 ${st.loadingElapsedSecs}s）· 完成后自动可用`);
+          fullLine = `索引: 加载中（已 ${st.loadingElapsedSecs}s）· 完成后自动可用`;
         } else {
           const segs: string[] = ["索引: 建库中"];
           if (phase) segs.push(`阶段 ${phaseZh(phase)}`);
@@ -634,24 +638,33 @@ export default function FindXSearchApp() {
           if (segs.length === 1) {
             segs.push("（读取 index.indexing.json，完成后将自动启动服务）");
           }
-          setIndexLine(segs.join(" · "));
+          fullLine = segs.join(" · ");
         }
+        setIndexLine(fullLine);
+        setIndexLineShort(fullLine.length > 60 ? `索引: 建库中...` : fullLine);
       } else if (st.lastError) {
-        setIndexLine(`索引: ${indexedCount.toLocaleString()} 条 · ${st.lastError}`);
+        const fullLine = `索引: ${indexedCount.toLocaleString()} 条 · ${st.lastError}`;
+        setIndexLine(fullLine);
+        setIndexLineShort(fullLine.length > 60 ? `索引: ${indexedCount.toLocaleString()} 条 · 警告` : fullLine);
       } else if (st.metadataReady === false) {
         const bd = st.backfillDone ?? 0;
         const bt = st.backfillTotal ?? 0;
         const pct = bt > 0 ? Math.min(100, Math.round((bd / bt) * 100)) : null;
         const base = `索引: ${indexedCount.toLocaleString()} 条`;
+        let fullLine: string;
         if (!(settings.enableMetadataBackfill ?? true)) {
-          setIndexLine(`${base} · 元数据回填已关闭（可在设置中开启）`);
+          fullLine = `${base} · 元数据回填已关闭（可在设置中开启）`;
         } else if (pct !== null) {
-          setIndexLine(`${base} · 元数据回填 ${pct}%（${bd.toLocaleString()}/${bt.toLocaleString()}）`);
+          fullLine = `${base} · 元数据回填 ${pct}%（${bd.toLocaleString()}/${bt.toLocaleString()}）`;
         } else {
-          setIndexLine(`${base} · 元数据回填中…`);
+          fullLine = `${base} · 元数据回填中…`;
         }
+        setIndexLine(fullLine);
+        setIndexLineShort(fullLine.length > 60 ? `${base} · 元数据回填中...` : fullLine);
       } else {
-        setIndexLine(`索引: ${indexedCount.toLocaleString()} 条`);
+        const fullLine = `索引: ${indexedCount.toLocaleString()} 条`;
+        setIndexLine(fullLine);
+        setIndexLineShort(fullLine);
       }
     } catch (e) {
       setIndexLine(`索引状态: ${String(e)}`);
@@ -1233,9 +1246,19 @@ export default function FindXSearchApp() {
           <span>{status}</span>
         </div>
         <span className="fx-status-right">
-          <span className="fx-index-line" title={indexLine}>
-            {indexLine}
+          <span className="fx-index-line" title={indexLine !== indexLineShort ? indexLine : undefined}>
+            {indexLineShort}
           </span>
+          {indexLine !== indexLineShort && (
+            <button
+              type="button"
+              className="fx-btn-icon"
+              title="查看详细状态"
+              onClick={() => setShowIndexDetail(true)}
+            >
+              详情
+            </button>
+          )}
           {selected !== null && (
             <>
               <button type="button" className="fx-btn-icon" onClick={() => void openSelected()}>
@@ -1266,6 +1289,35 @@ export default function FindXSearchApp() {
           </button>
         </span>
       </div>
+      {showIndexDetail && (
+        <div
+          className="fx-v2-notice-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-label="索引状态详情"
+          onClick={() => setShowIndexDetail(false)}
+        >
+          <div
+            className="fx-v2-notice-card"
+            onClick={(e) => e.stopPropagation()}
+            style={{ maxWidth: "720px" }}
+          >
+            <h3>索引状态详情</h3>
+            <p style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", lineHeight: "1.6" }}>
+              {indexLine}
+            </p>
+            <div className="fx-v2-notice-actions">
+              <button
+                type="button"
+                className="fx-btn-icon fx-btn-search"
+                onClick={() => setShowIndexDetail(false)}
+              >
+                关闭
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {showV2MigrationNotice && (
         <div className="fx-v2-notice-backdrop" role="dialog" aria-modal="true" aria-label="FindX2 升级说明">
           <div className="fx-v2-notice-card">
