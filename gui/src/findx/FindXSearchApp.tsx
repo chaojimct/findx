@@ -621,12 +621,13 @@ export default function FindXSearchApp() {
         // 混成一句「建库中」会让上亿条目的加载看起来像卡死——见 2.4.0 CHANGELOG。
         const stage = st.loadingStage?.trim();
         let fullLine: string;
+        let hasDetail = false;
         if (stage && !phase && entries == null) {
-          // loadingStage 形如 `解析条目（3/8 阶段，已 42s，共 3.1 亿条）`，已是完整描述。
           fullLine = `索引: 加载中 · ${stage}`;
+          hasDetail = stage.length > 40;
         } else if (!phase && entries == null && st.loadingElapsedSecs != null) {
-          // 旧版 service 不上报 loadingStage：至少显示已耗时，别让用户以为卡死。
           fullLine = `索引: 加载中（已 ${st.loadingElapsedSecs}s）· 完成后自动可用`;
+          hasDetail = true;
         } else {
           const segs: string[] = ["索引: 建库中"];
           if (phase) segs.push(`阶段 ${phaseZh(phase)}`);
@@ -639,13 +640,14 @@ export default function FindXSearchApp() {
             segs.push("（读取 index.indexing.json，完成后将自动启动服务）");
           }
           fullLine = segs.join(" · ");
+          hasDetail = segs.length > 2;
         }
         setIndexLine(fullLine);
-        setIndexLineShort(fullLine.length > 60 ? `索引: 建库中...` : fullLine);
+        setHasIndexDetail(hasDetail);
       } else if (st.lastError) {
         const fullLine = `索引: ${indexedCount.toLocaleString()} 条 · ${st.lastError}`;
         setIndexLine(fullLine);
-        setIndexLineShort(fullLine.length > 60 ? `索引: ${indexedCount.toLocaleString()} 条 · 警告` : fullLine);
+        setHasIndexDetail(st.lastError.length > 40);
       } else if (st.metadataReady === false) {
         const bd = st.backfillDone ?? 0;
         const bt = st.backfillTotal ?? 0;
@@ -660,11 +662,11 @@ export default function FindXSearchApp() {
           fullLine = `${base} · 元数据回填中…`;
         }
         setIndexLine(fullLine);
-        setIndexLineShort(fullLine.length > 60 ? `${base} · 元数据回填中...` : fullLine);
+        setHasIndexDetail(fullLine.length > 50);
       } else {
         const fullLine = `索引: ${indexedCount.toLocaleString()} 条`;
         setIndexLine(fullLine);
-        setIndexLineShort(fullLine);
+        setHasIndexDetail(false);
       }
     } catch (e) {
       setIndexLine(`索引状态: ${String(e)}`);
@@ -1246,10 +1248,10 @@ export default function FindXSearchApp() {
           <span>{status}</span>
         </div>
         <span className="fx-status-right">
-          <span className="fx-index-line" title={indexLine !== indexLineShort ? indexLine : undefined}>
-            {indexLineShort}
+          <span className="fx-index-line" title={hasIndexDetail ? indexLine : undefined}>
+            {indexLine}
           </span>
-          {indexLine !== indexLineShort && (
+          {hasIndexDetail && (
             <button
               type="button"
               className="fx-btn-icon"

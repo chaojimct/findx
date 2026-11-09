@@ -515,8 +515,8 @@ html {
 }
 
 .fx-index-line {
-  flex: 1;
-  min-width: 160px;
+  flex: 1 1 auto;
+  min-width: 0;
   max-width: min(520px, 58vw);
   text-align: right;
   line-height: 1.35;
