@@ -45,8 +45,8 @@
   --fx-transition-fast: 120ms ease;
   --fx-transition-base: 180ms ease;
 
-  /* 设置窗口内容宽度 */
-  --fx-settings-content-max-width: 680px;
+  /* 设置内容列上限。短数字框不跟着拉宽。 */
+  --fx-settings-content-max-width: 800px;
 
   /* 图标尺寸 */
   --fx-icon-sm: 14px;
@@ -85,32 +85,32 @@
   --fx-scrollbar-thumb-hover: #888888;
 }
 
-/* 深色主题 (全黑基底) */
+/* 深色主题：分层深灰。与 themeColors.ts / index.html 的 #1b1b1b 一致，不是纯黑。 */
 :root[data-fx-theme="dark"] {
   color-scheme: dark;
-  --fx-bg: #000000;
-  --fx-surface: #000000;
-  --fx-surface-raised: #0a0a0a;
-  --fx-border: #2a2a2a;
-  --fx-border-soft: #1a1a1a;
-  --fx-text-primary: #ececec;
-  --fx-text-secondary: #c4c4c4;
+  --fx-bg: #1b1b1b;
+  --fx-surface: #242424;
+  --fx-surface-raised: #2c2c2c;
+  --fx-border: #3d3d3d;
+  --fx-border-soft: #333333;
+  --fx-text-primary: #f2f2f2;
+  --fx-text-secondary: #c8c8c8;
   --fx-text-tertiary: #9a9a9a;
-  --fx-text-disabled: #666666;
+  --fx-text-disabled: #6e6e6e;
   --fx-accent: #4da3ff;
   --fx-accent-hover: #6bb4ff;
   --fx-accent-soft: rgba(77, 163, 255, 0.18);
-  --fx-hover: #121212;
-  --fx-pressed: #0d0d0d;
-  --fx-row-selected: #0d2847;
-  --fx-search-box-bg: #0a0a0a;
-  --fx-placeholder: #777777;
+  --fx-hover: #303030;
+  --fx-pressed: #3a3a3a;
+  --fx-row-selected: #1e3a5f;
+  --fx-search-box-bg: #2c2c2c;
+  --fx-placeholder: #8a8a8a;
   --fx-hit-bg: #6a5400;
   --fx-hit-fg: #fff8e1;
   --fx-success: #6ccb5f;
   --fx-warning: #f7b955;
   --fx-error: #e74856;
-  --fx-scrollbar-track: #0a0a0a;
-  --fx-scrollbar-thumb: #3a3a3a;
-  --fx-scrollbar-thumb-hover: #555555;
+  --fx-scrollbar-track: #1b1b1b;
+  --fx-scrollbar-thumb: #4a4a4a;
+  --fx-scrollbar-thumb-hover: #666666;
 }

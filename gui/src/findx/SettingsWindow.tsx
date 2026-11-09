@@ -5,8 +5,12 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import "./design-tokens.css";
 import "./findx.css";
 import "./settings-window.css";
-import { Button, Checkbox, Hint, Input, RadioGroup, SettingsRow } from "./components/UIComponents";
+import { Button, Checkbox, Input, RadioGroup, SettingsRow } from "./components/UIComponents";
 import { ExcludeDirsEditor } from "./components/ExcludeDirsEditor";
+import { IndexRangeList } from "./IndexRangeList";
+import { indexOpFeedback } from "./indexOps";
+import { windowThemeColors } from "./themeColors";
+import { UpdateCard } from "./UpdateCard";
 import { createOnceListener } from "./onceListener";
 import {
   CLOSE_DIRTY_MESSAGE,
@@ -88,6 +92,7 @@ export default function SettingsWindow() {
   const [idxEntries, setIdxEntries] = useState<number | null>(null);
   const [tombCount, setTombCount] = useState<number | null>(null);
   const [compactBusy, setCompactBusy] = useState(false);
+  const [indexOp, setIndexOp] = useState("");
   /** 应用更新：检测结果；下载走事件（findx2-update-progress/finished）驱动进度条 */
   const [updInfo, setUpdInfo] = useState<AppUpdateInfo | null>(null);
   /** true = 检查中或下载中（下载中由 dlProgress 非空区分） */
@@ -179,14 +184,12 @@ export default function SettingsWindow() {
 
   useEffect(() => {
     const isDark = effectiveTheme === "dark";
-    const bg = isDark ? "#000000" : "#fafafa";
-    const titleBar = isDark ? "#000000" : "#ebebeb";
-    const titleText = isDark ? "#e8eaed" : "#1f1f1f";
+    const colors = windowThemeColors(isDark);
     void invoke("sync_window_theme_command", {
       themeMode: isDark ? "dark" : "light",
-      backgroundColor: bg,
-      titleBarColor: titleBar,
-      titleBarTextColor: titleText,
+      backgroundColor: colors.backgroundColor,
+      titleBarColor: colors.titleBarColor,
+      titleBarTextColor: colors.titleBarTextColor,
     }).catch(() => {});
   }, [effectiveTheme]);
 
@@ -481,19 +484,17 @@ export default function SettingsWindow() {
     }
   };
 
-  const fmtSize = (b: number) =>
-    b >= 1024 * 1024 ? `${(b / 1024 / 1024).toFixed(1)} MB` : `${(b / 1024).toFixed(0)} KB`;
-
   const rebuildIdx = async () => {
     if (rebuildBusy) return;
     if (!confirm("将停止索引服务并重新扫描所选磁盘，期间搜索不可用。继续？")) return;
     setRebuildBusy(true);
+    setIndexOp(indexOpFeedback("rebuild", "working"));
     try {
       await invoke("save_findx_settings", { settings });
       await invoke("rebuild_index");
-      setHint("已开始重建索引（进度见主窗口状态条）");
+      setIndexOp(indexOpFeedback("rebuild", "submitted"));
     } catch (e) {
-      setHint(`重建失败: ${String(e)}`);
+      setIndexOp(indexOpFeedback("rebuild", "failed", String(e)));
     } finally {
       setRebuildBusy(false);
     }
@@ -510,13 +511,12 @@ export default function SettingsWindow() {
     )
       return;
     setCompactBusy(true);
-    setHint("正在压缩索引…（完成后会自动重启索引服务）");
+    setIndexOp(indexOpFeedback("compact", "working"));
     try {
       const r = await invoke<{ ok: boolean; message: string }>("compact_index");
-      setHint(r.message);
-      if (!r.ok) window.setTimeout(() => setHint(""), 10000);
+      setIndexOp(indexOpFeedback("compact", r.ok ? "submitted" : "failed", r.message));
     } catch (e) {
-      setHint(`压缩失败: ${String(e)}`);
+      setIndexOp(indexOpFeedback("compact", "failed", String(e)));
     } finally {
       setCompactBusy(false);
       // 服务重启后要重新加载 index.bin（秒级），立即查多半是 loading，延迟再拉。
@@ -641,30 +641,15 @@ export default function SettingsWindow() {
                   </>
                 )}
               </p>
-              <div className="fx-drives">
-                {availableDrives.length === 0 && (
-                  <span className="fx-hint">（加载磁盘列表中…）</span>
-                )}
-                {availableDrives.map((d) => {
-                  const drives = settings.drives ?? [];
-                  const checked = drives.includes(d);
-                  return (
-                    <Checkbox
-                      key={d}
-                      checked={checked}
-                      label={d}
-                      onChange={(on) => {
-                        setSettings((s) => {
-                          const cur = new Set(s.drives ?? []);
-                          if (on) cur.add(d);
-                          else cur.delete(d);
-                          return { ...s, drives: Array.from(cur) };
-                        });
-                      }}
-                    />
-                  );
-                })}
-              </div>
+              {availableDrives.length === 0 ? (
+                <p className="fx-hint">（加载磁盘列表中…）</p>
+              ) : (
+                <IndexRangeList
+                  paths={availableDrives}
+                  selected={settings.drives ?? []}
+                  onChange={(drives) => setSettings((s) => ({ ...s, drives }))}
+                />
+              )}
             </fieldset>
 
             <fieldset className="fx-settings-group">
@@ -773,6 +758,11 @@ export default function SettingsWindow() {
                   {suggest && (
                     <p className="fx-warn">
                       ⚠ 墓碑占比已超过 25%，占着内存与文件体积还拖慢加载，建议压缩回收。
+                    </p>
+                  )}
+                  {indexOp && (
+                    <p className="fx-settings-op" role="status">
+                      {indexOp}
                     </p>
                   )}
                 </>
@@ -910,107 +900,22 @@ export default function SettingsWindow() {
         {settingsTab === "advanced" && (
           <div>
             {/* 应用更新卡片 */}
-            <div className="fx-update-card">
-              <div className="fx-update-card-header">
-                <h3 className="fx-update-card-title">应用更新</h3>
-                {updBusy && !dlProgress && (
-                  <span className="fx-update-card-status">检查中...</span>
-                )}
-                {updBusy && dlProgress && (
-                  <span className="fx-update-card-status">下载中...</span>
-                )}
-                {!updBusy && downloadedPath && (
-                  <span className="fx-update-card-status">已下载,可安装</span>
-                )}
-                {!updBusy && updInfo && !updInfo.hasUpdate && (
-                  <span className="fx-update-card-status">已是最新</span>
-                )}
-              </div>
-
-              <div className="fx-update-card-actions">
-                <Button
-                  onClick={() => void checkUpdateFromGithub()}
-                  disabled={updBusy}
-                  size="sm"
-                >
-                  {updBusy && !dlProgress ? "检查中..." : "检查更新"}
-                </Button>
-                {updInfo?.hasUpdate && updInfo.downloadUrl && !updBusy && !downloadedPath && (
-                  <Button
-                    variant="primary"
-                    size="sm"
-                    onClick={() => void startDownload()}
-                  >
-                    下载 {updInfo.latestVersion}
-                    {updInfo.assetSize ? ` (${fmtSize(updInfo.assetSize)})` : ""}
-                  </Button>
-                )}
-                {updBusy && dlProgress && (
-                  <Button size="sm" onClick={() => void cancelDownload()}>
-                    取消下载
-                  </Button>
-                )}
-                {downloadedPath && !updBusy && (
-                  <Button
-                    variant="primary"
-                    size="sm"
-                    onClick={() => void installUpdate()}
-                  >
-                    安装更新并重启
-                  </Button>
-                )}
-              </div>
-
-              {dlProgress && (
-                <div className="fx-update-progress">
-                  <div className="fx-update-progress-bar-bg">
-                    <div
-                      className="fx-update-progress-bar"
-                      style={{
-                        width: `${Math.min(100, Math.max(0, dlProgress.percent))}%`,
-                      }}
-                    />
-                  </div>
-                  <p className="fx-update-progress-text">
-                    {dlProgress.total > 0
-                      ? `${dlProgress.percent.toFixed(1)}% (${fmtSize(dlProgress.downloaded)} / ${fmtSize(dlProgress.total)})`
-                      : `已下载 ${fmtSize(dlProgress.downloaded)}`}
-                  </p>
-                </div>
-              )}
-
-              {updInfo?.hasUpdate && updInfo.releaseNotes && (
-                <div className="fx-update-release-notes">
-                  <p><strong>新版本 {updInfo.latestVersion}</strong>（当前 {updInfo.currentVersion}）</p>
-                  <p>{updInfo.releaseNotes}</p>
-                </div>
-              )}
-
-              <Checkbox
-                checked={settings.autoCheckUpdate ?? true}
-                onChange={(checked) =>
-                  setSettings((s) => ({ ...s, autoCheckUpdate: checked }))
-                }
-                label="启动时自动检查更新（仅提示，不自动下载）"
-              />
-
-              <Hint variant="info">
-                更新流程：检查 → 下载（带进度）→ 静默安装（弹一次管理员授权）→ 自动重启。
-                也可到{" "}
-                <a
-                  href="https://github.com/chaojimct/findx/releases"
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  GitHub Releases
-                </a>{" "}
-                手动下载。
-              </Hint>
-            </div>
+            <UpdateCard
+              busy={updBusy}
+              info={updInfo}
+              progress={dlProgress}
+              downloadedPath={downloadedPath}
+              autoCheck={settings.autoCheckUpdate ?? true}
+              onAutoCheck={(checked) => setSettings((s) => ({ ...s, autoCheckUpdate: checked }))}
+              onCheck={() => void checkUpdateFromGithub()}
+              onDownload={() => void startDownload()}
+              onCancel={() => void cancelDownload()}
+              onInstall={() => void installUpdate()}
+            />
 
             <SettingsRow
               label="界面主题"
-              hint="改主题会立刻预览。未保存就关闭时，会回到打开设置页时的主题。深色背景为纯黑 #000。"
+              hint="改主题会立刻预览。未保存就关闭时，会回到打开设置页时的主题。"
             >
               <RadioGroup
                 name="ui-theme"
@@ -1019,7 +924,7 @@ export default function SettingsWindow() {
                 onChange={setUiThemePref}
                 options={[
                   { value: "light", label: "浅色" },
-                  { value: "dark", label: "深色（全黑）" },
+                  { value: "dark", label: "深色" },
                   { value: "system", label: "跟随系统" },
                 ]}
               />

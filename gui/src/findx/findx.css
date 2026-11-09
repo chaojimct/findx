@@ -92,8 +92,8 @@ html {
 }
 
 :root[data-fx-theme="dark"] .fx-update-banner {
-  background: color-mix(in srgb, var(--fx-accent) 18%, #0d0d0d);
-  border-bottom-color: color-mix(in srgb, var(--fx-accent) 35%, #333);
+  background: color-mix(in srgb, var(--fx-accent) 18%, var(--fx-surface));
+  border-bottom-color: var(--fx-border);
 }
 
 .fx-search-bar {
@@ -376,10 +376,10 @@ html {
   font-weight: 600;
 }
 
-.fx-table th:nth-child(3) .fx-th-btn {
+.fx-table th.fx-col-size .fx-th-btn {
   justify-content: flex-end;
 }
-.fx-table td:nth-child(3) {
+.fx-table td.fx-col-size {
   text-align: right;
 }
 
@@ -415,8 +415,8 @@ html {
 }
 
 .fx-th-btn span {
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow: visible;
+  text-overflow: clip;
   white-space: nowrap;
 }
 
@@ -545,14 +545,12 @@ html {
 }
 
 .fx-index-line {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   min-width: 0;
-  max-width: min(520px, 58vw);
+  max-width: min(420px, 46vw);
   text-align: right;
   line-height: 1.35;
   color: var(--fx-sub);
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -912,6 +910,8 @@ html {
 }
 
 .fx-preview-title {
+  flex: 1;
+  min-width: 0;
   font-weight: 600;
   color: var(--fx-text);
   white-space: nowrap;
@@ -975,9 +975,41 @@ html {
   font-family: ui-monospace, "JetBrains Mono", "Cascadia Mono", Consolas, "Courier New", monospace;
   font-size: 12px;
   line-height: 1.55;
-  white-space: pre;
   color: var(--fx-text);
   background: var(--fx-white);
+}
+
+.fx-preview-text--prose {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.fx-preview-text--code {
+  white-space: pre;
+  overflow: auto;
+}
+
+.fx-bounded-tip {
+  position: fixed;
+  z-index: 80;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--fx-border);
+  border-radius: 4px;
+  background: var(--fx-surface-raised);
+  color: var(--fx-text-primary);
+  font-size: 12px;
+  line-height: 1.45;
+  font-weight: 400;
+  text-align: left;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  overflow: auto;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.28);
+  pointer-events: none;
 }
 
 /* 内置 File Viewer：铺满预览栈，Shadow DOM 内部自己滚 */

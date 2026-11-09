@@ -24,8 +24,8 @@
             (t === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
           var mode = dark ? "dark" : "light";
           document.documentElement.setAttribute("data-fx-theme", mode);
-          document.documentElement.style.background = dark ? "#000000" : "#fafafa";
-          document.body.style.background = dark ? "#000000" : "#fafafa";
+          document.documentElement.style.background = dark ? "#1b1b1b" : "#fafafa";
+          document.body.style.background = dark ? "#1b1b1b" : "#fafafa";
         } catch (e) {
           document.documentElement.setAttribute("data-fx-theme", "light");
           document.documentElement.style.background = "#fafafa";

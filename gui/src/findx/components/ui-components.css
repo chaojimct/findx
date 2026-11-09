@@ -99,6 +99,18 @@
 
 .fx-input {
   height: var(--fx-control-md);
+  min-height: var(--fx-control-md);
+  max-height: var(--fx-control-md);
+  flex: 0 0 auto;
+  align-self: flex-start;
+  padding: 0 var(--fx-space-md);
+  line-height: calc(var(--fx-control-md) - 2px);
+}
+
+/* 窄数字框只限制宽度。列方向的 flex-basis 会被当成高度，不能写在这里。 */
+.fx-input.fx-input-narrow {
+  width: 8.5rem;
+  max-width: 100%;
 }
 
 .fx-input[type="number"] {

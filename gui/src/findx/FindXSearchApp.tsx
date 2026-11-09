@@ -6,13 +6,25 @@ import "./design-tokens.css";
 import "./findx.css";
 import type { AppUpdateInfo, FindxGuiSettings, UiThemePref } from "./findxGuiTypes";
 import { UI_THEME_KEY, loadUiThemePref } from "./findxGuiTypes";
+import { BoundedTip } from "./BoundedTip";
+import { summarizeIndexStatus } from "./indexStatus";
 import { IconHistory, IconPreview, IconSettings, IconSidebar } from "./icons";
 import { PreviewPane } from "./PreviewPane";
 import {
-  applyColumnDrag,
-  layoutColumnFractions,
+  applyColumnDragBetween,
+  COL_INDEX,
+  COL_LABEL,
+  COLUMN_HEADER_MIN_PX,
+  columnPixelWidths,
+  PREVIEW_AUTO_HIDE_BELOW,
+  resolvePanelOpen,
   RESULT_ROW_HEIGHT_PX,
+  SIDEBAR_AUTO_HIDE_BELOW,
+  visibleColumnIds,
+  type ColId,
 } from "./resultTableLayout";
+import { moveResultSelection, scrollTopForRow, type ResultNavKey } from "./resultSelection";
+import { windowThemeColors } from "./themeColors";
 
 /** 预览面板宽度（px）持久化 key；与 fx-preview 默认 320 配套。 */
 const PREVIEW_WIDTH_KEY = "findx2_preview_width";
@@ -277,8 +289,8 @@ export default function FindXSearchApp() {
   const loadingMoreRef = useRef(false);
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState("就绪");
-  const [indexLine, setIndexLine] = useState("索引: …");
-  const [hasIndexDetail, setHasIndexDetail] = useState(false);
+  const [indexSummary, setIndexSummary] = useState("索引 …");
+  const [indexDetail, setIndexDetail] = useState<string | null>(null);
   const [showIndexDetail, setShowIndexDetail] = useState(false);
   const [selected, setSelected] = useState<number | null>(null);
   // 预览面板状态：默认开启 + 持久化宽度
@@ -328,6 +340,39 @@ export default function FindXSearchApp() {
       /* ignore */
     }
   }, [previewWidth]);
+  const [windowWidth, setWindowWidth] = useState(() =>
+    typeof window === "undefined" ? 1200 : window.innerWidth,
+  );
+  const [sidebarForce, setSidebarForce] = useState<"show" | "hide" | null>(null);
+  const [previewForce, setPreviewForce] = useState<"show" | "hide" | null>(null);
+  const prevWindowWidth = useRef(windowWidth);
+  useEffect(() => {
+    const onResize = () => setWindowWidth(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  useEffect(() => {
+    const prev = prevWindowWidth.current;
+    if (prev < PREVIEW_AUTO_HIDE_BELOW && windowWidth >= PREVIEW_AUTO_HIDE_BELOW) {
+      setPreviewForce(null);
+    }
+    if (prev < SIDEBAR_AUTO_HIDE_BELOW && windowWidth >= SIDEBAR_AUTO_HIDE_BELOW) {
+      setSidebarForce(null);
+    }
+    prevWindowWidth.current = windowWidth;
+  }, [windowWidth]);
+  const sidebarShown = resolvePanelOpen({
+    windowWidth,
+    savedOpen: sidebarOpen,
+    forced: sidebarForce,
+    kind: "sidebar",
+  });
+  const previewShown = resolvePanelOpen({
+    windowWidth,
+    savedOpen: previewOpen,
+    forced: previewForce,
+    kind: "preview",
+  });
   const [sortCol, setSortCol] = useState<SortCol>(null);
   const [sortAsc, setSortAsc] = useState(true);
   const [histOpen, setHistOpen] = useState(false);
@@ -351,7 +396,7 @@ export default function FindXSearchApp() {
   const [showV2MigrationNotice, setShowV2MigrationNotice] = useState(false);
   /** GitHub Release 有新版本时顶部提示条 */
   const [updateBanner, setUpdateBanner] = useState<AppUpdateInfo | null>(null);
-  /** 界面主题：浅 / 深（全黑）/ 跟随系统 */
+  /** 界面主题：浅 / 深 / 跟随系统。深色是分层深灰。 */
   const [uiThemePref, setUiThemePref] = useState<UiThemePref>(() => loadUiThemePref());
   const [systemDark, setSystemDark] = useState(
     () => window.matchMedia("(prefers-color-scheme: dark)").matches,
@@ -360,7 +405,7 @@ export default function FindXSearchApp() {
   const [colFrac, setColFrac] = useState<[number, number, number, number]>(() => loadColFracs());
   const colFracRef = useRef(colFrac);
   colFracRef.current = colFrac;
-  const colResizeRef = useRef<{ i: number; startX: number; base: number[] } | null>(null);
+  const colResizeRef = useRef<{ i: number; right: number; startX: number; base: number[] } | null>(null);
 
   useEffect(() => {
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
@@ -398,14 +443,12 @@ export default function FindXSearchApp() {
   /** 与页面 data-fx-theme 一致，同步 WebView2 / Windows 标题栏与窗口背景 */
   useEffect(() => {
     const isDark = effectiveTheme === "dark";
-    const bg = isDark ? "#000000" : "#fafafa";
-    const titleBar = isDark ? "#000000" : "#ebebeb";
-    const titleText = isDark ? "#e8eaed" : "#1f1f1f";
+    const colors = windowThemeColors(isDark);
     void invoke("sync_window_theme_command", {
       themeMode: isDark ? "dark" : "light",
-      backgroundColor: bg,
-      titleBarColor: titleBar,
-      titleBarTextColor: titleText,
+      backgroundColor: colors.backgroundColor,
+      titleBarColor: colors.titleBarColor,
+      titleBarTextColor: colors.titleBarTextColor,
     }).catch(() => {
       /* 浏览器预览或非 Tauri 环境 */
     });
@@ -422,11 +465,12 @@ export default function FindXSearchApp() {
     return () => document.removeEventListener("mousedown", onDown);
   }, [histOpen]);
 
-  const onColResizeStart = useCallback((leftIdx: 0 | 1 | 2, e: React.MouseEvent) => {
+  const onColResizeStart = useCallback((leftIdx: number, rightIdx: number, e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
     colResizeRef.current = {
       i: leftIdx,
+      right: rightIdx,
       startX: e.clientX,
       base: [...colFracRef.current],
     };
@@ -437,7 +481,13 @@ export default function FindXSearchApp() {
       const tw = wrap.clientWidth;
       if (tw <= 0) return;
       const deltaPx = ev.clientX - st.startX;
-      const next = applyColumnDrag(st.base as [number, number, number, number], st.i as 0 | 1 | 2, deltaPx, tw);
+      const next = applyColumnDragBetween(
+        st.base as [number, number, number, number],
+        st.i,
+        st.right,
+        deltaPx,
+        tw,
+      );
       colFracRef.current = next;
       setColFrac(next);
     };
@@ -604,82 +654,32 @@ export default function FindXSearchApp() {
         indexing: st.indexing === true,
         metadataReady: st.metadataReady !== false,
       });
-      if (st.indexing === true) {
-        const msg = st.indexingMessage?.trim();
-        const vt = st.indexingVolumesTotal;
-        const vd = st.indexingVolumesDone;
-        const phase = st.indexingPhase;
-        const entries = st.indexingEntriesIndexed ?? (raw.indexing_entries_indexed as number | undefined);
-        const curVol = st.indexingCurrentVolume?.trim();
-        const phaseZh = (p: string | undefined) => {
-          switch (p) {
-            case "starting":
-              return "准备";
-            case "scanning":
-              return "扫描";
-            case "merging":
-              return "合并";
-            case "writing":
-              return "写入";
-            default:
-              return p ?? "";
-          }
-        };
-        // 两种截然不同的 `indexing=true`：
-        //   1) 真在建库（本地跑 CLI），进度来自 index.indexing.json；
-        //   2) service 已起、正在反序列化已存在的 index.bin（loadingStage 有值）。
-        // 混成一句「建库中」会让上亿条目的加载看起来像卡死——见 2.4.0 CHANGELOG。
-        const stage = st.loadingStage?.trim();
-        let fullLine: string;
-        let hasDetail = false;
-        if (stage && !phase && entries == null) {
-          fullLine = `索引: 加载中 · ${stage}`;
-          hasDetail = stage.length > 40;
-        } else if (!phase && entries == null && st.loadingElapsedSecs != null) {
-          fullLine = `索引: 加载中（已 ${st.loadingElapsedSecs}s）· 完成后自动可用`;
-          hasDetail = true;
-        } else {
-          const segs: string[] = ["索引: 建库中"];
-          if (phase) segs.push(`阶段 ${phaseZh(phase)}`);
-          if (entries != null && !Number.isNaN(entries)) segs.push(`已收录约 ${entries.toLocaleString()} 条`);
-          if (vt != null && vt > 0 && vd != null) segs.push(`卷进度 ${vd}/${vt}`);
-          if (curVol) segs.push(`当前卷 ${curVol}`);
-          if (msg) segs.push(msg);
-          if (stage) segs.push(stage);
-          if (segs.length === 1) {
-            segs.push("（读取 index.indexing.json，完成后将自动启动服务）");
-          }
-          fullLine = segs.join(" · ");
-          hasDetail = segs.length > 2;
-        }
-        setIndexLine(fullLine);
-        setHasIndexDetail(hasDetail);
-      } else if (st.lastError) {
-        const fullLine = `索引: ${indexedCount.toLocaleString()} 条 · ${st.lastError}`;
-        setIndexLine(fullLine);
-        setHasIndexDetail(st.lastError.length > 40);
-      } else if (st.metadataReady === false) {
-        const bd = st.backfillDone ?? 0;
-        const bt = st.backfillTotal ?? 0;
-        const pct = bt > 0 ? Math.min(100, Math.round((bd / bt) * 100)) : null;
-        const base = `索引: ${indexedCount.toLocaleString()} 条`;
-        let fullLine: string;
-        if (!(settings.enableMetadataBackfill ?? true)) {
-          fullLine = `${base} · 元数据回填已关闭（可在设置中开启）`;
-        } else if (pct !== null) {
-          fullLine = `${base} · 元数据回填 ${pct}%（${bd.toLocaleString()}/${bt.toLocaleString()}）`;
-        } else {
-          fullLine = `${base} · 元数据回填中…`;
-        }
-        setIndexLine(fullLine);
-        setHasIndexDetail(fullLine.length > 50);
-      } else {
-        const fullLine = `索引: ${indexedCount.toLocaleString()} 条`;
-        setIndexLine(fullLine);
-        setHasIndexDetail(false);
-      }
+      const entries =
+        st.indexingEntriesIndexed ??
+        (typeof raw.indexing_entries_indexed === "number" ? raw.indexing_entries_indexed : undefined);
+      const view = summarizeIndexStatus({
+        indexing: st.indexing === true,
+        indexedCount,
+        metadataReady: st.metadataReady,
+        backfillDone: st.backfillDone,
+        backfillTotal: st.backfillTotal,
+        indexingPhase: st.indexingPhase,
+        indexingVolumesTotal: st.indexingVolumesTotal,
+        indexingVolumesDone: st.indexingVolumesDone,
+        indexingMessage: st.indexingMessage,
+        indexingEntriesIndexed: entries,
+        indexingCurrentVolume: st.indexingCurrentVolume,
+        loadingStage: st.loadingStage,
+        loadingElapsedSecs: st.loadingElapsedSecs,
+        lastError: st.lastError,
+        enableMetadataBackfill: settings.enableMetadataBackfill ?? true,
+      });
+      setIndexSummary(view.summary);
+      setIndexDetail(view.detail);
     } catch (e) {
-      setIndexLine(`索引状态: ${String(e)}`);
+      const view = summarizeIndexStatus({ lastError: String(e), indexedCount: 0 });
+      setIndexSummary(view.summary);
+      setIndexDetail(view.detail);
     }
   }, [settings.enableMetadataBackfill]);
 
@@ -881,6 +881,41 @@ export default function FindXSearchApp() {
     }
   };
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const nav = e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Home" || e.key === "End";
+      if (!nav && e.key !== "Enter") return;
+      if (e.altKey || e.ctrlKey || e.metaKey) return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      const typingElsewhere =
+        tag === "TEXTAREA" ||
+        target?.isContentEditable === true ||
+        (tag === "INPUT" && target !== searchInputRef.current);
+      if (typingElsewhere) return;
+      if (tag === "INPUT" && (e.key === "Home" || e.key === "End")) return;
+      if (e.key === "Enter") {
+        if (tag === "INPUT" || tag === "BUTTON" || selected === null) return;
+        e.preventDefault();
+        void openSelected();
+        return;
+      }
+      if (sortedHits.length === 0) return;
+      e.preventDefault();
+      setSelected((cur) => moveResultSelection(cur, e.key as ResultNavKey, sortedHits.length));
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [openSelected, selected, sortedHits.length]);
+
+  useEffect(() => {
+    if (selected == null) return;
+    const el = tableScrollRef.current;
+    if (!el) return;
+    const next = scrollTopForRow(selected, ROW_HEIGHT, el.scrollTop, el.clientHeight);
+    if (next !== el.scrollTop) el.scrollTop = next;
+  }, [selected, ROW_HEIGHT]);
+
   const acknowledgeV2MigrationNotice = () => {
     try {
       localStorage.setItem(V2_MIGRATION_NOTICE_ACK_KEY, "1");
@@ -986,7 +1021,7 @@ export default function FindXSearchApp() {
       </div>
 
       <div className="fx-main">
-        {sidebarOpen && <aside className="fx-sidebar">
+        {sidebarShown && <aside className="fx-sidebar">
           <h3>筛选</h3>
           {(
             [
@@ -1070,83 +1105,97 @@ export default function FindXSearchApp() {
               const padTop = startIdx * ROW_HEIGHT;
               const padBottom = Math.max(0, (total - endIdx) * ROW_HEIGHT);
               const slice = sortedHits.slice(startIdx, endIdx);
-              const shownFrac = layoutColumnFractions(colFrac, tableWidth);
-              const colPct = (i: 0 | 1 | 2 | 3) => `${(shownFrac[i] * 100).toFixed(3)}%`;
+              const visible = visibleColumnIds(tableWidth);
+              const widths = columnPixelWidths(colFrac, tableWidth, visible);
+              const tablePx = visible.reduce((sum, id) => sum + widths[id], 0);
               const sortInd = (col: Exclude<SortCol, null>) =>
                 sortCol === col ? (
                   <span className="fx-sort-ind" aria-hidden>
                     {sortAsc ? "▲" : "▼"}
                   </span>
                 ) : null;
+              const cell = (id: ColId, row: SearchHit) => {
+                if (id === "name") {
+                  return (
+                    <td key={id}>
+                      {row.isDirectory ? "📁 " : ""}
+                      <HighlightText text={row.name} qRaw={q} serverRanges={row.nameHighlight} />
+                    </td>
+                  );
+                }
+                if (id === "path") {
+                  return (
+                    <td key={id} className="fx-path">
+                      <BoundedTip text={row.path}>
+                        <HighlightText text={row.path} qRaw={q} />
+                      </BoundedTip>
+                    </td>
+                  );
+                }
+                if (id === "size") {
+                  return (
+                    <td key={id} className="fx-col-size">
+                      {!indexMeta.metadataReady && !row.isDirectory && row.size === 0
+                        ? "—"
+                        : formatSize(row.size, row.isDirectory)}
+                    </td>
+                  );
+                }
+                return (
+                  <td key={id}>
+                    {!row.isDirectory && row.modifiedUnix === 0 ? "—" : formatTime(row.modifiedUnix)}
+                  </td>
+                );
+              };
               return (
                 <table
                   className="fx-table"
-                  style={{ ["--fx-row-height" as string]: `${ROW_HEIGHT}px` }}
+                  style={{
+                    ["--fx-row-height" as string]: `${ROW_HEIGHT}px`,
+                    width: Math.max(tableWidth, tablePx),
+                    minWidth: tablePx,
+                  }}
                 >
                   <colgroup>
-                    <col style={{ width: colPct(0) }} />
-                    <col style={{ width: colPct(1) }} />
-                    <col style={{ width: colPct(2) }} />
-                    <col style={{ width: colPct(3) }} />
+                    {visible.map((id) => (
+                      <col key={id} style={{ width: widths[id] }} />
+                    ))}
                   </colgroup>
                   <thead>
                     <tr>
-                      <th scope="col">
-                        <div className="fx-th-cell">
-                          <button type="button" className="fx-th-btn" onClick={() => onHeaderClick("name")}>
-                            <span>名称</span>
-                            {sortInd("name")}
-                          </button>
-                          <div
-                            className="fx-col-resize"
-                            role="separator"
-                            aria-hidden
-                            onMouseDown={(e) => onColResizeStart(0, e)}
-                          />
-                        </div>
-                      </th>
-                      <th scope="col">
-                        <div className="fx-th-cell">
-                          <button type="button" className="fx-th-btn" onClick={() => onHeaderClick("path")}>
-                            <span>路径</span>
-                            {sortInd("path")}
-                          </button>
-                          <div
-                            className="fx-col-resize"
-                            role="separator"
-                            aria-hidden
-                            onMouseDown={(e) => onColResizeStart(1, e)}
-                          />
-                        </div>
-                      </th>
-                      <th scope="col">
-                        <div className="fx-th-cell">
-                          <button type="button" className="fx-th-btn" onClick={() => onHeaderClick("size")}>
-                            <span>大小</span>
-                            {sortInd("size")}
-                          </button>
-                          <div
-                            className="fx-col-resize"
-                            role="separator"
-                            aria-hidden
-                            onMouseDown={(e) => onColResizeStart(2, e)}
-                          />
-                        </div>
-                      </th>
-                      <th scope="col">
-                        <div className="fx-th-cell">
-                          <button type="button" className="fx-th-btn" onClick={() => onHeaderClick("mtime")}>
-                            <span>修改时间</span>
-                            {sortInd("mtime")}
-                          </button>
-                        </div>
-                      </th>
+                      {visible.map((id, index) => {
+                        const next = visible[index + 1];
+                        return (
+                          <th
+                            key={id}
+                            scope="col"
+                            className={id === "size" ? "fx-col-size" : undefined}
+                            style={{ minWidth: COLUMN_HEADER_MIN_PX[id] }}
+                          >
+                            <div className="fx-th-cell">
+                              <button type="button" className="fx-th-btn" onClick={() => onHeaderClick(id)}>
+                                <span>{COL_LABEL[id]}</span>
+                                {sortInd(id)}
+                              </button>
+                              {next && (
+                                <div
+                                  className="fx-col-resize"
+                                  role="separator"
+                                  aria-orientation="vertical"
+                                  aria-hidden
+                                  onMouseDown={(e) => onColResizeStart(COL_INDEX[id], COL_INDEX[next], e)}
+                                />
+                              )}
+                            </div>
+                          </th>
+                        );
+                      })}
                     </tr>
                   </thead>
                   <tbody>
                     {padTop > 0 && (
                       <tr aria-hidden="true" style={{ height: padTop }}>
-                        <td colSpan={4} style={{ padding: 0, border: 0 }} />
+                        <td colSpan={visible.length} style={{ padding: 0, border: 0 }} />
                       </tr>
                     )}
                     {slice.map((row, j) => {
@@ -1176,40 +1225,13 @@ export default function FindXSearchApp() {
                             }).catch((err) => setStatus(String(err)));
                           }}
                         >
-                          <td>
-                            {row.isDirectory ? "📁 " : ""}
-                            <HighlightText
-                              text={row.name}
-                              qRaw={q}
-                              serverRanges={row.nameHighlight}
-                            />
-                          </td>
-                          <td className="fx-path" title={row.path}>
-                            <HighlightText text={row.path} qRaw={q} />
-                          </td>
-                          <td style={{ textAlign: "right" }}>
-                            {/* fast 模式下后台未完成回填时，size 字段对未回填文件就是 0 —— 显示为 "—"。
-                                完成后真空文件（极少数）会显示 0 B，可接受。 */}
-                            {!indexMeta.metadataReady &&
-                            !row.isDirectory &&
-                            row.size === 0
-                              ? "—"
-                              : formatSize(row.size, row.isDirectory)}
-                          </td>
-                          <td>
-                            {/* mtime 在 fast 首遍后已经是 USN TimeStamp（近似值，秒级精度）；
-                                backfill 完成后会被 STANDARD_INFORMATION 覆盖为权威值。
-                                这里只在确实拿到 0（USN 都没记录到）时才显示 "—"。 */}
-                            {!row.isDirectory && row.modifiedUnix === 0
-                              ? "—"
-                              : formatTime(row.modifiedUnix)}
-                          </td>
+                          {visible.map((id) => cell(id, row))}
                         </tr>
                       );
                     })}
                     {padBottom > 0 && (
                       <tr aria-hidden="true" style={{ height: padBottom }}>
-                        <td colSpan={4} style={{ padding: 0, border: 0 }} />
+                        <td colSpan={visible.length} style={{ padding: 0, border: 0 }} />
                       </tr>
                     )}
                   </tbody>
@@ -1219,7 +1241,7 @@ export default function FindXSearchApp() {
           </div>
         </div>
 
-        {previewOpen && (
+        {previewShown && (
           <>
             <div
               className="fx-preview-resizer"
@@ -1264,10 +1286,8 @@ export default function FindXSearchApp() {
           <span>{status}</span>
         </div>
         <span className="fx-status-right">
-          <span className="fx-index-line" title={hasIndexDetail ? indexLine : undefined}>
-            {indexLine}
-          </span>
-          {hasIndexDetail && (
+          <span className="fx-index-line">{indexSummary}</span>
+          {indexDetail && (
             <button
               type="button"
               className="fx-btn-icon"
@@ -1289,21 +1309,29 @@ export default function FindXSearchApp() {
           )}
           <button
             type="button"
-            className={`fx-btn-icon ${sidebarOpen ? "active" : ""}`}
-            title={sidebarOpen ? "隐藏侧栏" : "显示侧栏"}
-            aria-pressed={sidebarOpen}
-            aria-label={sidebarOpen ? "隐藏侧栏" : "显示侧栏"}
-            onClick={() => setSidebarOpen((v) => !v)}
+            className={`fx-btn-icon ${sidebarShown ? "active" : ""}`}
+            title={sidebarShown ? "隐藏侧栏" : "显示侧栏"}
+            aria-pressed={sidebarShown}
+            aria-label={sidebarShown ? "隐藏侧栏" : "显示侧栏"}
+            onClick={() => {
+              const next = !sidebarShown;
+              setSidebarOpen(next);
+              setSidebarForce(windowWidth < SIDEBAR_AUTO_HIDE_BELOW ? (next ? "show" : "hide") : null);
+            }}
           >
             <IconSidebar />
           </button>
           <button
             type="button"
-            className={`fx-btn-icon ${previewOpen ? "active" : ""}`}
-            title={previewOpen ? "关闭预览面板" : "打开预览面板"}
-            aria-pressed={previewOpen}
-            aria-label={previewOpen ? "关闭预览面板" : "打开预览面板"}
-            onClick={() => setPreviewOpen((v) => !v)}
+            className={`fx-btn-icon ${previewShown ? "active" : ""}`}
+            title={previewShown ? "关闭预览面板" : "打开预览面板"}
+            aria-pressed={previewShown}
+            aria-label={previewShown ? "关闭预览面板" : "打开预览面板"}
+            onClick={() => {
+              const next = !previewShown;
+              setPreviewOpen(next);
+              setPreviewForce(windowWidth < PREVIEW_AUTO_HIDE_BELOW ? (next ? "show" : "hide") : null);
+            }}
           >
             <IconPreview />
           </button>
@@ -1335,8 +1363,13 @@ export default function FindXSearchApp() {
           >
             <h3>索引状态详情</h3>
             <p style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", lineHeight: "1.6" }}>
-              {indexLine}
+              {indexSummary}
             </p>
+            {indexDetail && (
+              <p style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", lineHeight: "1.6" }}>
+                {indexDetail}
+              </p>
+            )}
             <div className="fx-v2-notice-actions">
               <button
                 type="button"
