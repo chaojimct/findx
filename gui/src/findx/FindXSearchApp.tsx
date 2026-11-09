@@ -17,13 +17,14 @@ import {
   COLUMN_HEADER_MIN_PX,
   columnPixelWidths,
   PREVIEW_AUTO_HIDE_BELOW,
-  resolvePanelOpen,
+  resolvePanels,
   RESULT_ROW_HEIGHT_PX,
   SIDEBAR_AUTO_HIDE_BELOW,
   visibleColumnIds,
   type ColId,
 } from "./resultTableLayout";
-import { moveResultSelection, scrollTopForRow, type ResultNavKey } from "./resultSelection";
+import { ResultNavigation } from "./resultNavigation";
+import { scrollTopForRow } from "./resultSelection";
 import { windowThemeColors } from "./themeColors";
 
 /** 预览面板宽度（px）持久化 key；与 fx-preview 默认 320 配套。 */
@@ -340,39 +341,47 @@ export default function FindXSearchApp() {
       /* ignore */
     }
   }, [previewWidth]);
-  const [windowWidth, setWindowWidth] = useState(() =>
-    typeof window === "undefined" ? 1200 : window.innerWidth,
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [contentWidth, setContentWidth] = useState(() =>
+    typeof document === "undefined" ? 0 : document.documentElement.clientWidth,
   );
   const [sidebarForce, setSidebarForce] = useState<"show" | "hide" | null>(null);
   const [previewForce, setPreviewForce] = useState<"show" | "hide" | null>(null);
-  const prevWindowWidth = useRef(windowWidth);
-  useEffect(() => {
-    const onResize = () => setWindowWidth(window.innerWidth);
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
+  const prevContentWidth = useRef(contentWidth);
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    const read = () => {
+      const rootW = root?.clientWidth ?? 0;
+      const docW = document.documentElement.clientWidth;
+      const next = rootW > 0 && docW > 0 ? Math.min(rootW, docW) : rootW || docW;
+      setContentWidth(next);
+    };
+    read();
+    const ro = new ResizeObserver(read);
+    if (root) ro.observe(root);
+    ro.observe(document.documentElement);
+    return () => ro.disconnect();
   }, []);
   useEffect(() => {
-    const prev = prevWindowWidth.current;
-    if (prev < PREVIEW_AUTO_HIDE_BELOW && windowWidth >= PREVIEW_AUTO_HIDE_BELOW) {
+    const prev = prevContentWidth.current;
+    if (prev < PREVIEW_AUTO_HIDE_BELOW && contentWidth >= PREVIEW_AUTO_HIDE_BELOW) {
       setPreviewForce(null);
     }
-    if (prev < SIDEBAR_AUTO_HIDE_BELOW && windowWidth >= SIDEBAR_AUTO_HIDE_BELOW) {
+    if (prev < SIDEBAR_AUTO_HIDE_BELOW && contentWidth >= SIDEBAR_AUTO_HIDE_BELOW) {
       setSidebarForce(null);
     }
-    prevWindowWidth.current = windowWidth;
-  }, [windowWidth]);
-  const sidebarShown = resolvePanelOpen({
-    windowWidth,
-    savedOpen: sidebarOpen,
-    forced: sidebarForce,
-    kind: "sidebar",
+    prevContentWidth.current = contentWidth;
+  }, [contentWidth]);
+  const panels = resolvePanels({
+    contentWidth,
+    previewWidth,
+    savedSidebar: sidebarOpen,
+    savedPreview: previewOpen,
+    sidebarForce,
+    previewForce,
   });
-  const previewShown = resolvePanelOpen({
-    windowWidth,
-    savedOpen: previewOpen,
-    forced: previewForce,
-    kind: "preview",
-  });
+  const sidebarShown = panels.sidebar;
+  const previewShown = panels.preview;
   const [sortCol, setSortCol] = useState<SortCol>(null);
   const [sortAsc, setSortAsc] = useState(true);
   const [histOpen, setHistOpen] = useState(false);
@@ -882,33 +891,6 @@ export default function FindXSearchApp() {
   };
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const nav = e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Home" || e.key === "End";
-      if (!nav && e.key !== "Enter") return;
-      if (e.altKey || e.ctrlKey || e.metaKey) return;
-      const target = e.target as HTMLElement | null;
-      const tag = target?.tagName;
-      const typingElsewhere =
-        tag === "TEXTAREA" ||
-        target?.isContentEditable === true ||
-        (tag === "INPUT" && target !== searchInputRef.current);
-      if (typingElsewhere) return;
-      if (tag === "INPUT" && (e.key === "Home" || e.key === "End")) return;
-      if (e.key === "Enter") {
-        if (tag === "INPUT" || tag === "BUTTON" || selected === null) return;
-        e.preventDefault();
-        void openSelected();
-        return;
-      }
-      if (sortedHits.length === 0) return;
-      e.preventDefault();
-      setSelected((cur) => moveResultSelection(cur, e.key as ResultNavKey, sortedHits.length));
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [openSelected, selected, sortedHits.length]);
-
-  useEffect(() => {
     if (selected == null) return;
     const el = tableScrollRef.current;
     if (!el) return;
@@ -926,7 +908,14 @@ export default function FindXSearchApp() {
   };
 
   return (
-    <div className="fx-root">
+    <div className="fx-root" ref={rootRef}>
+      <ResultNavigation
+        count={sortedHits.length}
+        selected={selected}
+        onSelect={setSelected}
+        onOpen={() => void openSelected()}
+        searchInputRef={searchInputRef}
+      />
       {updateBanner?.releasePageUrl && updateBanner.latestVersion && (
         <div className="fx-update-banner" role="status">
           <span>
@@ -1093,7 +1082,12 @@ export default function FindXSearchApp() {
         </aside>}
 
         <div className="fx-results">
-          <div className="fx-table-wrap" ref={tableScrollRef}>
+          <div
+            className="fx-table-wrap"
+            ref={tableScrollRef}
+            tabIndex={0}
+            onMouseDown={() => tableScrollRef.current?.focus()}
+          >
             {(() => {
               // 计算可见窗口；为了避免 5000 行一次性渲染卡死浏览器主线程，仅渲染 [start, end)。
               const total = sortedHits.length;
@@ -1117,7 +1111,7 @@ export default function FindXSearchApp() {
               const cell = (id: ColId, row: SearchHit) => {
                 if (id === "name") {
                   return (
-                    <td key={id}>
+                    <td key={id} className="fx-name">
                       {row.isDirectory ? "📁 " : ""}
                       <HighlightText text={row.name} qRaw={q} serverRanges={row.nameHighlight} />
                     </td>
@@ -1208,7 +1202,10 @@ export default function FindXSearchApp() {
                           onMouseDown={(e) => {
                             if (e.button === 0) e.preventDefault();
                           }}
-                          onClick={() => setSelected(i)}
+                          onClick={() => {
+                            setSelected(i);
+                            tableScrollRef.current?.focus();
+                          }}
                           onDoubleClick={() => {
                             setSelected(i);
                             void invoke("open_file", { path: row.path }).catch((e) =>
@@ -1316,7 +1313,7 @@ export default function FindXSearchApp() {
             onClick={() => {
               const next = !sidebarShown;
               setSidebarOpen(next);
-              setSidebarForce(windowWidth < SIDEBAR_AUTO_HIDE_BELOW ? (next ? "show" : "hide") : null);
+              setSidebarForce(contentWidth < SIDEBAR_AUTO_HIDE_BELOW ? (next ? "show" : "hide") : null);
             }}
           >
             <IconSidebar />
@@ -1330,7 +1327,7 @@ export default function FindXSearchApp() {
             onClick={() => {
               const next = !previewShown;
               setPreviewOpen(next);
-              setPreviewForce(windowWidth < PREVIEW_AUTO_HIDE_BELOW ? (next ? "show" : "hide") : null);
+              setPreviewForce(contentWidth < PREVIEW_AUTO_HIDE_BELOW ? (next ? "show" : "hide") : null);
             }}
           >
             <IconPreview />

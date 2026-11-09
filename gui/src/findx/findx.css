@@ -202,6 +202,7 @@ html {
   display: flex;
   flex: 1;
   min-height: 0;
+  min-width: 0;
 }
 
 .fx-sidebar {
@@ -317,13 +318,24 @@ html {
   flex: 1 1 auto;
   display: flex;
   flex-direction: column;
-  min-width: 240px;
+  min-width: 0;
   background: var(--fx-bg);
 }
 
 .fx-table-wrap {
   flex: 1;
+  min-width: 0;
   overflow: auto;
+}
+
+.fx-table-wrap:focus {
+  outline: none;
+}
+
+.fx-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .fx-table {

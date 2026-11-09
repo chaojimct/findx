@@ -17,7 +17,9 @@ import {
   COL_LABEL,
   COLUMN_HEADER_MIN_PX,
   columnPixelWidths,
+  NAME_COLUMN_MIN_PX,
   resolvePanelOpen,
+  resolvePanels,
   visibleColumnIds,
 } from "../resultTableLayout";
 import { moveResultSelection, scrollTopForRow } from "../resultSelection";
@@ -31,6 +33,31 @@ function readSrc(rel: string): string {
 }
 
 describe("截图里的控件和主题", () => {
+  it("间隔框在列布局里仍是短的单行", () => {
+    const style = document.createElement("style");
+    style.textContent = [
+      readSrc("../design-tokens.css"),
+      readSrc("../components/ui-components.css"),
+      readSrc("../settings-window.css"),
+    ].join("\n");
+    document.head.appendChild(style);
+    const host = document.createElement("div");
+    host.className = "fx-settings-row-container";
+    host.style.width = "640px";
+    const input = document.createElement("input");
+    input.className = "fx-input fx-input-narrow";
+    input.value = "30";
+    host.appendChild(input);
+    document.body.appendChild(host);
+    const cs = getComputedStyle(input);
+    expect(parseFloat(cs.height)).toBeLessThanOrEqual(32);
+    expect(parseFloat(cs.maxHeight)).toBeLessThanOrEqual(32);
+    expect(parseFloat(cs.width)).toBeGreaterThan(40);
+    expect(parseFloat(cs.width)).toBeLessThan(200);
+    host.remove();
+    style.remove();
+  });
+
   it("窄输入不再用 flex-basis 充当高度", () => {
     const ui = readSrc("../components/ui-components.css");
     const settings = readSrc("../settings-window.css");
@@ -114,8 +141,9 @@ describe("窄表列和面板", () => {
   const saved = [0.28, 0.38, 0.1, 0.24] as [number, number, number, number];
 
   it("放不下表头就隐藏低优先列，可见列不窄于表头", () => {
-    expect(visibleColumnIds(180)).toEqual(["name", "path"]);
+    expect(visibleColumnIds(180)).toEqual(["name"]);
     expect(visibleColumnIds(120)).toEqual(["name"]);
+    expect(NAME_COLUMN_MIN_PX).toBeGreaterThanOrEqual(160);
     expect(visibleColumnIds(646)).toContain("size");
     const shown = visibleColumnIds(220);
     const px = columnPixelWidths(saved, 220, shown);
@@ -127,6 +155,29 @@ describe("窄表列和面板", () => {
     }
     expect(sum).toBeLessThanOrEqual(220 + 0.01);
     expect(COL_LABEL.size).toBe("大小");
+  });
+
+  it("647 宽且没有本次手动打开时，两块面板都收起", () => {
+    expect(
+      resolvePanels({
+        contentWidth: 647,
+        previewWidth: 360,
+        savedSidebar: true,
+        savedPreview: true,
+        sidebarForce: null,
+        previewForce: null,
+      }),
+    ).toEqual({ sidebar: false, preview: false });
+    expect(
+      resolvePanels({
+        contentWidth: 647,
+        previewWidth: 360,
+        savedSidebar: true,
+        savedPreview: true,
+        sidebarForce: "show",
+        previewForce: "show",
+      }),
+    ).toEqual({ sidebar: true, preview: true });
   });
 
   it("窄窗口自动收起面板，手动打开可以盖过自动策略", () => {
@@ -245,35 +296,51 @@ describe("jsdom：更新夹具只验证结构，不测量像素，也不是原�
     });
 
     expect(host.textContent).toContain("不会请求 GitHub");
+    expect(host.textContent).toContain("生产包不含此页");
     expect(host.querySelector("script")).toBeNull();
-    expect(host.textContent).toContain("<script>alert(1)</script>");
 
-    const shells = [...host.querySelectorAll(".fx-settings-window-root")];
-    expect(shells.length).toBeGreaterThanOrEqual(5);
-    let notesSeen = 0;
-    for (const shell of shells) {
-      const header = shell.querySelector(".fx-settings-header");
-      const footer = shell.querySelector(".fx-settings-footer");
-      const scroll = shell.querySelector(".fx-settings-content-scroll");
-      expect(header).toBeTruthy();
-      expect(footer).toBeTruthy();
-      expect(scroll).toBeTruthy();
-      expect(scroll?.contains(footer)).toBe(false);
-      expect(header?.contains(footer)).toBe(false);
-      const notes = shell.querySelector(".fx-update-release-notes");
-      if (!notes) continue;
-      notesSeen += 1;
-      expect(scroll?.contains(notes)).toBe(true);
-      expect(header?.contains(notes)).toBe(false);
-      expect(footer?.contains(notes)).toBe(false);
+    const clickPhase = async (label: string) => {
+      const button = [...host!.querySelectorAll(".fx-fixture-switch button")].find(
+        (item) => item.textContent === label,
+      );
+      await act(async () => {
+        button?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+    };
+    const assertNotesInScroll = () => {
+      const shell = host!.querySelector(".fx-settings-window-root");
+      const header = shell?.querySelector(".fx-settings-header");
+      const footer = shell?.querySelector(".fx-settings-footer");
+      const scroll = shell?.querySelector(".fx-settings-content-scroll");
+      const notes = shell?.querySelector(".fx-update-release-notes");
+      expect(scroll?.contains(footer ?? null)).toBe(false);
+      expect(header?.contains(notes ?? null)).toBe(false);
+      expect(footer?.contains(notes ?? null)).toBe(false);
+      expect(scroll?.contains(notes ?? null)).toBe(true);
       expect(footer?.textContent ?? "").not.toContain("一二三四五六七八九十");
-    }
-    expect(notesSeen).toBeGreaterThan(0);
-    expect(host.textContent).toContain("检查中");
-    expect(host.textContent).toContain("模拟失败：更新源没有响应");
-    expect(host.querySelector('[data-update-phase="downloading"]')).toBeTruthy();
-    expect(host.querySelector('[data-update-phase="error"]')).toBeTruthy();
+    };
 
+    expect(host.textContent).toContain("<script>alert(1)</script>");
+    assertNotesInScroll();
+
+    await clickPhase("检查中");
+    expect(host.querySelector('[data-update-phase="checking"]')).toBeTruthy();
+    expect(host.querySelector(".fx-settings-footer")?.textContent).toContain("检查中（模拟）");
+
+    await clickPhase("下载中");
+    expect(host.querySelector('[data-update-phase="downloading"]')).toBeTruthy();
+
+    await clickPhase("失败");
+    expect(host.querySelector('[data-update-phase="error"]')).toBeTruthy();
+    expect(host.textContent).toContain("模拟失败：更新源没有响应");
+
+    await clickPhase("已取消");
+    expect(host.querySelector(".fx-settings-footer")?.textContent).toContain("已取消下载（模拟）");
+
+    await clickPhase("有新版本");
+    assertNotesInScroll();
+
+    await clickPhase("交互模拟");
     const checkButtons = [...host.querySelectorAll("button")].filter((b) => b.textContent === "检查更新");
     await act(async () => {
       checkButtons[checkButtons.length - 1]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));

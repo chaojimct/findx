@@ -12,7 +12,18 @@ import { UpdateCard } from "../UpdateCard";
  */
 
 export const FIXTURE_BANNER =
-  "开发/测试布局夹具。下面的更新状态是模拟，不会请求 GitHub，不会下载或安装更新。";
+  "模拟数据。不是 GitHub 更新，不会请求 GitHub，不会下载或安装。生产包不含此页。";
+
+export type FixturePhase = "checking" | "available" | "downloading" | "error" | "cancelled" | "live";
+
+const PHASES: { id: FixturePhase; label: string }[] = [
+  { id: "checking", label: "检查中" },
+  { id: "available", label: "有新版本" },
+  { id: "downloading", label: "下载中" },
+  { id: "error", label: "失败" },
+  { id: "cancelled", label: "已取消" },
+  { id: "live", label: "交互模拟" },
+];
 
 const LONG_NOTES = [
   "修复了设置页在窄窗口里底栏被内容顶走的问题。保存和关闭留在固定底栏。",
@@ -164,81 +175,78 @@ export function LiveUpdateSim() {
   );
 }
 
+function cardFor(phase: FixturePhase) {
+  if (phase === "checking") {
+    return { busy: true, info: null, progress: null, downloadedPath: null, hint: "检查中（模拟）" };
+  }
+  if (phase === "downloading") {
+    return {
+      busy: true,
+      info: AVAILABLE,
+      progress: { downloaded: 5 * 1024 * 1024, total: 12 * 1024 * 1024, percent: 41.7 },
+      downloadedPath: null,
+      hint: "下载中（模拟）",
+    };
+  }
+  if (phase === "error") {
+    return { busy: false, info: FAILED, progress: null, downloadedPath: null, hint: "检查失败（模拟）" };
+  }
+  if (phase === "cancelled") {
+    return { busy: false, info: AVAILABLE, progress: null, downloadedPath: null, hint: "已取消下载（模拟）" };
+  }
+  return {
+    busy: false,
+    info: AVAILABLE,
+    progress: null,
+    downloadedPath: null,
+    hint: "发现模拟版本。说明在上方滚动区。",
+  };
+}
+
+function phaseFromLocation(): FixturePhase {
+  if (typeof window === "undefined") return "available";
+  const value = new URLSearchParams(window.location.search).get("phase");
+  return PHASES.some((item) => item.id === value) ? (value as FixturePhase) : "available";
+}
+
 export function UpdateLayoutFixture() {
+  const [phase, setPhase] = useState<FixturePhase>(phaseFromLocation);
+  const card = cardFor(phase);
   return (
     <div className="fx-fixture-page">
       <p className="fx-fixture-banner">{FIXTURE_BANNER}</p>
-      <Shell hint="检查中（模拟）">
-        <UpdateCard
-          busy
-          info={null}
-          progress={null}
-          downloadedPath={null}
-          autoCheck
-          onAutoCheck={noop}
-          onCheck={noop}
-          onDownload={noop}
-          onCancel={noop}
-          onInstall={noop}
-        />
-      </Shell>
-      <Shell hint="发现模拟版本。说明在上方滚动区。">
-        <UpdateCard
-          busy={false}
-          info={AVAILABLE}
-          progress={null}
-          downloadedPath={null}
-          autoCheck
-          onAutoCheck={noop}
-          onCheck={noop}
-          onDownload={noop}
-          onCancel={noop}
-          onInstall={noop}
-        />
-      </Shell>
-      <Shell hint="下载中（模拟）">
-        <UpdateCard
-          busy
-          info={AVAILABLE}
-          progress={{ downloaded: 5 * 1024 * 1024, total: 12 * 1024 * 1024, percent: 41.7 }}
-          downloadedPath={null}
-          autoCheck
-          onAutoCheck={noop}
-          onCheck={noop}
-          onDownload={noop}
-          onCancel={noop}
-          onInstall={noop}
-        />
-      </Shell>
-      <Shell hint="检查失败（模拟）">
-        <UpdateCard
-          busy={false}
-          info={FAILED}
-          progress={null}
-          downloadedPath={null}
-          autoCheck={false}
-          onAutoCheck={noop}
-          onCheck={noop}
-          onDownload={noop}
-          onCancel={noop}
-          onInstall={noop}
-        />
-      </Shell>
-      <Shell hint="已取消下载（模拟）">
-        <UpdateCard
-          busy={false}
-          info={CURRENT}
-          progress={null}
-          downloadedPath={null}
-          autoCheck
-          onAutoCheck={noop}
-          onCheck={noop}
-          onDownload={noop}
-          onCancel={noop}
-          onInstall={noop}
-        />
-      </Shell>
-      <LiveUpdateSim />
+      <div className="fx-fixture-switch" role="tablist" aria-label="模拟更新状态">
+        {PHASES.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            role="tab"
+            aria-selected={phase === item.id}
+            className={phase === item.id ? "fx-fixture-switch-on" : ""}
+            onClick={() => setPhase(item.id)}
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
+      {phase === "live" ? (
+        <LiveUpdateSim />
+      ) : (
+        <Shell hint={card.hint}>
+          <UpdateCard
+            busy={card.busy}
+            info={card.info}
+            progress={card.progress}
+            downloadedPath={card.downloadedPath}
+            autoCheck
+            onAutoCheck={noop}
+            onCheck={noop}
+            onDownload={noop}
+            onCancel={noop}
+            onInstall={() => {}}
+          />
+        </Shell>
+      )}
     </div>
   );
 }

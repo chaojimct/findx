@@ -18,6 +18,7 @@ import {
   commitSaveIntervalSecs,
   commitSearchLimit,
   discardUnsaved,
+  formIsDirty,
   serviceStartHint,
 } from "./settingsDraft";
 import { settleUpdate, UpdateRequestGate } from "./updateGate";
@@ -55,7 +56,6 @@ export default function SettingsWindow() {
     autoCheckUpdate: true,
   });
   const [originalSettings, setOriginalSettings] = useState<FindxGuiSettings | null>(null);
-  const [isDirty, setIsDirty] = useState(false);
   const settingsRef = useRef(settings);
   const [settingsTab, setSettingsTab] = useState<"index" | "search" | "service" | "advanced">(
     "index",
@@ -108,14 +108,15 @@ export default function SettingsWindow() {
     return () => mq.removeEventListener("change", fn);
   }, []);
 
-  /** 外部载入设置时同步草稿；输入过程中不写回 settings，所以不会打断中间空值。 */
-  useEffect(() => {
-    setSearchLimitInput(String(settings.searchLimit));
-  }, [settings.searchLimit]);
-  useEffect(() => {
-    setSaveIntervalInput(String(settings.saveIntervalSecs ?? 30));
-  }, [settings.saveIntervalSecs]);
-  isDirtyRef.current = isDirty;
+  const dirty = formIsDirty({
+    settings,
+    original: originalSettings,
+    theme: uiThemePref,
+    originalTheme: originalUiThemePref,
+    searchLimitText: searchLimitInput,
+    saveIntervalText: saveIntervalInput,
+  });
+  isDirtyRef.current = dirty;
   originalRef.current = originalSettings;
   themeRef.current = uiThemePref;
   originalThemeRef.current = originalUiThemePref;
@@ -175,12 +176,7 @@ export default function SettingsWindow() {
 
   useEffect(() => {
     settingsRef.current = settings;
-    if (originalSettings) {
-      const settingsChanged = JSON.stringify(settings) !== JSON.stringify(originalSettings);
-      const themeChanged = uiThemePref !== originalUiThemePref;
-      setIsDirty(settingsChanged || themeChanged);
-    }
-  }, [settings, originalSettings, uiThemePref, originalUiThemePref]);
+  }, [settings]);
 
   useEffect(() => {
     const isDark = effectiveTheme === "dark";
@@ -198,7 +194,8 @@ export default function SettingsWindow() {
       const s = await invoke<FindxGuiSettings>("load_findx_settings");
       setSettings(s);
       setOriginalSettings(s);
-      setIsDirty(false);
+      setSearchLimitInput(String(s.searchLimit));
+      setSaveIntervalInput(String(s.saveIntervalSecs ?? 30));
     } catch {
       /* ignore */
     }
@@ -325,7 +322,8 @@ export default function SettingsWindow() {
       setSettings(next);
       setOriginalSettings(next);
       setOriginalUiThemePref(uiThemePref);
-      setIsDirty(false);
+      setSearchLimitInput(String(next.searchLimit));
+      setSaveIntervalInput(String(next.saveIntervalSecs ?? 30));
       setHint("设置已保存");
       window.setTimeout(() => setHint(""), 2500);
     } catch (e) {
@@ -553,7 +551,8 @@ export default function SettingsWindow() {
     });
     setSettings(reverted.settings);
     setUiThemePref(reverted.theme);
-    setIsDirty(false);
+    setSearchLimitInput(String(reverted.settings.searchLimit));
+    setSaveIntervalInput(String(reverted.settings.saveIntervalSecs ?? 30));
   }, []);
 
   const hideSettings = useCallback(() => {
@@ -599,7 +598,7 @@ export default function SettingsWindow() {
         <div className="fx-settings-header">
           <div className="fx-settings-title-row">
             <h2 className="fx-settings-title">FindX2 设置</h2>
-            {isDirty && <span className="fx-settings-dirty-indicator" title="有未保存的更改">●</span>}
+            {dirty && <span className="fx-settings-dirty-indicator" title="有未保存的更改">●</span>}
           </div>
           <div className="fx-settings-tabs" role="tablist">
             {(

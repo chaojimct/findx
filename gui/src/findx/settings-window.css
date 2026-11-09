@@ -560,6 +560,25 @@
   font-weight: 600;
 }
 
+.fx-fixture-switch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 12px 24px;
+  background: #fff4d6;
+  border-bottom: 2px solid #d28a3a;
+}
+
+.fx-fixture-switch button {
+  height: 32px;
+  padding: 0 12px;
+}
+
+.fx-fixture-switch-on {
+  background: #1f1f1f;
+  color: #fff;
+}
+
 .fx-fixture-shell {
   height: 480px;
   border-bottom: 8px solid var(--fx-border);

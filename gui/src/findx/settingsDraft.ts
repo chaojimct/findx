@@ -43,6 +43,27 @@ export function commitSaveIntervalSecs(text: string): DraftCommit {
   return { ok: true, value };
 }
 
+/**
+ * 数字框在保存前只改草稿，不写 settings。
+ * 主题会立刻改 uiThemePref，所以只比较 settings 会漏掉 5000→5001。
+ * 窗口关闭是隐藏，同一 WebView 会留下这份草稿；脏标记必须把草稿算进去。
+ */
+export function formIsDirty(input: {
+  settings: FindxGuiSettings;
+  original: FindxGuiSettings | null;
+  theme: UiThemePref;
+  originalTheme: UiThemePref;
+  searchLimitText: string;
+  saveIntervalText: string;
+}): boolean {
+  if (!input.original) return false;
+  if (input.theme !== input.originalTheme) return true;
+  if (JSON.stringify(input.settings) !== JSON.stringify(input.original)) return true;
+  if (input.searchLimitText !== String(input.original.searchLimit)) return true;
+  if (input.saveIntervalText !== String(input.original.saveIntervalSecs ?? 30)) return true;
+  return false;
+}
+
 export function closeDecision(isDirty: boolean, confirmed: boolean): "hide" | "stay" {
   if (!isDirty) return "hide";
   return confirmed ? "hide" : "stay";

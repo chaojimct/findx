@@ -102,8 +102,11 @@ export const COL_INDEX: Record<ColId, 0 | 1 | 2 | 3> = {
  * 表头完整文字的最小宽度。放不下就隐藏低优先列，而不是把「大小」画成「大」。
  * 名称列最后保留。
  */
+/** 名称列至少要能读出一段文件名，不能只剩两三个字。 */
+export const NAME_COLUMN_MIN_PX = 160;
+
 export const COLUMN_HEADER_MIN_PX: Record<ColId, number> = {
-  name: 72,
+  name: NAME_COLUMN_MIN_PX,
   path: 72,
   size: 72,
   mtime: 96,
@@ -164,4 +167,43 @@ export function resolvePanelOpen(args: {
   const limit = args.kind === "preview" ? PREVIEW_AUTO_HIDE_BELOW : SIDEBAR_AUTO_HIDE_BELOW;
   if (args.windowWidth < limit) return false;
   return args.savedOpen;
+}
+
+export const SIDEBAR_WIDTH_PX = 210;
+export const NAME_READABLE_PX = 180;
+
+/**
+ * 用内容区实际宽度，不用 window.innerWidth。
+ * 没在本次手动打开时，小窗先收起面板，保证名称区域够读。
+ * forced 只来自本次点击，不把上次保存的「展开」当成手动覆盖。
+ */
+export function resolvePanels(args: {
+  contentWidth: number;
+  previewWidth: number;
+  savedSidebar: boolean;
+  savedPreview: boolean;
+  sidebarForce: "show" | "hide" | null;
+  previewForce: "show" | "hide" | null;
+}): { sidebar: boolean; preview: boolean } {
+  let sidebar = resolvePanelOpen({
+    windowWidth: args.contentWidth,
+    savedOpen: args.savedSidebar,
+    forced: args.sidebarForce,
+    kind: "sidebar",
+  });
+  let preview = resolvePanelOpen({
+    windowWidth: args.contentWidth,
+    savedOpen: args.savedPreview,
+    forced: args.previewForce,
+    kind: "preview",
+  });
+  const results = (side: boolean, prev: boolean) =>
+    args.contentWidth - (side ? SIDEBAR_WIDTH_PX : 0) - (prev ? args.previewWidth + 4 : 0);
+  if (results(sidebar, preview) < NAME_READABLE_PX && preview && args.previewForce !== "show") {
+    preview = false;
+  }
+  if (results(sidebar, preview) < NAME_READABLE_PX && sidebar && args.sidebarForce !== "show") {
+    sidebar = false;
+  }
+  return { sidebar, preview };
 }
