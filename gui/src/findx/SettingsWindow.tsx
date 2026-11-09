@@ -73,6 +73,8 @@ export default function SettingsWindow() {
   const [dlProgress, setDlProgress] = useState<UpdateProgressEvent | null>(null);
   /** 下载完成后的安装包本地路径；非空时显示「安装更新并重启」 */
   const [downloadedPath, setDownloadedPath] = useState<string | null>(null);
+  /** 更新请求ID，用于防止过期响应 */
+  const updateRequestIdRef = useRef(0);
 
   useEffect(() => {
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
@@ -87,6 +89,9 @@ export default function SettingsWindow() {
       setDlProgress(e.payload);
     });
     const unFinished = listen<UpdateFinishedEvent>("findx2-update-finished", (e) => {
+      const requestId = updateRequestIdRef.current;
+      if (requestId === 0) return;
+      
       setDlProgress(null);
       setUpdBusy(false);
       if (e.payload.ok && e.payload.path) {
@@ -294,10 +299,18 @@ export default function SettingsWindow() {
   };
 
   const checkUpdateFromGithub = async () => {
+    if (updBusy) {
+      setHint("检查正在进行中，请稍候…");
+      return;
+    }
+    const requestId = ++updateRequestIdRef.current;
     setUpdBusy(true);
     setHint("正在从 GitHub 检查更新…");
     try {
       const info = await invoke<AppUpdateInfo>("check_app_update");
+      if (requestId !== updateRequestIdRef.current) {
+        return;
+      }
       setUpdInfo(info);
       if (!info.ok) {
         setHint(info.error ?? "检查失败");
@@ -320,15 +333,24 @@ export default function SettingsWindow() {
       }
       setHint(`当前 ${info.currentVersion} 已是最新。`);
     } catch (e) {
-      setHint(String(e));
+      if (requestId === updateRequestIdRef.current) {
+        setHint(String(e));
+      }
     } finally {
-      setUpdBusy(false);
+      if (requestId === updateRequestIdRef.current) {
+        setUpdBusy(false);
+      }
     }
   };
 
   /** 开始下载安装包；进度由 findx2-update-progress 事件驱动。 */
   const startDownload = async () => {
     if (!updInfo?.downloadUrl) return;
+    if (updBusy) {
+      setHint("操作正在进行中，请稍候…");
+      return;
+    }
+    const requestId = ++updateRequestIdRef.current;
     setUpdBusy(true);
     setDownloadedPath(null);
     setDlProgress({ downloaded: 0, total: updInfo.assetSize ?? 0, percent: 0 });
@@ -337,11 +359,15 @@ export default function SettingsWindow() {
         url: updInfo.downloadUrl,
         expectedSize: updInfo.assetSize ?? null,
       });
-      setHint("正在下载更新…");
+      if (requestId === updateRequestIdRef.current) {
+        setHint("正在下载更新…");
+      }
     } catch (e) {
-      setUpdBusy(false);
-      setDlProgress(null);
-      setHint(String(e));
+      if (requestId === updateRequestIdRef.current) {
+        setUpdBusy(false);
+        setDlProgress(null);
+        setHint(String(e));
+      }
     }
   };
 
@@ -430,11 +456,11 @@ export default function SettingsWindow() {
     }
   };
 
-  /** 禁止 close() 销毁窗口（否则再次 show_settings_window 会失败）；隐藏即可反复打开 */
-  const closeWindow = () => {
+  /** 关闭窗口时检查未保存更改 */
+  const closeWindow = useCallback(() => {
     if (isDirty) {
       if (!confirm("设置已修改但未保存,确定要关闭吗？未保存的更改将丢失。")) {
-        return;
+        return false;
       }
       setSettings(originalSettings ?? settings);
       setIsDirty(false);
@@ -448,7 +474,31 @@ export default function SettingsWindow() {
       }
       void getCurrentWindow().hide();
     })();
-  };
+    return true;
+  }, [isDirty, originalSettings, settings]);
+
+  /** 拦截系统窗口关闭事件 */
+  useEffect(() => {
+    const window = getCurrentWindow();
+    let unlisten: (() => void) | undefined;
+    
+    void window.onCloseRequested(async (event) => {
+      if (isDirty) {
+        event.preventDefault();
+        if (confirm("设置已修改但未保存,确定要关闭吗？未保存的更改将丢失。")) {
+          setSettings(originalSettings ?? settings);
+          setIsDirty(false);
+          await window.hide();
+        }
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, [isDirty, originalSettings, settings]);
 
   return (
     <div className="fx-settings-window-root">
