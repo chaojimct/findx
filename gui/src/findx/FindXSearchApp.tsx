@@ -271,7 +271,7 @@ export default function FindXSearchApp() {
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState("就绪");
   const [indexLine, setIndexLine] = useState("索引: …");
-  const [indexLineShort, setIndexLineShort] = useState("索引: …");
+  const [hasIndexDetail, setHasIndexDetail] = useState(false);
   const [showIndexDetail, setShowIndexDetail] = useState(false);
   const [selected, setSelected] = useState<number | null>(null);
   // 预览面板状态：默认开启 + 持久化宽度
