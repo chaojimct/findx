@@ -5,6 +5,7 @@ import { defineConfig } from "vite";
 export default defineConfig({
   plugins: [react()],
   base: "./",
+  publicDir: false,
   build: {
     outDir: "dist-fixture",
     emptyOutDir: true,
