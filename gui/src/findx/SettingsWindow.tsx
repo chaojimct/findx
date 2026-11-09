@@ -50,12 +50,14 @@ export default function SettingsWindow() {
   const [availableDrives, setAvailableDrives] = useState<string[]>([]);
   const [hostOs, setHostOs] = useState<string>("windows");
   const [uiThemePref, setUiThemePref] = useState<UiThemePref>(() => loadUiThemePref());
+  const [originalUiThemePref, setOriginalUiThemePref] = useState<UiThemePref | null>(null);
   const [systemDark, setSystemDark] = useState(
     () => window.matchMedia("(prefers-color-scheme: dark)").matches,
   );
   const [hint, setHint] = useState("");
   const [showSyntaxHelp, setShowSyntaxHelp] = useState(false);
   const [serviceBusy, setServiceBusy] = useState(false);
+  const [searchLimitInput, setSearchLimitInput] = useState(String(settings.searchLimit));
   /**
    * 「随系统启动」的真源是注册表，不是设置文件。
    * 因此单独存一份状态，进入设置页时从后端回读，避免显示与实际相反。
@@ -85,6 +87,11 @@ export default function SettingsWindow() {
     mq.addEventListener("change", fn);
     return () => mq.removeEventListener("change", fn);
   }, []);
+
+  /** 同步searchLimit到输入框显示 */
+  useEffect(() => {
+    setSearchLimitInput(String(settings.searchLimit));
+  }, [settings.searchLimit]);
 
   /** 应用更新：订阅后端下载进度/结束事件（下载线程 emit，200ms 节流）。 */
   useEffect(() => {
@@ -142,10 +149,11 @@ export default function SettingsWindow() {
   useEffect(() => {
     settingsRef.current = settings;
     if (originalSettings) {
-      const changed = JSON.stringify(settings) !== JSON.stringify(originalSettings);
-      setIsDirty(changed);
+      const settingsChanged = JSON.stringify(settings) !== JSON.stringify(originalSettings);
+      const themeChanged = originalUiThemePref !== null && uiThemePref !== originalUiThemePref;
+      setIsDirty(settingsChanged || themeChanged);
     }
-  }, [settings, originalSettings]);
+  }, [settings, originalSettings, uiThemePref, originalUiThemePref]);
 
   useEffect(() => {
     const isDark = effectiveTheme === "dark";
@@ -165,11 +173,14 @@ export default function SettingsWindow() {
       const s = await invoke<FindxGuiSettings>("load_findx_settings");
       setSettings(s);
       setOriginalSettings(s);
+      if (originalUiThemePref === null) {
+        setOriginalUiThemePref(uiThemePref);
+      }
       setIsDirty(false);
     } catch {
       /* ignore */
     }
-  }, []);
+  }, [originalUiThemePref, uiThemePref]);
 
   /**
    * 从后端回读自启真值（注册表）。与 loadSettings 分开，因为二者数据源不同：
@@ -292,7 +303,7 @@ export default function SettingsWindow() {
     setHint("正在启动服务…");
     try {
       await invoke("start_findx_service");
-      setHint("已启动 findx2-service，索引服务已就绪。");
+      setHint("已发送启动命令，服务进程启动中。请稍后查看状态栏确认索引是否就绪。");
     } catch (e) {
       const errMsg = String(e);
       if (errMsg.includes("already running") || errMsg.includes("已运行")) {
@@ -501,6 +512,9 @@ export default function SettingsWindow() {
         return false;
       }
       setSettings(originalSettings ?? settings);
+      if (originalUiThemePref !== null) {
+        setUiThemePref(originalUiThemePref);
+      }
       setIsDirty(false);
     }
     void (async () => {
@@ -513,7 +527,7 @@ export default function SettingsWindow() {
       void getCurrentWindow().hide();
     })();
     return true;
-  }, [isDirty, originalSettings, settings]);
+  }, [isDirty, originalSettings, settings, originalUiThemePref]);
 
   /** 拦截系统窗口关闭事件 */
   useEffect(() => {
@@ -744,17 +758,28 @@ export default function SettingsWindow() {
             <div className="fx-settings-row" style={{ alignItems: "center", gap: "12px" }}>
               <label style={{ margin: 0 }}>结果条数上限</label>
               <input
-                type="number"
-                min="100"
-                max="50000"
-                step="100"
-                value={settings.searchLimit}
-                onChange={(e) => {
-                  const val = parseInt(e.target.value, 10);
+                type="text"
+                value={searchLimitInput}
+                onChange={(e) => setSearchLimitInput(e.target.value)}
+                onBlur={() => {
+                  const val = parseInt(searchLimitInput, 10);
                   if (!isNaN(val) && val >= 100 && val <= 50000) {
                     setSettings((s) => ({ ...s, searchLimit: val }));
+                  } else {
+                    setSearchLimitInput(String(settings.searchLimit));
                   }
                 }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    const val = parseInt(searchLimitInput, 10);
+                    if (!isNaN(val) && val >= 100 && val <= 50000) {
+                      setSettings((s) => ({ ...s, searchLimit: val }));
+                    } else {
+                      setSearchLimitInput(String(settings.searchLimit));
+                    }
+                  }
+                }}
+                placeholder="100-50000"
                 style={{ width: "120px" }}
               />
               <button
