@@ -6,7 +6,13 @@ import "./design-tokens.css";
 import "./findx.css";
 import type { AppUpdateInfo, FindxGuiSettings, UiThemePref } from "./findxGuiTypes";
 import { UI_THEME_KEY, loadUiThemePref } from "./findxGuiTypes";
+import { IconHistory, IconPreview, IconSettings, IconSidebar } from "./icons";
 import { PreviewPane } from "./PreviewPane";
+import {
+  applyColumnDrag,
+  layoutColumnFractions,
+  RESULT_ROW_HEIGHT_PX,
+} from "./resultTableLayout";
 
 /** 预览面板宽度（px）持久化 key；与 fx-preview 默认 320 配套。 */
 const PREVIEW_WIDTH_KEY = "findx2_preview_width";
@@ -430,24 +436,8 @@ export default function FindXSearchApp() {
       if (!st || !wrap) return;
       const tw = wrap.clientWidth;
       if (tw <= 0) return;
-      const delta = (ev.clientX - st.startX) / tw;
-      const MIN = 0.06;
-      const a = [...st.base];
-      a[st.i] += delta;
-      a[st.i + 1] -= delta;
-      if (a[st.i] < MIN) {
-        const f = MIN - a[st.i];
-        a[st.i] = MIN;
-        a[st.i + 1] -= f;
-      }
-      if (a[st.i + 1] < MIN) {
-        const f = MIN - a[st.i + 1];
-        a[st.i + 1] = MIN;
-        a[st.i] -= f;
-      }
-      const s = a[0] + a[1] + a[2] + a[3];
-      if (s <= 0) return;
-      const next = a.map((x) => x / s) as [number, number, number, number];
+      const deltaPx = ev.clientX - st.startX;
+      const next = applyColumnDrag(st.base as [number, number, number, number], st.i as 0 | 1 | 2, deltaPx, tw);
       colFracRef.current = next;
       setColFrac(next);
     };
@@ -479,18 +469,22 @@ export default function FindXSearchApp() {
   const tableScrollRef = useRef<HTMLDivElement | null>(null);
   const searchBarRowRef = useRef<HTMLDivElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
-  const ROW_HEIGHT = 32;
+  const ROW_HEIGHT = RESULT_ROW_HEIGHT_PX;
   const OVERSCAN = 8;
   // 分页大小：首屏 + 滚动预取。服务端排序后按 [offset, offset+PAGE_SIZE) 切片；
   // 滚动接近底部自动追加（无限滚动），searchLimit 作为自动加载总上限。
   const PAGE_SIZE = 250;
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportH, setViewportH] = useState(600);
+  const [tableWidth, setTableWidth] = useState(800);
   useEffect(() => {
     const el = tableScrollRef.current;
     if (!el) return;
     const onScroll = () => setScrollTop(el.scrollTop);
-    const update = () => setViewportH(el.clientHeight);
+    const update = () => {
+      setViewportH(el.clientHeight);
+      setTableWidth(el.clientWidth);
+    };
     update();
     el.addEventListener("scroll", onScroll, { passive: true });
     const ro = new ResizeObserver(update);
@@ -979,9 +973,11 @@ export default function FindXSearchApp() {
             type="button"
             className="fx-btn-icon"
             title="搜索历史"
+            aria-expanded={histOpen}
+            aria-label="搜索历史"
             onClick={() => setHistOpen(!histOpen)}
           >
-            🕐
+            <IconHistory />
           </button>
           <button type="button" className="fx-btn-icon fx-btn-search" onClick={() => void runSearch(0, false)}>
             搜索
@@ -1074,7 +1070,8 @@ export default function FindXSearchApp() {
               const padTop = startIdx * ROW_HEIGHT;
               const padBottom = Math.max(0, (total - endIdx) * ROW_HEIGHT);
               const slice = sortedHits.slice(startIdx, endIdx);
-              const colPct = (i: 0 | 1 | 2 | 3) => `${(colFrac[i] * 100).toFixed(3)}%`;
+              const shownFrac = layoutColumnFractions(colFrac, tableWidth);
+              const colPct = (i: 0 | 1 | 2 | 3) => `${(shownFrac[i] * 100).toFixed(3)}%`;
               const sortInd = (col: Exclude<SortCol, null>) =>
                 sortCol === col ? (
                   <span className="fx-sort-ind" aria-hidden>
@@ -1082,7 +1079,10 @@ export default function FindXSearchApp() {
                   </span>
                 ) : null;
               return (
-                <table className="fx-table">
+                <table
+                  className="fx-table"
+                  style={{ ["--fx-row-height" as string]: `${ROW_HEIGHT}px` }}
+                >
                   <colgroup>
                     <col style={{ width: colPct(0) }} />
                     <col style={{ width: colPct(1) }} />
@@ -1291,27 +1291,32 @@ export default function FindXSearchApp() {
             type="button"
             className={`fx-btn-icon ${sidebarOpen ? "active" : ""}`}
             title={sidebarOpen ? "隐藏侧栏" : "显示侧栏"}
+            aria-pressed={sidebarOpen}
+            aria-label={sidebarOpen ? "隐藏侧栏" : "显示侧栏"}
             onClick={() => setSidebarOpen((v) => !v)}
           >
-            ☰
+            <IconSidebar />
           </button>
           <button
             type="button"
             className={`fx-btn-icon ${previewOpen ? "active" : ""}`}
             title={previewOpen ? "关闭预览面板" : "打开预览面板"}
+            aria-pressed={previewOpen}
+            aria-label={previewOpen ? "关闭预览面板" : "打开预览面板"}
             onClick={() => setPreviewOpen((v) => !v)}
           >
-            👁
+            <IconPreview />
           </button>
           <button
             type="button"
             className="fx-btn-icon"
             title="设置"
+            aria-label="设置"
             onClick={() => {
               void invoke("show_settings_window");
             }}
           >
-            ⚙
+            <IconSettings />
           </button>
         </span>
       </div>

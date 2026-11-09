@@ -158,12 +158,34 @@ html {
 
 .fx-btn-icon {
   border: none;
-  border-radius: 8px;
-  padding: 8px 12px;
+  border-radius: 4px;
+  padding: 6px 10px;
+  min-width: 32px;
+  min-height: 32px;
   cursor: pointer;
-  font-size: 14px;
+  font-size: 13px;
   background: var(--fx-btn-ghost-bg);
   color: var(--fx-text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.fx-btn-icon svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+  flex-shrink: 0;
+}
+
+.fx-btn-icon:focus-visible,
+.fx-filter:focus-visible,
+.fx-time:focus-visible,
+.fx-th-btn:focus-visible,
+.fx-settings-tab:focus-visible {
+  outline: 2px solid var(--fx-accent);
+  outline-offset: 2px;
 }
 
 .fx-btn-icon.active {
@@ -292,10 +314,10 @@ html {
 }
 
 .fx-results {
-  flex: 1;
+  flex: 1 1 auto;
   display: flex;
   flex-direction: column;
-  min-width: 0;
+  min-width: 240px;
   background: var(--fx-bg);
 }
 
@@ -389,6 +411,13 @@ html {
   font-weight: 600;
   color: inherit;
   text-align: left;
+  white-space: nowrap;
+}
+
+.fx-th-btn span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .fx-th-btn:hover {
@@ -540,6 +569,8 @@ html {
 
 .fx-v2-notice-card {
   width: min(640px, calc(100vw - 32px));
+  max-height: min(70vh, 420px);
+  overflow: auto;
   background: var(--fx-white);
   color: var(--fx-text);
   border: 1px solid var(--fx-border);

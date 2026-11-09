@@ -1437,16 +1437,12 @@ pub fn focus_existing_instance<R: Runtime>(app: &AppHandle<R>) {
 pub fn handle_window_event<R: Runtime>(window: &Window<R>, event: &WindowEvent) {
     let app = window.app_handle();
 
-    // 设置窗：用户点「关闭」或标题栏 X 时若直接 destroy，下次 invoke show 将找不到窗口。
-    // 拦截为隐藏，与主窗托盘「隐藏」语义一致，可反复打开。
+    // 设置窗：直接 destroy 后下次 show_settings_window 会找不到窗口。
+    // 这里只阻止销毁。未保存确认和 hide 由前端 onCloseRequested 处理，
+    // 否则标题栏关闭会先把窗口藏起来，确认框来不及拦住。
     if window.label() == SETTINGS_WINDOW_LABEL {
         if let WindowEvent::CloseRequested { api, .. } = event {
             api.prevent_close();
-            if let Some(w) = app.get_webview_window(SETTINGS_WINDOW_LABEL) {
-                if let Err(e) = w.hide() {
-                    log_desktop_error("hide settings window instead of closing", &e.to_string());
-                }
-            }
         }
         return;
     }
