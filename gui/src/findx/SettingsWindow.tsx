@@ -5,7 +5,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import "./design-tokens.css";
 import "./findx.css";
 import "./settings-window.css";
-import { Button, Checkbox, Input, Textarea, RadioGroup, SettingsRow, Hint } from "./components/UIComponents";
+import { Button, Checkbox, Hint } from "./components/UIComponents";
 import type {
   AppUpdateInfo,
   AutostartState,
