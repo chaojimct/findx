@@ -13,6 +13,7 @@ const PREVIEW_WIDTH_KEY = "findx2_preview_width";
 const PREVIEW_OPEN_KEY = "findx2_preview_open";
 const PREVIEW_MIN_WIDTH = 240;
 const PREVIEW_MAX_WIDTH = 720;
+const SIDEBAR_OPEN_KEY = "findx2_sidebar_open";
 
 type SearchHit = {
   name: string;
@@ -292,6 +293,14 @@ export default function FindXSearchApp() {
     }
     return 360;
   });
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
+    try {
+      const v = localStorage.getItem(SIDEBAR_OPEN_KEY);
+      return v === null ? true : v === "1";
+    } catch {
+      return true;
+    }
+  });
   useEffect(() => {
     try {
       localStorage.setItem(PREVIEW_OPEN_KEY, previewOpen ? "1" : "0");
@@ -299,6 +308,13 @@ export default function FindXSearchApp() {
       /* ignore */
     }
   }, [previewOpen]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDEBAR_OPEN_KEY, sidebarOpen ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  }, [sidebarOpen]);
   useEffect(() => {
     try {
       localStorage.setItem(PREVIEW_WIDTH_KEY, String(previewWidth));
@@ -974,7 +990,7 @@ export default function FindXSearchApp() {
       </div>
 
       <div className="fx-main">
-        <aside className="fx-sidebar">
+        {sidebarOpen && <aside className="fx-sidebar">
           <h3>筛选</h3>
           {(
             [
@@ -1043,7 +1059,7 @@ export default function FindXSearchApp() {
               onChange={(e) => setSizeMax(e.target.value)}
             />
           </div>
-        </aside>
+        </aside>}
 
         <div className="fx-results">
           <div className="fx-table-wrap" ref={tableScrollRef}>
@@ -1271,6 +1287,14 @@ export default function FindXSearchApp() {
               </button>
             </>
           )}
+          <button
+            type="button"
+            className={`fx-btn-icon ${sidebarOpen ? "active" : ""}`}
+            title={sidebarOpen ? "隐藏侧栏" : "显示侧栏"}
+            onClick={() => setSidebarOpen((v) => !v)}
+          >
+            ☰
+          </button>
           <button
             type="button"
             className={`fx-btn-icon ${previewOpen ? "active" : ""}`}

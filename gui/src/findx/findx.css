@@ -350,6 +350,7 @@ html {
   top: 0;
   z-index: 2;
   vertical-align: middle;
+  white-space: nowrap;
   font-weight: 600;
 }
 
@@ -436,8 +437,8 @@ html {
   padding: 0 10px;
   border-bottom: 1px solid var(--fx-cell-line);
   vertical-align: middle;
-  height: 32px;
-  line-height: 32px;
+  height: var(--fx-row-height);
+  line-height: var(--fx-row-height);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
