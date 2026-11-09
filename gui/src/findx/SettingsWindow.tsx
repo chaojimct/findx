@@ -55,6 +55,7 @@ export default function SettingsWindow() {
   );
   const [hint, setHint] = useState("");
   const [showSyntaxHelp, setShowSyntaxHelp] = useState(false);
+  const [serviceBusy, setServiceBusy] = useState(false);
   /**
    * 「随系统启动」的真源是注册表，不是设置文件。
    * 因此单独存一份状态，进入设置页时从后端回读，避免显示与实际相反。
@@ -283,20 +284,55 @@ export default function SettingsWindow() {
   };
 
   const startSvc = async () => {
+    if (serviceBusy) {
+      setHint("服务操作正在进行中，请稍候…");
+      return;
+    }
+    setServiceBusy(true);
+    setHint("正在启动服务…");
     try {
       await invoke("start_findx_service");
-      setHint("已启动 findx2-service");
+      setHint("已启动 findx2-service，索引服务已就绪。");
     } catch (e) {
-      setHint(String(e));
+      const errMsg = String(e);
+      if (errMsg.includes("already running") || errMsg.includes("已运行")) {
+        setHint("服务已在运行中。");
+      } else {
+        setHint(`启动失败：${errMsg}`);
+      }
+    } finally {
+      setTimeout(() => setServiceBusy(false), 1000);
     }
   };
 
   const stopSvc = async () => {
+    if (serviceBusy) {
+      setHint("服务操作正在进行中，请稍候…");
+      return;
+    }
+    if (
+      !confirm(
+        "确定要停止索引服务吗？\n\n" +
+          "停止后将无法搜索文件，增量索引也会暂停。\n" +
+          "需要重新启动服务才能恢复功能。"
+      )
+    ) {
+      return;
+    }
+    setServiceBusy(true);
+    setHint("正在停止服务…");
     try {
       await invoke("stop_findx_service");
-      setHint("已请求停止服务进程");
+      setHint("已请求停止服务进程，服务将在处理完当前任务后退出。");
     } catch (e) {
-      setHint(String(e));
+      const errMsg = String(e);
+      if (errMsg.includes("not running") || errMsg.includes("未运行")) {
+        setHint("服务未在运行。");
+      } else {
+        setHint(`停止失败：${errMsg}`);
+      }
+    } finally {
+      setTimeout(() => setServiceBusy(false), 1000);
     }
   };
 
@@ -822,14 +858,33 @@ export default function SettingsWindow() {
               服务管理器随系统启动，与这里的设置无关。
             </p>
 
-            <div className="fx-settings-row">
-              <button type="button" onClick={() => void startSvc()}>
-                启动服务
+            <div className="fx-settings-row" style={{ gap: "12px", alignItems: "center" }}>
+              <button
+                type="button"
+                onClick={() => void startSvc()}
+                disabled={serviceBusy}
+              >
+                {serviceBusy ? "操作中…" : "启动服务"}
               </button>
-              <button type="button" onClick={() => void stopSvc()}>
-                停止服务
+              <button
+                type="button"
+                onClick={() => void stopSvc()}
+                disabled={serviceBusy}
+              >
+                {serviceBusy ? "操作中…" : "停止服务"}
               </button>
+              {serviceBusy && (
+                <span className="fx-hint" style={{ margin: 0 }}>
+                  服务状态变更中，请稍候…
+                </span>
+              )}
             </div>
+            {hostOs !== "windows" && (
+              <p className="fx-hint">
+                ⚠️ 非 Windows 平台：服务控制仅适用于当前 GUI 启动的进程。
+                如使用 systemd 或 LaunchAgent 托管，请使用系统命令管理。
+              </p>
+            )}
           </div>
         )}
 
