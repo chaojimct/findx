@@ -1,0 +1,62 @@
+.fx-exclude-dirs-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm, 8px);
+  width: 100%;
+}
+
+.fx-exclude-dirs-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 var(--spacing-xs, 4px);
+}
+
+.fx-exclude-dirs-count {
+  font-size: var(--font-size-sm, 13px);
+  color: var(--text-secondary, #666);
+}
+
+.fx-exclude-dirs-actions {
+  display: flex;
+  gap: var(--spacing-md, 12px);
+}
+
+.fx-btn-link {
+  background: none;
+  border: none;
+  padding: var(--spacing-xs, 4px) var(--spacing-sm, 8px);
+  font-size: var(--font-size-sm, 13px);
+  color: var(--accent-primary, #0078d4);
+  cursor: pointer;
+  text-decoration: none;
+  transition: color 0.1s ease;
+}
+
+.fx-btn-link:hover {
+  color: var(--accent-primary-hover, #106ebe);
+  text-decoration: underline;
+}
+
+.fx-btn-link:disabled {
+  color: var(--text-disabled, #999);
+  cursor: not-allowed;
+  text-decoration: none;
+}
+
+.fx-btn-link.fx-btn-danger {
+  color: var(--error-text, #c42b1c);
+}
+
+.fx-btn-link.fx-btn-danger:hover:not(:disabled) {
+  color: var(--error-hover, #a52918);
+}
+
+.fx-exclude-dirs-textarea {
+  min-height: 96px;
+  max-height: 240px;
+  font-family: var(--font-mono, 'Consolas', 'Monaco', 'Courier New', monospace);
+  font-size: var(--font-size-sm, 13px);
+  line-height: 1.5;
+  resize: vertical;
+}

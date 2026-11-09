@@ -7,7 +7,7 @@
  * 3. 并发请求保护
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 
 describe('更新状态机 requestId 防护', () => {
   let requestId: number;
@@ -48,7 +48,7 @@ describe('更新状态机 requestId 防护', () => {
     
     // 模拟第一个请求（慢）
     const req1Id = ++requestId;
-    const req1 = mockCheckUpdate(100, true).then((res) => {
+    const req1 = mockCheckUpdate(100, true).then(() => {
       if (req1Id === requestId) {
         responses.push('req1');
       }
@@ -56,7 +56,7 @@ describe('更新状态机 requestId 防护', () => {
 
     // 模拟第二个请求（快）
     const req2Id = ++requestId;
-    const req2 = mockCheckUpdate(10, true).then((res) => {
+    const req2 = mockCheckUpdate(10, true).then(() => {
       if (req2Id === requestId) {
         responses.push('req2');
       }
@@ -121,9 +121,9 @@ describe('更新状态机 requestId 防护', () => {
     const reqId = ++requestId;
     try {
       await mockCheckUpdate(10, false);
-    } catch (e) {
+    } catch (err) {
       if (reqId === requestId) {
-        errors.push((e as Error).message);
+        errors.push((err as Error).message);
       }
     }
 
@@ -135,7 +135,7 @@ describe('更新状态机 requestId 防护', () => {
     
     // 第一个请求（慢，会失败）
     const req1Id = ++requestId;
-    const req1 = mockCheckUpdate(100, false).catch((e) => {
+    const req1 = mockCheckUpdate(100, false).catch(() => {
       if (req1Id === requestId) {
         errors.push('req1-error');
       }

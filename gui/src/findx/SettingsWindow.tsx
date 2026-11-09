@@ -6,6 +6,7 @@ import "./design-tokens.css";
 import "./findx.css";
 import "./settings-window.css";
 import { Button, Checkbox, Hint } from "./components/UIComponents";
+import { ExcludeDirsEditor } from "./components/ExcludeDirsEditor";
 import type {
   AppUpdateInfo,
   AutostartState,
@@ -53,6 +54,7 @@ export default function SettingsWindow() {
     () => window.matchMedia("(prefers-color-scheme: dark)").matches,
   );
   const [hint, setHint] = useState("");
+  const [showSyntaxHelp, setShowSyntaxHelp] = useState(false);
   /**
    * 「随系统启动」的真源是注册表，不是设置文件。
    * 因此单独存一份状态，进入设置页时从后端回读，避免显示与实际相反。
@@ -574,18 +576,10 @@ export default function SettingsWindow() {
                   : "/usr/share"}
               ）
             </label>
-            <textarea
-              value={(settings.excludedDirs ?? []).join("\n")}
-              onChange={(e) =>
-                setSettings((s) => ({
-                  ...s,
-                  excludedDirs: e.target.value
-                    .split(/\r?\n/)
-                    .map((x) => x.trim())
-                    .filter(Boolean),
-                }))
-              }
-              rows={4}
+            <ExcludeDirsEditor
+              value={settings.excludedDirs ?? []}
+              onChange={(dirs) => setSettings((s) => ({ ...s, excludedDirs: dirs }))}
+              hostOs={hostOs}
             />
             <p className="fx-hint">
               排除规则会写入 index.exclude.json，服务启动与增量监听都会过滤；
@@ -711,17 +705,34 @@ export default function SettingsWindow() {
               <code>!</code> 均可叠拼音。Unix 路径用 <code>/home/foo</code> 或{" "}
               <code>~/Documents</code>，不要写成盘符。
             </p>
-            <label>结果条数上限</label>
-            <input
-              type="text"
-              value={String(settings.searchLimit)}
-              onChange={(e) =>
-                setSettings((s) => ({
-                  ...s,
-                  searchLimit: parseInt(e.target.value, 10) || 500,
-                }))
-              }
-            />
+            <div className="fx-settings-row" style={{ alignItems: "center", gap: "12px" }}>
+              <label style={{ margin: 0 }}>结果条数上限</label>
+              <input
+                type="number"
+                min="100"
+                max="50000"
+                step="100"
+                value={settings.searchLimit}
+                onChange={(e) => {
+                  const val = parseInt(e.target.value, 10);
+                  if (!isNaN(val) && val >= 100 && val <= 50000) {
+                    setSettings((s) => ({ ...s, searchLimit: val }));
+                  }
+                }}
+                style={{ width: "120px" }}
+              />
+              <button
+                type="button"
+                className="fx-btn-link"
+                onClick={() => setShowSyntaxHelp(true)}
+                title="查看搜索语法帮助"
+              >
+                语法帮助
+              </button>
+            </div>
+            <p className="fx-hint">
+              推荐范围 500 ~ 5000。过大会影响性能，过小可能遗漏结果。
+            </p>
           </div>
         )}
 
@@ -1009,6 +1020,102 @@ export default function SettingsWindow() {
           </div>
         </div>
       </div>
+
+      {showSyntaxHelp && (
+        <div className="fx-modal-overlay" onClick={() => setShowSyntaxHelp(false)}>
+          <div className="fx-modal-dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="fx-modal-header">
+              <h3>搜索语法帮助</h3>
+              <button
+                type="button"
+                className="fx-btn-close"
+                onClick={() => setShowSyntaxHelp(false)}
+                title="关闭"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="fx-modal-body">
+              <h4>基础搜索</h4>
+              <ul>
+                <li>
+                  <code>beijing</code> 或 <code>bj</code> — 拼音全拼或简拼匹配
+                </li>
+                <li>
+                  <code>project</code> — 直接输入英文名称
+                </li>
+              </ul>
+
+              <h4>搜索修饰符</h4>
+              <ul>
+                <li>
+                  <code>;py</code> — 强制拼音匹配
+                </li>
+                <li>
+                  <code>;en</code> 或 <code>;np</code> — 关闭拼音，仅英文匹配
+                </li>
+              </ul>
+
+              <h4>路径和文件类型</h4>
+              <ul>
+                <li>
+                  <code>ext:pdf</code> — 扩展名匹配（仅 PDF 文件）
+                </li>
+                <li>
+                  <code>file:report</code> — 文件名包含"report"
+                </li>
+                <li>
+                  <code>folder:docs</code> — 文件夹名包含"docs"
+                </li>
+                <li>
+                  <code>startwith:2024</code> — 文件名以"2024"开头
+                </li>
+                <li>
+                  <code>endwith:backup</code> — 文件名以"backup"结尾
+                </li>
+                <li>
+                  <code>path:/home/user</code> — 路径包含"/home/user"
+                </li>
+                <li>
+                  <code>parent:Documents</code> — 父目录名包含"Documents"
+                </li>
+              </ul>
+
+              <h4>组合与排除</h4>
+              <ul>
+                <li>
+                  <code>report | document</code> — 或操作（匹配任一关键词）
+                </li>
+                <li>
+                  <code>!temp</code> — 排除包含"temp"的结果
+                </li>
+                <li>
+                  <code>ext:txt !backup</code> — TXT 文件但排除"backup"
+                </li>
+              </ul>
+
+              <h4>路径格式说明</h4>
+              <ul>
+                <li>
+                  <strong>Windows</strong>: <code>C:\Users\Name\Documents</code>
+                </li>
+                <li>
+                  <strong>Unix/Linux</strong>: <code>/home/user/documents</code> 或{" "}
+                  <code>~/Documents</code>
+                </li>
+                <li>
+                  ⚠️ Unix 路径不要写成盘符格式（例如不要写 <code>C:</code>）
+                </li>
+              </ul>
+            </div>
+            <div className="fx-modal-footer">
+              <button type="button" onClick={() => setShowSyntaxHelp(false)}>
+                关闭
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

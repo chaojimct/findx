@@ -291,3 +291,134 @@
   align-items: center;
   flex-wrap: wrap;
 }
+
+/* 模态框样式 */
+.fx-modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  animation: fadeIn 0.15s ease;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.fx-modal-dialog {
+  background: var(--fx-bg);
+  border-radius: var(--fx-radius-lg);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  max-width: 90vw;
+  max-height: 85vh;
+  width: 640px;
+  display: flex;
+  flex-direction: column;
+  animation: slideUp 0.2s ease;
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fx-modal-header {
+  padding: var(--fx-space-lg) var(--fx-space-xl);
+  border-bottom: 1px solid var(--fx-divider);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.fx-modal-header h3 {
+  margin: 0;
+  font-size: var(--fx-text-lg);
+  font-weight: 600;
+  color: var(--fx-text-primary);
+}
+
+.fx-btn-close {
+  background: none;
+  border: none;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--fx-radius-sm);
+  cursor: pointer;
+  font-size: 18px;
+  color: var(--fx-text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.1s ease;
+}
+
+.fx-btn-close:hover {
+  background: var(--fx-bg-hover);
+  color: var(--fx-text-primary);
+}
+
+.fx-modal-body {
+  padding: var(--fx-space-lg) var(--fx-space-xl);
+  overflow-y: auto;
+  flex: 1;
+}
+
+.fx-modal-body h4 {
+  margin: var(--fx-space-lg) 0 var(--fx-space-sm) 0;
+  font-size: var(--fx-text-base);
+  font-weight: 600;
+  color: var(--fx-text-primary);
+}
+
+.fx-modal-body h4:first-child {
+  margin-top: 0;
+}
+
+.fx-modal-body ul {
+  margin: 0 0 var(--fx-space-md) 0;
+  padding-left: var(--fx-space-xl);
+  list-style: disc;
+}
+
+.fx-modal-body li {
+  margin: var(--fx-space-xs) 0;
+  line-height: 1.6;
+}
+
+.fx-modal-body code {
+  background: var(--fx-code-bg);
+  padding: 2px 6px;
+  border-radius: var(--fx-radius-xs);
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  font-size: var(--fx-text-sm);
+  color: var(--fx-accent);
+}
+
+.fx-modal-footer {
+  padding: var(--fx-space-md) var(--fx-space-xl);
+  border-top: 1px solid var(--fx-divider);
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--fx-space-sm);
+}
+
+.fx-modal-footer button {
+  min-width: 80px;
+}
