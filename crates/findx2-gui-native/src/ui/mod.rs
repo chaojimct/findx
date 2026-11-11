@@ -14,7 +14,11 @@ pub fn start(opts: LaunchOptions) {
     let title = opts.window_title().to_string();
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
-        let session = cx.new(|_| AppSession::load(&opts, false));
+        let dark = matches!(
+            cx.window_appearance(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        );
+        let session = cx.new(|_| AppSession::load(&opts, dark));
         session.update(cx, |session, cx| {
             session.apply_theme(cx);
         });
@@ -78,7 +82,7 @@ pub fn open_settings_window(session: Entity<AppSession>, cx: &mut App) {
         "FindX2 设置 (isolated)"
     };
 
-    let bounds = Bounds::centered(None, size(px(720.), px(820.)), cx);
+    let bounds = Bounds::centered(None, size(px(760.), px(680.)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(480.), px(520.))),

@@ -411,6 +411,14 @@ impl MainWindow {
                     match result {
                         Ok(resp) => {
                             session.connected = true;
+                            session.status_raw = serde_json::to_string_pretty(&resp)
+                                .unwrap_or_else(|e| e.to_string());
+                            session.status_checked = search_logic::format_time(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                            );
                             session.last_error = None;
                             session.index_status = status_logic::summarize_status(&resp, backfill);
                         }

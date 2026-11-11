@@ -21,3 +21,6 @@ pub mod preview_worker;
 
 #[cfg(windows)]
 pub mod office_host;
+
+pub mod autostart;
+pub mod service_control;

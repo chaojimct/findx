@@ -106,10 +106,20 @@ async fn dispatch(job: Job) {
             offset,
             reply,
         } => {
-            let _ = reply.send(ipc_search(endpoint, query, pinyin, limit, offset).await);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                ipc_search(endpoint, query, pinyin, limit, offset),
+            )
+            .await
+            .unwrap_or_else(|_| Err("搜索响应超时（15 秒）".into()));
+            let _ = reply.send(result);
         }
         Job::Status { endpoint, reply } => {
-            let _ = reply.send(ipc_status(endpoint).await);
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(5), ipc_status(endpoint))
+                    .await
+                    .unwrap_or_else(|_| Err("Status 响应超时（5 秒）".into()));
+            let _ = reply.send(result);
         }
         Job::Ping { endpoint, reply } => {
             let _ = reply.send(ipc_ping(endpoint).await);

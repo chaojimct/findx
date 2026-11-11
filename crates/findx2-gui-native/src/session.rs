@@ -18,6 +18,8 @@ pub struct AppSession {
     pub prefs: LocalPrefs,
     pub index_status: IndexStatusView,
     pub connected: bool,
+    pub status_raw: String,
+    pub status_checked: String,
     pub last_error: Option<String>,
     pub available_roots: Vec<String>,
     pub system_dark: bool,
@@ -31,7 +33,7 @@ impl AppSession {
             prefs.diag_enabled = true;
         }
         let settings = prefs::load_settings(
-            &opts.pipe_name,
+            "findx2-native-dev",
             crate::isolation::isolated_index_path()
                 .to_string_lossy()
                 .into_owned(),
@@ -52,6 +54,8 @@ impl AppSession {
             prefs,
             index_status: initial_status,
             connected: false,
+            status_raw: "尚未收到 Status 响应".into(),
+            status_checked: "尚未查询".into(),
             last_error: None,
             available_roots: Vec::new(),
             system_dark,

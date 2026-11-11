@@ -2,20 +2,18 @@ use std::rc::Rc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::dialog::DialogButtonProps;
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::scroll::ScrollableElement;
-use gpui_kit::component::{
-    Disableable as _, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
-};
+use gpui_kit::component::{Disableable as _, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::prefs;
-use crate::session::{AppSession, persist_settings};
+use crate::session::AppSession;
 use crate::settings_logic::{
-    CLOSE_DIRTY_MESSAGE, CloseDecision, DraftCommit, FindxGuiSettings, RunMode, UiThemePref,
-    close_decision, commit_save_interval_secs, commit_search_limit, form_is_dirty,
+    CLOSE_DIRTY_MESSAGE, DraftCommit, FindxGuiSettings, UiThemePref, commit_save_interval_secs,
+    commit_search_limit, form_is_dirty,
 };
 use crate::theme::FindxTokens;
 use crate::ui::update_card::{UpdateCardState, render_update_card};
@@ -27,6 +25,7 @@ enum SettingsTab {
     Search,
     Service,
     Advanced,
+    Diagnostics,
 }
 
 pub struct SettingsWindow {
@@ -41,12 +40,18 @@ pub struct SettingsWindow {
     index_path: Entity<InputState>,
     pipe_name: Entity<InputState>,
     service_exe: Entity<InputState>,
-    excluded: Entity<InputState>,
+    excluded: Entity<TextareaState>,
     hint: SharedString,
     dirty_tick: u64,
     update: UpdateCardState,
     show_syntax: bool,
     close_guarded: bool,
+    saving: bool,
+    service_snapshot: Option<crate::service_control::Snapshot>,
+    service_pending: Option<crate::service_control::Action>,
+    service_busy: bool,
+    service_hint: String,
+    autostart_hint: String,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -64,8 +69,11 @@ impl SettingsWindow {
             cx.new(|cx| InputState::new(window, cx).default_value(settings.pipe_name.clone()));
         let service_exe = cx
             .new(|cx| InputState::new(window, cx).default_value(settings.service_exe_path.clone()));
-        let excluded = cx
-            .new(|cx| InputState::new(window, cx).default_value(settings.excluded_dirs.join("\n")));
+        let excluded = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(4)
+                .default_value(settings.excluded_dirs.join("\n"))
+        });
 
         let mut this = Self {
             session,
@@ -85,6 +93,12 @@ impl SettingsWindow {
             update: UpdateCardState::new(theme_auto_check_placeholder()),
             show_syntax: false,
             close_guarded: false,
+            saving: false,
+            service_snapshot: None,
+            service_pending: None,
+            service_busy: false,
+            service_hint: "正在识别正式服务…".into(),
+            autostart_hint: "正在读取 HKCU\\Run\\FindX…".into(),
             _subscriptions: Vec::new(),
         };
         this.update.auto_check = this.settings.auto_check_update;
@@ -100,7 +114,6 @@ impl SettingsWindow {
             this.index_path.clone(),
             this.pipe_name.clone(),
             this.service_exe.clone(),
-            this.excluded.clone(),
         ] {
             this._subscriptions
                 .push(cx.subscribe_in(&input, window, move |this, _, ev, _, cx| {
@@ -110,11 +123,30 @@ impl SettingsWindow {
                 }));
         }
 
+        this._subscriptions
+            .push(cx.observe(&this.session, |_, _, cx| cx.notify()));
+        this._subscriptions.push(
+            cx.subscribe_in(&this.excluded, window, |this, _, ev, _, cx| {
+                if let InputEvent::Change = ev {
+                    this.sync_text_fields(cx);
+                    cx.notify();
+                }
+            }),
+        );
+        this._subscriptions.push(
+            cx.subscribe_in(&this.excluded, window, |this, _, ev, _, cx| {
+                if let InputEvent::Change = ev {
+                    this.sync_text_fields(cx);
+                    cx.notify();
+                }
+            }),
+        );
         let entity = cx.entity();
         window.on_window_should_close(cx, move |window, cx| {
             entity.update(cx, |this, cx| this.confirm_close(window, cx))
         });
 
+        this.refresh_service(cx);
         this
     }
 
@@ -151,88 +183,51 @@ impl SettingsWindow {
         )
     }
 
-    fn confirm_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let dirty = self.is_dirty(cx);
-        match close_decision(dirty, false) {
-            CloseDecision::Hide => {
-                if dirty {
-                    // only when not dirty
-                }
-                true
-            }
-            CloseDecision::Stay => {
-                if self.close_guarded {
-                    return false;
-                }
-                self.close_guarded = true;
-                let entity = cx.entity();
-                window.open_alert_dialog(cx, move |alert, _, _| {
-                    alert
-                        .title("关闭设置？")
-                        .description(CLOSE_DIRTY_MESSAGE)
-                        .confirm()
-                        .button_props(
-                            DialogButtonProps::default()
-                                .ok_text("丢弃并关闭")
-                                .cancel_text("取消"),
-                        )
-                        .on_ok({
-                            let entity = entity.clone();
-                            move |_, window, cx| {
-                                let _ = entity.update(cx, |this, cx| {
-                                    this.revert_unsaved(cx);
-                                    this.close_guarded = false;
-                                    window.remove_window();
-                                });
-                                true
-                            }
-                        })
-                        .on_cancel({
-                            let entity = entity.clone();
-                            move |_, _, cx| {
-                                let _ = entity.update(cx, |this, cx| {
-                                    this.close_guarded = false;
-                                    cx.notify();
-                                });
-                                true
-                            }
-                        })
-                });
-                false
-            }
+    fn confirm_close(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.saving || self.service_busy {
+            return false;
         }
+        if !self.is_dirty(cx) {
+            return true;
+        }
+        self.close_guarded = true;
+        cx.notify();
+        false
     }
 
     fn revert_unsaved(&mut self, cx: &mut Context<Self>) {
         self.settings = self.original.clone();
         self.theme = self.original_theme;
-        self.session.update(cx, |session, cx| {
-            session.set_theme_pref(this_theme(self.theme), cx);
-        });
+        crate::theme::apply_findx_theme(
+            self.original_theme
+                .resolve(self.session.read(cx).system_dark),
+            cx,
+        );
+        cx.refresh_windows();
         self.hint = "已丢弃未保存的更改".into();
         cx.notify();
     }
 
-    fn save(&mut self, cx: &mut Context<Self>) {
+    fn save(&mut self, close_after: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving {
+            return;
+        }
         self.sync_text_fields(cx);
-        let limit = commit_search_limit(&self.search_limit_text(cx));
-        let interval = commit_save_interval_secs(&self.save_interval_text(cx));
-        let DraftCommit::Ok(limit) = limit else {
-            if let DraftCommit::Err(msg) = limit {
+        let (limit, interval) = match (
+            commit_search_limit(&self.search_limit_text(cx)),
+            commit_save_interval_secs(&self.save_interval_text(cx)),
+        ) {
+            (DraftCommit::Ok(l), DraftCommit::Ok(i)) => (l, i),
+            (DraftCommit::Err(msg), _) | (_, DraftCommit::Err(msg)) => {
                 self.hint = msg.into();
+                self.close_guarded = false;
+                cx.notify();
+                return;
             }
-            cx.notify();
-            return;
-        };
-        let DraftCommit::Ok(interval) = interval else {
-            if let DraftCommit::Err(msg) = interval {
-                self.hint = msg.into();
-            }
-            cx.notify();
-            return;
         };
         if crate::isolation::is_production_pipe(&self.settings.pipe_name) {
-            self.hint = "拒绝把管道名保存为生产默认 findx2。请使用隔离管道名。".into();
+            self.hint = "只允许保存隔离管道名；活动 live 连接不会被设置改变".into();
+            self.close_guarded = false;
             cx.notify();
             return;
         }
@@ -240,22 +235,66 @@ impl SettingsWindow {
         self.settings.save_interval_secs = interval;
         let next = self.settings.clone();
         let theme = self.theme;
-        self.original = next.clone();
-        self.original_theme = theme;
-        self.session.update(cx, |session, cx| {
-            session.settings = next.clone();
-            session.set_theme_pref(theme, cx);
-        });
-        persist_settings(next, cx);
-        self.hint = "设置已保存（仅写入隔离目录，不影响正式 GUI）".into();
+        let mut prefs = self.session.read(cx).prefs.clone();
+        prefs.theme = theme;
+        let handle = window.window_handle();
+        self.saving = true;
+        self.hint = "正在保存并回读隔离设置…".into();
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            let saved = next.clone();
+            let local_prefs = prefs.clone();
+            let result = cx
+                .background_spawn(async move {
+                    crate::prefs::save_settings(&saved)?;
+                    crate::prefs::save_prefs(&local_prefs)?;
+                    let text = std::fs::read_to_string(crate::prefs::settings_path())
+                        .map_err(|e| e.to_string())?;
+                    let readback: FindxGuiSettings =
+                        serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                    if readback != saved {
+                        return Err("设置回读与保存内容不一致".into());
+                    }
+                    if crate::prefs::load_prefs().theme != local_prefs.theme {
+                        return Err("主题回读失败".into());
+                    }
+                    Ok::<(), String>(())
+                })
+                .await;
+            let ok = result.is_ok();
+            this.update(cx, |this, cx| {
+                this.saving = false;
+                this.close_guarded = false;
+                match result {
+                    Ok(()) => {
+                        this.original = next.clone();
+                        this.settings = next.clone();
+                        this.original_theme = theme;
+                        this.session.update(cx, |s, cx| {
+                            s.settings = next;
+                            s.prefs.theme = theme;
+                            s.apply_theme(cx);
+                            cx.notify();
+                        });
+                        this.hint = "已保存并回读验证 · 仅 FindX-native-dev".into();
+                    }
+                    Err(e) => this.hint = format!("保存失败（草稿保留）：{e}").into(),
+                }
+                cx.notify();
+            })
+            .ok();
+            if ok && close_after {
+                let _ = handle.update(cx, |_, w, _| w.remove_window());
+            }
+        })
+        .detach();
     }
 
     fn set_theme(&mut self, pref: UiThemePref, cx: &mut Context<Self>) {
         self.theme = pref;
-        self.session.update(cx, |session, cx| {
-            session.set_theme_pref(pref, cx);
-        });
+        let dark = self.session.read(cx).system_dark;
+        crate::theme::apply_findx_theme(pref.resolve(dark), cx);
+        cx.refresh_windows();
         cx.notify();
     }
 
@@ -274,10 +313,6 @@ impl SettingsWindow {
     }
 }
 
-fn this_theme(pref: UiThemePref) -> UiThemePref {
-    pref
-}
-
 fn theme_auto_check_placeholder() -> bool {
     false
 }
@@ -291,6 +326,8 @@ impl Render for SettingsWindow {
 
         v_flex()
             .size_full()
+            .relative()
+            .overflow_hidden()
             .bg(tokens.bg)
             .text_color(tokens.text_primary)
             .child(self.render_header(dirty, tokens, cx))
@@ -314,9 +351,18 @@ impl Render for SettingsWindow {
                         SettingsTab::Advanced => {
                             self.render_advanced_tab(tokens, cx).into_any_element()
                         }
+                        SettingsTab::Diagnostics => {
+                            self.render_diagnostics(tokens, cx).into_any_element()
+                        }
                     }),
             )
             .child(self.render_footer(tokens, cx))
+            .when(self.service_pending.is_some(), |view| {
+                view.child(self.render_service_confirm(tokens, cx))
+            })
+            .when(self.close_guarded, |view| {
+                view.child(self.render_close_confirm(tokens, cx))
+            })
             .when(self.show_syntax, |this| {
                 this.child(self.render_syntax_help(tokens, cx))
             })
@@ -335,6 +381,7 @@ impl SettingsWindow {
             .bg(tokens.surface)
             .border_b_1()
             .border_color(tokens.border)
+            .flex_shrink_0()
             .px_4()
             .pt_3()
             .gap_2()
@@ -353,7 +400,8 @@ impl SettingsWindow {
                         (SettingsTab::Index, "索引"),
                         (SettingsTab::Search, "搜索"),
                         (SettingsTab::Service, "服务模式"),
-                        (SettingsTab::Advanced, "高级"),
+                        (SettingsTab::Advanced, "外观与高级"),
+                        (SettingsTab::Diagnostics, "诊断"),
                     ]
                     .into_iter()
                     .map(|(tab, label)| {
@@ -427,7 +475,7 @@ impl SettingsWindow {
                     .text_color(tokens.text_secondary)
                     .child("每行一个完整路径。规则只写入隔离设置；本批不会对生产 index 执行重建。"),
             )
-            .child(Input::new(&self.excluded).h(px(96.)))
+            .child(Textarea::new(&self.excluded).h(px(96.)))
             .child(section_title("元数据", tokens))
             .child(
                 Checkbox::new("backfill")
@@ -518,95 +566,79 @@ impl SettingsWindow {
             ))
     }
 
+    fn refresh_service(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let (snapshot, auto) = cx
+                .background_spawn(async {
+                    let s = crate::service_control::snapshot();
+                    let a = crate::autostart::read();
+                    (s, a)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.autostart_hint = format!(
+                    "正式 GUI 登录自启动：{} · {}",
+                    if auto.enabled {
+                        "已启用"
+                    } else {
+                        "未启用或指向其他程序"
+                    },
+                    auto.command.as_deref().unwrap_or("没有 Run 项")
+                );
+                match snapshot {
+                    Ok(s) => {
+                        this.service_hint = format!(
+                            "{} · {} · {} · PID {}",
+                            s.name, s.state, s.start_mode, s.process_id
+                        );
+                        this.service_snapshot = Some(s);
+                    }
+                    Err(e) => {
+                        this.service_snapshot = None;
+                        this.service_hint = e;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
     fn render_service_tab(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .gap_3()
-            .max_w(px(800.))
-            .child(div().child("启动模式"))
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child({
-                        let entity = cx.entity();
-                        radio_row(
-                            "mode-service",
-                            "服务模式（默认；不弹 UAC，开机自启）",
-                            self.settings.run_mode == RunMode::Service,
-                            move |checked, _, cx| {
-                                if *checked {
-                                    entity.update(cx, |this, cx| {
-                                        this.settings.run_mode = RunMode::Service;
-                                        cx.notify();
-                                    });
-                                }
-                            },
-                            tokens,
-                        )
-                    })
-                    .child({
-                        let entity = cx.entity();
-                        radio_row(
-                            "mode-standalone",
-                            "单体 UAC 模式（每次启动会请求管理员授权）",
-                            self.settings.run_mode == RunMode::Standalone,
-                            move |checked, _, cx| {
-                                if *checked {
-                                    entity.update(cx, |this, cx| {
-                                        this.settings.run_mode = RunMode::Standalone;
-                                        cx.notify();
-                                    });
-                                }
-                            },
-                            tokens,
-                        )
-                    }),
-            )
-            .child(
-                Checkbox::new("everything-ipc")
-                    .checked(self.settings.enable_everything_ipc)
-                    .label("开启 Everything SDK 兼容窗口（IbEverythingExt 等老客户端依赖）")
-                    .on_change({
-                    let entity = cx.entity();
-                    move |checked, _, cx| {
-                        entity.update(cx, |this, cx| {
-                        this.settings.enable_everything_ipc = *checked;
-                        cx.notify();
-                        });
-                    }
-                }),
-            )
-            .child(
-                Checkbox::new("auto-start-svc")
-                    .checked(self.settings.auto_start_service)
-                    .label("GUI 启动时自动拉起索引服务")
-                    .on_change({
-                    let entity = cx.entity();
-                    move |checked, _, cx| {
-                        entity.update(cx, |this, cx| {
-                        this.settings.auto_start_service = *checked;
-                        cx.notify();
-                        });
-                    }
-                }),
-            )
-            .child(
-                Checkbox::new("auto-start-app")
-                    .checked(self.settings.auto_start_app)
-                    .disabled(true)
-                    .label("随系统启动（登录时自动启动 FindX 托盘）"),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(Button::new("start-svc").label("启动服务").disabled(true))
-                    .child(Button::new("stop-svc").label("停止服务").disabled(true)),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(tokens.warning)
-                    .child("本客户端不会启动或停止生产 findx2-service，也不会改系统服务。上面的开关只写入隔离设置。"),
-            )
+        use crate::service_control::Action;
+        v_flex().gap_3().w_full()
+            .child(section_title("管理已安装的正式 FindX 服务",tokens))
+            .child(div().text_sm().child("只管理身份核对通过的 FindX2Search；不会按进程名称批量终止，也不会注册另一套开发服务。操作前确认，执行后回读。"))
+            .child(div().text_sm().child(self.service_hint.clone()))
+            .when_some(self.service_snapshot.as_ref(),|v,s|v.child(div().text_sm().child(s.path_name.clone())))
+            .child(div().text_sm().child(self.autostart_hint.clone()))
+            .child({let entity=cx.entity();Button::new("refresh-service").label("刷新服务状态").disabled(self.service_busy).on_click(move|_,_,cx|entity.update(cx,|this,cx|this.refresh_service(cx)))})
+            .child(h_flex().gap_2().flex_wrap().children([Action::Start,Action::Stop,Action::Auto,Action::Manual,Action::GuiAutoOn,Action::GuiAutoOff,Action::Compact,Action::Rebuild].into_iter().map(|action|{let entity=cx.entity();Button::new(SharedString::from(action.label())).label(action.label()).disabled(self.service_busy||self.service_snapshot.is_none()).on_click(move|_,_,cx|entity.update(cx,|this,cx|{this.service_pending=Some(action);cx.notify();}))})))
+            .child(div().text_sm().text_color(tokens.warning).child("服务控制需要 SCM 权限；权限不足会报告真实错误，不静默假装成功。维护需要管理员；先停服务并完整备份，在副本上运行安装版 CLI，成功校验后替换；保留旧库并恢复原运行状态。排除规则无法确定时拒绝重建。"))
+            .child(div().text_sm().child("此页修改 SCM / HKCU 正式自启动；其他标签的范围/路径草稿只保存 native-dev，不覆盖正式服务配置。活动服务的命令行才是当前启动参数真源。"))
+    }
+    fn render_service_confirm(
+        &self,
+        tokens: FindxTokens,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let action = self.service_pending.unwrap();
+        let target = self
+            .service_snapshot
+            .as_ref()
+            .map(|s| {
+                format!(
+                    "目标：{} · PID {} · {}\n{}",
+                    s.name, s.process_id, s.state, s.path_name
+                )
+            })
+            .unwrap_or_default();
+        div().absolute().inset_0().bg(rgba(0x00000088)).flex().items_center().justify_center().child(v_flex().w(px(520.)).max_w_full().m_4().p_4().gap_3().rounded_lg().bg(tokens.surface_raised)
+            .child(div().child(format!("确认{}？",action.label())))
+            .child(div().text_sm().child(target))
+            .child(div().text_sm().child("此操作真正影响正式 FindX。停止/维护期间搜索将不可用。备份可能占用大量磁盘空间；过程失败会明确报告。没有自动删除备份。"))
+            .child(h_flex().gap_2().child({let e=cx.entity();Button::new("confirm-service").label("确认执行").on_click(move|_,_,cx|e.update(cx,|this,cx|{let Some(expected)=this.service_snapshot.clone()else{return;};this.service_pending=None;this.service_busy=true;this.service_hint="正在执行正式服务操作，请勿关闭窗口…".into();cx.notify();cx.spawn(async move|this,cx|{let result=cx.background_spawn(async move{crate::service_control::execute(action,expected)}).await;this.update(cx,|this,cx|{this.service_busy=false;this.hint=match result{Ok(m)=>m.into(),Err(e)=>format!("操作失败：{e}").into()};this.refresh_service(cx);cx.notify();}).ok();}).detach();}))})
+            .child({let e=cx.entity();Button::new("cancel-service").label("取消操作").on_click(move|_,_,cx|e.update(cx,|this,cx|{this.service_pending=None;cx.notify();}))})))
     }
 
     fn render_advanced_tab(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> impl IntoElement {
@@ -715,10 +747,121 @@ impl SettingsWindow {
             .when(auto, |this| this)
     }
 
+    fn render_close_confirm(
+        &self,
+        tokens: FindxTokens,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .absolute()
+            .inset_0()
+            .bg(rgba(0x00000066))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                v_flex()
+                    .w(px(420.))
+                    .max_w_full()
+                    .m_4()
+                    .p_4()
+                    .gap_3()
+                    .rounded_lg()
+                    .bg(tokens.surface_raised)
+                    .border_1()
+                    .border_color(tokens.border)
+                    .child(div().child("设置尚未保存"))
+                    .child(div().text_sm().child(CLOSE_DIRTY_MESSAGE))
+                    .child(
+                        h_flex().gap_2().flex_wrap().children(
+                            [
+                                ("save-close", "保存并关闭"),
+                                ("discard-close", "丢弃并关闭"),
+                                ("cancel-close", "取消"),
+                            ]
+                            .into_iter()
+                            .map(|(id, label)| {
+                                let entity = cx.entity();
+                                Button::new(id).label(label).disabled(self.saving).on_click(
+                                    move |_, window, cx| {
+                                        entity.update(cx, |this, cx| match id {
+                                            "save-close" => this.save(true, window, cx),
+                                            "discard-close" => {
+                                                this.revert_unsaved(cx);
+                                                window.remove_window();
+                                            }
+                                            _ => {
+                                                this.close_guarded = false;
+                                                cx.notify();
+                                            }
+                                        })
+                                    },
+                                )
+                            }),
+                        ),
+                    ),
+            )
+    }
+
+    fn render_diagnostics(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> impl IntoElement {
+        let s = self.session.read(cx);
+        let rows = vec![
+            format!(
+                "Native 客户端版本：{} ({})",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::ARCH
+            ),
+            format!(
+                "连接：{}",
+                if s.connected {
+                    "Status 响应正常"
+                } else {
+                    "未连接 / 查询失败"
+                }
+            ),
+            format!("活动端点：{}", s.endpoint),
+            format!(
+                "模式：{}",
+                if s.live {
+                    "live 只读生产管道"
+                } else if s.mock {
+                    "模拟后端"
+                } else {
+                    "隔离后端"
+                }
+            ),
+            format!("最近成功 Status：{}（本地时间）", s.status_checked),
+            format!("服务版本：当前 Status 协议未提供版本，不推断"),
+            format!("索引：{}", s.index_status.summary),
+            format!("错误：{}", s.last_error.as_deref().unwrap_or("无")),
+            format!("设置文件：{}", prefs::settings_path().display()),
+            format!(
+                "隔离设置管道：{}（不改变当前活动连接）",
+                self.settings.pipe_name
+            ),
+            "自动折叠：预览 <900 / 侧栏 <760 逻辑 px；手动按钮可覆盖。不是物理屏幕像素。".into(),
+            "只读范围：Search / Status / Ping；未读取或打开生产索引文件。".into(),
+        ];
+        v_flex()
+            .w_full()
+            .gap_3()
+            .child(section_title("只读运行诊断", tokens))
+            .children(rows.into_iter().map(|r| div().text_sm().child(r)))
+            .child(section_title("原始 Status 响应（每 2 秒更新）", tokens))
+            .child(
+                div()
+                    .text_xs()
+                    .p_3()
+                    .bg(tokens.surface)
+                    .child(s.status_raw.clone()),
+            )
+    }
+
     fn render_footer(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .w_full()
             .h(px(56.))
+            .flex_shrink_0()
             .px_4()
             .gap_2()
             .items_center()
@@ -739,8 +882,9 @@ impl SettingsWindow {
                 Button::new("save")
                     .primary()
                     .label("保存")
-                    .on_click(move |_, _, cx| {
-                        entity.update(cx, |this, cx| this.save(cx));
+                    .disabled(self.saving)
+                    .on_click(move |_, window, cx| {
+                        entity.update(cx, |this, cx| this.save(false, window, cx));
                     })
             })
             .child({
@@ -821,19 +965,4 @@ fn section_title(text: &str, tokens: FindxTokens) -> impl IntoElement {
     div()
         .text_color(tokens.text_primary)
         .child(text.to_string())
-}
-
-fn radio_row(
-    id: &'static str,
-    label: &'static str,
-    selected: bool,
-    on_change: impl Fn(&bool, &mut Window, &mut App) + 'static,
-    tokens: FindxTokens,
-) -> impl IntoElement {
-    let _ = tokens;
-    // Checkbox used as a simple exclusive row; the listener sets the enum.
-    Checkbox::new(id)
-        .checked(selected)
-        .label(label)
-        .on_change(on_change)
 }
