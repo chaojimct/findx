@@ -24,3 +24,5 @@ pub mod office_host;
 
 pub mod autostart;
 pub mod service_control;
+
+pub mod browser;
