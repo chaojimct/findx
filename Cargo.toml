@@ -9,6 +9,7 @@ members = [
     "crates/findx2-ipc",
     "crates/findx2-service",
     "gui/src-tauri",
+    "crates/findx2-gui-native",
 ]
 
 [workspace.package]
