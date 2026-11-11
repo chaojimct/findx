@@ -7,6 +7,7 @@ pub struct LaunchOptions {
     pub mock: bool,
     pub live: bool,
     pub diag: bool,
+    pub preview_file: Option<String>,
 }
 
 impl LaunchOptions {
@@ -21,6 +22,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
     let mut mock = false;
     let mut live = false;
     let mut diag = false;
+    let mut preview_file = None;
     let mut iter = args.into_iter().peekable();
     // skip argv0
     let _ = iter.next();
@@ -30,6 +32,9 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
             "--mock" => mock = true,
             "--live" => live = true,
             "--diag" => diag = true,
+            "--preview-file" => {
+                preview_file = Some(iter.next().ok_or("--preview-file 需要本地文件路径")?);
+            }
             "--pipe" => {
                 let Some(value) = iter.next() else {
                     return Err("--pipe 需要一个管道名".into());
@@ -60,6 +65,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
         mock,
         live,
         diag,
+        preview_file,
     })
 }
 
@@ -75,6 +81,7 @@ findx2-gui-native — FindX 原生客户端（不替代 WebView GUI）
   --live          作为只读 IPC 客户端连接现有生产管道 findx2（不启动、不重启 service，不写索引）
   --pipe NAME     管道名。默认隔离名是 {DEFAULT_ISOLATED_PIPE}；加 --live 时默认是 {PRODUCTION_PIPE}。
                   生产名 findx2 仅在 --live 时允许，单独 --pipe findx2 会被拒绝
+  --preview-file PATH  直接只读预览本地文件（不插入搜索结果、不要求索引包含该文件）
   --diag          启动时打开诊断浮层
   -h, --help      显示帮助
 

@@ -359,7 +359,11 @@ fn rtf_text(bytes: &[u8]) -> Result<String, String> {
 }
 
 #[cfg(windows)]
-pub fn pdf_first_page(path: &Path) -> Result<(Vec<u8>, u32), String> {
+pub fn pdf_page(
+    path: &Path,
+    page_index: u32,
+    max_edge: u32,
+) -> Result<(Vec<u8>, u32, f32, f32), String> {
     use windows::{
         Data::Pdf::{PdfDocument, PdfPageRenderOptions},
         Storage::{
@@ -371,28 +375,47 @@ pub fn pdf_first_page(path: &Path) -> Result<(Vec<u8>, u32), String> {
     if std::fs::metadata(path).map_err(|e| e.to_string())?.len() > MAX_FILE {
         return Err("PDF 超过 32 MiB 预览上限".into());
     }
-    let run = || -> windows::core::Result<(Vec<u8>, u32)> {
-        let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(path.as_os_str()))?.get()?;
+    // WinRT StorageFile rejects mixed slash separators even though std::fs accepts them.
+    use std::os::windows::ffi::OsStrExt;
+    let absolute = std::path::absolute(path).map_err(|e| e.to_string())?;
+    let normalized: Vec<u16> = absolute
+        .as_os_str()
+        .encode_wide()
+        .map(|c| if c == 47 { 92 } else { c })
+        .collect();
+    let winrt_path = HSTRING::from_wide(&normalized);
+    let run = || -> windows::core::Result<(Vec<u8>, u32, f32, f32)> {
+        let file = StorageFile::GetFileFromPathAsync(&winrt_path)?.get()?;
         let doc = PdfDocument::LoadFromFileAsync(&file)?.get()?;
         let count = doc.PageCount()?;
-        let page = doc.GetPage(0)?;
+        let page = doc.GetPage(page_index.min(count.saturating_sub(1)))?;
         let stream = InMemoryRandomAccessStream::new()?;
         let options = PdfPageRenderOptions::new()?;
         let page_size = page.Size()?;
-        let scale = (1200.0 / page_size.Width.max(1.0)).min(1600.0 / page_size.Height.max(1.0));
+        let edge = max_edge.clamp(400, 3072) as f32;
+        let scale = (edge / page_size.Width.max(1.0)).min(edge / page_size.Height.max(1.0));
         options.SetDestinationWidth((page_size.Width * scale).max(1.0) as u32)?;
         options.SetDestinationHeight((page_size.Height * scale).max(1.0) as u32)?;
         page.RenderWithOptionsToStreamAsync(&stream, &options)?
             .get()?;
-        let size = stream.Size()?.min(24 * 1024 * 1024) as u32;
+        let size = stream.Size()?;
+        if size > 24 * 1024 * 1024 {
+            return Err(windows::core::Error::from_win32());
+        }
+        let size = size as u32;
         let reader = DataReader::CreateDataReader(&stream.GetInputStreamAt(0)?)?;
         reader.LoadAsync(size)?.get()?;
         let mut bytes = vec![0; size as usize];
         reader.ReadBytes(&mut bytes)?;
         page.Close()?;
-        Ok((bytes, count))
+        Ok((bytes, count, page_size.Width, page_size.Height))
     };
     run().map_err(|e| format!("Windows PDF 引擎无法预览（可能加密、损坏或引擎不可用）：{e}"))
+}
+
+#[cfg(windows)]
+pub fn pdf_first_page(path: &Path) -> Result<(Vec<u8>, u32), String> {
+    pdf_page(path, 0, 1600).map(|(bytes, count, _, _)| (bytes, count))
 }
 
 #[cfg(test)]

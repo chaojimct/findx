@@ -30,6 +30,7 @@ pub enum PreviewKind {
     Empty,
     Loading,
     Image,
+    NativeOffice,
     Text,
     Directory,
     Unsupported,
@@ -52,7 +53,17 @@ pub struct DirEntryPreview {
     pub is_dir: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct PdfMeta {
+    pub count: u32,
+    pub width: f32,
+    pub height: f32,
+}
+
 pub struct PreviewState {
+    #[cfg(windows)]
+    pub native: Option<crate::office_host::NativeClient>,
+    pub pdf: Option<PdfMeta>,
     pub generation: u64,
     pub meta: Option<PreviewMeta>,
     pub kind: PreviewKind,
@@ -71,6 +82,9 @@ pub struct PreviewState {
 impl PreviewState {
     pub fn empty() -> Self {
         Self {
+            #[cfg(windows)]
+            native: None,
+            pdf: None,
             generation: 0,
             meta: None,
             kind: PreviewKind::Empty,
@@ -89,6 +103,9 @@ impl PreviewState {
 
     pub fn loading(generation: u64, meta: PreviewMeta) -> Self {
         Self {
+            #[cfg(windows)]
+            native: None,
+            pdf: None,
             generation,
             meta: Some(meta),
             kind: PreviewKind::Loading,
@@ -259,6 +276,30 @@ pub fn load_preview(
     mtime: u64,
     is_directory: bool,
 ) -> PreviewState {
+    load_preview_with_options(
+        generation,
+        name,
+        path,
+        size,
+        mtime,
+        is_directory,
+        crate::preview_worker::PdfOptions::default(),
+        false,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+}
+
+pub fn load_preview_with_options(
+    generation: u64,
+    name: &str,
+    path: &str,
+    size: u64,
+    mtime: u64,
+    is_directory: bool,
+    options: crate::preview_worker::PdfOptions,
+    prefer_native: bool,
+    cancel: crate::preview_worker::Cancel,
+) -> PreviewState {
     let class = classify_path(path, is_directory);
     let mut state = PreviewState::loading(
         generation,
@@ -275,42 +316,92 @@ pub fn load_preview(
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if !is_directory && crate::document_preview::supported(&ext) {
-        if ext == "pdf" {
-            #[cfg(windows)]
-            match crate::document_preview::pdf_first_page(&path_buf) {
-                Ok((bytes, pages)) => match decode_image_bytes(&bytes, bytes.len() as u64) {
-                    Ok(image) => {
-                        apply_image(&mut state, image);
-                        state.image_note = Some(format!("PDF · 第 1 / {pages} 页（仅首屏预览）"));
-                    }
-                    Err(e) => apply_error(&mut state, e),
-                },
-                Err(e) => apply_error(&mut state, e),
+    let office = matches!(
+        ext.as_str(),
+        "docx" | "xlsx" | "pptx" | "rtf" | "doc" | "xls" | "ppt"
+    );
+    let mut native_error = None;
+    if !is_directory && office && prefer_native {
+        #[cfg(windows)]
+        match crate::office_host::start(path, cancel.clone()) {
+            Ok(client) => {
+                state.native = Some(client);
+                state.kind = PreviewKind::NativeOffice;
+                state.message = Some("系统预览处理器 · 实际版式由已安装应用提供".into());
+                return state;
             }
-            #[cfg(not(windows))]
-            {
-                state.kind = PreviewKind::Unsupported;
-                state.message = Some("PDF 图像预览目前需要 Windows PDF 引擎".into());
+            Err(e) => native_error = Some(e),
+        }
+    }
+    if matches!(ext.as_str(), "doc" | "xls" | "ppt") {
+        state.kind = PreviewKind::Unsupported;
+        state.message = Some(native_error.unwrap_or_else(|| {
+            "旧二进制 Office 格式需要可用的系统预览处理器；没有文字摘录后备".into()
+        }));
+        return state;
+    }
+    if !is_directory && crate::document_preview::supported(&ext) {
+        let request = if ext == "pdf" {
+            crate::preview_worker::Request::Pdf {
+                path: path.to_owned(),
+                page: options.page,
+                edge: if options.fit_width {
+                    1600
+                } else {
+                    (1600. * options.zoom).clamp(400., 3072.) as u32
+                },
             }
         } else {
-            match crate::document_preview::load_text(&path_buf, &ext) {
-                Ok(text) => {
-                    state.kind = PreviewKind::Text;
-                    state.text = Some(if text.trim().is_empty() {
-                        "未提取到文本（可能只有图片）".into()
-                    } else {
-                        text
+            crate::preview_worker::Request::Text {
+                path: path.to_owned(),
+                ext: ext.clone(),
+            }
+        };
+        match crate::preview_worker::run(request, cancel, std::time::Duration::from_secs(10)) {
+            Ok(crate::preview_worker::Output::Pdf {
+                png,
+                count,
+                width,
+                height,
+            }) => match decode_image_bytes(&png, png.len() as u64) {
+                Ok(image) => {
+                    apply_image(&mut state, image);
+                    // The raster is a derived PNG, not the source document's file size.
+                    if let Some(meta) = state.meta.as_mut() {
+                        meta.size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(size);
+                    }
+                    state.pdf = Some(PdfMeta {
+                        count,
+                        width,
+                        height,
                     });
-                    state.text_encoding = Some(if ext == "rtf" {
-                        "RTF 文本子集 · 不含图片/对象".into()
-                    } else {
-                        "OOXML 文本摘录 · 非版式预览；不执行宏/外链/公式".into()
-                    });
-                    state.message = None;
+                    state.image_note = Some(format!(
+                        "PDF · 第 {} / {count} 页",
+                        options.page.min(count.saturating_sub(1)) + 1
+                    ));
                 }
                 Err(e) => apply_error(&mut state, e),
+            },
+            Ok(crate::preview_worker::Output::Text(text)) => {
+                state.kind = PreviewKind::Text;
+                state.text = Some(if text.trim().is_empty() {
+                    "未提取到文本（可能只有图片）".into()
+                } else {
+                    text
+                });
+                state.text_encoding = Some(if ext == "rtf" {
+                    "RTF 文本摘录 · 非版式预览".into()
+                } else {
+                    "OOXML 文本摘录 · 非版式预览；不执行宏/外链/公式".into()
+                });
+                state.message = None;
+                if let Some(reason) = native_error {
+                    state.text_encoding = Some(format!(
+                        "系统版式不可用：{reason}\n已降级为文字摘录（不保留完整排版）"
+                    ));
+                }
             }
+            Err(e) => apply_error(&mut state, e),
         }
         return state;
     }

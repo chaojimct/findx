@@ -52,37 +52,54 @@ Search `offset`; a query-generation and offset guard rejects stale pages.
 The root is flex-constrained to the complete client area; there is no viewport-height
 subtraction for native chrome or DPI. The filter rail scrolls independently.
 
-Document previews are read-only and run off the GPUI thread, with selection-generation
-stale-drop. No macro engine, shell-open fallback, Office automation, external links,
-or document scripts are used.
+Document previews run off the GPUI thread with selection-generation stale-drop.
+PDF/OOXML/RTF decoding uses a disposable helper process (10-second timeout); selection
+changes cancel and terminate only that request's helper. Corrupt/oversized input fails
+calmly. Existing image/text/directory previews remain available.
 
-- PDF (Windows): Windows.Data.Pdf rasterizes page 1, fit inside 1200 x 1600 pixels.
-  It is explicitly a **first-page** preview, not a multi-page PDF viewer. Password-
-  protected/corrupt files or an unavailable OS engine produce a calm error.
-- DOCX/PPTX: bounded OOXML text only, not exact typography, images or embedded objects.
-  DOCX reads the document body; PPTX reads up to the first 100 slide parts.
-- XLSX: bounded worksheet text with cell addresses, shared strings and cached values.
-  It does not calculate formulas, resolve links, render charts, or format date serials.
-- RTF: conservative text subset (paragraphs, tabs, Unicode and Windows-1252 escapes).
-  Pictures, embedded objects, metadata and unsupported destinations are skipped.
-- Legacy binary DOC/XLS/PPT, encrypted OOXML and arbitrary binaries remain unsupported;
-  metadata is still available. Existing image, source/text and directory previews remain.
+- PDF (Windows): Windows.Data.Pdf renders the selected page. First/previous/next/last
+  controls expose the page count; fit-width and 25%–300% zoom support horizontal and
+  vertical panning. Rendering is capped at a 3072-pixel edge. Encrypted/corrupt files
+  return an error; this is a raster viewer, not text selection/search/annotations.
+- Office: attempts the locally registered IPreviewHandler in a separate COM STA helper.
+  A separately owned popup HWND follows the GPUI preview surface, owner movement,
+  minimization, resizing and visibility. COM initialization/SetWindow/DoPreview/SetRect/
+  Unload stay on that STA. Startup is limited to eight seconds; crashed or unavailable
+  handlers do not crash GPUI. The app does not install Office or alter associations.
+  Real-layout capability depends on the installed handler and is not claimed for every
+  Office feature. On a machine with WPS preview handlers registered, public DOCX, XLSX,
+  PPTX and RTF fixtures rendered actual typography, tables, grid/sheet tabs and slides.
+  The handler may show its own chrome. Legacy DOC/XLS/PPT remain system-handler-only and
+  were not visually accepted in this batch. Without a working handler the UI falls back
+  to bounded text (OOXML/RTF) or an explicit unsupported message (legacy binary).
+- DOCX/PPTX fallback: bounded OOXML **text excerpt**, not exact typography, images or
+  embedded objects. DOCX reads the body; PPTX reads up to 100 slide parts.
+- XLSX fallback: worksheet text, cell addresses, shared strings and cached values;
+  no formula calculation, links, charts, or date serial formatting.
+- RTF fallback: conservative text subset. Pictures and embedded objects are skipped.
+- DOC/XLS/PPT: system-handler-only; without a working installed handler the UI explicitly
+  says unsupported. There is no invented text/layout fallback for legacy binary formats.
+- 系统版式 / 文字摘录 explicitly select native rendering or bounded text fallback. A failed
+  native attempt explains the downgrade rather than labeling extracted text full layout.
+
+The app performs no Office automation, macro/script invocation, shell-open preview
+fallback, external conversion or upload. Installed native handlers are third-party code
+with their own behavior; process isolation is crash/hang containment, not a security
+sandbox for hostile documents. Use trusted local documents.
 
 Documents are capped at 32 MiB, XML/RTF parts at 4 MiB, cumulative slide/sheet XML at
-16 MiB, and output at 256 KiB. ZIP entries are read in memory, never extracted to disk.
+16 MiB, and extracted text at 256 KiB. ZIP entries stay in memory, never extracted.
+`--preview-file PATH` previews one local file read-only without inserting a fake search
+result or requiring indexing; selecting a real search result returns to normal preview.
 
 ### Evaluation of the old preview mechanism
 
 Reviewed `gui/src-tauri/src/win_preview.rs` and `gui/src/findx/PreviewPane.tsx`.
-The old WebView uses IPreviewHandler with a separately owned popup HWND because the
-DComp WebView obscures child HWNDs, registered COM handlers (including 32-bit WPS),
-STA affinity and unload/recycle logic; it falls back to a browser file-viewer engine.
-Blindly importing that global state or loading arbitrary in-process preview-handler DLLs
-into GPUI would risk UI-thread stalls, stale/stray windows and crashes. A robust handler
-host needs a separate STA/message pump or helper process, cancellation, HWND lifecycle
-and per-monitor DPI integration. That work is **not claimed implemented** here.
-The implemented PDF engine and data-only Office/RTF parsers do not depend on an installed
-Office preview handler and give real errors rather than pretending handlers are available.
+The older owned-popup HWND approach is reused, but its global in-process COM state is
+not imported: this implementation isolates handler DLLs/COM calls in a disposable STA
+helper and keeps GPUI callbacks limited to surface geometry. Native Office helper windows follow owner resize and hide with the preview pane;
+switching to text excerpt or another document tears down the previous helper. Cross-monitor
+DPI remains dependent on the installed handler.
 
 The blue `拖拽至此上传` bubble was independently identified as the visible `百度网盘`
 Chrome_WidgetWin_1 window owned by BaiduNetdiskUnite.exe (PID 39088 during verification),

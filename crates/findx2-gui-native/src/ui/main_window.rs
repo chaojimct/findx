@@ -1,3 +1,4 @@
+use gpui_kit::component::Disableable as _;
 use std::time::Duration;
 
 use findx2_ipc::SearchHitDto;
@@ -58,6 +59,11 @@ pub struct MainWindow {
     status_gen: u64,
     preview: PreviewState,
     preview_gen: u64,
+    preview_cancel: crate::preview_worker::Cancel,
+    pdf_options: crate::preview_worker::PdfOptions,
+    pdf_count: u32,
+    office_text_only: bool,
+    preview_file: Option<String>,
     loading: bool,
     sidebar_force: Option<ForceState>,
     preview_force: Option<ForceState>,
@@ -136,6 +142,11 @@ impl MainWindow {
             status_gen: 0,
             preview: PreviewState::empty(),
             preview_gen: 0,
+            preview_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pdf_options: Default::default(),
+            pdf_count: 0,
+            office_text_only: false,
+            preview_file: session.read(cx).preview_file.clone(),
             loading: false,
             sidebar_force: None,
             preview_force: None,
@@ -187,6 +198,9 @@ impl MainWindow {
                 }
             }));
         this.schedule_status_poll(cx);
+        if this.preview_file.is_some() {
+            this.request_preview(cx);
+        }
         this
     }
 
@@ -447,6 +461,12 @@ impl MainWindow {
 
     fn set_selected(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
         if self.selected != index {
+            if index.is_some() {
+                self.preview_file = None;
+            }
+            self.office_text_only = false;
+            self.pdf_options = Default::default();
+            self.pdf_count = 0;
             self.selected = index;
             self.request_preview(cx);
         } else {
@@ -456,27 +476,77 @@ impl MainWindow {
     }
 
     fn request_preview(&mut self, cx: &mut Context<Self>) {
+        self.preview_cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.preview_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = self.preview_cancel.clone();
+        let options = self.pdf_options;
+        let prefer_native = !self.office_text_only;
         self.preview_gen = self.preview_gen.wrapping_add(1);
         let generation = self.preview_gen;
-        let Some(hit) = self.selected.and_then(|i| self.hits.get(i).cloned()) else {
+        let local_file = self.preview_file.is_some();
+        let target = self
+            .selected
+            .and_then(|i| self.hits.get(i).cloned())
+            .or_else(|| {
+                self.preview_file.as_ref().map(|path| SearchHitDto {
+                    entry_idx: 0,
+                    name: std::path::Path::new(path)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.clone()),
+                    path: path.clone(),
+                    size: 0,
+                    mtime: 0,
+                    is_directory: false,
+                    name_highlight: Vec::new(),
+                })
+            });
+        let Some(hit) = target else {
+            self.pdf_count = 0;
+            self.pdf_options = Default::default();
+            self.office_text_only = false;
             self.preview = PreviewState::empty();
             self._preview_task = None;
             return;
         };
-        self.preview = PreviewState::loading(
-            generation,
-            preview::meta_from_hit(&hit.name, &hit.path, hit.size, hit.mtime, hit.is_directory),
-        );
+        let same_path = self
+            .preview
+            .meta
+            .as_ref()
+            .is_some_and(|meta| meta.path == hit.path);
+        if !same_path {
+            self.preview = PreviewState::loading(
+                generation,
+                preview::meta_from_hit(&hit.name, &hit.path, hit.size, hit.mtime, hit.is_directory),
+            );
+        }
         self._preview_task = Some(cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_spawn(async move {
-                    preview::load_preview(
+                    let mut hit = hit;
+                    if local_file {
+                        if let Ok(meta) = std::fs::metadata(&hit.path) {
+                            hit.size = meta.len();
+                            hit.mtime = meta
+                                .modified()
+                                .ok()
+                                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|t| t.as_secs())
+                                .unwrap_or(0);
+                            hit.is_directory = meta.is_dir();
+                        }
+                    }
+                    preview::load_preview_with_options(
                         generation,
                         &hit.name,
                         &hit.path,
                         hit.size,
                         hit.mtime,
                         hit.is_directory,
+                        options,
+                        prefer_native,
+                        cancel,
                     )
                 })
                 .await;
@@ -484,6 +554,9 @@ impl MainWindow {
                 if !preview::is_current_generation(this.preview_gen, generation, loaded.generation)
                 {
                     return;
+                }
+                if let Some(pdf) = loaded.pdf {
+                    this.pdf_count = pdf.count;
                 }
                 this.preview = loaded;
                 cx.notify();
@@ -733,7 +806,104 @@ impl MainWindow {
             )
     }
 
-    fn render_preview(&self, cx: &App) -> impl IntoElement {
+    fn pdf_action(&mut self, action: &str, cx: &mut Context<Self>) {
+        let previous_page = self.pdf_options.page;
+        let previous_edge = if self.pdf_options.fit_width {
+            1600u32
+        } else {
+            (1600. * self.pdf_options.zoom).clamp(400., 3072.) as u32
+        };
+        match action {
+            "first" => self.pdf_options.page = 0,
+            "previous" => self.pdf_options.navigate(-1, self.pdf_count),
+            "next" => self.pdf_options.navigate(1, self.pdf_count),
+            "last" => self.pdf_options.page = self.pdf_count.saturating_sub(1),
+            "minus" => self.pdf_options.scale(1. / 1.25),
+            "plus" => self.pdf_options.scale(1.25),
+            "fit" => self.pdf_options.fit_width = true,
+            "actual" => {
+                self.pdf_options.fit_width = false;
+                self.pdf_options.zoom = 1.;
+            }
+            _ => return,
+        }
+        let edge = if self.pdf_options.fit_width {
+            1600u32
+        } else {
+            (1600. * self.pdf_options.zoom).clamp(400., 3072.) as u32
+        };
+        // Fit/100%/zoom can relayout the current raster immediately. Reload only when
+        // the page changed or a sharper (or smaller) decode is actually required.
+        if self.pdf_options.page != previous_page || edge != previous_edge {
+            self.request_preview(cx);
+        }
+        cx.notify();
+    }
+    fn render_pdf_controls(&self, cx: &Context<Self>) -> impl IntoElement {
+        let page = self.pdf_options.page;
+        v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .child(
+                h_flex().gap_1().items_center().children(
+                    [
+                        ("first", "首页", page == 0),
+                        ("previous", "上一页", page == 0),
+                        ("next", "下一页", page + 1 >= self.pdf_count),
+                        ("last", "末页", page + 1 >= self.pdf_count),
+                    ]
+                    .into_iter()
+                    .map(|(id, label, disabled)| {
+                        let entity = cx.entity();
+                        Button::new(id)
+                            .ghost()
+                            .label(label)
+                            .disabled(disabled)
+                            .on_click(move |_, _, cx| {
+                                entity.update(cx, |this, cx| this.pdf_action(id, cx))
+                            })
+                    }),
+                ),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .child(format!("{} / {}", page + 1, self.pdf_count)),
+                    )
+                    .children(
+                        [
+                            ("minus", "−"),
+                            ("plus", "+"),
+                            ("fit", "适宽"),
+                            ("actual", "100%"),
+                        ]
+                        .into_iter()
+                        .map(|(id, label)| {
+                            let entity = cx.entity();
+                            Button::new(id)
+                                .ghost()
+                                .label(label)
+                                .on_click(move |_, _, cx| {
+                                    entity.update(cx, |this, cx| this.pdf_action(id, cx))
+                                })
+                        }),
+                    )
+                    .child(div().text_xs().child(if self.pdf_options.fit_width {
+                        "适宽".into()
+                    } else {
+                        format!("{}%", (self.pdf_options.zoom * 100.).round())
+                    })),
+            )
+    }
+
+    fn render_preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = Self::tokens(cx);
         let header = match &self.preview.meta {
             Some(meta) => v_flex()
@@ -787,6 +957,35 @@ impl MainWindow {
                         .child("选择一条结果以预览"),
                 )
                 .into_any_element(),
+            PreviewKind::NativeOffice => {
+                #[cfg(windows)]
+                {
+                    if let Some(client) = &self.preview.native {
+                        let surface = client.surface.clone();
+                        if surface.is_alive() {
+                            canvas(
+                                |_, _, _| (),
+                                move |bounds, _, window, _| {
+                                    surface.place(bounds, window.scale_factor())
+                                },
+                            )
+                            .size_full()
+                            .into_any_element()
+                        } else {
+                            div()
+                                .p_3()
+                                .child("系统处理器已退出。可切换文字摘录或重试系统版式。")
+                                .into_any_element()
+                        }
+                    } else {
+                        div().child("系统预览未就绪").into_any_element()
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    div().child("系统预览需要 Windows").into_any_element()
+                }
+            }
             PreviewKind::Loading => div()
                 .p_3()
                 .text_sm()
@@ -821,6 +1020,24 @@ impl MainWindow {
                     ),
                 )
                 .into_any_element(),
+            PreviewKind::Image if self.preview.pdf.is_some() => {
+                let pdf = self.preview.pdf.unwrap();
+                let width = if self.pdf_options.fit_width {
+                    PREVIEW_DEFAULT_WIDTH_PX - 24.
+                } else {
+                    pdf.width * self.pdf_options.zoom
+                };
+                let height = width * pdf.height / pdf.width.max(1.);
+                div()
+                    .p_3()
+                    .child(
+                        img(self.preview.image.clone().unwrap())
+                            .w(px(width))
+                            .h(px(height))
+                            .object_fit(ObjectFit::Contain),
+                    )
+                    .into_any_element()
+            }
             PreviewKind::Image => {
                 let mut col = v_flex()
                     .w_full()
@@ -940,7 +1157,56 @@ impl MainWindow {
             .border_l_1()
             .border_color(tokens.border)
             .child(header)
-            .child(if scrollable_body {
+            .when(self.pdf_count > 0, |view| {
+                view.child(self.render_pdf_controls(cx))
+            })
+            .when(
+                self.preview.meta.as_ref().is_some_and(|m| {
+                    let ext = std::path::Path::new(&m.path)
+                        .extension()
+                        .and_then(|x| x.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    matches!(
+                        ext.as_str(),
+                        "docx" | "xlsx" | "pptx" | "rtf" | "doc" | "xls" | "ppt"
+                    )
+                }),
+                |view| {
+                    view.child(
+                        h_flex().px_2().py_1().gap_1().flex_shrink_0().children(
+                            [
+                                ("office-native", "系统版式", false),
+                                ("office-text", "文字摘录", true),
+                            ]
+                            .into_iter()
+                            .map(|(id, label, text_only)| {
+                                let entity = cx.entity();
+                                Button::new(id)
+                                    .ghost()
+                                    .label(label)
+                                    .on_click(move |_, _, cx| {
+                                        entity.update(cx, |this, cx| {
+                                            this.office_text_only = text_only;
+                                            this.request_preview(cx);
+                                            cx.notify();
+                                        })
+                                    })
+                            }),
+                        ),
+                    )
+                },
+            )
+            .child(if self.preview.pdf.is_some() {
+                div()
+                    .id("pdf-page-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_scrollbar()
+                    .child(body)
+                    .into_any_element()
+            } else if scrollable_body {
                 div()
                     .id("preview-body")
                     .flex_1()
@@ -1050,6 +1316,12 @@ impl Render for MainWindow {
             self.preview_force,
         );
         self.last_diag = format!("{sidebar_reason}\n{preview_reason}");
+        #[cfg(windows)]
+        if !preview {
+            if let Some(client) = &self.preview.native {
+                client.surface.hide();
+            }
+        }
 
         v_flex()
             .id("findx-main")
@@ -1242,4 +1514,11 @@ fn focus_is_search(search: &Entity<InputState>, window: &Window, cx: &App) -> bo
         return false;
     };
     focused == search.read(cx).focus_handle(cx)
+}
+
+impl Drop for MainWindow {
+    fn drop(&mut self) {
+        self.preview_cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
 }

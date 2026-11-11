@@ -16,3 +16,8 @@ pub mod ui;
 pub mod update_logic;
 
 pub mod document_preview;
+
+pub mod preview_worker;
+
+#[cfg(windows)]
+pub mod office_host;

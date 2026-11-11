@@ -6,6 +6,15 @@ use findx2_gui_native::ui;
 
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
+    #[cfg(windows)]
+    if raw.get(1).is_some_and(|s| s == "--office-preview-host") {
+        findx2_gui_native::office_host::host_main(&raw);
+        return;
+    }
+    if raw.get(1).is_some_and(|s| s == "--document-preview-worker") {
+        findx2_gui_native::preview_worker::worker_main();
+        return;
+    }
     if raw.iter().any(|a| a == "-h" || a == "--help") {
         print!("{}", cli::help_text());
         return;

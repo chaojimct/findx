@@ -1,0 +1,57 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 3 /Kids [3 0 R 5 0 R 7 0 R] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 420 720] /Resources << /Font << /F1 9 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 178 >>
+stream
+0.1 0.5 0.2 rg 30 560 360 120 re f
+0 0 0 rg BT /F1 24 Tf 30 500 Td (FindX Public PDF) Tj 0 -45 Td (PAGE ONE) Tj 0 -40 Td /F1 12 Tf (Synthetic fixture - no private content) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 420 720] /Resources << /Font << /F1 9 0 R >> >> /Contents 6 0 R >>
+endobj
+6 0 obj
+<< /Length 178 >>
+stream
+0.2 0.3 0.8 rg 30 560 360 120 re f
+0 0 0 rg BT /F1 24 Tf 30 500 Td (FindX Public PDF) Tj 0 -45 Td (PAGE TWO) Tj 0 -40 Td /F1 12 Tf (Synthetic fixture - no private content) Tj ET
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 420 720] /Resources << /Font << /F1 9 0 R >> >> /Contents 8 0 R >>
+endobj
+8 0 obj
+<< /Length 180 >>
+stream
+0.7 0.2 0.1 rg 30 560 360 120 re f
+0 0 0 rg BT /F1 24 Tf 30 500 Td (FindX Public PDF) Tj 0 -45 Td (PAGE THREE) Tj 0 -40 Td /F1 12 Tf (Synthetic fixture - no private content) Tj ET
+endstream
+endobj
+9 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 10
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000127 00000 n 
+0000000253 00000 n 
+0000000481 00000 n 
+0000000607 00000 n 
+0000000835 00000 n 
+0000000961 00000 n 
+0000001191 00000 n 
+trailer
+<< /Size 10 /Root 1 0 R >>
+startxref
+1261
+%%EOF
