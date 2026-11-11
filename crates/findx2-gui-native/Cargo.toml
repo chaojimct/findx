@@ -3,7 +3,7 @@ name = "findx2-gui-native"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
-description = "FindX2 native GPUI client. Isolated runtime by default; --live is a read-only client of the existing service. Does not replace the WebView GUI."
+description = "FindX2 native GPUI client. Isolated runtime by default; --live talks to the official FindX2Search service over existing IPC and can manage that named service after explicit confirmation. Does not replace the WebView GUI."
 publish = false
 
 [lib]

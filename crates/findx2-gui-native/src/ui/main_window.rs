@@ -413,7 +413,11 @@ impl MainWindow {
             (
                 s.endpoint.clone(),
                 s.ipc.clone(),
-                s.settings.enable_metadata_backfill,
+                if s.live {
+                    true
+                } else {
+                    s.settings.enable_metadata_backfill
+                },
             )
         });
         let rx = ipc.status(endpoint);

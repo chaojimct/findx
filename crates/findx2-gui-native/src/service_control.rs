@@ -24,6 +24,7 @@ pub enum Action {
     GuiAutoOff,
     Compact,
     Rebuild,
+    ApplyPreferences,
 }
 impl Action {
     pub fn label(self) -> &'static str {
@@ -36,6 +37,7 @@ impl Action {
             Self::GuiAutoOff => "关闭正式 GUI 登录启动",
             Self::Compact => "备份后压缩正式索引",
             Self::Rebuild => "备份后重建正式索引",
+            Self::ApplyPreferences => "应用已保存的服务选项",
         }
     }
 }
@@ -72,6 +74,32 @@ pub fn snapshot() -> Result<Snapshot, String> {
         Err("仅 Windows 支持 SCM 服务管理".into())
     }
 }
+#[cfg(windows)]
+pub fn split_command(s: &str) -> Vec<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::{
+        Foundation::{HLOCAL, LocalFree},
+        UI::Shell::CommandLineToArgvW,
+    };
+    let wide: Vec<u16> = std::ffi::OsStr::new(s)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let mut argc = 0;
+    unsafe {
+        let argv = CommandLineToArgvW(windows::core::PCWSTR(wide.as_ptr()), &mut argc);
+        if argv.is_null() {
+            return vec![];
+        }
+        let output = std::slice::from_raw_parts(argv, argc.max(0) as usize)
+            .iter()
+            .map(|s| s.to_string().unwrap_or_default())
+            .collect();
+        let _ = LocalFree(Some(HLOCAL(argv as *mut _)));
+        output
+    }
+}
+#[cfg(not(windows))]
 pub fn split_command(s: &str) -> Vec<String> {
     let mut q = false;
     let mut item = String::new();
@@ -134,7 +162,11 @@ fn wait_state(state: &str) -> Result<(), String> {
     Err(format!("等待 SCM {state} 超时；请查看诊断，不代表操作成功"))
 }
 /// Only invoke after the UI displays the exact target and obtains explicit confirmation.
-pub fn execute(action: Action, expected: Snapshot) -> Result<String, String> {
+pub fn execute(
+    action: Action,
+    expected: Snapshot,
+    preferences: crate::settings_logic::FindxGuiSettings,
+) -> Result<String, String> {
     let current = snapshot()?;
     if current.path_name != expected.path_name
         || current.process_id != expected.process_id
@@ -174,6 +206,7 @@ pub fn execute(action: Action, expected: Snapshot) -> Result<String, String> {
                 return Err("正式 GUI 自启动回读不一致".into());
             }
         }
+        Action::ApplyPreferences => return apply_preferences(&current, &preferences),
         Action::Compact | Action::Rebuild => return maintenance(action, &current),
     }
     Ok(format!("{}完成；SCM/注册表已回读验证", action.label()))
@@ -307,10 +340,20 @@ fn maintenance(action: Action, s: &Snapshot) -> Result<String, String> {
             // Exclusion sidecar is preserved as authoritative; unknown layouts stop rather than rebuild the wrong scope.
             let side = part(&index, ".exclude.json");
             if side.exists() {
-                return Err(format!(
-                    "发现排除规则 {}；为避免错误扫描范围，此版本拒绝自动重建。旧库未改，服务将恢复。",
-                    side.display()
-                ));
+                let bytes = std::fs::read(&side).map_err(|e| e.to_string())?;
+                let value: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|e| format!("正式排除规则损坏：{e}"))?;
+                let dirs = value
+                    .get("excluded_dirs")
+                    .and_then(|v| v.as_array())
+                    .ok_or("未知正式排除规则格式，拒绝重建")?;
+                for dir in dirs {
+                    let dir = dir.as_str().ok_or("正式排除规则包含非字符串")?;
+                    if !std::path::Path::new(dir).is_absolute() {
+                        return Err("正式排除目录不是完整路径，拒绝重建".into());
+                    }
+                    c.arg("--exclude-dir").arg(dir);
+                }
             }
         }
         // Maintenance stdout/stderr are bounded to a log file, never pipe-buffer deadlock the CLI.
@@ -349,6 +392,162 @@ fn maintenance(action: Action, s: &Snapshot) -> Result<String, String> {
         (r, Err(e)) => Err(format!("维护结果 {:?}；服务恢复失败：{e}", r)),
     }
 }
+
+/// Preserve every unrelated CLI flag and official JSON field. Only these three
+/// runtime settings are owned by this operation; dev paths/UI prefs never migrate.
+pub fn runtime_arguments(
+    s: &Snapshot,
+    p: &crate::settings_logic::FindxGuiSettings,
+) -> Result<Vec<String>, String> {
+    validate(s)?;
+    let args = split_command(&s.path_name);
+    let mut next = vec![];
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--save-interval-secs" => i += 2,
+            "--no-backfill" | "--no-everything-ipc" => i += 1,
+            _ => {
+                next.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    next.push("--save-interval-secs".into());
+    next.push(p.save_interval_secs.max(1).to_string());
+    if !p.enable_metadata_backfill {
+        next.push("--no-backfill".into());
+    }
+    if !p.enable_everything_ipc {
+        next.push("--no-everything-ipc".into());
+    }
+    Ok(next)
+}
+
+/// Parse the official SCM command: interval, metadata backfill enabled, Everything IPC enabled.
+pub fn official_runtime_options(s: &Snapshot) -> Result<(u64, bool, bool), String> {
+    validate(s)?;
+    let args = split_command(&s.path_name);
+    let mut interval = 30u64;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--save-interval-secs" {
+            let raw = args
+                .get(i + 1)
+                .ok_or("正式命令缺少 --save-interval-secs 参数")?;
+            interval = raw
+                .parse::<u64>()
+                .map_err(|_| format!("正式落盘间隔不是整数：{raw}"))?;
+            if interval < 1 {
+                return Err("正式落盘间隔小于 1 秒".into());
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    let backfill = !args.iter().any(|a| a == "--no-backfill");
+    let everything = !args.iter().any(|a| a == "--no-everything-ipc");
+    Ok((interval, backfill, everything))
+}
+
+fn same_command(a: &str, b: &str) -> bool {
+    let left = split_command(a);
+    let right = split_command(b);
+    !left.is_empty() && left == right
+}
+fn quote_windows_arg(arg: &str) -> String {
+    let mut out = String::from("\"");
+    let mut slashes = 0;
+    for ch in arg.chars() {
+        if ch == '\\' {
+            slashes += 1;
+            continue;
+        }
+        let count = if ch == '"' { slashes * 2 + 1 } else { slashes };
+        out.extend(std::iter::repeat_n('\\', count));
+        out.push(ch);
+        slashes = 0;
+    }
+    out.extend(std::iter::repeat_n('\\', slashes * 2));
+    out.push('"');
+    out
+}
+fn apply_preferences(
+    s: &Snapshot,
+    p: &crate::settings_logic::FindxGuiSettings,
+) -> Result<String, String> {
+    let args = runtime_arguments(s, p)?;
+    let command = args
+        .iter()
+        .map(|a| quote_windows_arg(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let official = PathBuf::from(std::env::var_os("APPDATA").ok_or("未找到 APPDATA")?)
+        .join("tools.findx.gui/findx2-gui-settings.json");
+    let old = std::fs::read(&official)
+        .map_err(|e| format!("正式配置读取失败（不会创建覆盖未知配置）：{e}"))?;
+    let mut value: serde_json::Value = serde_json::from_slice(&old).map_err(|e| e.to_string())?;
+    let object = value.as_object_mut().ok_or("正式配置不是 JSON 对象")?;
+    object.insert(
+        "saveIntervalSecs".into(),
+        p.save_interval_secs.max(1).into(),
+    );
+    object.insert(
+        "enableMetadataBackfill".into(),
+        p.enable_metadata_backfill.into(),
+    );
+    object.insert("enableEverythingIpc".into(), p.enable_everything_ipc.into());
+    let backup = official.with_file_name(format!(
+        "findx2-gui-settings.native-backup-{}.json",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
+    // Backup is created before changing either authoritative location; never overwrite an old backup.
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&backup)
+        .map_err(|e| e.to_string())?;
+    f.write_all(&old).map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?;
+    drop(f);
+    sc(&["config", "FindX2Search", "binPath=", &command])?;
+    let result = (|| {
+        let applied = snapshot()?;
+        if !same_command(&applied.path_name, &command) {
+            return Err(format!(
+                "SCM 配置回读不一致：已写入 {command}，回读 {}",
+                applied.path_name
+            ));
+        }
+        crate::prefs::write_atomic(
+            &official,
+            &serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?,
+        )?;
+        let read: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&official).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        if read != value {
+            return Err("正式 JSON 回读不一致".into());
+        }
+        Ok::<(), String>(())
+    })();
+    if let Err(e) = result {
+        let restored = sc(&["config", "FindX2Search", "binPath=", &s.path_name]);
+        return Err(format!(
+            "应用失败：{e}；SCM 回滚：{restored:?}；配置备份 {}",
+            backup.display()
+        ));
+    }
+    Ok(format!(
+        "已更新正式 SCM 与正式 JSON 中的落盘间隔/回填/Everything，其他字段保留。当前进程不重启，下次启动生效。备份 {}",
+        backup.display()
+    ))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +583,119 @@ mod tests {
         assert_eq!(std::fs::read(&old).unwrap(), b"new");
         assert_eq!(std::fs::read(&rollback).unwrap(), b"old");
         std::fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn runtime_settings_preserve_index_pipe_and_unknown_flags() {
+        let exe = PathBuf::from(
+            std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into()),
+        )
+        .join("FindX/findx2-service.exe");
+        let s = Snapshot {
+            name: "FindX2Search".into(),
+            state: "Running".into(),
+            start_mode: "Auto".into(),
+            process_id: 1,
+            path_name: format!(
+                "\"{}\" --service --index C:\\ProgramData\\FindX\\index.bin --volume C: --pipe findx2 --save-interval-secs 30 --custom-flag",
+                exe.display()
+            ),
+        };
+        let mut p = crate::settings_logic::FindxGuiSettings::isolated_default(
+            "findx2-native-dev",
+            "NEVER-PRODUCTION".into(),
+        );
+        p.save_interval_secs = 45;
+        let a = runtime_arguments(&s, &p).unwrap();
+        assert!(a.contains(&"--custom-flag".into()));
+        assert!(!a.contains(&"NEVER-PRODUCTION".into()));
+        assert!(a.windows(2).any(|v| v == ["--pipe", "findx2"]));
+        assert!(a.windows(2).any(|v| v == ["--save-interval-secs", "45"]));
+    }
+    #[test]
+    fn differently_quoted_commands_are_equivalent() {
+        let exe = r"C:\Program Files\FindX\findx2-service.exe";
+        let compact = format!(r#""{exe}" --service --pipe findx2 --save-interval-secs 30"#);
+        let quoted =
+            format!(r#""{exe}" "--service" "--pipe" "findx2" "--save-interval-secs" "30""#);
+        assert!(same_command(&compact, &quoted));
+        assert!(!same_command(&compact, &format!("{compact} --custom-flag")));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn official_identity_is_installed_findx2search() {
+        let s = snapshot().expect("读取正式 FindX2Search 快照");
+        validate(&s).expect("正式服务身份校验");
+        assert_eq!(s.name, "FindX2Search");
+        assert!(
+            split_command(&s.path_name)
+                .windows(2)
+                .any(|a| a == ["--pipe", "findx2"])
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "no-op Start against the official service when it is already Running; never starts a stopped production service"]
+    fn official_start_is_noop_when_already_running() {
+        let s = snapshot().expect("读取正式 FindX2Search 快照");
+        validate(&s).expect("正式服务身份校验");
+        assert_eq!(s.state, "Running", "正式服务当前未运行；跳过以免误启动");
+        let before = s.clone();
+        let prefs = crate::settings_logic::FindxGuiSettings::isolated_default(
+            "findx2-native-dev",
+            "NEVER-PRODUCTION".into(),
+        );
+        execute(Action::Start, s, prefs).expect("已运行时启动应为无改动成功");
+        let after = snapshot().expect("再次读取正式快照");
+        assert_eq!(after.process_id, before.process_id);
+        assert_eq!(after.path_name, before.path_name);
+        assert_eq!(after.state, "Running");
+        assert_eq!(after.start_mode, before.start_mode);
+    }
+
+    #[test]
+    fn official_runtime_options_read_flags_and_interval() {
+        let exe = PathBuf::from(
+            std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into()),
+        )
+        .join("FindX/findx2-service.exe");
+        let s = Snapshot {
+            name: "FindX2Search".into(),
+            state: "Running".into(),
+            start_mode: "Auto".into(),
+            process_id: 1,
+            path_name: format!(
+                r#""{}" --service --index C:\ProgramData\FindX\index.bin --pipe findx2 --save-interval-secs 15 --no-backfill --no-everything-ipc"#,
+                exe.display()
+            ),
+        };
+        assert_eq!(official_runtime_options(&s).unwrap(), (15, false, false));
+        let s = Snapshot {
+            name: "FindX2Search".into(),
+            state: "Running".into(),
+            start_mode: "Auto".into(),
+            process_id: 1,
+            path_name: format!(
+                r#""{}" --service --index C:\ProgramData\FindX\index.bin --pipe findx2 --save-interval-secs 30"#,
+                exe.display()
+            ),
+        };
+        assert_eq!(official_runtime_options(&s).unwrap(), (30, true, true));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_command_quotes_roundtrip() {
+        let v = vec![
+            r"C:\Program Files\FindX\service.exe",
+            r"C:\",
+            r"directory with spaces\",
+            "quote\"inside",
+        ];
+        let command = v
+            .iter()
+            .map(|s| quote_windows_arg(s))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(split_command(&command), v);
     }
 }

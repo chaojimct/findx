@@ -61,7 +61,9 @@ impl FileAction {
     }
 }
 pub fn safe_name(s: &str) -> bool {
-    let s = s.trim();
+    if s != s.trim() {
+        return false;
+    }
     if s.is_empty()
         || s == "."
         || s == ".."
@@ -142,8 +144,77 @@ pub fn operate(action: FileAction, src: &Path, dst: &Path, cancel: &Cancel) -> R
             return Ok(());
         }
     }
+    if m.is_dir() {
+        if action == FileAction::Move {
+            return Err(
+                "跨卷目录移动未执行：为避免目录变化时丢失文件，请先复制并核对；同卷目录移动可用"
+                    .into(),
+            );
+        }
+        let source = std::fs::canonicalize(src).map_err(|e| e.to_string())?;
+        let parent = std::fs::canonicalize(dst.parent().ok_or("目标没有父目录")?)
+            .map_err(|e| e.to_string())?;
+        if parent
+            .to_string_lossy()
+            .to_lowercase()
+            .starts_with(&(source.to_string_lossy().to_lowercase() + "\\"))
+            || parent == source
+        {
+            return Err("不能把目录复制到自身内部".into());
+        }
+        let partial = dst.with_file_name(format!(
+            "{}.findx-partial-{}",
+            dst.file_name().ok_or("无目标文件名")?.to_string_lossy(),
+            std::process::id()
+        ));
+        std::fs::create_dir(&partial).map_err(|e| e.to_string())?;
+        let copied = (|| {
+            let mut work = vec![(src.to_path_buf(), partial.clone())];
+            let mut entries = 0usize;
+            while let Some((from, to)) = work.pop() {
+                if cancel.load(Ordering::Acquire) {
+                    return Err("目录复制已取消".into());
+                }
+                for item in std::fs::read_dir(&from).map_err(|e| e.to_string())? {
+                    let e = item.map_err(|e| e.to_string())?;
+                    entries += 1;
+                    if entries > 500_000 {
+                        return Err("目录复制达到 500000 项安全上限".into());
+                    }
+                    let meta = std::fs::symlink_metadata(e.path()).map_err(|e| e.to_string())?;
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::fs::MetadataExt;
+                        if meta.file_attributes() & 0x400 != 0 {
+                            return Err("目录副本含重解析点；拒绝跟随".into());
+                        }
+                    }
+                    if meta.is_symlink() {
+                        return Err("目录副本含符号链接；拒绝跟随".into());
+                    }
+                    let dest = to.join(e.file_name());
+                    if meta.is_dir() {
+                        std::fs::create_dir(&dest).map_err(|e| e.to_string())?;
+                        work.push((e.path(), dest));
+                    } else {
+                        operate(FileAction::Copy, &e.path(), &dest, cancel)?;
+                    }
+                }
+            }
+            Ok::<(), String>(())
+        })();
+        copied.map_err(|e| format!("{e}；部分目录副本保留在 {}", partial.display()))?;
+        if dst.exists() {
+            return Err(format!(
+                "目标已被创建；未覆盖，副本在 {}",
+                partial.display()
+            ));
+        }
+        std::fs::rename(&partial, dst).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
     if !m.is_file() {
-        return Err("复制只支持普通文件；目录可同卷移动/重命名，不自动递归合并".into());
+        return Err("只处理普通文件与目录".into());
     }
     // Destination opened create_new: never overwrite a racing target. A failed/cancelled
     // copy retains its visibly named partial file; no private file is deleted on failure.
@@ -174,6 +245,14 @@ pub fn operate(action: FileAction, src: &Path, dst: &Path, cancel: &Cancel) -> R
         output.write_all(&bytes[..n]).map_err(|e| e.to_string())?;
         written += n as u64;
     }
+    let mut times = std::fs::FileTimes::new();
+    if let Ok(time) = m.modified() {
+        times = times.set_modified(time);
+    }
+    if let Ok(time) = m.accessed() {
+        times = times.set_accessed(time);
+    }
+    output.set_times(times).map_err(|e| e.to_string())?;
     output.sync_all().map_err(|e| e.to_string())?;
     drop(output);
     let after = std::fs::metadata(src).map_err(|e| e.to_string())?;
@@ -231,5 +310,35 @@ mod tests {
     fn listing_is_sorted_and_cancellable() {
         let c = Arc::new(AtomicBool::new(true));
         assert!(list(&std::env::temp_dir(), &c).is_err());
+    }
+    #[test]
+    fn recursive_directory_copy_is_non_destructive() {
+        let root = std::env::temp_dir().join(format!("findx-dircopy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("source/sub")).unwrap();
+        std::fs::write(root.join("source/sub/file.txt"), b"directory fixture").unwrap();
+        let c = Arc::new(AtomicBool::new(false));
+        operate(
+            FileAction::Copy,
+            &root.join("source"),
+            &root.join("copy"),
+            &c,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("copy/sub/file.txt")).unwrap(),
+            b"directory fixture"
+        );
+        assert!(root.join("source/sub/file.txt").exists());
+        assert!(
+            operate(
+                FileAction::Copy,
+                &root.join("source"),
+                &root.join("source/nested"),
+                &c
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

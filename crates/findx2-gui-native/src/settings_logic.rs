@@ -134,7 +134,7 @@ impl FindxGuiSettings {
             drives: Vec::new(),
             excluded_dirs: Vec::new(),
             enable_metadata_backfill: true,
-            enable_everything_ipc: false,
+            enable_everything_ipc: true,
             save_interval_secs: 30,
             auto_start_app: false,
             auto_check_update: false,

@@ -233,6 +233,10 @@ impl SettingsWindow {
         }
         self.settings.search_limit = limit as u32;
         self.settings.save_interval_secs = interval;
+        self.search_limit
+            .update(cx, |i, cx| i.set_value(limit.to_string(), window, cx));
+        self.save_interval
+            .update(cx, |i, cx| i.set_value(interval.to_string(), window, cx));
         let next = self.settings.clone();
         let theme = self.theme;
         let mut prefs = self.session.read(cx).prefs.clone();
@@ -268,7 +272,7 @@ impl SettingsWindow {
                 match result {
                     Ok(()) => {
                         this.original = next.clone();
-                        this.settings = next.clone();
+
                         this.original_theme = theme;
                         this.session.update(cx, |s, cx| {
                             s.settings = next;
@@ -439,7 +443,7 @@ impl SettingsWindow {
                 div()
                     .text_sm()
                     .text_color(tokens.text_secondary)
-                    .child("勾选要扫描的盘。一个都不勾 = 全盘，与命令行默认一致。本批只编辑隔离设置，不会重建生产索引。"),
+                    .child("勾选要扫描的盘。一个都不勾 = 全盘，与命令行默认一致。这些范围草稿只写入 native-dev；要改变正式索引范围，请先保存后到「服务模式」确认重建（重建使用正式排除规则，不使用这里的草稿）。"),
             )
             .when(roots.is_empty(), |this| {
                 this.child(div().text_sm().text_color(tokens.text_tertiary).child("（加载磁盘列表中…）"))
@@ -473,7 +477,7 @@ impl SettingsWindow {
                 div()
                     .text_sm()
                     .text_color(tokens.text_secondary)
-                    .child("每行一个完整路径。规则只写入隔离设置；本批不会对生产 index 执行重建。"),
+                    .child("每行一个完整路径。规则只写入隔离设置；正式重建以服务目录中的 index.bin.exclude.json 为准。"),
             )
             .child(Textarea::new(&self.excluded).h(px(96.)))
             .child(section_title("元数据", tokens))
@@ -506,16 +510,24 @@ impl SettingsWindow {
                 }),
             )
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(Button::new("rebuild").primary().label("重建索引").disabled(true))
-                    .child(Button::new("compact").label("压缩索引").disabled(true)),
+                Checkbox::new("everything-ipc")
+                    .checked(self.settings.enable_everything_ipc)
+                    .label("启用 Everything IPC（正式服务当前以 SCM 命令行为准）")
+                    .on_change({
+                    let entity = cx.entity();
+                    move |checked, _, cx| {
+                        entity.update(cx, |this, cx| {
+                        this.settings.enable_everything_ipc = *checked;
+                        cx.notify();
+                        });
+                    }
+                }),
             )
             .child(
                 div()
                     .text_sm()
-                    .text_color(tokens.warning)
-                    .child("重建和压缩会动真实索引与服务，不属于本批。请继续用现有 WebView GUI 操作生产库。"),
+                    .text_color(tokens.text_secondary)
+                    .child("落盘间隔、元数据回填和 Everything 可先保存到 native-dev，再经「服务模式」确认后写入正式 SCM 与正式 JSON；不自动重启服务。重建/压缩也在「服务模式」确认后执行，会备份正式索引。"),
             )
     }
 
@@ -591,6 +603,23 @@ impl SettingsWindow {
                             "{} · {} · {} · PID {}",
                             s.name, s.state, s.start_mode, s.process_id
                         );
+                        if this.service_snapshot.is_none()
+                            && this.session.read(cx).live
+                            && let Ok((interval, backfill, everything)) =
+                                crate::service_control::official_runtime_options(&s)
+                        {
+                            this.settings.save_interval_secs = interval;
+                            this.settings.enable_metadata_backfill = backfill;
+                            this.settings.enable_everything_ipc = everything;
+                            this.original.save_interval_secs = interval;
+                            this.original.enable_metadata_backfill = backfill;
+                            this.original.enable_everything_ipc = everything;
+                            this.session.update(cx, |session, _| {
+                                session.settings.save_interval_secs = interval;
+                                session.settings.enable_metadata_backfill = backfill;
+                                session.settings.enable_everything_ipc = everything;
+                            });
+                        }
                         this.service_snapshot = Some(s);
                     }
                     Err(e) => {
@@ -610,11 +639,14 @@ impl SettingsWindow {
             .child(section_title("管理已安装的正式 FindX 服务",tokens))
             .child(div().text_sm().child("只管理身份核对通过的 FindX2Search；不会按进程名称批量终止，也不会注册另一套开发服务。操作前确认，执行后回读。"))
             .child(div().text_sm().child(self.service_hint.clone()))
-            .when_some(self.service_snapshot.as_ref(),|v,s|v.child(div().text_sm().child(s.path_name.clone())))
+            .when_some(self.service_snapshot.as_ref(),|v,s|{
+                let options=crate::service_control::official_runtime_options(s).ok().map(|(interval,backfill,everything)|format!("正式服务当前选项（SCM 命令行）：落盘 {interval} 秒，元数据回填 {}，Everything {}",if backfill{"开启"}else{"关闭"},if everything{"开启"}else{"关闭"}));
+                v.child(div().text_sm().child(s.path_name.clone())).when_some(options,|v,text|v.child(div().text_sm().child(text)))
+            })
             .child(div().text_sm().child(self.autostart_hint.clone()))
             .child({let entity=cx.entity();Button::new("refresh-service").label("刷新服务状态").disabled(self.service_busy).on_click(move|_,_,cx|entity.update(cx,|this,cx|this.refresh_service(cx)))})
-            .child(h_flex().gap_2().flex_wrap().children([Action::Start,Action::Stop,Action::Auto,Action::Manual,Action::GuiAutoOn,Action::GuiAutoOff,Action::Compact,Action::Rebuild].into_iter().map(|action|{let entity=cx.entity();Button::new(SharedString::from(action.label())).label(action.label()).disabled(self.service_busy||self.service_snapshot.is_none()).on_click(move|_,_,cx|entity.update(cx,|this,cx|{this.service_pending=Some(action);cx.notify();}))})))
-            .child(div().text_sm().text_color(tokens.warning).child("服务控制需要 SCM 权限；权限不足会报告真实错误，不静默假装成功。维护需要管理员；先停服务并完整备份，在副本上运行安装版 CLI，成功校验后替换；保留旧库并恢复原运行状态。排除规则无法确定时拒绝重建。"))
+            .child(h_flex().gap_2().flex_wrap().children([Action::Start,Action::Stop,Action::Auto,Action::Manual,Action::GuiAutoOn,Action::GuiAutoOff,Action::Compact,Action::Rebuild,Action::ApplyPreferences].into_iter().map(|action|{let entity=cx.entity();Button::new(SharedString::from(action.label())).label(action.label()).disabled(self.service_busy||self.service_snapshot.is_none()).on_click(move|_,_,cx|entity.update(cx,|this,cx|{this.service_pending=Some(action);cx.notify();}))})))
+            .child(div().text_sm().text_color(tokens.warning).child("服务控制需要 SCM 权限；权限不足会报告真实错误，不静默假装成功。维护需要管理员；先停服务并完整备份，在副本上运行安装版 CLI，成功校验后替换；保留旧库并恢复原运行状态。排除规则无法确定时拒绝重建。应用服务选项仅使用已保存的落盘间隔/回填/Everything，其余正式配置保留；下次启动生效。"))
             .child(div().text_sm().child("此页修改 SCM / HKCU 正式自启动；其他标签的范围/路径草稿只保存 native-dev，不覆盖正式服务配置。活动服务的命令行才是当前启动参数真源。"))
     }
     fn render_service_confirm(
@@ -633,11 +665,12 @@ impl SettingsWindow {
                 )
             })
             .unwrap_or_default();
-        div().absolute().inset_0().bg(rgba(0x00000088)).flex().items_center().justify_center().child(v_flex().w(px(520.)).max_w_full().m_4().p_4().gap_3().rounded_lg().bg(tokens.surface_raised)
+        div().absolute().inset_0().occlude().bg(rgba(0x00000088)).flex().items_center().justify_center().child(v_flex().w(px(520.)).max_w_full().m_4().p_4().gap_3().rounded_lg().bg(tokens.surface_raised)
             .child(div().child(format!("确认{}？",action.label())))
             .child(div().text_sm().child(target))
+            .when(action==crate::service_control::Action::ApplyPreferences,|v|{let saved=&self.session.read(cx).settings;let official=self.service_snapshot.as_ref().and_then(|s|crate::service_control::official_runtime_options(s).ok()).map(|(i,b,e)|format!("正式服务当前：落盘 {i} 秒，回填 {}，Everything {}",if b{"开启"}else{"关闭"},if e{"开启"}else{"关闭"})).unwrap_or_else(||"无法解析正式服务当前选项".into());v.child(div().text_sm().child(official)).child(div().text_sm().child(format!("将写入已保存选项：落盘 {} 秒，元数据回填 {}，Everything {}。请先在设置中保存再应用。不迁移开发索引/管道/路径，不自动重启正式服务。",saved.save_interval_secs,if saved.enable_metadata_backfill{"开启"}else{"关闭"},if saved.enable_everything_ipc{"开启"}else{"关闭"})))})
             .child(div().text_sm().child("此操作真正影响正式 FindX。停止/维护期间搜索将不可用。备份可能占用大量磁盘空间；过程失败会明确报告。没有自动删除备份。"))
-            .child(h_flex().gap_2().child({let e=cx.entity();Button::new("confirm-service").label("确认执行").on_click(move|_,_,cx|e.update(cx,|this,cx|{let Some(expected)=this.service_snapshot.clone()else{return;};this.service_pending=None;this.service_busy=true;this.service_hint="正在执行正式服务操作，请勿关闭窗口…".into();cx.notify();cx.spawn(async move|this,cx|{let result=cx.background_spawn(async move{crate::service_control::execute(action,expected)}).await;this.update(cx,|this,cx|{this.service_busy=false;this.hint=match result{Ok(m)=>m.into(),Err(e)=>format!("操作失败：{e}").into()};this.refresh_service(cx);cx.notify();}).ok();}).detach();}))})
+            .child(h_flex().gap_2().child({let e=cx.entity();Button::new("confirm-service").label("确认执行").on_click(move|_,_,cx|e.update(cx,|this,cx|{let Some(expected)=this.service_snapshot.clone()else{return;};this.service_pending=None;this.service_busy=true;this.service_hint="正在执行正式服务操作，请勿关闭窗口…".into();cx.notify();let saved_preferences=this.session.read(cx).settings.clone();cx.spawn(async move|this,cx|{let result=cx.background_spawn(async move{crate::service_control::execute(action,expected,saved_preferences)}).await;this.update(cx,|this,cx|{this.service_busy=false;this.hint=match result{Ok(m)=>m.into(),Err(e)=>format!("操作失败：{e}").into()};this.refresh_service(cx);cx.notify();}).ok();}).detach();}))})
             .child({let e=cx.entity();Button::new("cancel-service").label("取消操作").on_click(move|_,_,cx|e.update(cx,|this,cx|{this.service_pending=None;cx.notify();}))})))
     }
 
@@ -755,6 +788,7 @@ impl SettingsWindow {
         div()
             .absolute()
             .inset_0()
+            .occlude()
             .bg(rgba(0x00000066))
             .flex()
             .items_center()
@@ -847,6 +881,18 @@ impl SettingsWindow {
             .gap_3()
             .child(section_title("只读运行诊断", tokens))
             .children(rows.into_iter().map(|r| div().text_sm().child(r)))
+            .child({
+                let session = self.session.clone();
+                Checkbox::new("main-diagnostics")
+                    .checked(s.prefs.diag_enabled)
+                    .label("显示主窗诊断浮层（立即生效，Ctrl+Shift+D）")
+                    .on_change(move |on, _, cx| {
+                        session.update(cx, |s, cx| {
+                            s.set_diag(*on, cx);
+                            cx.notify();
+                        })
+                    })
+            })
             .child(section_title("原始 Status 响应（每 2 秒更新）", tokens))
             .child(
                 div()
