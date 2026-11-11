@@ -1,4 +1,5 @@
 pub mod main_window;
+mod result_table;
 pub mod settings_window;
 pub mod update_card;
 
@@ -10,6 +11,7 @@ use crate::ui::main_window::MainWindow;
 use crate::ui::settings_window::SettingsWindow;
 
 pub fn start(opts: LaunchOptions) {
+    let title = opts.window_title().to_string();
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         let session = cx.new(|_| AppSession::load(&opts, false));
@@ -34,15 +36,16 @@ pub fn start(opts: LaunchOptions) {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(560.), px(400.))),
             titlebar: Some(TitlebarOptions {
-                title: Some("FindX Native (isolated)".into()),
+                title: Some(title.clone().into()),
                 ..Default::default()
             }),
             ..Default::default()
         };
 
         let session_for_window = session.clone();
+        let title_for_window = title.clone();
         let _ = gpui_kit::open_window(options, cx, |window, cx| {
-            window.set_window_title("FindX Native (isolated)");
+            window.set_window_title(&title_for_window);
             cx.new(|cx| MainWindow::new(session_for_window, window, cx))
         })
         .expect("open FindX native window");
@@ -68,19 +71,26 @@ pub fn open_settings_window(session: Entity<AppSession>, cx: &mut App) {
         }
     }
 
+    let live = session.read(cx).live;
+    let title = if live {
+        "FindX2 设置 (native)"
+    } else {
+        "FindX2 设置 (isolated)"
+    };
+
     let bounds = Bounds::centered(None, size(px(720.), px(820.)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(480.), px(520.))),
         titlebar: Some(TitlebarOptions {
-            title: Some("FindX2 设置 (isolated)".into()),
+            title: Some(title.into()),
             ..Default::default()
         }),
         ..Default::default()
     };
     let session_for_view = session.clone();
     match gpui_kit::open_window(options, cx, |window, cx| {
-        window.set_window_title("FindX2 设置 (isolated)");
+        window.set_window_title(title);
         cx.new(|cx| SettingsWindow::new(session_for_view, window, cx))
     }) {
         Ok((handle, _)) => {

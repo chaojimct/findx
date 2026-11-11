@@ -12,6 +12,7 @@ pub struct AppSession {
     pub pipe_name: String,
     pub endpoint: String,
     pub mock: bool,
+    pub live: bool,
     pub settings: FindxGuiSettings,
     pub prefs: LocalPrefs,
     pub index_status: IndexStatusView,
@@ -34,14 +35,20 @@ impl AppSession {
                 .to_string_lossy()
                 .into_owned(),
         );
+        let initial_status = if opts.live {
+            status_logic::disconnected_status("尚未查询生产服务")
+        } else {
+            status_logic::disconnected_status("尚未查询隔离后端")
+        };
         Self {
             ipc: IpcClient::start(),
             pipe_name: opts.pipe_name.clone(),
             endpoint: opts.endpoint.clone(),
             mock: opts.mock,
+            live: opts.live,
             settings,
             prefs,
-            index_status: status_logic::disconnected_status("尚未查询隔离后端"),
+            index_status: initial_status,
             connected: false,
             last_error: None,
             available_roots: Vec::new(),
@@ -77,6 +84,10 @@ impl AppSession {
             self.prefs.preview_open = v;
         }
         persist_prefs(self.prefs.clone(), cx);
+    }
+
+    pub fn window_title(&self) -> &'static str {
+        crate::isolation::window_title(self.live)
     }
 }
 

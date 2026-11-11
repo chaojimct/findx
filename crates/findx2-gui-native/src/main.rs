@@ -25,6 +25,11 @@ fn main() {
         );
         let _handle = mock_backend::spawn_mock_server(opts.endpoint.clone());
         std::thread::sleep(Duration::from_millis(120));
+    } else if opts.live {
+        eprintln!(
+            "findx2-gui-native: live client mode, connecting to {} (read-only; will not start or restart findx2-service)",
+            opts.endpoint
+        );
     } else {
         eprintln!(
             "findx2-gui-native: connecting to isolated endpoint {} (will not use production pipe findx2)",

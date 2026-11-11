@@ -87,5 +87,7 @@ pub fn apply_findx_theme(theme: EffectiveTheme, cx: &mut App) {
         ThemeMode::Light
     };
     Theme::change(mode, None, cx);
+    // A file table needs discoverable, draggable scrollbars even while idle.
+    Theme::set_scrollbar_mode(gpui_kit::component::scroll::ScrollbarMode::Always, cx);
     cx.set_global(FindxTokens::for_theme(theme));
 }

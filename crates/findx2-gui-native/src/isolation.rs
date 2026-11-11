@@ -1,16 +1,17 @@
-//! 隔离运行约束：绝不连接生产 FindX 管道，也不使用正式 GUI 的配置目录。
-
+//! 隔离运行约束：默认拒绝生产管道，设置目录始终使用 FindX-native-dev。
+//! 只有显式 `--live` 才允许作为只读客户端连接生产管道 `findx2`。
 pub const DEFAULT_ISOLATED_PIPE: &str = "findx2-native-dev";
+pub const PRODUCTION_PIPE: &str = "findx2";
 pub const APP_DIR_NAME: &str = "FindX-native-dev";
 
-/// 生产默认管道（以及带路径前缀的等价形式）一律拒绝。
+/// 生产默认管道（以及带路径前缀的等价形式）。
 pub fn is_production_pipe(name: &str) -> bool {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return true;
     }
     let bare = pipe_bare_name(trimmed);
-    bare.eq_ignore_ascii_case("findx2")
+    bare.eq_ignore_ascii_case(PRODUCTION_PIPE)
 }
 
 pub fn pipe_bare_name(name: &str) -> String {
@@ -29,9 +30,14 @@ pub fn pipe_bare_name(name: &str) -> String {
 }
 
 pub fn normalize_pipe(pipe_name: &str) -> Result<String, String> {
-    if is_production_pipe(pipe_name) {
+    normalize_pipe_ex(pipe_name, false)
+}
+
+/// `allow_production` 为真时，允许规范化生产管道名（只读客户端，不启动 service）。
+pub fn normalize_pipe_ex(pipe_name: &str, allow_production: bool) -> Result<String, String> {
+    if is_production_pipe(pipe_name) && !allow_production {
         return Err(format!(
-            "拒绝连接生产管道 `{pipe_name}`。原生客户端只允许隔离管道（默认 `{DEFAULT_ISOLATED_PIPE}`）。"
+            "拒绝连接生产管道 `{pipe_name}`。原生客户端默认只允许隔离管道（默认 `{DEFAULT_ISOLATED_PIPE}`）。若要只读连接现有 findx2-service，请使用 --live。"
         ));
     }
     let p = pipe_name.trim();
@@ -102,6 +108,14 @@ pub fn isolated_index_path() -> std::path::PathBuf {
     isolated_data_dir().join("index.bin")
 }
 
+pub fn window_title(live: bool) -> &'static str {
+    if live {
+        "FindX Native (live)"
+    } else {
+        "FindX Native (isolated)"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +131,15 @@ mod tests {
         assert!(!is_production_pipe(r"\\.\pipe\findx2-native-dev"));
         assert!(normalize_pipe("findx2").is_err());
         assert!(normalize_pipe(DEFAULT_ISOLATED_PIPE).is_ok());
+    }
+
+    #[test]
+    fn live_mode_normalizes_production_pipe() {
+        let endpoint = normalize_pipe_ex("findx2", true).expect("live allows findx2");
+        assert!(is_production_pipe("findx2"));
+        #[cfg(windows)]
+        assert_eq!(endpoint, r"\\.\pipe\findx2");
+        assert!(normalize_pipe_ex(r"\\.\pipe\findx2", true).is_ok());
+        assert!(normalize_pipe_ex("findx2", false).is_err());
     }
 }

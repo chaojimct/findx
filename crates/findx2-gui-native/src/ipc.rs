@@ -1,5 +1,4 @@
 //! 现有 JSON 行协议客户端。I/O 只跑在专用后台运行时，不进 UI 线程。
-
 use findx2_ipc::{IpcRequest, IpcResponse, SearchHitDto};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
@@ -118,14 +117,13 @@ async fn dispatch(job: Job) {
     }
 }
 
-fn map_pipe_open_err(e: std::io::Error) -> String {
+fn map_pipe_open_err(endpoint: &str, e: std::io::Error) -> String {
     match e.raw_os_error() {
-        Some(2) => {
-            "无法连接隔离后端：端点不存在（未监听或仍在加载）。请用 --mock 或自行启动隔离 service。"
-                .into()
-        }
-        Some(5) => "无法连接隔离后端：拒绝访问。".into(),
-        _ => format!("无法连接隔离后端: {e}"),
+        Some(2) => format!(
+            "无法连接 `{endpoint}`：管道不存在或服务未监听。若使用 --live，请确认现有 findx2-service 正在运行；不要启动第二个服务进程。"
+        ),
+        Some(5) => format!("无法连接 `{endpoint}`：拒绝访问。"),
+        _ => format!("无法连接 `{endpoint}`: {e}"),
     }
 }
 
@@ -159,18 +157,19 @@ async fn connect_endpoint(
 ) -> IpcResult<tokio::net::windows::named_pipe::NamedPipeClient> {
     ClientOptions::new()
         .open(endpoint)
-        .map_err(map_pipe_open_err)
+        .map_err(|e| map_pipe_open_err(endpoint, e))
 }
 
 #[cfg(unix)]
 async fn connect_endpoint(endpoint: &str) -> IpcResult<UnixStream> {
     UnixStream::connect(endpoint)
         .await
-        .map_err(map_pipe_open_err)
+        .map_err(|e| map_pipe_open_err(endpoint, e))
 }
 
 #[cfg(not(any(windows, unix)))]
-async fn connect_endpoint(_endpoint: &str) -> IpcResult<()> {
+async fn connect_endpoint(endpoint: &str) -> IpcResult<()> {
+    let _ = endpoint;
     Err("当前平台没有实现 IPC 传输".into())
 }
 

@@ -18,6 +18,8 @@ pub struct LocalPrefs {
     pub preview_open: bool,
     #[serde(default)]
     pub preview_width: Option<f32>,
+    #[serde(default)]
+    pub column_widths: Option<[f32; 4]>,
 }
 
 fn default_true() -> bool {
@@ -32,6 +34,7 @@ impl Default for LocalPrefs {
             sidebar_open: true,
             preview_open: true,
             preview_width: None,
+            column_widths: None,
         }
     }
 }

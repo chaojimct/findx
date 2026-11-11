@@ -7,8 +7,10 @@ pub const SIDEBAR_WIDTH_PX: f32 = 210.0;
 pub const NAME_READABLE_PX: f32 = 180.0;
 pub const PREVIEW_DEFAULT_WIDTH_PX: f32 = 320.0;
 
-pub const COLUMN_HEADER_MIN_PX: [f32; 4] = [160.0, 72.0, 72.0, 96.0];
-pub const DEFAULT_COL_FRAC: [f32; 4] = [0.28, 0.38, 0.10, 0.24];
+pub const COLUMN_HEADER_MIN_PX: [f32; 4] = [160.0, 80.0, 72.0, 140.0];
+pub const DEFAULT_COL_FRAC: [f32; 4] = [0.28, 0.34, 0.10, 0.28];
+pub const RESULT_ROW_PAD_X_PX: f32 = 8.0;
+pub const RESULT_ROW_GAP_PX: f32 = 8.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColId {
@@ -236,6 +238,12 @@ fn panel_reason(
         }
         None => format!("{name}关：决策宽度 {content_width}px >= {limit}px，保存的偏好是关闭"),
     }
+}
+
+/// Width available to the four result cells after row padding and gaps.
+pub fn result_cells_inner_width(table_width: f32, visible_count: usize) -> f32 {
+    let gaps = RESULT_ROW_GAP_PX * visible_count.saturating_sub(1) as f32;
+    (table_width - RESULT_ROW_PAD_X_PX * 2.0 - gaps).max(1.0)
 }
 
 pub fn visible_column_ids(table_width: f32) -> Vec<ColId> {
@@ -509,12 +517,38 @@ pub fn format_size(n: u64, is_dir: bool) -> String {
     }
 }
 
-pub fn format_time(unix: u64) -> String {
+/// Windows FILETIME epoch (1601-01-01) in 100ns ticks, same as findx2-core.
+const FILETIME_EPOCH_DIFF: u64 = 116_444_736_000_000_000;
+
+/// Normalize a search-hit mtime to Unix seconds.
+///
+/// The official WebView does `new Date(unix * 1000)`. Live `findx2-service`
+/// currently sends Windows FILETIME (100ns since 1601). Values already in
+/// Unix seconds (including the mock backend) are left alone.
+pub fn unix_secs_from_mtime(raw: u64) -> u64 {
+    if raw == 0 {
+        0
+    } else if raw >= FILETIME_EPOCH_DIFF {
+        (raw - FILETIME_EPOCH_DIFF) / 10_000_000
+    } else {
+        raw
+    }
+}
+
+fn unix_secs_to_filetime(unix: u64) -> u64 {
+    if unix == 0 {
+        0
+    } else {
+        FILETIME_EPOCH_DIFF.saturating_add(unix.saturating_mul(10_000_000))
+    }
+}
+
+pub fn format_time(raw: u64) -> String {
+    let unix = unix_secs_from_mtime(raw);
     if unix == 0 {
         return "—".into();
     }
-    // Format as local-naive from UTC to keep this crate free of chrono in the GUI path.
-    // Display is YYYY-MM-DD HH:MM, matching the current GUI (which uses local time).
+    // Display is YYYY-MM-DD HH:MM in the local timezone, matching the WebView GUI.
     let offset = local_utc_offset_secs(unix);
     let t = unix as i64 + offset;
     let days = t.div_euclid(86400);
@@ -525,8 +559,72 @@ pub fn format_time(unix: u64) -> String {
     format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
 }
 
-fn local_utc_offset_secs(_unix: u64) -> i64 {
-    0
+fn local_utc_offset_secs(unix: u64) -> i64 {
+    #[cfg(windows)]
+    {
+        windows_local_utc_offset_secs(unix)
+    }
+    #[cfg(unix)]
+    {
+        unix_local_utc_offset_secs(unix)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = unix;
+        0
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WinFileTime {
+    dw_low_date_time: u32,
+    dw_high_date_time: u32,
+}
+
+#[cfg(windows)]
+impl WinFileTime {
+    fn from_u64(v: u64) -> Self {
+        Self {
+            dw_low_date_time: v as u32,
+            dw_high_date_time: (v >> 32) as u32,
+        }
+    }
+
+    fn to_u64(self) -> u64 {
+        (self.dw_low_date_time as u64) | ((self.dw_high_date_time as u64) << 32)
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn FileTimeToLocalFileTime(
+        lp_file_time: *const WinFileTime,
+        lp_local_file_time: *mut WinFileTime,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+fn windows_local_utc_offset_secs(unix: u64) -> i64 {
+    let utc = WinFileTime::from_u64(unix_secs_to_filetime(unix));
+    let mut local = WinFileTime::from_u64(0);
+    let ok = unsafe { FileTimeToLocalFileTime(&utc, &mut local) };
+    if ok == 0 {
+        return 0;
+    }
+    ((local.to_u64() as i128 - utc.to_u64() as i128) / 10_000_000) as i64
+}
+
+#[cfg(unix)]
+fn unix_local_utc_offset_secs(unix: u64) -> i64 {
+    let time = unix as libc::time_t;
+    let mut result = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let ptr = unsafe { libc::localtime_r(&time, result.as_mut_ptr()) };
+    if ptr.is_null() {
+        0
+    } else {
+        unsafe { (*ptr).tm_gmtoff as i64 }
+    }
 }
 
 /// 把 Unicode 标量下标半开区间切成 (text, highlighted) 段。
@@ -630,5 +728,49 @@ mod tests {
         assert_eq!(format_size(100, true), "");
         assert_eq!(format_size(512, false), "512 B");
         assert_eq!(format_size(2048, false), "2 KB");
+    }
+
+    #[test]
+    fn format_time_accepts_unix_seconds_in_2020s() {
+        // 2026-01-15 00:00:00 UTC
+        let unix = 1_768_435_200u64;
+        let s = format_time(unix);
+        assert_eq!(s.len(), 16, "expected YYYY-MM-DD HH:MM, got {s}");
+        assert!(
+            s.starts_with("2026-01-14")
+                || s.starts_with("2026-01-15")
+                || s.starts_with("2026-01-16"),
+            "unix seconds formatted out of range: {s}"
+        );
+        assert!(
+            !s.starts_with("38"),
+            "should not look like a FILETIME mis-parse: {s}"
+        );
+    }
+
+    #[test]
+    fn format_time_converts_windows_filetime() {
+        // Same instant as the unix test, encoded as FILETIME 100ns since 1601.
+        let unix = 1_768_435_200u64;
+        let ft = 116_444_736_000_000_000 + unix * 10_000_000;
+        assert_eq!(unix_secs_from_mtime(ft), unix);
+        assert_eq!(unix_secs_from_mtime(unix), unix);
+        assert_eq!(format_time(ft), format_time(unix));
+        // A real live hit from the user's production pipe (2026-08-29 17:00:48 +08).
+        let live_ft = 134_324_676_480_000_000u64;
+        assert_eq!(unix_secs_from_mtime(live_ft), 1_787_994_048);
+        let live = format_time(live_ft);
+        assert!(
+            live.starts_with("2026-08-29")
+                || live.starts_with("2026-08-28")
+                || live.starts_with("2026-08-30"),
+            "live FILETIME formatted out of range: {live}"
+        );
+    }
+
+    #[test]
+    fn format_time_zero_is_placeholder() {
+        assert_eq!(format_time(0), "—");
+        assert_eq!(unix_secs_from_mtime(0), 0);
     }
 }
