@@ -2,16 +2,39 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import "./design-tokens.css";
 import "./findx.css";
 import type { AppUpdateInfo, FindxGuiSettings, UiThemePref } from "./findxGuiTypes";
 import { UI_THEME_KEY, loadUiThemePref } from "./findxGuiTypes";
+import { BoundedTip } from "./BoundedTip";
+import { summarizeIndexStatus } from "./indexStatus";
+import { IconHistory, IconPreview, IconSettings, IconSidebar } from "./icons";
 import { PreviewPane } from "./PreviewPane";
+import {
+  applyColumnDragBetween,
+  COL_INDEX,
+  COL_LABEL,
+  COLUMN_HEADER_MIN_PX,
+  columnPixelWidths,
+  PREVIEW_AUTO_HIDE_BELOW,
+  resolvePanels,
+  RESULT_ROW_HEIGHT_PX,
+  SIDEBAR_AUTO_HIDE_BELOW,
+  visibleColumnIds,
+  type ColId,
+} from "./resultTableLayout";
+import { LayoutDiag } from "./LayoutDiag";
+import { noteLayoutSample, recordSelectionReset } from "./devDiag";
+import { ResultNavigation } from "./resultNavigation";
+import { scrollTopForRow } from "./resultSelection";
+import { windowThemeColors } from "./themeColors";
 
 /** 预览面板宽度（px）持久化 key；与 fx-preview 默认 320 配套。 */
 const PREVIEW_WIDTH_KEY = "findx2_preview_width";
 const PREVIEW_OPEN_KEY = "findx2_preview_open";
 const PREVIEW_MIN_WIDTH = 240;
 const PREVIEW_MAX_WIDTH = 720;
+const SIDEBAR_OPEN_KEY = "findx2_sidebar_open";
 
 type SearchHit = {
   name: string;
@@ -269,8 +292,12 @@ export default function FindXSearchApp() {
   const loadingMoreRef = useRef(false);
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState("就绪");
-  const [indexLine, setIndexLine] = useState("索引: …");
+  const [indexSummary, setIndexSummary] = useState("索引 …");
+  const [indexDetail, setIndexDetail] = useState<string | null>(null);
+  const [showIndexDetail, setShowIndexDetail] = useState(false);
   const [selected, setSelected] = useState<number | null>(null);
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
   // 预览面板状态：默认开启 + 持久化宽度
   const [previewOpen, setPreviewOpen] = useState<boolean>(() => {
     try {
@@ -289,6 +316,14 @@ export default function FindXSearchApp() {
     }
     return 360;
   });
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
+    try {
+      const v = localStorage.getItem(SIDEBAR_OPEN_KEY);
+      return v === null ? true : v === "1";
+    } catch {
+      return true;
+    }
+  });
   useEffect(() => {
     try {
       localStorage.setItem(PREVIEW_OPEN_KEY, previewOpen ? "1" : "0");
@@ -298,11 +333,96 @@ export default function FindXSearchApp() {
   }, [previewOpen]);
   useEffect(() => {
     try {
+      localStorage.setItem(SIDEBAR_OPEN_KEY, sidebarOpen ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  }, [sidebarOpen]);
+  useEffect(() => {
+    try {
       localStorage.setItem(PREVIEW_WIDTH_KEY, String(previewWidth));
     } catch {
       /* ignore */
     }
   }, [previewWidth]);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [contentWidth, setContentWidth] = useState(() =>
+    typeof document === "undefined" ? 0 : document.documentElement.clientWidth,
+  );
+  const [sidebarForce, setSidebarForce] = useState<"show" | "hide" | null>(null);
+  const [previewForce, setPreviewForce] = useState<"show" | "hide" | null>(null);
+  const prevContentWidth = useRef(contentWidth);
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    const read = () => {
+      const rootW = root?.clientWidth ?? 0;
+      const docW = document.documentElement.clientWidth;
+      const next = rootW > 0 && docW > 0 ? Math.min(rootW, docW) : rootW || docW;
+      const vv = window.visualViewport;
+      noteLayoutSample({
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        docClientWidth: docW,
+        docClientHeight: document.documentElement.clientHeight,
+        rootClientWidth: rootW,
+        rootClientHeight: root?.clientHeight ?? 0,
+        observerWidth: rootW,
+        devicePixelRatio: window.devicePixelRatio || 1,
+        screenWidth: window.screen?.width ?? 0,
+        screenHeight: window.screen?.height ?? 0,
+        screenAvailWidth: window.screen?.availWidth ?? 0,
+        screenAvailHeight: window.screen?.availHeight ?? 0,
+        visualViewportWidth: vv?.width ?? null,
+        visualViewportHeight: vv?.height ?? null,
+        visualViewportScale: vv?.scale ?? null,
+      });
+      setContentWidth(next);
+    };
+    read();
+    const onWindowResize = () => {
+      const vv = window.visualViewport;
+      noteLayoutSample({
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        docClientWidth: document.documentElement.clientWidth,
+        docClientHeight: document.documentElement.clientHeight,
+        devicePixelRatio: window.devicePixelRatio || 1,
+        visualViewportWidth: vv?.width ?? null,
+        visualViewportHeight: vv?.height ?? null,
+        visualViewportScale: vv?.scale ?? null,
+      });
+    };
+    const ro = new ResizeObserver(read);
+    if (root) ro.observe(root);
+    ro.observe(document.documentElement);
+    window.addEventListener("resize", onWindowResize);
+    window.visualViewport?.addEventListener("resize", onWindowResize);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", onWindowResize);
+      window.visualViewport?.removeEventListener("resize", onWindowResize);
+    };
+  }, []);
+  useEffect(() => {
+    const prev = prevContentWidth.current;
+    if (prev < PREVIEW_AUTO_HIDE_BELOW && contentWidth >= PREVIEW_AUTO_HIDE_BELOW) {
+      setPreviewForce(null);
+    }
+    if (prev < SIDEBAR_AUTO_HIDE_BELOW && contentWidth >= SIDEBAR_AUTO_HIDE_BELOW) {
+      setSidebarForce(null);
+    }
+    prevContentWidth.current = contentWidth;
+  }, [contentWidth]);
+  const panels = resolvePanels({
+    contentWidth,
+    previewWidth,
+    savedSidebar: sidebarOpen,
+    savedPreview: previewOpen,
+    sidebarForce,
+    previewForce,
+  });
+  const sidebarShown = panels.sidebar;
+  const previewShown = panels.preview;
   const [sortCol, setSortCol] = useState<SortCol>(null);
   const [sortAsc, setSortAsc] = useState(true);
   const [histOpen, setHistOpen] = useState(false);
@@ -326,7 +446,7 @@ export default function FindXSearchApp() {
   const [showV2MigrationNotice, setShowV2MigrationNotice] = useState(false);
   /** GitHub Release 有新版本时顶部提示条 */
   const [updateBanner, setUpdateBanner] = useState<AppUpdateInfo | null>(null);
-  /** 界面主题：浅 / 深（全黑）/ 跟随系统 */
+  /** 界面主题：浅 / 深 / 跟随系统。深色是分层深灰。 */
   const [uiThemePref, setUiThemePref] = useState<UiThemePref>(() => loadUiThemePref());
   const [systemDark, setSystemDark] = useState(
     () => window.matchMedia("(prefers-color-scheme: dark)").matches,
@@ -335,7 +455,7 @@ export default function FindXSearchApp() {
   const [colFrac, setColFrac] = useState<[number, number, number, number]>(() => loadColFracs());
   const colFracRef = useRef(colFrac);
   colFracRef.current = colFrac;
-  const colResizeRef = useRef<{ i: number; startX: number; base: number[] } | null>(null);
+  const colResizeRef = useRef<{ i: number; right: number; startX: number; base: number[] } | null>(null);
 
   useEffect(() => {
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
@@ -373,14 +493,12 @@ export default function FindXSearchApp() {
   /** 与页面 data-fx-theme 一致，同步 WebView2 / Windows 标题栏与窗口背景 */
   useEffect(() => {
     const isDark = effectiveTheme === "dark";
-    const bg = isDark ? "#000000" : "#fafafa";
-    const titleBar = isDark ? "#000000" : "#ebebeb";
-    const titleText = isDark ? "#e8eaed" : "#1f1f1f";
+    const colors = windowThemeColors(isDark);
     void invoke("sync_window_theme_command", {
       themeMode: isDark ? "dark" : "light",
-      backgroundColor: bg,
-      titleBarColor: titleBar,
-      titleBarTextColor: titleText,
+      backgroundColor: colors.backgroundColor,
+      titleBarColor: colors.titleBarColor,
+      titleBarTextColor: colors.titleBarTextColor,
     }).catch(() => {
       /* 浏览器预览或非 Tauri 环境 */
     });
@@ -397,11 +515,12 @@ export default function FindXSearchApp() {
     return () => document.removeEventListener("mousedown", onDown);
   }, [histOpen]);
 
-  const onColResizeStart = useCallback((leftIdx: 0 | 1 | 2, e: React.MouseEvent) => {
+  const onColResizeStart = useCallback((leftIdx: number, rightIdx: number, e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
     colResizeRef.current = {
       i: leftIdx,
+      right: rightIdx,
       startX: e.clientX,
       base: [...colFracRef.current],
     };
@@ -411,24 +530,14 @@ export default function FindXSearchApp() {
       if (!st || !wrap) return;
       const tw = wrap.clientWidth;
       if (tw <= 0) return;
-      const delta = (ev.clientX - st.startX) / tw;
-      const MIN = 0.06;
-      const a = [...st.base];
-      a[st.i] += delta;
-      a[st.i + 1] -= delta;
-      if (a[st.i] < MIN) {
-        const f = MIN - a[st.i];
-        a[st.i] = MIN;
-        a[st.i + 1] -= f;
-      }
-      if (a[st.i + 1] < MIN) {
-        const f = MIN - a[st.i + 1];
-        a[st.i + 1] = MIN;
-        a[st.i] -= f;
-      }
-      const s = a[0] + a[1] + a[2] + a[3];
-      if (s <= 0) return;
-      const next = a.map((x) => x / s) as [number, number, number, number];
+      const deltaPx = ev.clientX - st.startX;
+      const next = applyColumnDragBetween(
+        st.base as [number, number, number, number],
+        st.i,
+        st.right,
+        deltaPx,
+        tw,
+      );
       colFracRef.current = next;
       setColFrac(next);
     };
@@ -460,18 +569,22 @@ export default function FindXSearchApp() {
   const tableScrollRef = useRef<HTMLDivElement | null>(null);
   const searchBarRowRef = useRef<HTMLDivElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
-  const ROW_HEIGHT = 32;
+  const ROW_HEIGHT = RESULT_ROW_HEIGHT_PX;
   const OVERSCAN = 8;
   // 分页大小：首屏 + 滚动预取。服务端排序后按 [offset, offset+PAGE_SIZE) 切片；
   // 滚动接近底部自动追加（无限滚动），searchLimit 作为自动加载总上限。
   const PAGE_SIZE = 250;
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportH, setViewportH] = useState(600);
+  const [tableWidth, setTableWidth] = useState(800);
   useEffect(() => {
     const el = tableScrollRef.current;
     if (!el) return;
     const onScroll = () => setScrollTop(el.scrollTop);
-    const update = () => setViewportH(el.clientHeight);
+    const update = () => {
+      setViewportH(el.clientHeight);
+      setTableWidth(el.clientWidth);
+    };
     update();
     el.addEventListener("scroll", onScroll, { passive: true });
     const ro = new ResizeObserver(update);
@@ -591,70 +704,32 @@ export default function FindXSearchApp() {
         indexing: st.indexing === true,
         metadataReady: st.metadataReady !== false,
       });
-      if (st.indexing === true) {
-        const msg = st.indexingMessage?.trim();
-        const vt = st.indexingVolumesTotal;
-        const vd = st.indexingVolumesDone;
-        const phase = st.indexingPhase;
-        const entries = st.indexingEntriesIndexed ?? (raw.indexing_entries_indexed as number | undefined);
-        const curVol = st.indexingCurrentVolume?.trim();
-        const phaseZh = (p: string | undefined) => {
-          switch (p) {
-            case "starting":
-              return "准备";
-            case "scanning":
-              return "扫描";
-            case "merging":
-              return "合并";
-            case "writing":
-              return "写入";
-            default:
-              return p ?? "";
-          }
-        };
-        // 两种截然不同的 `indexing=true`：
-        //   1) 真在建库（本地跑 CLI），进度来自 index.indexing.json；
-        //   2) service 已起、正在反序列化已存在的 index.bin（loadingStage 有值）。
-        // 混成一句「建库中」会让上亿条目的加载看起来像卡死——见 2.4.0 CHANGELOG。
-        const stage = st.loadingStage?.trim();
-        if (stage && !phase && entries == null) {
-          // loadingStage 形如 `解析条目（3/8 阶段，已 42s，共 3.1 亿条）`，已是完整描述。
-          setIndexLine(`索引: 加载中 · ${stage}`);
-        } else if (!phase && entries == null && st.loadingElapsedSecs != null) {
-          // 旧版 service 不上报 loadingStage：至少显示已耗时，别让用户以为卡死。
-          setIndexLine(`索引: 加载中（已 ${st.loadingElapsedSecs}s）· 完成后自动可用`);
-        } else {
-          const segs: string[] = ["索引: 建库中"];
-          if (phase) segs.push(`阶段 ${phaseZh(phase)}`);
-          if (entries != null && !Number.isNaN(entries)) segs.push(`已收录约 ${entries.toLocaleString()} 条`);
-          if (vt != null && vt > 0 && vd != null) segs.push(`卷进度 ${vd}/${vt}`);
-          if (curVol) segs.push(`当前卷 ${curVol}`);
-          if (msg) segs.push(msg);
-          if (stage) segs.push(stage);
-          if (segs.length === 1) {
-            segs.push("（读取 index.indexing.json，完成后将自动启动服务）");
-          }
-          setIndexLine(segs.join(" · "));
-        }
-      } else if (st.lastError) {
-        setIndexLine(`索引: ${indexedCount.toLocaleString()} 条 · ${st.lastError}`);
-      } else if (st.metadataReady === false) {
-        const bd = st.backfillDone ?? 0;
-        const bt = st.backfillTotal ?? 0;
-        const pct = bt > 0 ? Math.min(100, Math.round((bd / bt) * 100)) : null;
-        const base = `索引: ${indexedCount.toLocaleString()} 条`;
-        if (!(settings.enableMetadataBackfill ?? true)) {
-          setIndexLine(`${base} · 元数据回填已关闭（可在设置中开启）`);
-        } else if (pct !== null) {
-          setIndexLine(`${base} · 元数据回填 ${pct}%（${bd.toLocaleString()}/${bt.toLocaleString()}）`);
-        } else {
-          setIndexLine(`${base} · 元数据回填中…`);
-        }
-      } else {
-        setIndexLine(`索引: ${indexedCount.toLocaleString()} 条`);
-      }
+      const entries =
+        st.indexingEntriesIndexed ??
+        (typeof raw.indexing_entries_indexed === "number" ? raw.indexing_entries_indexed : undefined);
+      const view = summarizeIndexStatus({
+        indexing: st.indexing === true,
+        indexedCount,
+        metadataReady: st.metadataReady,
+        backfillDone: st.backfillDone,
+        backfillTotal: st.backfillTotal,
+        indexingPhase: st.indexingPhase,
+        indexingVolumesTotal: st.indexingVolumesTotal,
+        indexingVolumesDone: st.indexingVolumesDone,
+        indexingMessage: st.indexingMessage,
+        indexingEntriesIndexed: entries,
+        indexingCurrentVolume: st.indexingCurrentVolume,
+        loadingStage: st.loadingStage,
+        loadingElapsedSecs: st.loadingElapsedSecs,
+        lastError: st.lastError,
+        enableMetadataBackfill: settings.enableMetadataBackfill ?? true,
+      });
+      setIndexSummary(view.summary);
+      setIndexDetail(view.detail);
     } catch (e) {
-      setIndexLine(`索引状态: ${String(e)}`);
+      const view = summarizeIndexStatus({ lastError: String(e), indexedCount: 0 });
+      setIndexSummary(view.summary);
+      setIndexDetail(view.detail);
     }
   }, [settings.enableMetadataBackfill]);
 
@@ -712,6 +787,7 @@ export default function FindXSearchApp() {
       setHits([]);
       setMatchTotal(0);
       setStatus("就绪");
+      recordSelectionReset("查询变空", selectedRef.current);
       setSelected(null);
       return;
     }
@@ -720,6 +796,7 @@ export default function FindXSearchApp() {
       setLoading(true);
       setStatus("搜索中…");
       // 每次重新搜索（含防抖自动搜）时清空列表选中，避免仍指向旧排序/旧结果中的行号。
+      recordSelectionReset("重新查询", selectedRef.current);
       setSelected(null);
     }
     try {
@@ -783,6 +860,7 @@ export default function FindXSearchApp() {
         if (!append) {
           setHits([]);
           setMatchTotal(0);
+          recordSelectionReset("查询失败", selectedRef.current);
           setSelected(null);
         }
         setStatus(`错误: ${String(e)}`);
@@ -856,6 +934,14 @@ export default function FindXSearchApp() {
     }
   };
 
+  useEffect(() => {
+    if (selected == null) return;
+    const el = tableScrollRef.current;
+    if (!el) return;
+    const next = scrollTopForRow(selected, ROW_HEIGHT, el.scrollTop, el.clientHeight);
+    if (next !== el.scrollTop) el.scrollTop = next;
+  }, [selected, ROW_HEIGHT]);
+
   const acknowledgeV2MigrationNotice = () => {
     try {
       localStorage.setItem(V2_MIGRATION_NOTICE_ACK_KEY, "1");
@@ -866,7 +952,24 @@ export default function FindXSearchApp() {
   };
 
   return (
-    <div className="fx-root">
+    <div className="fx-root" ref={rootRef}>
+      <ResultNavigation
+        count={sortedHits.length}
+        selected={selected}
+        onSelect={setSelected}
+        onOpen={() => void openSelected()}
+        searchInputRef={searchInputRef}
+      />
+      <LayoutDiag
+        decisionWidth={contentWidth}
+        previewWidth={previewWidth}
+        savedSidebar={sidebarOpen}
+        savedPreview={previewOpen}
+        sidebarForce={sidebarForce}
+        previewForce={previewForce}
+        selected={selected}
+        resultsCount={sortedHits.length}
+      />
       {updateBanner?.releasePageUrl && updateBanner.latestVersion && (
         <div className="fx-update-banner" role="status">
           <span>
@@ -948,9 +1051,11 @@ export default function FindXSearchApp() {
             type="button"
             className="fx-btn-icon"
             title="搜索历史"
+            aria-expanded={histOpen}
+            aria-label="搜索历史"
             onClick={() => setHistOpen(!histOpen)}
           >
-            🕐
+            <IconHistory />
           </button>
           <button type="button" className="fx-btn-icon fx-btn-search" onClick={() => void runSearch(0, false)}>
             搜索
@@ -959,7 +1064,7 @@ export default function FindXSearchApp() {
       </div>
 
       <div className="fx-main">
-        <aside className="fx-sidebar">
+        {sidebarShown && <aside className="fx-sidebar">
           <h3>筛选</h3>
           {(
             [
@@ -1028,10 +1133,15 @@ export default function FindXSearchApp() {
               onChange={(e) => setSizeMax(e.target.value)}
             />
           </div>
-        </aside>
+        </aside>}
 
         <div className="fx-results">
-          <div className="fx-table-wrap" ref={tableScrollRef}>
+          <div
+            className="fx-table-wrap"
+            ref={tableScrollRef}
+            tabIndex={0}
+            onMouseDown={() => tableScrollRef.current?.focus()}
+          >
             {(() => {
               // 计算可见窗口；为了避免 5000 行一次性渲染卡死浏览器主线程，仅渲染 [start, end)。
               const total = sortedHits.length;
@@ -1043,79 +1153,97 @@ export default function FindXSearchApp() {
               const padTop = startIdx * ROW_HEIGHT;
               const padBottom = Math.max(0, (total - endIdx) * ROW_HEIGHT);
               const slice = sortedHits.slice(startIdx, endIdx);
-              const colPct = (i: 0 | 1 | 2 | 3) => `${(colFrac[i] * 100).toFixed(3)}%`;
+              const visible = visibleColumnIds(tableWidth);
+              const widths = columnPixelWidths(colFrac, tableWidth, visible);
+              const tablePx = visible.reduce((sum, id) => sum + widths[id], 0);
               const sortInd = (col: Exclude<SortCol, null>) =>
                 sortCol === col ? (
                   <span className="fx-sort-ind" aria-hidden>
                     {sortAsc ? "▲" : "▼"}
                   </span>
                 ) : null;
+              const cell = (id: ColId, row: SearchHit) => {
+                if (id === "name") {
+                  return (
+                    <td key={id} className="fx-name">
+                      {row.isDirectory ? "📁 " : ""}
+                      <HighlightText text={row.name} qRaw={q} serverRanges={row.nameHighlight} />
+                    </td>
+                  );
+                }
+                if (id === "path") {
+                  return (
+                    <td key={id} className="fx-path">
+                      <BoundedTip text={row.path}>
+                        <HighlightText text={row.path} qRaw={q} />
+                      </BoundedTip>
+                    </td>
+                  );
+                }
+                if (id === "size") {
+                  return (
+                    <td key={id} className="fx-col-size">
+                      {!indexMeta.metadataReady && !row.isDirectory && row.size === 0
+                        ? "—"
+                        : formatSize(row.size, row.isDirectory)}
+                    </td>
+                  );
+                }
+                return (
+                  <td key={id}>
+                    {!row.isDirectory && row.modifiedUnix === 0 ? "—" : formatTime(row.modifiedUnix)}
+                  </td>
+                );
+              };
               return (
-                <table className="fx-table">
+                <table
+                  className="fx-table"
+                  style={{
+                    ["--fx-row-height" as string]: `${ROW_HEIGHT}px`,
+                    width: Math.max(tableWidth, tablePx),
+                    minWidth: tablePx,
+                  }}
+                >
                   <colgroup>
-                    <col style={{ width: colPct(0) }} />
-                    <col style={{ width: colPct(1) }} />
-                    <col style={{ width: colPct(2) }} />
-                    <col style={{ width: colPct(3) }} />
+                    {visible.map((id) => (
+                      <col key={id} style={{ width: widths[id] }} />
+                    ))}
                   </colgroup>
                   <thead>
                     <tr>
-                      <th scope="col">
-                        <div className="fx-th-cell">
-                          <button type="button" className="fx-th-btn" onClick={() => onHeaderClick("name")}>
-                            <span>名称</span>
-                            {sortInd("name")}
-                          </button>
-                          <div
-                            className="fx-col-resize"
-                            role="separator"
-                            aria-hidden
-                            onMouseDown={(e) => onColResizeStart(0, e)}
-                          />
-                        </div>
-                      </th>
-                      <th scope="col">
-                        <div className="fx-th-cell">
-                          <button type="button" className="fx-th-btn" onClick={() => onHeaderClick("path")}>
-                            <span>路径</span>
-                            {sortInd("path")}
-                          </button>
-                          <div
-                            className="fx-col-resize"
-                            role="separator"
-                            aria-hidden
-                            onMouseDown={(e) => onColResizeStart(1, e)}
-                          />
-                        </div>
-                      </th>
-                      <th scope="col">
-                        <div className="fx-th-cell">
-                          <button type="button" className="fx-th-btn" onClick={() => onHeaderClick("size")}>
-                            <span>大小</span>
-                            {sortInd("size")}
-                          </button>
-                          <div
-                            className="fx-col-resize"
-                            role="separator"
-                            aria-hidden
-                            onMouseDown={(e) => onColResizeStart(2, e)}
-                          />
-                        </div>
-                      </th>
-                      <th scope="col">
-                        <div className="fx-th-cell">
-                          <button type="button" className="fx-th-btn" onClick={() => onHeaderClick("mtime")}>
-                            <span>修改时间</span>
-                            {sortInd("mtime")}
-                          </button>
-                        </div>
-                      </th>
+                      {visible.map((id, index) => {
+                        const next = visible[index + 1];
+                        return (
+                          <th
+                            key={id}
+                            scope="col"
+                            className={id === "size" ? "fx-col-size" : undefined}
+                            style={{ minWidth: COLUMN_HEADER_MIN_PX[id] }}
+                          >
+                            <div className="fx-th-cell">
+                              <button type="button" className="fx-th-btn" onClick={() => onHeaderClick(id)}>
+                                <span>{COL_LABEL[id]}</span>
+                                {sortInd(id)}
+                              </button>
+                              {next && (
+                                <div
+                                  className="fx-col-resize"
+                                  role="separator"
+                                  aria-orientation="vertical"
+                                  aria-hidden
+                                  onMouseDown={(e) => onColResizeStart(COL_INDEX[id], COL_INDEX[next], e)}
+                                />
+                              )}
+                            </div>
+                          </th>
+                        );
+                      })}
                     </tr>
                   </thead>
                   <tbody>
                     {padTop > 0 && (
                       <tr aria-hidden="true" style={{ height: padTop }}>
-                        <td colSpan={4} style={{ padding: 0, border: 0 }} />
+                        <td colSpan={visible.length} style={{ padding: 0, border: 0 }} />
                       </tr>
                     )}
                     {slice.map((row, j) => {
@@ -1128,7 +1256,10 @@ export default function FindXSearchApp() {
                           onMouseDown={(e) => {
                             if (e.button === 0) e.preventDefault();
                           }}
-                          onClick={() => setSelected(i)}
+                          onClick={() => {
+                            setSelected(i);
+                            tableScrollRef.current?.focus();
+                          }}
                           onDoubleClick={() => {
                             setSelected(i);
                             void invoke("open_file", { path: row.path }).catch((e) =>
@@ -1145,40 +1276,13 @@ export default function FindXSearchApp() {
                             }).catch((err) => setStatus(String(err)));
                           }}
                         >
-                          <td>
-                            {row.isDirectory ? "📁 " : ""}
-                            <HighlightText
-                              text={row.name}
-                              qRaw={q}
-                              serverRanges={row.nameHighlight}
-                            />
-                          </td>
-                          <td className="fx-path" title={row.path}>
-                            <HighlightText text={row.path} qRaw={q} />
-                          </td>
-                          <td style={{ textAlign: "right" }}>
-                            {/* fast 模式下后台未完成回填时，size 字段对未回填文件就是 0 —— 显示为 "—"。
-                                完成后真空文件（极少数）会显示 0 B，可接受。 */}
-                            {!indexMeta.metadataReady &&
-                            !row.isDirectory &&
-                            row.size === 0
-                              ? "—"
-                              : formatSize(row.size, row.isDirectory)}
-                          </td>
-                          <td>
-                            {/* mtime 在 fast 首遍后已经是 USN TimeStamp（近似值，秒级精度）；
-                                backfill 完成后会被 STANDARD_INFORMATION 覆盖为权威值。
-                                这里只在确实拿到 0（USN 都没记录到）时才显示 "—"。 */}
-                            {!row.isDirectory && row.modifiedUnix === 0
-                              ? "—"
-                              : formatTime(row.modifiedUnix)}
-                          </td>
+                          {visible.map((id) => cell(id, row))}
                         </tr>
                       );
                     })}
                     {padBottom > 0 && (
                       <tr aria-hidden="true" style={{ height: padBottom }}>
-                        <td colSpan={4} style={{ padding: 0, border: 0 }} />
+                        <td colSpan={visible.length} style={{ padding: 0, border: 0 }} />
                       </tr>
                     )}
                   </tbody>
@@ -1188,7 +1292,7 @@ export default function FindXSearchApp() {
           </div>
         </div>
 
-        {previewOpen && (
+        {previewShown && (
           <>
             <div
               className="fx-preview-resizer"
@@ -1233,9 +1337,17 @@ export default function FindXSearchApp() {
           <span>{status}</span>
         </div>
         <span className="fx-status-right">
-          <span className="fx-index-line" title={indexLine}>
-            {indexLine}
-          </span>
+          <span className="fx-index-line">{indexSummary}</span>
+          {indexDetail && (
+            <button
+              type="button"
+              className="fx-btn-icon"
+              title="查看详细状态"
+              onClick={() => setShowIndexDetail(true)}
+            >
+              详情
+            </button>
+          )}
           {selected !== null && (
             <>
               <button type="button" className="fx-btn-icon" onClick={() => void openSelected()}>
@@ -1248,24 +1360,79 @@ export default function FindXSearchApp() {
           )}
           <button
             type="button"
-            className={`fx-btn-icon ${previewOpen ? "active" : ""}`}
-            title={previewOpen ? "关闭预览面板" : "打开预览面板"}
-            onClick={() => setPreviewOpen((v) => !v)}
+            className={`fx-btn-icon ${sidebarShown ? "active" : ""}`}
+            title={sidebarShown ? "隐藏侧栏" : "显示侧栏"}
+            aria-pressed={sidebarShown}
+            aria-label={sidebarShown ? "隐藏侧栏" : "显示侧栏"}
+            onClick={() => {
+              const next = !sidebarShown;
+              setSidebarOpen(next);
+              setSidebarForce(contentWidth < SIDEBAR_AUTO_HIDE_BELOW ? (next ? "show" : "hide") : null);
+            }}
           >
-            👁
+            <IconSidebar />
+          </button>
+          <button
+            type="button"
+            className={`fx-btn-icon ${previewShown ? "active" : ""}`}
+            title={previewShown ? "关闭预览面板" : "打开预览面板"}
+            aria-pressed={previewShown}
+            aria-label={previewShown ? "关闭预览面板" : "打开预览面板"}
+            onClick={() => {
+              const next = !previewShown;
+              setPreviewOpen(next);
+              setPreviewForce(contentWidth < PREVIEW_AUTO_HIDE_BELOW ? (next ? "show" : "hide") : null);
+            }}
+          >
+            <IconPreview />
           </button>
           <button
             type="button"
             className="fx-btn-icon"
             title="设置"
+            aria-label="设置"
             onClick={() => {
               void invoke("show_settings_window");
             }}
           >
-            ⚙
+            <IconSettings />
           </button>
         </span>
       </div>
+      {showIndexDetail && (
+        <div
+          className="fx-v2-notice-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-label="索引状态详情"
+          onClick={() => setShowIndexDetail(false)}
+        >
+          <div
+            className="fx-v2-notice-card"
+            onClick={(e) => e.stopPropagation()}
+            style={{ maxWidth: "720px" }}
+          >
+            <h3>索引状态详情</h3>
+            <p style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", lineHeight: "1.6" }}>
+              {indexSummary}
+            </p>
+            {indexDetail && (
+              <p style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", lineHeight: "1.6" }}>
+                {indexDetail}
+              </p>
+            )}
+            <div className="fx-v2-notice-actions">
+              <button
+                type="button"
+                className="fx-btn-icon fx-btn-search"
+                onClick={() => setShowIndexDetail(false)}
+              >
+                关闭
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {showV2MigrationNotice && (
         <div className="fx-v2-notice-backdrop" role="dialog" aria-modal="true" aria-label="FindX2 升级说明">
           <div className="fx-v2-notice-card">

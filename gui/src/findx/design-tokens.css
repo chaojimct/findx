@@ -1,0 +1,116 @@
+/**
+ * FindX GUI 设计令牌系统
+ * Windows 11 Fluent Design 基线,跨平台兼容
+ */
+
+:root {
+  /* 间距系统 (4px 基准) */
+  --fx-space-xs: 4px;
+  --fx-space-sm: 8px;
+  --fx-space-md: 12px;
+  --fx-space-lg: 16px;
+  --fx-space-xl: 24px;
+  --fx-space-2xl: 32px;
+
+  /* 圆角系统 */
+  --fx-radius-sm: 4px;
+  --fx-radius-md: 6px;
+  --fx-radius-lg: 8px;
+
+  /* 字体尺寸 */
+  --fx-text-xs: 11px;
+  --fx-text-sm: 12px;
+  --fx-text-base: 13px;
+  --fx-text-md: 14px;
+  --fx-text-lg: 16px;
+  --fx-text-xl: 18px;
+
+  /* 行高 */
+  --fx-leading-tight: 1.25;
+  --fx-leading-normal: 1.4;
+  --fx-leading-relaxed: 1.55;
+
+  /* 控件尺寸 */
+  --fx-control-sm: 28px;
+  --fx-control-md: 32px;
+  --fx-control-lg: 36px;
+
+  /* 结果行高度 */
+  --fx-row-height: 32px;
+
+  /* 焦点环 */
+  --fx-focus-ring: 0 0 0 2px var(--fx-accent-soft);
+
+  /* 过渡动画 */
+  --fx-transition-fast: 120ms ease;
+  --fx-transition-base: 180ms ease;
+
+  /* 设置内容列上限。短数字框不跟着拉宽。 */
+  --fx-settings-content-max-width: 800px;
+
+  /* 图标尺寸 */
+  --fx-icon-sm: 14px;
+  --fx-icon-base: 16px;
+  --fx-icon-lg: 20px;
+}
+
+/* 浅色主题 */
+:root[data-fx-theme="light"],
+:root:not([data-fx-theme]) {
+  color-scheme: light;
+  --fx-bg: #fafafa;
+  --fx-surface: #ffffff;
+  --fx-surface-raised: #ffffff;
+  --fx-border: #d8d8d8;
+  --fx-border-soft: #e8e8e8;
+  --fx-text-primary: #1f1f1f;
+  --fx-text-secondary: #555555;
+  --fx-text-tertiary: #888888;
+  --fx-text-disabled: #aaaaaa;
+  --fx-accent: #0078d4;
+  --fx-accent-hover: #106ebe;
+  --fx-accent-soft: rgba(0, 120, 212, 0.12);
+  --fx-hover: #f5f5f5;
+  --fx-pressed: #ebebeb;
+  --fx-row-selected: #e3f2fd;
+  --fx-search-box-bg: #f5f5f5;
+  --fx-placeholder: #aaaaaa;
+  --fx-hit-bg: #ffecb3;
+  --fx-hit-fg: #0d47a1;
+  --fx-success: #107c10;
+  --fx-warning: #d28a3a;
+  --fx-error: #c42b1c;
+  --fx-scrollbar-track: #eaeaea;
+  --fx-scrollbar-thumb: #a8a8a8;
+  --fx-scrollbar-thumb-hover: #888888;
+}
+
+/* 深色主题：分层深灰。与 themeColors.ts / index.html 的 #1b1b1b 一致，不是纯黑。 */
+:root[data-fx-theme="dark"] {
+  color-scheme: dark;
+  --fx-bg: #1b1b1b;
+  --fx-surface: #242424;
+  --fx-surface-raised: #2c2c2c;
+  --fx-border: #3d3d3d;
+  --fx-border-soft: #333333;
+  --fx-text-primary: #f2f2f2;
+  --fx-text-secondary: #c8c8c8;
+  --fx-text-tertiary: #9a9a9a;
+  --fx-text-disabled: #6e6e6e;
+  --fx-accent: #4da3ff;
+  --fx-accent-hover: #6bb4ff;
+  --fx-accent-soft: rgba(77, 163, 255, 0.18);
+  --fx-hover: #303030;
+  --fx-pressed: #3a3a3a;
+  --fx-row-selected: #1e3a5f;
+  --fx-search-box-bg: #2c2c2c;
+  --fx-placeholder: #8a8a8a;
+  --fx-hit-bg: #6a5400;
+  --fx-hit-fg: #fff8e1;
+  --fx-success: #6ccb5f;
+  --fx-warning: #f7b955;
+  --fx-error: #e74856;
+  --fx-scrollbar-track: #1b1b1b;
+  --fx-scrollbar-thumb: #4a4a4a;
+  --fx-scrollbar-thumb-hover: #666666;
+}

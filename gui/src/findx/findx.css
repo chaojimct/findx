@@ -1,75 +1,25 @@
-/* 浅色 / 深色（全黑底）由 html[data-fx-theme] 切换；侧栏约 210px、强调色可随主题略调 */
+/* 设计令牌已移至 design-tokens.css */
 
-:root[data-fx-theme="light"],
-:root:not([data-fx-theme]) {
-  color-scheme: light;
-  --fx-bg: #fafafa;
-  --fx-white: #ffffff;
-  --fx-border: #d8d8d8;
-  --fx-border-soft: #e8e8e8;
-  --fx-text: #222;
-  --fx-muted: #888;
-  --fx-sub: #555;
-  --fx-accent: #0078d4;
-  --fx-accent-soft: #dceefb;
-  --fx-hover: #f5f5f5;
-  --fx-row-sel: #e3f2fd;
-  --fx-search-box-bg: #f5f5f5;
-  --fx-placeholder: #aaa;
-  --fx-sidebar-section: #999;
-  --fx-filter-fg: #333;
-  --fx-filter-hover-bg: #e8e8e8;
-  --fx-time-hover-bg: #f0f0f0;
-  --fx-dot-border: #999;
-  --fx-input-border: #d0d0d0;
-  --fx-input-bg: #fbfbfb;
-  --fx-th-bg: #f3f3f3;
-  --fx-th-fg: #555;
-  --fx-cell-line: #ebebeb;
-  --fx-hit-bg: #ffecb3;
-  --fx-hit-fg: #0d47a1;
-  --fx-btn-ghost-bg: #f0f0f0;
-  --fx-settings-btn-bg: #f5f5f5;
-  --fx-drives-bg: #fafafa;
-  --fx-scrollbar-track: #eaeaea;
-  --fx-scrollbar-thumb: #a8a8a8;
-  --fx-scrollbar-thumb-hover: #888888;
-}
-
-/* 深色：背景/面板统一纯黑 #000，靠细边框与对比度分层 */
-:root[data-fx-theme="dark"] {
-  color-scheme: dark;
-  --fx-bg: #000000;
-  --fx-white: #000000;
-  --fx-border: #2a2a2a;
-  --fx-border-soft: #1a1a1a;
-  --fx-text: #ececec;
-  --fx-muted: #9a9a9a;
-  --fx-sub: #c4c4c4;
-  --fx-accent: #4da3ff;
-  --fx-accent-soft: rgba(77, 163, 255, 0.18);
-  --fx-hover: #121212;
-  --fx-row-sel: #0d2847;
-  --fx-search-box-bg: #0a0a0a;
-  --fx-placeholder: #777;
-  --fx-sidebar-section: #888;
-  --fx-filter-fg: #ddd;
-  --fx-filter-hover-bg: #1a1a1a;
-  --fx-time-hover-bg: #141414;
-  --fx-dot-border: #666;
-  --fx-input-border: #333;
-  --fx-input-bg: #0a0a0a;
-  --fx-th-bg: #000000;
-  --fx-th-fg: #b8b8b8;
-  --fx-cell-line: #1c1c1c;
-  --fx-hit-bg: #6a5400;
-  --fx-hit-fg: #fff8e1;
-  --fx-btn-ghost-bg: #1a1a1a;
-  --fx-settings-btn-bg: #141414;
-  --fx-drives-bg: #0a0a0a;
-  --fx-scrollbar-track: #0a0a0a;
-  --fx-scrollbar-thumb: #3a3a3a;
-  --fx-scrollbar-thumb-hover: #555555;
+/* 兼容性映射:旧变量名 → 新令牌 */
+:root {
+  --fx-white: var(--fx-surface);
+  --fx-text: var(--fx-text-primary);
+  --fx-muted: var(--fx-text-tertiary);
+  --fx-sub: var(--fx-text-secondary);
+  --fx-row-sel: var(--fx-row-selected);
+  --fx-sidebar-section: var(--fx-text-tertiary);
+  --fx-filter-fg: var(--fx-text-primary);
+  --fx-filter-hover-bg: var(--fx-hover);
+  --fx-time-hover-bg: var(--fx-hover);
+  --fx-dot-border: var(--fx-text-tertiary);
+  --fx-input-border: var(--fx-border);
+  --fx-input-bg: var(--fx-surface-raised);
+  --fx-th-bg: var(--fx-surface);
+  --fx-th-fg: var(--fx-text-secondary);
+  --fx-cell-line: var(--fx-border-soft);
+  --fx-btn-ghost-bg: var(--fx-surface-raised);
+  --fx-settings-btn-bg: var(--fx-surface-raised);
+  --fx-drives-bg: var(--fx-surface-raised);
 }
 
 body {
@@ -142,8 +92,8 @@ html {
 }
 
 :root[data-fx-theme="dark"] .fx-update-banner {
-  background: color-mix(in srgb, var(--fx-accent) 18%, #0d0d0d);
-  border-bottom-color: color-mix(in srgb, var(--fx-accent) 35%, #333);
+  background: color-mix(in srgb, var(--fx-accent) 18%, var(--fx-surface));
+  border-bottom-color: var(--fx-border);
 }
 
 .fx-search-bar {
@@ -208,12 +158,34 @@ html {
 
 .fx-btn-icon {
   border: none;
-  border-radius: 8px;
-  padding: 8px 12px;
+  border-radius: 4px;
+  padding: 6px 10px;
+  min-width: 32px;
+  min-height: 32px;
   cursor: pointer;
-  font-size: 14px;
+  font-size: 13px;
   background: var(--fx-btn-ghost-bg);
   color: var(--fx-text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.fx-btn-icon svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+  flex-shrink: 0;
+}
+
+.fx-btn-icon:focus-visible,
+.fx-filter:focus-visible,
+.fx-time:focus-visible,
+.fx-th-btn:focus-visible,
+.fx-settings-tab:focus-visible {
+  outline: 2px solid var(--fx-accent);
+  outline-offset: 2px;
 }
 
 .fx-btn-icon.active {
@@ -230,6 +202,7 @@ html {
   display: flex;
   flex: 1;
   min-height: 0;
+  min-width: 0;
 }
 
 .fx-sidebar {
@@ -342,7 +315,7 @@ html {
 }
 
 .fx-results {
-  flex: 1;
+  flex: 1 1 auto;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -351,7 +324,51 @@ html {
 
 .fx-table-wrap {
   flex: 1;
+  min-width: 0;
   overflow: auto;
+}
+
+.fx-table-wrap:focus {
+  outline: none;
+}
+
+.fx-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fx-layout-diag {
+  position: fixed;
+  left: 8px;
+  bottom: 8px;
+  z-index: 80;
+  width: min(420px, calc(100vw - 16px));
+  max-height: 46vh;
+  overflow: auto;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid #d28a3a;
+  background: #fff8e8;
+  color: #1f1f1f;
+  font-size: 11px;
+  line-height: 1.35;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+
+.fx-layout-diag-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.fx-layout-diag pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, monospace;
 }
 
 .fx-table {
@@ -400,13 +417,14 @@ html {
   top: 0;
   z-index: 2;
   vertical-align: middle;
+  white-space: nowrap;
   font-weight: 600;
 }
 
-.fx-table th:nth-child(3) .fx-th-btn {
+.fx-table th.fx-col-size .fx-th-btn {
   justify-content: flex-end;
 }
-.fx-table td:nth-child(3) {
+.fx-table td.fx-col-size {
   text-align: right;
 }
 
@@ -438,6 +456,13 @@ html {
   font-weight: 600;
   color: inherit;
   text-align: left;
+  white-space: nowrap;
+}
+
+.fx-th-btn span {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: nowrap;
 }
 
 .fx-th-btn:hover {
@@ -486,8 +511,8 @@ html {
   padding: 0 10px;
   border-bottom: 1px solid var(--fx-cell-line);
   vertical-align: middle;
-  height: 32px;
-  line-height: 32px;
+  height: var(--fx-row-height);
+  line-height: var(--fx-row-height);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -565,14 +590,12 @@ html {
 }
 
 .fx-index-line {
-  flex: 1;
-  min-width: 160px;
-  max-width: min(520px, 58vw);
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: min(420px, 46vw);
   text-align: right;
   line-height: 1.35;
   color: var(--fx-sub);
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -589,6 +612,8 @@ html {
 
 .fx-v2-notice-card {
   width: min(640px, calc(100vw - 32px));
+  max-height: min(70vh, 420px);
+  overflow: auto;
   background: var(--fx-white);
   color: var(--fx-text);
   border: 1px solid var(--fx-border);
@@ -930,6 +955,8 @@ html {
 }
 
 .fx-preview-title {
+  flex: 1;
+  min-width: 0;
   font-weight: 600;
   color: var(--fx-text);
   white-space: nowrap;
@@ -993,9 +1020,41 @@ html {
   font-family: ui-monospace, "JetBrains Mono", "Cascadia Mono", Consolas, "Courier New", monospace;
   font-size: 12px;
   line-height: 1.55;
-  white-space: pre;
   color: var(--fx-text);
   background: var(--fx-white);
+}
+
+.fx-preview-text--prose {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.fx-preview-text--code {
+  white-space: pre;
+  overflow: auto;
+}
+
+.fx-bounded-tip {
+  position: fixed;
+  z-index: 80;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--fx-border);
+  border-radius: 4px;
+  background: var(--fx-surface-raised);
+  color: var(--fx-text-primary);
+  font-size: 12px;
+  line-height: 1.45;
+  font-weight: 400;
+  text-align: left;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  overflow: auto;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.28);
+  pointer-events: none;
 }
 
 /* 内置 File Viewer：铺满预览栈，Shadow DOM 内部自己滚 */

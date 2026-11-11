@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { BoundedTip } from "./BoundedTip";
+import { previewWhitespace } from "./previewText";
 import { ViewerPreview } from "./ViewerPreview";
 import { fileExt, viewerCanPreview } from "./viewerPreviewSupport";
 
@@ -396,9 +398,9 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
   return (
     <div ref={containerRef} className={`fx-preview ${className ?? ""}`}>
       <div className="fx-preview-header">
-        <span className="fx-preview-title" title={path ?? ""}>
+        <BoundedTip className="fx-preview-title" text={path ?? ""}>
           {path ? path.split(/[\\/]/).pop() : "预览"}
-        </span>
+        </BoundedTip>
         {busy && (
           <span className="fx-preview-busy">{cloudLabel ? "云同步中…" : "加载中…"}</span>
         )}
@@ -410,7 +412,15 @@ export function PreviewPane({ path, isDirectory, className }: Props) {
           <img className="fx-preview-img" src={imgUrl} alt="" />
         )}
         {path && !isDirectory && mode === "text" && textBody !== null && (
-          <pre className="fx-preview-text">{textBody}</pre>
+          <pre
+            className={`fx-preview-text ${
+              previewWhitespace(fileExt(path)) === "prose"
+                ? "fx-preview-text--prose"
+                : "fx-preview-text--code"
+            }`}
+          >
+            {textBody}
+          </pre>
         )}
         {path && !isDirectory && showNative && (
           <div className="fx-preview-native-stack">

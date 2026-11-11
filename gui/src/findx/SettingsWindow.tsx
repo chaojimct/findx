@@ -1,8 +1,27 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import "./design-tokens.css";
 import "./findx.css";
+import "./settings-window.css";
+import { Button, Checkbox, Input, RadioGroup, SettingsRow } from "./components/UIComponents";
+import { ExcludeDirsEditor } from "./components/ExcludeDirsEditor";
+import { IndexRangeList } from "./IndexRangeList";
+import { indexOpFeedback } from "./indexOps";
+import { windowThemeColors } from "./themeColors";
+import { UpdateCard } from "./UpdateCard";
+import { createOnceListener } from "./onceListener";
+import {
+  CLOSE_DIRTY_MESSAGE,
+  closeDecision,
+  commitSaveIntervalSecs,
+  commitSearchLimit,
+  discardUnsaved,
+  formIsDirty,
+  serviceStartHint,
+} from "./settingsDraft";
+import { settleUpdate, UpdateRequestGate } from "./updateGate";
 import type {
   AppUpdateInfo,
   AutostartState,
@@ -36,6 +55,8 @@ export default function SettingsWindow() {
     autoStartApp: false,
     autoCheckUpdate: true,
   });
+  const [originalSettings, setOriginalSettings] = useState<FindxGuiSettings | null>(null);
+  const settingsRef = useRef(settings);
   const [settingsTab, setSettingsTab] = useState<"index" | "search" | "service" | "advanced">(
     "index",
   );
@@ -43,10 +64,21 @@ export default function SettingsWindow() {
   const [availableDrives, setAvailableDrives] = useState<string[]>([]);
   const [hostOs, setHostOs] = useState<string>("windows");
   const [uiThemePref, setUiThemePref] = useState<UiThemePref>(() => loadUiThemePref());
+  const [originalUiThemePref, setOriginalUiThemePref] = useState<UiThemePref>(() => loadUiThemePref());
   const [systemDark, setSystemDark] = useState(
     () => window.matchMedia("(prefers-color-scheme: dark)").matches,
   );
   const [hint, setHint] = useState("");
+  const [showSyntaxHelp, setShowSyntaxHelp] = useState(false);
+  const [serviceBusy, setServiceBusy] = useState(false);
+  const [searchLimitInput, setSearchLimitInput] = useState(String(settings.searchLimit));
+  const [saveIntervalInput, setSaveIntervalInput] = useState(String(settings.saveIntervalSecs ?? 30));
+  const updateGateRef = useRef(new UpdateRequestGate());
+  const updateOpIdRef = useRef(0);
+  const isDirtyRef = useRef(false);
+  const originalRef = useRef<FindxGuiSettings | null>(null);
+  const themeRef = useRef(uiThemePref);
+  const originalThemeRef = useRef(originalUiThemePref);
   /**
    * 「随系统启动」的真源是注册表，不是设置文件。
    * 因此单独存一份状态，进入设置页时从后端回读，避免显示与实际相反。
@@ -60,6 +92,7 @@ export default function SettingsWindow() {
   const [idxEntries, setIdxEntries] = useState<number | null>(null);
   const [tombCount, setTombCount] = useState<number | null>(null);
   const [compactBusy, setCompactBusy] = useState(false);
+  const [indexOp, setIndexOp] = useState("");
   /** 应用更新：检测结果；下载走事件（findx2-update-progress/finished）驱动进度条 */
   const [updInfo, setUpdInfo] = useState<AppUpdateInfo | null>(null);
   /** true = 检查中或下载中（下载中由 dlProgress 非空区分） */
@@ -75,12 +108,28 @@ export default function SettingsWindow() {
     return () => mq.removeEventListener("change", fn);
   }, []);
 
+  const dirty = formIsDirty({
+    settings,
+    original: originalSettings,
+    theme: uiThemePref,
+    originalTheme: originalUiThemePref,
+    searchLimitText: searchLimitInput,
+    saveIntervalText: saveIntervalInput,
+  });
+  isDirtyRef.current = dirty;
+  originalRef.current = originalSettings;
+  themeRef.current = uiThemePref;
+  originalThemeRef.current = originalUiThemePref;
+
   /** 应用更新：订阅后端下载进度/结束事件（下载线程 emit，200ms 节流）。 */
   useEffect(() => {
     const unProgress = listen<UpdateProgressEvent>("findx2-update-progress", (e) => {
+      if (!updateGateRef.current.isCurrent(updateOpIdRef.current)) return;
       setDlProgress(e.payload);
     });
     const unFinished = listen<UpdateFinishedEvent>("findx2-update-finished", (e) => {
+      const id = updateOpIdRef.current;
+      if (!updateGateRef.current.finish(id)) return;
       setDlProgress(null);
       setUpdBusy(false);
       if (e.payload.ok && e.payload.path) {
@@ -126,15 +175,17 @@ export default function SettingsWindow() {
   }, [effectiveTheme, uiThemePref]);
 
   useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+
+  useEffect(() => {
     const isDark = effectiveTheme === "dark";
-    const bg = isDark ? "#000000" : "#fafafa";
-    const titleBar = isDark ? "#000000" : "#ebebeb";
-    const titleText = isDark ? "#e8eaed" : "#1f1f1f";
+    const colors = windowThemeColors(isDark);
     void invoke("sync_window_theme_command", {
       themeMode: isDark ? "dark" : "light",
-      backgroundColor: bg,
-      titleBarColor: titleBar,
-      titleBarTextColor: titleText,
+      backgroundColor: colors.backgroundColor,
+      titleBarColor: colors.titleBarColor,
+      titleBarTextColor: colors.titleBarTextColor,
     }).catch(() => {});
   }, [effectiveTheme]);
 
@@ -142,6 +193,9 @@ export default function SettingsWindow() {
     try {
       const s = await invoke<FindxGuiSettings>("load_findx_settings");
       setSettings(s);
+      setOriginalSettings(s);
+      setSearchLimitInput(String(s.searchLimit));
+      setSaveIntervalInput(String(s.saveIntervalSecs ?? 30));
     } catch {
       /* ignore */
     }
@@ -247,9 +301,29 @@ export default function SettingsWindow() {
   }, []);
 
   const saveSettings = async () => {
+    const limit = commitSearchLimit(searchLimitInput);
+    if (!limit.ok) {
+      setHint(limit.message);
+      return;
+    }
+    const interval = commitSaveIntervalSecs(saveIntervalInput);
+    if (!interval.ok) {
+      setHint(interval.message);
+      return;
+    }
+    const next: FindxGuiSettings = {
+      ...settings,
+      searchLimit: limit.value,
+      saveIntervalSecs: interval.value,
+    };
     try {
-      await invoke("save_findx_settings", { settings });
+      await invoke("save_findx_settings", { settings: next });
       await emit("findx2-settings-saved", {});
+      setSettings(next);
+      setOriginalSettings(next);
+      setOriginalUiThemePref(uiThemePref);
+      setSearchLimitInput(String(next.searchLimit));
+      setSaveIntervalInput(String(next.saveIntervalSecs ?? 30));
       setHint("设置已保存");
       window.setTimeout(() => setHint(""), 2500);
     } catch (e) {
@@ -258,29 +332,70 @@ export default function SettingsWindow() {
   };
 
   const startSvc = async () => {
+    if (serviceBusy) {
+      setHint("服务操作正在进行中，请稍候…");
+      return;
+    }
+    setServiceBusy(true);
+    setHint("正在启动服务…");
     try {
       await invoke("start_findx_service");
-      setHint("已启动 findx2-service");
+      setHint(serviceStartHint("sent"));
     } catch (e) {
-      setHint(String(e));
+      const errMsg = String(e);
+      if (errMsg.includes("already running") || errMsg.includes("已运行")) {
+        setHint(serviceStartHint("already"));
+      } else {
+        setHint(serviceStartHint("failed", errMsg));
+      }
+    } finally {
+      setTimeout(() => setServiceBusy(false), 1000);
     }
   };
 
   const stopSvc = async () => {
+    if (serviceBusy) {
+      setHint("服务操作正在进行中，请稍候…");
+      return;
+    }
+    if (
+      !confirm(
+        "确定要停止索引服务吗？\n\n" +
+          "停止后将无法搜索文件，增量索引也会暂停。\n" +
+          "需要重新启动服务才能恢复功能。"
+      )
+    ) {
+      return;
+    }
+    setServiceBusy(true);
+    setHint("正在停止服务…");
     try {
       await invoke("stop_findx_service");
-      setHint("已请求停止服务进程");
+      setHint("已请求停止服务进程，服务将在处理完当前任务后退出。");
     } catch (e) {
-      setHint(String(e));
+      const errMsg = String(e);
+      if (errMsg.includes("not running") || errMsg.includes("未运行")) {
+        setHint("服务未在运行。");
+      } else {
+        setHint(`停止失败：${errMsg}`);
+      }
+    } finally {
+      setTimeout(() => setServiceBusy(false), 1000);
     }
   };
 
   const checkUpdateFromGithub = async () => {
+    const requestId = updateGateRef.current.tryBegin();
+    if (requestId == null) {
+      setHint("检查正在进行中，请稍候…");
+      return;
+    }
+    updateOpIdRef.current = requestId;
     setUpdBusy(true);
     setHint("正在从 GitHub 检查更新…");
     try {
       const info = await invoke<AppUpdateInfo>("check_app_update");
-      setUpdInfo(info);
+      if (!settleUpdate(updateGateRef.current, requestId, info, setUpdInfo)) return;
       if (!info.ok) {
         setHint(info.error ?? "检查失败");
         return;
@@ -302,15 +417,25 @@ export default function SettingsWindow() {
       }
       setHint(`当前 ${info.currentVersion} 已是最新。`);
     } catch (e) {
-      setHint(String(e));
+      if (updateGateRef.current.isCurrent(requestId)) {
+        setHint(String(e));
+      }
     } finally {
-      setUpdBusy(false);
+      if (updateGateRef.current.finish(requestId)) {
+        setUpdBusy(false);
+      }
     }
   };
 
   /** 开始下载安装包；进度由 findx2-update-progress 事件驱动。 */
   const startDownload = async () => {
     if (!updInfo?.downloadUrl) return;
+    const requestId = updateGateRef.current.tryBegin();
+    if (requestId == null) {
+      setHint("操作正在进行中，请稍候…");
+      return;
+    }
+    updateOpIdRef.current = requestId;
     setUpdBusy(true);
     setDownloadedPath(null);
     setDlProgress({ downloaded: 0, total: updInfo.assetSize ?? 0, percent: 0 });
@@ -319,15 +444,23 @@ export default function SettingsWindow() {
         url: updInfo.downloadUrl,
         expectedSize: updInfo.assetSize ?? null,
       });
-      setHint("正在下载更新…");
+      if (updateGateRef.current.isCurrent(requestId)) {
+        setHint("正在下载更新…");
+      }
     } catch (e) {
-      setUpdBusy(false);
-      setDlProgress(null);
-      setHint(String(e));
+      if (updateGateRef.current.finish(requestId)) {
+        setUpdBusy(false);
+        setDlProgress(null);
+        setHint(String(e));
+      }
     }
   };
 
   const cancelDownload = async () => {
+    updateGateRef.current.invalidate();
+    updateOpIdRef.current = 0;
+    setUpdBusy(false);
+    setDlProgress(null);
     try {
       await invoke("cancel_update_download");
       setHint("正在取消下载…");
@@ -349,19 +482,17 @@ export default function SettingsWindow() {
     }
   };
 
-  const fmtSize = (b: number) =>
-    b >= 1024 * 1024 ? `${(b / 1024 / 1024).toFixed(1)} MB` : `${(b / 1024).toFixed(0)} KB`;
-
   const rebuildIdx = async () => {
     if (rebuildBusy) return;
     if (!confirm("将停止索引服务并重新扫描所选磁盘，期间搜索不可用。继续？")) return;
     setRebuildBusy(true);
+    setIndexOp(indexOpFeedback("rebuild", "working"));
     try {
       await invoke("save_findx_settings", { settings });
       await invoke("rebuild_index");
-      setHint("已开始重建索引（进度见主窗口状态条）");
+      setIndexOp(indexOpFeedback("rebuild", "submitted"));
     } catch (e) {
-      setHint(`重建失败: ${String(e)}`);
+      setIndexOp(indexOpFeedback("rebuild", "failed", String(e)));
     } finally {
       setRebuildBusy(false);
     }
@@ -378,13 +509,12 @@ export default function SettingsWindow() {
     )
       return;
     setCompactBusy(true);
-    setHint("正在压缩索引…（完成后会自动重启索引服务）");
+    setIndexOp(indexOpFeedback("compact", "working"));
     try {
       const r = await invoke<{ ok: boolean; message: string }>("compact_index");
-      setHint(r.message);
-      if (!r.ok) window.setTimeout(() => setHint(""), 10000);
+      setIndexOp(indexOpFeedback("compact", r.ok ? "submitted" : "failed", r.message));
     } catch (e) {
-      setHint(`压缩失败: ${String(e)}`);
+      setIndexOp(indexOpFeedback("compact", "failed", String(e)));
     } finally {
       setCompactBusy(false);
       // 服务重启后要重新加载 index.bin（秒级），立即查多半是 loading，延迟再拉。
@@ -412,8 +542,20 @@ export default function SettingsWindow() {
     }
   };
 
-  /** 禁止 close() 销毁窗口（否则再次 show_settings_window 会失败）；隐藏即可反复打开 */
-  const closeWindow = () => {
+  const revertUnsaved = useCallback(() => {
+    const reverted = discardUnsaved({
+      settings: settingsRef.current,
+      original: originalRef.current,
+      theme: themeRef.current,
+      originalTheme: originalThemeRef.current,
+    });
+    setSettings(reverted.settings);
+    setUiThemePref(reverted.theme);
+    setSearchLimitInput(String(reverted.settings.searchLimit));
+    setSaveIntervalInput(String(reverted.settings.saveIntervalSecs ?? 30));
+  }, []);
+
+  const hideSettings = useCallback(() => {
     void (async () => {
       try {
         await invoke("hide_settings_window");
@@ -423,96 +565,109 @@ export default function SettingsWindow() {
       }
       void getCurrentWindow().hide();
     })();
-  };
+  }, []);
+
+  /** 关闭按钮与系统关闭共用同一判断：脏表单需确认，取消时还原主题预览。 */
+  const closeWindow = useCallback(() => {
+    const decision = closeDecision(
+      isDirtyRef.current,
+      isDirtyRef.current ? confirm(CLOSE_DIRTY_MESSAGE) : true,
+    );
+    if (decision === "stay") return false;
+    if (isDirtyRef.current) revertUnsaved();
+    hideSettings();
+    return true;
+  }, [hideSettings, revertUnsaved]);
+
+  /** 系统关闭只注册一次。Rust 侧只 prevent_close，由这里决定隐藏还是留下。 */
+  useEffect(() => {
+    const listener = createOnceListener();
+    void listener.arm(() =>
+      getCurrentWindow().onCloseRequested((event) => {
+        event.preventDefault();
+        closeWindow();
+      }),
+    );
+    return () => listener.dispose();
+  }, [closeWindow]);
 
   return (
     <div className="fx-settings-window-root">
-      <div className="fx-settings fx-settings--dialog">
-        <h2>FindX2 设置</h2>
-        {hint ? (
-          <p className="fx-hint" style={{ marginTop: -4, marginBottom: 8 }}>
-            {hint}
-          </p>
-        ) : null}
-        <div className="fx-settings-tabs" role="tablist">
-          {(
-            [
-              ["index", "索引"],
-              ["search", "搜索"],
-              ["service", "服务模式"],
-              ["advanced", "高级"],
-            ] as const
-          ).map(([k, label]) => (
-            <button
-              key={k}
-              type="button"
-              role="tab"
-              aria-selected={settingsTab === k}
-              className="fx-settings-tab"
-              onClick={() => setSettingsTab(k)}
-            >
-              {label}
-            </button>
-          ))}
+      <div className="fx-settings-window-container">
+        {/* 固定头部:标题+标签栏 */}
+        <div className="fx-settings-header">
+          <div className="fx-settings-title-row">
+            <h2 className="fx-settings-title">FindX2 设置</h2>
+            {dirty && <span className="fx-settings-dirty-indicator" title="有未保存的更改">●</span>}
+          </div>
+          <div className="fx-settings-tabs" role="tablist">
+            {(
+              [
+                ["index", "索引"],
+                ["search", "搜索"],
+                ["service", "服务模式"],
+                ["advanced", "高级"],
+              ] as const
+            ).map(([k, label]) => (
+              <button
+                key={k}
+                type="button"
+                role="tab"
+                aria-selected={settingsTab === k}
+                className="fx-settings-tab"
+                onClick={() => setSettingsTab(k)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
         </div>
 
-        <div className="fx-settings-scroll">
+        {/* 可滚动内容区 */}
+        <div className="fx-settings-content-scroll">
         {settingsTab === "index" && (
           <div>
-            <label>{hostOs === "windows" ? "索引磁盘（不勾选 = 全盘）" : "索引范围（不勾选 = 默认挂载点）"}</label>
-            <div className="fx-drives">
-              {availableDrives.length === 0 && (
-                <span className="fx-hint">（加载磁盘列表中…）</span>
+            <fieldset className="fx-settings-group">
+              <legend>索引范围</legend>
+              <p className="fx-hint">
+                {hostOs === "windows"
+                  ? "勾选要扫描的盘。一个都不勾 = 全盘，与命令行默认一致。"
+                  : "勾选要扫描的挂载点。一个都不勾 = 默认挂载点。"}
+                {availableDrives.length > 0 && (
+                  <>
+                    {" "}
+                    当前已选 {(settings.drives ?? []).length} / {availableDrives.length}。
+                  </>
+                )}
+              </p>
+              {availableDrives.length === 0 ? (
+                <p className="fx-hint">（加载磁盘列表中…）</p>
+              ) : (
+                <IndexRangeList
+                  paths={availableDrives}
+                  selected={settings.drives ?? []}
+                  onChange={(drives) => setSettings((s) => ({ ...s, drives }))}
+                />
               )}
-              {availableDrives.map((d) => {
-                const drives = settings.drives ?? [];
-                const checked = drives.includes(d);
-                return (
-                  <label key={d}>
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      onChange={(e) => {
-                        setSettings((s) => {
-                          const cur = new Set(s.drives ?? []);
-                          if (e.target.checked) cur.add(d);
-                          else cur.delete(d);
-                          return { ...s, drives: Array.from(cur) };
-                        });
-                      }}
-                    />
-                    {d}
-                  </label>
-                );
-              })}
-            </div>
+            </fieldset>
 
-            <label>
-              排除目录（每行一个完整路径，例如{" "}
-              {hostOs === "windows"
-                ? "C:\\Windows\\WinSxS"
-                : hostOs === "darwin" || hostOs === "macos"
-                  ? "/System/Volumes/Data/private/var/folders"
-                  : "/usr/share"}
-              ）
-            </label>
-            <textarea
-              value={(settings.excludedDirs ?? []).join("\n")}
-              onChange={(e) =>
-                setSettings((s) => ({
-                  ...s,
-                  excludedDirs: e.target.value
-                    .split(/\r?\n/)
-                    .map((x) => x.trim())
-                    .filter(Boolean),
-                }))
-              }
-              rows={4}
-            />
-            <p className="fx-hint">
-              排除规则会写入 index.exclude.json，服务启动与增量监听都会过滤；
-              修改后需要点「重建索引」才能彻底清掉历史已入库条目。
-            </p>
+            <fieldset className="fx-settings-group">
+              <legend>排除目录</legend>
+              <p className="fx-hint">
+                每行一个完整路径，例如{" "}
+                {hostOs === "windows"
+                  ? "C:\\Windows\\WinSxS"
+                  : hostOs === "darwin" || hostOs === "macos"
+                    ? "/System/Volumes/Data/private/var/folders"
+                    : "/usr/share"}
+                。规则写入 index.exclude.json；改完要「重建索引」才会清掉已经入库的条目。
+              </p>
+              <ExcludeDirsEditor
+                value={settings.excludedDirs ?? []}
+                onChange={(dirs) => setSettings((s) => ({ ...s, excludedDirs: dirs }))}
+                hostOs={hostOs}
+              />
+            </fieldset>
             {(hostOs === "darwin" || hostOs === "macos") && (
               <p className="fx-hint">
                 macOS 扫整盘需要「系统设置 → 隐私与安全性 → 完全磁盘访问权限」勾选 FindX；
@@ -526,16 +681,15 @@ export default function SettingsWindow() {
               </p>
             )}
 
-            <label>
-              <input
-                type="checkbox"
-                checked={settings.enableMetadataBackfill ?? true}
-                onChange={(e) =>
-                  setSettings((s) => ({ ...s, enableMetadataBackfill: e.target.checked }))
-                }
-              />{" "}
-              开启时间/大小元数据回填（默认开启）
-            </label>
+            <fieldset className="fx-settings-group">
+              <legend>元数据</legend>
+            <Checkbox
+              checked={settings.enableMetadataBackfill ?? true}
+              label="开启时间/大小元数据回填（默认开启）"
+              onChange={(checked) =>
+                setSettings((s) => ({ ...s, enableMetadataBackfill: checked }))
+              }
+            />
             <p className="fx-hint">
               {hostOs === "windows"
                 ? "Windows：fast 首遍走 MFT，后台按目录补齐大小与时间。"
@@ -547,21 +701,19 @@ export default function SettingsWindow() {
                 可换来更低的 CPU/磁盘 IO 占用。
               </p>
             )}
-            <label>
-              <input
-                type="checkbox"
-                checked={settings.firstIndexFullMetadata ?? false}
-                onChange={(e) =>
-                  setSettings((s) => ({ ...s, firstIndexFullMetadata: e.target.checked }))
-                }
-              />{" "}
-              首次建库直接读全量元数据（更慢，但即时可用）
-            </label>
+            <Checkbox
+              checked={settings.firstIndexFullMetadata ?? false}
+              label="首次建库直接读全量元数据（更慢，但即时可用）"
+              onChange={(checked) =>
+                setSettings((s) => ({ ...s, firstIndexFullMetadata: checked }))
+              }
+            />
             {hostOs !== "windows" && (
               <p className="fx-hint">
                 开启后扫描时同步 statx / getattrlist，建库更慢，但按大小/时间筛选立刻准确。
               </p>
             )}
+            </fieldset>
 
             <div className="fx-settings-row">
               <button
@@ -607,6 +759,11 @@ export default function SettingsWindow() {
                       ⚠ 墓碑占比已超过 25%，占着内存与文件体积还拖慢加载，建议压缩回收。
                     </p>
                   )}
+                  {indexOp && (
+                    <p className="fx-settings-op" role="status">
+                      {indexOp}
+                    </p>
+                  )}
                 </>
               );
             })()}
@@ -615,16 +772,11 @@ export default function SettingsWindow() {
 
         {settingsTab === "search" && (
           <div>
-            <label>
-              <input
-                type="checkbox"
-                checked={settings.pinyinDefault}
-                onChange={(e) =>
-                  setSettings((s) => ({ ...s, pinyinDefault: e.target.checked }))
-                }
-              />{" "}
-              默认拼音匹配
-            </label>
+            <Checkbox
+              checked={settings.pinyinDefault}
+              label="默认拼音匹配"
+              onChange={(checked) => setSettings((s) => ({ ...s, pinyinDefault: checked }))}
+            />
             <p className="fx-hint">
               与 Windows 相同：全拼 <code>beijing</code>、简拼 <code>bj</code>、
               <code>;py</code> 强制拼音、<code>;en</code>/<code>;np</code> 关拼音。
@@ -633,46 +785,39 @@ export default function SettingsWindow() {
               <code>!</code> 均可叠拼音。Unix 路径用 <code>/home/foo</code> 或{" "}
               <code>~/Documents</code>，不要写成盘符。
             </p>
-            <label>结果条数上限</label>
-            <input
-              type="text"
-              value={String(settings.searchLimit)}
-              onChange={(e) =>
-                setSettings((s) => ({
-                  ...s,
-                  searchLimit: parseInt(e.target.value, 10) || 500,
-                }))
-              }
-            />
+            <SettingsRow
+              label="结果条数上限"
+              hint="编辑时可以暂时留空。点保存时检查：须为 1 到 4294967295 的整数，与设置字段 u32 一致。默认 5000。没有另行规定的性能上限。"
+            >
+              <div className="fx-settings-inline">
+                <Input
+                  value={searchLimitInput}
+                  onChange={setSearchLimitInput}
+                  placeholder="例如 5000"
+                  className="fx-input-narrow"
+                />
+                <Button size="sm" onClick={() => setShowSyntaxHelp(true)} title="查看搜索语法帮助">
+                  语法帮助
+                </Button>
+              </div>
+            </SettingsRow>
           </div>
         )}
 
         {settingsTab === "service" && (
           <div>
             {hostOs === "windows" ? (
-              <>
-            <label>启动模式</label>
-            <div className="fx-settings-row" style={{ marginTop: 0, marginBottom: 12 }}>
-              <label style={{ fontWeight: "normal", margin: 0 }}>
-                <input
-                  type="radio"
+              <SettingsRow label="启动模式">
+                <RadioGroup
                   name="run-mode"
-                  checked={(settings.runMode ?? "service") === "service"}
-                  onChange={() => void applyRunMode("service")}
-                />{" "}
-                服务模式（默认；不弹 UAC，开机自启）
-              </label>
-              <label style={{ fontWeight: "normal", margin: 0 }}>
-                <input
-                  type="radio"
-                  name="run-mode"
-                  checked={settings.runMode === "standalone"}
-                  onChange={() => void applyRunMode("standalone")}
-                />{" "}
-                单体 UAC 模式（每次启动会请求管理员授权）
-              </label>
-            </div>
-              </>
+                  value={settings.runMode ?? "service"}
+                  onChange={(value) => void applyRunMode(value)}
+                  options={[
+                    { value: "service", label: "服务模式（默认；不弹 UAC，开机自启）" },
+                    { value: "standalone", label: "单体 UAC 模式（每次启动会请求管理员授权）" },
+                  ]}
+                />
+              </SettingsRow>
             ) : (
               <p className="fx-hint">
                 当前由 GUI 以当前用户拉起 findx2-service，并不是 LaunchAgent / systemd 安装。
@@ -681,39 +826,35 @@ export default function SettingsWindow() {
               </p>
             )}
 
-            {hostOs === "windows" && (
-            <label>
-              <input
-                type="checkbox"
+            {hostOs === "windows" ? (
+              <Checkbox
                 checked={settings.enableEverythingIpc ?? true}
-                onChange={(e) =>
-                  setSettings((s) => ({ ...s, enableEverythingIpc: e.target.checked }))
+                label="开启 Everything SDK 兼容窗口（IbEverythingExt 等老客户端依赖）"
+                onChange={(checked) =>
+                  setSettings((s) => ({ ...s, enableEverythingIpc: checked }))
                 }
-              />{" "}
-              开启 Everything SDK 兼容窗口（IbEverythingExt 等老客户端依赖）
-            </label>
+              />
+            ) : (
+              <Checkbox
+                checked={false}
+                disabled
+                label="Everything SDK 兼容窗口仅 Windows 可用"
+                onChange={() => {}}
+              />
             )}
 
-            <label>
-              <input
-                type="checkbox"
-                checked={settings.autoStartService ?? true}
-                onChange={(e) =>
-                  setSettings((s) => ({ ...s, autoStartService: e.target.checked }))
-                }
-              />{" "}
-              GUI 启动时自动拉起索引服务
-            </label>
+            <Checkbox
+              checked={settings.autoStartService ?? true}
+              label="GUI 启动时自动拉起索引服务"
+              onChange={(checked) => setSettings((s) => ({ ...s, autoStartService: checked }))}
+            />
 
-            <label>
-              <input
-                type="checkbox"
-                checked={autostart.enabled}
-                disabled={!autostart.supported || autostartBusy}
-                onChange={(e) => void toggleAutostart(e.target.checked)}
-              />{" "}
-              随系统启动（登录时自动启动 FindX 托盘）
-            </label>
+            <Checkbox
+              checked={autostart.enabled}
+              disabled={!autostart.supported || autostartBusy}
+              label="随系统启动（登录时自动启动 FindX 托盘）"
+              onChange={(checked) => void toggleAutostart(checked)}
+            />
             {autostart.supported ? (
               <p className="fx-hint" style={{ marginTop: -4, marginBottom: 8 }}>
                 {hostOs === "windows"
@@ -733,192 +874,217 @@ export default function SettingsWindow() {
               服务管理器随系统启动，与这里的设置无关。
             </p>
 
-            <div className="fx-settings-row">
-              <button type="button" onClick={() => void startSvc()}>
-                启动服务
-              </button>
-              <button type="button" onClick={() => void stopSvc()}>
-                停止服务
-              </button>
+            <div className="fx-settings-row" style={{ gap: "12px", alignItems: "center" }}>
+              <Button onClick={() => void startSvc()} disabled={serviceBusy}>
+                {serviceBusy ? "操作中…" : "启动服务"}
+              </Button>
+              <Button onClick={() => void stopSvc()} disabled={serviceBusy}>
+                {serviceBusy ? "操作中…" : "停止服务"}
+              </Button>
+              {serviceBusy && (
+                <span className="fx-hint" style={{ margin: 0 }}>
+                  服务状态变更中，请稍候…
+                </span>
+              )}
             </div>
+            {hostOs !== "windows" && (
+              <p className="fx-hint">
+                ⚠️ 非 Windows 平台：服务控制仅适用于当前 GUI 启动的进程。
+                如使用 systemd 或 LaunchAgent 托管，请使用系统命令管理。
+              </p>
+            )}
           </div>
         )}
 
         {settingsTab === "advanced" && (
           <div>
-            <label>应用更新</label>
-            <div className="fx-settings-row" style={{ marginBottom: 8 }}>
-              <button
-                type="button"
-                onClick={() => void checkUpdateFromGithub()}
-                disabled={updBusy}
-              >
-                从 GitHub 检查更新
-              </button>
-              {updInfo?.hasUpdate && updInfo.downloadUrl && !updBusy && !downloadedPath && (
-                <button type="button" className="primary" onClick={() => void startDownload()}>
-                  下载 {updInfo.latestVersion}
-                  {updInfo.assetSize ? `（${fmtSize(updInfo.assetSize)}）` : ""}
-                </button>
-              )}
-              {updBusy && dlProgress && (
-                <button type="button" onClick={() => void cancelDownload()}>
-                  取消下载
-                </button>
-              )}
-              {downloadedPath && !updBusy && (
-                <button type="button" className="primary" onClick={() => void installUpdate()}>
-                  安装更新并重启
-                </button>
-              )}
-            </div>
+            {/* 应用更新卡片 */}
+            <UpdateCard
+              busy={updBusy}
+              info={updInfo}
+              progress={dlProgress}
+              downloadedPath={downloadedPath}
+              autoCheck={settings.autoCheckUpdate ?? true}
+              onAutoCheck={(checked) => setSettings((s) => ({ ...s, autoCheckUpdate: checked }))}
+              onCheck={() => void checkUpdateFromGithub()}
+              onDownload={() => void startDownload()}
+              onCancel={() => void cancelDownload()}
+              onInstall={() => void installUpdate()}
+            />
 
-            {dlProgress && (
-              <div style={{ marginBottom: 10 }}>
-                <div
-                  style={{
-                    height: 6,
-                    borderRadius: 3,
-                    overflow: "hidden",
-                    background: "rgba(127,127,127,0.25)",
-                  }}
-                >
-                  <div
-                    style={{
-                      height: "100%",
-                      width: `${Math.min(100, Math.max(0, dlProgress.percent))}%`,
-                      background: "#3b82f6",
-                      transition: "width 0.15s linear",
-                    }}
-                  />
-                </div>
-                <p className="fx-hint" style={{ marginTop: 4, marginBottom: 0 }}>
-                  {dlProgress.total > 0
-                    ? `正在下载 ${dlProgress.percent.toFixed(1)}%（${fmtSize(dlProgress.downloaded)} / ${fmtSize(dlProgress.total)}）`
-                    : `已下载 ${fmtSize(dlProgress.downloaded)}`}
-                </p>
-              </div>
-            )}
+            <SettingsRow
+              label="界面主题"
+              hint="改主题会立刻预览。未保存就关闭时，会回到打开设置页时的主题。"
+            >
+              <RadioGroup
+                name="ui-theme"
+                direction="row"
+                value={uiThemePref}
+                onChange={setUiThemePref}
+                options={[
+                  { value: "light", label: "浅色" },
+                  { value: "dark", label: "深色" },
+                  { value: "system", label: "跟随系统" },
+                ]}
+              />
+            </SettingsRow>
 
-            {updInfo?.hasUpdate && (
-              <p className="fx-hint" style={{ marginTop: 0, marginBottom: 8 }}>
-                发现新版本 {updInfo.latestVersion}（当前 {updInfo.currentVersion}）。
-                {updInfo.releaseNotes ? `更新说明：${updInfo.releaseNotes}` : ""}
-              </p>
-            )}
-
-            <label style={{ fontWeight: "normal", margin: "0 0 8px" }}>
-              <input
-                type="checkbox"
-                checked={settings.autoCheckUpdate ?? true}
-                onChange={(e) =>
-                  setSettings((s) => ({ ...s, autoCheckUpdate: e.target.checked }))
+            <fieldset className="fx-settings-group">
+              <legend>路径</legend>
+              <SettingsRow
+                label={
+                  hostOs === "windows"
+                    ? "索引文件（默认 index.bin，与程序同目录；正式安装走 ProgramData）"
+                    : "索引文件（默认写入用户数据目录，勿放在 .app 包内）"
                 }
-              />{" "}
-              启动时自动检查更新（仅提示，不自动下载）
-            </label>
-
-            <p className="fx-hint" style={{ marginTop: 0, marginBottom: 16 }}>
-              更新流程：检查 → 下载（带进度）→ 静默安装（弹一次管理员授权）→ 自动重启，服务会随安装器自动恢复。
-              也可到仓库{" "}
-              <a
-                href="https://github.com/chaojimct/findx/releases"
-                target="_blank"
-                rel="noreferrer"
               >
-                chaojimct/findx
-              </a>{" "}
-              的 Releases 手动下载（需联网）。
-            </p>
+                <Input
+                  value={settings.indexPath}
+                  onChange={(value) => setSettings((s) => ({ ...s, indexPath: value }))}
+                />
+              </SettingsRow>
+            </fieldset>
 
-            <label>界面主题</label>
-            <div className="fx-settings-row" style={{ marginTop: 4, marginBottom: 14 }}>
-              <label style={{ fontWeight: "normal", margin: 0 }}>
-                <input
-                  type="radio"
-                  name="ui-theme"
-                  checked={uiThemePref === "light"}
-                  onChange={() => setUiThemePref("light")}
-                />{" "}
-                浅色
-              </label>
-              <label style={{ fontWeight: "normal", margin: 0 }}>
-                <input
-                  type="radio"
-                  name="ui-theme"
-                  checked={uiThemePref === "dark"}
-                  onChange={() => setUiThemePref("dark")}
-                />{" "}
-                深色（全黑）
-              </label>
-              <label style={{ fontWeight: "normal", margin: 0 }}>
-                <input
-                  type="radio"
-                  name="ui-theme"
-                  checked={uiThemePref === "system"}
-                  onChange={() => setUiThemePref("system")}
-                />{" "}
-                跟随系统
-              </label>
-            </div>
-            <p className="fx-hint" style={{ marginTop: -8 }}>
-              深色模式背景为纯黑 #000；主窗口列表列宽可在表头分隔条上拖拽，比例会记住。
-            </p>
-
-            <label>
-              {hostOs === "windows"
-                ? "索引文件（默认 index.bin，与程序同目录；正式安装走 ProgramData）"
-                : "索引文件（默认写入用户数据目录，勿放在 .app 包内）"}
-            </label>
-            <input
-              type="text"
-              value={settings.indexPath}
-              onChange={(e) => setSettings((s) => ({ ...s, indexPath: e.target.value }))}
-            />
-            <label>{hostOs === "windows" ? "命名管道名" : "IPC 套接字名"}</label>
-            <input
-              type="text"
-              value={settings.pipeName}
-              onChange={(e) => setSettings((s) => ({ ...s, pipeName: e.target.value }))}
-            />
-            <label>findx2-service 路径（可空）</label>
-            <input
-              type="text"
-              value={settings.serviceExePath}
-              onChange={(e) =>
-                setSettings((s) => ({ ...s, serviceExePath: e.target.value }))
-              }
-            />
-            <label>增量落盘间隔（秒）</label>
-            <input
-              type="number"
-              min={1}
-              value={settings.saveIntervalSecs ?? 30}
-              onChange={(e) =>
-                setSettings((s) => ({
-                  ...s,
-                  saveIntervalSecs: Math.max(1, parseInt(e.target.value, 10) || 30),
-                }))
-              }
-            />
+            <details className="fx-expert-fold">
+              <summary>专家选项</summary>
+              <SettingsRow label={hostOs === "windows" ? "命名管道名" : "IPC 套接字名"}>
+                <Input
+                  value={settings.pipeName}
+                  onChange={(value) => setSettings((s) => ({ ...s, pipeName: value }))}
+                />
+              </SettingsRow>
+              <SettingsRow label="findx2-service 路径（可空）">
+                <Input
+                  value={settings.serviceExePath}
+                  onChange={(value) => setSettings((s) => ({ ...s, serviceExePath: value }))}
+                />
+              </SettingsRow>
+              <SettingsRow
+                label="增量落盘间隔（秒）"
+                hint="可以先清空再重填。保存时才要求是不小于 1 的整数秒。"
+              >
+                <Input
+                  value={saveIntervalInput}
+                  onChange={setSaveIntervalInput}
+                  className="fx-input-narrow"
+                />
+              </SettingsRow>
+            </details>
           </div>
         )}
         </div>
 
-        <footer className="fx-settings-footer-bar">
+        {/* 固定底栏:保存/关闭按钮 */}
+        <div className="fx-settings-footer">
+          <p className="fx-settings-footer-hint" title={hint || undefined}>
+            {hint}
+          </p>
           <div className="fx-settings-footer-actions">
-            <button type="button" className="primary" onClick={() => void saveSettings()}>
+            <Button variant="primary" onClick={() => void saveSettings()}>
               保存
-            </button>
-            <button type="button" onClick={closeWindow}>
+            </Button>
+            <Button onClick={closeWindow}>
               关闭
-            </button>
+            </Button>
           </div>
-          {/* <p className="fx-hint fx-settings-footer-note">
-            侧栏条件与搜索框关键词以空格组合。建索引与启动服务需访问卷设备时会弹出 Windows UAC 授权提权。
-          </p> */}
-        </footer>
+        </div>
       </div>
+
+      {showSyntaxHelp && (
+        <div className="fx-modal-overlay" onClick={() => setShowSyntaxHelp(false)}>
+          <div className="fx-modal-dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="fx-modal-header">
+              <h3>搜索语法帮助</h3>
+              <button
+                type="button"
+                className="fx-btn-close"
+                onClick={() => setShowSyntaxHelp(false)}
+                title="关闭"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="fx-modal-body">
+              <h4>基础搜索</h4>
+              <ul>
+                <li>
+                  <code>beijing</code> 或 <code>bj</code> — 拼音全拼或简拼匹配
+                </li>
+                <li>
+                  <code>project</code> — 直接输入英文名称
+                </li>
+              </ul>
+
+              <h4>搜索修饰符</h4>
+              <ul>
+                <li>
+                  <code>;py</code> — 强制拼音匹配
+                </li>
+                <li>
+                  <code>;en</code> 或 <code>;np</code> — 关闭拼音，仅英文匹配
+                </li>
+              </ul>
+
+              <h4>路径和文件类型</h4>
+              <ul>
+                <li>
+                  <code>ext:pdf</code> — 扩展名匹配（仅 PDF 文件）
+                </li>
+                <li>
+                  <code>file:report</code> — 文件名包含"report"
+                </li>
+                <li>
+                  <code>folder:docs</code> — 文件夹名包含"docs"
+                </li>
+                <li>
+                  <code>startwith:2024</code> — 文件名以"2024"开头
+                </li>
+                <li>
+                  <code>endwith:backup</code> — 文件名以"backup"结尾
+                </li>
+                <li>
+                  <code>path:/home/user</code> — 路径包含"/home/user"
+                </li>
+                <li>
+                  <code>parent:Documents</code> — 父目录名包含"Documents"
+                </li>
+              </ul>
+
+              <h4>组合与排除</h4>
+              <ul>
+                <li>
+                  <code>report | document</code> — 或操作（匹配任一关键词）
+                </li>
+                <li>
+                  <code>!temp</code> — 排除包含"temp"的结果
+                </li>
+                <li>
+                  <code>ext:txt !backup</code> — TXT 文件但排除"backup"
+                </li>
+              </ul>
+
+              <h4>路径格式说明</h4>
+              <ul>
+                <li>
+                  <strong>Windows</strong>: <code>C:\Users\Name\Documents</code>
+                </li>
+                <li>
+                  <strong>Unix/Linux</strong>: <code>/home/user/documents</code> 或{" "}
+                  <code>~/Documents</code>
+                </li>
+                <li>
+                  ⚠️ Unix 路径不要写成盘符格式（例如不要写 <code>C:</code>）
+                </li>
+              </ul>
+            </div>
+            <div className="fx-modal-footer">
+              <button type="button" onClick={() => setShowSyntaxHelp(false)}>
+                关闭
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
