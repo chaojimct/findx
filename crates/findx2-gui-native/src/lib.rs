@@ -26,3 +26,5 @@ pub mod autostart;
 pub mod service_control;
 
 pub mod browser;
+
+pub mod disk_usage;

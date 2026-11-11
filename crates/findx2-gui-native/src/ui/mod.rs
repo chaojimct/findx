@@ -1,5 +1,6 @@
 mod browser_table;
 pub mod browser_window;
+pub mod disk_window;
 pub mod main_window;
 mod result_table;
 pub mod settings_window;

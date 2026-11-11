@@ -197,6 +197,22 @@ impl MainWindow {
                     _ => {}
                 }
             }));
+        let session_for_appearance = session.clone();
+        this._subscriptions
+            .push(window.observe_window_appearance(move |window, cx| {
+                let dark = matches!(
+                    window.appearance(),
+                    WindowAppearance::Dark | WindowAppearance::VibrantDark
+                );
+                session_for_appearance.update(cx, |s, cx| {
+                    s.system_dark = dark;
+                    if s.prefs.theme == crate::settings_logic::UiThemePref::System {
+                        s.apply_theme(cx);
+                        cx.refresh_windows();
+                    }
+                    cx.notify();
+                });
+            }));
         this.schedule_status_poll(cx);
         if this.preview_file.is_some() {
             this.request_preview(cx);
@@ -1374,30 +1390,43 @@ impl Render for MainWindow {
                 crate::ui::open_settings_window(session, cx);
             }))
             .child(self.render_toolbar(sidebar, preview, cx))
-            .child(h_flex().flex_shrink_0().px_3().py_1().gap_2().child({
-                let entity = cx.entity();
-                Button::new("directory-browser")
-                    .ghost()
-                    .label("目录浏览")
-                    .on_click(move |_, _, cx| {
-                        let initial = entity
-                            .read(cx)
-                            .selected
-                            .and_then(|i| entity.read(cx).hits.get(i))
-                            .map(|h| {
-                                if h.is_directory {
-                                    std::path::PathBuf::from(&h.path)
-                                } else {
-                                    std::path::Path::new(&h.path)
-                                        .parent()
-                                        .unwrap_or(std::path::Path::new("C:\\"))
-                                        .to_path_buf()
-                                }
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_1()
+                    .gap_2()
+                    .child({
+                        let entity = cx.entity();
+                        Button::new("directory-browser")
+                            .ghost()
+                            .label("目录浏览")
+                            .on_click(move |_, _, cx| {
+                                let initial = entity
+                                    .read(cx)
+                                    .selected
+                                    .and_then(|i| entity.read(cx).hits.get(i))
+                                    .map(|h| {
+                                        if h.is_directory {
+                                            std::path::PathBuf::from(&h.path)
+                                        } else {
+                                            std::path::Path::new(&h.path)
+                                                .parent()
+                                                .unwrap_or(std::path::Path::new("C:\\"))
+                                                .to_path_buf()
+                                        }
+                                    })
+                                    .unwrap_or_else(|| std::path::PathBuf::from("C:\\"));
+                                crate::ui::browser_window::open(initial, cx);
                             })
-                            .unwrap_or_else(|| std::path::PathBuf::from("C:\\"));
-                        crate::ui::browser_window::open(initial, cx);
                     })
-            }))
+                    .child(
+                        Button::new("disk-usage")
+                            .ghost()
+                            .label("磁盘占用（只读）")
+                            .on_click(|_, _, cx| crate::ui::disk_window::open(cx)),
+                    ),
+            )
             .child(
                 h_flex()
                     .flex_1()
