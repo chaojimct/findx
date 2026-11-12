@@ -193,6 +193,7 @@ pub(super) struct Workspace {
     pub(super) address_menu: Option<Entity<gpui_kit::component::menu::PopupMenu>>,
     pub(super) address_menu_position: Point<Pixels>,
     address_menu_subscription: Option<Subscription>,
+    pub(super) address_menu_token: Option<crate::preview_visibility::MenuToken>,
     address_menu_generation: u64,
     address_menu_cancel: Arc<AtomicBool>,
     tab_scroll: ScrollHandle,
@@ -303,6 +304,7 @@ impl Workspace {
             address_menu: None,
             address_menu_position: point(px(0.), px(0.)),
             address_menu_subscription: None,
+            address_menu_token: None,
             address_menu_generation: 0,
             address_menu_cancel: Arc::new(AtomicBool::new(false)),
             tab_scroll: ScrollHandle::new(),
@@ -596,6 +598,7 @@ impl MainWindow {
     fn select_directory_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         self.cancel_path_edit(cx);
         self.dismiss_address_menu(cx);
+        self.dismiss_file_menu(cx);
         if index >= self.workspace.tabs.len() || index == self.workspace.active_tab {
             return;
         }
@@ -622,6 +625,7 @@ impl MainWindow {
     fn new_directory_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel_path_edit(cx);
         self.dismiss_address_menu(cx);
+        self.dismiss_file_menu(cx);
         if self.workspace.tabs.len() >= 12 {
             self.workspace.status = "最多同时打开 12 个目录标签".into();
             cx.notify();
@@ -686,6 +690,7 @@ impl MainWindow {
     fn close_directory_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         self.cancel_path_edit(cx);
         self.dismiss_address_menu(cx);
+        self.dismiss_file_menu(cx);
         if self.workspace.tabs.len() == 1 {
             return;
         }
@@ -795,6 +800,7 @@ impl MainWindow {
     pub(super) fn workspace_switch(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
         self.cancel_path_edit(cx);
         self.dismiss_address_menu(cx);
+        self.dismiss_file_menu(cx);
         if mode == self.workspace.mode {
             return;
         }
@@ -948,6 +954,7 @@ impl MainWindow {
         });
         self.cancel_path_edit(cx);
         self.dismiss_address_menu(cx);
+        self.dismiss_file_menu(cx);
         self.workspace.show_actions = false;
         self.workspace.mode = mode;
         self.workspace.pending_hit = pending;
@@ -1117,6 +1124,17 @@ impl MainWindow {
         }
     }
     pub(super) fn workspace_enter(&mut self, cx: &mut Context<Self>) {
+        if self.workspace.mode == ViewMode::Usage {
+            if let Some(index) = self.active_workspace_hit().and_then(|hit| {
+                self.workspace
+                    .scan_lookup
+                    .get(&key(Path::new(&hit.path)))
+                    .copied()
+            }) {
+                self.select_usage_node(index, true, cx);
+            }
+            return;
+        }
         if let Some(h) = self.active_workspace_hit() {
             if h.is_directory {
                 let mode = if self.workspace.mode == ViewMode::Usage {
@@ -1172,16 +1190,18 @@ impl MainWindow {
                 t.scroll_to_row(ix, cx);
             });
         }
-        if enter && directory {
-            self.workspace.usage_focus = None;
-            self.workspace_navigate(path.into(), ViewMode::Usage, None, true, cx);
-        } else if enter {
-            // Explicit preview action reuses the main host; never executes a file from the map.
-            self.workspace_reveal(cx);
-            self.preview_force = Some(ForceState::Show);
-            self.preview_active_selection(cx);
-        } else {
-            cx.notify();
+        match crate::usage_view::activation(enter, directory) {
+            crate::usage_view::Activation::Select => cx.notify(),
+            crate::usage_view::Activation::Drill => {
+                self.workspace.usage_focus = None;
+                self.workspace_navigate(path.into(), ViewMode::Usage, None, true, cx);
+            }
+            crate::usage_view::Activation::Preview => {
+                // Enter and double-click share this path. A map never executes a file.
+                self.workspace_reveal(cx);
+                self.preview_force = Some(ForceState::Show);
+                self.preview_active_selection(cx);
+            }
         }
     }
     fn start_workspace_scan(&mut self, cx: &mut Context<Self>) {

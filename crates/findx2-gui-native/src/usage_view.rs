@@ -452,3 +452,33 @@ mod tests {
         assert_eq!(ease_out(1.), 1.);
     }
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Activation {
+    Select,
+    Drill,
+    Preview,
+}
+pub(crate) fn activation(enter: bool, directory: bool) -> Activation {
+    if !enter {
+        Activation::Select
+    } else if directory {
+        Activation::Drill
+    } else {
+        Activation::Preview
+    }
+}
+#[cfg(test)]
+mod activation_tests {
+    use super::*;
+    #[test]
+    fn click_only_selects_files_and_directories() {
+        assert_eq!(activation(false, false), Activation::Select);
+        assert_eq!(activation(false, true), Activation::Select);
+    }
+    #[test]
+    fn enter_and_double_click_share_drill_or_preview_never_execute() {
+        assert_eq!(activation(true, true), Activation::Drill);
+        assert_eq!(activation(true, false), Activation::Preview);
+    }
+}

@@ -134,6 +134,7 @@ impl MainWindow {
     fn open_settings_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel_path_edit(cx);
         self.dismiss_address_menu(cx);
+        self.dismiss_file_menu(cx);
         if self.settings_page.is_some() {
             return;
         }
@@ -1275,17 +1276,12 @@ impl MainWindow {
                 {
                     if let Some(client) = &self.preview.native {
                         let surface = client.surface.clone();
-                        let menu_open =
-                            self.workspace.show_actions || self.file_actions.native_menu_open;
                         if surface.is_alive() {
                             canvas(
                                 |_, _, _| (),
                                 move |bounds, _, window, _| {
-                                    if menu_open {
-                                        surface.hide();
-                                    } else {
-                                        surface.place(bounds, window.scale_factor());
-                                    }
+                                    // Placement cannot release a newer menu/page suppression.
+                                    surface.place(bounds, window.scale_factor());
                                 },
                             )
                             .size_full()
@@ -1706,10 +1702,15 @@ impl Render for MainWindow {
             sidebar = false;
         }
         #[cfg(windows)]
-        if !preview {
-            if let Some(client) = &self.preview.native {
-                client.surface.hide();
-            }
+        if let Some(client) = &self.preview.native {
+            let mounted = preview && matches!(self.preview.kind, PreviewKind::NativeOffice);
+            let allowed = crate::preview_visibility::surface_allowed(
+                mounted,
+                self.workspace.show_actions || self.file_actions.native_menu.is_open(),
+                self.workspace.address_menu.is_some(),
+                self.file_actions.keyboard_menu.is_some(),
+            );
+            client.surface.set_suppressed(!allowed);
         }
 
         v_flex()

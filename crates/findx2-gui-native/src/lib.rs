@@ -36,3 +36,5 @@ pub mod file_transfer;
 pub mod navigation;
 
 pub mod usage_view;
+
+mod preview_visibility;

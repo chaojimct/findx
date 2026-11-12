@@ -63,7 +63,8 @@ pub(super) struct FileActions {
     pub(super) summary: String,
     show_report: bool,
     activity_dismissed: bool,
-    pub(super) native_menu_open: bool,
+    pub(super) native_menu: crate::preview_visibility::MenuGate,
+    keyboard_menu_token: Option<crate::preview_visibility::MenuToken>,
     pub(super) native_menu_focus_subscription: Option<Subscription>,
     snapshot_key: Vec<(String, u64, u64)>,
     snapshot_generation: u64,
@@ -235,24 +236,50 @@ impl MainWindow {
                 .map(|h| h.path.into())
         }
     }
+    pub(super) fn finish_native_menu_focus(
+        &mut self,
+        token: crate::preview_visibility::MenuToken,
+        cx: &mut Context<Self>,
+    ) {
+        if self.file_actions.native_menu.finish(token) {
+            self.file_actions.native_menu_focus_subscription = None;
+            cx.notify();
+        }
+    }
+    pub(super) fn dismiss_file_menu(&mut self, cx: &mut Context<Self>) {
+        if self.file_actions.keyboard_menu.take().is_some() {
+            self.file_actions.menu_subscription = None;
+            if let Some(token) = self.file_actions.keyboard_menu_token.take() {
+                self.finish_native_menu_focus(token, cx);
+            }
+            cx.notify();
+        }
+    }
     pub(super) fn track_native_menu_focus(
         &mut self,
         focus: FocusHandle,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        self.file_actions.native_menu_open = true;
+    ) -> crate::preview_visibility::MenuToken {
+        let token = self.file_actions.native_menu.begin();
         #[cfg(windows)]
         if let Some(client) = &self.preview.native {
-            client.surface.hide();
+            client.surface.set_suppressed(true);
         }
+        let domain = focus.clone();
         self.file_actions.native_menu_focus_subscription =
-            Some(cx.on_blur(&focus, window, |this, _, cx| {
-                this.file_actions.native_menu_open = false;
-                this.file_actions.native_menu_focus_subscription = None;
-                cx.notify();
-            }));
+            Some(
+                cx.on_focus_out(&focus, window, move |_this, _, window, cx| {
+                    let domain = domain.clone();
+                    cx.defer_in(window, move |this, window, cx| {
+                        if !domain.contains_focused(window, cx) {
+                            this.finish_native_menu_focus(token, cx);
+                        }
+                    });
+                }),
+            );
         cx.notify();
+        token
     }
     pub(crate) fn file_context_menu(
         &mut self,
@@ -261,6 +288,8 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> PopupMenu {
+        self.dismiss_address_menu(cx);
+        self.dismiss_file_menu(cx);
         self.track_native_menu_focus(menu.focus_handle(cx), window, cx);
         self.build_file_context_menu(menu, blank, window, cx)
     }
@@ -374,11 +403,17 @@ impl MainWindow {
             self.build_file_context_menu(menu, false, window, cx)
                 .action_context(self.focus.clone())
         });
-        self.track_native_menu_focus(menu.read(cx).focus_handle(cx), window, cx);
+        self.dismiss_address_menu(cx);
+        self.dismiss_file_menu(cx);
+        let token = self.track_native_menu_focus(menu.read(cx).focus_handle(cx), window, cx);
+        self.file_actions.keyboard_menu_token = Some(token);
         self.file_actions.menu_subscription =
-            Some(cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
-                this.file_actions.native_menu_open = false;
-                this.file_actions.native_menu_focus_subscription = None;
+            Some(cx.subscribe(&menu, move |this, _, _: &DismissEvent, cx| {
+                if this.file_actions.keyboard_menu_token != Some(token) {
+                    return;
+                }
+                this.file_actions.keyboard_menu_token = None;
+                this.finish_native_menu_focus(token, cx);
                 this.file_actions.keyboard_menu = None;
                 this.file_actions.menu_subscription = None;
                 cx.notify();

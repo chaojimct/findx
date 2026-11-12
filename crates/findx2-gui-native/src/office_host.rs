@@ -33,12 +33,20 @@ struct Position {
 }
 pub struct Surface {
     position: Mutex<Position>,
+    suppressed: AtomicBool,
     cancel: Cancel,
     alive: AtomicBool,
 }
 impl Surface {
     pub fn place(&self, bounds: gpui_kit::Bounds<gpui_kit::Pixels>, scale: f32) {
         if let Ok(mut p) = self.position.lock() {
+            if self.suppressed.load(Ordering::Acquire)
+                || self.cancel.load(Ordering::Acquire)
+                || !self.is_alive()
+            {
+                p.visible = false;
+                return;
+            }
             *p = Position {
                 rect: [
                     (bounds.origin.x.as_f32() * scale).round() as i32,
@@ -48,6 +56,12 @@ impl Surface {
                 ],
                 visible: true,
             };
+        }
+    }
+    pub fn set_suppressed(&self, suppressed: bool) {
+        self.suppressed.store(suppressed, Ordering::Release);
+        if suppressed {
+            self.hide();
         }
     }
     pub fn is_alive(&self) -> bool {
@@ -64,6 +78,7 @@ pub struct NativeClient {
 }
 impl Drop for NativeClient {
     fn drop(&mut self) {
+        self.surface.set_suppressed(true);
         self.surface.cancel.store(true, Ordering::Release);
     }
 }
@@ -122,6 +137,7 @@ pub fn start(path: &str, cancel: Cancel) -> Result<NativeClient, String> {
     }
     let surface = Arc::new(Surface {
         position: Mutex::new(Position::default()),
+        suppressed: AtomicBool::new(false),
         cancel,
         alive: AtomicBool::new(true),
     });
@@ -461,5 +477,67 @@ unsafe fn host_setup(args: &[String]) -> Result<(), String> {
         let _ = ShowWindow(host, SW_HIDE);
         let _ = handler.Unload();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod surface_visibility_tests {
+    use super::*;
+    fn surface() -> Surface {
+        Surface {
+            position: Mutex::new(Position::default()),
+            suppressed: AtomicBool::new(false),
+            cancel: Arc::new(AtomicBool::new(false)),
+            alive: AtomicBool::new(true),
+        }
+    }
+    fn bounds() -> gpui_kit::Bounds<gpui_kit::Pixels> {
+        gpui_kit::Bounds {
+            origin: gpui_kit::point(gpui_kit::px(10.), gpui_kit::px(20.)),
+            size: gpui_kit::size(gpui_kit::px(100.), gpui_kit::px(200.)),
+        }
+    }
+    #[test]
+    fn late_canvas_place_cannot_show_suppressed_office_surface() {
+        let s = surface();
+        s.place(bounds(), 2.);
+        assert!(s.position.lock().unwrap().visible);
+        s.set_suppressed(true);
+        s.place(bounds(), 2.);
+        assert!(!s.position.lock().unwrap().visible);
+    }
+    #[test]
+    fn closing_menu_does_not_auto_show_an_unmounted_preview() {
+        let s = surface();
+        s.place(bounds(), 1.);
+        s.set_suppressed(true);
+        s.set_suppressed(false);
+        assert!(!s.position.lock().unwrap().visible);
+        s.place(bounds(), 1.);
+        assert!(s.position.lock().unwrap().visible);
+    }
+    #[test]
+    fn cancelled_or_dead_worker_cannot_be_revealed_by_a_late_frame() {
+        let s = surface();
+        s.cancel.store(true, Ordering::Release);
+        s.set_suppressed(false);
+        s.place(bounds(), 2.);
+        assert!(!s.position.lock().unwrap().visible);
+        s.cancel.store(false, Ordering::Release);
+        s.alive.store(false, Ordering::Release);
+        s.place(bounds(), 2.);
+        assert!(!s.position.lock().unwrap().visible);
+    }
+    #[test]
+    fn dropping_client_hides_before_cancelling_its_worker() {
+        let s = Arc::new(surface());
+        s.place(bounds(), 2.);
+        let client = NativeClient { surface: s.clone() };
+        drop(client);
+        assert!(!s.position.lock().unwrap().visible);
+        assert!(s.cancel.load(Ordering::Acquire));
+        s.set_suppressed(false);
+        s.place(bounds(), 2.);
+        assert!(!s.position.lock().unwrap().visible);
     }
 }

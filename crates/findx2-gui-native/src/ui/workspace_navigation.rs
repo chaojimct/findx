@@ -14,6 +14,7 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) {
         self.dismiss_address_menu(cx);
+        self.dismiss_file_menu(cx);
         if !self.workspace.editing_path {
             self.workspace.path_status_before_edit = Some(self.workspace.status.clone());
         }
@@ -105,8 +106,9 @@ impl MainWindow {
             .store(true, Ordering::Release);
         if self.workspace.address_menu.take().is_some() {
             self.workspace.address_menu_subscription = None;
-            self.file_actions.native_menu_open = false;
-            self.file_actions.native_menu_focus_subscription = None;
+            if let Some(token) = self.workspace.address_menu_token.take() {
+                self.finish_native_menu_focus(token, cx);
+            }
             cx.notify();
         }
     }
@@ -216,17 +218,22 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.track_native_menu_focus(menu.read(cx).focus_handle(cx), window, cx);
-        self.workspace.address_menu_subscription =
-            Some(
-                cx.subscribe_in(&menu, window, |this, _, _: &DismissEvent, window, cx| {
-                    this.dismiss_address_menu(cx);
-                    // Only reclaim focus while this popup was the focus owner, never after a user's outside click.
-                    if window.focused(cx).is_none() {
-                        this.focus.focus(window, cx);
-                    }
-                }),
-            );
+        let token = self.track_native_menu_focus(menu.read(cx).focus_handle(cx), window, cx);
+        self.workspace.address_menu_token = Some(token);
+        self.workspace.address_menu_subscription = Some(cx.subscribe_in(
+            &menu,
+            window,
+            move |this, _, _: &DismissEvent, window, cx| {
+                if this.workspace.address_menu_token != Some(token) {
+                    return;
+                }
+                this.dismiss_address_menu(cx);
+                // Only reclaim focus while this popup was the focus owner, never after a user's outside click.
+                if window.focused(cx).is_none() {
+                    this.focus.focus(window, cx);
+                }
+            },
+        ));
         self.workspace.address_menu_position = position;
         menu.read(cx).focus_handle(cx).focus(window, cx);
         self.workspace.address_menu = Some(menu);
@@ -240,6 +247,7 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) {
         self.dismiss_address_menu(cx);
+        self.dismiss_file_menu(cx);
         let Some(parent) = path.parent().map(Path::to_path_buf) else {
             return;
         };
@@ -332,6 +340,7 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) {
         self.dismiss_address_menu(cx);
+        self.dismiss_file_menu(cx);
         let owner = cx.weak_entity();
         let mode = self.workspace.mode;
         let menu = PopupMenu::build(window, cx, |mut menu, _, _| {

@@ -325,7 +325,7 @@ impl MainWindow {
                             .whitespace_nowrap()
                             .text_ellipsis()
                             .overflow_hidden()
-                            .child(label),
+                            .child(label.clone()),
                     )
                 })
                 .tooltip(move |w, cx| {
@@ -336,6 +336,8 @@ impl MainWindow {
                 let double_key = scene.key.clone();
                 let menu_key = scene.key.clone();
                 element = element
+                    .role(gpui_kit::accesskit::Role::Button)
+                    .aria_label(label.clone())
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if this.workspace.mode != ViewMode::Usage
