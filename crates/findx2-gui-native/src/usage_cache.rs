@@ -1,7 +1,7 @@
 //! Dev-only measured-tree repository. No index.bin, service, IPC, file contents,
 //! recursive mtime freshness claim, or background volume scan. Versioned bounded
 //! snapshots store UTF-16 basenames + parent indices, never repeated full paths.
-use crate::disk_usage::{self, Limits, Node, Progress, Scan, VolumeSpace};
+use crate::disk_usage::{self, Limits, Node, Progress, Scan, VolumeSpace, tree_storage_bytes};
 use crate::disktree::lock;
 use std::{
     collections::{HashMap, VecDeque},
@@ -13,11 +13,11 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-const SCHEMA: u32 = 1;
-const MAX_NODES: usize = 2_000_000;
-const MAX_UNPACKED: u64 = 512 * 1024 * 1024;
-const MEMORY_BUDGET: usize = 128 * 1024 * 1024;
-const DISK_BUDGET: u64 = 128 * 1024 * 1024;
+const SCHEMA: u32 = 3;
+pub(crate) const MAX_NODES: usize = 8_000_000;
+const MAX_UNPACKED: u64 = 2 * 1024 * 1024 * 1024;
+const MEMORY_BUDGET: usize = 1024 * 1024 * 1024;
+const DISK_BUDGET: u64 = 512 * 1024 * 1024;
 const ROOT_LIMIT: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -41,7 +41,13 @@ impl Cached {
         format!(
             "{source} · 扫描时点 {}（本地）{}",
             crate::search_logic::format_time(self.captured),
-            if self.scan.partial {
+            if self.scan.is_legacy_entry_truncation() {
+                " · 旧的条目或时间上限截断结果，请手动重新扫描"
+            } else if self.scan.memory_limit_reached {
+                " · 达到内存预算的部分结果，请缩小范围或在高级选项中提高内存上限后手动重扫"
+            } else if self.scan.alloc_failed {
+                " · 系统内存不足，已保留已测部分"
+            } else if self.scan.partial {
                 " · 部分结果"
             } else {
                 ""
@@ -100,15 +106,16 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+pub(crate) fn snapshot_allowed(node_count: usize, _unpacked_hint: u64) -> Result<(), String> {
+    if node_count > MAX_NODES {
+        return Err(format!(
+            "快照超出磁盘缓存节点上限（{MAX_NODES}），已拒绝写入缓存；扫描结果仍留在内存，不会因此截断"
+        ));
+    }
+    Ok(())
+}
 fn memory_cost(scan: &Scan) -> usize {
-    scan.nodes
-        .iter()
-        .map(|n| {
-            std::mem::size_of::<Node>()
-                + n.path.as_os_str().len() * 2
-                + n.children.capacity() * std::mem::size_of::<usize>()
-        })
-        .sum()
+    tree_storage_bytes(&scan.nodes)
 }
 struct Entry {
     value: Cached,
@@ -303,7 +310,7 @@ impl Repository {
                 if self::key(&job.root).as_ref() == Some(&key) {
                     self.remember(key.clone(), value.clone());
                     if let Err(e) = self.write_snapshot(&key, &value, Some(&job.cancel)) {
-                        eprintln!("usage_snapshot skipped: {e}");
+                        eprintln!("usage_snapshot skipped (scan kept in memory): {e}");
                     }
                 }
             }
@@ -324,9 +331,7 @@ impl Repository {
         cancel: Option<&AtomicBool>,
     ) -> Result<(), String> {
         std::fs::create_dir_all(&self.directory).map_err(|e| e.to_string())?;
-        if value.scan.nodes.len() > MAX_NODES {
-            return Err("node budget".into());
-        }
+        snapshot_allowed(value.scan.nodes.len(), 0)?;
         let header = Header::from_scan(key, value);
         let encoded = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
         let destination = self.snapshot_path(key);
@@ -444,7 +449,8 @@ impl Repository {
         let mut json = vec![0; length];
         reader.read_exact(&mut json).map_err(|e| e.to_string())?;
         let header: Header = serde_json::from_slice(&json).map_err(|e| e.to_string())?;
-        if header.schema != SCHEMA
+        if header.schema == 0
+            || header.schema > SCHEMA
             || header.provider != "win32-batch-unnamed-v1"
             || header.nodes == 0
             || header.nodes > MAX_NODES
@@ -553,9 +559,14 @@ impl Repository {
             elapsed: Duration::from_millis(header.elapsed_ms),
             entry_limit_reached: header.entry_limit,
             time_limit_reached: header.time_limit,
+            memory_limit_reached: header.memory_limit,
+            alloc_failed: header.alloc_failed,
             limits: Limits {
-                entries: header.limit_entries,
-                timeout: Duration::from_secs(header.limit_secs),
+                memory_bytes: if header.limit_memory > 0 {
+                    header.limit_memory as usize
+                } else {
+                    crate::disk_usage::DEFAULT_MEMORY_BUDGET
+                },
             },
             volume,
         };
@@ -608,6 +619,12 @@ struct Header {
     time_limit: bool,
     limit_entries: usize,
     limit_secs: u64,
+    #[serde(default)]
+    memory_limit: bool,
+    #[serde(default)]
+    alloc_failed: bool,
+    #[serde(default)]
+    limit_memory: u64,
     volume: Option<(Vec<u16>, u64, u64, u64)>,
 }
 impl Header {
@@ -631,8 +648,11 @@ impl Header {
             elapsed_ms: s.elapsed.as_millis().min(u64::MAX as u128) as u64,
             entry_limit: s.entry_limit_reached,
             time_limit: s.time_limit_reached,
-            limit_entries: s.limits.entries,
-            limit_secs: s.limits.timeout.as_secs(),
+            limit_entries: 0,
+            limit_secs: 0,
+            memory_limit: s.memory_limit_reached,
+            alloc_failed: s.alloc_failed,
+            limit_memory: s.limits.memory_bytes as u64,
             volume: s
                 .volume
                 .as_ref()
@@ -855,22 +875,23 @@ mod tests {
         }
         let repo = Repository::new(f.0.join("cache"), provider.clone());
         let value = repo
-            .run(&repo.request(
-                &root,
-                true,
-                Limits {
-                    entries: 3,
-                    timeout: Duration::from_secs(5),
-                },
-            ))
+            .run(&repo.request(&root, true, Limits::from_bytes(2048)))
             .unwrap();
-        assert!(value.scan.partial && value.scan.entry_limit_reached);
-        assert!(value.scan.nodes.len() <= 3);
+        assert!(
+            value.scan.partial && value.scan.memory_limit_reached,
+            "{}",
+            value.scan.partial_reasons()
+        );
+        assert!(!value.scan.entry_limit_reached && !value.scan.time_limit_reached);
+        assert!(value.scan.nodes.len() < 12);
         let restart = Repository::new(f.0.join("cache"), provider.clone());
         let loaded = restart.lookup(&root).unwrap();
-        assert!(loaded.scan.partial && loaded.scan.entry_limit_reached);
-        assert_eq!(loaded.scan.limits.entries, 3);
-        assert!(loaded.label().contains("部分结果"));
+        assert!(loaded.scan.partial && loaded.scan.memory_limit_reached);
+        assert!(
+            loaded.label().contains("内存预算") || loaded.label().contains("部分结果"),
+            "{}",
+            loaded.label()
+        );
         assert!(restart.lookup(&root.join("not-observed")).is_none());
         assert_eq!(provider.0.load(Ordering::Relaxed), 1);
     }

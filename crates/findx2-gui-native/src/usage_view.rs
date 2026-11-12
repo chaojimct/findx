@@ -107,6 +107,7 @@ pub struct SceneTile {
     pub header: Option<Rect>,
     pub category: usize,
     pub bytes: u64,
+    pub class: crate::disktree::classify::Category,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SceneKey {
@@ -124,6 +125,7 @@ pub struct Scene {
     pub viewport: Rect,
     pub tiles: Vec<SceneTile>,
     pub layout_elapsed: std::time::Duration,
+    pub worth_a_look: Vec<(String, String, u64)>,
 }
 /// Greedily choose each short-side row by worst aspect ratio; zero weights never produce NaN.
 #[cfg(test)]
@@ -219,8 +221,12 @@ impl From<crate::disktree::treemap::Rect> for Rect {
         }
     }
 }
-/// Build a bounded *adapter*, not a second filesystem tree. Values remain exact measured
-/// allocation totals; omitted children become a real weighted tail. No file IO here.
+/// Build a bounded *adapter*, not a second filesystem tree. Values remain exact
+/// measured allocation totals. Immediate children of the current root are always
+/// attached as named tiles before any descendant budget is spent, so a large
+/// sibling can never be folded into Others because a cousin exhausted the node
+/// budget. Others only represents a genuine leftover tail of already-attached
+/// smaller children; unread/unknown space is never invented as measured area.
 pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
     use crate::disktree::{
         classify,
@@ -235,18 +241,26 @@ pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
         w: key.width as f32,
         h: key.height as f32,
     };
-    let mut address = HashMap::<Vec<usize>, (TileKey, usize)>::new();
+    if key.root >= scan.nodes.len() {
+        return Scene {
+            key,
+            viewport,
+            tiles: vec![],
+            layout_elapsed: started.elapsed(),
+            worth_a_look: vec![],
+        };
+    }
+    let mut address = HashMap::<Vec<usize>, (TileKey, classify::Category)>::new();
     let mut budget = 16_384usize;
-    fn adapt(
+    fn leaf(
         scan: &Scan,
         id: usize,
-        crumbs: &mut Vec<usize>,
-        address: &mut HashMap<Vec<usize>, (TileKey, usize)>,
+        crumbs: &[usize],
+        address: &mut HashMap<Vec<usize>, (TileKey, classify::Category)>,
         budget: &mut usize,
-        depth: usize,
     ) -> TreeNode {
-        let n = &scan.nodes[id];
         *budget = budget.saturating_sub(1);
+        let n = &scan.nodes[id];
         let mut node = TreeNode::entry(
             n.path
                 .file_name()
@@ -263,47 +277,129 @@ pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
         node.files = n.files;
         node.dirs = n.directories.min(u32::MAX as u64) as u32;
         node.read_error = n.uncertain;
-        address.insert(crumbs.clone(), (TileKey::Node(id), n.category));
-        if n.directory && depth < 7 {
-            let mut represented = 0u64;
-            for &child in n.children.iter().take(192) {
-                if *budget < 2 {
-                    break;
-                }
-                crumbs.push(node.children.len());
-                node.children
-                    .push(adapt(scan, child, crumbs, address, budget, depth + 1));
-                crumbs.pop();
-                represented = represented.saturating_add(scan.nodes[child].allocated);
-            }
-            let tail = n.allocated.saturating_sub(represented);
-            if tail > 0 && !node.children.is_empty() {
-                crumbs.push(node.children.len());
-                address.insert(crumbs.clone(), (TileKey::Other(id), n.category));
-                crumbs.pop();
-                node.children
-                    .push(TreeNode::entry("其余已测占用", Kind::File, tail));
-            }
-        }
+        address.insert(
+            crumbs.to_vec(),
+            (TileKey::Node(id), classify::Category::Other),
+        );
         node
     }
-    if key.root >= scan.nodes.len() {
-        return Scene {
-            key,
-            viewport,
-            tiles: vec![],
-            layout_elapsed: started.elapsed(),
-        };
+    fn attach_children(
+        scan: &Scan,
+        parent: usize,
+        node: &mut TreeNode,
+        crumbs: &mut Vec<usize>,
+        address: &mut HashMap<Vec<usize>, (TileKey, classify::Category)>,
+        budget: &mut usize,
+        root_level: bool,
+    ) -> Vec<(u64, usize, Vec<usize>)> {
+        let max_attach = if root_level { 4096 } else { 256 };
+        let children = &scan.nodes[parent].children;
+        let mut expandable = Vec::new();
+        let mut leftover = 0u64;
+        let mut skipped = 0usize;
+        let mut taken = 0usize;
+        for &child in children {
+            if scan.nodes[child].allocated == 0 {
+                continue;
+            }
+            if taken >= max_attach || *budget < 2 {
+                leftover = leftover.saturating_add(scan.nodes[child].allocated);
+                skipped += 1;
+                continue;
+            }
+            crumbs.push(node.children.len());
+            let attached = leaf(scan, child, crumbs, address, budget);
+            if scan.nodes[child].directory && !scan.nodes[child].children.is_empty() {
+                expandable.push((scan.nodes[child].allocated, child, crumbs.clone()));
+            }
+            node.children.push(attached);
+            crumbs.pop();
+            taken += 1;
+        }
+        // Genuine leftover of children we chose not to name, never the bytes of
+        // large named directories we failed to attach after recursing elsewhere.
+        // Unread space is not present in parent.allocated, so it cannot appear here.
+        if leftover > 0 && *budget >= 1 {
+            crumbs.push(node.children.len());
+            address.insert(
+                crumbs.clone(),
+                (TileKey::Other(parent), classify::Category::Other),
+            );
+            let mut extra = TreeNode::entry(format!("其他 {skipped} 项"), Kind::File, leftover);
+            extra.read_error = false;
+            node.children.push(extra);
+            crumbs.pop();
+            *budget = budget.saturating_sub(1);
+        }
+        expandable
     }
-    let mut tree = adapt(
+    fn node_at_mut<'a>(root: &'a mut TreeNode, crumbs: &[usize]) -> Option<&'a mut TreeNode> {
+        let mut n = root;
+        for &i in crumbs {
+            n = n.children.get_mut(i)?;
+        }
+        Some(n)
+    }
+    let mut tree = leaf(scan, key.root, &[], &mut address, &mut budget);
+    let mut expandable = attach_children(
         scan,
         key.root,
+        &mut tree,
         &mut Vec::new(),
         &mut address,
         &mut budget,
-        0,
+        true,
     );
+    // Largest closed directory first. A deep Program Files tree cannot evict Users.
+    while budget >= 8 {
+        expandable.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+        let Some((_, id, crumbs)) = expandable.pop() else {
+            break;
+        };
+        let Some(node) = node_at_mut(&mut tree, &crumbs) else {
+            continue;
+        };
+        if !node.children.is_empty() || crumbs.len() >= 8 {
+            continue;
+        }
+        let mut path = crumbs;
+        let more = attach_children(scan, id, node, &mut path, &mut address, &mut budget, false);
+        expandable.extend(more);
+    }
     classify::classify(&mut tree);
+    fn stamp(
+        node: &TreeNode,
+        crumbs: &mut Vec<usize>,
+        address: &mut HashMap<Vec<usize>, (TileKey, classify::Category)>,
+    ) {
+        if let Some((key, class)) = address.get_mut(crumbs) {
+            *class = node.category;
+            let _ = key;
+        }
+        for (i, child) in node.children.iter().enumerate() {
+            crumbs.push(i);
+            stamp(child, crumbs, address);
+            crumbs.pop();
+        }
+    }
+    stamp(&tree, &mut Vec::new(), &mut address);
+    let mut worth = Vec::new();
+    fn collect_reclaim(node: &TreeNode, worth: &mut Vec<(String, String, u64)>) {
+        if let Some(reason) = node.reclaim {
+            worth.push((
+                node.name.to_string(),
+                reason.label().to_string(),
+                node.bytes,
+            ));
+        }
+        for child in &node.children {
+            collect_reclaim(child, worth);
+        }
+    }
+    collect_reclaim(&tree, &mut worth);
+    worth.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    worth.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+    worth.truncate(8);
     let detail = key.detail.max(1) as f32;
     let options = LayoutOptions {
         max_depth: key.depth.clamp(1, 6) as u32,
@@ -326,33 +422,24 @@ pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
         bytes: scan.nodes[key.root].allocated,
         header: None,
         category: scan.nodes[key.root].category,
+        class: tree.category,
     });
     for tile in layouts {
-        let (tile_key, fallback) = match &tile.kind {
+        let (tile_key, class) = match &tile.kind {
             TileKind::Node { crumbs } => address
                 .get(crumbs)
                 .copied()
-                .unwrap_or((TileKey::Other(key.root), 5)),
+                .unwrap_or((TileKey::Other(key.root), classify::Category::Other)),
             TileKind::Others { crumbs, .. } => {
                 let parent = match address.get(crumbs) {
                     Some((TileKey::Node(i), _)) => *i,
                     _ => key.root,
                 };
-                (TileKey::Other(parent), scan.nodes[parent].category)
+                (TileKey::Other(parent), classify::Category::Other)
             }
         };
         let node = tree.resolve(tile.crumbs());
-        let category = match node.map(|n| n.category) {
-            Some(classify::Category::Documents) => 1,
-            Some(classify::Category::Media) => 2,
-            Some(classify::Category::Code | classify::Category::Git) => 3,
-            Some(
-                classify::Category::Toolchain
-                | classify::Category::Cache
-                | classify::Category::AgentScratch,
-            ) => 5,
-            _ => fallback,
-        };
+        let class = node.map(|n| n.category).unwrap_or(class);
         let bytes = match &tile.kind {
             TileKind::Others { count, .. } => {
                 let mut weights = node
@@ -388,7 +475,8 @@ pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
             depth: tile.depth as usize + 1,
             nested: tile.header.is_some(),
             bytes,
-            category,
+            category: class as usize,
+            class,
         });
     }
     // Preserve all top-level siblings before spending a finite draw budget on detail.
@@ -399,14 +487,18 @@ pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
         viewport,
         tiles,
         layout_elapsed: started.elapsed(),
+        worth_a_look: worth,
     }
 }
+
 pub fn ease_out(t: f32) -> f32 {
     1. - (1. - t.clamp(0., 1.)).powi(3)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk_usage::Limits;
+    use std::time::Duration;
     #[test]
     fn squarified_area_is_exact_and_bounded() {
         let r = Rect {
@@ -535,6 +627,8 @@ mod tests {
             elapsed: Duration::ZERO,
             entry_limit_reached: false,
             time_limit_reached: false,
+            memory_limit_reached: false,
+            alloc_failed: false,
             limits: Limits::default(),
             volume: None,
         };
@@ -566,6 +660,221 @@ mod tests {
             started.elapsed()
         );
     }
+
+    #[test]
+    fn named_root_siblings_survive_a_budget_hungry_cousin() {
+        fn node(
+            path: String,
+            parent: Option<usize>,
+            directory: bool,
+            allocated: u64,
+        ) -> crate::disk_usage::Node {
+            crate::disk_usage::Node {
+                path: path.into(),
+                parent,
+                children: vec![],
+                entries: 1,
+                files: u64::from(!directory),
+                directories: u64::from(directory),
+                category: 0,
+                own_allocated: if directory { 0 } else { allocated },
+                directory,
+                logical: allocated,
+                mtime: 0,
+                allocated,
+                hardlink_duplicate: false,
+                uncertain: false,
+            }
+        }
+        let mut nodes = vec![node("C:\\".into(), None, true, 0)];
+        let add = |nodes: &mut Vec<crate::disk_usage::Node>,
+                   parent: usize,
+                   rel: &str,
+                   directory: bool,
+                   allocated: u64| {
+            let i = nodes.len();
+            nodes[parent].children.push(i);
+            nodes.push(node(
+                format!("C:\\{rel}"),
+                Some(parent),
+                directory,
+                allocated,
+            ));
+            i
+        };
+        let pagefile = add(&mut nodes, 0, "pagefile.sys", false, 5_000);
+        let programs = add(&mut nodes, 0, "Program Files", true, 0);
+        let users = add(&mut nodes, 0, "Users", true, 8_000);
+        let windows = add(&mut nodes, 0, "Windows", true, 6_000);
+        for i in 0..20_000 {
+            add(
+                &mut nodes,
+                programs,
+                &format!("Program Files\\app-{i:05}.dll"),
+                false,
+                1,
+            );
+        }
+        nodes[programs].allocated = 20_000;
+        nodes[0].allocated = 20_000 + 5_000 + 8_000 + 6_000;
+        let sizes: Vec<u64> = nodes.iter().map(|n| n.allocated).collect();
+        for n in &mut nodes {
+            n.children
+                .sort_by_key(|&j| (std::cmp::Reverse(sizes[j]), j));
+        }
+        let scan = Scan {
+            nodes,
+            errors: 0,
+            skipped_links: 0,
+            hardlinks: 0,
+            unknown: 0,
+            partial: true,
+            cancelled: false,
+            elapsed: Duration::from_secs(5),
+            entry_limit_reached: true,
+            time_limit_reached: false,
+            memory_limit_reached: false,
+            alloc_failed: false,
+            limits: Limits::default(),
+            volume: None,
+        };
+        let scene = build_scene(
+            &scan,
+            SceneKey {
+                scan: 1,
+                root: 0,
+                depth: 3,
+                width: 1000,
+                height: 600,
+                detail: 1,
+            },
+        );
+        let present = |id| {
+            scene
+                .tiles
+                .iter()
+                .any(|t| t.depth == 1 && t.key == TileKey::Node(id))
+        };
+        assert!(
+            present(users),
+            "Users must stay a named root tile, not disappear into Others"
+        );
+        assert!(present(windows), "Windows must stay a named root tile");
+        assert!(
+            present(programs),
+            "Program Files must stay a named root tile"
+        );
+        assert!(present(pagefile), "pagefile must stay a named root tile");
+        let others: u64 = scene
+            .tiles
+            .iter()
+            .filter(|t| t.depth == 1 && matches!(t.key, TileKey::Other(_)))
+            .map(|t| t.bytes)
+            .sum();
+        assert!(
+            others < 8_000,
+            "Others must not swallow a large named directory, got {others}"
+        );
+        let area = |id| {
+            let t = scene
+                .tiles
+                .iter()
+                .find(|t| t.depth == 1 && t.key == TileKey::Node(id))
+                .unwrap();
+            t.rect.w * t.rect.h
+        };
+        assert!(area(programs) > area(users));
+        assert!(area(users) > area(windows) * 0.5);
+        assert!(area(users) > 0. && area(windows) > 0. && area(pagefile) > 0.);
+    }
+    #[test]
+    fn others_is_only_a_small_named_tail_and_unread_is_not_invented() {
+        fn node(
+            path: &str,
+            parent: Option<usize>,
+            directory: bool,
+            allocated: u64,
+            uncertain: bool,
+        ) -> crate::disk_usage::Node {
+            crate::disk_usage::Node {
+                path: path.into(),
+                parent,
+                children: vec![],
+                entries: 1,
+                files: u64::from(!directory),
+                directories: u64::from(directory),
+                category: 0,
+                own_allocated: allocated,
+                directory,
+                logical: allocated,
+                mtime: 0,
+                allocated,
+                hardlink_duplicate: false,
+                uncertain,
+            }
+        }
+        let mut nodes = vec![node("R", None, true, 100, false)];
+        for (name, size) in [("a", 40u64), ("b", 30), ("c", 20), ("d", 10)] {
+            let i = nodes.len();
+            nodes[0].children.push(i);
+            nodes.push(node(name, Some(0), true, size, false));
+        }
+        let unread = nodes.len();
+        nodes[0].children.push(unread);
+        nodes.push(node("unreadable", Some(0), true, 0, true));
+        nodes[0].allocated = 100;
+        let scan = Scan {
+            nodes,
+            errors: 1,
+            skipped_links: 0,
+            hardlinks: 0,
+            unknown: 1,
+            partial: true,
+            cancelled: false,
+            elapsed: Duration::ZERO,
+            entry_limit_reached: false,
+            time_limit_reached: false,
+            memory_limit_reached: false,
+            alloc_failed: false,
+            limits: Limits::default(),
+            volume: None,
+        };
+        let scene = build_scene(
+            &scan,
+            SceneKey {
+                scan: 1,
+                root: 0,
+                depth: 3,
+                width: 800,
+                height: 600,
+                detail: 1,
+            },
+        );
+        for name_id in 1..=4 {
+            assert!(
+                scene
+                    .tiles
+                    .iter()
+                    .any(|t| t.depth == 1 && t.key == TileKey::Node(name_id))
+            );
+        }
+        assert!(
+            !scene
+                .tiles
+                .iter()
+                .any(|t| matches!(t.key, TileKey::Other(_)) && t.bytes >= 40)
+        );
+        assert_eq!(
+            scene
+                .tiles
+                .iter()
+                .filter(|t| t.depth == 1)
+                .map(|t| t.bytes)
+                .sum::<u64>(),
+            100
+        );
+    }
+
     #[test]
     fn transition_easing_is_monotonic_and_bounded() {
         let mut last = 0.;

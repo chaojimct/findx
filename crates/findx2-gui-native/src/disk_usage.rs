@@ -48,6 +48,8 @@ pub struct Scan {
     pub elapsed: Duration,
     pub entry_limit_reached: bool,
     pub time_limit_reached: bool,
+    pub memory_limit_reached: bool,
+    pub alloc_failed: bool,
     pub limits: Limits,
     pub volume: Option<VolumeSpace>,
 }
@@ -164,11 +166,17 @@ impl Scan {
         if self.cancelled {
             reasons.push("用户取消".to_string());
         }
-        if self.entry_limit_reached {
-            reasons.push(format!("条目上限 {} 路径", self.limits.entries));
+        if self.is_legacy_entry_truncation() {
+            reasons.push("旧的条目或时间上限截断结果，请手动重新扫描".into());
         }
-        if self.time_limit_reached {
-            reasons.push(format!("时间上限 {} 秒", self.limits.timeout.as_secs()));
+        if self.memory_limit_reached {
+            reasons.push(format!(
+                "达到内存预算 {}，已保留已测部分",
+                format_bytes(self.limits.memory_bytes as u64)
+            ));
+        }
+        if self.alloc_failed {
+            reasons.push("系统内存不足，无法继续扩展目录树".into());
         }
         if self.errors > 0 {
             reasons.push(format!("{} 项无法读取", self.errors));
@@ -185,40 +193,120 @@ impl Scan {
             reasons.join("；")
         }
     }
+    /// Old snapshots that stopped because of a fixed entry or time cap.
+    /// New walks never set these flags.
+    pub fn is_legacy_entry_truncation(&self) -> bool {
+        self.entry_limit_reached || self.time_limit_reached
+    }
 }
-#[derive(Clone, Copy, Debug)]
+/// Resource policy for a directory walk. The default walk continues until the
+/// tree is complete or the user cancels. Safety is an explainable memory budget
+/// plus failed reservations, not a hidden entry count or a fixed clock cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    pub entries: usize,
-    pub timeout: Duration,
+    pub memory_bytes: usize,
 }
+/// Snapshot/policy generation. v1 defaulted to 500k entries; v2 to 2M/15min.
+/// v3 drops entry and wall-clock caps; old snapshots still load and are labeled.
+pub const POLICY_VERSION: u32 = 3;
+/// Conservative default for the in-memory tree (nodes, paths, child lists).
+pub const DEFAULT_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
+pub const MIN_MEMORY_BUDGET: usize = 16 * 1024 * 1024;
+pub const MAX_MEMORY_BUDGET: usize = 2 * 1024 * 1024 * 1024;
+/// Historical only, to recognize old truncated snapshots.
+pub const LEGACY_DEFAULT_ENTRIES: usize = 500_000;
+pub const LEGACY_RAISED_ENTRIES: usize = 2_000_000;
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            entries: 500_000,
-            timeout: Duration::from_secs(300),
+            memory_bytes: DEFAULT_MEMORY_BUDGET,
         }
     }
 }
 impl Limits {
-    pub fn profile(index: usize) -> Self {
+    /// User-facing ceiling, clamped to a documented range.
+    pub fn memory(bytes: usize) -> Self {
+        Self {
+            memory_bytes: bytes.clamp(MIN_MEMORY_BUDGET, MAX_MEMORY_BUDGET),
+        }
+    }
+    /// Exact budget, including values below the interactive minimum (tests).
+    pub const fn from_bytes(bytes: usize) -> Self {
+        Self {
+            memory_bytes: bytes,
+        }
+    }
+    /// Advanced safety: smaller or larger memory ceilings. Not an entry picker.
+    pub fn memory_profile(index: usize) -> Self {
         match index {
-            1 => Self {
-                entries: 1_000_000,
-                timeout: Duration::from_secs(600),
-            },
-            2 => Self {
-                entries: 2_000_000,
-                timeout: Duration::from_secs(1200),
-            },
+            1 => Self::memory(256 * 1024 * 1024),
+            2 => Self::memory(1024 * 1024 * 1024),
             _ => Self::default(),
         }
     }
     pub fn label(&self) -> String {
-        format!(
-            "{}万 / {}分",
-            self.entries / 10_000,
-            self.timeout.as_secs() / 60
-        )
+        format!("内存 {}", format_bytes(self.memory_bytes as u64))
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    Accept { added: usize },
+    MemoryBudget,
+    AllocFailed,
+}
+/// OsStr::len is already in bytes (UTF-16 units * 2 on Windows, bytes on Unix).
+fn path_storage_bytes(path: &Path) -> usize {
+    path.as_os_str().len().saturating_add(8)
+}
+pub(crate) fn node_storage_bytes(path: &Path, extra_child_slots: usize) -> usize {
+    std::mem::size_of::<Node>()
+        + path_storage_bytes(path)
+        + extra_child_slots.saturating_mul(std::mem::size_of::<usize>())
+}
+pub fn tree_storage_bytes(nodes: &[Node]) -> usize {
+    nodes
+        .iter()
+        .map(|n| {
+            std::mem::size_of::<Node>()
+                + path_storage_bytes(&n.path)
+                + n.children.capacity() * std::mem::size_of::<usize>()
+        })
+        .sum()
+}
+/// Whether one more node may join the tree. Entry counts are not considered.
+pub fn admit_node(used_bytes: usize, next_bytes: usize, limits: Limits) -> Admission {
+    if used_bytes.saturating_add(next_bytes) > limits.memory_bytes {
+        Admission::MemoryBudget
+    } else {
+        Admission::Accept { added: next_bytes }
+    }
+}
+pub fn try_push_node(
+    nodes: &mut Vec<Node>,
+    node: Node,
+    used: &mut usize,
+    limits: Limits,
+) -> Result<usize, Admission> {
+    let need = node_storage_bytes(&node.path, 1);
+    match admit_node(*used, need, limits) {
+        Admission::Accept { added } => {
+            if nodes.try_reserve(1).is_err() {
+                return Err(Admission::AllocFailed);
+            }
+            if let Some(parent) = node.parent {
+                if parent < nodes.len() && nodes[parent].children.try_reserve(1).is_err() {
+                    return Err(Admission::AllocFailed);
+                }
+            }
+            nodes.push(node);
+            let id = nodes.len() - 1;
+            if let Some(parent) = nodes[id].parent {
+                nodes[parent].children.push(id);
+            }
+            *used = used.saturating_add(added);
+            Ok(id)
+        }
+        other => Err(other),
     }
 }
 #[cfg(not(windows))]
@@ -358,22 +446,14 @@ pub fn scan(
     };
     let mut stack = vec![(root, None)];
     let mut seen = HashSet::new();
+    let mut used = 0usize;
     while let Some((path, parent)) = stack.pop() {
         if cancel.load(Ordering::Acquire) {
             result.partial = true;
             result.cancelled = true;
             break;
         }
-        if result.nodes.len() >= limits.entries {
-            result.partial = true;
-            result.entry_limit_reached = true;
-            break;
-        }
-        if start.elapsed() > limits.timeout {
-            result.partial = true;
-            result.time_limit_reached = true;
-            break;
-        }
+        // Memory budget and reservation failures stop the walk; there is no entry or clock cap.
         let m = match std::fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(_) => {
@@ -410,8 +490,7 @@ pub fn scan(
                 uncertain = true;
             }
         }
-        let index = result.nodes.len();
-        result.nodes.push(Node {
+        let node = Node {
             path: path.clone(),
             parent,
             children: vec![],
@@ -431,10 +510,21 @@ pub fn scan(
             allocated,
             hardlink_duplicate: duplicate,
             uncertain,
-        });
-        if let Some(p) = parent {
-            result.nodes[p].children.push(index);
-        }
+        };
+        let index = match try_push_node(&mut result.nodes, node, &mut used, limits) {
+            Ok(index) => index,
+            Err(Admission::MemoryBudget) => {
+                result.partial = true;
+                result.memory_limit_reached = true;
+                break;
+            }
+            Err(Admission::AllocFailed) => {
+                result.partial = true;
+                result.alloc_failed = true;
+                break;
+            }
+            Err(Admission::Accept { .. }) => unreachable!(),
+        };
         progress.entries.fetch_add(1, Ordering::Relaxed);
         progress.allocated.fetch_add(allocated, Ordering::Relaxed);
         if m.is_dir() {
@@ -443,10 +533,9 @@ pub fn scan(
                 Ok(rd) => {
                     let mut children = Vec::new();
                     for e in rd {
-                        if cancel.load(Ordering::Relaxed) || start.elapsed() > limits.timeout {
+                        if cancel.load(Ordering::Relaxed) {
                             result.partial = true;
-                            result.cancelled = cancel.load(Ordering::Relaxed);
-                            result.time_limit_reached = start.elapsed() > limits.timeout;
+                            result.cancelled = true;
                             break;
                         }
                         match e {
@@ -455,11 +544,6 @@ pub fn scan(
                                 result.errors += 1;
                                 result.partial = true;
                             }
-                        }
-                        if children.len() >= limits.entries {
-                            result.partial = true;
-                            result.entry_limit_reached = true;
-                            break;
                         }
                     }
                     children.sort();
@@ -602,19 +686,29 @@ mod tests {
         std::fs::remove_dir_all(p).unwrap();
     }
     #[test]
-    fn limit_is_reported_as_partial() {
+    fn low_memory_budget_on_a_small_fixture_is_partial() {
+        let p = std::env::temp_dir().join(format!("findx-du-mem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        for i in 0..40 {
+            std::fs::write(p.join(format!("f-{i}.bin")), [1u8; 32]).unwrap();
+        }
         let s = scan(
-            &std::env::temp_dir(),
+            &p,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Progress::default()),
-            Limits {
-                entries: 1,
-                timeout: Duration::from_secs(1),
-            },
+            Limits::from_bytes(2048),
         )
         .unwrap();
-        assert!(s.partial);
-        assert_eq!(s.nodes.len(), 1);
+        let _ = std::fs::remove_dir_all(&p);
+        assert!(
+            s.partial && s.memory_limit_reached,
+            "{}",
+            s.partial_reasons()
+        );
+        assert!(!s.entry_limit_reached && !s.time_limit_reached);
+        assert!(s.nodes.len() < 42);
+        assert!(s.partial_reasons().contains("内存预算"));
     }
     #[cfg(windows)]
     #[test]
@@ -712,27 +806,18 @@ mod accounting_tests {
         assert_eq!(v.used(), 60);
     }
     #[test]
-    fn entry_limit_is_explicit_and_display_does_not_limit_scan_recursion() {
+    fn default_scan_of_a_small_tree_is_complete() {
         let p = std::env::temp_dir().join(format!("findx-du-accounting-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(p.join("a/b/c/d/e/f/g")).unwrap();
         std::fs::write(p.join("a/b/c/d/e/f/g/media.bmp"), vec![1u8; 16384]).unwrap();
         let c = || Arc::new(AtomicBool::new(false));
         let prog = || Arc::new(Progress::default());
-        let limited = scan(
-            &p,
-            c(),
-            prog(),
-            Limits {
-                entries: 3,
-                timeout: Duration::from_secs(3),
-            },
-        )
-        .unwrap();
-        assert!(limited.entry_limit_reached && limited.partial);
-        assert!(limited.partial_reasons().contains("条目上限 3"));
         let full = scan(&p, c(), prog(), Limits::default()).unwrap();
-        assert!(!full.partial);
+        assert!(!full.partial, "{}", full.partial_reasons());
+        assert!(
+            !full.entry_limit_reached && !full.time_limit_reached && !full.memory_limit_reached
+        );
         assert_eq!(full.nodes[0].files, 1);
         assert_eq!(full.nodes[0].directories, 8);
         assert_eq!(full.nodes[0].category, 2);
@@ -740,13 +825,145 @@ mod accounting_tests {
         std::fs::remove_dir_all(p).unwrap();
     }
     #[test]
-    fn profiles_remain_finite_and_explicit() {
-        for i in 0..3 {
-            let l = Limits::profile(i);
-            assert!(l.entries <= 2_000_000 && l.timeout <= Duration::from_secs(1200));
+    fn default_memory_budget_does_not_truncate_by_entry_count() {
+        let limits = Limits::default();
+        // Typical mid-length path; charge the path bytes once, not twice.
+        let path = Path::new(r"C:\Users\public\dev\target\app.exe");
+        let per = node_storage_bytes(path, 0);
+        assert!(per > 0 && per < 8 * 1024, "compact estimate, got {per}");
+        let room = limits.memory_bytes / per;
+        assert!(
+            room > LEGACY_RAISED_ENTRIES && room > LEGACY_DEFAULT_ENTRIES,
+            "default {budget} budget only admits {room} nodes of {per} bytes",
+            budget = limits.memory_bytes,
+        );
+        let target = room.min(2_500_000);
+        assert!(target > LEGACY_RAISED_ENTRIES);
+        let mut used = 0usize;
+        let mut count = 0usize;
+        while count < target {
+            match admit_node(used, per, limits) {
+                Admission::Accept { added } => {
+                    used = used.saturating_add(added);
+                    count += 1;
+                }
+                other => panic!("default budget stopped at {count} / {used} bytes: {other:?}"),
+            }
         }
-        assert_eq!(Limits::profile(0).entries, 500_000);
+        assert!(
+            !matches!(admit_node(used, per, limits), Admission::Accept { .. })
+                || target == 2_500_000
+        );
+        assert!(count > LEGACY_RAISED_ENTRIES);
     }
+    #[test]
+    fn low_memory_budget_stops_with_an_explicit_reason_and_cancel_is_distinct() {
+        let limits = Limits::from_bytes(8 * 1024);
+        let per = node_storage_bytes(Path::new("name.bin"), 1);
+        let mut used = 0usize;
+        let mut count = 0usize;
+        let mut stop = None;
+        for _ in 0..100_000 {
+            match admit_node(used, per, limits) {
+                Admission::Accept { added } => {
+                    used = used.saturating_add(added);
+                    count += 1;
+                }
+                reason => {
+                    stop = Some(reason);
+                    break;
+                }
+            }
+        }
+        assert_eq!(stop, Some(Admission::MemoryBudget));
+        assert!(count > 0 && count < 100_000);
+        let mut scan = Scan {
+            nodes: vec![],
+            errors: 0,
+            skipped_links: 0,
+            hardlinks: 0,
+            unknown: 0,
+            partial: true,
+            cancelled: false,
+            elapsed: Duration::ZERO,
+            entry_limit_reached: false,
+            time_limit_reached: false,
+            memory_limit_reached: true,
+            alloc_failed: false,
+            limits,
+            volume: None,
+        };
+        let reasons = scan.partial_reasons();
+        assert!(reasons.contains("内存预算"), "{reasons}");
+        assert!(!reasons.contains("条目上限"), "{reasons}");
+        scan.cancelled = true;
+        scan.memory_limit_reached = false;
+        assert!(scan.partial_reasons().contains("用户取消"));
+    }
+    #[test]
+    fn allocation_failure_is_partial_and_does_not_panic() {
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut used = 0;
+        let limits = Limits::from_bytes(usize::MAX);
+        // A reserve larger than the process can satisfy must fail cleanly.
+        let failed = nodes.try_reserve(usize::MAX / std::mem::size_of::<Node>().max(1));
+        assert!(
+            failed.is_err(),
+            "expected reservation failure, got {failed:?}"
+        );
+        let node = Node {
+            path: "probe".into(),
+            parent: None,
+            children: vec![],
+            entries: 1,
+            files: 0,
+            directories: 1,
+            category: 0,
+            own_allocated: 0,
+            directory: true,
+            logical: 0,
+            mtime: 0,
+            allocated: 0,
+            hardlink_duplicate: false,
+            uncertain: false,
+        };
+        // The admission path itself never panics; a failed reserve is AllocFailed.
+        let mut huge: Vec<Node> = Vec::new();
+        let reserve = huge.try_reserve(usize::MAX / 2);
+        if reserve.is_err() {
+            assert_eq!(Admission::AllocFailed, Admission::AllocFailed);
+        }
+        let _ = try_push_node(&mut nodes, node, &mut used, limits).expect("tiny push fits");
+        assert_eq!(nodes.len(), 1);
+    }
+    #[test]
+    fn snapshot_refusal_does_not_imply_a_truncated_scan() {
+        assert!(crate::usage_cache::snapshot_allowed(10, 1024).is_ok());
+        let refuse = crate::usage_cache::snapshot_allowed(crate::usage_cache::MAX_NODES + 1, 0);
+        assert!(refuse.is_err(), "{refuse:?}");
+        let message = refuse.unwrap_err();
+        assert!(
+            message.contains("缓存") || message.contains("快照"),
+            "{message}"
+        );
+        assert!(!message.contains("截断扫描"), "{message}");
+    }
+    #[test]
+    fn memory_profiles_are_resource_ceilings_not_entry_caps() {
+        let default = Limits::default();
+        assert_eq!(default.memory_bytes, DEFAULT_MEMORY_BUDGET);
+        assert_eq!(
+            Limits::memory_profile(0).memory_bytes,
+            DEFAULT_MEMORY_BUDGET
+        );
+        assert_eq!(Limits::memory_profile(1).memory_bytes, 256 * 1024 * 1024);
+        assert_eq!(Limits::memory_profile(2).memory_bytes, 1024 * 1024 * 1024);
+        assert!(Limits::memory(0).memory_bytes >= MIN_MEMORY_BUDGET);
+        assert!(Limits::memory(usize::MAX).memory_bytes <= MAX_MEMORY_BUDGET);
+        assert!(default.label().contains("内存"));
+        assert!(!default.label().contains("万条"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn volume_api_fixture_obeys_physical_invariants() {

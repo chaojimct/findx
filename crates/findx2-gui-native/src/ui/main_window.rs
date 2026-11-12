@@ -357,6 +357,15 @@ impl MainWindow {
             })
         });
         this.init_workspace(window, cx);
+        if let Some(path) = crate::isolation::isolated_usage_open_path(
+            this.session.read(cx).live,
+            std::env::var_os("FINDX_NATIVE_USAGE_OPEN")
+                .map(std::path::PathBuf::from)
+                .as_deref(),
+        ) {
+            this.workspace_navigate(path, ViewMode::Usage, None, true, cx);
+            this.start_workspace_scan(true, cx);
+        }
         this.schedule_status_poll(cx);
         if this.preview_file.is_some() {
             this.request_preview(cx);
@@ -1718,6 +1727,9 @@ impl Render for MainWindow {
             .key_context("FindXMain")
             .track_focus(&self.focus)
             .size_full()
+            .min_w_0()
+            .min_h_0()
+            .overflow_hidden()
             .relative()
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 this.resize_preview_move(event, cx)
@@ -1863,15 +1875,23 @@ impl Render for MainWindow {
                 view.child(div().flex_1().min_h_0().child(page))
             })
             .when(self.settings_page.is_none(), |view| {
-                view.child(self.render_workspace_page(sidebar, preview, window, cx))
-                    .child(self.render_workspace_operation(cx))
-                    .when(self.has_file_activity(), |view| {
-                        view.child(self.render_file_activity(cx))
-                    })
-                    .child(self.render_status_bar(&index_view, cx))
-                    .when(self.workspace.show_actions, |view| {
-                        view.child(self.render_workspace_actions(cx))
-                    })
+                view.child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .w_full()
+                        .overflow_hidden()
+                        .child(self.render_workspace_page(sidebar, preview, window, cx)),
+                )
+                .child(self.render_workspace_operation(cx))
+                .when(self.has_file_activity(), |view| {
+                    view.child(self.render_file_activity(cx))
+                })
+                .child(self.render_status_bar(&index_view, cx))
+                .when(self.workspace.show_actions, |view| {
+                    view.child(self.render_workspace_actions(cx))
+                })
             })
             .when_some(self.workspace.address_menu.clone(), |view, menu| {
                 view.child(

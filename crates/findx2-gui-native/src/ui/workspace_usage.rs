@@ -33,6 +33,7 @@ struct PaintTile {
     selected: bool,
     hovered: bool,
     unknown: bool,
+    class: crate::disktree::classify::Category,
 }
 fn tile_body(rect: Rect, header: Option<Rect>) -> Rect {
     if let Some(h) = header {
@@ -356,16 +357,12 @@ impl MainWindow {
                             )
                         }
                         TileKey::Other(_) => (
-                            "其余已测占用".into(),
+                            "其他小项".into(),
                             disk_usage::format_bytes(tile.bytes),
                             false,
                         ),
                     };
-                    let mut color = tokens.allocation_color(tile.category);
-                    color.l = (color.l
-                        + tile.depth.min(6) as f32
-                            * if tokens.bg.l < 0.4 { -0.006 } else { 0.009 })
-                    .clamp(0., 1.);
+                    let color = tokens.usage_fill(tile.class, tile.depth);
                     draws.push(PaintTile {
                         key: tile.key,
                         rect: r,
@@ -375,6 +372,7 @@ impl MainWindow {
                         name,
                         size,
                         unknown,
+                        class: tile.class,
                         selected: matches!(tile.key,TileKey::Node(i) if Some(i)==selected),
                         hovered: self.workspace.usage_hover == Some(tile.key),
                     });
@@ -411,6 +409,7 @@ impl MainWindow {
                         selected: false,
                         hovered: false,
                         unknown: false,
+                        class: crate::disktree::classify::Category::Other,
                     });
                     x += w;
                 }
@@ -421,15 +420,6 @@ impl MainWindow {
         } else {
             empty = Some("选择目录开始测量；已有快照会直接读取，不会自动全盘扫描");
         }
-        let tooltip = self.workspace.usage_hover.and_then(|k| match k {
-            TileKey::Node(i) => self
-                .workspace
-                .scan
-                .as_ref()
-                .and_then(|s| s.nodes.get(i))
-                .map(|n| display_path(&n.path)),
-            TileKey::Other(_) => Some("合并项只保留已测面积；进入父目录查看明细".into()),
-        });
         let paint = draws.clone();
         let menu_owner = cx.weak_entity();
         let mut view = div()
@@ -465,8 +455,13 @@ impl MainWindow {
             .on_click(cx.listener(|this, _, window, cx| {
                 let p = this.usage_point(window.mouse_position());
                 this.workspace.usage_map_focus.focus(window, cx);
-                if let Some(TileKey::Node(i)) = this.usage_hit(p) {
-                    this.select_usage_node(i, false, cx);
+                match this.usage_hit(p) {
+                    Some(TileKey::Node(i)) => this.select_usage_node(i, false, cx),
+                    _ => {
+                        if let Some(root) = this.scan_node() {
+                            this.select_usage_node(root, false, cx);
+                        }
+                    }
                 }
                 cx.stop_propagation();
             }))
@@ -493,12 +488,6 @@ impl MainWindow {
                 }
                 cx.stop_propagation();
             }))
-            .when(tooltip.is_some(), |view| {
-                let text = tooltip.clone().unwrap();
-                view.tooltip(move |w, cx| {
-                    gpui_kit::component::tooltip::Tooltip::new(text.clone()).build(w, cx)
-                })
-            })
             .context_menu(move |menu, window, cx| {
                 menu_owner
                     .update(cx, |this, cx| {
@@ -547,12 +536,15 @@ impl MainWindow {
                         window.with_content_mask(Some(ContentMask { bounds: b }), |window| {
                             // Fill first, then labels, finally outlines (selected stays visible).
                             for d in &paint {
+                                if d.depth == 0 {
+                                    continue;
+                                }
                                 window.paint_quad(fill(screen(d.rect), d.color));
                                 if d.depth == 1 {
-                                    let mut strip = d.color;
-                                    strip.l = (strip.l - 0.12).max(0.);
-                                    window
-                                        .paint_quad(fill(screen(Rect { h: 2., ..d.rect }), strip));
+                                    window.paint_quad(fill(
+                                        screen(Rect { h: 2., ..d.rect }),
+                                        tokens.usage_accent(d.class),
+                                    ));
                                 }
                                 if d.unknown {
                                     window.paint_quad(fill(
@@ -572,11 +564,7 @@ impl MainWindow {
                                     continue;
                                 }
                                 let clip = screen(label);
-                                let text = if label.w >= 150. {
-                                    format!("{}  {}", d.name, d.size)
-                                } else {
-                                    d.name.clone()
-                                };
+                                let text = d.name.clone();
                                 let run = TextRun {
                                     len: text.len(),
                                     font: Font {
@@ -609,7 +597,38 @@ impl MainWindow {
                                         );
                                     },
                                 );
-                                if d.header.is_none() && label.h >= 44. && label.w >= 70. {
+                                if d.header.is_some() && label.w >= 118. {
+                                    let run = TextRun {
+                                        len: d.size.len(),
+                                        font: font("Segoe UI"),
+                                        color: tokens.text_secondary,
+                                        ..Default::default()
+                                    };
+                                    let line = window.text_system().shape_line(
+                                        SharedString::from(d.size.clone()),
+                                        px(10.),
+                                        &[run],
+                                        None,
+                                    );
+                                    let width = f32::from(line.width());
+                                    window.with_content_mask(
+                                        Some(ContentMask { bounds: clip }),
+                                        |window| {
+                                            let origin = point(
+                                                clip.origin.x + px((label.w - width - 6.).max(48.)),
+                                                clip.origin.y + px(2.),
+                                            );
+                                            let _ = line.paint(
+                                                origin,
+                                                px(16.),
+                                                TextAlign::Left,
+                                                None,
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    );
+                                } else if d.header.is_none() && label.h >= 44. && label.w >= 70. {
                                     let run = TextRun {
                                         len: d.size.len(),
                                         font: font("Segoe UI"),
@@ -640,7 +659,10 @@ impl MainWindow {
                                     );
                                 }
                             }
-                            for d in paint.iter().filter(|d| d.selected || d.hovered) {
+                            for d in paint
+                                .iter()
+                                .filter(|d| d.depth > 0 && (d.selected || d.hovered))
+                            {
                                 let mut clear = tokens.surface;
                                 clear.a = 0.;
                                 window.paint_quad(quad(

@@ -74,6 +74,69 @@ impl FindxTokens {
         };
         rgb(colors[category % colors.len()]).into()
     }
+
+    /// DiskTree category fills, mixed toward the active FindX surface so Warm /
+    /// Neutral / VS Code light and dark stay coherent. This does not replace the
+    /// application chrome palette.
+    pub fn usage_hue(class: crate::disktree::classify::Category) -> (f32, f32) {
+        use crate::disktree::classify::Category::*;
+        match class {
+            Code => (0.605, 1.0),
+            AgentScratch => (0.065, 1.0),
+            Toolchain => (0.415, 1.0),
+            Synced => (0.535, 1.0),
+            Git => (0.955, 1.0),
+            Media => (0.745, 1.0),
+            Cache => (0.125, 0.95),
+            Documents => (0.6, 0.18),
+            Other => (0.6, 0.08),
+        }
+    }
+    pub fn usage_fill(&self, class: crate::disktree::classify::Category, depth: usize) -> Hsla {
+        let (h, chroma) = Self::usage_hue(class);
+        let step = depth.min(4) as f32;
+        let dark = self.bg.l < 0.4;
+        let (s, l) = if dark {
+            (0.26 * chroma, step.mul_add(0.028, 0.215))
+        } else {
+            (0.30 * chroma, step.mul_add(-0.03, 0.84))
+        };
+        self.mix_toward_surface(Hsla { h, s, l, a: 1.0 }, 0.12)
+    }
+    pub fn usage_accent(&self, class: crate::disktree::classify::Category) -> Hsla {
+        let (h, chroma) = Self::usage_hue(class);
+        let dark = self.bg.l < 0.4;
+        let (s, l) = if dark {
+            (0.42 * chroma, 0.52)
+        } else {
+            (0.45 * chroma, 0.46)
+        };
+        Hsla { h, s, l, a: 1.0 }
+    }
+    fn mix_toward_surface(&self, color: Hsla, amount: f32) -> Hsla {
+        let t = amount.clamp(0., 1.);
+        Hsla {
+            h: color.h + (self.surface.h - color.h) * t,
+            s: color.s + (self.surface.s - color.s) * t,
+            l: color.l + (self.surface.l - color.l) * t,
+            a: 1.0,
+        }
+    }
+    pub fn usage_class_label(class: crate::disktree::classify::Category) -> &'static str {
+        use crate::disktree::classify::Category::*;
+        match class {
+            Code => "代码",
+            AgentScratch => "代理草稿",
+            Toolchain => "工具链",
+            Synced => "同步",
+            Git => "Git",
+            Media => "媒体",
+            Documents => "文档",
+            Cache => "缓存",
+            Other => "其他",
+        }
+    }
+
     pub fn for_theme(theme: EffectiveTheme) -> Self {
         Self::for_style(ThemeStyle::default(), theme)
     }

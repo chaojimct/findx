@@ -33,14 +33,14 @@ struct Walk {
     cancel: Arc<AtomicBool>,
     progress: Arc<Progress>,
     limits: Limits,
-    start: Instant,
     errors: AtomicU64,
     skipped: AtomicU64,
     hardlinks: AtomicU64,
     unknown: AtomicU64,
     partial: AtomicBool,
-    entry_limit: AtomicBool,
-    time_limit: AtomicBool,
+    memory_limit: AtomicBool,
+    alloc_failed: AtomicBool,
+    used: AtomicUsize,
     pending: AtomicUsize,
 }
 impl Walk {
@@ -49,14 +49,7 @@ impl Walk {
             self.partial.store(true, Ordering::Relaxed);
             return true;
         }
-        if self.start.elapsed() >= self.limits.timeout {
-            self.partial.store(true, Ordering::Relaxed);
-            self.time_limit.store(true, Ordering::Relaxed);
-            return true;
-        }
-        if self.progress.entries.load(Ordering::Relaxed) >= self.limits.entries as u64 {
-            self.partial.store(true, Ordering::Relaxed);
-            self.entry_limit.store(true, Ordering::Relaxed);
+        if self.memory_limit.load(Ordering::Relaxed) || self.alloc_failed.load(Ordering::Relaxed) {
             return true;
         }
         false
@@ -283,13 +276,8 @@ fn dispatch_one<'s>(
         };
         let id = {
             let mut nodes = lock(&ctx.nodes);
-            if nodes.len() as u64 >= ctx.limits.entries as u64 {
-                ctx.entry_limit.store(true, Ordering::Relaxed);
-                ctx.partial.store(true, Ordering::Relaxed);
-                return false;
-            }
-            let id = nodes.len();
-            nodes.push(Node {
+            let mut used = ctx.used.load(Ordering::Relaxed);
+            let node = Node {
                 path: e.path.clone(),
                 parent: Some(parent),
                 children: vec![],
@@ -304,9 +292,24 @@ fn dispatch_one<'s>(
                 allocated: occupied,
                 hardlink_duplicate: duplicate,
                 uncertain: unknown,
-            });
-            nodes[parent].children.push(id);
-            id
+            };
+            match try_push_node(&mut nodes, node, &mut used, ctx.limits) {
+                Ok(id) => {
+                    ctx.used.store(used, Ordering::Relaxed);
+                    id
+                }
+                Err(Admission::MemoryBudget) => {
+                    ctx.memory_limit.store(true, Ordering::Relaxed);
+                    ctx.partial.store(true, Ordering::Relaxed);
+                    return false;
+                }
+                Err(Admission::AllocFailed) => {
+                    ctx.alloc_failed.store(true, Ordering::Relaxed);
+                    ctx.partial.store(true, Ordering::Relaxed);
+                    return false;
+                }
+                Err(Admission::Accept { .. }) => unreachable!(),
+            }
         };
         ctx.progress.entries.fetch_add(1, Ordering::Relaxed);
         ctx.progress
@@ -431,20 +434,21 @@ pub(super) fn scan(
     progress.directories.store(1, Ordering::Relaxed);
     progress.allocated.store(occupied, Ordering::Relaxed);
     lock(&progress.preview).directory(root);
+    let root_used = crate::disk_usage::node_storage_bytes(&root_node.path, 1);
     let ctx = Walk {
         nodes: Mutex::new(vec![root_node]),
         seen: Mutex::new([exact.identity].into_iter().collect()),
         cancel: cancel.clone(),
         progress: progress.clone(),
         limits,
-        start,
         errors: AtomicU64::new(0),
         skipped: AtomicU64::new(0),
         hardlinks: AtomicU64::new(0),
         unknown: AtomicU64::new(0),
         partial: AtomicBool::new(false),
-        entry_limit: AtomicBool::new(false),
-        time_limit: AtomicBool::new(false),
+        memory_limit: AtomicBool::new(false),
+        alloc_failed: AtomicBool::new(false),
+        used: AtomicUsize::new(root_used),
         pending: AtomicUsize::new(1),
     };
     let workers = std::thread::available_parallelism()
@@ -466,8 +470,10 @@ pub(super) fn scan(
         partial: ctx.partial.load(Ordering::Relaxed),
         cancelled: cancel.load(Ordering::Relaxed),
         elapsed: Duration::ZERO,
-        entry_limit_reached: ctx.entry_limit.load(Ordering::Relaxed),
-        time_limit_reached: ctx.time_limit.load(Ordering::Relaxed),
+        entry_limit_reached: false,
+        time_limit_reached: false,
+        memory_limit_reached: ctx.memory_limit.load(Ordering::Relaxed),
+        alloc_failed: ctx.alloc_failed.load(Ordering::Relaxed),
         limits,
         volume: volume_space(root).ok(),
     };

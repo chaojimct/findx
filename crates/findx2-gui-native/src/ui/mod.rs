@@ -13,6 +13,21 @@ use crate::session::AppSession;
 use crate::ui::main_window::MainWindow;
 use crate::ui::settings_window::SettingsWindow;
 
+fn launch_window_size() -> Size<Pixels> {
+    if let Ok(raw) = std::env::var("FINDX_NATIVE_WINDOW_SIZE") {
+        let lowered = raw.to_ascii_lowercase();
+        let mut parts = lowered.split('x');
+        if let (Some(w), Some(h)) = (parts.next(), parts.next()) {
+            if let (Ok(w), Ok(h)) = (w.trim().parse::<f32>(), h.trim().parse::<f32>()) {
+                if (560.0..4000.0).contains(&w) && (400.0..3000.0).contains(&h) {
+                    return size(px(w), px(h));
+                }
+            }
+        }
+    }
+    size(px(1100.), px(720.))
+}
+
 pub fn start(opts: LaunchOptions) {
     let title = opts.window_title().to_string();
     gpui_kit::application()
@@ -40,7 +55,8 @@ pub fn start(opts: LaunchOptions) {
             })
             .detach();
 
-            let bounds = Bounds::centered(None, size(px(1100.), px(720.)), cx);
+            let window_size = launch_window_size();
+            let bounds = Bounds::centered(None, window_size, cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(560.), px(400.))),

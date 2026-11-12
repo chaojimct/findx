@@ -216,7 +216,7 @@ pub(super) struct Workspace {
     window: AnyWindowHandle,
     usage_depth: usize,
     usage_advanced: bool,
-    usage_limit_profile: usize,
+    usage_memory_profile: usize,
     scan: Option<Arc<Scan>>,
     usage_scene: Option<Arc<crate::usage_view::Scene>>,
     usage_scene_key: Option<crate::usage_view::SceneKey>,
@@ -339,7 +339,7 @@ impl Workspace {
             window: window.window_handle(),
             usage_depth: 3,
             usage_advanced: false,
-            usage_limit_profile: 0,
+            usage_memory_profile: 0,
             scan: None,
             usage_scene: None,
             usage_scene_key: None,
@@ -934,17 +934,23 @@ impl MainWindow {
                 }
             })
             .collect();
-        self.workspace.status = format!(
-            "占用 · {} 个子项 · 逻辑 {} · 实际 {}{}",
-            children.len(),
-            search_logic::format_size(scan.nodes[ix].logical, false),
-            search_logic::format_size(scan.nodes[ix].allocated, false),
-            if scan.partial { " · 部分结果" } else { "" }
-        );
+        let focus = focus.or_else(|| Some(display_path(&scan.nodes[ix].path)));
+        self.workspace.usage_focus = focus.clone();
+        self.workspace.status = if scan.is_legacy_entry_truncation() {
+            "占用 · 旧的截断结果，请手动重新扫描".into()
+        } else if scan.memory_limit_reached {
+            "占用 · 达到内存预算的部分结果".into()
+        } else if scan.alloc_failed {
+            "占用 · 系统内存不足，已保留已测部分".into()
+        } else if scan.partial {
+            "占用 · 部分结果".into()
+        } else {
+            format!("占用 · {} 个子项", children.len())
+        };
         self.set_workspace_rows(rows, focus, true, cx);
         true
     }
-    fn workspace_navigate(
+    pub(super) fn workspace_navigate(
         &mut self,
         path: PathBuf,
         mode: ViewMode,
@@ -1278,7 +1284,7 @@ impl MainWindow {
         })
         .detach();
     }
-    fn start_workspace_scan(&mut self, force: bool, cx: &mut Context<Self>) {
+    pub(super) fn start_workspace_scan(&mut self, force: bool, cx: &mut Context<Self>) {
         if self.workspace.op_busy || self.file_actions.busy || self.workspace.scanning {
             return;
         }
@@ -1289,7 +1295,7 @@ impl MainWindow {
         let job = repository.request(
             &path,
             force,
-            Limits::profile(self.workspace.usage_limit_profile),
+            Limits::memory_profile(self.workspace.usage_memory_profile),
         );
         self.workspace.scan_cancel = job.cancel.clone();
         self.workspace.progress = job.progress.clone();
@@ -1320,12 +1326,7 @@ impl MainWindow {
                     Ok((value, lookup)) => {
                         this.workspace.scan_stale =
                             value.source != crate::usage_cache::Source::Measured;
-                        this.workspace.scan_status = format!(
-                            "{} · {} · 硬链接去重 {}",
-                            value.label(),
-                            value.scan.partial_reasons(),
-                            value.scan.hardlinks
-                        );
+                        this.workspace.scan_status = value.label();
                         let previous_scan = this.workspace.scan.replace(value.scan);
                         let previous_lookup =
                             std::mem::replace(&mut this.workspace.scan_lookup, lookup);

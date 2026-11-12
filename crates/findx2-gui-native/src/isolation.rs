@@ -143,3 +143,62 @@ mod tests {
         assert!(normalize_pipe_ex("findx2", false).is_err());
     }
 }
+
+/// Open a fixture directory on the occupancy page. Live mode, missing
+/// paths, and volume roots are refused so a screenshot run cannot start
+/// a whole-drive scan.
+pub fn isolated_usage_open_path(
+    live: bool,
+    raw: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    if live {
+        return None;
+    }
+    let path = raw?;
+    let path = path.canonicalize().ok()?;
+    if !path.is_dir() {
+        return None;
+    }
+    if is_volume_root(&path) {
+        return None;
+    }
+    Some(path)
+}
+
+pub fn is_volume_root(path: &std::path::Path) -> bool {
+    let mut comps = path.components();
+    matches!(
+        (comps.next(), comps.next(), comps.next()),
+        (
+            Some(std::path::Component::Prefix(_)),
+            Some(std::path::Component::RootDir),
+            None
+        ) | (Some(std::path::Component::RootDir), None, None)
+    )
+}
+
+#[cfg(test)]
+mod usage_open_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn live_mode_and_volume_roots_are_refused() {
+        assert!(isolated_usage_open_path(true, Some(std::env::temp_dir().as_path())).is_none());
+        let root = if cfg!(windows) {
+            std::path::Path::new(r"C:\")
+        } else {
+            std::path::Path::new("/")
+        };
+        if root.is_dir() {
+            assert!(isolated_usage_open_path(false, Some(root)).is_none());
+        }
+        let dir = std::env::temp_dir().join(format!("findx-usage-open-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let opened = isolated_usage_open_path(false, Some(&dir)).expect("subdir allowed");
+        assert!(opened.ends_with(dir.file_name().unwrap()));
+        assert!(isolated_usage_open_path(false, Some(&dir.join("missing"))).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
