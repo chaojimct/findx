@@ -1,7 +1,11 @@
 //! Distinct search, directory-tab and usage pages share file identity and explicit actions, not navigation histories.
 //! Filesystem and allocation work never run on the render/input thread.
+#[path = "workspace_navigation.rs"]
+mod navigation_ui;
 #[path = "workspace_pages.rs"]
 mod pages;
+#[path = "workspace_usage.rs"]
+mod usage_ui;
 use super::super::browser_table::{BrowserTable, MIN_WIDTHS as BROWSER_MIN_WIDTHS};
 use super::*;
 use crate::{
@@ -180,6 +184,19 @@ pub(super) struct Workspace {
     filter_text: String,
     all_rows: Vec<SearchHitDto>,
     pub(super) editing_path: bool,
+    path_edit: crate::navigation::AddressEdit,
+    path_error: Option<String>,
+    path_status_before_edit: Option<String>,
+    path_ime_enter: bool,
+    path_ime_escape: bool,
+    address_focus: FocusHandle,
+    pub(super) address_menu: Option<Entity<gpui_kit::component::menu::PopupMenu>>,
+    pub(super) address_menu_position: Point<Pixels>,
+    address_menu_subscription: Option<Subscription>,
+    address_menu_generation: u64,
+    address_menu_cancel: Arc<AtomicBool>,
+    tab_scroll: ScrollHandle,
+    address_width: std::rc::Rc<std::cell::Cell<f32>>,
     pub(super) show_actions: bool,
     pub(super) path: Entity<InputState>,
     pub(super) status: String,
@@ -197,7 +214,14 @@ pub(super) struct Workspace {
     window: AnyWindowHandle,
     usage_depth: usize,
     usage_limit_profile: usize,
-    scan: Option<Scan>,
+    scan: Option<Arc<Scan>>,
+    usage_scene: Option<Arc<crate::usage_view::Scene>>,
+    usage_scene_key: Option<crate::usage_view::SceneKey>,
+    usage_scene_generation: u64,
+    usage_camera: crate::usage_view::Camera,
+    usage_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
+    usage_map_focus: FocusHandle,
+    usage_transition: Option<usage_ui::Transition>,
     scan_lookup: HashMap<String, usize>,
     scan_generation: u64,
     scan_cancel: Arc<AtomicBool>,
@@ -270,6 +294,19 @@ impl Workspace {
             filter_text: String::new(),
             all_rows: vec![],
             editing_path: false,
+            path_edit: Default::default(),
+            path_error: None,
+            path_status_before_edit: None,
+            path_ime_enter: false,
+            path_ime_escape: false,
+            address_focus: cx.focus_handle(),
+            address_menu: None,
+            address_menu_position: point(px(0.), px(0.)),
+            address_menu_subscription: None,
+            address_menu_generation: 0,
+            address_menu_cancel: Arc::new(AtomicBool::new(false)),
+            tab_scroll: ScrollHandle::new(),
+            address_width: Default::default(),
             show_actions: false,
             path,
             status: "选择位置后浏览".into(),
@@ -288,6 +325,13 @@ impl Workspace {
             usage_depth: 3,
             usage_limit_profile: 0,
             scan: None,
+            usage_scene: None,
+            usage_scene_key: None,
+            usage_scene_generation: 0,
+            usage_camera: Default::default(),
+            usage_bounds: Default::default(),
+            usage_map_focus: cx.focus_handle(),
+            usage_transition: None,
             scan_lookup: HashMap::new(),
             scan_generation: 0,
             scan_cancel: Arc::new(AtomicBool::new(false)),
@@ -394,13 +438,42 @@ impl MainWindow {
         self._subscriptions.push(cx.subscribe_in(
             &path,
             window,
-            |this, _, ev: &InputEvent, _, cx| {
-                if matches!(ev, InputEvent::PressEnter { .. }) {
-                    let p = PathBuf::from(this.workspace.path.read(cx).value().to_string());
-                    this.workspace_navigate(p, this.workspace.mode, None, true, cx);
+            |this, _, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { .. } if this.workspace.editing_path => {
+                    if !std::mem::take(&mut this.workspace.path_ime_enter) {
+                        this.submit_path_edit(window, cx);
+                    }
                 }
+                InputEvent::Change if this.workspace.editing_path => {
+                    this.workspace.path_edit.change();
+                    this.workspace.path_error = None;
+                    cx.notify();
+                }
+                _ => {}
             },
         ));
+        let address_focus = self.workspace.address_focus.clone();
+        self._subscriptions.push(
+            cx.on_focus_out(&address_focus, window, |this, _, window, cx| {
+                if this.workspace.editing_path {
+                    cx.defer_in(window, |this, window, cx| {
+                        if this.workspace.editing_path
+                            && !this.workspace.address_focus.contains_focused(window, cx)
+                            && !this.workspace.path.read(cx).has_selection_focus(window, cx)
+                        {
+                            this.cancel_path_edit(cx);
+                        }
+                    });
+                }
+            }),
+        );
+        self._subscriptions
+            .push(cx.observe_window_activation(window, |this, window, cx| {
+                if !window.is_window_active() {
+                    this.cancel_path_edit(cx);
+                    this.dismiss_address_menu(cx);
+                }
+            }));
         self.workspace._tick = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -521,6 +594,8 @@ impl MainWindow {
     }
 
     fn select_directory_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.cancel_path_edit(cx);
+        self.dismiss_address_menu(cx);
         if index >= self.workspace.tabs.len() || index == self.workspace.active_tab {
             return;
         }
@@ -528,6 +603,7 @@ impl MainWindow {
         self.workspace.list_cancel.store(true, Ordering::Release);
         self.workspace.list_generation = self.workspace.list_generation.wrapping_add(1);
         self.workspace.active_tab = index;
+        self.workspace.tab_scroll.scroll_to_item(index);
         let state = self.workspace.tabs[index].clone();
         let needs_load = self.restore_page_context(state, cx);
         if needs_load {
@@ -544,6 +620,8 @@ impl MainWindow {
     }
 
     fn new_directory_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_path_edit(cx);
+        self.dismiss_address_menu(cx);
         if self.workspace.tabs.len() >= 12 {
             self.workspace.status = "最多同时打开 12 个目录标签".into();
             cx.notify();
@@ -582,7 +660,32 @@ impl MainWindow {
         self.select_directory_tab(self.workspace.tabs.len() - 1, cx);
     }
 
+    pub(super) fn directory_tab_shortcut(
+        &mut self,
+        kind: u8,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings_page.is_some() || self.workspace.mode != ViewMode::Directory {
+            return;
+        }
+        match kind {
+            0 => self.new_directory_tab(window, cx),
+            1 => self.close_directory_tab(self.workspace.active_tab, cx),
+            2 | 3 => {
+                let count = self.workspace.tabs.len();
+                if count > 0 {
+                    let step = if kind == 2 { 1 } else { count - 1 };
+                    self.select_directory_tab((self.workspace.active_tab + step) % count, cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn close_directory_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.cancel_path_edit(cx);
+        self.dismiss_address_menu(cx);
         if self.workspace.tabs.len() == 1 {
             return;
         }
@@ -690,6 +793,8 @@ impl MainWindow {
         cx.notify();
     }
     pub(super) fn workspace_switch(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        self.cancel_path_edit(cx);
+        self.dismiss_address_menu(cx);
         if mode == self.workspace.mode {
             return;
         }
@@ -841,7 +946,8 @@ impl MainWindow {
                 .as_ref()
                 .is_some_and(|p| key(Path::new(p)) == key(Path::new(&h.path)))
         });
-        self.workspace.editing_path = false;
+        self.cancel_path_edit(cx);
+        self.dismiss_address_menu(cx);
         self.workspace.show_actions = false;
         self.workspace.mode = mode;
         self.workspace.pending_hit = pending;
@@ -1126,8 +1232,14 @@ impl MainWindow {
                             s.partial_reasons(),
                             s.hardlinks
                         );
-                        this.workspace.scan = Some(s);
-                        this.workspace.scan_lookup = lookup;
+                        let previous_scan = this.workspace.scan.replace(Arc::new(s));
+                        let previous_lookup =
+                            std::mem::replace(&mut this.workspace.scan_lookup, lookup);
+                        cx.background_executor()
+                            .spawn(async move {
+                                drop((previous_scan, previous_lookup));
+                            })
+                            .detach();
                         if this.workspace.mode == ViewMode::Usage {
                             let focus = this.active_workspace_hit().map(|h| h.path);
                             this.show_scanned_directory(focus, cx);

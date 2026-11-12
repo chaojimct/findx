@@ -747,3 +747,7 @@ mod accounting_tests {
         assert!(v.total > 0 && v.free <= v.total && v.used() <= v.total);
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "allocation_batch_probe.rs"]
+mod allocation_batch_probe;

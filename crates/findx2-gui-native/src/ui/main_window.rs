@@ -62,6 +62,10 @@ actions!(
         WorkspaceUp,
         WorkspaceFocusPath,
         WorkspaceRefresh,
+        DirectoryNewTab,
+        DirectoryCloseTab,
+        DirectoryNextTab,
+        DirectoryPreviousTab,
     ]
 );
 
@@ -128,6 +132,8 @@ pub struct MainWindow {
 
 impl MainWindow {
     fn open_settings_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_path_edit(cx);
+        self.dismiss_address_menu(cx);
         if self.settings_page.is_some() {
             return;
         }
@@ -189,6 +195,10 @@ impl MainWindow {
             KeyBinding::new("alt-up", WorkspaceUp, Some("FindXMain")),
             KeyBinding::new("ctrl-l", WorkspaceFocusPath, Some("FindXMain")),
             KeyBinding::new("f5", WorkspaceRefresh, Some("FindXMain")),
+            KeyBinding::new("ctrl-t", DirectoryNewTab, Some("FindXMain")),
+            KeyBinding::new("ctrl-w", DirectoryCloseTab, Some("FindXMain")),
+            KeyBinding::new("ctrl-tab", DirectoryNextTab, Some("FindXMain")),
+            KeyBinding::new("ctrl-shift-tab", DirectoryPreviousTab, Some("FindXMain")),
             KeyBinding::new("down", SelectNextResult, Some("FindXMain")),
             KeyBinding::new("up", SelectPrevResult, Some("FindXMain")),
             KeyBinding::new("home", SelectFirstResult, Some("FindXMain")),
@@ -1633,6 +1643,7 @@ impl Render for MainWindow {
         let viewport = window.viewport_size();
         let content_width = viewport.width.as_f32();
         self.last_content_width = content_width;
+        self.ensure_usage_scene(window, cx);
         let rail_width = if self.workspace.mode == ViewMode::Directory {
             workspace::DIRECTORY_SIDEBAR_WIDTH
         } else {
@@ -1783,13 +1794,23 @@ impl Render for MainWindow {
             }))
             .on_action(cx.listener(|this, _: &WorkspaceUp, _, cx| this.workspace_up(cx)))
             .on_action(cx.listener(|this, _: &WorkspaceRefresh, _, cx| this.workspace_refresh(cx)))
+            .on_action(cx.listener(|this, _: &DirectoryNewTab, window, cx| {
+                this.directory_tab_shortcut(0, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DirectoryCloseTab, window, cx| {
+                this.directory_tab_shortcut(1, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DirectoryNextTab, window, cx| {
+                this.directory_tab_shortcut(2, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DirectoryPreviousTab, window, cx| {
+                this.directory_tab_shortcut(3, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &WorkspaceFocusPath, window, cx| {
                 if this.settings_page.is_some() || this.workspace.mode == ViewMode::Search {
                     return;
                 }
-                this.workspace.editing_path = true;
-                this.workspace.path.update(cx, |i, cx| i.focus(window, cx));
-                cx.notify();
+                this.begin_path_edit(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectNextResult, _, cx| {
                 this.move_sel(ResultNavKey::ArrowDown, cx)
@@ -1850,6 +1871,17 @@ impl Render for MainWindow {
                     .when(self.workspace.show_actions, |view| {
                         view.child(self.render_workspace_actions(cx))
                     })
+            })
+            .when_some(self.workspace.address_menu.clone(), |view, menu| {
+                view.child(
+                    deferred(
+                        anchored()
+                            .position(self.workspace.address_menu_position)
+                            .snap_to_window_with_margin(px(8.))
+                            .child(menu),
+                    )
+                    .with_priority(gpui_kit::base::POPUP_PRIORITY),
+                )
             })
             .when_some(self.file_actions.keyboard_menu.clone(), |view, menu| {
                 view.child(
@@ -2019,6 +2051,10 @@ mod key_binding_tests {
             "f2",
             "alt-enter",
             "ctrl-a",
+            "ctrl-t",
+            "ctrl-w",
+            "ctrl-tab",
+            "ctrl-shift-tab",
         ] {
             assert!(
                 gpui_kit::Keystroke::parse(key).is_ok(),

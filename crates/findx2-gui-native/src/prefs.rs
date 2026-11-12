@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct LocalPrefs {
     #[serde(default)]
+    pub usage_reduce_motion: bool,
+    #[serde(default)]
     pub browser_favorites: Vec<String>,
     #[serde(default)]
     pub browser_recent: Vec<String>,
@@ -45,6 +47,7 @@ fn default_true() -> bool {
 impl Default for LocalPrefs {
     fn default() -> Self {
         Self {
+            usage_reduce_motion: false,
             browser_favorites: Vec::new(),
             browser_recent: Vec::new(),
             browser_show_hidden: false,

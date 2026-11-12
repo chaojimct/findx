@@ -64,7 +64,7 @@ pub(super) struct FileActions {
     show_report: bool,
     activity_dismissed: bool,
     pub(super) native_menu_open: bool,
-    native_menu_focus_subscription: Option<Subscription>,
+    pub(super) native_menu_focus_subscription: Option<Subscription>,
     snapshot_key: Vec<(String, u64, u64)>,
     snapshot_generation: u64,
     snapshot_cancel: Arc<AtomicBool>,
@@ -235,7 +235,7 @@ impl MainWindow {
                 .map(|h| h.path.into())
         }
     }
-    fn track_native_menu_focus(
+    pub(super) fn track_native_menu_focus(
         &mut self,
         focus: FocusHandle,
         window: &mut Window,

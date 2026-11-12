@@ -32,3 +32,7 @@ pub mod disk_usage;
 pub mod file_identity;
 
 pub mod file_transfer;
+
+pub mod navigation;
+
+pub mod usage_view;
