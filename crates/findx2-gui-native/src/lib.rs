@@ -28,3 +28,7 @@ pub mod service_control;
 pub mod browser;
 
 pub mod disk_usage;
+
+pub mod file_identity;
+
+pub mod file_transfer;

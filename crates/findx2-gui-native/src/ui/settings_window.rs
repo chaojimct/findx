@@ -1,3 +1,4 @@
+use gpui_kit::component::{Icon, IconName};
 use std::rc::Rc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -15,20 +16,60 @@ use crate::settings_logic::{
     CLOSE_DIRTY_MESSAGE, DraftCommit, FindxGuiSettings, UiThemePref, commit_save_interval_secs,
     commit_search_limit, form_is_dirty,
 };
-use crate::theme::FindxTokens;
+use crate::theme::{FindxTokens, ThemeStyle};
 use crate::ui::update_card::{UpdateCardState, render_update_card};
 use crate::update_logic::UpdatePhase;
 
+// Fixed-width content avoids Button's internal centered label changing each row's icon origin.
+fn settings_nav_content(icon: Icon, label: &'static str) -> impl IntoElement {
+    h_flex()
+        .w(px(152.))
+        .items_center()
+        .child(div().w(px(8.)).flex_shrink_0())
+        .child(
+            h_flex()
+                .w(px(20.))
+                .flex_shrink_0()
+                .justify_center()
+                .child(icon.size_4()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .pl_1()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(label),
+        )
+        .child(div().w(px(8.)).flex_shrink_0())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
+    Appearance,
+    Files,
+    Preview,
+    Shortcuts,
+    About,
     Index,
     Search,
-    Service,
-    Advanced,
     Diagnostics,
 }
 
+#[derive(Clone, Copy)]
+pub enum SettingsEvent {
+    Return,
+    CloseApp,
+    Stay,
+}
+impl EventEmitter<SettingsEvent> for SettingsWindow {}
+
 pub struct SettingsWindow {
+    embedded: bool,
+    closing_app: bool,
+    style: ThemeStyle,
+    original_style: ThemeStyle,
     session: Entity<AppSession>,
     tab: SettingsTab,
     settings: FindxGuiSettings,
@@ -57,6 +98,24 @@ pub struct SettingsWindow {
 
 impl SettingsWindow {
     pub fn new(session: Entity<AppSession>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_inner(session, false, window, cx)
+    }
+
+    pub fn new_embedded(
+        session: Entity<AppSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_inner(session, true, window, cx)
+    }
+
+    fn new_inner(
+        session: Entity<AppSession>,
+        embedded: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let style = session.read(cx).prefs.theme_style;
         let (settings, theme) = session.read_with(cx, |s, _| (s.settings.clone(), s.prefs.theme));
         let search_limit = cx
             .new(|cx| InputState::new(window, cx).default_value(settings.search_limit.to_string()));
@@ -76,8 +135,12 @@ impl SettingsWindow {
         });
 
         let mut this = Self {
+            embedded,
+            closing_app: false,
+            style,
+            original_style: style,
             session,
-            tab: SettingsTab::Index,
+            tab: SettingsTab::Appearance,
             original: settings.clone(),
             settings,
             theme,
@@ -141,10 +204,12 @@ impl SettingsWindow {
                 }
             }),
         );
-        let entity = cx.entity();
-        window.on_window_should_close(cx, move |window, cx| {
-            entity.update(cx, |this, cx| this.confirm_close(window, cx))
-        });
+        if !embedded {
+            let entity = cx.entity();
+            window.on_window_should_close(cx, move |window, cx| {
+                entity.update(cx, |this, cx| this.confirm_close(window, cx))
+            });
+        }
 
         this.refresh_service(cx);
         this
@@ -173,18 +238,21 @@ impl SettingsWindow {
     }
 
     fn is_dirty(&self, cx: &App) -> bool {
-        form_is_dirty(
-            &self.settings,
-            Some(&self.original),
-            self.theme,
-            self.original_theme,
-            &self.search_limit_text(cx),
-            &self.save_interval_text(cx),
-        )
+        self.style != self.original_style
+            || form_is_dirty(
+                &self.settings,
+                Some(&self.original),
+                self.theme,
+                self.original_theme,
+                &self.search_limit_text(cx),
+                &self.save_interval_text(cx),
+            )
     }
 
     fn confirm_close(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.saving || self.service_busy {
+            self.hint = "正在保存或执行已确认的服务操作；完成前不能离开设置".into();
+            cx.notify();
             return false;
         }
         if !self.is_dirty(cx) {
@@ -198,11 +266,12 @@ impl SettingsWindow {
     fn revert_unsaved(&mut self, cx: &mut Context<Self>) {
         self.settings = self.original.clone();
         self.theme = self.original_theme;
-        crate::theme::apply_findx_theme(
-            self.original_theme
-                .resolve(self.session.read(cx).system_dark),
-            cx,
-        );
+        self.style = self.original_style;
+        self.session.update(cx, |s, cx| {
+            s.preview_theme = None;
+            s.apply_theme(cx);
+            cx.notify();
+        });
         cx.refresh_windows();
         self.hint = "已丢弃未保存的更改".into();
         cx.notify();
@@ -241,6 +310,8 @@ impl SettingsWindow {
         let theme = self.theme;
         let mut prefs = self.session.read(cx).prefs.clone();
         prefs.theme = theme;
+        let style = self.style;
+        prefs.theme_style = style;
         let handle = window.window_handle();
         self.saving = true;
         self.hint = "正在保存并回读隔离设置…".into();
@@ -259,7 +330,9 @@ impl SettingsWindow {
                     if readback != saved {
                         return Err("设置回读与保存内容不一致".into());
                     }
-                    if crate::prefs::load_prefs().theme != local_prefs.theme {
+                    if crate::prefs::load_prefs().theme != local_prefs.theme
+                        || crate::prefs::load_prefs().theme_style != local_prefs.theme_style
+                    {
                         return Err("主题回读失败".into());
                     }
                     Ok::<(), String>(())
@@ -274,9 +347,12 @@ impl SettingsWindow {
                         this.original = next.clone();
 
                         this.original_theme = theme;
+                        this.original_style = style;
                         this.session.update(cx, |s, cx| {
                             s.settings = next;
                             s.prefs.theme = theme;
+                            s.prefs.theme_style = style;
+                            s.preview_theme = None;
                             s.apply_theme(cx);
                             cx.notify();
                         });
@@ -288,7 +364,9 @@ impl SettingsWindow {
             })
             .ok();
             if ok && close_after {
-                let _ = handle.update(cx, |_, w, _| w.remove_window());
+                let _ = handle.update(cx, |_, w, cx| {
+                    let _ = this.update(cx, |this, cx| this.finish_leave(w, cx));
+                });
             }
         })
         .detach();
@@ -296,9 +374,7 @@ impl SettingsWindow {
 
     fn set_theme(&mut self, pref: UiThemePref, cx: &mut Context<Self>) {
         self.theme = pref;
-        let dark = self.session.read(cx).system_dark;
-        crate::theme::apply_findx_theme(pref.resolve(dark), cx);
-        cx.refresh_windows();
+        self.preview_theme(cx);
         cx.notify();
     }
 
@@ -310,10 +386,75 @@ impl SettingsWindow {
         }
     }
 
-    fn close_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.confirm_close(window, cx) {
+    fn preview_theme(&self, cx: &mut Context<Self>) {
+        self.session.update(cx, |s, cx| {
+            s.preview_theme = Some((self.style, self.theme));
+            s.apply_theme(cx);
+            cx.notify();
+        });
+        cx.refresh_windows();
+    }
+
+    pub fn request_leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.closing_app = false;
+        self.close_clicked(window, cx);
+    }
+
+    pub fn request_app_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.closing_app = true;
+        self.confirm_close(window, cx)
+    }
+
+    fn finish_leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.session.update(cx, |session, cx| {
+            session.preview_theme = None;
+            session.apply_theme(cx);
+            cx.notify();
+        });
+        if self.embedded {
+            cx.emit(if self.closing_app {
+                SettingsEvent::CloseApp
+            } else {
+                SettingsEvent::Return
+            });
+        } else {
             window.remove_window();
         }
+    }
+
+    fn close_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirm_close(window, cx) {
+            self.finish_leave(window, cx);
+        }
+    }
+
+    fn restore_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings = FindxGuiSettings::isolated_default(
+            "findx2-native-dev",
+            crate::isolation::isolated_index_path()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        self.theme = UiThemePref::Light;
+        self.style = ThemeStyle::Warm;
+        for (input, value) in [
+            (&self.search_limit, self.settings.search_limit.to_string()),
+            (
+                &self.save_interval,
+                self.settings.save_interval_secs.to_string(),
+            ),
+            (&self.index_path, self.settings.index_path.clone()),
+            (&self.pipe_name, self.settings.pipe_name.clone()),
+            (&self.service_exe, self.settings.service_exe_path.clone()),
+        ] {
+            input.update(cx, |i, cx| i.set_value(value, window, cx));
+        }
+        self.excluded.update(cx, |i, cx| {
+            i.set_value(self.settings.excluded_dirs.join("\n"), window, cx)
+        });
+        self.preview_theme(cx);
+        self.hint = "默认值已载入草稿；保存后生效，不执行任何正式服务操作".into();
+        cx.notify();
     }
 }
 
@@ -322,43 +463,174 @@ fn theme_auto_check_placeholder() -> bool {
 }
 
 impl Render for SettingsWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = Self::tokens(cx);
-        let dirty = self.is_dirty(cx);
-        let tab = self.tab;
         let roots = self.session.read(cx).available_roots.clone();
-
-        v_flex()
-            .size_full()
-            .relative()
-            .overflow_hidden()
-            .bg(tokens.bg)
-            .text_color(tokens.text_primary)
-            .child(self.render_header(dirty, tokens, cx))
+        let dirty = self.is_dirty(cx);
+        let categories = [
+            (SettingsTab::Appearance, "外观"),
+            (SettingsTab::Search, "搜索"),
+            (SettingsTab::Files, "文件浏览"),
+            (SettingsTab::Preview, "预览"),
+            (SettingsTab::Index, "索引与服务"),
+            (SettingsTab::Shortcuts, "快捷键"),
+            (SettingsTab::Diagnostics, "诊断"),
+            (SettingsTab::About, "关于"),
+        ];
+        let title = categories
+            .iter()
+            .find(|(tab, _)| *tab == self.tab)
+            .map(|(_, label)| *label)
+            .unwrap_or("设置");
+        let body = match self.tab {
+            SettingsTab::Appearance => self.render_appearance(tokens, cx).into_any_element(),
+            SettingsTab::Search => self.render_search_tab(tokens, cx).into_any_element(),
+            SettingsTab::Index => v_flex()
+                .gap_6()
+                .child(self.render_service_tab(tokens, cx))
+                .child(self.render_index_tab(&roots, tokens, cx))
+                .child(self.render_advanced_tab(tokens, cx))
+                .into_any_element(),
+            SettingsTab::About => self.render_advanced_tab(tokens, cx).into_any_element(),
+            SettingsTab::Diagnostics => self.render_diagnostics(tokens, cx).into_any_element(),
+            SettingsTab::Files => self
+                .render_policy(
+                    "目录工作区",
+                    &[
+                        "目录标签拥有独立的位置、前进/后退记录、筛选与选中状态。",
+                        "当前目录过滤只匹配本层名称，不递归；需要后代文件请显式发起范围索引搜索。",
+                        "复制、移动、重命名均需审查目标，默认不覆盖；当前不提供删除或通用撤销。",
+                    ],
+                    tokens,
+                )
+                .into_any_element(),
+            SettingsTab::Preview => self
+                .render_policy(
+                    "共享文件预览",
+                    &[
+                        "在搜索或文件页按需展开预览，可拖动分隔线调整宽度。",
+                        "PDF 提供多页导航与适宽；Office 优先使用本机预览处理器。",
+                        "快速切换会取消或丢弃过期请求，不修改原始文件。PDF 内存输入上限为 32 MiB。",
+                        "主题作用于 FindX 原生界面；WPS/Office 处理器内部外观由其自身控制。",
+                    ],
+                    tokens,
+                )
+                .into_any_element(),
+            SettingsTab::Shortcuts => self
+                .render_policy(
+                    "键盘操作",
+                    &[
+                        "Ctrl+F  搜索输入 / 目录本层过滤",
+                        "Ctrl+L  编辑目录地址",
+                        "Alt+← / Alt+→  当前标签后退 / 前进；Alt+↑  上一级",
+                        "F5  刷新当前目录；扫描必须显式开始",
+                        "↑ / ↓ / Home / End  选择列表；Enter 激活选中项",
+                        "Ctrl+Enter  在文件中定位；Ctrl+,  打开设置",
+                    ],
+                    tokens,
+                )
+                .into_any_element(),
+        };
+        let navigation = v_flex()
+            .id("settings-navigation")
+            .min_h_0()
+            .overflow_y_scrollbar()
+            .w(px(176.))
+            .h_full()
+            .flex_shrink_0()
+            .p_3()
+            .gap_1()
+            .bg(tokens.surface)
+            .border_r_1()
+            .border_color(tokens.border)
+            .child(div().text_lg().px_2().py_3().child("设置"))
+            .child(
+                Button::new("settings-back")
+                    .ghost()
+                    .w_full()
+                    .h(px(32.))
+                    .px_0()
+                    .accessibility_label("返回工作区")
+                    .child(settings_nav_content(
+                        Icon::new(IconName::ArrowLeft),
+                        "返回工作区",
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| this.request_leave(window, cx))),
+            )
+            .child(div().h(px(12.)))
+            .children(categories.into_iter().map(|(tab, label)| {
+                Button::new(SharedString::from(format!("settings-category-{label}")))
+                    .ghost()
+                    .w_full()
+                    .h(px(32.))
+                    .px_0()
+                    .accessibility_label(label)
+                    .child(settings_nav_content(
+                        Icon::default().path(match tab {
+                            SettingsTab::Appearance => "icons/palette.svg",
+                            SettingsTab::Search => "icons/search.svg",
+                            SettingsTab::Files => "icons/folder.svg",
+                            SettingsTab::Preview => "icons/panel-right.svg",
+                            SettingsTab::Index => "icons/database.svg",
+                            SettingsTab::Shortcuts => "icons/keyboard.svg",
+                            SettingsTab::Diagnostics => "icons/activity.svg",
+                            SettingsTab::About => "icons/info.svg",
+                        }),
+                        label,
+                    ))
+                    .selected(self.tab == tab)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tab = tab;
+                        cx.notify();
+                    }))
+            }));
+        let content = v_flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(
+                h_flex()
+                    .px_6()
+                    .py_4()
+                    .gap_3()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(tokens.border)
+                    .child(div().text_lg().child(title))
+                    .when(dirty, |view| {
+                        view.child(div().text_xs().text_color(tokens.accent).child("● 未保存"))
+                    }),
+            )
             .child(
                 div()
                     .id("settings-scroll")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scrollbar()
-                    .p_4()
-                    .child(match tab {
-                        SettingsTab::Index => {
-                            self.render_index_tab(&roots, tokens, cx).into_any_element()
-                        }
-                        SettingsTab::Search => {
-                            self.render_search_tab(tokens, cx).into_any_element()
-                        }
-                        SettingsTab::Service => {
-                            self.render_service_tab(tokens, cx).into_any_element()
-                        }
-                        SettingsTab::Advanced => {
-                            self.render_advanced_tab(tokens, cx).into_any_element()
-                        }
-                        SettingsTab::Diagnostics => {
-                            self.render_diagnostics(tokens, cx).into_any_element()
-                        }
-                    }),
+                    .p_6()
+                    .child(body),
+            );
+        v_flex()
+            .size_full()
+            .relative()
+            .overflow_hidden()
+            .bg(tokens.bg)
+            .text_color(tokens.text_primary)
+            .when(!self.embedded, |view| {
+                view.child(crate::ui::chrome::title_bar(
+                    div().px_3().text_sm().child("FindX · 设置"),
+                    window,
+                    cx,
+                ))
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .items_stretch()
+                    .child(navigation)
+                    .child(content),
             )
             .child(self.render_footer(tokens, cx))
             .when(self.service_pending.is_some(), |view| {
@@ -367,65 +639,50 @@ impl Render for SettingsWindow {
             .when(self.close_guarded, |view| {
                 view.child(self.render_close_confirm(tokens, cx))
             })
-            .when(self.show_syntax, |this| {
-                this.child(self.render_syntax_help(tokens, cx))
+            .when(self.show_syntax, |view| {
+                view.child(self.render_syntax_help(tokens, cx))
             })
     }
 }
 
 impl SettingsWindow {
-    fn render_header(
-        &self,
-        dirty: bool,
-        tokens: FindxTokens,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_policy(&self, title: &str, lines: &[&str], tokens: FindxTokens) -> AnyElement {
         v_flex()
-            .w_full()
-            .bg(tokens.surface)
-            .border_b_1()
-            .border_color(tokens.border)
-            .flex_shrink_0()
-            .px_4()
-            .pt_3()
-            .gap_2()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(div().child("FindX2 设置"))
-                    .when(dirty, |this| {
-                        this.child(div().text_color(tokens.accent).child("● 未保存"))
-                    }),
-            )
-            .child(
-                h_flex().gap_1().children(
-                    [
-                        (SettingsTab::Index, "索引"),
-                        (SettingsTab::Search, "搜索"),
-                        (SettingsTab::Service, "服务模式"),
-                        (SettingsTab::Advanced, "外观与高级"),
-                        (SettingsTab::Diagnostics, "诊断"),
-                    ]
-                    .into_iter()
-                    .map(|(tab, label)| {
-                        let selected = self.tab == tab;
-                        {
-                            let entity = cx.entity();
-                            Button::new(SharedString::from(label))
-                                .ghost()
-                                .label(label)
-                                .selected(selected)
-                                .on_click(move |_, _, cx| {
-                                    entity.update(cx, |this, cx| {
-                                        this.tab = tab;
-                                        cx.notify();
-                                    });
-                                })
-                        }
-                    }),
-                ),
-            )
+            .max_w(px(780.))
+            .gap_4()
+            .child(section_title(title, tokens))
+            .children(lines.iter().map(|line| {
+                div()
+                    .text_sm()
+                    .text_color(tokens.text_secondary)
+                    .child(line.to_string())
+            }))
+            .into_any_element()
+    }
+
+    fn render_appearance(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex().w_full().max_w(px(900.)).gap_5()
+            .child(section_title("主题风格",tokens))
+            .child(div().text_sm().text_color(tokens.text_secondary).child("风格与明暗模式独立组合。选择会立即预览；取消或丢弃可还原。"))
+            .child(h_flex().gap_3().flex_wrap().children(ThemeStyle::ALL.into_iter().map(|(style,label)|{
+                let p=FindxTokens::for_style(style,self.theme.resolve(self.session.read(cx).system_dark));
+                let selected=self.style==style;
+                Button::new(SharedString::from(format!("theme-style-{label}")))
+                            .ghost()
+                            .accessibility_label(format!("主题风格：{label}"))
+                            .selected(selected)
+                            .h(px(136.))
+                            .flex_col().w(px(208.)).p_3().gap_3().rounded_lg().border_2().border_color(if selected {tokens.accent} else {tokens.border}).bg(p.bg).cursor_pointer()
+                    .child(v_flex().w_full().items_center().gap_3().child(h_flex().w(px(170.)).h(px(78.)).rounded_md().overflow_hidden().border_1().border_color(p.border)
+                        .child(div().w(px(34.)).h_full().bg(p.surface))
+                        .child(v_flex().flex_1().p_2().gap_2().child(div().h(px(8.)).w_full().bg(p.surface)).child(div().h(px(8.)).w(px(72.)).bg(p.row_selected)).child(div().h(px(8.)).w(px(92.)).bg(p.border_soft))))
+                    .child(h_flex().gap_2().when(selected,|v|v.child(Icon::new(IconName::Check).size_3())).child(div().text_sm().text_color(p.text_primary).child(label.to_string()))))
+                    .on_click(cx.listener(move|this,_,_,cx|{this.style=style;this.preview_theme(cx);cx.notify();}))
+            })))
+            .child(section_title("明暗模式",tokens))
+            .child(h_flex().gap_2().flex_wrap().children([(UiThemePref::Light,"浅色"),(UiThemePref::Dark,"深色"),(UiThemePref::System,"跟随系统")].into_iter().map(|(pref,label)|Button::new(SharedString::from(format!("theme-mode-{label}"))).label(label).selected(self.theme==pref).on_click(cx.listener(move|this,_,_,cx|this.set_theme(pref,cx))))))
+            .child(div().text_sm().text_color(tokens.text_secondary).child("跟随系统会监听 Windows 外观变化。已保存的风格与模式将在重启后恢复。"))
+            .child(div().mt_4().p_4().rounded_md().bg(tokens.surface).text_sm().text_color(tokens.text_secondary).child("标题栏、列表、菜单、预览外壳与占用图统一使用所选主题。WPS / Office 预览内部不保证换肤。"))
     }
 
     fn render_index_tab(
@@ -703,32 +960,6 @@ impl SettingsWindow {
                     })
                 },
             ))
-            .child(section_title("界面主题", tokens))
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(tokens.text_secondary)
-                    .child("改主题会立刻预览。未保存就关闭时，会回到打开设置页时的主题。"),
-            )
-            .child(
-                h_flex().gap_2().children(
-                    [
-                        (UiThemePref::Light, "浅色"),
-                        (UiThemePref::Dark, "深色"),
-                        (UiThemePref::System, "跟随系统"),
-                    ]
-                    .into_iter()
-                    .map(|(pref, label)| {
-                        let entity = cx.entity();
-                        Button::new(SharedString::from(label))
-                            .label(label)
-                            .selected(self.theme == pref)
-                            .on_click(move |_, _, cx| {
-                                entity.update(cx, |this, cx| this.set_theme(pref, cx));
-                            })
-                    }),
-                ),
-            )
             .child(section_title("路径", tokens))
             .child(
                 v_flex()
@@ -822,10 +1053,12 @@ impl SettingsWindow {
                                             "save-close" => this.save(true, window, cx),
                                             "discard-close" => {
                                                 this.revert_unsaved(cx);
-                                                window.remove_window();
+                                                this.finish_leave(window, cx);
                                             }
                                             _ => {
                                                 this.close_guarded = false;
+                                                this.closing_app = false;
+                                                cx.emit(SettingsEvent::Stay);
                                                 cx.notify();
                                             }
                                         })
@@ -923,6 +1156,13 @@ impl SettingsWindow {
                     .text_ellipsis()
                     .child(self.hint.clone()),
             )
+            .child(
+                Button::new("settings-defaults")
+                    .ghost()
+                    .label("恢复默认")
+                    .disabled(self.saving || self.service_busy)
+                    .on_click(cx.listener(|this, _, window, cx| this.restore_defaults(window, cx))),
+            )
             .child({
                 let entity = cx.entity();
                 Button::new("save")
@@ -936,7 +1176,8 @@ impl SettingsWindow {
             .child({
                 let entity = cx.entity();
                 Button::new("close")
-                    .label("关闭")
+                    .label("取消并返回")
+                    .disabled(self.saving || self.service_busy)
                     .on_click(move |_, window, cx| {
                         entity.update(cx, |this, cx| this.close_clicked(window, cx));
                     })

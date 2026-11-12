@@ -1,5 +1,16 @@
+#[path = "file_actions.rs"]
+mod file_actions;
+use file_actions::FileActions;
+#[path = "file_context.rs"]
+mod file_context;
+#[path = "search_session.rs"]
+mod search_session;
+use search_session::SearchSnapshot;
+#[path = "workspace.rs"]
+mod workspace;
 use gpui_kit::component::Disableable as _;
 use std::time::Duration;
+use workspace::{ViewMode, Workspace};
 
 use findx2_ipc::SearchHitDto;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -10,7 +21,6 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::result_table::{DEFAULT_WIDTHS, MIN_WIDTHS, ResultsTable};
-use crate::open_path;
 use crate::preview::{self, PreviewKind, PreviewState};
 use crate::search_logic::{
     self, ForceState, PREVIEW_DEFAULT_WIDTH_PX, ResultNavKey, SIDEBAR_WIDTH_PX, TimeFilter,
@@ -33,6 +43,25 @@ actions!(
         ToggleDiag,
         FocusSearch,
         OpenSettings,
+        ShowFileMenu,
+        ContextOpen,
+        ContextOpenWith,
+        ContextLocate,
+        ContextCopyPath,
+        ContextCopy,
+        ContextCut,
+        ContextPaste,
+        ContextRename,
+        ContextProperties,
+        ContextAnalyze,
+        ContextScope,
+        ContextSelectAll,
+        ContextAutoFit,
+        WorkspaceBack,
+        WorkspaceForward,
+        WorkspaceUp,
+        WorkspaceFocusPath,
+        WorkspaceRefresh,
     ]
 );
 
@@ -40,12 +69,29 @@ const PAGE_SIZE: usize = 200;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(60);
 
 pub struct MainWindow {
+    file_actions: FileActions,
+    search_selection: std::collections::BTreeSet<usize>,
+    focus: FocusHandle,
+    identity_key: Option<(String, u64, u64)>,
+    identity_generation: u64,
+    selected_identity: Option<crate::file_identity::FileStamp>,
+    identity_pending: bool,
+    identity_error: Option<String>,
+    pending_open: Option<SearchHitDto>,
+    run_pending: Option<(SearchHitDto, crate::file_identity::FileStamp)>,
+    workspace: Workspace,
+    settings_page: Option<Entity<super::settings_window::SettingsWindow>>,
+    settings_pending_mode: Option<ViewMode>,
+    preview_resize: Option<(f32, f32)>,
+    actual_preview_width: f32,
     table: Entity<TableState<ResultsTable>>,
     page_loading: bool,
     page_error: bool,
     _page_task: Option<Task<()>>,
     session: Entity<AppSession>,
     search: Entity<InputState>,
+    search_scope: Option<std::path::PathBuf>,
+    global_search: Option<SearchSnapshot>,
     type_filter: TypeFilter,
     time_filter: TimeFilter,
     path_prefix: String,
@@ -57,7 +103,9 @@ pub struct MainWindow {
     search_status: SharedString,
     search_gen: u64,
     status_gen: u64,
+    preview_diagnostics: bool,
     preview: PreviewState,
+    preview_memo: std::collections::HashMap<(String, u64, u64), crate::preview_worker::PdfOptions>,
     preview_gen: u64,
     preview_cancel: crate::preview_worker::Cancel,
     pdf_options: crate::preview_worker::PdfOptions,
@@ -68,6 +116,7 @@ pub struct MainWindow {
     sidebar_force: Option<ForceState>,
     preview_force: Option<ForceState>,
     last_content_width: f32,
+    table_viewport_width: f32,
     last_diag: String,
     key_traces: Vec<String>,
     selection_resets: Vec<String>,
@@ -78,8 +127,68 @@ pub struct MainWindow {
 }
 
 impl MainWindow {
+    fn open_settings_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_page.is_some() {
+            return;
+        }
+        self.pause_preview();
+        self.workspace.show_actions = false;
+        let session = self.session.clone();
+        let page =
+            cx.new(|cx| super::settings_window::SettingsWindow::new_embedded(session, window, cx));
+        self._subscriptions.push(
+            cx.subscribe_in(&page, window, |this, _, event, window, cx| {
+                use super::settings_window::SettingsEvent;
+                match event {
+                    SettingsEvent::Return => {
+                        this.settings_page = None;
+                        if let Some(mode) = this.settings_pending_mode.take() {
+                            this.workspace_switch(mode, cx);
+                        }
+                        cx.notify();
+                    }
+                    SettingsEvent::CloseApp => window.remove_window(),
+                    SettingsEvent::Stay => {
+                        this.settings_pending_mode = None;
+                        cx.notify();
+                    }
+                }
+            }),
+        );
+        self.settings_page = Some(page);
+        cx.notify();
+    }
+
+    fn request_mode(&mut self, mode: ViewMode, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(page) = self.settings_page.clone() {
+            self.settings_pending_mode = Some(mode);
+            page.update(cx, |page, cx| page.request_leave(window, cx));
+        } else {
+            self.workspace_switch(mode, cx);
+            if mode == ViewMode::Search {
+                self.search.update(cx, |input, cx| input.focus(window, cx));
+            } else {
+                window.focus(&self.focus, cx);
+            }
+        }
+    }
+
     pub fn new(session: Entity<AppSession>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.bind_keys([
+            KeyBinding::new("shift-f10", ShowFileMenu, Some("FindXMain")),
+            KeyBinding::new("menu", ShowFileMenu, Some("FindXMain")),
+            KeyBinding::new("ctrl-c", ContextCopy, Some("FindXMain")),
+            KeyBinding::new("ctrl-x", ContextCut, Some("FindXMain")),
+            KeyBinding::new("ctrl-v", ContextPaste, Some("FindXMain")),
+            KeyBinding::new("ctrl-shift-c", ContextCopyPath, Some("FindXMain")),
+            KeyBinding::new("f2", ContextRename, Some("FindXMain")),
+            KeyBinding::new("alt-enter", ContextProperties, Some("FindXMain")),
+            KeyBinding::new("ctrl-a", ContextSelectAll, Some("FindXMain")),
+            KeyBinding::new("alt-left", WorkspaceBack, Some("FindXMain")),
+            KeyBinding::new("alt-right", WorkspaceForward, Some("FindXMain")),
+            KeyBinding::new("alt-up", WorkspaceUp, Some("FindXMain")),
+            KeyBinding::new("ctrl-l", WorkspaceFocusPath, Some("FindXMain")),
+            KeyBinding::new("f5", WorkspaceRefresh, Some("FindXMain")),
             KeyBinding::new("down", SelectNextResult, Some("FindXMain")),
             KeyBinding::new("up", SelectPrevResult, Some("FindXMain")),
             KeyBinding::new("home", SelectFirstResult, Some("FindXMain")),
@@ -122,13 +231,45 @@ impl MainWindow {
             .row_selectable(true)
             .col_selectable(false)
         });
+        let browser_widths = session
+            .read(cx)
+            .prefs
+            .browser_column_widths
+            .unwrap_or(super::browser_table::DEFAULT_WIDTHS);
+        let browser_widths = if session.read(cx).prefs.browser_column_widths.is_some() {
+            super::browser_table::migrate_widths(
+                browser_widths,
+                session.read(cx).prefs.browser_column_schema,
+            )
+        } else {
+            browser_widths
+        };
+        let mut workspace = Workspace::new(browser_widths, window, cx);
+        workspace.show_hidden = session.read(cx).prefs.browser_show_hidden;
         let mut this = Self {
+            file_actions: FileActions::default(),
+            search_selection: Default::default(),
+            focus: cx.focus_handle(),
+            identity_key: None,
+            identity_generation: 0,
+            selected_identity: None,
+            identity_pending: false,
+            identity_error: None,
+            pending_open: None,
+            run_pending: None,
+            workspace,
+            settings_page: None,
+            settings_pending_mode: None,
+            preview_resize: None,
+            actual_preview_width: PREVIEW_DEFAULT_WIDTH_PX,
             table: table.clone(),
             page_loading: false,
             page_error: false,
             _page_task: None,
             session: session.clone(),
             search: search.clone(),
+            search_scope: None,
+            global_search: None,
             type_filter: TypeFilter::All,
             time_filter: TimeFilter::All,
             path_prefix: String::new(),
@@ -140,7 +281,9 @@ impl MainWindow {
             search_status: "就绪".into(),
             search_gen: 0,
             status_gen: 0,
+            preview_diagnostics: false,
             preview: PreviewState::empty(),
+            preview_memo: std::collections::HashMap::new(),
             preview_gen: 0,
             preview_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pdf_options: Default::default(),
@@ -151,6 +294,7 @@ impl MainWindow {
             sidebar_force: None,
             preview_force: None,
             last_content_width: 1100.0,
+            table_viewport_width: 1100.0,
             last_diag: String::new(),
             key_traces: Vec::new(),
             selection_resets: Vec::new(),
@@ -160,43 +304,14 @@ impl MainWindow {
             _preview_task: None,
         };
 
-        this._subscriptions.push(cx.subscribe_in(
-            &search,
-            window,
-            |this, _input, event, window, cx| {
-                if let InputEvent::Change = event {
-                    this.schedule_search(window, cx);
-                }
-            },
-        ));
+        this.subscribe_search_input(search.clone(), window, cx);
         this._subscriptions
             .push(cx.observe(&session, |this, _, cx| {
                 cx.notify();
                 let _ = this;
             }));
 
-        this._subscriptions
-            .push(cx.subscribe(&table, |this, _, event: &TableEvent, cx| {
-                match event {
-                    TableEvent::SelectRow(ix) => this.set_selected(Some(*ix), cx),
-                    TableEvent::DoubleClickedRow(ix) => {
-                        this.set_selected(Some(*ix), cx);
-                        this.open_selected(cx);
-                    }
-                    TableEvent::ColumnWidthsChanged(widths) if widths.len() == 4 => {
-                        let widths =
-                            std::array::from_fn(|i| widths[i].as_f32().clamp(MIN_WIDTHS[i], 1600.));
-                        this.session.update(cx, |s, cx| {
-                            s.prefs.column_widths = Some(widths);
-                            crate::session::persist_prefs(s.prefs.clone(), cx);
-                        });
-                        // Keep delegate widths current so a later header refresh cannot undo a drag.
-                        this.table
-                            .update(cx, |t, _| t.delegate_mut().widths = widths);
-                    }
-                    _ => {}
-                }
-            }));
+        this.subscribe_results_table(table.clone(), cx);
         let session_for_appearance = session.clone();
         this._subscriptions
             .push(window.observe_window_appearance(move |window, cx| {
@@ -206,18 +321,88 @@ impl MainWindow {
                 );
                 session_for_appearance.update(cx, |s, cx| {
                     s.system_dark = dark;
-                    if s.prefs.theme == crate::settings_logic::UiThemePref::System {
+                    if s.preview_theme
+                        .map(|(_, pref)| pref)
+                        .unwrap_or(s.prefs.theme)
+                        == crate::settings_logic::UiThemePref::System
+                    {
                         s.apply_theme(cx);
                         cx.refresh_windows();
                     }
                     cx.notify();
                 });
             }));
+        let closing = cx.entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            closing.update(cx, |this, cx| {
+                if this.cancel_active_batch_before_close(cx) {
+                    return false;
+                }
+                if let Some(settings) = this.settings_page.clone() {
+                    settings.update(cx, |page, cx| page.request_app_close(window, cx))
+                } else {
+                    true
+                }
+            })
+        });
+        this.init_workspace(window, cx);
         this.schedule_status_poll(cx);
         if this.preview_file.is_some() {
             this.request_preview(cx);
         }
         this
+    }
+
+    fn subscribe_search_input(
+        &mut self,
+        input: Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self._subscriptions.push(cx.subscribe_in(
+            &input,
+            window,
+            |this, input, event, window, cx| {
+                if input.entity_id() != this.search.entity_id() {
+                    return;
+                }
+                if let InputEvent::Change = event {
+                    this.schedule_search(window, cx);
+                }
+            },
+        ));
+    }
+    fn subscribe_results_table(
+        &mut self,
+        table: Entity<TableState<ResultsTable>>,
+        cx: &mut Context<Self>,
+    ) {
+        self._subscriptions
+            .push(cx.subscribe(&table, |this, table, event: &TableEvent, cx| {
+                if table.entity_id() != this.table.entity_id() {
+                    return;
+                }
+                match event {
+                    TableEvent::SelectRow(ix) => this.table_selected_event(true, *ix, cx),
+                    TableEvent::DoubleClickedRow(ix) => {
+                        this.set_selected(Some(*ix), cx);
+                        this.open_selected(cx);
+                    }
+                    TableEvent::ColumnWidthsChanged(widths) if widths.len() == 4 => {
+                        let widths =
+                            std::array::from_fn(|i| widths[i].as_f32().clamp(MIN_WIDTHS[i], 1600.));
+                        this.session.update(cx, |s, cx| {
+                            s.prefs.column_widths = Some(widths);
+                            s.prefs.search_fit_columns = false;
+                            crate::session::persist_prefs(s.prefs.clone(), cx);
+                        });
+                        // Keep delegate widths current so a later header refresh cannot undo a drag.
+                        this.table
+                            .update(cx, |t, _| t.delegate_mut().widths = widths);
+                    }
+                    _ => {}
+                }
+            }));
     }
 
     fn current_query(&self, cx: &App) -> String {
@@ -234,6 +419,9 @@ impl MainWindow {
     }
 
     fn schedule_search(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace.mode != ViewMode::Search {
+            self.workspace_switch(ViewMode::Search, cx);
+        }
         self.search_gen = self.search_gen.wrapping_add(1);
         let generation = self.search_gen;
         self._search_task = Some(cx.spawn(async move |this, cx| {
@@ -253,6 +441,7 @@ impl MainWindow {
             self.record_reset("查询变空");
             self.hits.clear();
             self.match_total = 0;
+            self.search_selection.clear();
             self.selected = None;
             self.loading = false;
             self.search_status = "就绪".into();
@@ -268,6 +457,7 @@ impl MainWindow {
         self.match_total = 0;
         self.sync_table(true, cx);
         self.record_reset("重新查询");
+        self.search_selection.clear();
         self.selected = None;
         self.request_preview(cx);
         self.loading = true;
@@ -294,7 +484,14 @@ impl MainWindow {
                 this.loading = false;
                 match result {
                     Ok(out) => {
-                        this.hits = out.hits;
+                        this.hits = out
+                            .hits
+                            .into_iter()
+                            .map(|mut hit| {
+                                hit.path = workspace::display_path(std::path::Path::new(&hit.path));
+                                hit
+                            })
+                            .collect();
                         this.match_total = out.total;
                         let shown = this.hits.len();
                         let total = out.total as usize;
@@ -315,6 +512,7 @@ impl MainWindow {
                         this.hits.clear();
                         this.match_total = 0;
                         this.record_reset("查询失败");
+                        this.search_selection.clear();
                         this.selected = None;
                         this.search_status = format!("错误: {err}").into();
                         this.request_preview(cx);
@@ -372,7 +570,10 @@ impl MainWindow {
                         if out.hits.is_empty() {
                             this.match_total = this.hits.len() as u32;
                         } else {
-                            this.hits.extend(out.hits);
+                            this.hits.extend(out.hits.into_iter().map(|mut hit| {
+                                hit.path = workspace::display_path(std::path::Path::new(&hit.path));
+                                hit
+                            }));
                             this.match_total = out.total;
                         }
                         this.search_status = format!(
@@ -488,19 +689,27 @@ impl MainWindow {
     }
 
     fn set_selected(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
+        self.record_single_selection(true, index);
         if self.selected != index {
             if index.is_some() {
                 self.preview_file = None;
             }
             self.office_text_only = false;
-            self.pdf_options = Default::default();
             self.pdf_count = 0;
             self.selected = index;
-            self.request_preview(cx);
+            self.preview_active_selection(cx);
         } else {
             self.selected = index;
         }
         cx.notify();
+    }
+
+    fn pause_preview(&mut self) {
+        self.preview_cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.preview_gen = self.preview_gen.wrapping_add(1);
+        self._preview_task = None;
+        self.preview = PreviewState::empty();
     }
 
     fn request_preview(&mut self, cx: &mut Context<Self>) {
@@ -512,24 +721,33 @@ impl MainWindow {
         let prefer_native = !self.office_text_only;
         self.preview_gen = self.preview_gen.wrapping_add(1);
         let generation = self.preview_gen;
-        let local_file = self.preview_file.is_some();
-        let target = self
-            .selected
-            .and_then(|i| self.hits.get(i).cloned())
-            .or_else(|| {
-                self.preview_file.as_ref().map(|path| SearchHitDto {
-                    entry_idx: 0,
-                    name: std::path::Path::new(path)
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.clone()),
-                    path: path.clone(),
-                    size: 0,
-                    mtime: 0,
-                    is_directory: false,
-                    name_highlight: Vec::new(),
-                })
-            });
+        let visible = self.settings_page.is_none()
+            && self.workspace.mode != ViewMode::Usage
+            && match self.preview_force {
+                Some(ForceState::Hide) => false,
+                Some(ForceState::Show) => true,
+                None => self.session.read(cx).prefs.preview_open,
+            };
+        if !visible {
+            self._preview_task = None;
+            self.preview = PreviewState::empty();
+            return;
+        }
+        let local_file = self.preview_file.is_some() || self.workspace.mode != ViewMode::Search;
+        let target = self.active_workspace_hit().or_else(|| {
+            self.preview_file.as_ref().map(|path| SearchHitDto {
+                entry_idx: 0,
+                name: std::path::Path::new(path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone()),
+                path: path.clone(),
+                size: 0,
+                mtime: 0,
+                is_directory: false,
+                name_highlight: Vec::new(),
+            })
+        });
         let Some(hit) = target else {
             self.pdf_count = 0;
             self.pdf_options = Default::default();
@@ -538,12 +756,25 @@ impl MainWindow {
             self._preview_task = None;
             return;
         };
+        if self.preview_memo.len() > 64 {
+            self.preview_memo.clear();
+        }
+        self.preview_memo.insert(
+            workspace::preview_stamp(&hit.path, hit.size, hit.mtime),
+            self.pdf_options,
+        );
         let same_path = self
             .preview
             .meta
             .as_ref()
             .is_some_and(|meta| meta.path == hit.path);
+        let changed_page =
+            self.preview.pdf.is_some() && !self.preview.pdf_frame_matches(&hit.path, options.page);
         if !same_path {
+            self.pdf_count = 0;
+        }
+        // Never label the old raster as the new PDF page while a worker is decoding.
+        if !same_path || changed_page {
             self.preview = PreviewState::loading(
                 generation,
                 preview::meta_from_hit(&hit.name, &hit.path, hit.size, hit.mtime, hit.is_directory),
@@ -583,8 +814,9 @@ impl MainWindow {
                 {
                     return;
                 }
+                this.pdf_count = loaded.pdf.map(|pdf| pdf.count).unwrap_or(0);
                 if let Some(pdf) = loaded.pdf {
-                    this.pdf_count = pdf.count;
+                    this.pdf_options.page = pdf.page;
                 }
                 this.preview = loaded;
                 cx.notify();
@@ -594,6 +826,10 @@ impl MainWindow {
     }
 
     fn move_sel(&mut self, key: ResultNavKey, cx: &mut Context<Self>) {
+        if self.workspace.mode != ViewMode::Search {
+            self.workspace_move_selection(key, cx);
+            return;
+        }
         if let Some(index) = move_result_selection(self.selected, key, self.hits.len()) {
             let label = match key {
                 ResultNavKey::ArrowDown => "down",
@@ -611,36 +847,10 @@ impl MainWindow {
     }
 
     fn open_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(i) = self.selected else {
-            return;
-        };
-        let Some(hit) = self.hits.get(i) else {
-            return;
-        };
-        let path = hit.path.clone();
-        self.record_key("enter", "open", self.selected);
-        cx.background_spawn(async move {
-            if let Err(err) = open_path::open_path(&path) {
-                eprintln!("findx2-gui-native: {err}");
-            }
-        })
-        .detach();
+        self.workspace_enter(cx);
     }
-
     fn reveal_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(i) = self.selected else {
-            return;
-        };
-        let Some(hit) = self.hits.get(i) else {
-            return;
-        };
-        let path = hit.path.clone();
-        cx.background_spawn(async move {
-            if let Err(err) = open_path::reveal_in_folder(&path) {
-                eprintln!("findx2-gui-native: {err}");
-            }
-        })
-        .detach();
+        self.workspace_reveal(cx);
     }
 
     fn toggle_diag(&mut self, cx: &mut Context<Self>) {
@@ -670,6 +880,13 @@ impl MainWindow {
             search_logic::PanelKind::Sidebar => session.set_panels(Some(!currently_open), None, cx),
             search_logic::PanelKind::Preview => session.set_panels(None, Some(!currently_open), cx),
         });
+        if matches!(kind, search_logic::PanelKind::Preview) {
+            if currently_open {
+                self.pause_preview();
+            } else {
+                self.preview_active_selection(cx);
+            }
+        }
         cx.notify();
     }
 
@@ -681,16 +898,16 @@ impl MainWindow {
         }
     }
 
-    fn type_icon(filter: TypeFilter) -> IconName {
-        match filter {
-            TypeFilter::All => IconName::Search,
-            TypeFilter::Folder => IconName::Folder,
-            TypeFilter::File => IconName::File,
-            TypeFilter::Doc => IconName::FileText,
-            TypeFilter::Image => IconName::Frame,
-            TypeFilter::Video => IconName::Play,
-            TypeFilter::Audio => IconName::Mic,
-        }
+    fn type_icon(filter: TypeFilter) -> Icon {
+        Icon::default().path(match filter {
+            TypeFilter::All => "icons/files.svg",
+            TypeFilter::Folder => "icons/folder.svg",
+            TypeFilter::File => "icons/file.svg",
+            TypeFilter::Doc => "icons/file-text.svg",
+            TypeFilter::Image => "icons/image.svg",
+            TypeFilter::Video => "icons/film.svg",
+            TypeFilter::Audio => "icons/music.svg",
+        })
     }
 
     fn render_section_header(label: &'static str, tokens: FindxTokens) -> impl IntoElement {
@@ -706,54 +923,61 @@ impl MainWindow {
 
     fn render_filter_row(
         id: SharedString,
-        icon: IconName,
+        icon: Icon,
         label: &'static str,
         selected: bool,
         tokens: FindxTokens,
         on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
-        h_flex()
-            .id(id)
+        Button::new(id)
+            .ghost()
             .w_full()
             .h(px(28.))
-            .px_1()
-            .gap_2()
-            .items_center()
-            .rounded_md()
-            .cursor_pointer()
-            .when(selected, |this| this.bg(tokens.row_selected))
-            .when(!selected, |this| this.hover(|s| s.bg(tokens.hover)))
+            .px_0()
+            .accessibility_label(label)
+            .selected(selected)
             .on_click(on_click)
             .child(
-                div()
-                    .w(px(3.))
-                    .h(px(14.))
-                    .rounded_sm()
-                    .when(selected, |this| this.bg(tokens.accent))
-                    .when(!selected, |this| this.bg(hsla(0., 0., 0., 0.))),
-            )
-            .child(
-                Icon::new(icon)
-                    .with_size(gpui_kit::component::Size::Small)
-                    .flex_shrink_0()
-                    .text_color(if selected {
-                        tokens.accent
-                    } else {
-                        tokens.text_secondary
-                    }),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .text_sm()
-                    .text_ellipsis()
-                    .text_color(if selected {
-                        tokens.accent
-                    } else {
-                        tokens.text_primary
-                    })
-                    .child(label),
+                h_flex()
+                    .w(px(SIDEBAR_WIDTH_PX - 16.))
+                    .h(px(28.))
+                    .px_1()
+                    .gap_2()
+                    .items_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(selected, |this| this.bg(tokens.row_selected))
+                    .when(!selected, |this| this.hover(|s| s.bg(tokens.hover)))
+                    .child(
+                        div()
+                            .w(px(3.))
+                            .h(px(14.))
+                            .rounded_sm()
+                            .when(selected, |this| this.bg(tokens.accent))
+                            .when(!selected, |this| this.bg(hsla(0., 0., 0., 0.))),
+                    )
+                    .child(
+                        icon.with_size(gpui_kit::component::Size::Small)
+                            .flex_shrink_0()
+                            .text_color(if selected {
+                                tokens.accent
+                            } else {
+                                tokens.text_secondary
+                            }),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .text_sm()
+                            .text_ellipsis()
+                            .text_color(if selected {
+                                tokens.accent
+                            } else {
+                                tokens.text_primary
+                            })
+                            .child(label),
+                    ),
             )
     }
 
@@ -798,7 +1022,7 @@ impl MainWindow {
                 let entity = entity.clone();
                 Self::render_filter_row(
                     SharedString::from(format!("time-{}", f.label())),
-                    IconName::Calendar,
+                    Icon::new(IconName::Calendar),
                     f.label(),
                     selected,
                     tokens,
@@ -869,97 +1093,148 @@ impl MainWindow {
     }
     fn render_pdf_controls(&self, cx: &Context<Self>) -> impl IntoElement {
         let page = self.pdf_options.page;
-        v_flex()
+        h_flex()
             .w_full()
             .flex_shrink_0()
-            .px_2()
+            .px_1()
             .py_1()
-            .gap_1()
+            .gap(px(2.))
+            .items_center()
+            .children(
+                [
+                    ("first", "|‹", "首页", page == 0),
+                    ("previous", "‹", "上一页", page == 0),
+                    ("next", "›", "下一页", page + 1 >= self.pdf_count),
+                    ("last", "›|", "末页", page + 1 >= self.pdf_count),
+                ]
+                .into_iter()
+                .map(|(id, _label, name, disabled)| {
+                    let e = cx.entity();
+                    Button::new(id)
+                        .ghost()
+                        .icon(Icon::default().path(match id {
+                            "first" => "icons/chevrons-left.svg",
+                            "previous" => "icons/chevron-left.svg",
+                            "next" => "icons/chevron-right.svg",
+                            _ => "icons/chevrons-right.svg",
+                        }))
+                        .tooltip(name)
+                        .accessibility_label(name)
+                        .w(px(20.))
+                        .h(px(24.))
+                        .px_0()
+                        .text_xs()
+                        .disabled(disabled)
+                        .on_click(move |_, _, cx| e.update(cx, |this, cx| this.pdf_action(id, cx)))
+                }),
+            )
             .child(
-                h_flex().gap_1().items_center().children(
-                    [
-                        ("first", "首页", page == 0),
-                        ("previous", "上一页", page == 0),
-                        ("next", "下一页", page + 1 >= self.pdf_count),
-                        ("last", "末页", page + 1 >= self.pdf_count),
-                    ]
+                div()
+                    .id("pdf-page-counter")
+                    .role(gpui_kit::accesskit::Role::Label)
+                    .aria_label(format!(
+                        "PDF 第 {} / {} 页 · {}",
+                        page + 1,
+                        self.pdf_count,
+                        if self.preview.pdf.is_some() {
+                            "已加载"
+                        } else {
+                            "正在加载"
+                        }
+                    ))
+                    .w(px(30.))
+                    .text_xs()
+                    .whitespace_nowrap()
+                    .child(format!("{}/{}", page + 1, self.pdf_count)),
+            )
+            .children(
+                [("minus", "−"), ("plus", "+")]
                     .into_iter()
-                    .map(|(id, label, disabled)| {
-                        let entity = cx.entity();
+                    .map(|(id, _label)| {
+                        let e = cx.entity();
                         Button::new(id)
                             .ghost()
-                            .label(label)
-                            .disabled(disabled)
+                            .icon(if id == "minus" {
+                                IconName::Minus
+                            } else {
+                                IconName::Plus
+                            })
+                            .tooltip(if id == "minus" { "缩小" } else { "放大" })
+                            .accessibility_label(if id == "minus" { "缩小" } else { "放大" })
+                            .w(px(20.))
+                            .h(px(24.))
+                            .px_0()
                             .on_click(move |_, _, cx| {
-                                entity.update(cx, |this, cx| this.pdf_action(id, cx))
+                                e.update(cx, |this, cx| this.pdf_action(id, cx))
                             })
                     }),
-                ),
             )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .child(format!("{} / {}", page + 1, self.pdf_count)),
-                    )
-                    .children(
-                        [
-                            ("minus", "−"),
-                            ("plus", "+"),
-                            ("fit", "适宽"),
-                            ("actual", "100%"),
-                        ]
-                        .into_iter()
-                        .map(|(id, label)| {
-                            let entity = cx.entity();
-                            Button::new(id)
-                                .ghost()
-                                .label(label)
-                                .on_click(move |_, _, cx| {
-                                    entity.update(cx, |this, cx| this.pdf_action(id, cx))
-                                })
-                        }),
-                    )
-                    .child(div().text_xs().child(if self.pdf_options.fit_width {
-                        "适宽".into()
-                    } else {
-                        format!("{}%", (self.pdf_options.zoom * 100.).round())
-                    })),
-            )
+            .child({
+                let e = cx.entity();
+                Button::new("fit")
+                    .ghost()
+                    .icon(Icon::default().path("icons/move-horizontal.svg"))
+                    .tooltip("适应宽度")
+                    .accessibility_label("适宽")
+                    .selected(self.pdf_options.fit_width)
+                    .w(px(22.))
+                    .h(px(24.))
+                    .px_0()
+                    .text_xs()
+                    .on_click(move |_, _, cx| e.update(cx, |this, cx| this.pdf_action("fit", cx)))
+            })
+            .child({
+                let e = cx.entity();
+                Button::new("actual")
+                    .ghost()
+                    .icon(Icon::default().path("icons/scan.svg"))
+                    .tooltip("恢复 100% 原始大小")
+                    .accessibility_label("100%")
+                    .w(px(22.))
+                    .h(px(24.))
+                    .px_0()
+                    .text_xs()
+                    .on_click(move |_, _, cx| {
+                        e.update(cx, |this, cx| this.pdf_action("actual", cx))
+                    })
+            })
     }
-
-    fn render_preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_single_preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = Self::tokens(cx);
         let header = match &self.preview.meta {
             Some(meta) => v_flex()
                 .w_full()
+                .min_w_0()
                 .flex_shrink_0()
-                .gap_1()
                 .px_3()
-                .pt_3()
-                .pb_2()
+                .py_2()
+                .gap_1()
                 .border_b_1()
                 .border_color(tokens.border)
                 .child(
                     div()
-                        .text_color(tokens.text_primary)
+                        .id("preview-filename")
+                        .role(gpui_kit::accesskit::Role::Label)
+                        .aria_label(meta.name.clone())
+                        .w_full()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
                         .text_ellipsis()
+                        .text_sm()
+                        .aria_description(meta.path.clone())
                         .child(meta.name.clone()),
                 )
                 .child(
                     div()
+                        .w_full()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_xs()
                         .text_color(tokens.text_secondary)
-                        .text_xs()
                         .child(preview::format_meta_line(meta)),
-                )
-                .child(
-                    div()
-                        .text_color(tokens.text_tertiary)
-                        .text_xs()
-                        .child(meta.path.clone()),
                 )
                 .into_any_element(),
             None => div().into_any_element(),
@@ -990,11 +1265,17 @@ impl MainWindow {
                 {
                     if let Some(client) = &self.preview.native {
                         let surface = client.surface.clone();
+                        let menu_open =
+                            self.workspace.show_actions || self.file_actions.native_menu_open;
                         if surface.is_alive() {
                             canvas(
                                 |_, _, _| (),
                                 move |bounds, _, window, _| {
-                                    surface.place(bounds, window.scale_factor())
+                                    if menu_open {
+                                        surface.hide();
+                                    } else {
+                                        surface.place(bounds, window.scale_factor());
+                                    }
                                 },
                             )
                             .size_full()
@@ -1025,16 +1306,44 @@ impl MainWindow {
                         .unwrap_or_else(|| "正在加载预览…".into()),
                 )
                 .into_any_element(),
-            PreviewKind::Error => div()
+            PreviewKind::Error => v_flex()
                 .p_3()
-                .text_sm()
-                .text_color(tokens.error)
+                .gap_3()
                 .child(
-                    self.preview
-                        .message
-                        .clone()
-                        .unwrap_or_else(|| "预览失败".into()),
+                    div()
+                        .text_sm()
+                        .text_color(tokens.text_secondary)
+                        .child("暂时无法显示此文件。请检查本地可读性、文件关联，或稍后重试。"),
                 )
+                .child(
+                    Button::new("preview-error-diagnostics")
+                        .ghost()
+                        .icon(IconName::Info)
+                        .label(if self.preview_diagnostics {
+                            "收起诊断"
+                        } else {
+                            "诊断详情"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.preview_diagnostics = !this.preview_diagnostics;
+                            cx.notify();
+                        })),
+                )
+                .when(self.preview_diagnostics, |view| {
+                    view.child(
+                        div()
+                            .max_h(px(160.))
+                            .overflow_y_scrollbar()
+                            .text_xs()
+                            .text_color(tokens.text_secondary)
+                            .child(
+                                self.preview
+                                    .message
+                                    .clone()
+                                    .unwrap_or_else(|| "未提供额外诊断".into()),
+                            ),
+                    )
+                })
                 .into_any_element(),
             PreviewKind::Unsupported => v_flex()
                 .p_3()
@@ -1051,7 +1360,7 @@ impl MainWindow {
             PreviewKind::Image if self.preview.pdf.is_some() => {
                 let pdf = self.preview.pdf.unwrap();
                 let width = if self.pdf_options.fit_width {
-                    PREVIEW_DEFAULT_WIDTH_PX - 24.
+                    self.actual_preview_width - 24.
                 } else {
                     pdf.width * self.pdf_options.zoom
                 };
@@ -1177,7 +1486,7 @@ impl MainWindow {
         );
 
         v_flex()
-            .w(px(PREVIEW_DEFAULT_WIDTH_PX))
+            .w(px(self.actual_preview_width))
             .h_full()
             .min_h_0()
             .flex_shrink_0()
@@ -1324,6 +1633,11 @@ impl Render for MainWindow {
         let viewport = window.viewport_size();
         let content_width = viewport.width.as_f32();
         self.last_content_width = content_width;
+        let rail_width = if self.workspace.mode == ViewMode::Directory {
+            workspace::DIRECTORY_SIDEBAR_WIDTH
+        } else {
+            SIDEBAR_WIDTH_PX
+        };
         // Viewport can report the outer frame; leave slack for title bar + borders
         // so the pinned status bar is never pushed off-screen.
         let (saved_sidebar, saved_preview, diag_on, index_view) =
@@ -1335,7 +1649,7 @@ impl Render for MainWindow {
                     s.index_status.clone(),
                 )
             });
-        let (sidebar, preview, sidebar_reason, preview_reason) = explain_panels(
+        let (mut sidebar, mut preview, sidebar_reason, preview_reason) = explain_panels(
             content_width,
             PREVIEW_DEFAULT_WIDTH_PX,
             saved_sidebar,
@@ -1343,7 +1657,43 @@ impl Render for MainWindow {
             self.sidebar_force,
             self.preview_force,
         );
+        let wanted = self
+            .session
+            .read(cx)
+            .prefs
+            .preview_width
+            .unwrap_or(PREVIEW_DEFAULT_WIDTH_PX)
+            .clamp(240., 600.);
+        let list_min = if self.workspace.mode == ViewMode::Directory {
+            super::browser_table::MIN_WIDTHS.iter().sum()
+        } else {
+            super::result_table::MIN_WIDTHS.iter().sum()
+        };
+        (sidebar, preview, self.actual_preview_width) = workspace::panel_budget(
+            content_width,
+            rail_width,
+            list_min,
+            sidebar,
+            preview,
+            wanted,
+        );
+        self.table_viewport_width = content_width
+            - if sidebar { rail_width } else { 0. }
+            - if preview {
+                self.actual_preview_width + 6.
+            } else {
+                0.
+            };
+        self.fit_active_columns(self.table_viewport_width, cx);
         self.last_diag = format!("{sidebar_reason}\n{preview_reason}");
+        if self.workspace.mode == ViewMode::Usage {
+            sidebar = false;
+            preview = false;
+        }
+        if self.settings_page.is_some() {
+            preview = false;
+            sidebar = false;
+        }
         #[cfg(windows)]
         if !preview {
             if let Some(client) = &self.preview.native {
@@ -1354,11 +1704,93 @@ impl Render for MainWindow {
         v_flex()
             .id("findx-main")
             .key_context("FindXMain")
-            .track_focus(&cx.focus_handle())
+            .track_focus(&self.focus)
             .size_full()
+            .relative()
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.resize_preview_move(event, cx)
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.finish_preview_resize(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                    if event.button == MouseButton::Left {
+                        this.finish_preview_resize(cx);
+                    }
+                }),
+            )
             .overflow_hidden()
             .bg(tokens.bg)
             .text_color(tokens.text_primary)
+            .on_action(
+                cx.listener(|this, _: &WorkspaceBack, _, cx| this.workspace_history(false, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &WorkspaceForward, _, cx| this.workspace_history(true, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ShowFileMenu, window, cx| this.show_file_menu(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ContextOpen, window, cx| this.context_action(0, window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ContextOpenWith, window, cx| {
+                this.context_action(1, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &ContextLocate, window, cx| {
+                    this.context_action(2, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &ContextCopyPath, window, cx| {
+                this.context_action(3, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &ContextCopy, window, cx| this.context_action(4, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ContextCut, window, cx| this.context_action(5, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ContextPaste, window, cx| {
+                    this.context_action(6, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &ContextRename, window, cx| {
+                    this.context_action(7, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &ContextProperties, window, cx| {
+                this.context_action(8, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ContextAnalyze, window, cx| {
+                this.context_action(9, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &ContextScope, window, cx| {
+                    this.context_action(10, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &ContextSelectAll, window, cx| {
+                this.context_action(11, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ContextAutoFit, window, cx| {
+                this.context_action(12, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &WorkspaceUp, _, cx| this.workspace_up(cx)))
+            .on_action(cx.listener(|this, _: &WorkspaceRefresh, _, cx| this.workspace_refresh(cx)))
+            .on_action(cx.listener(|this, _: &WorkspaceFocusPath, window, cx| {
+                if this.settings_page.is_some() || this.workspace.mode == ViewMode::Search {
+                    return;
+                }
+                this.workspace.editing_path = true;
+                this.workspace.path.update(cx, |i, cx| i.focus(window, cx));
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &SelectNextResult, _, cx| {
                 this.move_sel(ResultNavKey::ArrowDown, cx)
             }))
@@ -1379,7 +1811,9 @@ impl Render for MainWindow {
                 this.move_sel(ResultNavKey::End, cx)
             }))
             .on_action(cx.listener(|this, _: &OpenSelected, window, cx| {
-                if focus_is_search(&this.search, window, cx) {
+                if focus_is_search(&this.search, window, cx)
+                    || focus_is_search(&this.workspace.path, window, cx)
+                {
                     return;
                 }
                 this.open_selected(cx)
@@ -1387,73 +1821,53 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &RevealSelected, _, cx| this.reveal_selected(cx)))
             .on_action(cx.listener(|this, _: &ToggleDiag, _, cx| this.toggle_diag(cx)))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
-                window.focus(&this.search.read(cx).focus_handle(cx), cx);
+                if this.settings_page.is_some() {
+                    return;
+                }
+                if this.workspace.mode == ViewMode::Directory {
+                    this.focus_directory_filter(window, cx);
+                } else {
+                    this.workspace_switch(ViewMode::Search, cx);
+                    window.focus(&this.search.read(cx).focus_handle(cx), cx);
+                }
             }))
-            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
-                let session = this.session.clone();
-                crate::ui::open_settings_window(session, cx);
-            }))
-            .child(self.render_toolbar(sidebar, preview, cx))
-            .child(
-                h_flex()
-                    .flex_shrink_0()
-                    .px_3()
-                    .py_1()
-                    .gap_2()
-                    .child({
-                        let entity = cx.entity();
-                        Button::new("directory-browser")
-                            .ghost()
-                            .label("目录浏览")
-                            .on_click(move |_, _, cx| {
-                                let initial = entity
-                                    .read(cx)
-                                    .selected
-                                    .and_then(|i| entity.read(cx).hits.get(i))
-                                    .map(|h| {
-                                        if h.is_directory {
-                                            std::path::PathBuf::from(&h.path)
-                                        } else {
-                                            std::path::Path::new(&h.path)
-                                                .parent()
-                                                .unwrap_or(std::path::Path::new("C:\\"))
-                                                .to_path_buf()
-                                        }
-                                    })
-                                    .unwrap_or_else(|| std::path::PathBuf::from("C:\\"));
-                                crate::ui::browser_window::open(initial, cx);
-                            })
+            .on_action(
+                cx.listener(|this, _: &OpenSettings, window, cx| {
+                    this.open_settings_page(window, cx)
+                }),
+            )
+            .child(self.render_workspace_title(window, cx))
+            .when_some(self.settings_page.clone(), |view, page| {
+                view.child(div().flex_1().min_h_0().child(page))
+            })
+            .when(self.settings_page.is_none(), |view| {
+                view.child(self.render_workspace_page(sidebar, preview, window, cx))
+                    .child(self.render_workspace_operation(cx))
+                    .when(self.has_file_activity(), |view| {
+                        view.child(self.render_file_activity(cx))
                     })
-                    .child(
-                        Button::new("disk-usage")
-                            .ghost()
-                            .label("磁盘占用（只读）")
-                            .on_click(|_, _, cx| crate::ui::disk_window::open(cx)),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .items_stretch()
-                    .overflow_hidden()
-                    .when(sidebar, |this| this.child(self.render_sidebar(cx)))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .min_h_0()
-                            .overflow_hidden()
-                            .child(
-                                DataTable::new(&self.table)
-                                    .scrollbar_visible(true, true)
-                                    .bordered(false),
-                            ),
+                    .child(self.render_status_bar(&index_view, cx))
+                    .when(self.workspace.show_actions, |view| {
+                        view.child(self.render_workspace_actions(cx))
+                    })
+            })
+            .when_some(self.file_actions.keyboard_menu.clone(), |view, menu| {
+                view.child(
+                    deferred(
+                        anchored()
+                            .position(point(px(200.), px(120.)))
+                            .snap_to_window_with_margin(px(8.))
+                            .child(menu),
                     )
-                    .when(preview, |this| this.child(self.render_preview(cx))),
-            )
-            .child(self.render_status_bar(&index_view, cx))
+                    .with_priority(gpui_kit::base::POPUP_PRIORITY),
+                )
+            })
+            .when(self.file_actions.confirm_target.is_some(), |view| {
+                view.child(self.render_paste_confirmation(cx))
+            })
+            .when(self.run_pending.is_some(), |view| {
+                view.child(self.render_run_confirmation(cx))
+            })
             .when(diag_on, |this| {
                 this.child(self.render_diag(
                     content_width,
@@ -1468,96 +1882,70 @@ impl Render for MainWindow {
 }
 
 impl MainWindow {
-    fn render_toolbar(
-        &self,
-        sidebar: bool,
-        preview: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_status_bar(&self, index: &IndexStatusView, cx: &mut Context<Self>) -> AnyElement {
         let tokens = Self::tokens(cx);
-        h_flex()
-            .w_full()
-            .h(px(48.))
-            .px_3()
-            .gap_2()
-            .items_center()
-            .bg(tokens.surface)
-            .border_b_1()
-            .border_color(tokens.border)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Input::new(&self.search).cleanable(true)),
-            )
-            .child(
-                h_flex()
-                    .flex_shrink_0()
-                    .gap_2()
-                    .items_center()
-                    .child({
-                        let entity = cx.entity();
-                        Button::new("toolbar-sidebar")
-                            .ghost()
-                            .label("侧栏")
-                            .selected(sidebar)
-                            .on_click(move |_, _, cx| {
-                                entity.update(cx, |this, cx| {
-                                    this.toggle_panel(
-                                        search_logic::PanelKind::Sidebar,
-                                        sidebar,
-                                        cx,
-                                    );
-                                });
-                            })
-                    })
-                    .child({
-                        let entity = cx.entity();
-                        Button::new("toolbar-preview")
-                            .ghost()
-                            .label("预览")
-                            .selected(preview)
-                            .on_click(move |_, _, cx| {
-                                entity.update(cx, |this, cx| {
-                                    this.toggle_panel(
-                                        search_logic::PanelKind::Preview,
-                                        preview,
-                                        cx,
-                                    );
-                                });
-                            })
-                    })
-                    .child({
-                        let session = self.session.clone();
-                        Button::new("toolbar-settings")
-                            .ghost()
-                            .label("设置")
-                            .on_click(move |_, _, cx| {
-                                crate::ui::open_settings_window(session.clone(), cx);
-                            })
-                    }),
-            )
-    }
-
-    fn render_status_bar(&self, index: &IndexStatusView, cx: &App) -> impl IntoElement {
-        let tokens = Self::tokens(cx);
-        let mock = self.session.read(cx).mock;
-        let connected = self.session.read(cx).connected;
-        let pipe = self.session.read(cx).pipe_name.clone();
-        let left = self.search_status.clone();
-        let mid = index.summary.clone();
-        let mode = if mock {
-            format!("模拟后端 · {pipe}")
-        } else if self.session.read(cx).live {
-            format!("生产管道 · {pipe}")
-        } else if connected {
-            format!("隔离管道 · {pipe}")
+        if self.workspace.mode == ViewMode::Directory {
+            let count = self.workspace.rows.len();
+            let selected = self.selected_file_hits().len();
+            let summary = if self.workspace.listing {
+                "正在读取目录…".to_string()
+            } else if self.workspace.status.starts_with("目录读取失败") {
+                "目录不可用：请检查权限或磁盘连接".to_string()
+            } else {
+                self.file_actions.summary.clone()
+            };
+            return h_flex()
+                .w_full()
+                .h(px(32.))
+                .flex_shrink_0()
+                .px_3()
+                .gap_3()
+                .border_t_1()
+                .border_color(tokens.border)
+                .bg(tokens.surface)
+                .text_xs()
+                .text_color(tokens.text_secondary)
+                .child(div().flex_shrink_0().child(if selected > 0 {
+                    format!("{selected} 个项目已选择 · 共 {count} 个项目")
+                } else {
+                    format!("{count} 个项目")
+                }))
+                .child(div().flex_1().min_w_0().text_ellipsis().child(summary))
+                .child(
+                    gpui_kit::component::switch::Switch::new("browser-show-hidden")
+                        .small()
+                        .checked(self.workspace.show_hidden)
+                        .label("显示隐藏文件")
+                        .on_click(cx.listener(|this, show, _, cx| this.set_show_hidden(*show, cx))),
+                )
+                .child(
+                    Button::new("browser-index-status")
+                        .ghost()
+                        .icon(Icon::default().path(if self.session.read(cx).connected {
+                            "icons/circle-check.svg"
+                        } else {
+                            "icons/circle-alert.svg"
+                        }))
+                        .w(px(24.))
+                        .h(px(24.))
+                        .px_0()
+                        .tooltip(index.summary.clone())
+                        .accessibility_label("索引连接状态"),
+                )
+                .into_any_element();
+        }
+        let left: String = if self.workspace.mode == ViewMode::Search {
+            if self.file_actions.summary.is_empty() {
+                self.search_status.to_string()
+            } else {
+                format!("{} · {}", self.search_status, self.file_actions.summary)
+            }
         } else {
-            format!("未连接 · {pipe}")
+            self.workspace_scan_status()
         };
         h_flex()
             .w_full()
-            .h(px(28.))
+            .h(px(32.))
             .flex_shrink_0()
             .overflow_hidden()
             .px_3()
@@ -1566,11 +1954,39 @@ impl MainWindow {
             .bg(tokens.surface)
             .border_t_1()
             .border_color(tokens.border)
-            .text_sm()
+            .text_xs()
             .text_color(tokens.text_secondary)
             .child(div().flex_1().min_w_0().text_ellipsis().child(left))
-            .child(div().min_w_0().text_ellipsis().child(mid))
-            .child(div().text_color(tokens.text_tertiary).child(mode))
+            .when(
+                self.workspace.mode == ViewMode::Search && self.workspace.scanning,
+                |v| {
+                    v.child(
+                        Button::new("background-scan-status")
+                            .ghost()
+                            .icon(IconName::ChartPie)
+                            .label("后台扫描中")
+                            .tooltip(self.workspace_scan_status())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.workspace_switch(ViewMode::Usage, cx)
+                            })),
+                    )
+                },
+            )
+            .child(
+                Button::new("workspace-index-status")
+                    .ghost()
+                    .icon(Icon::default().path(if self.session.read(cx).connected {
+                        "icons/circle-check.svg"
+                    } else {
+                        "icons/circle-alert.svg"
+                    }))
+                    .w(px(24.))
+                    .h(px(24.))
+                    .px_0()
+                    .tooltip(index.summary.clone())
+                    .accessibility_label("索引连接状态"),
+            )
+            .into_any_element()
     }
 }
 
@@ -1583,7 +1999,31 @@ fn focus_is_search(search: &Entity<InputState>, window: &Window, cx: &App) -> bo
 
 impl Drop for MainWindow {
     fn drop(&mut self) {
+        self.cancel_file_background();
         self.preview_cancel
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod key_binding_tests {
+    #[test]
+    fn context_and_file_shortcuts_parse_before_startup() {
+        for key in [
+            "menu",
+            "shift-f10",
+            "ctrl-c",
+            "ctrl-x",
+            "ctrl-v",
+            "ctrl-shift-c",
+            "f2",
+            "alt-enter",
+            "ctrl-a",
+        ] {
+            assert!(
+                gpui_kit::Keystroke::parse(key).is_ok(),
+                "invalid shortcut {key}"
+            );
+        }
     }
 }

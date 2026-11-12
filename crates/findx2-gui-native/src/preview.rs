@@ -55,6 +55,8 @@ pub struct DirEntryPreview {
 
 #[derive(Clone, Copy, Debug)]
 pub struct PdfMeta {
+    /// Page represented by this raster, not the page merely requested by the toolbar.
+    pub page: u32,
     pub count: u32,
     pub width: f32,
     pub height: f32,
@@ -80,6 +82,11 @@ pub struct PreviewState {
 }
 
 impl PreviewState {
+    pub fn pdf_frame_matches(&self, path: &str, page: u32) -> bool {
+        self.meta.as_ref().is_some_and(|m| m.path == path)
+            && self.pdf.is_some_and(|pdf| pdf.page == page)
+    }
+
     pub fn empty() -> Self {
         Self {
             #[cfg(windows)]
@@ -371,6 +378,7 @@ pub fn load_preview_with_options(
                         meta.size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(size);
                     }
                     state.pdf = Some(PdfMeta {
+                        page: options.page.min(count.saturating_sub(1)),
                         count,
                         width,
                         height,
@@ -734,6 +742,19 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    #[test]
+    fn pdf_frame_identity_includes_the_rendered_page_and_path() {
+        let mut state = PreviewState::loading(1, meta_from_hit("f.pdf", r"C:\f.pdf", 10, 0, false));
+        state.pdf = Some(PdfMeta {
+            page: 0,
+            count: 3,
+            width: 100.,
+            height: 200.,
+        });
+        assert!(state.pdf_frame_matches(r"C:\f.pdf", 0));
+        assert!(!state.pdf_frame_matches(r"C:\f.pdf", 1));
+        assert!(!state.pdf_frame_matches(r"C:\other.pdf", 0));
+    }
     #[test]
     fn tiny_png_decodes() {
         // 1x1 red PNG

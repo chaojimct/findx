@@ -9,7 +9,17 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct LocalPrefs {
     #[serde(default)]
+    pub browser_favorites: Vec<String>,
+    #[serde(default)]
+    pub browser_recent: Vec<String>,
+    #[serde(default)]
+    pub browser_show_hidden: bool,
+    #[serde(default)]
+    pub browser_column_schema: u8,
+    #[serde(default)]
     pub theme: UiThemePref,
+    #[serde(default)]
+    pub theme_style: crate::theme::ThemeStyle,
     #[serde(default)]
     pub diag_enabled: bool,
     #[serde(default = "default_true")]
@@ -20,6 +30,12 @@ pub struct LocalPrefs {
     pub preview_width: Option<f32>,
     #[serde(default)]
     pub column_widths: Option<[f32; 4]>,
+    #[serde(default = "default_true")]
+    pub search_fit_columns: bool,
+    #[serde(default = "default_true")]
+    pub browser_fit_columns: bool,
+    #[serde(default)]
+    pub browser_column_widths: Option<[f32; 4]>,
 }
 
 fn default_true() -> bool {
@@ -29,12 +45,20 @@ fn default_true() -> bool {
 impl Default for LocalPrefs {
     fn default() -> Self {
         Self {
+            browser_favorites: Vec::new(),
+            browser_recent: Vec::new(),
+            browser_show_hidden: false,
+            browser_column_schema: 0,
             theme: UiThemePref::Light,
+            theme_style: crate::theme::ThemeStyle::default(),
             diag_enabled: false,
             sidebar_open: true,
             preview_open: true,
             preview_width: None,
             column_widths: None,
+            search_fit_columns: true,
+            browser_fit_columns: true,
+            browser_column_widths: None,
         }
     }
 }

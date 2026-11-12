@@ -3,7 +3,7 @@
 pub const RESULT_ROW_HEIGHT_PX: f32 = 32.0;
 pub const PREVIEW_AUTO_HIDE_BELOW: f32 = 900.0;
 pub const SIDEBAR_AUTO_HIDE_BELOW: f32 = 760.0;
-pub const SIDEBAR_WIDTH_PX: f32 = 210.0;
+pub const SIDEBAR_WIDTH_PX: f32 = 156.0;
 pub const NAME_READABLE_PX: f32 = 180.0;
 pub const PREVIEW_DEFAULT_WIDTH_PX: f32 = 320.0;
 

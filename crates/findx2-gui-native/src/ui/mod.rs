@@ -1,6 +1,6 @@
 mod browser_table;
-pub mod browser_window;
-pub mod disk_window;
+pub(super) mod chrome;
+mod file_icon;
 pub mod main_window;
 mod result_table;
 pub mod settings_window;
@@ -15,55 +15,53 @@ use crate::ui::settings_window::SettingsWindow;
 
 pub fn start(opts: LaunchOptions) {
     let title = opts.window_title().to_string();
-    gpui_kit::application().run(move |cx| {
-        gpui_kit::init(cx);
-        let dark = matches!(
-            cx.window_appearance(),
-            WindowAppearance::Dark | WindowAppearance::VibrantDark
-        );
-        let session = cx.new(|_| AppSession::load(&opts, dark));
-        session.update(cx, |session, cx| {
-            session.apply_theme(cx);
-        });
-
-        let roots_session = session.clone();
-        cx.spawn(async move |cx| {
-            let roots = cx
-                .background_spawn(async { crate::prefs::list_available_roots() })
-                .await;
-            let _ = roots_session.update(cx, |session, cx| {
-                session.available_roots = roots;
-                cx.notify();
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::AllAssets)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            let dark = matches!(
+                cx.window_appearance(),
+                WindowAppearance::Dark | WindowAppearance::VibrantDark
+            );
+            let session = cx.new(|_| AppSession::load(&opts, dark));
+            session.update(cx, |session, cx| {
+                session.apply_theme(cx);
             });
-        })
-        .detach();
 
-        let bounds = Bounds::centered(None, size(px(1100.), px(720.)), cx);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(560.), px(400.))),
-            titlebar: Some(TitlebarOptions {
-                title: Some(title.clone().into()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+            let roots_session = session.clone();
+            cx.spawn(async move |cx| {
+                let roots = cx
+                    .background_spawn(async { crate::prefs::list_available_roots() })
+                    .await;
+                let _ = roots_session.update(cx, |session, cx| {
+                    session.available_roots = roots;
+                    cx.notify();
+                });
+            })
+            .detach();
 
-        let session_for_window = session.clone();
-        let title_for_window = title.clone();
-        let _ = gpui_kit::open_window(options, cx, |window, cx| {
-            window.set_window_title(&title_for_window);
-            cx.new(|cx| MainWindow::new(session_for_window, window, cx))
-        })
-        .expect("open FindX native window");
+            let bounds = Bounds::centered(None, size(px(1100.), px(720.)), cx);
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(560.), px(400.))),
+                ..gpui_kit::component::TitleBar::window_options()
+            };
 
-        cx.on_window_closed(|cx, _id| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
-    });
+            let session_for_window = session.clone();
+            let title_for_window = title.clone();
+            let _ = gpui_kit::open_window(options, cx, |window, cx| {
+                window.set_window_title(&title_for_window);
+                cx.new(|cx| MainWindow::new(session_for_window, window, cx))
+            })
+            .expect("open FindX native window");
+
+            cx.on_window_closed(|cx, _id| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+        });
 }
 
 pub fn open_settings_window(session: Entity<AppSession>, cx: &mut App) {
@@ -89,11 +87,7 @@ pub fn open_settings_window(session: Entity<AppSession>, cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(480.), px(520.))),
-        titlebar: Some(TitlebarOptions {
-            title: Some(title.into()),
-            ..Default::default()
-        }),
-        ..Default::default()
+        ..gpui_kit::component::TitleBar::window_options()
     };
     let session_for_view = session.clone();
     match gpui_kit::open_window(options, cx, |window, cx| {

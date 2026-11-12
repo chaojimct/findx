@@ -16,6 +16,47 @@ pub(super) struct ResultsTable {
     pub owner: WeakEntity<MainWindow>,
 }
 impl TableDelegate for ResultsTable {
+    fn render_tr(
+        &mut self,
+        row: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> Stateful<Div> {
+        let owner = self.owner.clone();
+        let selected = owner
+            .read_with(cx, |view, cx| view.context_row_selected(true, row, cx))
+            .unwrap_or(false);
+        let tokens = *cx.global::<crate::theme::FindxTokens>();
+        div()
+            .id(("row", row))
+            .when(selected, |v| {
+                v.bg(tokens.row_selected)
+                    .border_b_1()
+                    .border_color(tokens.accent)
+            })
+            .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                let _ = owner.update(cx, |view, cx| {
+                    view.selection_pointer(true, row, event.modifiers, cx)
+                });
+            })
+    }
+    fn context_menu(
+        &mut self,
+        row: usize,
+        menu: gpui_kit::component::menu::PopupMenu,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> gpui_kit::component::menu::PopupMenu {
+        let owner = self.owner.clone();
+        let table = cx.entity();
+        cx.defer(move |cx| table.update(cx, |t, cx| t.set_selected_row(row, cx)));
+        owner
+            .update(cx, |view, cx| {
+                view.prepare_context_row(true, row, cx);
+                view.file_context_menu(menu, false, window, cx)
+            })
+            .unwrap_or_else(|_| panic!("menu owner closed during event"))
+    }
     fn columns_count(&self, _: &App) -> usize {
         4
     }
@@ -53,29 +94,45 @@ impl TableDelegate for ResultsTable {
         row: usize,
         col: usize,
         _: &mut Window,
-        _: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let Some(hit) = self.hits.get(row) else {
             return div().into_any_element();
         };
+        let tokens = *cx.global::<crate::theme::FindxTokens>();
         if col == 0 {
             return div()
                 .flex()
                 .items_center()
-                .min_w_0()
                 .w_full()
                 .h_full()
+                .min_w_0()
                 .overflow_hidden()
-                .children(
-                    highlight_segments(&hit.name, &hit.name_highlight)
-                        .into_iter()
-                        .map(|(text, on)| {
-                            div()
-                                .flex_shrink_0()
-                                .whitespace_nowrap()
-                                .when(on, |d| d.bg(rgb(0xffecb3)).text_color(rgb(0x0d47a1)))
-                                .child(text.to_owned())
-                        }),
+                .child(super::file_icon::file_icon(
+                    &hit.name,
+                    hit.is_directory,
+                    tokens,
+                ))
+                .child(
+                    div()
+                        .ml_2()
+                        .flex()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .children(
+                            highlight_segments(&hit.name, &hit.name_highlight)
+                                .into_iter()
+                                .map(|(text, on)| {
+                                    div()
+                                        .flex_shrink_0()
+                                        .whitespace_nowrap()
+                                        .when(on, |view| {
+                                            view.bg(tokens.hit_bg).text_color(tokens.hit_fg)
+                                        })
+                                        .child(text.to_owned())
+                                }),
+                        ),
                 )
                 .into_any_element();
         }

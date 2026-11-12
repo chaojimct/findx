@@ -13,8 +13,11 @@ pub struct Node {
     pub path: PathBuf,
     pub parent: Option<usize>,
     pub children: Vec<usize>,
+    /// Measured paths in this subtree, including this node; drilling never reuses the global count.
+    pub entries: u64,
     pub directory: bool,
     pub logical: u64,
+    pub mtime: u64,
     pub allocated: u64,
     pub hardlink_duplicate: bool,
     pub uncertain: bool,
@@ -230,8 +233,15 @@ pub fn scan(
             path: path.clone(),
             parent,
             children: vec![],
+            entries: 1,
             directory: m.is_dir(),
             logical: if m.is_file() { m.len() } else { 0 },
+            mtime: m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|t| t.as_secs())
+                .unwrap_or(0),
             allocated,
             hardlink_duplicate: duplicate,
             uncertain,
@@ -247,6 +257,11 @@ pub fn scan(
                 Ok(rd) => {
                     let mut children = Vec::new();
                     for e in rd {
+                        if cancel.load(Ordering::Relaxed) || start.elapsed() > limits.timeout {
+                            result.partial = true;
+                            result.cancelled = cancel.load(Ordering::Relaxed);
+                            break;
+                        }
                         match e {
                             Ok(e) => children.push(e.path()),
                             Err(_) => {
@@ -276,6 +291,8 @@ pub fn scan(
         if let Some(p) = result.nodes[i].parent {
             let logical = result.nodes[i].logical;
             let occupied = result.nodes[i].allocated;
+            let entries = result.nodes[i].entries;
+            result.nodes[p].entries = result.nodes[p].entries.saturating_add(entries);
             result.nodes[p].logical = result.nodes[p].logical.saturating_add(logical);
             result.nodes[p].allocated = result.nodes[p].allocated.saturating_add(occupied);
         }
@@ -367,6 +384,7 @@ mod tests {
         .unwrap();
         assert_eq!(s.hardlinks, 1);
         assert_eq!(s.nodes[0].logical, 16384);
+        assert_eq!(s.nodes[0].entries, 3);
         let f: Vec<_> = s.nodes.iter().filter(|n| !n.directory).collect();
         assert_eq!(f.iter().filter(|n| n.hardlink_duplicate).count(), 1);
         assert!(f.iter().map(|n| n.allocated).sum::<u64>() >= 8192);
@@ -423,6 +441,33 @@ mod tests {
             "sparse reservation was wrongly counted as disk cost"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn inflight_cancel_keeps_a_real_partial_result() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("findx-du-midcancel-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        for i in 0..1000 {
+            std::fs::write(root.join(format!("entry-{i:04}.bin")), [7u8; 4096]).unwrap();
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Progress::default());
+        let (c, p, worker_root) = (cancel.clone(), progress.clone(), root.clone());
+        let worker = std::thread::spawn(move || scan(&worker_root, c, p, Limits::default()));
+        while progress.entries.load(Ordering::Relaxed) < 8 && !worker.is_finished() {
+            std::thread::yield_now();
+        }
+        cancel.store(true, Ordering::Relaxed);
+        let result = worker.join().unwrap().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(result.cancelled && result.partial);
+        assert!(result.nodes.len() > 1 && result.nodes.len() < 1001);
+        assert!(result.nodes[0].allocated > 0);
+        assert_eq!(result.nodes[0].entries, result.nodes.len() as u64);
     }
     #[test]
     fn cancelled_scan_does_not_claim_complete() {

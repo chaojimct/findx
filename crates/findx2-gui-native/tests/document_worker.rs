@@ -107,3 +107,37 @@ fn malformed_and_oversized_input_fail_calmly() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[cfg(windows)]
+#[test]
+fn pdf_stream_handles_long_chinese_extended_and_mixed_paths_without_mutating_source() {
+    let root =
+        std::env::temp_dir().join(format!("findx-pdf-path-regression-{}", std::process::id()));
+    let dir = root
+        .join("WPS Cloud Files/.282634911/cachedata/D9302413A59146BFBA2D38F810FCE024")
+        .join("公开路径回归测试目录".repeat(8));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join(format!("{}公开三页.pdf", "长中文文件名".repeat(10)));
+    let original = std::fs::read(fixture("findx-public-three-pages.pdf")).unwrap();
+    std::fs::write(&file, &original).unwrap();
+    let plain = file.to_string_lossy().into_owned();
+    assert!(plain.encode_utf16().count() > 260);
+    let extended = std::fs::canonicalize(&file)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    for path in [plain.clone(), extended, plain.replace('\\', "/")] {
+        let Output::Pdf { png, count, .. } = worker(Request::Pdf {
+            path,
+            page: 1,
+            edge: 700,
+        })
+        .unwrap() else {
+            panic!("not PDF")
+        };
+        assert_eq!(count, 3);
+        assert!(png.starts_with(b"\x89PNG"));
+    }
+    assert_eq!(std::fs::read(&file).unwrap(), original);
+    std::fs::remove_dir_all(root).unwrap();
+}

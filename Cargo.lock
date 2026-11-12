@@ -2266,6 +2266,7 @@ dependencies = [
  "image",
  "libc",
  "quick-xml 0.32.0",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "tokio",

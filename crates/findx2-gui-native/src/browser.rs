@@ -10,6 +10,13 @@ use std::{
 };
 pub type Cancel = Arc<AtomicBool>;
 pub fn list(path: &Path, cancel: &Cancel) -> Result<(PathBuf, Vec<SearchHitDto>, bool), String> {
+    list_with_hidden(path, cancel, true)
+}
+pub fn list_with_hidden(
+    path: &Path,
+    cancel: &Cancel,
+    show_hidden: bool,
+) -> Result<(PathBuf, Vec<SearchHitDto>, bool), String> {
     let path = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
     let mut rows = Vec::new();
     let mut truncated = false;
@@ -23,6 +30,19 @@ pub fn list(path: &Path, cancel: &Cancel) -> Result<(PathBuf, Vec<SearchHitDto>,
         }
         let e = item.map_err(|e| e.to_string())?;
         let Ok(meta) = e.metadata() else { continue };
+        if !show_hidden {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if meta.file_attributes() & 0x2 != 0 {
+                    continue;
+                }
+            }
+            #[cfg(not(windows))]
+            if e.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+        }
         rows.push(SearchHitDto {
             entry_idx: rows.len() as u32,
             name: e.file_name().to_string_lossy().into_owned(),
@@ -114,6 +134,38 @@ pub fn destination(action: FileAction, source: &Path, text: &str) -> Result<Path
         Ok(dst)
     }
 }
+/// Windows MoveFileW deliberately does NOT use MOVEFILE_REPLACE_EXISTING.
+/// A destination created after the UI check must still never be overwritten.
+fn rename_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::{Win32::Storage::FileSystem::MoveFileW, core::PCWSTR};
+        let a = src
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let b = dst
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        unsafe { MoveFileW(PCWSTR(a.as_ptr()), PCWSTR(b.as_ptr())) }
+            .map_err(|_| std::io::Error::last_os_error())
+    }
+    #[cfg(not(windows))]
+    {
+        if dst.exists() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "目标已存在",
+            ))
+        } else {
+            std::fs::rename(src, dst)
+        }
+    }
+}
 pub fn operate(action: FileAction, src: &Path, dst: &Path, cancel: &Cancel) -> Result<(), String> {
     if cancel.load(Ordering::Acquire) {
         return Err("操作已取消".into());
@@ -136,11 +188,11 @@ pub fn operate(action: FileAction, src: &Path, dst: &Path, cancel: &Cancel) -> R
         return Err("源与目标相同".into());
     }
     if action == FileAction::Rename {
-        std::fs::rename(src, dst).map_err(|e| e.to_string())?;
+        rename_no_replace(src, dst).map_err(|e| e.to_string())?;
         return Ok(());
     }
     if action == FileAction::Move {
-        if std::fs::rename(src, dst).is_ok() {
+        if rename_no_replace(src, dst).is_ok() {
             return Ok(());
         }
     }
@@ -210,7 +262,7 @@ pub fn operate(action: FileAction, src: &Path, dst: &Path, cancel: &Cancel) -> R
                 partial.display()
             ));
         }
-        std::fs::rename(&partial, dst).map_err(|e| e.to_string())?;
+        rename_no_replace(&partial, dst).map_err(|e| e.to_string())?;
         return Ok(());
     }
     if !m.is_file() {
@@ -268,7 +320,7 @@ pub fn operate(action: FileAction, src: &Path, dst: &Path, cancel: &Cancel) -> R
             partial.display()
         ));
     }
-    std::fs::rename(&partial, dst)
+    rename_no_replace(&partial, dst)
         .map_err(|e| format!("提交失败：{e}；副本在 {}", partial.display()))?;
     if action == FileAction::Move {
         std::fs::remove_file(src).map_err(|e| format!("复制成功但源删除失败（保留两份）：{e}"))?;
@@ -339,6 +391,103 @@ mod tests {
             )
             .is_err()
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod no_replace_tests {
+    use super::*;
+    #[test]
+    fn atomic_commit_does_not_replace_a_racing_destination() {
+        let root = std::env::temp_dir().join(format!(
+            "findx-commit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let a = root.join("a");
+        let b = root.join("b");
+        std::fs::write(&a, "source").unwrap();
+        std::fs::write(&b, "destination").unwrap();
+        assert!(rename_no_replace(&a, &b).is_err());
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "source");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "destination");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Resolves Windows known folders (including redirected/cloud locations) without constructing fake entries.
+/// Call on a background worker; a failed shell lookup is omitted, not guessed.
+pub fn standard_locations() -> Vec<(&'static str, &'static str, PathBuf)> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::{
+            System::Com::CoTaskMemFree,
+            UI::Shell::{
+                FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music,
+                FOLDERID_Pictures, FOLDERID_Videos, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+            },
+        };
+        let mut out = Vec::new();
+        for (name, icon, id) in [
+            ("桌面", "monitor", FOLDERID_Desktop),
+            ("文档", "file-text", FOLDERID_Documents),
+            ("下载", "download", FOLDERID_Downloads),
+            ("图片", "image", FOLDERID_Pictures),
+            ("音乐", "music", FOLDERID_Music),
+            ("视频", "video", FOLDERID_Videos),
+        ] {
+            if let Ok(wide) = unsafe { SHGetKnownFolderPath(&id, KF_FLAG_DEFAULT, None) } {
+                let text = unsafe { wide.to_string() };
+                unsafe { CoTaskMemFree(Some(wide.0 as _)) };
+                if let Ok(text) = text {
+                    out.push((name, icon, PathBuf::from(text)));
+                }
+            }
+        }
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod hidden_tests {
+    use super::*;
+    #[test]
+    fn native_hidden_attribute_is_respected_and_can_be_shown() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::{
+            Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW},
+            core::PCWSTR,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "findx-hidden-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("hidden.txt");
+        std::fs::write(&path, "public fixture").unwrap();
+        std::fs::write(root.join("visible.txt"), "public fixture").unwrap();
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        unsafe { SetFileAttributesW(PCWSTR(wide.as_ptr()), FILE_ATTRIBUTE_HIDDEN) }.unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert_eq!(list_with_hidden(&root, &cancel, false).unwrap().1.len(), 1);
+        assert_eq!(list_with_hidden(&root, &cancel, true).unwrap().1.len(), 2);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

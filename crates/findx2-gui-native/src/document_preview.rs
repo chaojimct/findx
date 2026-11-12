@@ -364,29 +364,32 @@ pub fn pdf_page(
     page_index: u32,
     max_edge: u32,
 ) -> Result<(Vec<u8>, u32, f32, f32), String> {
+    use std::io::Read;
     use windows::{
         Data::Pdf::{PdfDocument, PdfPageRenderOptions},
-        Storage::{
-            StorageFile,
-            Streams::{DataReader, InMemoryRandomAccessStream},
-        },
-        core::HSTRING,
+        Storage::Streams::{DataReader, DataWriter, InMemoryRandomAccessStream},
     };
-    if std::fs::metadata(path).map_err(|e| e.to_string())?.len() > MAX_FILE {
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("无法读取 PDF；请检查本地文件或云盘下载状态：{e}"))?;
+    if file.metadata().map_err(|e| e.to_string())?.len() > MAX_FILE {
         return Err("PDF 超过 32 MiB 预览上限".into());
     }
-    // WinRT StorageFile rejects mixed slash separators even though std::fs accepts them.
-    use std::os::windows::ffi::OsStrExt;
-    let absolute = std::path::absolute(path).map_err(|e| e.to_string())?;
-    let normalized: Vec<u16> = absolute
-        .as_os_str()
-        .encode_wide()
-        .map(|c| if c == 47 { 92 } else { c })
-        .collect();
-    let winrt_path = HSTRING::from_wide(&normalized);
+    let mut input = Vec::new();
+    file.take(MAX_FILE + 1)
+        .read_to_end(&mut input)
+        .map_err(|e| format!("无法读取本地 PDF 或云盘副本：{e}"))?;
+    if input.len() as u64 > MAX_FILE {
+        return Err("PDF 超过 32 MiB 预览上限".into());
+    }
     let run = || -> windows::core::Result<(Vec<u8>, u32, f32, f32)> {
-        let file = StorageFile::GetFileFromPathAsync(&winrt_path)?.get()?;
-        let doc = PdfDocument::LoadFromFileAsync(&file)?.get()?;
+        let source = InMemoryRandomAccessStream::new()?;
+        let writer = DataWriter::CreateDataWriter(&source.GetOutputStreamAt(0)?)?;
+        writer.WriteBytes(&input)?;
+        writer.StoreAsync()?.get()?;
+        writer.FlushAsync()?.get()?;
+        writer.DetachStream()?;
+        source.Seek(0)?;
+        let doc = PdfDocument::LoadFromStreamAsync(&source)?.get()?;
         let count = doc.PageCount()?;
         let page = doc.GetPage(page_index.min(count.saturating_sub(1)))?;
         let stream = InMemoryRandomAccessStream::new()?;
@@ -410,7 +413,10 @@ pub fn pdf_page(
         page.Close()?;
         Ok((bytes, count, page_size.Width, page_size.Height))
     };
-    run().map_err(|e| format!("Windows PDF 引擎无法预览（可能加密、损坏或引擎不可用）：{e}"))
+    run().map_err(|e| {
+        eprintln!("findx PDF engine: {e}");
+        "此 PDF 暂时无法显示。请确认文件已完整下载、未加密；可以重试或查看其他文件。".into()
+    })
 }
 
 #[cfg(windows)]

@@ -23,6 +23,7 @@ pub struct AppSession {
     pub last_error: Option<String>,
     pub available_roots: Vec<String>,
     pub system_dark: bool,
+    pub preview_theme: Option<(theme::ThemeStyle, UiThemePref)>,
     pub settings_window: Option<AnyWindowHandle>,
 }
 
@@ -59,16 +60,24 @@ impl AppSession {
             last_error: None,
             available_roots: Vec::new(),
             system_dark,
+            preview_theme: None,
             settings_window: None,
         }
     }
 
     pub fn effective_theme(&self) -> EffectiveTheme {
-        self.prefs.theme.resolve(self.system_dark)
+        self.preview_theme
+            .map(|(_, pref)| pref)
+            .unwrap_or(self.prefs.theme)
+            .resolve(self.system_dark)
     }
 
     pub fn apply_theme(&self, cx: &mut App) {
-        theme::apply_findx_theme(self.effective_theme(), cx);
+        let style = self
+            .preview_theme
+            .map(|(style, _)| style)
+            .unwrap_or(self.prefs.theme_style);
+        theme::apply_findx_style(style, self.effective_theme(), cx);
     }
 
     pub fn set_theme_pref(&mut self, pref: UiThemePref, cx: &mut App) {
