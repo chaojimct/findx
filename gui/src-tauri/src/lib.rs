@@ -15,9 +15,7 @@ use std::os::windows::ffi::OsStrExt;
 use windows::{
     core::{implement, PCWSTR},
     Win32::{
-        Foundation::{
-            DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, S_OK,
-        },
+        Foundation::{DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, S_OK},
         System::{
             Com::IDataObject,
             Ole::{IDropSource, IDropSource_Impl, DROPEFFECT, DROPEFFECT_COPY},
@@ -35,9 +33,9 @@ mod desktop;
 
 mod app_update;
 mod autostart;
-mod findx_settings;
 #[cfg(windows)]
 mod elevate;
+mod findx_settings;
 #[cfg(windows)]
 mod win_file_context_menu;
 #[cfg(windows)]
@@ -120,16 +118,15 @@ fn sibling_target_profile_dir(base: &Path) -> Option<PathBuf> {
     None
 }
 
-fn resolve_indexing_json_path(
-    base: &Path,
-    settings: &findx_settings::FindxGuiSettings,
-) -> PathBuf {
-    let primary = findx_settings::resolve_index_path(base, settings).with_extension("indexing.json");
+fn resolve_indexing_json_path(base: &Path, settings: &findx_settings::FindxGuiSettings) -> PathBuf {
+    let primary =
+        findx_settings::resolve_index_path(base, settings).with_extension("indexing.json");
     if primary.exists() {
         return primary;
     }
     if let Some(sibling) = sibling_target_profile_dir(base) {
-        let alt = findx_settings::resolve_index_path(&sibling, settings).with_extension("indexing.json");
+        let alt =
+            findx_settings::resolve_index_path(&sibling, settings).with_extension("indexing.json");
         if alt.exists() {
             return alt;
         }
@@ -417,10 +414,7 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
                 loading_phase_total: None,
                 tombstone_count: None,
                 last_error: Some(take_last_index_error().unwrap_or_else(|| {
-                    format!(
-                        "尚无索引 {}（首次启动会自动建索引）",
-                        index_path.display()
-                    )
+                    format!("尚无索引 {}（首次启动会自动建索引）", index_path.display())
                 })),
             };
         }
@@ -433,11 +427,8 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
         };
 
         const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
-        let pipe_res = tokio::time::timeout(
-            STATUS_TIMEOUT,
-            pipe::ipc_status_for_pipe_name(&pipe_name),
-        )
-        .await;
+        let pipe_res =
+            tokio::time::timeout(STATUS_TIMEOUT, pipe::ipc_status_for_pipe_name(&pipe_name)).await;
 
         match pipe_res {
             Ok(Ok(findx2_ipc::IpcResponse::StatusResult {
@@ -483,31 +474,31 @@ async fn fetch_index_status<R: Runtime>(app: tauri::AppHandle<R>) -> IndexStatus
                 }
                 let final_build_active = if service_alive { false } else { build_active };
                 IndexStatus {
-                indexing: final_build_active || loading,
-                ready: healthy && !loading,
-                indexed_count: entry_count,
-                metadata_ready,
-                backfill_done,
-                backfill_total,
-                indexing_phase: idx_snap.phase.clone(),
-                indexing_volumes_total: idx_snap.volumes_total,
-                indexing_volumes_done: idx_snap.volumes_done,
-                indexing_message: idx_snap.message.clone(),
-                indexing_entries_indexed: idx_snap.entries_indexed,
-                indexing_current_volume: idx_snap.current_volume.clone(),
-                loading_stage,
-                loading_elapsed_secs,
-                loading_phase_done,
-                loading_phase_total,
-                tombstone_count,
-                // USN 监听故障（增量中断/重建中）走 last_error 通道进状态栏；
-                // loading 提示优先（索引都没加载完时故障信息没意义）。
-                last_error: if loading {
-                    Some("索引加载中…（service 已启动，正在反序列化 index.bin）".into())
-                } else {
-                    watch_error.or(backfill_error)
-                },
-            }
+                    indexing: final_build_active || loading,
+                    ready: healthy && !loading,
+                    indexed_count: entry_count,
+                    metadata_ready,
+                    backfill_done,
+                    backfill_total,
+                    indexing_phase: idx_snap.phase.clone(),
+                    indexing_volumes_total: idx_snap.volumes_total,
+                    indexing_volumes_done: idx_snap.volumes_done,
+                    indexing_message: idx_snap.message.clone(),
+                    indexing_entries_indexed: idx_snap.entries_indexed,
+                    indexing_current_volume: idx_snap.current_volume.clone(),
+                    loading_stage,
+                    loading_elapsed_secs,
+                    loading_phase_done,
+                    loading_phase_total,
+                    tombstone_count,
+                    // USN 监听故障（增量中断/重建中）走 last_error 通道进状态栏；
+                    // loading 提示优先（索引都没加载完时故障信息没意义）。
+                    last_error: if loading {
+                        Some("索引加载中…（service 已启动，正在反序列化 index.bin）".into())
+                    } else {
+                        watch_error.or(backfill_error)
+                    },
+                }
             }
             Ok(Ok(_)) => IndexStatus {
                 indexing: build_active,
@@ -614,7 +605,11 @@ fn index_cli_args_to_shell_params(args: &[String]) -> String {
 ///
 /// 即便在「服务模式」下，建库本身依然需要管理员权限才能 OpenVolume、读 USN，所以只此一次 UAC 提权是合理的（与 Everything 首次需要管理员一致）。
 #[cfg(target_os = "windows")]
-fn run_index_cli_blocking(cli: &std::path::Path, args: &[String], work_dir: &std::path::Path) -> bool {
+fn run_index_cli_blocking(
+    cli: &std::path::Path,
+    args: &[String],
+    work_dir: &std::path::Path,
+) -> bool {
     use std::os::windows::process::CommandExt;
     use std::process::Command;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -637,7 +632,9 @@ fn run_index_cli_blocking(cli: &std::path::Path, args: &[String], work_dir: &std
                 return st.success();
             }
             Err(e) => {
-                eprintln!("findx2: 管理员会话下直接启动建索引 CLI 失败（{e}），回退 ShellExecute runas…");
+                eprintln!(
+                    "findx2: 管理员会话下直接启动建索引 CLI 失败（{e}），回退 ShellExecute runas…"
+                );
             }
         }
     }
@@ -661,10 +658,7 @@ fn run_index_cli_blocking(cli: &std::path::Path, args: &[String], work_dir: &std
 
 /// 建库成功后拉起 findx2-service；若 `index.bin` 尚未可见或 spawn 瞬时失败则短暂重试。
 #[cfg(target_os = "windows")]
-fn spawn_service_after_index_build<R: Runtime>(
-    app: tauri::AppHandle<R>,
-    index_path: PathBuf,
-) {
+fn spawn_service_after_index_build<R: Runtime>(app: tauri::AppHandle<R>, index_path: PathBuf) {
     let app_wait = app.clone();
     for attempt in 1..=12u32 {
         if !index_path.exists() {
@@ -688,8 +682,8 @@ fn spawn_service_after_index_build<R: Runtime>(
                         Ok(rt) => rt,
                         Err(_) => return,
                     };
-                    let settings = findx_settings::load_findx_settings(app_wait.clone())
-                        .unwrap_or_default();
+                    let settings =
+                        findx_settings::load_findx_settings(app_wait.clone()).unwrap_or_default();
                     let pn = settings.pipe_name.trim();
                     let pn = if pn.is_empty() { "findx2" } else { pn };
                     let _ = rt.block_on(wait_for_service_pipe(pn, SERVICE_PIPE_WAIT_SECS));
@@ -762,10 +756,7 @@ pub(crate) async fn auto_start_flow<R: Runtime>(app: tauri::AppHandle<R>) -> Res
     };
 
     if index.exists() {
-        if pipe::ipc_status_for_pipe_name(pipe_name)
-            .await
-            .is_ok()
-        {
+        if pipe::ipc_status_for_pipe_name(pipe_name).await.is_ok() {
             return Ok(());
         }
         findx_settings::spawn_findx_service_process(app.clone())?;
@@ -804,9 +795,8 @@ async fn start_indexing_impl<R: Runtime>(
     })?;
     let index = findx_settings::resolve_index_path(&base, &settings);
     if let Some(parent) = index.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            format!("无法创建索引目录 {}: {e}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("无法创建索引目录 {}: {e}", parent.display()))?;
     }
     let progress_path = index.with_extension("indexing.json");
     let mut cli_args: Vec<String> = vec![
@@ -872,7 +862,9 @@ async fn start_indexing_impl<R: Runtime>(
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) async fn ensure_service_running<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), String> {
+pub(crate) async fn ensure_service_running<R: Runtime>(
+    app: tauri::AppHandle<R>,
+) -> Result<(), String> {
     let base = findx_settings::exe_resource_dir();
     let settings = findx_settings::load_findx_settings(app.clone())?;
     let index = findx_settings::resolve_index_path(&base, &settings);
@@ -1060,9 +1052,7 @@ async fn search_files(
         if let Some(ext) = extension.filter(|s| !s.is_empty()) {
             q.push_str(&format!(" ext:{ext}"));
         }
-        let lim = limit
-            .unwrap_or(settings.search_limit)
-            .clamp(1, 8192) as usize;
+        let lim = limit.unwrap_or(settings.search_limit).clamp(1, 8192) as usize;
         // offset 不设上限（由 total 决定是否有更多页）；越界时 service 返回空页。
         let off = offset.unwrap_or(0) as usize;
         let (dtos, total, elapsed_ms) = pipe::ipc_search_with_pipe_name(
@@ -1329,7 +1319,10 @@ async fn compact_index(app: tauri::AppHandle) -> Result<CompactResult, String> {
     let base = findx_settings::exe_resource_dir();
     let index = findx_settings::resolve_index_path(&base, &settings);
     if !index.exists() {
-        return Err(format!("索引文件不存在: {}（先建库再压缩）", index.display()));
+        return Err(format!(
+            "索引文件不存在: {}（先建库再压缩）",
+            index.display()
+        ));
     }
     let cli = findx_settings::resolve_cli_exe(&base, &settings)
         .ok_or_else(|| "未找到 findx2 命令行（安装包应在资源目录 bin 提供 sidecar）".to_string())?;
@@ -1483,10 +1476,7 @@ fn get_autostart_state() -> autostart::AutostartState {
 /// 同时把结果同步进设置文件（`autoStartApp`）——那只是给 UI 用的缓存，
 /// 真正的判定永远是 `get_autostart_state`。
 #[tauri::command]
-fn set_autostart(
-    app: tauri::AppHandle,
-    enable: bool,
-) -> Result<autostart::AutostartState, String> {
+fn set_autostart(app: tauri::AppHandle, enable: bool) -> Result<autostart::AutostartState, String> {
     let state = autostart::apply(enable)?;
     // 设置文件写失败不该让整次操作失败：注册表已经改成功了，UI 只要拿到真实状态即可。
     if let Ok(mut s) = findx_settings::load_findx_settings(app.clone()) {
@@ -1549,7 +1539,9 @@ fn delete_path(
         if use_recycle_bin {
             // 使用 SHFileOperationW 将文件/目录移至回收站
             use std::os::windows::ffi::OsStrExt;
-            use windows::Win32::UI::Shell::{FOF_ALLOWUNDO, FO_DELETE, SHFileOperationW, SHFILEOPSTRUCTW};
+            use windows::Win32::UI::Shell::{
+                SHFileOperationW, FOF_ALLOWUNDO, FO_DELETE, SHFILEOPSTRUCTW,
+            };
             // FOF_NO_UI = FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_NOCONFIRMMKDIR
             const FOF_NO_UI: u16 = 0x0604;
             let wide_path: Vec<u16> = std::path::Path::new(&path)
@@ -1664,7 +1656,10 @@ fn list_drives() -> Result<Vec<DriveInfo>, String> {
             }
             let letter_char = (b'A' + i as u8) as char;
             // GetDriveTypeW / GetVolumeInformationW 需要 `<letter>:\` 形式（带尾反斜杠）。
-            let root_w: Vec<u16> = format!("{letter_char}:\\").encode_utf16().chain([0]).collect();
+            let root_w: Vec<u16> = format!("{letter_char}:\\")
+                .encode_utf16()
+                .chain([0])
+                .collect();
             let dt = unsafe { GetDriveTypeW(PCWSTR(root_w.as_ptr())) };
             // 跳过 DRIVE_UNKNOWN / DRIVE_NO_ROOT_DIR；仅保留可用类型。
             let drive_type = match dt {
@@ -1773,8 +1768,15 @@ fn unix_list_mounts() -> Result<Vec<DriveInfo>, String> {
                 let Some(fstype) = it.next() else { continue };
                 if matches!(
                     fstype,
-                    "proc" | "sysfs" | "devtmpfs" | "devpts" | "cgroup" | "cgroup2" | "tmpfs"
-                        | "overlay" | "squashfs"
+                    "proc"
+                        | "sysfs"
+                        | "devtmpfs"
+                        | "devpts"
+                        | "cgroup"
+                        | "cgroup2"
+                        | "tmpfs"
+                        | "overlay"
+                        | "squashfs"
                 ) {
                     continue;
                 }
@@ -1849,9 +1851,12 @@ fn open_path_in_console(path: String) -> Result<(), String> {
         let target_directory = if requested_path.is_dir() {
             requested_path
         } else {
-            requested_path.parent().map(std::path::Path::to_path_buf).ok_or_else(|| {
-                "Failed to resolve the parent folder for the requested path.".to_string()
-            })?
+            requested_path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .ok_or_else(|| {
+                    "Failed to resolve the parent folder for the requested path.".to_string()
+                })?
         };
 
         if !target_directory.is_dir() {
@@ -2223,8 +2228,7 @@ fn load_preview_data_url(path: String) -> Result<String, String> {
         _ => return Err("此文件类型不支持图片预览。".to_string()),
     };
 
-    let metadata =
-        fs::metadata(&file_path).map_err(|err| format!("读取预览元数据失败: {err}"))?;
+    let metadata = fs::metadata(&file_path).map_err(|err| format!("读取预览元数据失败: {err}"))?;
     let max_preview_bytes = match mime {
         "application/pdf" => 8 * 1024 * 1024_u64,
         "video/mp4" | "video/webm" | "video/quicktime" | "video/x-m4v" | "video/x-msvideo"

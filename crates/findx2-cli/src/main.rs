@@ -1,16 +1,16 @@
-﻿//! findx2 命令行入口。
+//! findx2 命令行入口。
 
 use clap::{Parser, Subcommand, ValueEnum};
-use findx2_core::{
-    load_store_auto, save_index_bin, ParsedQuery, QueryParser, Result,
-    SearchEngine, SearchOptions, V6Layout, v6_save_full,
-};
 #[cfg(windows)]
 use findx2_core::SearchHit;
+use findx2_core::{
+    load_store_auto, save_index_bin, v6_save_full, ParsedQuery, QueryParser, Result, SearchEngine,
+    SearchOptions, V6Layout,
+};
 /// Windows 常驻才用的增量提交类型（Watch/回填）：Unix/macOS 下 Watch 命令不存在，
 /// 这些导入只在 Windows 生效，避免非 Windows 构建报 unused_imports。
 #[cfg(windows)]
-use findx2_core::{CommitBatch, CommitOutcome, IndexStore, v6_try_commit};
+use findx2_core::{v6_try_commit, CommitBatch, CommitOutcome, IndexStore};
 #[cfg(windows)]
 mod remote;
 #[cfg(windows)]
@@ -130,10 +130,7 @@ enum OutColumn {
 /// CLI / Service 终端日志的本地时间格式：`HH:MM:SS.mmm`，与 `findx2_core::progress!` 对齐。
 struct LocalTimer;
 impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
-    fn format_time(
-        &self,
-        w: &mut tracing_subscriber::fmt::format::Writer<'_>,
-    ) -> std::fmt::Result {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
         write!(w, "{}", chrono::Local::now().format("%H:%M:%S%.3f"))
     }
 }
@@ -141,8 +138,7 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_timer(LocalTimer)
         .with_target(false)
@@ -191,9 +187,7 @@ fn run() -> Result<()> {
                         })
                         .collect(),
                     (_, Some(v))
-                        if !v.trim().is_empty()
-                            && !v.eq_ignore_ascii_case("C:")
-                            && v != r"C:\" =>
+                        if !v.trim().is_empty() && !v.eq_ignore_ascii_case("C:") && v != r"C:\" =>
                     {
                         vec![v]
                     }
@@ -242,7 +236,13 @@ fn run() -> Result<()> {
             let parse_us = t_parse.elapsed().as_micros();
             let engine = SearchEngine::new(store);
             // 预热一次，避免线程池/页缓存冷启动算到第一次的耗时里。
-            let _ = engine.search(&pq, &SearchOptions { allow_pinyin: pinyin, ..Default::default() })?;
+            let _ = engine.search(
+                &pq,
+                &SearchOptions {
+                    allow_pinyin: pinyin,
+                    ..Default::default()
+                },
+            )?;
             let mut samples: Vec<u128> = Vec::with_capacity(5);
             let mut last_total: u32 = 0;
             let mut last_hits_len: usize = 0;
@@ -250,7 +250,10 @@ fn run() -> Result<()> {
                 let t = std::time::Instant::now();
                 let (h, total) = engine.search(
                     &pq,
-                    &SearchOptions { allow_pinyin: pinyin, ..Default::default() },
+                    &SearchOptions {
+                        allow_pinyin: pinyin,
+                        ..Default::default()
+                    },
                 )?;
                 samples.push(t.elapsed().as_micros());
                 last_total = total;
@@ -308,38 +311,39 @@ fn run() -> Result<()> {
             columns,
         } => {
             let pipe_name = pipe.as_deref().unwrap_or("findx2");
-            let hits: Vec<SearchHit> = match remote::remote_search_blocking(pipe_name, &query, pinyin, limit) {
-                Ok(dtos) => dtos
-                    .into_iter()
-                    .map(|d| SearchHit {
-                        entry_idx: d.entry_idx,
-                        name: d.name,
-                        path: d.path,
-                        size: d.size,
-                        mtime: d.mtime,
-                        name_highlight: d.name_highlight,
-                    })
-                    .collect(),
-                Err(e) => {
-                    if let Some(idx) = index {
-                        eprintln!("连接服务失败（{e}），回退本地索引 …");
-                        let store = load_store_auto(&idx)?;
-                        let mut pq: ParsedQuery = QueryParser::parse(&query)?;
-                        pq.limit = limit.min(8192) as u32;
-                        let engine = SearchEngine::new(store);
-                        let (h, _t) = engine.search(
-                            &pq,
-                            &SearchOptions {
-                                allow_pinyin: pinyin,
-                                ..Default::default()
-                            },
-                        )?;
-                        h
-                    } else {
-                        return Err(e);
+            let hits: Vec<SearchHit> =
+                match remote::remote_search_blocking(pipe_name, &query, pinyin, limit) {
+                    Ok(dtos) => dtos
+                        .into_iter()
+                        .map(|d| SearchHit {
+                            entry_idx: d.entry_idx,
+                            name: d.name,
+                            path: d.path,
+                            size: d.size,
+                            mtime: d.mtime,
+                            name_highlight: d.name_highlight,
+                        })
+                        .collect(),
+                    Err(e) => {
+                        if let Some(idx) = index {
+                            eprintln!("连接服务失败（{e}），回退本地索引 …");
+                            let store = load_store_auto(&idx)?;
+                            let mut pq: ParsedQuery = QueryParser::parse(&query)?;
+                            pq.limit = limit.min(8192) as u32;
+                            let engine = SearchEngine::new(store);
+                            let (h, _t) = engine.search(
+                                &pq,
+                                &SearchOptions {
+                                    allow_pinyin: pinyin,
+                                    ..Default::default()
+                                },
+                            )?;
+                            h
+                        } else {
+                            return Err(e);
+                        }
                     }
-                }
-            };
+                };
             if json {
                 println!("{}", serde_json::to_string_pretty(&hits)?);
             } else {
@@ -389,8 +393,10 @@ fn run() -> Result<()> {
             let tomb = store.deleted.len() as usize;
             let bytes_before = std::fs::metadata(&index).map(|m| m.len()).unwrap_or(0);
 
-            println!("压缩前: {n_before} 条目，其中墓碑 {tomb}（{:.2}%）",
-                store.tombstone_ratio() * 100.0);
+            println!(
+                "压缩前: {n_before} 条目，其中墓碑 {tomb}（{:.2}%）",
+                store.tombstone_ratio() * 100.0
+            );
             println!("文件大小: {:.2} GB", bytes_before as f64 / 1073741824.0);
 
             if dry_run {
@@ -493,9 +499,7 @@ fn run() -> Result<()> {
             let mut dirty = false;
             println!(
                 "开始监听 {volume} ，从 journal_id={} last_usn={} 续跑；每 {:?} 落盘",
-                vol.usn_journal_id,
-                vol.last_usn,
-                save_every
+                vol.usn_journal_id, vol.last_usn, save_every
             );
             loop {
                 match rx.recv_timeout(Duration::from_secs(1)) {
@@ -516,7 +520,10 @@ fn run() -> Result<()> {
                             }
                             dirty = true;
                         }
-                        findx2_windows::UsnWatchMsg::StatRefresh { file_id, file_id_128 } => {
+                        findx2_windows::UsnWatchMsg::StatRefresh {
+                            file_id,
+                            file_id_128,
+                        } => {
                             sync_fetch_one(&volume, file_id, file_id_128, &mut store);
                             dirty = true;
                         }
@@ -560,9 +567,7 @@ fn run() -> Result<()> {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
-                    return Err(findx2_core::Error::Platform(
-                        "USN 监听线程异常结束".into(),
-                    ));
+                    return Err(findx2_core::Error::Platform("USN 监听线程异常结束".into()));
                 }
             }
             v6_commit_store(&v6, &mut store)?;
@@ -585,16 +590,12 @@ fn sync_fetch_one(
     let dev = if volume.starts_with(r"\\.\") {
         volume.to_string()
     } else {
-        format!(
-            r"\\.\{}:",
-            volume.trim_end_matches([':', '\\'])
-        )
+        format!(r"\\.\{}:", volume.trim_end_matches([':', '\\']))
     };
     let frns = [file_id];
     let ids = [file_id_128];
     let idx = [0usize];
-    let updates =
-        findx2_windows::fill_metadata_by_id_pooled(&dev, &frns, &ids, &idx, None, None);
+    let updates = findx2_windows::fill_metadata_by_id_pooled(&dev, &frns, &ids, &idx, None, None);
     for (_, size, mt, ct) in updates {
         let _ = store.apply_change_event(&findx2_core::ChangeEvent::DataOrMeta {
             file_id,
@@ -650,7 +651,11 @@ fn v6_commit_store(v6: &V6Layout, store: &mut IndexStore) -> Result<()> {
         return Ok(());
     }
     match v6_try_commit(v6, &batch)? {
-        CommitOutcome::Delta { applied, bytes, generation } => {
+        CommitOutcome::Delta {
+            applied,
+            bytes,
+            generation,
+        } => {
             eprintln!("[findx2] v6 commit：{applied} 条 / {bytes} B / gen {generation}");
             Ok(())
         }

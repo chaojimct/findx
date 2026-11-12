@@ -92,10 +92,7 @@ unsafe fn create_process_in_session(
 
     let exe_w: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut cmd_w: Vec<u16> = cmd.encode_wide().chain(Some(0)).collect();
-    let mut desktop: Vec<u16> = "winsta0\\default"
-        .encode_utf16()
-        .chain(Some(0))
-        .collect();
+    let mut desktop: Vec<u16> = "winsta0\\default".encode_utf16().chain(Some(0)).collect();
 
     let si = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,

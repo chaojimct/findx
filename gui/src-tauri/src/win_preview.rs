@@ -20,8 +20,11 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Mutex;
 
-use windows::core::{Interface, PCWSTR, GUID};
+use windows::core::{Interface, GUID, PCWSTR};
+use windows::Win32::Foundation::POINT;
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Gdi::{ClientToScreen, InvalidateRect, UpdateWindow};
+use windows::Win32::System::Com::IPersistFile;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX, CLSCTX_ACTIVATE_32_BIT_SERVER,
     CLSCTX_ACTIVATE_64_BIT_SERVER, CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER,
@@ -31,18 +34,16 @@ use windows::Win32::System::Registry::{
     RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CLASSES_ROOT, HKEY_LOCAL_MACHINE,
     KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY, REG_SAM_FLAGS, REG_VALUE_TYPE,
 };
-use windows::Win32::System::Com::IPersistFile;
 use windows::Win32::UI::Shell::PropertiesSystem::{IInitializeWithFile, IInitializeWithStream};
 use windows::Win32::UI::Shell::{
-    IInitializeWithItem, IPreviewHandler, IShellItem, SHCreateItemFromParsingName, SHCreateStreamOnFileEx,
+    IInitializeWithItem, IPreviewHandler, IShellItem, SHCreateItemFromParsingName,
+    SHCreateStreamOnFileEx,
 };
-use windows::Win32::Graphics::Gdi::{ClientToScreen, InvalidateRect, UpdateWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CreateWindowExW, DestroyWindow, EnumChildWindows, GetClassNameW,
-    SetWindowPos, ShowWindow, HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE,
-    SWP_NOZORDER, SW_HIDE, SW_SHOW, WS_CLIPCHILDREN, WS_POPUP, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    SetWindowPos, ShowWindow, HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOZORDER,
+    SW_HIDE, SW_SHOW, WS_CLIPCHILDREN, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
-use windows::Win32::Foundation::POINT;
 
 /// 预览处理器的 shellex 子键 GUID。Explorer 与 prevhost 都查这一项。
 const PREVIEW_HANDLER_SHELLEX_KEY: &str = "shellex\\{8895b1c6-b41f-4c1c-a562-0d564250836f}";
@@ -55,7 +56,11 @@ pub(crate) fn plog(msg: &str) {
     if let Ok(tmp) = std::env::var("TEMP") {
         let mut p = std::path::PathBuf::from(tmp);
         p.push("findx2-preview.log");
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+        {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
@@ -86,13 +91,18 @@ impl SystemAwareGuard {
             SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_SYSTEM_AWARE,
         };
         let prev = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE) };
-        Self { prev, ok: prev.0 as isize != 0 }
+        Self {
+            prev,
+            ok: prev.0 as isize != 0,
+        }
     }
 }
 impl Drop for SystemAwareGuard {
     fn drop(&mut self) {
         if self.ok {
-            unsafe { let _ = windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(self.prev); }
+            unsafe {
+                let _ = windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(self.prev);
+            }
         }
     }
 }
@@ -107,7 +117,12 @@ fn host_phys_to_sys_inner(top_hwnd: HWND, phys_w: i32, phys_h: i32) -> RECT {
     let monitor_dpi = if monitor_dpi == 0 { 96 } else { monitor_dpi };
     let w = ((phys_w as f64) * (system_dpi as f64) / (monitor_dpi as f64)).round() as i32;
     let h = ((phys_h as f64) * (system_dpi as f64) / (monitor_dpi as f64)).round() as i32;
-    RECT { left: 0, top: 0, right: w.max(1), bottom: h.max(1) }
+    RECT {
+        left: 0,
+        top: 0,
+        right: w.max(1),
+        bottom: h.max(1),
+    }
 }
 
 /// `RPC_E_SERVERCALL_RETRYLATER`：COM 返回「应用程序正在使用中」，常见于 prevhost/Office
@@ -251,8 +266,14 @@ fn read_hkcr_default_view(sub: &str, view: REG_SAM_FLAGS) -> Option<String> {
     unsafe {
         let mut hkey = HKEY::default();
         let wsub = to_wide(sub);
-        if RegOpenKeyExW(HKEY_CLASSES_ROOT, PCWSTR(wsub.as_ptr()), Some(0), KEY_READ | view, &mut hkey)
-            .is_err()
+        if RegOpenKeyExW(
+            HKEY_CLASSES_ROOT,
+            PCWSTR(wsub.as_ptr()),
+            Some(0),
+            KEY_READ | view,
+            &mut hkey,
+        )
+        .is_err()
         {
             return None;
         }
@@ -295,8 +316,14 @@ fn read_hklm_classes_default(sub: &str) -> Option<String> {
         let mut hkey = HKEY::default();
         let path = format!("SOFTWARE\\Classes\\{sub}");
         let wsub = to_wide(&path);
-        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(wsub.as_ptr()), Some(0), KEY_READ, &mut hkey)
-            .is_err()
+        if RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(wsub.as_ptr()),
+            Some(0),
+            KEY_READ,
+            &mut hkey,
+        )
+        .is_err()
         {
             return None;
         }
@@ -318,7 +345,11 @@ fn read_hklm_classes_default(sub: &str) -> Option<String> {
         let n = (len_bytes as usize / 2).saturating_sub(1);
         let s: String = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
         let s = s.trim_end_matches('\0').trim().to_string();
-        if s.is_empty() { None } else { Some(s) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
     }
 }
 
@@ -329,8 +360,9 @@ fn find_preview_handler_clsid_hklm(path: &Path) -> Option<GUID> {
         return None;
     }
     let dot_ext = format!(".{ext}");
-    if let Some(clsid) = read_hklm_classes_default(&format!("{dot_ext}\\{PREVIEW_HANDLER_SHELLEX_KEY}"))
-        .and_then(|s| parse_clsid(&s))
+    if let Some(clsid) =
+        read_hklm_classes_default(&format!("{dot_ext}\\{PREVIEW_HANDLER_SHELLEX_KEY}"))
+            .and_then(|s| parse_clsid(&s))
     {
         return Some(clsid);
     }
@@ -405,10 +437,20 @@ struct ClsidInfo {
 }
 
 fn format_clsid(clsid: &GUID) -> String {
-    format!("{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
-        clsid.data1, clsid.data2, clsid.data3,
-        clsid.data4[0], clsid.data4[1], clsid.data4[2], clsid.data4[3],
-        clsid.data4[4], clsid.data4[5], clsid.data4[6], clsid.data4[7])
+    format!(
+        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        clsid.data1,
+        clsid.data2,
+        clsid.data3,
+        clsid.data4[0],
+        clsid.data4[1],
+        clsid.data4[2],
+        clsid.data4[3],
+        clsid.data4[4],
+        clsid.data4[5],
+        clsid.data4[6],
+        clsid.data4[7]
+    )
 }
 
 /// 在指定注册表视图下探测某个 CLSID 子键是否存在。
@@ -470,7 +512,10 @@ fn probe_clsid(clsid: &GUID) -> ClsidInfo {
 /// EnumChildWindows 回调用来定位 WebView2 的真实窗口（命中即写入 OUT 参数并停止枚举）。
 /// 当前 DComp 预览走独立顶级窗口方案，不再需要穿透找宿主 HWND；保留供排查窗口层级时复用。
 #[allow(dead_code)]
-unsafe extern "system" fn enum_find_webview2(hwnd: HWND, lparam: windows::Win32::Foundation::LPARAM) -> windows::core::BOOL {
+unsafe extern "system" fn enum_find_webview2(
+    hwnd: HWND,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::core::BOOL {
     let mut buf = [0u16; 128];
     let n = unsafe { GetClassNameW(hwnd, &mut buf) };
     if n > 0 {
@@ -524,7 +569,11 @@ unsafe fn create_host_window(owner: HWND, screen_rect: RECT) -> Result<HWND, Str
     let h = (screen_rect.bottom - screen_rect.top).max(1);
     plog!(
         "[findx2-preview] create_host owner=0x{:X} screen_rect=({},{},{}x{})",
-        owner.0 as usize, screen_rect.left, screen_rect.top, w, h
+        owner.0 as usize,
+        screen_rect.left,
+        screen_rect.top,
+        w,
+        h
     );
     // 不要 WS_VISIBLE / SWP_SHOWWINDOW：否则空宿主会在 Initialize/DoPreview 完成前就盖住 WebView，
     // 前端「云同步 / 加载中」遮罩（DOM）会被压在下面用户永远看不到。
@@ -599,7 +648,9 @@ fn hydrate_cloud_file_best_effort(path: &Path) -> Result<(), String> {
 
     plog!(
         "[findx2-preview] cloud hydrate start len={} attr=0x{:X} cloud_dir={}",
-        len, attrs, cloud_dir
+        len,
+        attrs,
+        cloud_dir
     );
 
     let mut f = match std::fs::File::open(path) {
@@ -643,7 +694,10 @@ fn hydrate_cloud_file_best_effort(path: &Path) -> Result<(), String> {
             since_check = 0;
             if let Ok(m2) = std::fs::metadata(path) {
                 let a2 = m2.file_attributes();
-                if a2 & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+                if a2
+                    & (FILE_ATTRIBUTE_OFFLINE
+                        | FILE_ATTRIBUTE_RECALL_ON_OPEN
+                        | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
                     == 0
                 {
                     plog!(
@@ -655,7 +709,11 @@ fn hydrate_cloud_file_best_effort(path: &Path) -> Result<(), String> {
             }
         }
     }
-    plog!("[findx2-preview] cloud hydrate done, read {} / {} bytes", total, len);
+    plog!(
+        "[findx2-preview] cloud hydrate done, read {} / {} bytes",
+        total,
+        len
+    );
     Ok(())
 }
 
@@ -850,11 +908,18 @@ unsafe fn initialize_handler(handler: &IPreviewHandler, path: &Path) -> Result<(
     Err(msg)
 }
 
-
 /// 显示/切换预览。`path` 是绝对路径。
 ///
 /// 必须在主线程调用。命令侧用 `run_on_main_thread` 包一层。
-pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w: f64, css_h: f64, dpr: f64) -> Result<(), String> {
+pub fn show_preview(
+    top_hwnd: HWND,
+    path: String,
+    css_x: f64,
+    css_y: f64,
+    css_w: f64,
+    css_h: f64,
+    dpr: f64,
+) -> Result<(), String> {
     ensure_com_init();
     let p = Path::new(&path);
     if !p.exists() {
@@ -870,7 +935,11 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
     //   不要去找 Chromium 子 HWND 当基准：DComp 模式下其位置/大小不可靠。
     // - scale = 前端 `window.devicePixelRatio`（webview 真实使用的值），
     //   不用 GetDpiForWindow 猜——跨屏/启动瞬间二者会不一致。
-    let scale = if dpr.is_finite() && dpr > 0.0 { dpr } else { 1.0 };
+    let scale = if dpr.is_finite() && dpr > 0.0 {
+        dpr
+    } else {
+        1.0
+    };
     let x = (css_x * scale).round() as i32;
     let y = (css_y * scale).round() as i32;
     let w = ((css_w * scale).round() as i32).max(1);
@@ -883,9 +952,13 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
         use windows::Win32::UI::HiDpi::GetDpiForWindow;
         use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
         let mut wr = RECT::default();
-        unsafe { let _ = GetWindowRect(top_hwnd, &mut wr); }
+        unsafe {
+            let _ = GetWindowRect(top_hwnd, &mut wr);
+        }
         let mut o = POINT { x: 0, y: 0 };
-        unsafe { let _ = ClientToScreen(top_hwnd, &mut o); }
+        unsafe {
+            let _ = ClientToScreen(top_hwnd, &mut o);
+        }
         let dpi = unsafe { GetDpiForWindow(top_hwnd) };
         plog!(
             "[findx2-preview] diag top_window_rect=({},{},{}x{}) client_origin_screen=({},{}) GetDpiForWindow={}",
@@ -960,7 +1033,8 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
         .filter(|c| format_clsid(c) != format_clsid(&clsid_primary));
     plog!(
         "[findx2-preview] clsid primary={:?} hklm_fallback={:?}",
-        clsid_primary, clsid_fallback
+        clsid_primary,
+        clsid_fallback
     );
 
     // 换文件：只 Unload 旧处理器，复用宿主 HWND（与 Explorer 预览窗格一致）。
@@ -981,17 +1055,39 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
             }
         };
         if info.handler_only {
-            if info.has_32 { push(CLSCTX_LOCAL_SERVER | CLSCTX_ACTIVATE_32_BIT_SERVER, &mut attempts); }
-            if info.has_64 { push(CLSCTX_LOCAL_SERVER | CLSCTX_ACTIVATE_64_BIT_SERVER, &mut attempts); }
+            if info.has_32 {
+                push(
+                    CLSCTX_LOCAL_SERVER | CLSCTX_ACTIVATE_32_BIT_SERVER,
+                    &mut attempts,
+                );
+            }
+            if info.has_64 {
+                push(
+                    CLSCTX_LOCAL_SERVER | CLSCTX_ACTIVATE_64_BIT_SERVER,
+                    &mut attempts,
+                );
+            }
             push(CLSCTX_LOCAL_SERVER, &mut attempts);
         } else {
             if info.has_64 {
-                push(CLSCTX_INPROC_SERVER | CLSCTX_ACTIVATE_64_BIT_SERVER, &mut attempts);
-                push(CLSCTX_LOCAL_SERVER | CLSCTX_ACTIVATE_64_BIT_SERVER, &mut attempts);
+                push(
+                    CLSCTX_INPROC_SERVER | CLSCTX_ACTIVATE_64_BIT_SERVER,
+                    &mut attempts,
+                );
+                push(
+                    CLSCTX_LOCAL_SERVER | CLSCTX_ACTIVATE_64_BIT_SERVER,
+                    &mut attempts,
+                );
             }
             if info.has_32 {
-                push(CLSCTX_LOCAL_SERVER | CLSCTX_ACTIVATE_32_BIT_SERVER, &mut attempts);
-                push(CLSCTX_INPROC_SERVER | CLSCTX_ACTIVATE_32_BIT_SERVER, &mut attempts);
+                push(
+                    CLSCTX_LOCAL_SERVER | CLSCTX_ACTIVATE_32_BIT_SERVER,
+                    &mut attempts,
+                );
+                push(
+                    CLSCTX_INPROC_SERVER | CLSCTX_ACTIVATE_32_BIT_SERVER,
+                    &mut attempts,
+                );
             }
             push(CLSCTX_LOCAL_SERVER, &mut attempts);
             push(CLSCTX_INPROC_SERVER, &mut attempts);
@@ -1090,15 +1186,23 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
         (rec.hwnd, need, true)
     } else {
         let _sys_aware_guard = SystemAwareGuard::enter();
-        (unsafe { create_host_window(top_hwnd, popup_screen_rect)? }, false, false)
+        (
+            unsafe { create_host_window(top_hwnd, popup_screen_rect)? },
+            false,
+            false,
+        )
     };
     let host_phys_w = (screen_rect.right - screen_rect.left).max(1);
     let host_phys_h = (screen_rect.bottom - screen_rect.top).max(1);
     let inner = host_phys_to_sys_inner(top_hwnd, host_phys_w, host_phys_h);
     plog!(
         "[findx2-preview] inner host_phys=({}x{}) inner_sys=({}x{}) popup_sys_rect=({},{},{}x{})",
-        host_phys_w, host_phys_h, inner.right, inner.bottom,
-        popup_screen_rect.left, popup_screen_rect.top,
+        host_phys_w,
+        host_phys_h,
+        inner.right,
+        inner.bottom,
+        popup_screen_rect.left,
+        popup_screen_rect.top,
         popup_screen_rect.right - popup_screen_rect.left,
         popup_screen_rect.bottom - popup_screen_rect.top,
     );
@@ -1122,7 +1226,9 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
                 }
                 plog!(
                     "[findx2-preview] DoPreview ok, host shown at ({}x{}) recycled={}",
-                    inner.right, inner.bottom, was_recycled
+                    inner.right,
+                    inner.bottom,
+                    was_recycled
                 );
                 Ok(())
             })()
@@ -1164,8 +1270,19 @@ pub fn show_preview(top_hwnd: HWND, path: String, css_x: f64, css_y: f64, css_w:
 ///
 /// 矩形未变时直接返回：列表滚动会经 capture 阶段的 scroll 事件打到这里，
 /// 对 IPreviewHandler 反复 `SetRect` 会把 prevhost 子窗口打成白屏。
-pub fn set_bounds(top_hwnd: HWND, css_x: f64, css_y: f64, css_w: f64, css_h: f64, dpr: f64) -> Result<(), String> {
-    let scale = if dpr.is_finite() && dpr > 0.0 { dpr } else { 1.0 };
+pub fn set_bounds(
+    top_hwnd: HWND,
+    css_x: f64,
+    css_y: f64,
+    css_w: f64,
+    css_h: f64,
+    dpr: f64,
+) -> Result<(), String> {
+    let scale = if dpr.is_finite() && dpr > 0.0 {
+        dpr
+    } else {
+        1.0
+    };
     let x = (css_x * scale).round() as i32;
     let y = (css_y * scale).round() as i32;
     let w = ((css_w * scale).round() as i32).max(1);
@@ -1242,7 +1359,12 @@ mod tests {
     use super::*;
 
     fn r(l: i32, t: i32, w: i32, h: i32) -> RECT {
-        RECT { left: l, top: t, right: l + w, bottom: t + h }
+        RECT {
+            left: l,
+            top: t,
+            right: l + w,
+            bottom: t + h,
+        }
     }
 
     #[test]
@@ -1254,8 +1376,16 @@ mod tests {
 
     #[test]
     fn rect_size_almost_eq_ignores_origin() {
-        assert!(rect_size_almost_eq(r(0, 0, 320, 480), r(80, 40, 320, 480), 1));
+        assert!(rect_size_almost_eq(
+            r(0, 0, 320, 480),
+            r(80, 40, 320, 480),
+            1
+        ));
         assert!(rect_size_almost_eq(r(0, 0, 320, 480), r(0, 0, 321, 479), 1));
-        assert!(!rect_size_almost_eq(r(0, 0, 320, 480), r(0, 0, 320, 500), 1));
+        assert!(!rect_size_almost_eq(
+            r(0, 0, 320, 480),
+            r(0, 0, 320, 500),
+            1
+        ));
     }
 }

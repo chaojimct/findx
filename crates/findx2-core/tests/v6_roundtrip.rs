@@ -128,14 +128,21 @@ fn v6_delta_commit_meta_patch_and_reload() {
     let batch = batch_of(&mut store);
     assert!(!batch.mutations.is_empty());
     match v6_try_commit(&layout, &batch).unwrap() {
-        CommitOutcome::Delta { applied, generation, .. } => {
+        CommitOutcome::Delta {
+            applied,
+            generation,
+            ..
+        } => {
             assert_eq!(applied, batch.mutations.len());
             assert!(generation >= 2);
         }
         CommitOutcome::NeedFull { reason } => panic!("unexpected NeedFull: {reason}"),
     }
     let loaded = v6_load(&layout).unwrap();
-    assert_eq!(loaded.entries[store.frn_to_entry.get(&1).copied().unwrap() as usize].size, 11);
+    assert_eq!(
+        loaded.entries[store.frn_to_entry.get(&1).copied().unwrap() as usize].size,
+        11
+    );
     let _ = std::fs::remove_dir_all(&layout.dir);
 }
 
@@ -255,7 +262,9 @@ fn v6_empty_commit_is_noop_and_crash_tail_tolerated() {
         CommitOutcome::Delta { .. } => {}
         CommitOutcome::NeedFull { reason } => panic!("unexpected NeedFull: {reason}"),
     }
-    let meta_len = std::fs::metadata(layout.dir.join("entries.dat")).unwrap().len();
+    let meta_len = std::fs::metadata(layout.dir.join("entries.dat"))
+        .unwrap()
+        .len();
     assert_eq!(meta_len, (store.entries.len() * 32) as u64);
     let _ = std::fs::remove_dir_all(&layout.dir);
 }
@@ -336,7 +345,8 @@ fn v6_full_resync_falls_back_to_rewrite() {
 }
 
 #[test]
-fn v6_auto_prefers_v6_over_v5() {    let (p, layout) = tmp_index("auto");
+fn v6_auto_prefers_v6_over_v5() {
+    let (p, layout) = tmp_index("auto");
     let store = sample_store();
     // 先写 v5
     findx2_core::save_index_bin(&p, &store).unwrap();

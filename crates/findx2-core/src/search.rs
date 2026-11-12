@@ -297,10 +297,7 @@ impl SearchEngine {
 
     /// 批量写主索引（**只在 fast 索引建库期、单线程独占场景下使用**——例如 USN watcher 增量更新走的是另一条
     /// 单条 `patch_entry_metadata`；这里保留是为了兼容老用例，回填路径已经改走 overlay）。
-    pub fn patch_entries_metadata_batch(
-        &self,
-        updates: &[(usize, u64, u64, u64)],
-    ) -> Result<()> {
+    pub fn patch_entries_metadata_batch(&self, updates: &[(usize, u64, u64, u64)]) -> Result<()> {
         if updates.is_empty() {
             return Ok(());
         }
@@ -510,39 +507,39 @@ impl SearchEngine {
         // pin matcher 按分支预编译一次（串行；构建便宜），扫描中各线程再 clone。
         let mut branch_qs: Vec<ParsedQuery> = Vec::with_capacity(1 + q.or_branches.len());
         branch_qs.push(Self::strip_or(q));
-            for br in &q.or_branches {
-                branch_qs.push(Self::strip_or(br));
-            }
-            #[cfg(feature = "pinyin")]
-            let branch_needles: Vec<Vec<String>> = branch_qs
-                .iter()
-                .map(|b| collect_pinyin_needles(b, opt))
-                .collect();
-            #[cfg(feature = "pinyin")]
-            let branch_matchers: Vec<Vec<IbRegex<'_>>> = branch_needles
-                .iter()
-                .map(|ns| {
-                    ns.iter()
-                        .map(|s| build_pinyin_matcher(s.as_str()))
-                        .collect::<Result<Vec<_>>>()
-                })
-                .collect::<Result<Vec<_>>>()?;
+        for br in &q.or_branches {
+            branch_qs.push(Self::strip_or(br));
+        }
+        #[cfg(feature = "pinyin")]
+        let branch_needles: Vec<Vec<String>> = branch_qs
+            .iter()
+            .map(|b| collect_pinyin_needles(b, opt))
+            .collect();
+        #[cfg(feature = "pinyin")]
+        let branch_matchers: Vec<Vec<IbRegex<'_>>> = branch_needles
+            .iter()
+            .map(|ns| {
+                ns.iter()
+                    .map(|s| build_pinyin_matcher(s.as_str()))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-            let per_branch: Vec<Vec<u32>> = (0..branch_qs.len())
-                .into_par_iter()
-                .map(|i| {
-                    #[cfg(feature = "pinyin")]
-                    let m: &PinList<'_> = branch_matchers[i].as_slice();
-                    #[cfg(not(feature = "pinyin"))]
-                    let m: &PinList<'_> = &[];
-                    Self::search_flat_indices(store, overlay, &branch_qs[i], opt, m)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let mut uni: HashSet<u32> = HashSet::new();
-            for v in per_branch {
-                uni.extend(v);
-            }
-            Ok(uni.into_iter().collect())
+        let per_branch: Vec<Vec<u32>> = (0..branch_qs.len())
+            .into_par_iter()
+            .map(|i| {
+                #[cfg(feature = "pinyin")]
+                let m: &PinList<'_> = branch_matchers[i].as_slice();
+                #[cfg(not(feature = "pinyin"))]
+                let m: &PinList<'_> = &[];
+                Self::search_flat_indices(store, overlay, &branch_qs[i], opt, m)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut uni: HashSet<u32> = HashSet::new();
+        for v in per_branch {
+            uni.extend(v);
+        }
+        Ok(uni.into_iter().collect())
     }
 
     fn strip_or(q: &ParsedQuery) -> ParsedQuery {
@@ -895,7 +892,11 @@ impl SearchEngine {
                     let cmp = |a: &u32, b: &u32| -> std::cmp::Ordering {
                         let sa = store.entries[*a as usize].size;
                         let sb = store.entries[*b as usize].size;
-                        if desc { sb.cmp(&sa) } else { sa.cmp(&sb) }
+                        if desc {
+                            sb.cmp(&sa)
+                        } else {
+                            sa.cmp(&sb)
+                        }
                     };
                     select_top_k_then_sort(&mut out, k, cmp);
                     out
@@ -911,7 +912,11 @@ impl SearchEngine {
                     let cmp = |a: &u32, b: &u32| -> std::cmp::Ordering {
                         let sa = store.entries[*a as usize].mtime;
                         let sb = store.entries[*b as usize].mtime;
-                        if desc { sb.cmp(&sa) } else { sa.cmp(&sb) }
+                        if desc {
+                            sb.cmp(&sa)
+                        } else {
+                            sa.cmp(&sb)
+                        }
                     };
                     select_top_k_then_sort(&mut out, k, cmp);
                     out
@@ -927,7 +932,11 @@ impl SearchEngine {
                     let cmp = |a: &u32, b: &u32| -> std::cmp::Ordering {
                         let sa = store.entries[*a as usize].ctime;
                         let sb = store.entries[*b as usize].ctime;
-                        if desc { sb.cmp(&sa) } else { sa.cmp(&sb) }
+                        if desc {
+                            sb.cmp(&sa)
+                        } else {
+                            sa.cmp(&sb)
+                        }
                     };
                     select_top_k_then_sort(&mut out, k, cmp);
                     out
@@ -971,9 +980,7 @@ impl SearchEngine {
                         // 小命中集不切分，理由同 finalize 构建。
                         .with_min_len(1024)
                         .map(|&idx| {
-                            let p = store
-                                .entry_display_path(idx as usize)
-                                .unwrap_or_default();
+                            let p = store.entry_display_path(idx as usize).unwrap_or_default();
                             (idx, p)
                         })
                         .collect();
@@ -997,7 +1004,7 @@ impl SearchEngine {
         }
     }
 
-/// 当页构建：已排序的 idx 切片 → `SearchHit`（name/path/highlight/meta）。
+    /// 当页构建：已排序的 idx 切片 → `SearchHit`（name/path/highlight/meta）。
     /// 每 hit 相互独立，并行（rayon 对 indexed 源 collect 保序）；pin matcher
     /// 每线程 clone（`map_init`），`with_min_len` 保小页不切分。
     /// 错误整体返回 Err（并行下具体哪一个先报不确定，但实践中不可达）。
@@ -1086,7 +1093,11 @@ impl SearchEngine {
     /// FRN → entry 下标（后台 stat worker 等外部增量用；墓碑条目也会返回下标，
     /// 调用方自行决定是否跳过）。
     pub fn entry_idx_by_frn(&self, frn: u64) -> Option<usize> {
-        self.store.read().frn_to_entry.get_idx(frn).map(|i| i as usize)
+        self.store
+            .read()
+            .frn_to_entry
+            .get_idx(frn)
+            .map(|i| i as usize)
     }
 
     pub fn index_store(&self) -> parking_lot::RwLockReadGuard<'_, IndexStore> {
@@ -1115,10 +1126,9 @@ impl SearchEngine {
             crate::trigram::build_and_save(&store, index_path)?;
             pending_before
         };
-        let new_tri = crate::trigram::TrigramIndex::load(&crate::trigram::tri_sidecar_path(
-            index_path,
-        ))?
-        .ok_or_else(|| crate::Error::Persist("trigram 重建后加载失败".into()))?;
+        let new_tri =
+            crate::trigram::TrigramIndex::load(&crate::trigram::tri_sidecar_path(index_path))?
+                .ok_or_else(|| crate::Error::Persist("trigram 重建后加载失败".into()))?;
         {
             let mut store = self.index_store_mut();
             store.trigram = Some(Arc::new(new_tri));
@@ -1181,11 +1191,7 @@ impl SearchEngine {
 }
 
 #[inline]
-fn effective_meta(
-    overlay: &MetaOverlay,
-    store: &IndexStore,
-    idx: u32,
-) -> (u64, u64, u64) {
+fn effective_meta(overlay: &MetaOverlay, store: &IndexStore, idx: u32) -> (u64, u64, u64) {
     if let Some((size, mtime, ctime)) = overlay.get(idx as usize) {
         return (
             size,
@@ -1205,11 +1211,7 @@ fn effective_meta(
 /// 与 [`effective_meta`] 同源：dm:/dc: 过滤必须用「展示用的」mtime/ctime。
 /// 回填阶段主索引可能仍是 USN/首遍占位，overlay 已是磁盘读出的真值；只读 store 会导致侧栏时间条件与列表日期不一致。
 #[inline]
-fn entry_meta_for_filter(
-    overlay: &MetaOverlay,
-    store: &IndexStore,
-    idx: u32,
-) -> (u64, u32, u32) {
+fn entry_meta_for_filter(overlay: &MetaOverlay, store: &IndexStore, idx: u32) -> (u64, u32, u32) {
     if let Some(triple) = overlay.get(idx as usize) {
         return triple;
     }
@@ -1441,7 +1443,12 @@ fn pinyin_candidate_ids(store: &IndexStore, q: &ParsedQuery) -> Option<Vec<u32>>
     Some(bm.iter().collect())
 }
 /// 融合扫描主体：`ids` 是并行迭代器（全表 Range 或 trigram 候选 Vec），过滤逻辑完全一致。
-fn fused_scan_par<PI>(store: &IndexStore, overlay: &MetaOverlay, q: &ParsedQuery, ids: PI) -> Vec<u32>
+fn fused_scan_par<PI>(
+    store: &IndexStore,
+    overlay: &MetaOverlay,
+    q: &ParsedQuery,
+    ids: PI,
+) -> Vec<u32>
 where
     PI: rayon::iter::IndexedParallelIterator<Item = u32>,
 {
@@ -1493,16 +1500,18 @@ where
     let check_deleted_bm = !store.deleted.is_empty();
     let n = store.entries.len() as u32;
     let any_size_filter = metadata_ready && (size_min.is_some() || size_max.is_some());
-    let any_time_filter = mtime_min.is_some()
-        || mtime_max.is_some()
-        || ctime_min.is_some()
-        || ctime_max.is_some();
+    let any_time_filter =
+        mtime_min.is_some() || mtime_max.is_some() || ctime_min.is_some() || ctime_max.is_some();
 
     // par_iter().fold + reduce：每个线程 chunk 内 push 进一个 Vec，最后一次性 extend 到主 Vec。
     // 这比 .collect::<Vec<_>>() 在大候选 + 大命中时更稳，避免 rayon 默认中间结构反复分配。
     let _dbg = std::env::var("FINDX2_DEBUG_SEARCH").is_ok();
     let _t_par = std::time::Instant::now();
-    let _n_threads = if _dbg { rayon::current_num_threads() } else { 0 };
+    let _n_threads = if _dbg {
+        rayon::current_num_threads()
+    } else {
+        0
+    };
     let result = ids
         .fold(Vec::new, |mut acc, idx| {
             let e = unsafe { store.entries.get_unchecked(idx as usize) };
@@ -1624,7 +1633,10 @@ fn fused_scan_pinyin(
     pin_res: &[IbRegex<'_>],
     cands: Option<Vec<u32>>,
 ) -> Vec<u32> {
-    debug_assert!(!pin_res.is_empty(), "fused_scan_pinyin 调用方必须保证 pin_res 非空");
+    debug_assert!(
+        !pin_res.is_empty(),
+        "fused_scan_pinyin 调用方必须保证 pin_res 非空"
+    );
     match cands {
         Some(ids) => fused_scan_pinyin_par(store, overlay, q, pin_res, ids.into_par_iter()),
         None => {
@@ -1645,7 +1657,6 @@ fn fused_scan_pinyin_par<PI>(
 where
     PI: rayon::iter::IndexedParallelIterator<Item = u32>,
 {
-
     let only_files = q.only_files;
     let only_dirs = q.only_dirs;
     let attrib_must = q.attrib_must;
@@ -1659,14 +1670,16 @@ where
     let ctime_max = q.ctime_max.map(crate::index::filetime_to_unix_secs);
     let check_deleted_bm = !store.deleted.is_empty();
     let any_size_filter = metadata_ready && (size_min.is_some() || size_max.is_some());
-    let any_time_filter = mtime_min.is_some()
-        || mtime_max.is_some()
-        || ctime_min.is_some()
-        || ctime_max.is_some();
+    let any_time_filter =
+        mtime_min.is_some() || mtime_max.is_some() || ctime_min.is_some() || ctime_max.is_some();
 
     let _dbg = std::env::var("FINDX2_DEBUG_SEARCH").is_ok();
     let _t_par = std::time::Instant::now();
-    let _n_threads = if _dbg { rayon::current_num_threads() } else { 0 };
+    let _n_threads = if _dbg {
+        rayon::current_num_threads()
+    } else {
+        0
+    };
 
     // pin matcher 每线程 clone 一份：lita::Regex 内部有 cache pool，多线程共享
     // 同一实例会在短 haystack + 大并发下自旋竞争（上游文档建议 per-thread clone）。
@@ -1675,75 +1688,76 @@ where
         .fold(
             || (Vec::new(), pin_res.to_vec()),
             |(mut acc, pin_local), idx| {
-            let e = unsafe { store.entries.get_unchecked(idx as usize) };
-            if e.is_deleted() {
-                return (acc, pin_local);
-            }
-            if check_deleted_bm && store.deleted.contains(idx) {
-                return (acc, pin_local);
-            }
-            let is_dir = e.is_dir_entry();
-            if only_files && is_dir {
-                return (acc, pin_local);
-            }
-            if only_dirs && !is_dir {
-                return (acc, pin_local);
-            }
-            if attrib_must != 0 {
-                let a = e.attrs & 0xff;
-                if (a & attrib_must) != attrib_must {
+                let e = unsafe { store.entries.get_unchecked(idx as usize) };
+                if e.is_deleted() {
                     return (acc, pin_local);
                 }
-            }
-            if any_size_filter {
-                if let Some(v) = size_min {
-                    if e.size < v {
-                        return (acc, pin_local);
-                    }
-                }
-                if let Some(v) = size_max {
-                    if e.size > v {
-                        return (acc, pin_local);
-                    }
-                }
-            }
-            if any_time_filter {
-                let (_, mt, ct) = entry_meta_for_filter(overlay, store, idx);
-                if let Some(v) = mtime_min {
-                    if mt < v {
-                        return (acc, pin_local);
-                    }
-                }
-                if let Some(v) = mtime_max {
-                    if mt > v {
-                        return (acc, pin_local);
-                    }
-                }
-                if let Some(v) = ctime_min {
-                    if ct < v {
-                        return (acc, pin_local);
-                    }
-                }
-                if let Some(v) = ctime_max {
-                    if ct > v {
-                        return (acc, pin_local);
-                    }
-                }
-            }
-            // 名字匹配（AND）：lita::Regex 接 &str；name_str 在 UTF-8 校验失败时会用 lossy。
-            // 我们的索引 name 必为合法 UTF-8（建索引时强制），unsafe 走原始字节避免重复校验。
-            let name_bytes = store.name_bytes(e);
-            // SAFETY：建索引阶段已保证 entry.name 是合法 UTF-8（FRN→name 通过 OS API 取的 wide string 转过来）。
-            let name_str = unsafe { std::str::from_utf8_unchecked(name_bytes) };
-            // 用本线程 clone 的 matcher（pin_local），不碰共享实例的内部 cache pool。
-            for re in pin_local.iter() {
-                if re.find(name_str).is_none() {
+                if check_deleted_bm && store.deleted.contains(idx) {
                     return (acc, pin_local);
                 }
-            }
-            acc.push(idx);
-            (acc, pin_local)
-        })
+                let is_dir = e.is_dir_entry();
+                if only_files && is_dir {
+                    return (acc, pin_local);
+                }
+                if only_dirs && !is_dir {
+                    return (acc, pin_local);
+                }
+                if attrib_must != 0 {
+                    let a = e.attrs & 0xff;
+                    if (a & attrib_must) != attrib_must {
+                        return (acc, pin_local);
+                    }
+                }
+                if any_size_filter {
+                    if let Some(v) = size_min {
+                        if e.size < v {
+                            return (acc, pin_local);
+                        }
+                    }
+                    if let Some(v) = size_max {
+                        if e.size > v {
+                            return (acc, pin_local);
+                        }
+                    }
+                }
+                if any_time_filter {
+                    let (_, mt, ct) = entry_meta_for_filter(overlay, store, idx);
+                    if let Some(v) = mtime_min {
+                        if mt < v {
+                            return (acc, pin_local);
+                        }
+                    }
+                    if let Some(v) = mtime_max {
+                        if mt > v {
+                            return (acc, pin_local);
+                        }
+                    }
+                    if let Some(v) = ctime_min {
+                        if ct < v {
+                            return (acc, pin_local);
+                        }
+                    }
+                    if let Some(v) = ctime_max {
+                        if ct > v {
+                            return (acc, pin_local);
+                        }
+                    }
+                }
+                // 名字匹配（AND）：lita::Regex 接 &str；name_str 在 UTF-8 校验失败时会用 lossy。
+                // 我们的索引 name 必为合法 UTF-8（建索引时强制），unsafe 走原始字节避免重复校验。
+                let name_bytes = store.name_bytes(e);
+                // SAFETY：建索引阶段已保证 entry.name 是合法 UTF-8（FRN→name 通过 OS API 取的 wide string 转过来）。
+                let name_str = unsafe { std::str::from_utf8_unchecked(name_bytes) };
+                // 用本线程 clone 的 matcher（pin_local），不碰共享实例的内部 cache pool。
+                for re in pin_local.iter() {
+                    if re.find(name_str).is_none() {
+                        return (acc, pin_local);
+                    }
+                }
+                acc.push(idx);
+                (acc, pin_local)
+            },
+        )
         .reduce(
             || (Vec::new(), pin_res.to_vec()),
             |(mut a, pa), (mut b, _pb)| {
@@ -1831,10 +1845,8 @@ fn slow_attr_candidates(store: &IndexStore, overlay: &MetaOverlay, q: &ParsedQue
     let mtime_max = q.mtime_max.map(crate::index::filetime_to_unix_secs);
     let ctime_min = q.ctime_min.map(crate::index::filetime_to_unix_secs);
     let ctime_max = q.ctime_max.map(crate::index::filetime_to_unix_secs);
-    let any_time_filter = mtime_min.is_some()
-        || mtime_max.is_some()
-        || ctime_min.is_some()
-        || ctime_max.is_some();
+    let any_time_filter =
+        mtime_min.is_some() || mtime_max.is_some() || ctime_min.is_some() || ctime_max.is_some();
     let metadata_ready = store.metadata_ready;
 
     let pred = |idx: u32| -> bool {
@@ -1947,9 +1959,7 @@ fn path_matches_drive_prefix(
         return true;
     }
 
-    let vol_letter = vol
-        .map(|v| v.volume_letter as char)
-        .unwrap_or('C');
+    let vol_letter = vol.map(|v| v.volume_letter as char).unwrap_or('C');
     let letter = drive.unwrap_or(vol_letter).to_ascii_uppercase();
 
     if let Some(pref_in) = path_prefix {
@@ -1983,9 +1993,7 @@ fn combine_vol_path(letter: char, dir_path: &[u8]) -> Vec<u8> {
 }
 
 fn path_key(s: &str) -> String {
-    s.replace('\\', "/")
-        .trim_matches('/')
-        .to_ascii_lowercase()
+    s.replace('\\', "/").trim_matches('/').to_ascii_lowercase()
 }
 
 /// `path:` 两段式过滤的**第一段**：把「全路径含 `needle`」的条目集合压到一个候选超集。
@@ -2192,11 +2200,7 @@ fn path_candidate_ids(
     // 「needle 跨过 root_prefix 与目录路径边界」的命中（如 root_prefix 尾段 + 首目录名）
     // 不被变体覆盖，候选集会漏报。unix 库规模小、性能非热点，正确性优先直接回退。
     // （回归 `unix_path_syntax_with_pinyin` 曾抓到此处漏报全部命中。）
-    if store
-        .volumes
-        .iter()
-        .any(|v| v.is_unix())
-    {
+    if store.volumes.iter().any(|v| v.is_unix()) {
         return None;
     }
 
@@ -2366,9 +2370,7 @@ fn path_candidate_ids(
             |mut acc, idx| {
                 let e = &store.entries[idx as usize];
                 // 名字侧：tri 位图不含此条目 → 名字必不含任何变体，跳过小写化+比对。
-                let in_tri = tri_union
-                    .as_ref()
-                    .map_or(true, |bm| bm.contains(idx));
+                let in_tri = tri_union.as_ref().map_or(true, |bm| bm.contains(idx));
                 if in_tri {
                     let mut scratch2 = [0u8; 256];
                     let nl = store.name_lower_into(e, &mut scratch2);
@@ -2528,11 +2530,7 @@ fn filter_dupe(store: &IndexStore, hits: &[u32], kind: &str) -> Result<Vec<u32>>
                 .filter(|v| v.len() > 1)
                 .flat_map(|v| v.into_iter())
                 .collect();
-            Ok(hits
-                .iter()
-                .filter(|i| keep.contains(i))
-                .copied()
-                .collect())
+            Ok(hits.iter().filter(|i| keep.contains(i)).copied().collect())
         }
         _ => Ok(hits.to_vec()),
     }
@@ -2602,12 +2600,11 @@ fn name_match_phase(
         #[cfg(feature = "pinyin")]
         {
             let ascii_lower_only = needle_bs.iter().all(|b| b.is_ascii_lowercase());
-            let use_pinyin = _opt.allow_pinyin
-                && !q.no_pinyin
-                && (q.pinyin_only || ascii_lower_only);
+            let use_pinyin =
+                _opt.allow_pinyin && !q.no_pinyin && (q.pinyin_only || ascii_lower_only);
             if use_pinyin {
-                let needle_str =
-                    std::str::from_utf8(needle_bs).map_err(|e| crate::Error::Query(e.to_string()))?;
+                let needle_str = std::str::from_utf8(needle_bs)
+                    .map_err(|e| crate::Error::Query(e.to_string()))?;
                 let config = MatchConfig::builder()
                     .pinyin(PinyinMatchConfig::default())
                     .build();
@@ -2747,7 +2744,9 @@ fn apply_post_name_filters(
     if q.len_min.is_some() || q.len_max.is_some() {
         hits.retain(|&idx| {
             let n = store.name_bytes(&store.entries[idx as usize]);
-            let ok = std::str::from_utf8(n).map(|s| s.chars().count()).unwrap_or(0) as u32;
+            let ok = std::str::from_utf8(n)
+                .map(|s| s.chars().count())
+                .unwrap_or(0) as u32;
             let mut ok2 = true;
             if let Some(lo) = q.len_min {
                 ok2 &= ok >= lo;
@@ -2945,7 +2944,10 @@ fn highlight_name_for_query(
     byte_ranges_to_char_ranges_merged(name, byte_ranges)
 }
 
-fn byte_ranges_to_char_ranges_merged(name: &str, byte_ranges: Vec<(usize, usize)>) -> Vec<[u32; 2]> {
+fn byte_ranges_to_char_ranges_merged(
+    name: &str,
+    byte_ranges: Vec<(usize, usize)>,
+) -> Vec<[u32; 2]> {
     let merged = merge_byte_ranges(byte_ranges);
     let mut ranges: Vec<(u32, u32)> = merged
         .into_iter()
@@ -3034,10 +3036,8 @@ fn needle_byte_ranges_for_name_match(
     name_bytes: &[u8],
     term: &HighlightTerm,
     q: &ParsedQuery,
-    #[allow(unused_variables)]
-    opt: &SearchOptions,
-    #[cfg_attr(not(feature = "pinyin"), allow(unused_variables))]
-    pin_re: Option<&IbRegexUnit<'_>>,
+    #[allow(unused_variables)] opt: &SearchOptions,
+    #[cfg_attr(not(feature = "pinyin"), allow(unused_variables))] pin_re: Option<&IbRegexUnit<'_>>,
 ) -> Vec<(usize, usize)> {
     if term.needle.is_empty() {
         return vec![];

@@ -6,7 +6,10 @@ use tracing::{debug, error, info};
 
 use crate::ipc_dispatch::{process_request, req_kind_label, EngineSlot};
 
-pub async fn unix_accept_loop(socket_path: std::path::PathBuf, slot: EngineSlot) -> anyhow::Result<()> {
+pub async fn unix_accept_loop(
+    socket_path: std::path::PathBuf,
+    slot: EngineSlot,
+) -> anyhow::Result<()> {
     if socket_path.exists() {
         let _ = std::fs::remove_file(&socket_path);
     }
@@ -39,10 +42,7 @@ pub async fn unix_accept_loop(socket_path: std::path::PathBuf, slot: EngineSlot)
     }
 }
 
-async fn handle_client(
-    stream: tokio::net::UnixStream,
-    slot: EngineSlot,
-) -> anyhow::Result<()> {
+async fn handle_client(stream: tokio::net::UnixStream, slot: EngineSlot) -> anyhow::Result<()> {
     static SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let sid = SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 

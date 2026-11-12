@@ -13,10 +13,7 @@ use findx2_core::{
 use rayon::prelude::*;
 
 /// 与 CLI `index` 子命令一致的卷列表解析。
-pub fn resolve_volume_list(
-    volume: Option<String>,
-    volumes: Option<Vec<String>>,
-) -> Vec<String> {
+pub fn resolve_volume_list(volume: Option<String>, volumes: Option<Vec<String>>) -> Vec<String> {
     if let Some(ref vs) = volumes {
         if vs.is_empty() {
             vec![volume.unwrap_or_else(|| "C:".into())]
@@ -108,9 +105,10 @@ pub fn build_full_disk_index(
         .filter_map(|s| normalize_excluded_dir(s))
         .collect();
     // P1-5：HDD 卷串行（多磁头并行只会互相抢寻道）；SSD 卷仍可并行。
-    let (ssd_vols, hdd_vols): (Vec<String>, Vec<String>) = vol_list.iter().cloned().partition(|v| {
-        !crate::volume_incurs_seek_penalty(v)
-    });
+    let (ssd_vols, hdd_vols): (Vec<String>, Vec<String>) = vol_list
+        .iter()
+        .cloned()
+        .partition(|v| !crate::volume_incurs_seek_penalty(v));
     if !hdd_vols.is_empty() {
         findx2_core::progress!(
             "建库画像：SSD {} 卷并行 / HDD {} 卷串行",
@@ -124,10 +122,9 @@ pub fn build_full_disk_index(
         .build()
         .map_err(|e| findx2_core::Error::Platform(e.to_string()))?;
 
-    let progress_path: std::path::PathBuf =
-        progress_file.map(Path::to_path_buf).unwrap_or_else(|| {
-            output.with_extension("indexing.json")
-        });
+    let progress_path: std::path::PathBuf = progress_file
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| output.with_extension("indexing.json"));
 
     let total_vols = vol_list.len();
     let _ = write_index_progress(
@@ -188,8 +185,7 @@ pub fn build_full_disk_index(
         let r = index_one_volume(vol_s, full_stat, metadata_ready);
         if let Ok(ref store) = r {
             let added = store.entry_count() as u64;
-            let entries_so_far =
-                entries_accumulated.fetch_add(added, Ordering::Relaxed) + added;
+            let entries_so_far = entries_accumulated.fetch_add(added, Ordering::Relaxed) + added;
             let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
             let _ = write_index_progress(
                 progress_path.as_ref(),
@@ -211,9 +207,8 @@ pub fn build_full_disk_index(
 
     let mut part: Vec<findx2_core::Result<IndexStore>> = Vec::with_capacity(vol_list.len());
     if !ssd_vols.is_empty() {
-        let ssd_part: Vec<findx2_core::Result<IndexStore>> = pool.install(|| {
-            ssd_vols.par_iter().map(scan_one).collect()
-        });
+        let ssd_part: Vec<findx2_core::Result<IndexStore>> =
+            pool.install(|| ssd_vols.par_iter().map(scan_one).collect());
         part.extend(ssd_part);
     }
     for v in &hdd_vols {

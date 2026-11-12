@@ -454,7 +454,11 @@ pub enum Mutation {
         name: Vec<u8>,
     },
     /// 已存在文件改名/移动：names 追加 + `entries[idx]` 原地替换。
-    RepathFile { idx: u32, entry: FileEntry, name: Vec<u8> },
+    RepathFile {
+        idx: u32,
+        entry: FileEntry,
+        name: Vec<u8>,
+    },
     /// 已存在目录改名/移动：names 追加 + `entries[idx]` 与 `dirs[di]` 原地替换。
     RepathDir {
         idx: u32,
@@ -590,12 +594,18 @@ impl IndexStore {
 
     /// 取出并清空已记录的变更（commit 时调用）。未开启记录时返回空 vec。
     pub fn take_mutations(&mut self) -> Vec<Mutation> {
-        self.mutation_log.as_mut().map(|v| std::mem::take(v)).unwrap_or_default()
+        self.mutation_log
+            .as_mut()
+            .map(|v| std::mem::take(v))
+            .unwrap_or_default()
     }
 
     /// 是否有未提交的变更。
     pub fn has_pending_mutations(&self) -> bool {
-        self.mutation_log.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+        self.mutation_log
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
     }
 
     fn log_mut(&mut self, m: Mutation) {
@@ -765,7 +775,7 @@ impl IndexStore {
         for (i, seg) in parts.iter().enumerate() {
             if i == 0 {
                 if !seg.is_empty() {
-                    out.push(b'/');  // Unix 使用 /
+                    out.push(b'/'); // Unix 使用 /
                     out.extend_from_slice(seg);
                 }
             } else {
@@ -1118,12 +1128,7 @@ impl IndexStore {
             }
             new_dirs.push(d);
             // dir_paths_buf 原样保留，偏移不变，所以 range 直接搬（缺失则补 (0,0)）
-            new_dir_path_ranges.push(
-                self.dir_path_ranges
-                    .get(i)
-                    .copied()
-                    .unwrap_or((0, 0)),
-            );
+            new_dir_path_ranges.push(self.dir_path_ranges.get(i).copied().unwrap_or((0, 0)));
         }
 
         // —— 6. 重建两个映射表 ——
@@ -1458,7 +1463,12 @@ impl IndexStore {
         Ok(())
     }
 
-    fn apply_rename_mapped(&mut self, file_id: u64, new_parent_id: u64, new_name: &str) -> crate::Result<()> {
+    fn apply_rename_mapped(
+        &mut self,
+        file_id: u64,
+        new_parent_id: u64,
+        new_name: &str,
+    ) -> crate::Result<()> {
         let Some(&idx) = self.frn_to_entry.get(&file_id) else {
             return Ok(());
         };
@@ -1705,7 +1715,7 @@ impl IndexStore {
     }
 
     /// 按 `VolumeState.first_entry_idx` 段选择卷（多卷合并索引）。
-    /// 
+    ///
     /// **注意：** 对于增量追加的条目，此方法可能不准确（会选到最后一个卷）。
     /// 如需精确解析，请使用 `volume_for_entry_by_parent`。
     pub fn volume_for_entry(&self, idx: usize) -> Option<&VolumeState> {
@@ -1723,12 +1733,12 @@ impl IndexStore {
     }
 
     /// 从父目录查找条目所属的卷（适用于增量追加的条目）。
-    /// 
+    ///
     /// 增量 Create/CreatePending 追加的条目会超出原始 first_entry_idx 范围，
     /// `volume_for_entry` 会错误地选择最后一个卷。此方法通过父目录的所属卷来推导。
     fn volume_for_entry_by_parent(&self, idx: usize) -> Option<&VolumeState> {
         let e = self.entries.get(idx)?;
-        
+
         // 对于目录条目，从 frn 查找 dir_idx
         if e.is_dir_entry() {
             let fr = self.frns.get(idx).copied().unwrap_or(0);
@@ -1737,7 +1747,7 @@ impl IndexStore {
                 return self.volume_for_dir_idx(di);
             }
         }
-        
+
         // 对于文件条目，从 dir_idx 查找父目录
         self.volume_for_dir_idx(e.dir_idx)
     }
@@ -1822,8 +1832,10 @@ impl IndexStore {
     /// 条目完整小写路径（含卷前缀），供排除规则与 `path:` 过滤。
     pub fn entry_full_path_lower(&self, idx: usize) -> String {
         // 对于增量追加的条目，使用基于父目录的卷查找
-        let Some(vol) = self.volume_for_entry_by_parent(idx)
-            .or_else(|| self.volume_for_entry(idx)) else {
+        let Some(vol) = self
+            .volume_for_entry_by_parent(idx)
+            .or_else(|| self.volume_for_entry(idx))
+        else {
             return String::new();
         };
         let Some(e) = self.entries.get(idx) else {
@@ -1852,16 +1864,19 @@ impl IndexStore {
     /// 重建 `C:\path\file` 或 Unix `/prefix/path/file` 显示路径
     pub fn entry_display_path(&self, idx: usize) -> crate::Result<String> {
         // 对于增量追加的条目，使用基于父目录的卷查找
-        let vol = self.volume_for_entry_by_parent(idx)
+        let vol = self
+            .volume_for_entry_by_parent(idx)
             .or_else(|| self.volume_for_entry(idx));
         let unix = vol.map(|v| v.is_unix()).unwrap_or(false);
-        let letter = vol.map(|v| {
-            if v.volume_letter == 0 {
-                'C'
-            } else {
-                (v.volume_letter as char).to_ascii_uppercase()
-            }
-        }).unwrap_or('C');
+        let letter = vol
+            .map(|v| {
+                if v.volume_letter == 0 {
+                    'C'
+                } else {
+                    (v.volume_letter as char).to_ascii_uppercase()
+                }
+            })
+            .unwrap_or('C');
         let e = self
             .entries
             .get(idx)
@@ -2083,7 +2098,8 @@ impl IndexBuilder {
         let file_count = files.len();
         crate::progress!(
             "索引：目录 {}、文件 {}，拓扑与父链 …（路径不物化，与 Everything 一致）",
-            dir_count, file_count
+            dir_count,
+            file_count
         );
         let _ = std::io::stderr().flush();
 
@@ -2166,10 +2182,7 @@ impl IndexBuilder {
             }
             assembled_files += 1;
             if assembled_files % 300_000 == 0 {
-                crate::progress!(
-                    "索引：组装文件 {} / {} …",
-                    assembled_files, file_count
-                );
+                crate::progress!("索引：组装文件 {} / {} …", assembled_files, file_count);
                 let _ = std::io::stderr().flush();
             }
             let name_off = interner.intern(&mut names_buf, f.name.as_bytes());
@@ -2254,10 +2267,8 @@ impl IndexBuilder {
         for e in entries.iter() {
             ext_counts[e.ext_hash_u8() as usize] += 1;
         }
-        let mut ext_buckets: Vec<Vec<u32>> = ext_counts
-            .iter()
-            .map(|&c| Vec::with_capacity(c))
-            .collect();
+        let mut ext_buckets: Vec<Vec<u32>> =
+            ext_counts.iter().map(|&c| Vec::with_capacity(c)).collect();
         for (i, e) in entries.iter().enumerate() {
             if i > 0 && i % 500_000 == 0 {
                 crate::progress!("索引：扩展名桶 {}/{} …", i, n_entries);
@@ -2374,11 +2385,7 @@ pub fn merge_index_stores(stores: Vec<IndexStore>) -> crate::Result<IndexStore> 
                 "合并失败：dir_path_ranges 与 dirs 长度不一致".into(),
             ));
         }
-        for (mut d, (a, b)) in store
-            .dirs
-            .drain(..)
-            .zip(store.dir_path_ranges.drain(..))
-        {
+        for (mut d, (a, b)) in store.dirs.drain(..).zip(store.dir_path_ranges.drain(..)) {
             d.name_offset = d.name_offset.saturating_add(names_shift);
             if d.parent_idx != 0 {
                 d.parent_idx = d.parent_idx.saturating_add(dir_base);
@@ -2427,7 +2434,8 @@ pub fn merge_index_stores(stores: Vec<IndexStore>) -> crate::Result<IndexStore> 
     for e in merged_entries.iter() {
         ext_counts[e.ext_hash_u8() as usize] += 1;
     }
-    let mut ext_buckets: Vec<Vec<u32>> = ext_counts.iter().map(|&c| Vec::with_capacity(c)).collect();
+    let mut ext_buckets: Vec<Vec<u32>> =
+        ext_counts.iter().map(|&c| Vec::with_capacity(c)).collect();
     for (i, e) in merged_entries.iter().enumerate() {
         ext_buckets[e.ext_hash_u8() as usize].push(i as u32);
     }

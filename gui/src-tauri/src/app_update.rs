@@ -7,8 +7,8 @@
 //! （见 installer/FindX.iss 的 PrepareToInstall / CurStepChanged / [Run] WizardSilent 项）。
 //! 非 Windows 平台无对应安装器，`download_url` 为空、安装命令返回 Err，降级为打开发行页手动更新。
 
-use serde::{Deserialize, Serialize};
 use semver::Version;
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 use tauri::{AppHandle, Emitter};
 
@@ -140,9 +140,7 @@ pub fn check_app_update(app: AppHandle) -> AppUpdateInfo {
         }
     };
 
-    let url = format!(
-        "https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
-    );
+    let url = format!("https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest");
 
     let resp = match ureq::get(&url)
         .set("User-Agent", "FindX2-GUI-UpdateCheck")
@@ -445,7 +443,9 @@ fn run_download(
 
     if downloaded != total {
         let _ = std::fs::remove_file(dest);
-        return Err(format!("下载数据不完整（{downloaded}/{total} B），已删除临时文件。"));
+        return Err(format!(
+            "下载数据不完整（{downloaded}/{total} B），已删除临时文件。"
+        ));
     }
 
     let _ = app.emit(

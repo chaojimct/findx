@@ -16,9 +16,27 @@ use findx2_core::index::unix_secs_to_filetime;
 use findx2_core::{progress, RawEntry, Result, VolumeScanner, WatchCursor};
 
 const SKIP_FS: &[&str] = &[
-    "proc", "sysfs", "devtmpfs", "devpts", "cgroup", "cgroup2", "tmpfs", "overlay",
-    "squashfs", "nsfs", "autofs", "nfs", "nfs4", "fuse.portal", "rpc_pipefs", "debugfs",
-    "tracefs", "securityfs", "pstore", "bpf", "configfs",
+    "proc",
+    "sysfs",
+    "devtmpfs",
+    "devpts",
+    "cgroup",
+    "cgroup2",
+    "tmpfs",
+    "overlay",
+    "squashfs",
+    "nsfs",
+    "autofs",
+    "nfs",
+    "nfs4",
+    "fuse.portal",
+    "rpc_pipefs",
+    "debugfs",
+    "tracefs",
+    "securityfs",
+    "pstore",
+    "bpf",
+    "configfs",
 ];
 
 const SKIP_NAMES: &[&str] = &[".", "..", "lost+found", ".Trash", ".Trash-1000"];
@@ -99,7 +117,11 @@ fn parse_local_mounts() -> Vec<String> {
         if SKIP_FS.iter().any(|s| *s == fstype) {
             continue;
         }
-        if dir == "/proc" || dir == "/sys" || dir == "/dev" || dir == "/run" || dir.starts_with("/snap")
+        if dir == "/proc"
+            || dir == "/sys"
+            || dir == "/dev"
+            || dir == "/run"
+            || dir.starts_with("/snap")
         {
             continue;
         }
@@ -140,7 +162,12 @@ fn scan_parallel(
 ) -> Result<u64> {
     let c_root = CString::new(root.as_bytes())
         .map_err(|_| findx2_core::Error::Platform("扫描根路径含 NUL".into()))?;
-    let fd = unsafe { libc::open(c_root.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    let fd = unsafe {
+        libc::open(
+            c_root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
     if fd < 0 {
         return Err(findx2_core::Error::Platform(format!(
             "无法打开目录 {root}: {}",
@@ -159,7 +186,15 @@ fn scan_parallel(
     let root_ino = st.st_ino;
 
     let threads = resolve_threads(max_threads);
-    progress!("Linux 扫描：{} 线程，{}元数据", threads, if full_stat { "同步" } else { "fast（稍后回填）" });
+    progress!(
+        "Linux 扫描：{} 线程，{}元数据",
+        threads,
+        if full_stat {
+            "同步"
+        } else {
+            "fast（稍后回填）"
+        }
+    );
 
     let q = Arc::new(Queue {
         jobs: Mutex::new(VecDeque::from([DirJob {
@@ -254,14 +289,7 @@ fn enumerate_dir(
     let fd = owned.as_raw_fd();
     let mut buf = vec![0u8; GETDENTS_BUF];
     loop {
-        let nread = unsafe {
-            libc::syscall(
-                libc::SYS_getdents64,
-                fd,
-                buf.as_mut_ptr(),
-                buf.len(),
-            )
-        };
+        let nread = unsafe { libc::syscall(libc::SYS_getdents64, fd, buf.as_mut_ptr(), buf.len()) };
         if nread < 0 {
             break;
         }
@@ -278,7 +306,10 @@ fn enumerate_dir(
             let d_ino = u64::from_ne_bytes(buf[off..off + 8].try_into().unwrap());
             let d_type = buf[off + 18];
             let name_bytes = &buf[off + 19..off + d_reclen];
-            let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+            let name_end = name_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(name_bytes.len());
             let name = String::from_utf8_lossy(&name_bytes[..name_end]).into_owned();
             off += d_reclen;
             if should_skip_name(&name) {
@@ -419,7 +450,7 @@ pub fn volume_id_for_path(path: &str) -> String {
         .ok()
         .and_then(|p| p.to_str().map(|s| s.to_string()))
         .unwrap_or_else(|| path.to_string());
-    
+
     fs::metadata(&canonical)
         .map(|m| format!("dev:{}:{}", m.dev(), canonical))
         .unwrap_or_else(|_| canonical)

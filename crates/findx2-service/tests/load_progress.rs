@@ -33,7 +33,11 @@ fn status_once(
     pipe: &str,
 ) -> std::io::Result<Option<(bool, Option<String>, Option<u64>, Option<u32>, Option<u32>)>> {
     let path = format!(r"\\.\pipe\{pipe}");
-    let mut f = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+    let mut f = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
         Ok(f) => f,
         Err(_) => return Ok(None),
     };
@@ -57,7 +61,9 @@ fn status_once(
         return Ok(None);
     }
     Ok(Some((
-        obj.get("loading").and_then(|x| x.as_bool()).unwrap_or(false),
+        obj.get("loading")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
         obj.get("loading_stage")
             .and_then(|x| x.as_str())
             .map(|s| s.to_string()),

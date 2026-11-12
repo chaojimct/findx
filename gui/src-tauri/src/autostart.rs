@@ -214,12 +214,10 @@ mod imp {
         if enable {
             let cmd = current_exe_command()?;
             let data = wide(&cmd);
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2)
-            };
-            let rc = unsafe {
-                RegSetValueExW(hkey, PCWSTR(name.as_ptr()), None, REG_SZ, Some(bytes))
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
+            let rc =
+                unsafe { RegSetValueExW(hkey, PCWSTR(name.as_ptr()), None, REG_SZ, Some(bytes)) };
             if rc != ERROR_SUCCESS {
                 return Err(format!("写入自启动项失败: Win32 错误 {}", rc.0));
             }

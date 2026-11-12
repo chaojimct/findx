@@ -78,7 +78,9 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                         dir_count: g.dirs.len() as u64,
                         last_usn: vol.map(|v| v.last_usn).unwrap_or(0),
                         journal_id: vol.map(|v| v.usn_journal_id).unwrap_or(0),
-                        volume_letter: vol.filter(|v| v.volume_letter != 0).map(|v| v.volume_letter as char),
+                        volume_letter: vol
+                            .filter(|v| v.volume_letter != 0)
+                            .map(|v| v.volume_letter as char),
                         healthy: true,
                         metadata_ready: g.metadata_ready,
                         backfill_done,
@@ -111,9 +113,7 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                         backfill_done: backfill.0,
                         backfill_total: backfill.1,
                         loading: true,
-                        loading_stage: l
-                            .as_ref()
-                            .map(|s| crate::load_state::progress_line_of(s)),
+                        loading_stage: l.as_ref().map(|s| crate::load_state::progress_line_of(s)),
                         loading_elapsed_secs: l.as_ref().map(|s| s.started.elapsed().as_secs()),
                         loading_phase_done: l.as_ref().map(|s| s.phases_done),
                         loading_phase_total: l.as_ref().map(|s| s.phases_total),

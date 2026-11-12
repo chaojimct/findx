@@ -36,11 +36,26 @@ fn gui_root() -> PathBuf {
 fn maybe_build_gui_frontend() {
     let gui_root = gui_root();
 
-    println!("cargo:rerun-if-changed={}", gui_root.join("package.json").display());
-    println!("cargo:rerun-if-changed={}", gui_root.join("package-lock.json").display());
-    println!("cargo:rerun-if-changed={}", gui_root.join("vite.config.ts").display());
-    println!("cargo:rerun-if-changed={}", gui_root.join("tsconfig.json").display());
-    println!("cargo:rerun-if-changed={}", gui_root.join("index.html").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        gui_root.join("package.json").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        gui_root.join("package-lock.json").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        gui_root.join("vite.config.ts").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        gui_root.join("tsconfig.json").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        gui_root.join("index.html").display()
+    );
     let src = gui_root.join("src");
     if src.is_dir() {
         println!("cargo:rerun-if-changed={}", src.display());
@@ -146,7 +161,9 @@ fn ensure_node_modules(gui_root: &Path) {
         .args(["ci"])
         .current_dir(gui_root)
         .output()
-        .unwrap_or_else(|e| panic!("无法执行 npm ci（{e}）。请安装 Node.js 并确保 npm 在 PATH 中。"));
+        .unwrap_or_else(|e| {
+            panic!("无法执行 npm ci（{e}）。请安装 Node.js 并确保 npm 在 PATH 中。")
+        });
     if !out.status.success() {
         eprintln!(
             "npm ci 失败 (code {:?})\n--- stdout ---\n{}\n--- stderr ---\n{}",

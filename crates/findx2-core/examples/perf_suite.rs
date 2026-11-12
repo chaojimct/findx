@@ -90,7 +90,10 @@ fn main() {
     println!("索引: {}", path.display());
 
     let file_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    println!("文件大小: {:.2} GB ({file_bytes} B)", file_bytes as f64 / 1073741824.0);
+    println!(
+        "文件大小: {:.2} GB ({file_bytes} B)",
+        file_bytes as f64 / 1073741824.0
+    );
 
     let rss_before = rss_mb();
     println!("加载前进程 RSS: {rss_before:.1} MB");
@@ -102,7 +105,10 @@ fn main() {
     let rss_after = rss_mb();
     println!();
     println!("── 加载 ──");
-    println!("load_index_bin : {load_ms:.1} ms  ({:.2} s)", load_ms / 1000.0);
+    println!(
+        "load_index_bin : {load_ms:.1} ms  ({:.2} s)",
+        load_ms / 1000.0
+    );
     println!("加载后进程 RSS : {rss_after:.1} MB");
     println!("加载净增 RSS   : {:.1} MB", rss_after - rss_before);
 
@@ -116,21 +122,46 @@ fn main() {
     println!("── 索引构成 ──");
     println!("条目数         : {n_entries}");
     println!("目录数         : {n_dirs}");
-    println!("墓碑数         : {n_tomb} ({:.2}%)", store.tombstone_ratio() * 100.0);
+    println!(
+        "墓碑数         : {n_tomb} ({:.2}%)",
+        store.tombstone_ratio() * 100.0
+    );
     println!("存活条目       : {live}");
-    println!("条目区         : {:.2} GB ({} × 32B)", n_entries as f64 * 32.0 / 1073741824.0, n_entries);
-    println!("目录区         : {:.2} GB ({} × 24B)", n_dirs as f64 * 24.0 / 1073741824.0, n_dirs);
+    println!(
+        "条目区         : {:.2} GB ({} × 32B)",
+        n_entries as f64 * 32.0 / 1073741824.0,
+        n_entries
+    );
+    println!(
+        "目录区         : {:.2} GB ({} × 24B)",
+        n_dirs as f64 * 24.0 / 1073741824.0,
+        n_dirs
+    );
     println!(
         "名字区         : {:.2} GB ({} B, {:.2} B/条)",
         n_names as f64 / 1073741824.0,
         n_names,
-        if n_entries > 0 { n_names as f64 / n_entries as f64 } else { 0.0 }
+        if n_entries > 0 {
+            n_names as f64 / n_entries as f64
+        } else {
+            0.0
+        }
     );
-    println!("磁盘字节/条目  : {:.1}", if n_entries > 0 { file_bytes as f64 / n_entries as f64 } else { 0.0 });
+    println!(
+        "磁盘字节/条目  : {:.1}",
+        if n_entries > 0 {
+            file_bytes as f64 / n_entries as f64
+        } else {
+            0.0
+        }
+    );
 
     // ── 3. 查询延迟矩阵 ──
     let engine = SearchEngine::new(store);
-    let rounds: usize = std::env::var("ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let rounds: usize = std::env::var("ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
 
     let opt_no_py = SearchOptions::default(); // allow_pinyin 默认 false
     let mut opt_py = SearchOptions::default();
@@ -139,7 +170,10 @@ fn main() {
 
     println!();
     println!("── 查询延迟（{} 轮取中位数）──", rounds);
-    println!("{:<34} {:>10} {:>10} {:>10}", "查询", "中位数", "最小", "命中");
+    println!(
+        "{:<34} {:>10} {:>10} {:>10}",
+        "查询", "中位数", "最小", "命中"
+    );
 
     let cases: &[(&str, &str, bool)] = &[
         ("子串: readme", "readme", false),
@@ -177,16 +211,28 @@ fn main() {
     pq_sort.sort_desc = true;
     pq_sort.limit = 100;
     let (med, min, hits) = bench(rounds, || {
-        engine.search(&pq_sort, &opt_no_py).map(|(v, _)| v.len()).unwrap_or(0)
+        engine
+            .search(&pq_sort, &opt_no_py)
+            .map(|(v, _)| v.len())
+            .unwrap_or(0)
     });
-    println!("{:<34} {:>10} {:>10} {:>10}", "ext:txt sort:size desc 100", format!("{med:.1}ms"), format!("{min:.1}ms"), hits);
+    println!(
+        "{:<34} {:>10} {:>10} {:>10}",
+        "ext:txt sort:size desc 100",
+        format!("{med:.1}ms"),
+        format!("{min:.1}ms"),
+        hits
+    );
 
     let rss_final = rss_mb();
     println!();
     println!("── 汇总 ──");
     println!("加载耗时       : {load_ms:.1} ms");
     println!("常驻内存 RSS   : {rss_final:.1} MB");
-    println!("文件大小       : {:.2} GB", file_bytes as f64 / 1073741824.0);
+    println!(
+        "文件大小       : {:.2} GB",
+        file_bytes as f64 / 1073741824.0
+    );
     println!("存活条目       : {live}");
     println!("================================");
 }

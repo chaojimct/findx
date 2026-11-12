@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use std::{ffi::c_void, mem::size_of};
 use std::{
     io::ErrorKind,
     path::PathBuf,
@@ -19,8 +21,6 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_window_state::{
     AppHandleExt as WindowStateAppHandleExt, StateFlags, WindowExt as WindowStateWindowExt,
 };
-#[cfg(windows)]
-use std::{ffi::c_void, mem::size_of};
 #[cfg(windows)]
 use windows::Win32::{
     Foundation::COLORREF,
@@ -194,9 +194,7 @@ pub fn window_state_plugin<R: Runtime>() -> TauriPlugin<R> {
     tauri_plugin_window_state::Builder::default()
         .skip_initial_state(MAIN_WINDOW_LABEL)
         .with_state_flags(full_window_state_flags())
-        .with_filter(move |label| {
-            label == MAIN_WINDOW_LABEL && save_enabled.load(Ordering::SeqCst)
-        })
+        .with_filter(move |label| label == MAIN_WINDOW_LABEL && save_enabled.load(Ordering::SeqCst))
         .build()
 }
 
@@ -286,7 +284,10 @@ fn sanitize_persisted_desktop_state(mut state: PersistedDesktopState) -> Persist
 fn sanitize_full_window_layout_snapshot(
     snapshot: FullWindowLayoutSnapshot,
 ) -> Option<FullWindowLayoutSnapshot> {
-    if snapshot.width <= 0.0 || snapshot.height <= 0.0 || !snapshot.width.is_finite() || !snapshot.height.is_finite()
+    if snapshot.width <= 0.0
+        || snapshot.height <= 0.0
+        || !snapshot.width.is_finite()
+        || !snapshot.height.is_finite()
     {
         return None;
     }
@@ -428,7 +429,10 @@ fn set_window_mode<R: Runtime>(app: &AppHandle<R>, mode: WindowMode) -> Result<(
     Ok(())
 }
 
-fn set_window_mode_and_sync<R: Runtime>(app: &AppHandle<R>, mode: WindowMode) -> Result<(), String> {
+fn set_window_mode_and_sync<R: Runtime>(
+    app: &AppHandle<R>,
+    mode: WindowMode,
+) -> Result<(), String> {
     set_window_mode(app, mode)?;
     sync_window_state_save_behavior(app);
     Ok(())
@@ -486,25 +490,21 @@ fn apply_full_window_layout_snapshot<R: Runtime>(
     }
     if snapshot.layout_version >= 1 {
         window
-            .set_size(Size::Logical(LogicalSize::new(snapshot.width, snapshot.height)))
+            .set_size(Size::Logical(LogicalSize::new(
+                snapshot.width,
+                snapshot.height,
+            )))
             .map_err(|err| err.to_string())?;
     } else {
-        let w = snapshot
-            .width
-            .round()
-            .clamp(1.0, u32::MAX as f64) as u32;
-        let h = snapshot
-            .height
-            .round()
-            .clamp(1.0, u32::MAX as f64) as u32;
+        let w = snapshot.width.round().clamp(1.0, u32::MAX as f64) as u32;
+        let h = snapshot.height.round().clamp(1.0, u32::MAX as f64) as u32;
         window
             .set_size(Size::Physical(PhysicalSize::new(w, h)))
             .map_err(|err| err.to_string())?;
     }
     window
         .set_position(Position::Physical(PhysicalPosition::new(
-            snapshot.x,
-            snapshot.y,
+            snapshot.x, snapshot.y,
         )))
         .map_err(|err| err.to_string())?;
     if snapshot.maximized {
@@ -520,9 +520,7 @@ fn snapshot_looks_like_quick_layout(snapshot: &FullWindowLayoutSnapshot) -> bool
 
     let width_scale = snapshot.width as f64 / QUICK_WINDOW_WIDTH;
     let height_scale = snapshot.height as f64 / QUICK_WINDOW_HEIGHT;
-    width_scale >= 0.9
-        && height_scale >= 0.9
-        && (width_scale - height_scale).abs() <= 0.03
+    width_scale >= 0.9 && height_scale >= 0.9 && (width_scale - height_scale).abs() <= 0.03
 }
 
 fn persist_full_window_state_snapshot<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
@@ -668,7 +666,10 @@ fn restore_saved_full_window_layout<R: Runtime>(
     }
 
     let loaded_state = load_desktop_state(app);
-    if matches!(loaded_state.last_window_mode, Some(PersistedWindowMode::Quick)) {
+    if matches!(
+        loaded_state.last_window_mode,
+        Some(PersistedWindowMode::Quick)
+    ) {
         return Ok(false);
     }
 
@@ -689,7 +690,9 @@ fn restore_saved_full_window_layout<R: Runtime>(
             }
 
             let snapshot = snapshot_from_window(window)?;
-            if loaded_state.last_window_mode.is_none() && snapshot_looks_like_quick_layout(&snapshot) {
+            if loaded_state.last_window_mode.is_none()
+                && snapshot_looks_like_quick_layout(&snapshot)
+            {
                 return Ok(false);
             }
 
@@ -1050,15 +1053,17 @@ fn probe_tray_service_is_up(_app: &AppHandle<tauri::Wry>) -> bool {
 }
 
 /// 构建托盘菜单。`service_up` 由调用方提供，避免在启动路径上阻塞做管道探测。
-fn build_tray_menu(app: &AppHandle<tauri::Wry>, service_up: bool) -> tauri::Result<Menu<tauri::Wry>> {
+fn build_tray_menu(
+    app: &AppHandle<tauri::Wry>,
+    service_up: bool,
+) -> tauri::Result<Menu<tauri::Wry>> {
     let svc_label = if service_up {
         "停止索引服务"
     } else {
         "启动索引服务"
     };
 
-    let search_item =
-        MenuItem::with_id(app, TRAY_MENU_SEARCH_ID, "打开搜索", true, None::<&str>)?;
+    let search_item = MenuItem::with_id(app, TRAY_MENU_SEARCH_ID, "打开搜索", true, None::<&str>)?;
     let settings_item = MenuItem::with_id(app, TRAY_MENU_SETTINGS_ID, "设置…", true, None::<&str>)?;
     let svc_item = MenuItem::with_id(app, TRAY_MENU_SERVICE_ID, svc_label, true, None::<&str>)?;
     let hide_item = MenuItem::with_id(app, TRAY_MENU_HIDE_ID, "隐藏窗口", true, None::<&str>)?;
@@ -1101,7 +1106,8 @@ fn sync_tray_menu(app: &AppHandle<tauri::Wry>) {
 fn refresh_tray_menu_async(app: AppHandle<tauri::Wry>) {
     tauri::async_runtime::spawn(async move {
         let h_probe = app.clone();
-        let up = match tokio::task::spawn_blocking(move || probe_tray_service_is_up(&h_probe)).await {
+        let up = match tokio::task::spawn_blocking(move || probe_tray_service_is_up(&h_probe)).await
+        {
             Ok(v) => v,
             Err(_) => false,
         };
@@ -1339,7 +1345,9 @@ pub fn setup(app: &mut App<tauri::Wry>) -> tauri::Result<()> {
     setup_system_tray(app)?;
 
     let loaded_state = load_desktop_state(app.handle());
-    if let Ok(mut last_full_window_layout) = desktop_state(app.handle()).last_full_window_layout.lock() {
+    if let Ok(mut last_full_window_layout) =
+        desktop_state(app.handle()).last_full_window_layout.lock()
+    {
         *last_full_window_layout = loaded_state.last_full_window_layout.clone();
     }
     let loaded_settings = loaded_state.settings.clone();
@@ -1366,9 +1374,15 @@ pub fn setup(app: &mut App<tauri::Wry>) -> tauri::Result<()> {
             log_desktop_error("apply the initial full window layout", &err);
         }
         if let Err(err) = window.show() {
-            log_desktop_error("show the main window after restoring layout", &err.to_string());
+            log_desktop_error(
+                "show the main window after restoring layout",
+                &err.to_string(),
+            );
         } else if let Err(err) = window.set_focus() {
-            log_desktop_error("focus the main window after restoring layout", &err.to_string());
+            log_desktop_error(
+                "focus the main window after restoring layout",
+                &err.to_string(),
+            );
         }
         if let Err(err) = capture_live_full_window_layout(app.handle(), &window) {
             log_desktop_error("capture the initial full window layout", &err);

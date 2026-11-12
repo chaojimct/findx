@@ -398,7 +398,9 @@ unsafe fn handle_query(
         SortField::Name,
         false,
     )?;
-    send_query1_reply(reply_hwnd, my_hwnd, reply_msg, results, offset, max as u32, wide);
+    send_query1_reply(
+        reply_hwnd, my_hwnd, reply_msg, results, offset, max as u32, wide,
+    );
     Some(LRESULT(1))
 }
 
@@ -546,7 +548,9 @@ fn do_search_via_pipe(query: &str, max_total: usize) -> Option<Vec<IpcHit>> {
         offset: 0,
     };
     match pipe_rpc(&pipe, &req)? {
-        IpcResponse::SearchResult { hits, .. } => Some(hits.into_iter().map(dto_to_ipc_hit).collect()),
+        IpcResponse::SearchResult { hits, .. } => {
+            Some(hits.into_iter().map(dto_to_ipc_hit).collect())
+        }
         _ => None,
     }
 }
@@ -577,11 +581,7 @@ fn pipe_rpc(pipe: &str, req: &IpcRequest) -> Option<IpcResponse> {
     } else {
         format!(r"\\.\pipe\{pipe}")
     };
-    let mut f = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .ok()?;
+    let mut f = OpenOptions::new().read(true).write(true).open(&path).ok()?;
     let mut body = serde_json::to_string(req).ok()?;
     body.push('\n');
     f.write_all(body.as_bytes()).ok()?;

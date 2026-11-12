@@ -51,11 +51,7 @@ fn engine_from_fixture() -> SearchEngine {
         });
         id += 1;
     }
-    assert!(
-        !files.is_empty(),
-        "{} 下应有若干测试文件",
-        dir.display()
-    );
+    assert!(!files.is_empty(), "{} 下应有若干测试文件", dir.display());
 
     let store = IndexBuilder::new(b'C', 1, 1, 1)
         .build_from_raw(files, dirs, true)
@@ -370,12 +366,12 @@ fn pinyin_prune_consistency_with_trigram_sidecar() {
     let engine_pruned = SearchEngine::new(loaded);
 
     let queries = [
-        "beijing",     // 全拼 → 北京 + noise-beijing-*（字面）
-        "sh",          // 简拼 → 上海 + noise-sh*（字面）；<3 字节不剪枝
+        "beijing",           // 全拼 → 北京 + noise-beijing-*（字面）
+        "sh",                // 简拼 → 上海 + noise-sh*（字面）；<3 字节不剪枝
         "shanghai lujiazui", // 多 needle AND
         "pinyin quanpin",    // 双拼音词
-        "中文",        // CJK needle（字面 UTF-8 窗口）
-        "english",     // 纯 ASCII
+        "中文",              // CJK needle（字面 UTF-8 窗口）
+        "english",           // 纯 ASCII
         "startwith:beijing", // 前缀
         "startwith:noise",   // 前缀 + 高频候选
     ];
@@ -391,4 +387,3 @@ fn pinyin_prune_consistency_with_trigram_sidecar() {
 
     std::fs::remove_dir_all(&tmp).ok();
 }
-

@@ -7,7 +7,9 @@
 use std::path::Path;
 use std::time::Instant;
 
-use findx2_core::{build_trigram_sidecar, load_index_bin, QueryParser, SearchEngine, SearchOptions};
+use findx2_core::{
+    build_trigram_sidecar, load_index_bin, QueryParser, SearchEngine, SearchOptions,
+};
 
 const QUERIES: &[&str] = &[
     "config",     // 中频词
@@ -26,10 +28,10 @@ const PREFIX_QUERIES: &[&str] = &[
 /// 拼音 Auto 场景：全拼命中中文名走 `trigram ∪ cjk_names` 剪枝（主战场），
 /// 纯 ASCII 字面走 trigram 主导；两条路都在 fused_scan_pinyin 里验证。
 const PINYIN_QUERIES: &[&str] = &[
-    "config",            // 纯 ASCII 字面对照
-    "jisuanqi",          // 计算器（全拼）
-    "weixin",            // 微信
-    "startwith:config",  // 前缀 + 拼音路径
+    "config",             // 纯 ASCII 字面对照
+    "jisuanqi",           // 计算器（全拼）
+    "weixin",             // 微信
+    "startwith:config",   // 前缀 + 拼音路径
     "startwith:jisuanqi", // 前缀全拼
 ];
 
@@ -134,9 +136,7 @@ fn main() {
         let (ms, total, hits) = bench(&engine, q);
         let base = baseline[i];
         let speedup = if ms > 0.001 { base / ms } else { f64::INFINITY };
-        println!(
-            "{q:<24} {base:8.2} ms {ms:8.2} ms  {speedup:7.1}x  hits={hits} total={total}"
-        );
+        println!("{q:<24} {base:8.2} ms {ms:8.2} ms  {speedup:7.1}x  hits={hits} total={total}");
     }
 
     println!("\n=== 拼音优化后：Auto + 边车剪枝（trigram ∪ cjk_names）===");
@@ -146,8 +146,6 @@ fn main() {
         let (ms, hits) = bench_pinyin(&engine, q);
         let speedup = if ms > 0.001 { base / ms } else { f64::INFINITY };
         let ok = if hits_base == hits { "yes" } else { "NO!" };
-        println!(
-            "{q:<24} {base:8.2} ms {ms:8.2} ms  {speedup:7.1}x  {ok} ({hits})"
-        );
+        println!("{q:<24} {base:8.2} ms {ms:8.2} ms  {speedup:7.1}x  {ok} ({hits})");
     }
 }

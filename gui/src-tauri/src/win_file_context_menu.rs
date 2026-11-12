@@ -12,7 +12,6 @@ use tauri::AppHandle;
 use tauri_plugin_opener::OpenerExt;
 use windows::core::{Interface, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows_core::BOOL;
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
@@ -20,18 +19,19 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_DOWN, VK_SHIFT, VK_UP};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    CMINVOKECOMMANDINFO, CMF_EXTENDEDVERBS, CMF_NORMAL, IContextMenu, IContextMenu2, IContextMenu3,
-    IShellFolder, SHBindToParent, SHFileOperationW, FO_DELETE, FOF_ALLOWUNDO, SHFILEOPSTRUCTW,
+    IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, SHBindToParent, SHFileOperationW,
+    CMF_EXTENDEDVERBS, CMF_NORMAL, CMINVOKECOMMANDINFO, FOF_ALLOWUNDO, FO_DELETE, SHFILEOPSTRUCTW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CallWindowProcW, CreatePopupMenu, DestroyMenu, EnumThreadWindows,
     GetClassNameW, GetCursorPos, GetWindowLongPtrW, IsWindowVisible, SendMessageW,
     SetForegroundWindow, SetMenuInfo, SetWindowLongPtrW, SetWindowsHookExW, TrackPopupMenu,
     UnhookWindowsHookEx, WindowFromPoint, GWLP_WNDPROC, HHOOK, HMENU, MENUINFO, MF_SEPARATOR,
-    MF_STRING, MIM_MAXHEIGHT, MSGF_MENU, MSG, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD,
+    MF_STRING, MIM_MAXHEIGHT, MSG, MSGF_MENU, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD,
     TRACK_POPUP_MENU_FLAGS, WH_MSGFILTER, WM_DRAWITEM, WM_INITMENUPOPUP, WM_KEYDOWN,
     WM_MEASUREITEM, WM_MENUCHAR, WM_MOUSEWHEEL, WNDPROC,
 };
+use windows_core::BOOL;
 
 const CMD_OPEN: usize = 1;
 const CMD_OPEN_PARENT: usize = 2;
@@ -389,11 +389,7 @@ fn show_shell_menu(hwnd: HWND, path: &str, px: i32, py: i32, extended: bool) -> 
         let old_ptr = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
         let old_proc: WNDPROC = std::mem::transmute(old_ptr);
         SHELL_MENU_HOOK.with(|cell| {
-            cell.replace(Some(ShellMenuHook {
-                old_proc,
-                cm2,
-                cm3,
-            }));
+            cell.replace(Some(ShellMenuHook { old_proc, cm2, cm3 }));
         });
         SetWindowLongPtrW(
             hwnd,

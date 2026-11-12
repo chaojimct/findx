@@ -155,10 +155,11 @@ pub fn watch_loop(root: &str, cursor: WatchCursor, tx: Sender<ChangeEvent>) -> R
     });
     let info = Box::into_raw(state);
 
-    let c_root = CString::new(root)
-        .map_err(|_| findx2_core::Error::Platform("监听根路径含 NUL".into()))?;
+    let c_root =
+        CString::new(root).map_err(|_| findx2_core::Error::Platform("监听根路径含 NUL".into()))?;
     unsafe {
-        let cf_path = CFStringCreateWithCString(ptr::null(), c_root.as_ptr(), KCF_STRING_ENCODING_UTF8);
+        let cf_path =
+            CFStringCreateWithCString(ptr::null(), c_root.as_ptr(), KCF_STRING_ENCODING_UTF8);
         if cf_path.is_null() {
             let _ = Box::from_raw(info);
             return Err(findx2_core::Error::Platform("CFString 创建失败".into()));
@@ -197,17 +198,25 @@ pub fn watch_loop(root: &str, cursor: WatchCursor, tx: Sender<ChangeEvent>) -> R
         CFRelease(arr as *const c_void);
         if stream.is_null() {
             let _ = Box::from_raw(info);
-            return Err(findx2_core::Error::Platform("FSEventStreamCreate 失败".into()));
+            return Err(findx2_core::Error::Platform(
+                "FSEventStreamCreate 失败".into(),
+            ));
         }
 
         let rl = CFRunLoopGetCurrent();
-        (*info).runloop.lock().ok().map(|mut g| *g = Some(rl as usize));
+        (*info)
+            .runloop
+            .lock()
+            .ok()
+            .map(|mut g| *g = Some(rl as usize));
         FSEventStreamScheduleWithRunLoop(stream, rl, kCFRunLoopDefaultMode);
         if FSEventStreamStart(stream) == 0 {
             FSEventStreamInvalidate(stream);
             FSEventStreamRelease(stream);
             let _ = Box::from_raw(info);
-            return Err(findx2_core::Error::Platform("FSEventStreamStart 失败".into()));
+            return Err(findx2_core::Error::Platform(
+                "FSEventStreamStart 失败".into(),
+            ));
         }
         CFRunLoopRun();
         FSEventStreamStop(stream);

@@ -207,7 +207,9 @@ fn migrate_installed_layout_settings<R: Runtime>(
 }
 
 #[tauri::command]
-pub fn load_findx_settings<R: Runtime>(app: tauri::AppHandle<R>) -> Result<FindxGuiSettings, String> {
+pub fn load_findx_settings<R: Runtime>(
+    app: tauri::AppHandle<R>,
+) -> Result<FindxGuiSettings, String> {
     let path = settings_path(&app)?;
     if !path.exists() {
         #[cfg(windows)]
@@ -236,7 +238,8 @@ pub fn load_findx_settings<R: Runtime>(app: tauri::AppHandle<R>) -> Result<Findx
         if index_path_needs_unix_migrate(&s.index_path, &base) {
             s.index_path = unix_default_index_path().to_string_lossy().into_owned();
         }
-        if s.volume.trim().eq_ignore_ascii_case("C:") || s.volume.trim().eq_ignore_ascii_case(r"C:\")
+        if s.volume.trim().eq_ignore_ascii_case("C:")
+            || s.volume.trim().eq_ignore_ascii_case(r"C:\")
         {
             s.volume.clear();
         }
@@ -391,7 +394,10 @@ fn strip_macos_quarantine(path: &Path) {
 }
 
 #[cfg(unix)]
-pub(crate) fn unix_configure_detached_child(cmd: &mut std::process::Command, log_path: Option<&Path>) {
+pub(crate) fn unix_configure_detached_child(
+    cmd: &mut std::process::Command,
+    log_path: Option<&Path>,
+) {
     use std::os::unix::process::CommandExt;
     cmd.stdin(std::process::Stdio::null());
     cmd.process_group(0);
@@ -585,7 +591,12 @@ fn try_start_windows_service() -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn install_args_for_settings(settings: &FindxGuiSettings, index: &Path, vol: &str, pipe: &str) -> String {
+fn install_args_for_settings(
+    settings: &FindxGuiSettings,
+    index: &Path,
+    vol: &str,
+    pipe: &str,
+) -> String {
     use crate::elevate::quote_arg;
     let mut params = format!(
         "install --index {} --volume {} --pipe {} --save-interval-secs {}",
@@ -663,9 +674,7 @@ fn start_service_mode_process(
             }
             cmd.arg("--exclude-dir").arg(d);
         }
-        let status = cmd
-            .status()
-            .map_err(|e| format!("注册系统服务失败: {e}"))?;
+        let status = cmd.status().map_err(|e| format!("注册系统服务失败: {e}"))?;
         if !status.success() {
             return Err(format!(
                 "注册系统服务失败（退出码 {}）。",
@@ -686,8 +695,13 @@ fn start_service_mode_process(
         return Ok(());
     }
     let sc = Path::new(r"C:\Windows\System32\sc.exe");
-    shell_execute_runas(sc, Some(&format!("start {WINDOWS_SERVICE_NAME}")), work, true)
-        .map_err(|e| format!("提权启动系统服务失败: {e}"))?;
+    shell_execute_runas(
+        sc,
+        Some(&format!("start {WINDOWS_SERVICE_NAME}")),
+        work,
+        true,
+    )
+    .map_err(|e| format!("提权启动系统服务失败: {e}"))?;
     Ok(())
 }
 
@@ -838,8 +852,7 @@ pub fn spawn_findx_service_process<R: Runtime>(app: tauri::AppHandle<R>) -> Resu
     #[cfg(not(windows))]
     {
         let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("--index")
-            .arg(index.as_os_str());
+        cmd.arg("--index").arg(index.as_os_str());
         if !vol.is_empty() && vol != "C:" {
             cmd.arg("--volume").arg(vol);
         }

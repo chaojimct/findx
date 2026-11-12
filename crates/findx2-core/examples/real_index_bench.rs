@@ -72,8 +72,10 @@ fn main() {
         }
     );
     let live = n_entries.saturating_sub(n_tomb);
-    eprintln!("  存活条目: {live}（墓碑压缩后可回收 {:.2} GB）",
-        n_tomb as f64 * 32.0 / 1073741824.0);
+    eprintln!(
+        "  存活条目: {live}（墓碑压缩后可回收 {:.2} GB）",
+        n_tomb as f64 * 32.0 / 1073741824.0
+    );
 
     let engine = SearchEngine::new(store);
     let opt = SearchOptions::default();

@@ -5,9 +5,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use findx2_core::{
-    IndexBuilder, ParsedQuery, QueryParser, RawEntry, SearchEngine, SearchOptions,
-};
+use findx2_core::{IndexBuilder, ParsedQuery, QueryParser, RawEntry, SearchEngine, SearchOptions};
 
 fn synthetic_chinese_entries(n_files: usize) -> (Vec<RawEntry>, Vec<RawEntry>) {
     let root_frn = 100u64;

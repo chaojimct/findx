@@ -6,22 +6,22 @@ mod load_state;
 mod startup_compact;
 mod watch_health;
 
+mod backfill;
 #[cfg(windows)]
 mod everything_ipc;
 #[cfg(windows)]
 mod pipe_server;
 #[cfg(windows)]
 mod run;
-mod backfill;
-#[cfg(windows)]
-mod win_service;
 #[cfg(windows)]
 mod session_spawn;
+#[cfg(windows)]
+mod win_service;
 
 #[cfg(unix)]
-mod unix_server;
-#[cfg(unix)]
 mod run_unix;
+#[cfg(unix)]
+mod unix_server;
 
 use clap::Parser;
 
@@ -33,17 +33,17 @@ fn main() {
         let path = std::env::temp_dir().join(SERVICE_LAST_ERROR_FILENAME);
         let text = format!("{e:#}\n");
         let _ = std::fs::write(&path, &text);
-        eprintln!("findx2-service 启动失败: {e:#}\n（详情已写入 {}）", path.display());
+        eprintln!(
+            "findx2-service 启动失败: {e:#}\n（详情已写入 {}）",
+            path.display()
+        );
         std::process::exit(1);
     }
 }
 
 struct LocalTimer;
 impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
-    fn format_time(
-        &self,
-        w: &mut tracing_subscriber::fmt::format::Writer<'_>,
-    ) -> std::fmt::Result {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
         write!(w, "{}", chrono::Local::now().format("%H:%M:%S%.3f"))
     }
 }

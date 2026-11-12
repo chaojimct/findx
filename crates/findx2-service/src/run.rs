@@ -10,8 +10,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use findx2_core::{
-    load_index_bin_with_progress, v6_load, v6_save_full, v6_try_commit,
-    CommitBatch, CommitOutcome, SearchEngine, V6Layout,
+    load_index_bin_with_progress, v6_load, v6_save_full, v6_try_commit, CommitBatch, CommitOutcome,
+    SearchEngine, V6Layout,
 };
 use tracing::{error, info};
 
@@ -79,24 +79,44 @@ fn spawn_stat_worker(
                         }
                         // 攒够一批就刷（5000 条或 1 秒超时，取先到者）。
                         if pending.len() >= 5000 {
-                            drain_stat_batch(&engine, &volume_device_path, &mut pending, &mut logged_no_perm);
+                            drain_stat_batch(
+                                &engine,
+                                &volume_device_path,
+                                &mut pending,
+                                &mut logged_no_perm,
+                            );
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         if !pending.is_empty() {
-                            drain_stat_batch(&engine, &volume_device_path, &mut pending, &mut logged_no_perm);
+                            drain_stat_batch(
+                                &engine,
+                                &volume_device_path,
+                                &mut pending,
+                                &mut logged_no_perm,
+                            );
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
                 // 兜底：队列过大（极端风暴）时强制刷盘，避免内存无限涨。
                 if pending.len() >= 50_000 {
-                    drain_stat_batch(&engine, &volume_device_path, &mut pending, &mut logged_no_perm);
+                    drain_stat_batch(
+                        &engine,
+                        &volume_device_path,
+                        &mut pending,
+                        &mut logged_no_perm,
+                    );
                 }
             }
             // 退出前把剩余的刷完（进程退出场景基本走不到，保底）。
             if !pending.is_empty() {
-                drain_stat_batch(&engine, &volume_device_path, &mut pending, &mut logged_no_perm);
+                drain_stat_batch(
+                    &engine,
+                    &volume_device_path,
+                    &mut pending,
+                    &mut logged_no_perm,
+                );
             }
         })
         .ok();
@@ -221,11 +241,7 @@ fn spawn_trigram_rebuild(engine: Arc<SearchEngine>, index: PathBuf, reason: &'st
 /// 默认 max(条目数/32, 65536)）。未超阈值是常态，检查本身只是一次位图 len 读取。
 fn maybe_rebuild_trigram(engine: &Arc<SearchEngine>, index: &Path) {
     if engine.index_store().tri_pending_overflow() {
-        spawn_trigram_rebuild(
-            engine.clone(),
-            index.to_path_buf(),
-            "USN 增量超过阈值",
-        );
+        spawn_trigram_rebuild(engine.clone(), index.to_path_buf(), "USN 增量超过阈值");
     }
 }
 
@@ -387,11 +403,7 @@ pub(crate) fn run_foreground(
     // 边车缺失 / 加载时被判不可信（重建窗口内崩溃过）：后台补建一次，
     // 本轮搜索先走全表扫描兜底，构建完成后自动切到剪枝路径。
     if engine.index_store().trigram.is_none() {
-        spawn_trigram_rebuild(
-            engine.clone(),
-            index.clone(),
-            "启动时边车缺失或校验失败",
-        );
+        spawn_trigram_rebuild(engine.clone(), index.clone(), "启动时边车缺失或校验失败");
     }
 
     let _everything: Option<JoinHandle<()>> = if flags.no_everything_ipc {
@@ -422,10 +434,7 @@ pub(crate) fn run_foreground(
                 .find(|ch| ch.is_ascii_alphabetic())
                 .unwrap_or('C')
                 .to_ascii_uppercase();
-            vec![(
-                format!("{}:", c),
-                c as u8,
-            )]
+            vec![(format!("{}:", c), c as u8)]
         } else {
             g.volumes
                 .iter()
@@ -704,7 +713,10 @@ fn usn_watch_loop(
                         dirty_count += flush_pending(&mut pending);
                     }
                 }
-                findx2_windows::UsnWatchMsg::StatRefresh { file_id, file_id_128 } => {
+                findx2_windows::UsnWatchMsg::StatRefresh {
+                    file_id,
+                    file_id_128,
+                } => {
                     // 路由给后台 stat worker（watch 线程永不 stat）；发送失败（worker 退出）
                     // 则丢弃——下次同文件变更会重新排队，极端下靠全量重建兜底。
                     let _ = stat_tx.send((file_id, file_id_128));
@@ -717,16 +729,14 @@ fn usn_watch_loop(
                     if let Some(v) = engine.index_store_mut().volumes.iter_mut().find(|x| {
                         (x.volume_letter as char).to_ascii_uppercase()
                             == (volume_letter as char).to_ascii_uppercase()
-                    })
-                    {
+                    }) {
                         v.usn_journal_id = journal_id;
                         v.last_usn = next_usn;
                     }
                     // 存活确认：收到 journal 心跳即视为健康，复位退避/重建计数。
                     backoff = Duration::from_secs(1);
                     gap_rebuilds = 0;
-                    if let Some(w) = probe_journal_wrap_warning(&volume_path, letter, next_usn)
-                    {
+                    if let Some(w) = probe_journal_wrap_warning(&volume_path, letter, next_usn) {
                         set_watch_error(letter, Some(w));
                     } else {
                         set_watch_error(letter, None);
@@ -743,7 +753,7 @@ fn usn_watch_loop(
                     dirty_count += flush_pending(&mut pending);
                 }
                 try_maybe_persist(&mut dirty_count, &mut last_save, &engine, &index_path)?;
-            },
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // worker 死了：join 判因后重启（先排空残留消息已由 Disconnected 语义保证）。
                 dirty_count += flush_pending(&mut pending);
@@ -753,10 +763,7 @@ fn usn_watch_loop(
                     Ok(Err(e)) => format!("{e}"),
                     Err(_) => "watch 线程 panic".to_string(),
                 };
-                let is_gap = matches!(
-                    &exit,
-                    Ok(Err(findx2_core::Error::JournalGap(_)))
-                );
+                let is_gap = matches!(&exit, Ok(Err(findx2_core::Error::JournalGap(_))));
                 if is_gap && gap_rebuilds < 3 {
                     gap_rebuilds += 1;
                     set_watch_error(
@@ -765,10 +772,7 @@ fn usn_watch_loop(
                     );
                     error!("卷 {letter} {reason}，触发全卷重建");
                     if let Err(re) = rebuild_volume(&engine, letter, &index_path) {
-                        set_watch_error(
-                            letter,
-                            Some(format!("重建失败: {re}，退避重试…")),
-                        );
+                        set_watch_error(letter, Some(format!("重建失败: {re}，退避重试…")));
                         error!("卷 {letter} 重建失败: {re:#}");
                     } else {
                         info!("卷 {letter} 重建完成，恢复增量监听");
@@ -902,26 +906,18 @@ fn rebuild_volume(
         {
             let fresh_usn = v.last_usn;
             let resume = match findx2_windows::query_journal_state(&vol_str) {
-                Ok((jid, first, _)) => resume_usn_after_rebuild(
-                    frozen,
-                    frozen_journal_id,
-                    fresh_usn,
-                    jid,
-                    first,
-                ),
+                Ok((jid, first, _)) => {
+                    resume_usn_after_rebuild(frozen, frozen_journal_id, fresh_usn, jid, first)
+                }
                 Err(e) => {
-                    info!(
-                        "卷 {letter} 重建后无法复查 journal（{e}），保留扫描游标 {fresh_usn}"
-                    );
+                    info!("卷 {letter} 重建后无法复查 journal（{e}），保留扫描游标 {fresh_usn}");
                     fresh_usn
                 }
             };
             if resume == frozen && resume != fresh_usn {
                 info!("卷 {letter} 回绕到 frozen={frozen} 重放扫描期间的增量");
             } else if resume != frozen {
-                info!(
-                    "卷 {letter} 断档游标 {frozen} 已不可读，保留扫描结束时的游标 {resume}"
-                );
+                info!("卷 {letter} 断档游标 {frozen} 已不可读，保留扫描结束时的游标 {resume}");
             }
             v.last_usn = resume;
         }
@@ -930,7 +926,11 @@ fn rebuild_volume(
 
     // 4) 落盘 + trigram 重建（合并后 trigram=None，先回全表扫描，重建完自动切回剪枝）。
     persist_index(engine, index_path)?;
-    spawn_trigram_rebuild(engine.clone(), index_path.to_path_buf(), "单卷重建后边车重建");
+    spawn_trigram_rebuild(
+        engine.clone(),
+        index_path.to_path_buf(),
+        "单卷重建后边车重建",
+    );
     // 合并后 metadata_ready=false（fast 重枚举），必须重新拉起回填；旧 overlay 下标已失效。
     engine.clear_metadata_overlay();
     crate::backfill::spawn_backfill(Arc::clone(engine), index_path.to_path_buf());
@@ -959,9 +959,10 @@ fn merge_rebuilt_volume(
     letter: char,
 ) -> anyhow::Result<findx2_core::IndexStore> {
     let up = letter.to_ascii_uppercase();
-    let has_letter = old.volumes.iter().any(|v| {
-        (v.volume_letter as char).to_ascii_uppercase() == up
-    });
+    let has_letter = old
+        .volumes
+        .iter()
+        .any(|v| (v.volume_letter as char).to_ascii_uppercase() == up);
     let sole = has_letter
         && old
             .volumes
@@ -1031,11 +1032,7 @@ fn resume_usn_after_rebuild(
 ///
 /// 真正有风险的是：我们还落后（next > cursor），且 FirstUsn 已经逼近 cursor
 /// （历史缓冲 < 占用跨度的 5%）。追上后覆写的是早已处理过的旧记录，不必报警。
-fn probe_journal_wrap_warning(
-    volume_path: &str,
-    letter: char,
-    cursor_usn: u64,
-) -> Option<String> {
+fn probe_journal_wrap_warning(volume_path: &str, letter: char, cursor_usn: u64) -> Option<String> {
     let Ok((_, first, next)) = findx2_windows::query_journal_state(volume_path) else {
         return None;
     };
@@ -1049,9 +1046,7 @@ fn probe_journal_wrap_warning(
     let span = (next - first) as u64;
     let slack = cursor.saturating_sub(first).max(0) as u64;
     if span > 0 && slack < span / 20 {
-        tracing::warn!(
-            "卷 {letter} USN journal 未读游标接近覆写前沿 (缓冲 {slack}/{span})"
-        );
+        tracing::warn!("卷 {letter} USN journal 未读游标接近覆写前沿 (缓冲 {slack}/{span})");
         return Some(format!(
             "USN journal 未读记录即将被覆写（缓冲 {slack}/{span}），停机过久会触发全量重建"
         ));
@@ -1101,7 +1096,11 @@ pub(crate) fn persist_index(engine: &SearchEngine, path: &Path) -> anyhow::Resul
     let v6 = V6Layout::for_index(path);
     let t0 = Instant::now();
     match v6_try_commit(&v6, &batch).map_err(|e| anyhow::anyhow!("{e:#}"))? {
-        CommitOutcome::Delta { applied, bytes, generation } => {
+        CommitOutcome::Delta {
+            applied,
+            bytes,
+            generation,
+        } => {
             tracing::debug!(
                 "v6 commit：{applied} 条 / {bytes} B / gen {generation}（{:.1}ms）",
                 t0.elapsed().as_secs_f64() * 1000.0
@@ -1165,10 +1164,7 @@ mod tests {
         assert_ne!(merged.entry_count(), old_n + fresh_n);
         assert_eq!(merged.volumes.len(), 1);
         assert_eq!(merged.volumes[0].last_usn, 50_000);
-        assert_eq!(
-            merged.excluded_dirs,
-            vec![r"C:\Users".to_string()]
-        );
+        assert_eq!(merged.excluded_dirs, vec![r"C:\Users".to_string()]);
         assert!(merged.deleted.len() > 0, "排除目录下的新扫描条目应被打墓碑");
     }
 
@@ -1177,21 +1173,12 @@ mod tests {
         let fresh = 85_472_796_576u64;
         let first = 84_474_593_280i64;
         let frozen = 80_312_296_848u64;
-        assert_eq!(
-            resume_usn_after_rebuild(frozen, 9, fresh, 9, first),
-            fresh
-        );
-        assert_eq!(
-            resume_usn_after_rebuild(fresh, 9, fresh, 9, first),
-            fresh
-        );
+        assert_eq!(resume_usn_after_rebuild(frozen, 9, fresh, 9, first), fresh);
+        assert_eq!(resume_usn_after_rebuild(fresh, 9, fresh, 9, first), fresh);
         assert_eq!(
             resume_usn_after_rebuild(first as u64, 9, fresh, 9, first),
             first as u64
         );
-        assert_eq!(
-            resume_usn_after_rebuild(fresh, 1, fresh, 9, first),
-            fresh
-        );
+        assert_eq!(resume_usn_after_rebuild(fresh, 1, fresh, 9, first), fresh);
     }
 }

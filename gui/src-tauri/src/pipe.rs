@@ -86,7 +86,9 @@ async fn write_request<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 #[cfg(windows)]
-async fn connect_endpoint(endpoint: &str) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, String> {
+async fn connect_endpoint(
+    endpoint: &str,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, String> {
     ClientOptions::new()
         .open(endpoint)
         .map_err(map_pipe_open_err)

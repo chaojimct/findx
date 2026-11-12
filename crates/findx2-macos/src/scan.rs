@@ -94,7 +94,10 @@ impl VolumeScanner for MacosVolumeScanner {
         volume: &str,
         out: &mut dyn FnMut(RawEntry) -> Result<()>,
     ) -> Result<WatchCursor> {
-        let root = if volume.is_empty() || volume.eq_ignore_ascii_case("C:") || volume.eq_ignore_ascii_case(r"C:\") {
+        let root = if volume.is_empty()
+            || volume.eq_ignore_ascii_case("C:")
+            || volume.eq_ignore_ascii_case(r"C:\")
+        {
             default_scan_root()
         } else {
             volume.to_string()
@@ -185,7 +188,11 @@ fn scan_tree_parallel(
     progress!(
         "macOS 扫描：{} 线程，{}",
         threads,
-        if full_stat { "带元数据" } else { "fast（稍后回填）" }
+        if full_stat {
+            "带元数据"
+        } else {
+            "fast（稍后回填）"
+        }
     );
     let q = Arc::new(Queue {
         jobs: Mutex::new(VecDeque::from([DirJob { fd }])),
@@ -307,9 +314,8 @@ fn enumerate_dirfd(
                     }
                     if is_dir && !is_link {
                         if let Some(c) = name_c {
-                            let child = unsafe {
-                                libc::openat(dirfd, c.as_ptr(), O_RDONLY | O_DIRECTORY)
-                            };
+                            let child =
+                                unsafe { libc::openat(dirfd, c.as_ptr(), O_RDONLY | O_DIRECTORY) };
                             if child >= 0 {
                                 q.inflight.fetch_add(1, Ordering::AcqRel);
                                 q.jobs.lock().unwrap().push_back(DirJob { fd: child });

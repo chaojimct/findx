@@ -665,9 +665,7 @@ fn parse_date_range(val: &str, mtime: bool, q: &mut ParsedQuery) -> std::result:
             let (w0_unix, w1_unix) = calendar_week_bounds_local();
             let week_sec = 7 * 86400;
             apply(
-                Some(unix_secs_to_filetime(
-                    w0_unix.saturating_sub(week_sec),
-                )),
+                Some(unix_secs_to_filetime(w0_unix.saturating_sub(week_sec))),
                 Some(unix_secs_to_filetime(w1_unix.saturating_sub(week_sec))),
             );
         }
@@ -752,8 +750,7 @@ fn calendar_month_bounds_local() -> (u64, u64) {
     let end = if now.month() == 12 {
         NaiveDate::from_ymd_opt(now.year() + 1, 1, 1).unwrap() - chrono::Duration::days(1)
     } else {
-        NaiveDate::from_ymd_opt(now.year(), now.month() + 1, 1).unwrap()
-            - chrono::Duration::days(1)
+        NaiveDate::from_ymd_opt(now.year(), now.month() + 1, 1).unwrap() - chrono::Duration::days(1)
     };
     let s0 = first
         .and_hms_opt(0, 0, 0)
@@ -803,9 +800,15 @@ fn parse_date_token(s: &str) -> std::result::Result<u64, Error> {
     let s = s.trim();
     let parts: Vec<&str> = s.split('-').collect();
     if parts.len() == 3 {
-        let y: i32 = parts[0].parse().map_err(|_| Error::Query("日期无效".into()))?;
-        let m: u32 = parts[1].parse().map_err(|_| Error::Query("日期无效".into()))?;
-        let d: u32 = parts[2].parse().map_err(|_| Error::Query("日期无效".into()))?;
+        let y: i32 = parts[0]
+            .parse()
+            .map_err(|_| Error::Query("日期无效".into()))?;
+        let m: u32 = parts[1]
+            .parse()
+            .map_err(|_| Error::Query("日期无效".into()))?;
+        let d: u32 = parts[2]
+            .parse()
+            .map_err(|_| Error::Query("日期无效".into()))?;
         // days_from_civil 已是「相对 1970-01-01 的公历日数」，乘 86400 即 Unix 秒（UTC 当日 0 点）。
         // 切勿再减 11644473600：那是 unix_secs_to_filetime 内部用于 1970↔1601 的位移，重复减会导致
         // saturating_sub 恒为 0 → dm:/dc: 阈值变成「未过滤」。
@@ -837,7 +840,8 @@ fn parse_date_token_flexible(s: &str) -> std::result::Result<(u64, u64), Error> 
         let m: u32 = parts[1]
             .parse()
             .map_err(|_| Error::Query("日期年月无效".into()))?;
-        let first = NaiveDate::from_ymd_opt(y, m, 1).ok_or_else(|| Error::Query("日期无效".into()))?;
+        let first =
+            NaiveDate::from_ymd_opt(y, m, 1).ok_or_else(|| Error::Query("日期无效".into()))?;
         let last = if m == 12 {
             NaiveDate::from_ymd_opt(y + 1, 1, 1).unwrap() - chrono::Duration::days(1)
         } else {
@@ -857,7 +861,9 @@ fn parse_date_token_flexible(s: &str) -> std::result::Result<(u64, u64), Error> 
             .timestamp() as u64;
         return Ok((unix_secs_to_filetime(lo), unix_secs_to_filetime(hi)));
     }
-    Err(Error::Query(format!("日期格式应为 YYYY-MM-DD 或 YYYY-MM: {s}")))
+    Err(Error::Query(format!(
+        "日期格式应为 YYYY-MM-DD 或 YYYY-MM: {s}"
+    )))
 }
 
 /// Howard Hinnant 公历算法，返回 1970-01-01 起的日数近似（与 Unix 日对齐）
@@ -953,7 +959,9 @@ fn apply_named_needle(q: &mut ParsedQuery, val: &str) {
 }
 
 fn apply_parent_path(q: &mut ParsedQuery, val: &str, substring: bool) {
-    let mut p = expand_home(val.trim()).replace('\\', "/").to_ascii_lowercase();
+    let mut p = expand_home(val.trim())
+        .replace('\\', "/")
+        .to_ascii_lowercase();
     if p.len() >= 2 {
         let b = p.as_bytes();
         if b[0].is_ascii_alphabetic() && b[1] == b':' {

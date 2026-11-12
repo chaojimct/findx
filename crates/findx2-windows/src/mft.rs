@@ -11,17 +11,17 @@ mod imp {
     use std::path::{Path, PathBuf};
     use walkdir::WalkDir;
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, ERROR_HANDLE_EOF, GENERIC_READ, GENERIC_WRITE, HANDLE};
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_HANDLE_EOF, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    };
     use windows::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateFileW, ExtendedFileIdType, FileIdType,
-        GetFileInformationByHandle, GetFinalPathNameByHandleW, OpenFileById,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128,
-        FILE_ID_DESCRIPTOR, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        CreateFileW, ExtendedFileIdType, FileIdType, GetFileInformationByHandle,
+        GetFinalPathNameByHandleW, OpenFileById, BY_HANDLE_FILE_INFORMATION,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128, FILE_ID_DESCRIPTOR,
+        FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
     };
-    use windows::Win32::System::Ioctl::{
-        FSCTL_ENUM_USN_DATA, MFT_ENUM_DATA_V0, MFT_ENUM_DATA_V1,
-    };
+    use windows::Win32::System::Ioctl::{FSCTL_ENUM_USN_DATA, MFT_ENUM_DATA_V0, MFT_ENUM_DATA_V1};
     use windows::Win32::System::IO::DeviceIoControl;
 
     /// USN 记录解析输出。字段：
@@ -55,7 +55,9 @@ mod imp {
                 let file_attr = u32::from_le_bytes(rec[52..56].try_into().ok()?);
                 let name_len = u16::from_le_bytes(rec[56..58].try_into().ok()?) as usize;
                 let name_off = u16::from_le_bytes(rec[58..60].try_into().ok()?) as usize;
-                Some((file_id, parent_id, file_attr, name_len, name_off, None, timestamp))
+                Some((
+                    file_id, parent_id, file_attr, name_len, name_off, None, timestamp,
+                ))
             }
             3 => {
                 if rec.len() < 76 {
@@ -70,7 +72,15 @@ mod imp {
                 let file_attr = u32::from_le_bytes(rec[68..72].try_into().ok()?);
                 let name_len = u16::from_le_bytes(rec[72..74].try_into().ok()?) as usize;
                 let name_off = u16::from_le_bytes(rec[74..76].try_into().ok()?) as usize;
-                Some((file_id, parent_id, file_attr, name_len, name_off, Some(id128), timestamp))
+                Some((
+                    file_id,
+                    parent_id,
+                    file_attr,
+                    name_len,
+                    name_off,
+                    Some(id128),
+                    timestamp,
+                ))
             }
             _ => None,
         }
@@ -90,7 +100,8 @@ mod imp {
     /// 而不是等整个卷跑完才在 `index.indexing.json` 写一次。
     /// 设计为全局 atomic 而不是回调参数，是因为 `pub fn scan_volume_*` 已是稳定 API；
     /// 同时 `build_full_disk_index` 又是单例（一次建库不会并发跑两次），全局状态足够用。
-    pub static SCAN_LIVE_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static SCAN_LIVE_ENTRIES: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
 
     pub struct MftScanner;
 
@@ -259,17 +270,15 @@ mod imp {
             }
         }
 
-        findx2_core::progress!(
-            "MFT 枚举完成：文件 {}，目录 {}。",
-            files.len(),
-            dirs.len()
-        );
+        findx2_core::progress!("MFT 枚举完成：文件 {}，目录 {}。", files.len(), dirs.len());
 
         // SSD/HDD 检测：SSD 上 MFT 直读仅覆盖 5-20%（碎片化），直接用 NtQueryDirectoryFile
         // 组合方案（99%+ 覆盖率）；HDD 上 MFT 直读仍有价值（顺序 I/O 快），保持原有策略。
         let ssd = crate::volumes::is_ssd(root);
         if ssd {
-            findx2_core::progress!("检测到 SSD，使用 NtQueryDirectoryFile 组合方案（跳过 MFT 直读）");
+            findx2_core::progress!(
+                "检测到 SSD，使用 NtQueryDirectoryFile 组合方案（跳过 MFT 直读）"
+            );
         }
 
         if fast {
@@ -284,7 +293,9 @@ mod imp {
                     Ok((_record_size, mmap)) => {
                         let mut hit = 0usize;
                         for e in files.iter_mut() {
-                            if let Some((sz, mt, ct)) = crate::mft_read::lookup_meta(&mmap, e.file_id) {
+                            if let Some((sz, mt, ct)) =
+                                crate::mft_read::lookup_meta(&mmap, e.file_id)
+                            {
                                 e.size = sz;
                                 e.mtime = mt;
                                 e.ctime = ct;
@@ -292,7 +303,9 @@ mod imp {
                             }
                         }
                         for e in dirs.iter_mut() {
-                            if let Some((_sz, mt, ct)) = crate::mft_read::lookup_meta(&mmap, e.file_id) {
+                            if let Some((_sz, mt, ct)) =
+                                crate::mft_read::lookup_meta(&mmap, e.file_id)
+                            {
                                 e.mtime = mt;
                                 e.ctime = ct;
                             }
@@ -312,7 +325,9 @@ mod imp {
                         }
                     }
                     Err(e) => {
-                        findx2_core::progress!("fast 模式 MFT 直读失败（{e}），元数据将由 service 后台回填");
+                        findx2_core::progress!(
+                            "fast 模式 MFT 直读失败（{e}），元数据将由 service 后台回填"
+                        );
                     }
                 }
             }
@@ -330,7 +345,9 @@ mod imp {
                         let mut hit = 0usize;
                         let mut miss_indices: Vec<usize> = Vec::new();
                         for (i, e) in files.iter_mut().enumerate() {
-                            if let Some((sz, mt, ct)) = crate::mft_read::lookup_meta(&meta_map, e.file_id) {
+                            if let Some((sz, mt, ct)) =
+                                crate::mft_read::lookup_meta(&meta_map, e.file_id)
+                            {
                                 e.size = sz;
                                 e.mtime = mt;
                                 e.ctime = ct;
@@ -341,7 +358,9 @@ mod imp {
                         }
                         // 目录也需要回填 mtime/ctime
                         for e in dirs.iter_mut() {
-                            if let Some((_sz, mt, ct)) = crate::mft_read::lookup_meta(&meta_map, e.file_id) {
+                            if let Some((_sz, mt, ct)) =
+                                crate::mft_read::lookup_meta(&meta_map, e.file_id)
+                            {
                                 e.mtime = mt;
                                 e.ctime = ct;
                             }
@@ -400,12 +419,7 @@ mod imp {
             "NtQueryDirectoryFile 回退：批量扫描 {} 个目录（已按 FRN 排序）…",
             dir_list.len(),
         );
-        let dir_meta = crate::nt_dir_query::fetch_dir_meta_batched(
-            path,
-            &dir_list,
-            None,
-            None,
-        );
+        let dir_meta = crate::nt_dir_query::fetch_dir_meta_batched(path, &dir_list, None, None);
         let mut by_frn: std::collections::HashMap<u64, (u64, u64, u64)> =
             std::collections::HashMap::with_capacity(dir_meta.len());
         for (frn, sz, mt, ct) in dir_meta {
@@ -456,8 +470,7 @@ mod imp {
             return;
         }
         let file_ids: Vec<u64> = files.iter().map(|e| e.file_id).collect();
-        let file_id_128s: Vec<Option<[u8; 16]>> =
-            files.iter().map(|e| e.file_id_128).collect();
+        let file_id_128s: Vec<Option<[u8; 16]>> = files.iter().map(|e| e.file_id_128).collect();
         let updates = crate::metadata_fill::fill_metadata_by_id_pooled(
             volume_device_path,
             &file_ids,
@@ -538,9 +551,7 @@ mod imp {
                     continue;
                 }
                 let wide = u16_slice(&rec[name_off..name_off + name_len]);
-                let name = OsString::from_wide(wide)
-                    .to_string_lossy()
-                    .into_owned();
+                let name = OsString::from_wide(wide).to_string_lossy().into_owned();
                 if name == "." || name == ".." {
                     continue;
                 }
@@ -571,8 +582,7 @@ mod imp {
             // 实时进度：让 GUI 的 indexing.json ticker 能读到当前累计条数。
             // batch 级累加（每批 ~几万条）开销忽略不计，比每条记录递增便宜得多。
             if recs_this_batch > 0 {
-                SCAN_LIVE_ENTRIES
-                    .fetch_add(recs_this_batch, std::sync::atomic::Ordering::Relaxed);
+                SCAN_LIVE_ENTRIES.fetch_add(recs_this_batch, std::sync::atomic::Ordering::Relaxed);
             }
 
             if batch_idx % MFT_PROGRESS_EVERY_BATCHES == 0 {
@@ -627,7 +637,11 @@ mod imp {
             });
         }
         let mut walked: usize = 0;
-        for ent in WalkDir::new(&root_path).follow_links(false).into_iter().filter_map(|e| e.ok()) {
+        for ent in WalkDir::new(&root_path)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             let path = ent.path();
             let is_dir = ent.file_type().is_dir();
             let name = path
@@ -680,8 +694,7 @@ mod imp {
         );
         if files.is_empty() && dirs.is_empty() {
             return Err(findx2_core::Error::Platform(
-                "MFT 枚举与目录遍历均未得到条目：请以管理员运行、确认卷为本地 NTFS。"
-                    .into(),
+                "MFT 枚举与目录遍历均未得到条目：请以管理员运行、确认卷为本地 NTFS。".into(),
             ));
         }
         if fast {
@@ -715,7 +728,12 @@ mod imp {
 
     fn volume_to_folder_root(vol: &str) -> String {
         let v = vol.trim().trim_end_matches('\\');
-        if v.len() == 1 && v.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+        if v.len() == 1
+            && v.chars()
+                .next()
+                .map(|c| c.is_ascii_alphabetic())
+                .unwrap_or(false)
+        {
             format!("{}:\\", v.to_ascii_uppercase())
         } else if v.len() >= 2 && v.as_bytes()[1] == b':' {
             format!("{}\\", v.trim_end_matches('\\'))
@@ -933,9 +951,7 @@ mod imp {
     }
 
     /// 跟随 reparse 打开路径上的实际文件 / 占位文件，拿 (FRN, parent FRN, attrs, size, mtime, ctime)。
-    fn open_file_info_by_path(
-        path: &Path,
-    ) -> Option<(u64, u64, u32, u64, u64, u64)> {
+    fn open_file_info_by_path(path: &Path) -> Option<(u64, u64, u32, u64, u64, u64)> {
         use windows::Win32::Foundation::FILETIME;
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         // 不带 OPEN_REPARSE_POINT：让 OneDrive 占位以"目标"形式打开（仅读 attrs，不会触发 hydration）
@@ -962,10 +978,7 @@ mod imp {
             return None;
         }
         let frn = ((bh.nFileIndexHigh as u64) << 32) | bh.nFileIndexLow as u64;
-        let parent = path
-            .parent()
-            .and_then(file_id_from_path)
-            .unwrap_or(0);
+        let parent = path.parent().and_then(file_id_from_path).unwrap_or(0);
         let size = ((bh.nFileSizeHigh as u64) << 32) | bh.nFileSizeLow as u64;
         let to_u64 = |ft: FILETIME| ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
         Some((
@@ -980,7 +993,12 @@ mod imp {
 
     fn volume_path(volume: &str) -> String {
         let v = volume.trim().trim_end_matches('\\');
-        if v.len() == 1 && v.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+        if v.len() == 1
+            && v.chars()
+                .next()
+                .map(|c| c.is_ascii_alphabetic())
+                .unwrap_or(false)
+        {
             format!(r"\\.\{}:", v.to_ascii_uppercase())
         } else if v.ends_with(':') && v.len() == 2 {
             format!(r"\\.\{}", v.to_ascii_uppercase())

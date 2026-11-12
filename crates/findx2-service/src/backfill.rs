@@ -30,9 +30,9 @@ impl Drop for BackfillRunningGuard {
 }
 
 use findx2_core::SearchEngine;
-use tracing::{error, info};
 #[cfg(unix)]
 use tracing::warn;
+use tracing::{error, info};
 
 /// 是否启用后台元数据回填。默认 **on**；可用 `FINDX2_DISABLE_BACKFILL=1` 关掉
 /// （diagnostic 场景或想完全保留 fast 索引语义时）。
@@ -97,12 +97,13 @@ fn spawn_final_persist(engine: Arc<SearchEngine>, path: std::path::PathBuf) {
             //    这步发生时回填线程已退出，不会再有新 put；search 会被这次写锁阻塞数秒。
             //    虽然不完美，但只发生一次，可接受。
             match engine.set_metadata_ready(true) {
-                Ok(_) => info!("终态落盘：metadata_ready=true 已写入索引（耗时 {:?}）", t0.elapsed()),
+                Ok(_) => info!(
+                    "终态落盘：metadata_ready=true 已写入索引（耗时 {:?}）",
+                    t0.elapsed()
+                ),
                 Err(e) => {
                     error!("终态落盘：set_metadata_ready 失败: {e}");
-                    engine.set_backfill_error(Some(format!(
-                        "元数据已补全但写入索引失败：{e}"
-                    )));
+                    engine.set_backfill_error(Some(format!("元数据已补全但写入索引失败：{e}")));
                     return;
                 }
             }
@@ -272,7 +273,11 @@ fn unix_entry_fs_path(store: &findx2_core::IndexStore, idx: usize) -> Option<Str
     let rel = segs.join("/");
     let prefix = prefix.trim_end_matches('/');
     if rel.is_empty() {
-        Some(if prefix.is_empty() { "/".into() } else { prefix.to_string() })
+        Some(if prefix.is_empty() {
+            "/".into()
+        } else {
+            prefix.to_string()
+        })
     } else if prefix.is_empty() || prefix == "/" {
         Some(format!("/{rel}"))
     } else {
@@ -281,7 +286,10 @@ fn unix_entry_fs_path(store: &findx2_core::IndexStore, idx: usize) -> Option<Str
 }
 
 #[cfg(unix)]
-fn unix_dir_name<'a>(store: &'a findx2_core::IndexStore, d: &findx2_core::index::DirEntry) -> Option<&'a str> {
+fn unix_dir_name<'a>(
+    store: &'a findx2_core::IndexStore,
+    d: &findx2_core::index::DirEntry,
+) -> Option<&'a str> {
     let start = d.name_offset as usize;
     let end = start + d.name_len as usize;
     let raw = store.names_buf.get(start..end)?;
@@ -428,9 +436,7 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
     // 扫描阶段也上报进度，避免 GUI 把 total=0 误读成「回填没跑」。
     engine.set_backfill_error(None);
     engine.set_backfill_total(total_entries as u64);
-    info!(
-        "后台回填启动：索引共 {total_entries} 条，扫描待补元数据条目 …"
-    );
+    info!("后台回填启动：索引共 {total_entries} 条，扫描待补元数据条目 …");
     let scan_start = Instant::now();
 
     // 1) 扫描待补：按 (盘符 -> {files: [(entry_idx, frn, dir_idx)], dirs: [frn]}) 分组。
@@ -464,9 +470,10 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
                     _ => continue,
                 };
                 let letter = g.volume_letter_for_entry(i);
-                let slot = by_volume
-                    .entry(letter)
-                    .or_insert_with(|| VolPending { files: Vec::new(), dirs: Vec::new() });
+                let slot = by_volume.entry(letter).or_insert_with(|| VolPending {
+                    files: Vec::new(),
+                    dirs: Vec::new(),
+                });
                 if e.is_dir_entry() {
                     slot.dirs.push(frn);
                 } else if e.size == 0 {
@@ -520,11 +527,7 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
         }
         let vol_path = format!("\\\\.\\{}:", letter);
         let is_hdd = findx2_windows::volume_incurs_seek_penalty(&format!("{letter}:"));
-        let vol_threads = if is_hdd {
-            2
-        } else {
-            ssd_threads
-        };
+        let vol_threads = if is_hdd { 2 } else { ssd_threads };
         let backfill_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(vol_threads)
             .thread_name(|i| format!("findx2-backfill-{i}"))
@@ -568,7 +571,6 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
         global_done: &AtomicUsize,
         _total_pending: usize,
     ) -> anyhow::Result<()> {
-
         // 建"待回填 FRN 集合"，用于在 NtQueryDirectoryFile 阶段筛选只要的子项。
         let needed: std::collections::HashSet<u64> =
             pending.files.iter().map(|(_, f)| *f).collect();
@@ -723,11 +725,7 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
     //    flush + 写盘 549MB 是耗时操作（HDD 上可能 10+ 秒），扔到独立线程跑，
     //    本回填线程可以立刻退出，不阻塞任何东西。
     let done_count = global_done.load(Ordering::Relaxed);
-    info!(
-        "后台元数据回填完成：done={}/{}",
-        done_count,
-        total_pending
-    );
+    info!("后台元数据回填完成：done={}/{}", done_count, total_pending);
     if done_count == 0 {
         // 回填了 0 条——可能是权限不足或句柄打开全部失败。
         // 不触发终态落盘，不设 metadata_ready=true，下次启动 service 时重试。
@@ -745,4 +743,3 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
     spawn_final_persist(engine, index_path);
     Ok(())
 }
-

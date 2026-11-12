@@ -111,9 +111,17 @@ fn compact_and_save(store: &mut IndexStore, index: &Path) -> anyhow::Result<Auto
     info!(
         "自动压缩完成：移除 {removed} 条墓碑 → {} 条目，耗时 {elapsed_secs:.1}s，落盘 {}",
         store.entry_count(),
-        if saved_ok { "成功" } else { "失败（下次启动再试）" }
+        if saved_ok {
+            "成功"
+        } else {
+            "失败（下次启动再试）"
+        }
     );
-    Ok(AutoCompactOutcome::Compacted { removed, saved_ok, elapsed_secs })
+    Ok(AutoCompactOutcome::Compacted {
+        removed,
+        saved_ok,
+        elapsed_secs,
+    })
 }
 
 /// 原子落盘：写同目录 `.compact.tmp` 再 rename 覆盖（与 CLI `compact` 一致），
@@ -181,10 +189,8 @@ mod tests {
     }
 
     fn temp_index_path(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "findx2-autocompact-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("findx2-autocompact-{}-{tag}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         dir.join("index.bin")
     }
@@ -222,7 +228,10 @@ mod tests {
         assert!(store.should_compact(), "35.7% 墓碑必须命中体检");
 
         let out = auto_compact_if_needed(&mut store, &idx).unwrap();
-        let AutoCompactOutcome::Compacted { removed, saved_ok, .. } = out else {
+        let AutoCompactOutcome::Compacted {
+            removed, saved_ok, ..
+        } = out
+        else {
             panic!("命中阈值必须压缩，实际 {out:?}");
         };
         assert_eq!(removed, TOMBS, "被移除的墓碑数");

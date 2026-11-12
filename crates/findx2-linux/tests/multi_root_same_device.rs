@@ -65,10 +65,7 @@ fn test_volume_id_stability() {
     let vol_id1 = volume_id_for_path(test_root.to_str().unwrap());
     let vol_id2 = volume_id_for_path(test_root.to_str().unwrap());
 
-    assert_eq!(
-        vol_id1, vol_id2,
-        "同一路径的 volume_id 应该保持稳定"
-    );
+    assert_eq!(vol_id1, vol_id2, "同一路径的 volume_id 应该保持稳定");
 
     // 清理
     let _ = fs::remove_dir_all(test_root);

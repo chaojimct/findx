@@ -37,13 +37,17 @@ pub fn is_ssd(volume: &str) -> bool {
         FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows::Win32::System::Ioctl::{
-        DEVICE_SEEK_PENALTY_DESCRIPTOR, IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery,
-        StorageDeviceSeekPenaltyProperty, STORAGE_PROPERTY_QUERY,
+        PropertyStandardQuery, StorageDeviceSeekPenaltyProperty, DEVICE_SEEK_PENALTY_DESCRIPTOR,
+        IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_PROPERTY_QUERY,
     };
     use windows::Win32::System::IO::DeviceIoControl;
 
     let vol = volume.trim().trim_end_matches('\\');
-    let drive_char = vol.chars().next().map(|c| c.to_ascii_uppercase()).unwrap_or('?');
+    let drive_char = vol
+        .chars()
+        .next()
+        .map(|c| c.to_ascii_uppercase())
+        .unwrap_or('?');
     let dev_path = format!(r"\\.\{}:", drive_char);
     let wide: Vec<u16> = dev_path.encode_utf16().chain(Some(0)).collect();
 

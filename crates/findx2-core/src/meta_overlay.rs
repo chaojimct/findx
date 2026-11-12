@@ -127,7 +127,12 @@ impl MetaOverlay {
                 continue;
             }
             let packed = self.mctime[i].load(Ordering::Relaxed);
-            out.push((i, size, (packed >> 32) as u32, (packed & 0xFFFF_FFFF) as u32));
+            out.push((
+                i,
+                size,
+                (packed >> 32) as u32,
+                (packed & 0xFFFF_FFFF) as u32,
+            ));
         }
         out
     }

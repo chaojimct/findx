@@ -78,12 +78,7 @@ fn main() {
 
     for (label, qstr) in cases {
         let pq: ParsedQuery = QueryParser::parse(qstr).unwrap();
-        let (ms, nhits) = time_ms(|| {
-            engine
-                .search(&pq, &opt)
-                .map(|(v, _t)| v.len())
-                .unwrap_or(0)
-        });
+        let (ms, nhits) = time_ms(|| engine.search(&pq, &opt).map(|(v, _t)| v.len()).unwrap_or(0));
         eprintln!("  [{label}] {qstr:?}  -> {nhits} 条, {ms:.1} ms");
     }
 
@@ -101,7 +96,5 @@ fn main() {
             .map(|(v, _t)| v.len())
             .unwrap_or(0)
     });
-    eprintln!(
-        "  [按大小降序取 100 条] ext:txt sort:size desc -> {nhits} 条, {ms:.1} ms"
-    );
+    eprintln!("  [按大小降序取 100 条] ext:txt sort:size desc -> {nhits} 条, {ms:.1} ms");
 }

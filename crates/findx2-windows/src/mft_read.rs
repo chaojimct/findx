@@ -12,16 +12,15 @@ mod imp {
     use std::collections::HashMap;
     use std::mem::size_of;
 
+    use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, GENERIC_READ};
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_BEGIN, FILE_CURRENT, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile, SetFilePointerEx,
+        CreateFileW, ReadFile, SetFilePointerEx, FILE_BEGIN, FILE_CURRENT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
     };
-    use windows::Win32::System::Ioctl::{
-        FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER,
-    };
+    use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
     use windows::Win32::System::IO::DeviceIoControl;
-    use windows::core::PCWSTR;
 
     const MFT_MAGIC_FILE: &[u8; 4] = b"FILE";
     const MFT_MAGIC_BAAD: &[u8; 4] = b"BAAD";
@@ -75,8 +74,7 @@ mod imp {
                     None,
                 )?;
             }
-            let vol_data =
-                unsafe { &*(vol_data_buf.as_ptr() as *const NTFS_VOLUME_DATA_BUFFER) };
+            let vol_data = unsafe { &*(vol_data_buf.as_ptr() as *const NTFS_VOLUME_DATA_BUFFER) };
             let mft_start_lcn = vol_data.MftStartLcn;
             let bytes_per_cluster = vol_data.BytesPerCluster as u64;
             let mft_offset: u64 = (mft_start_lcn as u64) * bytes_per_cluster;
@@ -101,19 +99,13 @@ mod imp {
                 let mut probe = vec![0u8; 4096];
                 let mut bytes_read: u32 = 0;
                 unsafe {
-                    ReadFile(
-                        h,
-                        Some(probe.as_mut_slice()),
-                        Some(&mut bytes_read),
-                        None,
-                    )?;
+                    ReadFile(h, Some(probe.as_mut_slice()), Some(&mut bytes_read), None)?;
                 }
                 if bytes_read < 42 {
                     let _ = unsafe { CloseHandle(h) };
                     return Err(windows::core::Error::from_thread());
                 }
-                let rec_alloc =
-                    u32::from_le_bytes(probe[0x1C..0x20].try_into().unwrap()) as usize;
+                let rec_alloc = u32::from_le_bytes(probe[0x1C..0x20].try_into().unwrap()) as usize;
                 if rec_alloc >= 512 && rec_alloc <= 4096 {
                     rec_alloc
                 } else {
@@ -127,10 +119,7 @@ mod imp {
                 SetFilePointerEx(h, mft_offset as i64, Some(&mut new_pos), FILE_BEGIN)?;
             }
 
-            findx2_core::progress!(
-                "MFT 直读：record_size={}, 开始顺序读取…",
-                record_size,
-            );
+            findx2_core::progress!("MFT 直读：record_size={}, 开始顺序读取…", record_size,);
 
             // 顺序读取并解析 MFT 记录
             let mut mft_buf = vec![0u8; READ_BUF_SIZE];
@@ -142,8 +131,8 @@ mod imp {
             let mut consecutive_empty: u32 = 0;
 
             while total_read < mft_valid_len {
-                let to_read = std::cmp::min(mft_buf.len() as u64, mft_valid_len - total_read)
-                    as u32;
+                let to_read =
+                    std::cmp::min(mft_buf.len() as u64, mft_valid_len - total_read) as u32;
                 if to_read == 0 {
                     break;
                 }
@@ -264,8 +253,7 @@ mod imp {
             if attr_type == 0x0000_0000 || attr_type == 0xFFFF_FFFF {
                 break;
             }
-            let attr_len =
-                u32::from_le_bytes(record[off + 4..off + 8].try_into().ok()?) as usize;
+            let attr_len = u32::from_le_bytes(record[off + 4..off + 8].try_into().ok()?) as usize;
             if attr_len < 24 || off + attr_len > record.len() {
                 break;
             }
@@ -282,9 +270,8 @@ mod imp {
                             u16::from_le_bytes(attr_data[20..22].try_into().ok()?) as usize;
                         let abs_off = off + content_off;
                         if abs_off + 48 <= record.len() && content_size >= 48 {
-                            ctime = u64::from_le_bytes(
-                                record[abs_off..abs_off + 8].try_into().ok()?,
-                            );
+                            ctime =
+                                u64::from_le_bytes(record[abs_off..abs_off + 8].try_into().ok()?);
                             mtime = u64::from_le_bytes(
                                 record[abs_off + 8..abs_off + 16].try_into().ok()?,
                             );
@@ -299,8 +286,7 @@ mod imp {
                         size = content_size;
                     } else {
                         if attr_data.len() >= 0x38 {
-                            size =
-                                u64::from_le_bytes(attr_data[0x30..0x38].try_into().ok()?);
+                            size = u64::from_le_bytes(attr_data[0x30..0x38].try_into().ok()?);
                         }
                     }
                 }
@@ -344,4 +330,4 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{read_mft_metadata, lookup_meta};
+pub use imp::{lookup_meta, read_mft_metadata};

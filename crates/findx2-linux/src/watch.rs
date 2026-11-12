@@ -61,17 +61,21 @@ impl ChangeWatcher for LinuxChangeWatcher {
     }
 }
 
-pub fn watch_loop(roots: &[String], cursor: WatchCursor, tx: Sender<ChangeEvent>) -> Result<WatchCursor> {
+pub fn watch_loop(
+    roots: &[String],
+    cursor: WatchCursor,
+    tx: Sender<ChangeEvent>,
+) -> Result<WatchCursor> {
     if try_fanotify(roots, &tx)? {
         return Ok(WatchCursor {
             watch_gen: cursor.watch_gen.saturating_add(1).max(1),
             watch_cursor: 0,
         });
     }
-    findx2_core::progress!("Linux：fanotify 不可用（无 CAP_SYS_ADMIN），降级 inotify（非整盘实时）");
-    set_watch_note(
-        "无 CAP_SYS_ADMIN，增量已降级为 inotify（非整盘实时；重启可能漏事件）",
+    findx2_core::progress!(
+        "Linux：fanotify 不可用（无 CAP_SYS_ADMIN），降级 inotify（非整盘实时）"
     );
+    set_watch_note("无 CAP_SYS_ADMIN，增量已降级为 inotify（非整盘实时；重启可能漏事件）");
     watch_inotify(roots, tx)?;
     Ok(WatchCursor {
         watch_gen: cursor.watch_gen.saturating_add(1).max(1),
@@ -232,9 +236,7 @@ fn watch_inotify(roots: &[String], tx: Sender<ChangeEvent>) -> Result<()> {
             };
             // inotify 队列溢出：后台追赶，避免在 notify 回调里同步扫大树再次撑爆队列。
             if ev.need_rescan() {
-                set_watch_note(
-                    "inotify 队列溢出，已对监听根做追赶扫描（仍非 fanotify 整盘实时）",
-                );
+                set_watch_note("inotify 队列溢出，已对监听根做追赶扫描（仍非 fanotify 整盘实时）");
                 let tx3 = tx2.clone();
                 let cache3 = cache2.clone();
                 let roots3 = roots_owned.clone();
@@ -253,7 +255,10 @@ fn watch_inotify(roots: &[String], tx: Sender<ChangeEvent>) -> Result<()> {
                 }
                 // 新目录：watch 注册存在经典竞态。立即追赶 + 短延迟再追赶一次，
                 // 覆盖「mkdir 后立刻往里写文件」窗口；已存在条目走 CreatePending 快路径。
-                if matches!(ev.kind, EventKind::Create(notify::event::CreateKind::Folder)) {
+                if matches!(
+                    ev.kind,
+                    EventKind::Create(notify::event::CreateKind::Folder)
+                ) {
                     catch_up_tree(path, &tx2, &cache2);
                     let path_delayed = path.clone();
                     let tx_d = tx2.clone();
@@ -337,7 +342,9 @@ fn notify_to_changes(path: &Path, kind: EventKind, cache: &PathInodeCache) -> Ve
             }
             out
         }
-        EventKind::Modify(ModifyKind::Name(RenameMode::To | RenameMode::Both | RenameMode::Any)) => {
+        EventKind::Modify(ModifyKind::Name(
+            RenameMode::To | RenameMode::Both | RenameMode::Any,
+        )) => {
             let mut out = Vec::new();
             if let Some(ev) = meta_rename(path, name.clone()) {
                 if let ChangeEvent::Rename { file_id, .. } = &ev {

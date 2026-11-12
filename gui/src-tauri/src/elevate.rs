@@ -9,13 +9,11 @@ use std::path::Path;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
-use windows::Win32::Security::{
-    GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
-};
+use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, WaitForSingleObject, INFINITE,
 };
-use windows::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_NOCLOSEPROCESS};
+use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 fn to_wide_os(s: &OsStr) -> Vec<u16> {
@@ -38,10 +36,7 @@ pub fn process_is_elevated() -> bool {
         let ok = GetTokenInformation(
             token,
             TokenElevation,
-            Some(
-                (&mut elevation as *mut TOKEN_ELEVATION)
-                    .cast::<std::ffi::c_void>(),
-            ),
+            Some((&mut elevation as *mut TOKEN_ELEVATION).cast::<std::ffi::c_void>()),
             std::mem::size_of::<TOKEN_ELEVATION>() as u32,
             &mut ret_len,
         );

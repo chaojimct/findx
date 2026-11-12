@@ -40,7 +40,7 @@ fn apply_local_client_acl(
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
     use windows::Win32::Security::{
-        DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetKernelObjectSecurity,
+        SetKernelObjectSecurity, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
     };
 
     const SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019f;;;AU)";
@@ -61,7 +61,9 @@ fn apply_local_client_acl(
     Ok(())
 }
 
-fn create_first_pipe_server(pipe_path: &str) -> anyhow::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+fn create_first_pipe_server(
+    pipe_path: &str,
+) -> anyhow::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
     let mut opts = tokio::net::windows::named_pipe::ServerOptions::new();
     configure_opts(&mut opts);
     opts.first_pipe_instance(true);
@@ -91,7 +93,9 @@ fn create_first_pipe_server(pipe_path: &str) -> anyhow::Result<tokio::net::windo
     }
 }
 
-fn create_next_pipe_server(pipe_path: &str) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+fn create_next_pipe_server(
+    pipe_path: &str,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
     let mut opts = tokio::net::windows::named_pipe::ServerOptions::new();
     configure_opts(&mut opts);
     opts.create(pipe_path)
@@ -122,9 +126,7 @@ pub async fn pipe_accept_loop(pipe_path: String, slot: EngineSlot) -> anyhow::Re
                     Ok(s) => s,
                     Err(e2) => {
                         // 实在起不来就退出 accept loop，让外层 main 看到错误（而不是静默 hang）。
-                        return Err(anyhow::anyhow!(
-                            "创建后续管道实例两次均失败: {e}; {e2}"
-                        ));
+                        return Err(anyhow::anyhow!("创建后续管道实例两次均失败: {e}; {e2}"));
                     }
                 }
             }
@@ -180,15 +182,17 @@ async fn handle_client(
                 let req_kind = req_kind_label(&req);
                 debug!(sid, kind = req_kind, "spawn_blocking 派发");
                 let blocking_started = std::time::Instant::now();
-                let result = tokio::task::spawn_blocking(move || process_request(&slot_cloned, req))
-                    .await;
+                let result =
+                    tokio::task::spawn_blocking(move || process_request(&slot_cloned, req)).await;
                 let blocking_ms = blocking_started.elapsed().as_millis();
                 if blocking_ms > 200 {
                     info!(sid, kind = req_kind, blocking_ms, "请求处理偏慢");
                 }
                 result.unwrap_or_else(|e| {
                     error!(sid, "spawn_blocking panic: {e}");
-                    IpcResponse::Error { message: format!("处理请求 panic: {e}") }
+                    IpcResponse::Error {
+                        message: format!("处理请求 panic: {e}"),
+                    }
                 })
             }
             Err(e) => IpcResponse::Error {
@@ -209,4 +213,3 @@ async fn handle_client(
 
     Ok(())
 }
-

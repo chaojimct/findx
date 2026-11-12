@@ -40,9 +40,9 @@ use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE};
 #[cfg(windows)]
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ExtendedFileIdType, FileIdBothDirectoryInfo, FileIdType,
-    GetFileInformationByHandleEx, OpenFileById, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_ID_128, FILE_ID_BOTH_DIR_INFO, FILE_ID_DESCRIPTOR, FILE_LIST_DIRECTORY,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    GetFileInformationByHandleEx, OpenFileById, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_128,
+    FILE_ID_BOTH_DIR_INFO, FILE_ID_DESCRIPTOR, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
 /// 单条回填结果：`(frn, size, mtime_filetime, ctime_filetime)`。
@@ -126,11 +126,18 @@ pub fn fetch_dir_meta_batched(
                 Ok(h) if !h.is_invalid() => h,
                 Ok(h) => {
                     let _ = unsafe { CloseHandle(h) };
-                    findx2_core::progress!("NtQueryDirectoryFile: CreateFileW 返回无效句柄（需管理员权限）{}", path_owned);
+                    findx2_core::progress!(
+                        "NtQueryDirectoryFile: CreateFileW 返回无效句柄（需管理员权限）{}",
+                        path_owned
+                    );
                     return Vec::new();
                 }
                 Err(e) => {
-                    findx2_core::progress!("NtQueryDirectoryFile: CreateFileW 失败（需管理员权限）{}: {}", path_owned, e);
+                    findx2_core::progress!(
+                        "NtQueryDirectoryFile: CreateFileW 失败（需管理员权限）{}: {}",
+                        path_owned,
+                        e
+                    );
                     return Vec::new();
                 }
             };
@@ -150,8 +157,7 @@ pub fn fetch_dir_meta_batched(
                 }
                 local_done += 1;
 
-                let Some(dir_h) = (unsafe { open_dir_by_id(vol_h, dir_frn, dir_id128) })
-                else {
+                let Some(dir_h) = (unsafe { open_dir_by_id(vol_h, dir_frn, dir_id128) }) else {
                     continue;
                 };
                 unsafe {
@@ -205,11 +211,7 @@ pub fn fetch_dir_meta_batched(
 }
 
 #[cfg(windows)]
-unsafe fn open_dir_by_id(
-    vol: HANDLE,
-    dir_frn: u64,
-    dir_id128: Option<[u8; 16]>,
-) -> Option<HANDLE> {
+unsafe fn open_dir_by_id(vol: HANDLE, dir_frn: u64, dir_id128: Option<[u8; 16]>) -> Option<HANDLE> {
     // 首选 64 位 FileId。
     let mut desc = FILE_ID_DESCRIPTOR::default();
     desc.dwSize = size_of::<FILE_ID_DESCRIPTOR>() as u32;
@@ -252,11 +254,7 @@ unsafe fn open_dir_by_id(
 }
 
 #[cfg(windows)]
-unsafe fn enumerate_dir_into(
-    dir_h: HANDLE,
-    buf: &mut [u64],
-    out: &mut Vec<DirMetaRec>,
-) {
+unsafe fn enumerate_dir_into(dir_h: HANDLE, buf: &mut [u64], out: &mut Vec<DirMetaRec>) {
     const ATTR_DIRECTORY: u32 = 0x10;
     let buf_bytes = buf.as_mut_ptr() as *mut u8;
     let buf_len = (buf.len() * 8) as u32;

@@ -33,10 +33,7 @@ use std::path::{Path, PathBuf};
 
 use roaring::RoaringBitmap;
 
-use crate::index::{
-    DirEntry, FileEntry, FrnIdxMap,
-    IndexStore, Mutation, VolumeState,
-};
+use crate::index::{DirEntry, FileEntry, FrnIdxMap, IndexStore, Mutation, VolumeState};
 use crate::persist::{
     dir_entry_from_bytes, dir_entry_to_bytes, file_entry_from_disk_bytes_v5,
     file_entry_to_disk_bytes_v5, load_exclude_sidecar, mount_trigram_sidecars,
@@ -162,18 +159,19 @@ impl CommitBatch {
 
 #[derive(Debug)]
 pub enum CommitOutcome {
-    Delta { applied: usize, bytes: u64, generation: u64 },
+    Delta {
+        applied: usize,
+        bytes: u64,
+        generation: u64,
+    },
     /// 调用方应降级走全量分段重写（`v6_save_full`）。
     NeedFull { reason: String },
 }
 
-
-
 fn read_manifest(layout: &V6Layout) -> Result<V6Manifest> {
     let p = layout.file(F_MANIFEST);
-    let bytes = std::fs::read(&p).map_err(|e| {
-        crate::Error::Persist(format!("v6 读 manifest 失败 {}: {e}", p.display()))
-    })?;
+    let bytes = std::fs::read(&p)
+        .map_err(|e| crate::Error::Persist(format!("v6 读 manifest 失败 {}: {e}", p.display())))?;
     let m: V6Manifest = serde_json::from_slice(&bytes)
         .map_err(|e| crate::Error::Persist(format!("v6 manifest 解析失败: {e}")))?;
     if m.version != V6_VERSION {
@@ -318,9 +316,8 @@ fn parse_frns(buf: &[u8]) -> Result<Vec<u64>> {
     let n = buf.len() / FRN_SIZE;
     let mut out = vec![0u64; n];
     // LE 假设：x86_64 Windows 小端，磁盘即 LE，直接转写即可。
-    out.as_mut_slice().copy_from_slice(unsafe {
-        std::slice::from_raw_parts(buf.as_ptr() as *const u64, n)
-    });
+    out.as_mut_slice()
+        .copy_from_slice(unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u64, n) });
     Ok(out)
 }
 
@@ -503,7 +500,11 @@ fn pwrite(f: &mut File, off: u64, bytes: &[u8]) -> Result<()> {
 /// 增量提交。调用方已把 store 锁释放，只带 `batch` 进来做文件 IO。
 /// 任何校验失败 → `NeedFull`（调用方降级全量），绝不写坏文件。
 pub fn v6_try_commit(layout: &V6Layout, batch: &CommitBatch) -> Result<CommitOutcome> {
-    if batch.mutations.iter().any(|m| matches!(m, Mutation::FullResync)) {
+    if batch
+        .mutations
+        .iter()
+        .any(|m| matches!(m, Mutation::FullResync))
+    {
         return Ok(CommitOutcome::NeedFull {
             reason: "batch 含 FullResync".into(),
         });
@@ -533,21 +534,16 @@ pub fn v6_try_commit(layout: &V6Layout, batch: &CommitBatch) -> Result<CommitOut
     }
 
     // 打开 + 截到 manifest 长度（丢弃崩溃 tail）。
-    let mut fe = open_rw(&layout.file(F_ENTRIES)).map_err(|_| {
-        crate::Error::Persist("v6 缺段，降级全量".into())
-    })?;
-    let mut ff = open_rw(&layout.file(F_FRNS)).map_err(|_| {
-        crate::Error::Persist("v6 缺段，降级全量".into())
-    })?;
-    let mut fd = open_rw(&layout.file(F_DIRS)).map_err(|_| {
-        crate::Error::Persist("v6 缺段，降级全量".into())
-    })?;
-    let mut fr = open_rw(&layout.file(F_RANGES)).map_err(|_| {
-        crate::Error::Persist("v6 缺段，降级全量".into())
-    })?;
-    let mut fn_ = open_rw(&layout.file(F_NAMES)).map_err(|_| {
-        crate::Error::Persist("v6 缺段，降级全量".into())
-    })?;
+    let mut fe = open_rw(&layout.file(F_ENTRIES))
+        .map_err(|_| crate::Error::Persist("v6 缺段，降级全量".into()))?;
+    let mut ff = open_rw(&layout.file(F_FRNS))
+        .map_err(|_| crate::Error::Persist("v6 缺段，降级全量".into()))?;
+    let mut fd = open_rw(&layout.file(F_DIRS))
+        .map_err(|_| crate::Error::Persist("v6 缺段，降级全量".into()))?;
+    let mut fr = open_rw(&layout.file(F_RANGES))
+        .map_err(|_| crate::Error::Persist("v6 缺段，降级全量".into()))?;
+    let mut fn_ = open_rw(&layout.file(F_NAMES))
+        .map_err(|_| crate::Error::Persist("v6 缺段，降级全量".into()))?;
 
     let exp_e = (m.entry_count * ENTRY_SIZE) as u64;
     let exp_f = (m.entry_count * FRN_SIZE) as u64;
@@ -570,10 +566,14 @@ pub fn v6_try_commit(layout: &V6Layout, batch: &CommitBatch) -> Result<CommitOut
             });
         }
     }
-    fe.set_len(exp_e).map_err(|e| crate::Error::Persist(format!("v6 截断失败: {e}")))?;
-    ff.set_len(exp_f).map_err(|e| crate::Error::Persist(format!("v6 截断失败: {e}")))?;
-    fd.set_len(exp_d).map_err(|e| crate::Error::Persist(format!("v6 截断失败: {e}")))?;
-    fr.set_len(exp_r).map_err(|e| crate::Error::Persist(format!("v6 截断失败: {e}")))?;
+    fe.set_len(exp_e)
+        .map_err(|e| crate::Error::Persist(format!("v6 截断失败: {e}")))?;
+    ff.set_len(exp_f)
+        .map_err(|e| crate::Error::Persist(format!("v6 截断失败: {e}")))?;
+    fd.set_len(exp_d)
+        .map_err(|e| crate::Error::Persist(format!("v6 截断失败: {e}")))?;
+    fr.set_len(exp_r)
+        .map_err(|e| crate::Error::Persist(format!("v6 截断失败: {e}")))?;
     fn_.set_len(m.names_len as u64)
         .map_err(|e| crate::Error::Persist(format!("v6 截断失败: {e}")))?;
 
@@ -588,29 +588,36 @@ pub fn v6_try_commit(layout: &V6Layout, batch: &CommitBatch) -> Result<CommitOut
     // names 追加 helper：校验内存偏移 == 文件尾（错位说明日志漏记 → 全量）。
     // 磁盘约定与内存 `append_name(..., tail_null=true)` 一致：名字字节 + 1 字节 0
     //（目录名同样带尾 null，便于整块 memchr 扫描）。
-    let mut append_name = |f: &mut File, expect_off: u32, data: &[u8], bytes: &mut u64| -> Result<()> {
-        if expect_off as usize != cur_n {
-            return Err(crate::Error::Persist(format!(
-                "v6 names 偏移错位（内存 {expect_off} vs 文件 {cur_n}），降级全量"
-            )));
-        }
-        pwrite(f, cur_n as u64, data)?;
-        cur_n += data.len();
-        *bytes += data.len() as u64;
-        pwrite(f, cur_n as u64, &[0u8])?;
-        cur_n += 1;
-        *bytes += 1;
-        Ok(())
-    };
+    let mut append_name =
+        |f: &mut File, expect_off: u32, data: &[u8], bytes: &mut u64| -> Result<()> {
+            if expect_off as usize != cur_n {
+                return Err(crate::Error::Persist(format!(
+                    "v6 names 偏移错位（内存 {expect_off} vs 文件 {cur_n}），降级全量"
+                )));
+            }
+            pwrite(f, cur_n as u64, data)?;
+            cur_n += data.len();
+            *bytes += data.len() as u64;
+            pwrite(f, cur_n as u64, &[0u8])?;
+            cur_n += 1;
+            *bytes += 1;
+            Ok(())
+        };
 
-    let need_full = |reason: String| Ok::<CommitOutcome, crate::Error>(CommitOutcome::NeedFull { reason });
+    let need_full =
+        |reason: String| Ok::<CommitOutcome, crate::Error>(CommitOutcome::NeedFull { reason });
 
     for mut_ in &batch.mutations {
         match mut_ {
             Mutation::FullResync => {
                 return need_full("batch 含 FullResync".into());
             }
-            Mutation::Meta { idx, size, mtime, ctime } => {
+            Mutation::Meta {
+                idx,
+                size,
+                mtime,
+                ctime,
+            } => {
                 let idx = *idx as usize;
                 if idx >= m.entry_count {
                     return need_full(format!("Meta idx {idx} 越界"));
@@ -654,7 +661,12 @@ pub fn v6_try_commit(layout: &V6Layout, batch: &CommitBatch) -> Result<CommitOut
                 t_f = true;
                 t_n = true;
             }
-            Mutation::PushDir { entry, frn, dir, name } => {
+            Mutation::PushDir {
+                entry,
+                frn,
+                dir,
+                name,
+            } => {
                 append_name(&mut fn_, entry.name_offset, name, &mut bytes)?;
                 let eb = file_entry_to_disk_bytes_v5(entry);
                 pwrite(&mut fe, (cur_e * ENTRY_SIZE) as u64, &eb)?;
@@ -683,7 +695,13 @@ pub fn v6_try_commit(layout: &V6Layout, batch: &CommitBatch) -> Result<CommitOut
                 t_e = true;
                 t_n = true;
             }
-            Mutation::RepathDir { idx, di, entry, dir, name } => {
+            Mutation::RepathDir {
+                idx,
+                di,
+                entry,
+                dir,
+                name,
+            } => {
                 let (idx, di) = (*idx as usize, *di as usize);
                 if idx >= m.entry_count || di >= m.dir_count {
                     return need_full(format!("RepathDir {idx}/{di} 越界"));
@@ -711,7 +729,8 @@ pub fn v6_try_commit(layout: &V6Layout, batch: &CommitBatch) -> Result<CommitOut
 
     for (f, touched) in [(&fe, t_e), (&ff, t_f), (&fd, t_d), (&fr, t_r), (&fn_, t_n)] {
         if touched {
-            f.sync_all().map_err(|e| crate::Error::Persist(format!("v6 sync 失败: {e}")))?;
+            f.sync_all()
+                .map_err(|e| crate::Error::Persist(format!("v6 sync 失败: {e}")))?;
         }
     }
 

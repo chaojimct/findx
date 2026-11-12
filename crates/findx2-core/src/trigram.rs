@@ -250,9 +250,8 @@ impl TrigramIndex {
         };
         // SAFETY: blobs 借自堆上 Box<Mmap>（地址稳定），TrigramIndex 持有该 Box 保活；
         // from_raw_parts 把生命周期抬到 'static，切片仅经 &self 对外、不逃逸出本结构体。
-        let blobs: &'static [u8] = unsafe {
-            std::slice::from_raw_parts(blobs.as_ptr(), blobs.len())
-        };
+        let blobs: &'static [u8] =
+            unsafe { std::slice::from_raw_parts(blobs.as_ptr(), blobs.len()) };
         // 格式校验通过才预取（垃圾文件不值得占页缓存）；整个 map 都会用到
         // （table + blobs），整段预取最划算。
         prefetch_mmap(mm);
@@ -498,10 +497,7 @@ mod tests {
     /// 每个测试独立子目录（cargo test 并行跑；共用同一目录会因开头的
     /// `remove_dir_all` 互相删掉对方的边车文件）。
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "findx2-tri-test-{}-{tag}",
-            std::process::id()
-        ));
+        let d = std::env::temp_dir().join(format!("findx2-tri-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -603,7 +599,9 @@ mod tests {
     fn missing_file_returns_none() {
         let dir = temp_dir("missing");
         let idx = dir.join("index.bin");
-        assert!(TrigramIndex::load(&tri_sidecar_path(&idx)).unwrap().is_none());
+        assert!(TrigramIndex::load(&tri_sidecar_path(&idx))
+            .unwrap()
+            .is_none());
         assert!(load_pending_sidecar(&idx).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }

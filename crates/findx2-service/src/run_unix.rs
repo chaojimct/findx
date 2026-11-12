@@ -23,7 +23,11 @@ pub(crate) fn run_foreground(
     max_scan_threads: usize,
 ) -> anyhow::Result<()> {
     let socket = findx2_ipc::unix_socket_path(&pipe_name);
-    info!("Unix 服务：index={} socket={}", index.display(), socket.display());
+    info!(
+        "Unix 服务：index={} socket={}",
+        index.display(),
+        socket.display()
+    );
 
     let slot: EngineSlot = Arc::new(RwLock::new(None));
     let slot_ipc = slot.clone();
@@ -58,7 +62,13 @@ pub(crate) fn run_foreground(
         }
     } else {
         info!("index.bin 不存在，开始全量建库…");
-        build_unix_index(&index, &volume, &extra_excluded, full_stat, max_scan_threads)?
+        build_unix_index(
+            &index,
+            &volume,
+            &extra_excluded,
+            full_stat,
+            max_scan_threads,
+        )?
     };
     if !extra_excluded.is_empty() {
         store.excluded_dirs = extra_excluded.clone();
@@ -271,13 +281,25 @@ fn build_unix_index(
     let exclude = extra_excluded.to_vec();
     #[cfg(target_os = "macos")]
     {
-        return findx2_macos::build_full_disk_index(output, roots, exclude, full_stat, max_scan_threads)
-            .map_err(|e| anyhow::anyhow!("{e}"));
+        return findx2_macos::build_full_disk_index(
+            output,
+            roots,
+            exclude,
+            full_stat,
+            max_scan_threads,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"));
     }
     #[cfg(target_os = "linux")]
     {
-        return findx2_linux::build_full_disk_index(output, roots, exclude, full_stat, max_scan_threads)
-            .map_err(|e| anyhow::anyhow!("{e}"));
+        return findx2_linux::build_full_disk_index(
+            output,
+            roots,
+            exclude,
+            full_stat,
+            max_scan_threads,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"));
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {

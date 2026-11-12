@@ -153,9 +153,7 @@ fn main() {
         n_stored as f64 / 1e8
     );
     let cap = frns_cap(entry_count);
-    println!(
-        "  阈值 = entry_count×8 + 1 MiB = {cap}（entry_count = {entry_count}）"
-    );
+    println!("  阈值 = entry_count×8 + 1 MiB = {cap}（entry_count = {entry_count}）");
     if n_stored as u64 > cap {
         println!("  ✗ 超过阈值 {n_stored} > {cap} → 加载会在此报错");
         println!(

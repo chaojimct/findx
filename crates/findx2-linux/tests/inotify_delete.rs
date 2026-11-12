@@ -57,12 +57,16 @@ fn test_inotify_delete_event_processing() {
     let mut store = builder.build_from_raw(files, dirs, false).unwrap();
 
     // 验证文件在索引中（包含根目录和文件，共2个条目）
-    assert_eq!(store.entry_count(), 2, "初始索引应该包含根目录和文件共2个条目");
+    assert_eq!(
+        store.entry_count(),
+        2,
+        "初始索引应该包含根目录和文件共2个条目"
+    );
     assert!(
         store.frn_to_entry.contains_key(&file_ino),
         "文件 inode 应该在映射中"
     );
-    
+
     let initial_entry_count = store.entry_count();
 
     // 删除文件
@@ -78,22 +82,16 @@ fn test_inotify_delete_event_processing() {
 
     // 验证文件已从索引中删除（被标记为已删除）
     if let Some(&idx) = store.frn_to_entry.get(&file_ino) {
-        assert!(
-            store.deleted.contains(idx),
-            "删除的文件应该被标记为已删除"
-        );
+        assert!(store.deleted.contains(idx), "删除的文件应该被标记为已删除");
     }
-    
+
     // 验证条目总数没变，但删除计数增加了
     assert_eq!(
         store.entry_count(),
         initial_entry_count,
         "条目总数应该保持不变"
     );
-    assert!(
-        store.deleted.len() > 0,
-        "应该至少有一个已删除的条目"
-    );
+    assert!(store.deleted.len() > 0, "应该至少有一个已删除的条目");
 
     // 清理
     let _ = fs::remove_dir_all(test_root);
@@ -146,10 +144,7 @@ fn test_path_inode_cache_behavior() {
     );
 
     // 验证文件确实已被删除
-    assert!(
-        !test_file.exists(),
-        "文件应该已被删除"
-    );
+    assert!(!test_file.exists(), "文件应该已被删除");
 
     // 清理
     let _ = fs::remove_dir_all(test_root);

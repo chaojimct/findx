@@ -24,12 +24,19 @@ pub(crate) fn remote_search_blocking(
     pinyin: bool,
     limit: usize,
 ) -> Result<Vec<findx2_ipc::SearchHitDto>> {
-    let rt =
-        tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| Error::Platform(e.to_string()))?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Platform(e.to_string()))?;
     rt.block_on(async {
         tokio::time::timeout(REMOTE_TIMEOUT, remote_search(pipe, query, pinyin, limit))
             .await
-            .map_err(|_| Error::Platform(format!("远程搜索超时（>{}s），service 可能正在合并回填或卡死", REMOTE_TIMEOUT.as_secs())))?
+            .map_err(|_| {
+                Error::Platform(format!(
+                    "远程搜索超时（>{}s），service 可能正在合并回填或卡死",
+                    REMOTE_TIMEOUT.as_secs()
+                ))
+            })?
     })
 }
 
@@ -40,7 +47,9 @@ async fn remote_search(
     limit: usize,
 ) -> Result<Vec<findx2_ipc::SearchHitDto>> {
     let path = normalize_pipe_path(pipe);
-    let mut client = ClientOptions::new().open(path).map_err(|e| Error::Platform(format!("连接管道失败: {e}")))?;
+    let mut client = ClientOptions::new()
+        .open(path)
+        .map_err(|e| Error::Platform(format!("连接管道失败: {e}")))?;
 
     let req = IpcRequest::Search {
         query: query.to_string(),

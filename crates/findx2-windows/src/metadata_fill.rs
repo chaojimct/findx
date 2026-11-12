@@ -24,8 +24,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ};
 #[cfg(windows)]
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
 };
 
 #[cfg(windows)]
@@ -118,11 +118,18 @@ pub fn fill_metadata_by_id_pooled(
                 Ok(h) if !h.is_invalid() => h,
                 Ok(h) => {
                     let _ = unsafe { CloseHandle(h) };
-                    findx2_core::progress!("OpenFileById: CreateFileW 返回无效句柄（需管理员权限）{}", path_owned);
+                    findx2_core::progress!(
+                        "OpenFileById: CreateFileW 返回无效句柄（需管理员权限）{}",
+                        path_owned
+                    );
                     return Vec::new();
                 }
                 Err(e) => {
-                    findx2_core::progress!("OpenFileById: CreateFileW 失败（需管理员权限）{}: {}", path_owned, e);
+                    findx2_core::progress!(
+                        "OpenFileById: CreateFileW 失败（需管理员权限）{}: {}",
+                        path_owned,
+                        e
+                    );
                     return Vec::new();
                 }
             };
@@ -139,8 +146,7 @@ pub fn fill_metadata_by_id_pooled(
                 }
                 let frn = file_ids[idx];
                 let id128 = file_id_128s.get(idx).copied().flatten();
-                if let Some((sz, mt, ct)) =
-                    unsafe { fetch_file_metadata_by_id(vol_h, frn, id128) }
+                if let Some((sz, mt, ct)) = unsafe { fetch_file_metadata_by_id(vol_h, frn, id128) }
                 {
                     out.push((idx, sz, mt, ct));
                 }
@@ -153,7 +159,12 @@ pub fn fill_metadata_by_id_pooled(
             let prev_m = prev / PROGRESS_EVERY_DEFAULT;
             let cur_m = cur / PROGRESS_EVERY_DEFAULT;
             if cur_m > prev_m || cur >= total {
-                findx2_core::progress!("OpenFileById 进度: {}/{} ({}%)", cur, total, cur * 100 / total.max(1));
+                findx2_core::progress!(
+                    "OpenFileById 进度: {}/{} ({}%)",
+                    cur,
+                    total,
+                    cur * 100 / total.max(1)
+                );
             }
             if let Some(cb) = progress {
                 cb(cur, total);

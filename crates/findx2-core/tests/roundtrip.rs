@@ -36,7 +36,10 @@ fn query_dm_gt_date() {
     assert!(q.mtime_min.is_some());
     assert!(q.mtime_max.is_none());
     let u = filetime_to_unix_secs(q.mtime_min.unwrap());
-    assert!(u > 1_000_000_000, "dm:> 阈值 unix 不得为 0，否则全表通过时间下界");
+    assert!(
+        u > 1_000_000_000,
+        "dm:> 阈值 unix 不得为 0，否则全表通过时间下界"
+    );
 }
 
 /// 与 GUI 一致：`dm:>日期` 后接关键词时阈值须非 0，否则热路径里 `mt < 0` 永假，等于未筛时间。
@@ -476,11 +479,9 @@ fn index_build_interns_duplicate_names() {
     assert_eq!(unique, 3, "全部名字只有 proj/src/index.js 三段");
 
     // 共享不改变切片语义：每个条目仍能取回自己的名字。
-    for (e, expect) in store
-        .entries
-        .iter()
-        .zip(["index.js", "index.js", "index.js", "src", "proj", "src", "src"])
-    {
+    for (e, expect) in store.entries.iter().zip([
+        "index.js", "index.js", "index.js", "src", "proj", "src", "src",
+    ]) {
         assert_eq!(store.name_str(e).unwrap(), expect);
     }
 
@@ -497,11 +498,9 @@ fn index_build_interns_duplicate_names() {
     }
     let loaded_offsets: Vec<u32> = loaded.entries.iter().map(|e| e.name_offset).collect();
     assert_eq!(loaded_offsets[0], loaded_offsets[2]);
-    for (e, expect) in loaded
-        .entries
-        .iter()
-        .zip(["index.js", "index.js", "index.js", "src", "proj", "src", "src"])
-    {
+    for (e, expect) in loaded.entries.iter().zip([
+        "index.js", "index.js", "index.js", "src", "proj", "src", "src",
+    ]) {
         assert_eq!(loaded.name_str(e).unwrap(), expect);
     }
 
@@ -647,8 +646,8 @@ fn starts_with_ends_with_trigram_pruning_matches_full_scan() {
         "startwith:read",
         "endwith:md",
         "endwith:.json",
-        "readme",          // 普通子串（含前缀命中）
-        "startwith:覆盖",  // 非 ASCII 前缀（UTF-8 字节窗口）
+        "readme",         // 普通子串（含前缀命中）
+        "startwith:覆盖", // 非 ASCII 前缀（UTF-8 字节窗口）
     ] {
         let pruned = run(query);
         // 关掉边车走全表扫描对照。
@@ -663,7 +662,10 @@ fn starts_with_ends_with_trigram_pruning_matches_full_scan() {
             pruned, full,
             "query `{query}`：trigram 剪枝路径与全表扫描结果不一致"
         );
-        assert!(!pruned.is_empty(), "query `{query}` 应有命中，否则对照无意义");
+        assert!(
+            !pruned.is_empty(),
+            "query `{query}` 应有命中，否则对照无意义"
+        );
     }
 
     // spot check：具体语义抽查两个。
@@ -1046,7 +1048,11 @@ fn compact_tombstones_keeps_index_consistent_and_search_equivalent() {
     assert_eq!(store.entry_count(), n_before - removed);
 
     // 1) 平行数组长度一致 + deleted 清空
-    assert_eq!(store.frns.len(), store.entries.len(), "frns 与 entries 必须等长");
+    assert_eq!(
+        store.frns.len(),
+        store.entries.len(),
+        "frns 与 entries 必须等长"
+    );
     assert_eq!(store.deleted.len(), 0, "压缩后不再有墓碑");
     assert_eq!(
         store.dir_path_ranges.len(),
@@ -1203,13 +1209,15 @@ fn compact_survivor_count_drops_unmarked_children_of_deleted_dir() {
         "未打标的子文件必须从保留计划里剔除：naive={naive} expected={expected}"
     );
     let removed = store.compact_tombstones();
-    assert!(removed >= 2, "目录和它下面的文件都该消失，实际移除 {removed}");
+    assert!(
+        removed >= 2,
+        "目录和它下面的文件都该消失，实际移除 {removed}"
+    );
     assert_eq!(store.entry_count(), expected);
     let still = (0..store.entries.len())
         .any(|i| store.name_bytes(&store.entries[i]) == b"inside_gone_dir.txt");
     assert!(!still, "父目录已删除的文件不能留在压缩结果里");
-    let kept = (0..store.entries.len())
-        .any(|i| store.name_bytes(&store.entries[i]) == b"keep.txt");
+    let kept = (0..store.entries.len()).any(|i| store.name_bytes(&store.entries[i]) == b"keep.txt");
     assert!(kept, "兄弟目录下的文件必须留下");
 }
 
@@ -1363,8 +1371,7 @@ fn path_two_phase_filter_matches_naive_full_path_scan() {
                 full.extend_from_slice(dir_path.as_ref());
                 full.push(b'\\');
                 full.extend_from_slice(&name);
-                full.windows(nb.len().max(1)).any(|w| w == nb.as_slice())
-                    || (nb.is_empty())
+                full.windows(nb.len().max(1)).any(|w| w == nb.as_slice()) || (nb.is_empty())
             })
             .collect()
     };
@@ -1376,15 +1383,15 @@ fn path_two_phase_filter_matches_naive_full_path_scan() {
     };
 
     let cases = [
-        "users",      // 纯目录段
-        "readme",     // 纯文件名（多处）
-        "c:\\us",     // 骑缝：跨 c: 与 \Users 的 \users
-        "s\\alice",   // 骑缝：跨 Users 与 Alice 的 \users\alice
-        "alice",      // 目录名 + 文件名同时命中
-        "projects\\", // needle 以分隔符结尾
-        "\\alice",    // needle 以分隔符开头
-        "bob",        // 浅层目录
-        "zzz_nope",   // 无命中
+        "users",                                 // 纯目录段
+        "readme",                                // 纯文件名（多处）
+        "c:\\us",                                // 骑缝：跨 c: 与 \Users 的 \users
+        "s\\alice",                              // 骑缝：跨 Users 与 Alice 的 \users\alice
+        "alice",                                 // 目录名 + 文件名同时命中
+        "projects\\",                            // needle 以分隔符结尾
+        "\\alice",                               // needle 以分隔符开头
+        "bob",                                   // 浅层目录
+        "zzz_nope",                              // 无命中
         "c:\\users\\alice\\projects\\readme.md", // 完整路径
     ];
 
@@ -1418,7 +1425,13 @@ fn path_two_phase_filter_matches_naive_full_path_scan() {
     //    `c:\alice\projects`（**不含** `users`）→ **不**命中。
     //    这正是既有 `build_dir_path_lower_owned` 的行为，优化实现不得擅自“修正”它。
     let hits = search("path:users");
-    for must in ["Users", "Alice", "Bob", "alice_profile.dat", "USERS_INDEX.db"] {
+    for must in [
+        "Users",
+        "Alice",
+        "Bob",
+        "alice_profile.dat",
+        "USERS_INDEX.db",
+    ] {
         assert!(
             hits.iter().any(|h| h == must),
             "path:users 必须包含 {must}，实际 {hits:?}"
@@ -1532,15 +1545,15 @@ fn path_unix_volume_matches_naive_full_path_scan() {
     };
 
     let cases = [
-        "/tmp/findx-fixture", // 纯 root_prefix
-        "findx",              // prefix 内段
-        "users",              // 纯目录段
-        "fixture/users",      // ⚠️ 骑缝跨 root_prefix 尾与首目录边界（曾被漏报的形态）
-        "tmp/f",              // 骑缝跨 prefix 内部 `/`
-        "alice/readme",       // 跨目录分隔符
-        "readme",             // 纯文件名（多处）
+        "/tmp/findx-fixture",                                // 纯 root_prefix
+        "findx",                                             // prefix 内段
+        "users",                                             // 纯目录段
+        "fixture/users", // ⚠️ 骑缝跨 root_prefix 尾与首目录边界（曾被漏报的形态）
+        "tmp/f",         // 骑缝跨 prefix 内部 `/`
+        "alice/readme",  // 跨目录分隔符
+        "readme",        // 纯文件名（多处）
         "/tmp/findx-fixture/users/alice/projects/readme.md", // 完整路径
-        "zzz_nope",           // 无命中
+        "zzz_nope",      // 无命中
     ];
 
     for needle in cases {
@@ -1554,10 +1567,7 @@ fn path_unix_volume_matches_naive_full_path_scan() {
         let mut got = search(&format!("path:{needle}"));
         expect.sort();
         got.sort();
-        assert_eq!(
-            got, expect,
-            "unix path:{needle} 与朴素全路径扫描结果不一致"
-        );
+        assert_eq!(got, expect, "unix path:{needle} 与朴素全路径扫描结果不一致");
     }
 
     // 前置 sanity：骑缝用例必须真有命中，防止 fixture 退化后等价性检查变空转。
@@ -1566,4 +1576,3 @@ fn path_unix_volume_matches_naive_full_path_scan() {
         "跨 root_prefix 边界的 needle 应命中（这是本用例存在的意义）"
     );
 }
-

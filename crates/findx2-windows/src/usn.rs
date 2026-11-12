@@ -1,11 +1,11 @@
 //! USN Journal：QUERY / READ 轮询，映射为 ChangeEvent。
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStringExt;
 use std::ptr;
 use std::sync::mpsc::Sender;
-use std::collections::HashMap;
 
 use findx2_core::{ChangeEvent, Result};
 use windows::core::PCWSTR;
@@ -15,10 +15,10 @@ use windows::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Ioctl::{
-    FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V0,
-    USN_JOURNAL_DATA_V0, USN_REASON_BASIC_INFO_CHANGE, USN_REASON_DATA_EXTEND,
-    USN_REASON_DATA_TRUNCATION, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE,
-    USN_REASON_RENAME_NEW_NAME, USN_REASON_RENAME_OLD_NAME,
+    FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V0, USN_JOURNAL_DATA_V0,
+    USN_REASON_BASIC_INFO_CHANGE, USN_REASON_DATA_EXTEND, USN_REASON_DATA_TRUNCATION,
+    USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE, USN_REASON_RENAME_NEW_NAME,
+    USN_REASON_RENAME_OLD_NAME,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 
@@ -121,7 +121,12 @@ fn parse_read_usn_record(
 
 fn volume_root_for_info(volume: &str) -> String {
     let v = volume.trim().trim_end_matches('\\');
-    if v.len() == 1 && v.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+    if v.len() == 1
+        && v.chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false)
+    {
         format!("{}:\\", v.to_ascii_uppercase())
     } else if v.len() == 2 && v.as_bytes()[1] == b':' {
         format!("{}\\", v.to_ascii_uppercase())
@@ -281,9 +286,7 @@ pub fn usn_watch_forever(
                     continue;
                 }
                 let wide = u16_slice(&rec[name_off..name_off + name_len]);
-                let name = OsString::from_wide(wide)
-                    .to_string_lossy()
-                    .into_owned();
+                let name = OsString::from_wide(wide).to_string_lossy().into_owned();
                 let is_dir = (attrs & 0x10) != 0;
                 batch.push(ParsedWatchRec {
                     file_ref,
@@ -335,10 +338,7 @@ fn coalesce_watch_batch(recs: Vec<ParsedWatchRec>) -> Vec<ParsedWatchRec> {
             map.insert(r.file_ref, r);
         }
     }
-    order
-        .into_iter()
-        .filter_map(|k| map.remove(&k))
-        .collect()
+    order.into_iter().filter_map(|k| map.remove(&k)).collect()
 }
 
 /// 合并后的单条投递（watch 线程内，永不做 `OpenFileById`）：
@@ -459,7 +459,12 @@ fn open_volume_handle(path: &str) -> Result<windows::Win32::Foundation::HANDLE> 
 
 fn volume_device_path(volume: &str) -> String {
     let v = volume.trim().trim_end_matches('\\');
-    if v.len() == 1 && v.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+    if v.len() == 1
+        && v.chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false)
+    {
         format!(r"\\.\{}:", v.to_ascii_uppercase())
     } else if v.ends_with(':') && v.len() == 2 {
         format!(r"\\.\{}", v.to_ascii_uppercase())
@@ -713,7 +718,10 @@ mod tests {
         assert_eq!(out[0].file_ref, 1);
         assert_eq!(
             out[0].reason,
-            USN_REASON_FILE_CREATE | USN_REASON_DATA_EXTEND | USN_REASON_DATA_TRUNCATION | USN_REASON_BASIC_INFO_CHANGE
+            USN_REASON_FILE_CREATE
+                | USN_REASON_DATA_EXTEND
+                | USN_REASON_DATA_TRUNCATION
+                | USN_REASON_BASIC_INFO_CHANGE
         );
         assert_eq!(out[1].file_ref, 2);
     }

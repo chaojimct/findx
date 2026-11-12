@@ -224,7 +224,8 @@ pub fn write_index_bin<W: Write>(w: &mut W, store: &IndexStore) -> Result<()> {
     }
 
     // 单次拷贝到一个 32 × N 的连续缓冲后整段 write_all，保留一次大块 I/O；不再走每条 syscall。
-    let mut entry_bytes: Vec<u8> = Vec::with_capacity(store.entries.len() * FILE_ENTRY_V5_DISK_SIZE);
+    let mut entry_bytes: Vec<u8> =
+        Vec::with_capacity(store.entries.len() * FILE_ENTRY_V5_DISK_SIZE);
     for e in &store.entries {
         entry_bytes.extend_from_slice(&file_entry_to_disk_bytes_v5(e));
     }
@@ -360,14 +361,17 @@ pub(crate) fn save_trigram_sidecars(path: &Path, store: &IndexStore) {
 pub(crate) fn mount_trigram_sidecars(
     path: &Path,
     entry_count: usize,
-) -> (Option<std::sync::Arc<crate::trigram::TrigramIndex>>, RoaringBitmap) {
+) -> (
+    Option<std::sync::Arc<crate::trigram::TrigramIndex>>,
+    RoaringBitmap,
+) {
     let n_entries = entry_count as u32;
     // trigram 边车挂载：`.tri` mmap + `.tri.pending`。缺失/损坏一律静默降级为全表扫描。
-    let mut trigram = match crate::trigram::TrigramIndex::load(&crate::trigram::tri_sidecar_path(path))
-    {
-        Ok(t) => t.map(std::sync::Arc::new),
-        Err(_) => None,
-    };
+    let mut trigram =
+        match crate::trigram::TrigramIndex::load(&crate::trigram::tri_sidecar_path(path)) {
+            Ok(t) => t.map(std::sync::Arc::new),
+            Err(_) => None,
+        };
     let mut tri_pending = RoaringBitmap::new();
     if let Some(t) = trigram.as_ref() {
         let tri_snap = t.snapshot_entry_count();
@@ -635,8 +639,7 @@ pub fn load_index_bin_with_progress(
             // u64 LE 大块拷入（小端平台直接 memcpy；大端理论路径逐个转换）。
             // 同 bulk_copy_or_parse_v5：section 起点偏移由前面各段长度累加决定，
             // 不保证 8 对齐，未对齐的 memcpy 是 UB，必须先验再拷。
-            let src_aligned =
-                (section.as_ptr() as usize) % std::mem::align_of::<u64>() == 0;
+            let src_aligned = (section.as_ptr() as usize) % std::mem::align_of::<u64>() == 0;
             if cfg!(target_endian = "little") && src_aligned {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -692,8 +695,7 @@ pub fn load_index_bin_with_progress(
     on_phase(LoadPhase::Indexes);
     // 加载阶段同样走 sorted Vec（push_unsorted + finalize_build），
     // 比 hashbrown 在 8.5M 条目下省 ~100MB RSS、且加载更快（无 hash 计算）。
-    let mut dir_index: crate::index::FrnIdxMap =
-        crate::index::FrnIdxMap::with_capacity(dirs.len());
+    let mut dir_index: crate::index::FrnIdxMap = crate::index::FrnIdxMap::with_capacity(dirs.len());
     for (i, d) in dirs.iter().enumerate() {
         dir_index.push_unsorted(d.frn, i as u32);
     }
@@ -791,9 +793,9 @@ fn bulk_copy_or_parse_v5(section: &[u8], entries: &mut Vec<FileEntry>) {
             std::ptr::copy_nonoverlapping(section.as_ptr() as *const FileEntry, dst, n);
             entries.set_len(n);
         }
-        let layout_ok = entries
-            .first()
-            .is_none_or(|e| file_entry_to_disk_bytes_v5(e).as_slice() == &section[..FILE_ENTRY_V5_DISK_SIZE]);
+        let layout_ok = entries.first().is_none_or(|e| {
+            file_entry_to_disk_bytes_v5(e).as_slice() == &section[..FILE_ENTRY_V5_DISK_SIZE]
+        });
         if layout_ok {
             return;
         }
@@ -821,10 +823,8 @@ fn repair_attrs_v3(
             if let Some(e) = entries.get_mut(idx as usize) {
                 let nl = d.name_len as usize;
                 let off = d.name_offset as usize;
-                let name = std::str::from_utf8(
-                    names_buf.get(off..off + nl).unwrap_or(&[]),
-                )
-                .unwrap_or("");
+                let name =
+                    std::str::from_utf8(names_buf.get(off..off + nl).unwrap_or(&[])).unwrap_or("");
                 let eh = hash_ext8(name);
                 e.attrs = FileEntry::ATTR_IS_DIR | ((eh as u32) << 8);
             }
@@ -835,10 +835,8 @@ fn repair_attrs_v3(
             // 非目录条目：补 ext_hash（基于文件名首段或后缀）；attrs 低位标志位无来源，置 0 即可。
             let off = e.name_offset as usize;
             let nl = e.n_len as usize;
-            let name = std::str::from_utf8(
-                names_buf.get(off..off + nl).unwrap_or(&[]),
-            )
-            .unwrap_or("");
+            let name =
+                std::str::from_utf8(names_buf.get(off..off + nl).unwrap_or(&[])).unwrap_or("");
             let eh = hash_ext8(name);
             e.attrs = (eh as u32) << 8;
         }
@@ -898,8 +896,7 @@ pub fn save_exclude_sidecar(index_path: &Path, excluded: &[String]) -> Result<()
         .filter_map(|s| crate::index::normalize_excluded_dir(s))
         .collect();
     let v = serde_json::json!({ "excluded_dirs": normalized });
-    let s = serde_json::to_string_pretty(&v)
-        .map_err(|e| crate::Error::Persist(e.to_string()))?;
+    let s = serde_json::to_string_pretty(&v).map_err(|e| crate::Error::Persist(e.to_string()))?;
     std::fs::write(&p, s.as_bytes())?;
     Ok(())
 }
@@ -908,8 +905,8 @@ pub fn save_exclude_sidecar(index_path: &Path, excluded: &[String]) -> Result<()
 pub fn save_index_zst(path: &Path, store: &IndexStore) -> Result<()> {
     let mut bin = Vec::new();
     write_index_bin(&mut bin, store)?;
-    let compressed = zstd::encode_all(bin.as_slice(), 3)
-        .map_err(|e| crate::Error::Persist(e.to_string()))?;
+    let compressed =
+        zstd::encode_all(bin.as_slice(), 3).map_err(|e| crate::Error::Persist(e.to_string()))?;
     let mut out = File::create(path)?;
     out.write_all(&compressed)?;
     Ok(())
