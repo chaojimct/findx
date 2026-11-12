@@ -276,7 +276,9 @@ impl MainWindow {
                 ),
             };
             let mut color = tokens.allocation_color(category);
-            color.l = (color.l + tile.depth.min(6) as f32 * 0.009).clamp(0., 1.);
+            color.l = (color.l
+                + tile.depth.min(6) as f32 * if tokens.bg.l < 0.4 { -0.006 } else { 0.009 })
+            .clamp(0., 1.);
             let mut element = div()
                 .id(SharedString::from(format!("usage-tile-{:?}", tile.key)))
                 .absolute()
