@@ -1876,7 +1876,7 @@ impl Render for MainWindow {
             })
             .when(self.settings_page.is_none(), |view| {
                 view.child(
-                    div()
+                    v_flex()
                         .flex_1()
                         .min_h_0()
                         .min_w_0()

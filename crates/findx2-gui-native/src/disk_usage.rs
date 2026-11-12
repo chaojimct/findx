@@ -176,7 +176,7 @@ impl Scan {
             ));
         }
         if self.alloc_failed {
-            reasons.push("系统内存不足，无法继续扩展目录树".into());
+            reasons.push("系统内存压力或分配失败，无法继续扩展目录树".into());
         }
         if self.errors > 0 {
             reasons.push(format!("{} 项无法读取", self.errors));
@@ -209,8 +209,9 @@ pub struct Limits {
 /// Snapshot/policy generation. v1 defaulted to 500k entries; v2 to 2M/15min.
 /// v3 drops entry and wall-clock caps; old snapshots still load and are labeled.
 pub const POLICY_VERSION: u32 = 3;
-/// Conservative default for the in-memory tree (nodes, paths, child lists).
-pub const DEFAULT_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
+/// Conservative managed-resident allowance: tree capacities, paths, lookup keys,
+/// identity buckets and build scratch. GPUI/GPU/process baseline is separate.
+pub const DEFAULT_MEMORY_BUDGET: usize = 1024 * 1024 * 1024;
 pub const MIN_MEMORY_BUDGET: usize = 16 * 1024 * 1024;
 pub const MAX_MEMORY_BUDGET: usize = 2 * 1024 * 1024 * 1024;
 /// Historical only, to recognize old truncated snapshots.
@@ -240,7 +241,7 @@ impl Limits {
     pub fn memory_profile(index: usize) -> Self {
         match index {
             1 => Self::memory(256 * 1024 * 1024),
-            2 => Self::memory(1024 * 1024 * 1024),
+            2 => Self::memory(512 * 1024 * 1024),
             _ => Self::default(),
         }
     }
@@ -254,22 +255,27 @@ pub enum Admission {
     MemoryBudget,
     AllocFailed,
 }
-/// OsStr::len is already in bytes (UTF-16 units * 2 on Windows, bytes on Unix).
-fn path_storage_bytes(path: &Path) -> usize {
-    path.as_os_str().len().saturating_add(8)
+/// Conservative resident allowance, separate from the process/GPU baseline.
+/// A path is charged for scan storage, normalized lookup key, temporary adapter
+/// strings; 192 bytes covers hash/identity buckets and queue/sort scratch per node.
+fn derived_storage_bytes(path: &Path) -> usize {
+    path.as_os_str().len().saturating_mul(3).saturating_add(192)
 }
+#[cfg(test)]
 pub(crate) fn node_storage_bytes(path: &Path, extra_child_slots: usize) -> usize {
     std::mem::size_of::<Node>()
-        + path_storage_bytes(path)
-        + extra_child_slots.saturating_mul(std::mem::size_of::<usize>())
+        + path.as_os_str().len()
+        + derived_storage_bytes(path)
+        + extra_child_slots * std::mem::size_of::<usize>()
 }
 pub fn tree_storage_bytes(nodes: &[Node]) -> usize {
     nodes
         .iter()
         .map(|n| {
             std::mem::size_of::<Node>()
-                + path_storage_bytes(&n.path)
+                + n.path.capacity()
                 + n.children.capacity() * std::mem::size_of::<usize>()
+                + derived_storage_bytes(&n.path)
         })
         .sum()
 }
@@ -281,33 +287,86 @@ pub fn admit_node(used_bytes: usize, next_bytes: usize, limits: Limits) -> Admis
         Admission::Accept { added: next_bytes }
     }
 }
+/// Stop admission under severe OS pressure even when our own allowance remains.
+/// Thresholds are resource semantics: >=97% load or <64MiB physical availability.
+#[cfg(windows)]
+fn system_memory_pressure() -> bool {
+    #[repr(C)]
+    struct Status {
+        length: u32,
+        load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page: u64,
+        avail_page: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        extended: u64,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(status: *mut Status) -> i32;
+    }
+    let mut status: Status = unsafe { std::mem::zeroed() };
+    status.length = std::mem::size_of::<Status>() as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut status) != 0 })
+        && (status.load >= 97 || status.avail_phys < 64 * 1024 * 1024)
+}
+#[cfg(not(windows))]
+fn system_memory_pressure() -> bool {
+    false
+}
 pub fn try_push_node(
     nodes: &mut Vec<Node>,
     node: Node,
     used: &mut usize,
     limits: Limits,
 ) -> Result<usize, Admission> {
-    let need = node_storage_bytes(&node.path, 1);
-    match admit_node(*used, need, limits) {
-        Admission::Accept { added } => {
-            if nodes.try_reserve(1).is_err() {
-                return Err(Admission::AllocFailed);
-            }
-            if let Some(parent) = node.parent {
-                if parent < nodes.len() && nodes[parent].children.try_reserve(1).is_err() {
-                    return Err(Admission::AllocFailed);
-                }
-            }
-            nodes.push(node);
-            let id = nodes.len() - 1;
-            if let Some(parent) = nodes[id].parent {
-                nodes[parent].children.push(id);
-            }
-            *used = used.saturating_add(added);
-            Ok(id)
-        }
-        other => Err(other),
+    // Periodic *resource* measurement, not a node stop limit.
+    if nodes.len() % 4096 == 0 && system_memory_pressure() {
+        return Err(Admission::AllocFailed);
     }
+    // Reserve in bounded exact chunks; charge spare capacity before requesting it.
+    let available_slots = limits
+        .memory_bytes
+        .saturating_sub(*used)
+        .saturating_sub(node.path.capacity() + derived_storage_bytes(&node.path) + 128)
+        / std::mem::size_of::<Node>();
+    let grow = if nodes.len() == nodes.capacity() {
+        available_slots.clamp(1, 1024)
+    } else {
+        0
+    };
+    let parent = node.parent;
+    let child_grow = parent.map_or(0, |p| {
+        if nodes[p].children.len() == nodes[p].children.capacity() {
+            16
+        } else {
+            0
+        }
+    });
+    let need = grow * std::mem::size_of::<Node>()
+        + child_grow * std::mem::size_of::<usize>()
+        + node.path.capacity()
+        + derived_storage_bytes(&node.path);
+    let Admission::Accept { added } = admit_node(*used, need, limits) else {
+        return Err(Admission::MemoryBudget);
+    };
+    if grow > 0 && nodes.try_reserve_exact(grow).is_err() {
+        return Err(Admission::AllocFailed);
+    }
+    if let Some(p) = parent {
+        if child_grow > 0 && nodes[p].children.try_reserve_exact(child_grow).is_err() {
+            return Err(Admission::AllocFailed);
+        }
+    }
+    nodes.push(node);
+    let id = nodes.len() - 1;
+    if let Some(p) = parent {
+        nodes[p].children.push(id);
+    }
+    *used = used.saturating_add(added);
+    Ok(id)
 }
 #[cfg(not(windows))]
 use std::collections::HashSet;
@@ -790,6 +849,84 @@ mod tests {
 #[cfg(test)]
 mod accounting_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn synthetic_resident_capacity_probe_without_files() {
+        #[repr(C)]
+        struct Counters {
+            cb: u32,
+            faults: u32,
+            peak_ws: usize,
+            ws: usize,
+            peak_paged: usize,
+            paged: usize,
+            peak_nonpaged: usize,
+            nonpaged: usize,
+            pagefile: usize,
+            peak_pagefile: usize,
+            private: usize,
+        }
+        #[link(name = "psapi")]
+        unsafe extern "system" {
+            fn GetProcessMemoryInfo(handle: isize, counters: *mut Counters, size: u32) -> i32;
+        }
+        fn memory() -> (usize, usize) {
+            let mut c: Counters = unsafe { std::mem::zeroed() };
+            c.cb = std::mem::size_of::<Counters>() as u32;
+            assert_ne!(
+                unsafe { GetProcessMemoryInfo(-1, &mut c, std::mem::size_of::<Counters>() as u32) },
+                0
+            );
+            (c.ws, c.private)
+        }
+        let baseline = memory();
+        let mut nodes = Vec::new();
+        let mut used = 0;
+        let limits = Limits::default();
+        for i in 0..250_000 {
+            let node = Node {
+                path: PathBuf::from(format!(
+                    r"C:\public-fixture\bucket{}\file{}.bin",
+                    i / 256,
+                    i
+                )),
+                parent: if i == 0 { None } else { Some(0) },
+                children: vec![],
+                entries: 1,
+                files: 1,
+                directories: 0,
+                category: 0,
+                own_allocated: 4096,
+                directory: i == 0,
+                logical: 4096,
+                mtime: 0,
+                allocated: 4096,
+                hardlink_duplicate: false,
+                uncertain: false,
+            };
+            try_push_node(&mut nodes, node, &mut used, limits).unwrap();
+            if matches!(i, 99_999 | 249_999) {
+                let actual = tree_storage_bytes(&nodes)
+                    + (nodes.capacity() - nodes.len()) * std::mem::size_of::<Node>();
+                let current = memory();
+                println!(
+                    "synthetic nodes={} capacity={} accounted={} allowance={} ws_delta={} private_delta={}",
+                    nodes.len(),
+                    nodes.capacity(),
+                    used,
+                    actual,
+                    current.0.saturating_sub(baseline.0),
+                    current.1.saturating_sub(baseline.1)
+                );
+                assert!(
+                    used >= actual,
+                    "capacity accounting must include reserved space"
+                );
+                assert!(current.1.saturating_sub(baseline.1) <= used * 2 + 64 * 1024 * 1024);
+            }
+        }
+    }
     #[test]
     fn binary_units_are_not_decimal_gb() {
         assert_eq!(format_bytes(1024u64.pow(3)), "1.00 GiB");
@@ -828,7 +965,7 @@ mod accounting_tests {
     fn default_memory_budget_does_not_truncate_by_entry_count() {
         let limits = Limits::default();
         // Typical mid-length path; charge the path bytes once, not twice.
-        let path = Path::new(r"C:\Users\public\dev\target\app.exe");
+        let path = Path::new("file.bin");
         let per = node_storage_bytes(path, 0);
         assert!(per > 0 && per < 8 * 1024, "compact estimate, got {per}");
         let room = limits.memory_bytes / per;
@@ -957,7 +1094,7 @@ mod accounting_tests {
             DEFAULT_MEMORY_BUDGET
         );
         assert_eq!(Limits::memory_profile(1).memory_bytes, 256 * 1024 * 1024);
-        assert_eq!(Limits::memory_profile(2).memory_bytes, 1024 * 1024 * 1024);
+        assert_eq!(Limits::memory_profile(2).memory_bytes, 512 * 1024 * 1024);
         assert!(Limits::memory(0).memory_bytes >= MIN_MEMORY_BUDGET);
         assert!(Limits::memory(usize::MAX).memory_bytes <= MAX_MEMORY_BUDGET);
         assert!(default.label().contains("内存"));

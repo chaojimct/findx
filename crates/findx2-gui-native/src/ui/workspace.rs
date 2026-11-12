@@ -958,6 +958,18 @@ impl MainWindow {
         remember: bool,
         cx: &mut Context<Self>,
     ) {
+        if std::env::var_os("FINDX_NATIVE_FIXTURE_LOCK").is_some() && !self.session.read(cx).live {
+            if let Some(root) = crate::isolation::isolated_usage_open_path(
+                false,
+                std::env::var_os("FINDX_NATIVE_USAGE_OPEN")
+                    .map(PathBuf::from)
+                    .as_deref(),
+            ) {
+                if path.canonicalize().ok().as_ref() != Some(&root) {
+                    return;
+                }
+            }
+        }
         let source_hit = self.active_workspace_hit();
         if self.workspace.mode != mode {
             self.workspace.suspend_preview = true;
@@ -1240,16 +1252,14 @@ impl MainWindow {
             let value = cx
                 .background_spawn(async move {
                     crate::usage_cache::Repository::global()
-                        .lookup(&requested)
-                        .map(|value| {
-                            let lookup = value
-                                .scan
-                                .nodes
-                                .iter()
-                                .enumerate()
-                                .map(|(i, n)| (key(&n.path), i))
-                                .collect::<HashMap<_, _>>();
-                            (value, lookup)
+                        .lookup_reported(&requested)
+                        .and_then(|value| {
+                            value
+                                .map(|value| {
+                                    let lookup = fallible_usage_lookup(&value.scan)?;
+                                    Ok((value, lookup))
+                                })
+                                .transpose()
                         })
                 })
                 .await;
@@ -1261,6 +1271,14 @@ impl MainWindow {
                 {
                     return;
                 }
+                let value = match value {
+                    Ok(value) => value,
+                    Err(reason) => {
+                        this.workspace.scan_status = reason;
+                        cx.notify();
+                        return;
+                    }
+                };
                 if let Some((value, lookup)) = value {
                     let old_lookup = std::mem::replace(&mut this.workspace.scan_lookup, lookup);
                     cx.background_executor()
@@ -1291,6 +1309,25 @@ impl MainWindow {
         self.workspace.scan_generation = self.workspace.scan_generation.wrapping_add(1);
         let generation = self.workspace.scan_generation;
         let path = self.workspace.location.clone();
+        if !self.session.read(cx).live {
+            if let Some(root) = crate::isolation::isolated_usage_open_path(
+                false,
+                std::env::var_os("FINDX_NATIVE_USAGE_OPEN")
+                    .map(PathBuf::from)
+                    .as_deref(),
+            ) {
+                if path
+                    .canonicalize()
+                    .ok()
+                    .is_none_or(|p| !p.starts_with(root))
+                {
+                    self.workspace.scan_status =
+                        "隔离 fixture 入口拒绝扫描公开 fixture 范围外目录".into();
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         let repository = crate::usage_cache::Repository::global();
         let job = repository.request(
             &path,
@@ -1305,15 +1342,21 @@ impl MainWindow {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    repository.run(&job).map(|value| {
-                        let lookup = value
-                            .scan
-                            .nodes
-                            .iter()
-                            .enumerate()
-                            .map(|(i, n)| (key(&n.path), i))
-                            .collect::<HashMap<_, _>>();
-                        (value, lookup)
+                    repository.run(&job).and_then(|value| {
+                        let lookup = fallible_usage_lookup(&value.scan)?;
+                        #[cfg(debug_assertions)]
+                        if std::env::var_os("FINDX_NATIVE_USAGE_OPEN").is_some() {
+                            use std::io::Write;
+                            let log = std::env::temp_dir().join(format!("findx-fixture-memory-{}.log", std::process::id()));
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+                                let scan = &value.scan;
+                                let resident = crate::disk_usage::tree_storage_bytes(&scan.nodes)
+                                    + (scan.nodes.capacity() - scan.nodes.len()) * std::mem::size_of::<crate::disk_usage::Node>();
+                                let _ = writeln!(f, "nodes={} node_capacity={} managed_allowance={} lookup_capacity={} volume_available={}",
+                                    scan.nodes.len(), scan.nodes.capacity(), resident, lookup.capacity(), scan.volume.is_some());
+                            }
+                        }
+                        Ok((value, lookup))
                     })
                 })
                 .await;
@@ -1988,4 +2031,17 @@ impl MainWindow {
         self.workspace.usage_focus = None;
         self.workspace_navigate(path, ViewMode::Usage, None, true, cx);
     }
+}
+
+/// Large lookup bucket allocation is fallible; a resource failure leaves the
+/// existing view/snapshot intact and is shown as a resource error, never a cap.
+fn fallible_usage_lookup(scan: &disk_usage::Scan) -> Result<HashMap<String, usize>, String> {
+    let mut result = HashMap::new();
+    result.try_reserve(scan.nodes.len()).map_err(|_| {
+        "目录定位表内存分配失败；已测树/原快照保留，可降低资源占用后重试".to_string()
+    })?;
+    for (i, n) in scan.nodes.iter().enumerate() {
+        result.insert(key(&n.path), i);
+    }
+    Ok(result)
 }

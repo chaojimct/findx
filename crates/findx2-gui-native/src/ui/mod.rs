@@ -59,6 +59,7 @@ pub fn start(opts: LaunchOptions) {
             let bounds = Bounds::centered(None, window_size, cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                focus: std::env::var_os("FINDX_NATIVE_USAGE_OPEN").is_none(),
                 window_min_size: Some(size(px(560.), px(400.))),
                 ..gpui_kit::component::TitleBar::window_options()
             };

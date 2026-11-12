@@ -788,7 +788,7 @@ impl MainWindow {
                                 .ghost()
                                 .h(px(24.))
                                 .label(format!("上限 {}", limits.label()))
-                                .tooltip("默认遍历到结束或取消。高级选项只改变内存上限（256MiB / 512MiB / 1GiB），不是条数或分钟档位。超出预算或分配失败会停止并保留已测部分。旧截断快照需手动重扫，不会自动全盘扫描。")
+                                .tooltip("默认遍历到结束或取消。高级选项只改变内存上限（默认 1GiB / 256MiB / 512MiB，含树、lookup 与构建暂存估计，不含 GPUI/GPU 基线），不是条数或分钟档位。超出预算或分配失败会停止并保留已测部分。旧截断快照需手动重扫，不会自动全盘扫描。")
                                 .disabled(self.workspace.scanning)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.workspace.usage_memory_profile =
@@ -837,7 +837,7 @@ impl MainWindow {
                     .overflow_hidden()
                     .items_stretch()
                     .child(
-                        div()
+                        v_flex()
                             .flex_1()
                             .min_w_0()
                             .min_h_0()
@@ -1179,6 +1179,19 @@ impl MainWindow {
                     .child(div().text_xs().text_color(tokens.text_tertiary).child(
                         "卷已用含未扫描目录与系统保留；三种口径不相减推算可清理量。ADS 不在承诺范围。",
                     ));
+            } else {
+                foot = foot
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("卷"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .child("卷容量暂不可用；不代表 0 或整卷已扫描"),
+                    );
             }
             panel = panel.child(head).child(mid).child(foot);
         } else {

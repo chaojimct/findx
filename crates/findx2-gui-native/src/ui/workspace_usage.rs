@@ -424,6 +424,8 @@ impl MainWindow {
         let menu_owner = cx.weak_entity();
         let mut view = div()
             .id("usage-camera")
+            .flex()
+            .flex_col()
             .relative()
             .flex_1()
             .min_h_0()
@@ -514,6 +516,8 @@ impl MainWindow {
             .child(
                 canvas(
                     move |b, _, cx| {
+                        #[cfg(debug_assertions)]
+                        fixture_geometry("layout", b, draws.len());
                         let old = bounds.replace(b);
                         *frame.borrow_mut() = draws
                             .iter()
@@ -525,6 +529,8 @@ impl MainWindow {
                         }
                     },
                     move |b, _, window, cx| {
+                        #[cfg(debug_assertions)]
+                        fixture_geometry("paint", b, paint.len());
                         let started = Instant::now();
                         let screen = |r: Rect| Bounds {
                             origin: point(
@@ -689,5 +695,35 @@ impl MainWindow {
             view = view.child(self.usage_empty(message, tokens));
         }
         view.into_any_element()
+    }
+}
+
+#[cfg(debug_assertions)]
+fn fixture_geometry(event: &str, b: Bounds<Pixels>, tiles: usize) {
+    use std::io::Write;
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if std::env::var_os("FINDX_NATIVE_USAGE_OPEN").is_none()
+        || std::env::args().any(|a| a == "--live")
+        || N.fetch_add(1, Ordering::Relaxed) >= 64
+    {
+        return;
+    }
+    let path =
+        std::env::temp_dir().join(format!("findx-fixture-geometry-{}.log", std::process::id()));
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            f,
+            "{} x={} y={} width={} height={} tiles={}",
+            event,
+            f32::from(b.origin.x),
+            f32::from(b.origin.y),
+            f32::from(b.size.width),
+            f32::from(b.size.height),
+            tiles
+        );
     }
 }

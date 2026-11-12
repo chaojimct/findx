@@ -16,7 +16,9 @@ use std::{
 const SCHEMA: u32 = 3;
 pub(crate) const MAX_NODES: usize = 8_000_000;
 const MAX_UNPACKED: u64 = 2 * 1024 * 1024 * 1024;
-const MEMORY_BUDGET: usize = 1024 * 1024 * 1024;
+// Cache budget includes conservative downstream lookup/scene/identity overhead.
+const MEMORY_BUDGET: usize = 256 * 1024 * 1024;
+const READ_UNPACKED: u64 = 256 * 1024 * 1024;
 const DISK_BUDGET: u64 = 512 * 1024 * 1024;
 const ROOT_LIMIT: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +118,7 @@ pub(crate) fn snapshot_allowed(node_count: usize, _unpacked_hint: u64) -> Result
 }
 fn memory_cost(scan: &Scan) -> usize {
     tree_storage_bytes(&scan.nodes)
+        + (scan.nodes.capacity() - scan.nodes.len()) * std::mem::size_of::<Node>()
 }
 struct Entry {
     value: Cached,
@@ -129,6 +132,8 @@ struct State {
 }
 pub struct Repository {
     directory: PathBuf,
+    #[cfg(test)]
+    reads: std::sync::atomic::AtomicUsize,
     state: Mutex<State>,
     provider: Arc<dyn MeasuredUsageProvider>,
 }
@@ -149,7 +154,14 @@ impl Repository {
         GLOBAL
             .get_or_init(|| {
                 Arc::new(Self::new(
-                    crate::isolation::isolated_data_dir().join("usage-cache-v1"),
+                    if std::env::var_os("FINDX_NATIVE_USAGE_OPEN").is_some()
+                        && !std::env::args().any(|arg| arg == "--live")
+                    {
+                        std::env::temp_dir()
+                            .join(format!("findx-fixture-cache-{}", std::process::id()))
+                    } else {
+                        crate::isolation::isolated_data_dir().join("usage-cache-v1")
+                    },
                     Arc::new(MeasuredFilesystem),
                 ))
             })
@@ -158,6 +170,8 @@ impl Repository {
     pub fn new(directory: PathBuf, provider: Arc<dyn MeasuredUsageProvider>) -> Self {
         Self {
             directory,
+            #[cfg(test)]
+            reads: std::sync::atomic::AtomicUsize::new(0),
             state: Mutex::new(State::default()),
             provider,
         }
@@ -190,14 +204,6 @@ impl Repository {
             key.volume, key.id, key.created
         ))
     }
-    fn touch(&self, key: &Key) {
-        if let Ok(file) = std::fs::OpenOptions::new()
-            .write(true)
-            .open(self.snapshot_path(key))
-        {
-            let _ = file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()));
-        }
-    }
     fn remember(&self, key: Key, value: Cached) {
         let bytes = memory_cost(&value.scan);
         if bytes > MEMORY_BUDGET {
@@ -215,7 +221,13 @@ impl Repository {
     /// Ancestor coverage is an old observation, not recursive freshness. A partial
     /// snapshot only covers nodes actually present; never synthesize missing children.
     pub fn lookup(&self, root: &Path) -> Option<Cached> {
-        let root_key = key(root)?;
+        self.lookup_reported(root).ok().flatten()
+    }
+    /// Interactive cache reads preserve resource refusal reasons; never rewrite a snapshot.
+    pub fn lookup_reported(&self, root: &Path) -> Result<Option<Cached>, String> {
+        let Some(root_key) = key(root) else {
+            return Ok(None);
+        };
         {
             let mut state = lock(&self.state);
             if let Some(index) = state
@@ -238,47 +250,57 @@ impl Repository {
                 .max_by_key(|(i, e)| (e.value.captured, std::cmp::Reverse(*i)))
                 .map(|(i, _)| i)
             {
-                let entry = state.entries.remove(index)?;
+                let Some(entry) = state.entries.remove(index) else {
+                    return Ok(None);
+                };
                 let stored_key = entry.key.clone();
                 let mut value = entry.value.clone();
                 value.source = Source::Memory;
                 state.entries.push_front(entry);
                 drop(state);
-                self.touch(&stored_key);
-                return Some(value);
+                let _ = stored_key;
+                return Ok(Some(value));
             }
         }
-        let entries = std::fs::read_dir(&self.directory).ok()?;
-        let mut files = entries
-            .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some_and(|x| x == "fxdu"))
-            .collect::<Vec<_>>();
-        files.sort_by_key(|e| std::cmp::Reverse(e.metadata().ok().and_then(|m| m.modified().ok())));
-        for entry in files.into_iter().take(ROOT_LIMIT) {
-            let Ok((stored_key, value)) = self.read_snapshot(&entry.path(), Some(root)) else {
+        // Exact root first, then identity-named ancestors only. Never enumerate and
+        // inflate every stored root to discover coverage (compressed size is not RSS).
+        for ancestor in root.ancestors() {
+            let Some(candidate) = self::key(ancestor) else {
                 continue;
             };
-            let Some(base) = value.scan.nodes.first() else {
-                continue;
-            };
-            if key(&base.path).as_ref() != Some(&stored_key) {
+            let path = self.snapshot_path(&candidate);
+            if !path.is_file() {
                 continue;
             }
-            let covers = value
-                .scan
-                .nodes
-                .iter()
-                .any(|n| n.directory && n.path == root);
-            self.remember(stored_key, value.clone());
-            if covers {
-                if let Ok(file) = std::fs::OpenOptions::new().write(true).open(entry.path()) {
-                    let _ =
-                        file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()));
+            let (stored_key, value) = match self.read_snapshot(&path, Some(root)) {
+                Ok(value) => value,
+                Err(reason)
+                    if reason.contains("预算")
+                        || reason.contains("budget")
+                        || reason.contains("资源不足") =>
+                {
+                    return Err(format!("快照未载入：{reason}；原快照未修改，可手动扫描"));
                 }
-                return Some(value);
+                Err(_) => continue,
+            };
+            if stored_key != candidate
+                || value
+                    .scan
+                    .nodes
+                    .first()
+                    .is_none_or(|n| self::key(&n.path).as_ref() != Some(&stored_key))
+                || !value
+                    .scan
+                    .nodes
+                    .iter()
+                    .any(|n| n.directory && n.path == root)
+            {
+                continue;
             }
+            self.remember(stored_key, value.clone());
+            return Ok(Some(value));
         }
-        None
+        Ok(None)
     }
     pub fn run(&self, job: &Arc<Job>) -> Result<Cached, String> {
         if job.started.swap(true, Ordering::AcqRel) {
@@ -332,6 +354,11 @@ impl Repository {
     ) -> Result<(), String> {
         std::fs::create_dir_all(&self.directory).map_err(|e| e.to_string())?;
         snapshot_allowed(value.scan.nodes.len(), 0)?;
+        if memory_cost(&value.scan) > MEMORY_BUDGET {
+            return Err(
+                "仅拒绝快照缓存：展开内存超出 256MiB 缓存预算；完整扫描结果仍保留在内存".into(),
+            );
+        }
         let header = Header::from_scan(key, value);
         let encoded = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
         let destination = self.snapshot_path(key);
@@ -424,16 +451,18 @@ impl Repository {
         path: &Path,
         requested: Option<&Path>,
     ) -> Result<(Key, Cached), String> {
+        #[cfg(test)]
+        self.reads.fetch_add(1, Ordering::Relaxed);
         let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
         if file.metadata().map_err(|e| e.to_string())?.len() > DISK_BUDGET {
             return Err("compressed budget".into());
         }
         let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
         let entry = archive.by_name("tree.v1").map_err(|e| e.to_string())?;
-        if entry.size() > MAX_UNPACKED {
+        if entry.size() > READ_UNPACKED {
             return Err("decompression budget".into());
         }
-        let mut reader = entry.take(MAX_UNPACKED);
+        let mut reader = entry.take(READ_UNPACKED);
         fn bytes<const N: usize>(r: &mut impl Read) -> Result<[u8; N], String> {
             let mut a = [0; N];
             r.read_exact(&mut a).map_err(|e| e.to_string())?;
@@ -466,7 +495,15 @@ impl Repository {
         if requested.is_some_and(|r| !r.starts_with(&root)) {
             return Err("outside coverage".into());
         }
-        let mut nodes = Vec::<Node>::with_capacity(header.nodes.min(4096));
+        if header
+            .nodes
+            .saturating_mul(std::mem::size_of::<Node>() + 128)
+            > MEMORY_BUDGET
+        {
+            return Err("快照展开内存预算；保留原快照，需手动重扫或提高资源预算".into());
+        }
+        let mut nodes = Vec::<Node>::new();
+        let mut resident = 0usize;
         for index in 0..header.nodes {
             let length = u32::from_le_bytes(bytes(&mut reader)?) as usize;
             if length > 32768 {
@@ -508,25 +545,28 @@ impl Repository {
             for n in &mut numbers {
                 *n = u64::from_le_bytes(bytes(&mut reader)?);
             }
-            nodes.push(Node {
-                path,
-                parent,
-                children: vec![],
-                entries: numbers[0],
-                files: numbers[1],
-                directories: numbers[2],
-                own_allocated: numbers[3],
-                logical: numbers[4],
-                mtime: numbers[5],
-                allocated: numbers[6],
-                directory: flags[0] & 1 != 0,
-                hardlink_duplicate: flags[0] & 2 != 0,
-                uncertain: flags[0] & 4 != 0,
-                category: flags[1] as usize,
-            });
-            if let Some(p) = parent {
-                nodes[p].children.push(index);
-            }
+            disk_usage::try_push_node(
+                &mut nodes,
+                Node {
+                    path,
+                    parent,
+                    children: vec![],
+                    entries: numbers[0],
+                    files: numbers[1],
+                    directories: numbers[2],
+                    own_allocated: numbers[3],
+                    logical: numbers[4],
+                    mtime: numbers[5],
+                    allocated: numbers[6],
+                    directory: flags[0] & 1 != 0,
+                    hardlink_duplicate: flags[0] & 2 != 0,
+                    uncertain: flags[0] & 4 != 0,
+                    category: flags[1] as usize,
+                },
+                &mut resident,
+                Limits::from_bytes(MEMORY_BUDGET),
+            )
+            .map_err(|reason| format!("快照展开内存资源不足：{reason:?}；原文件未改动"))?;
         }
         let mut trailing = [0];
         if reader.read(&mut trailing).map_err(|e| e.to_string())? != 0 {
@@ -749,6 +789,65 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
             disk_usage::scan(root, c, p, l)
         }
+    }
+
+    #[test]
+    fn inflated_snapshot_header_is_rejected_before_tree_allocation() {
+        let f = Fixture::new("read-budget");
+        let provider = Arc::new(Counted(AtomicU64::new(0)));
+        let repo = Repository::new(f.0.join("cache"), provider);
+        let root = f.0.join("data");
+        let value = repo
+            .run(&repo.request(&root, true, Limits::default()))
+            .unwrap();
+        let k = key(&root).unwrap();
+        let mut header = Header::from_scan(&k, &value);
+        header.nodes = 2_000_000;
+        let json = serde_json::to_vec(&header).unwrap();
+        let fake = f.0.join("inflated.fxdu");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&fake).unwrap());
+        zip.start_file("tree.v1", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"FXDU\x01\0").unwrap();
+        zip.write_all(&(json.len() as u32).to_le_bytes()).unwrap();
+        zip.write_all(&json).unwrap();
+        zip.finish().unwrap();
+        let reason = repo.read_snapshot(&fake, Some(&root)).err().unwrap();
+        assert!(reason.contains("展开内存预算"), "{reason}");
+    }
+    #[test]
+    fn lookup_decodes_only_requested_identity_and_never_touches_unrelated_snapshots() {
+        let a = Fixture::new("scope-a");
+        let b = Fixture::new("scope-b");
+        let provider = Arc::new(Counted(AtomicU64::new(0)));
+        let directory = a.0.join("cache");
+        let writer = Repository::new(directory.clone(), provider.clone());
+        let root_a = a.0.join("data");
+        let root_b = b.0.join("data");
+        writer
+            .run(&writer.request(&root_a, true, Limits::default()))
+            .unwrap();
+        writer
+            .run(&writer.request(&root_b, true, Limits::default()))
+            .unwrap();
+        let unrelated = writer.snapshot_path(&key(&root_b).unwrap());
+        let before = std::fs::read(&unrelated).unwrap();
+        let modified = std::fs::metadata(&unrelated).unwrap().modified().unwrap();
+        let reader = Repository::new(directory.clone(), provider.clone());
+        let value = reader.lookup(&root_a).unwrap();
+        assert_eq!(reader.reads.load(Ordering::Relaxed), 1);
+        assert_eq!(lock(&reader.state).entries.len(), 1);
+        assert_eq!(value.scan.nodes[0].path, root_a);
+        assert_eq!(std::fs::read(&unrelated).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&unrelated).unwrap().modified().unwrap(),
+            modified
+        );
+        // A miss must not decompress unrelated roots either.
+        let missing = a.0.join("unmeasured");
+        std::fs::create_dir(&missing).unwrap();
+        assert!(reader.lookup(&missing).is_none());
+        assert_eq!(reader.reads.load(Ordering::Relaxed), 1);
     }
     #[test]
     fn same_key_single_worker_memory_ancestor_and_restart_snapshot_are_zero_scans() {

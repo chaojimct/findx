@@ -254,9 +254,21 @@ fn dispatch_one<'s>(
             ctx.skipped.fetch_add(1, Ordering::Relaxed);
             return true;
         }
-        let duplicate = e.allocated.is_some()
-            && e.id
-                .is_some_and(|id| id.1 != 0 && !lock(&ctx.seen).insert(id));
+        let duplicate = if e.allocated.is_some() {
+            if let Some(id) = e.id.filter(|id| id.1 != 0) {
+                let mut seen = lock(&ctx.seen);
+                if seen.try_reserve(1).is_err() {
+                    ctx.alloc_failed.store(true, Ordering::Relaxed);
+                    ctx.partial.store(true, Ordering::Relaxed);
+                    return false;
+                }
+                !seen.insert(id)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         if duplicate && e.directory {
             ctx.skipped.fetch_add(1, Ordering::Relaxed);
             return true;
@@ -333,6 +345,11 @@ fn dispatch_one<'s>(
                 scope.spawn(move |scope| dispatch(scope, ctx, id, e.id));
             } else {
                 ctx.pending.fetch_sub(1, Ordering::Relaxed);
+                if deferred.try_reserve(1).is_err() {
+                    ctx.alloc_failed.store(true, Ordering::Relaxed);
+                    ctx.partial.store(true, Ordering::Relaxed);
+                    return false;
+                }
                 deferred.push((id, e.id));
             }
         }
@@ -434,9 +451,12 @@ pub(super) fn scan(
     progress.directories.store(1, Ordering::Relaxed);
     progress.allocated.store(occupied, Ordering::Relaxed);
     lock(&progress.preview).directory(root);
-    let root_used = crate::disk_usage::node_storage_bytes(&root_node.path, 1);
+    let mut root_nodes = Vec::new();
+    let mut root_used = 0;
+    try_push_node(&mut root_nodes, root_node, &mut root_used, limits)
+        .map_err(|r| format!("根目录内存资源不足：{r:?}"))?;
     let ctx = Walk {
-        nodes: Mutex::new(vec![root_node]),
+        nodes: Mutex::new(root_nodes),
         seen: Mutex::new([exact.identity].into_iter().collect()),
         cancel: cancel.clone(),
         progress: progress.clone(),
