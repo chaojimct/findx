@@ -107,11 +107,13 @@ impl MainWindow {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.workspace.status = match result {
-                    Ok(()) => "已交给系统打开".into(),
-                    Err(e) => e,
-                };
-                this.file_actions.summary = this.workspace.status.clone();
+                match result {
+                    Ok(()) => this.transient_file_notice("已交给系统打开".into(), cx),
+                    Err(e) => {
+                        this.workspace.status = e.clone();
+                        this.file_actions.summary = e;
+                    }
+                }
                 cx.notify();
             })
             .ok();

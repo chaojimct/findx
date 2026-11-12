@@ -49,6 +49,8 @@ fn capture_selection_sources(
 #[derive(Default)]
 pub(super) struct FileActions {
     pub(super) keyboard_menu: Option<Entity<PopupMenu>>,
+    pub(super) keyboard_menu_position: Point<Pixels>,
+    notice_generation: u64,
     menu_subscription: Option<Subscription>,
     context_blank: bool,
     pub(super) pending_shell: Option<crate::open_path::ShellDialog>,
@@ -77,6 +79,30 @@ pub(super) struct FileActions {
     pending_clipboard: Option<bool>,
 }
 impl MainWindow {
+    pub(crate) fn file_menu_is_open(&self) -> bool {
+        self.file_actions.native_menu.is_open() || self.file_actions.keyboard_menu.is_some()
+    }
+    pub(super) fn transient_file_notice(&mut self, message: String, cx: &mut Context<Self>) {
+        self.file_actions.notice_generation = self.file_actions.notice_generation.wrapping_add(1);
+        let ticket = self.file_actions.notice_generation;
+        self.file_actions.summary = message.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(4)).await;
+            let _ = this.update(cx, |this, cx| {
+                if crate::interaction_logic::notice_can_expire(
+                    ticket,
+                    this.file_actions.notice_generation,
+                    &message,
+                    &this.file_actions.summary,
+                    this.file_actions.busy || this.workspace.op_busy,
+                ) {
+                    this.file_actions.summary.clear();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
     pub(crate) fn context_row_selected(&self, search: bool, row: usize, _: &App) -> bool {
         if search {
             self.search_selection.contains(&row)
@@ -242,6 +268,7 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) {
         if self.file_actions.native_menu.finish(token) {
+            self.file_actions.context_blank = false;
             self.file_actions.native_menu_focus_subscription = None;
             cx.notify();
         }
@@ -300,32 +327,86 @@ impl MainWindow {
         _: &mut Window,
         cx: &mut App,
     ) -> PopupMenu {
+        use crate::interaction_logic::{FileMenuContext, file_menu_context};
+        let hits = self.selected_file_hits();
+        let context = file_menu_context(
+            blank,
+            hits.len(),
+            hits.first().is_some_and(|h| h.is_directory),
+        );
+        let blank = context == FileMenuContext::Blank;
         self.file_actions.context_blank = blank;
-        let hits = if blank {
-            Vec::new()
-        } else {
-            self.selected_file_hits()
-        };
-        let single = hits.len() == 1;
-        let any = !hits.is_empty();
-        let current_root = self.workspace.mode == ViewMode::Directory && (blank || hits.is_empty());
-        let directory = current_root || (single && hits[0].is_directory);
+        let single = matches!(context, FileMenuContext::File | FileMenuContext::Directory);
+        let directory = context == FileMenuContext::Directory;
         let busy = self.file_actions.busy || self.workspace.op_busy;
         let paste = !self.file_actions.clipboard.sources.is_empty()
-            && self.paste_directory().is_some()
-            && !busy;
+            && !busy
+            && (!blank || self.workspace.mode == ViewMode::Directory)
+            && self.paste_directory().is_some();
+        if blank {
+            let fit = if self.workspace.mode == ViewMode::Search {
+                self.session.read(cx).prefs.search_fit_columns
+            } else {
+                self.session.read(cx).prefs.browser_fit_columns
+            };
+            return menu
+                .menu_with_icon("刷新", IconName::RefreshCw, Box::new(WorkspaceRefresh))
+                .menu_with_icon_and_disabled(
+                    "全选（当前已加载）",
+                    IconName::Check,
+                    Box::new(ContextSelectAll),
+                    self.workspace.mode == ViewMode::Usage
+                        || if self.workspace.mode == ViewMode::Search {
+                            self.hits.is_empty()
+                        } else {
+                            self.workspace.rows.is_empty()
+                        },
+                )
+                .menu_with_icon_and_disabled(
+                    if fit {
+                        "停用自动适宽"
+                    } else {
+                        "自动适应列宽"
+                    },
+                    Icon::default().path("icons/columns-3.svg"),
+                    Box::new(ContextAutoFit),
+                    self.workspace.mode == ViewMode::Usage,
+                )
+                .when(self.workspace.mode == ViewMode::Directory, |menu| {
+                    menu.separator()
+                        .menu_with_icon_and_disabled(
+                            "粘贴文件…",
+                            Icon::default().path("icons/clipboard-paste.svg"),
+                            Box::new(ContextPaste),
+                            !paste,
+                        )
+                        .separator()
+                        .menu_with_icon(
+                            "分析当前目录占用",
+                            IconName::ChartPie,
+                            Box::new(ContextAnalyze),
+                        )
+                        .menu_with_icon(
+                            "在当前目录范围搜索",
+                            IconName::Search,
+                            Box::new(ContextScope),
+                        )
+                });
+        }
         menu.menu_with_icon_and_disabled(
             "打开",
             IconName::ExternalLink,
             Box::new(ContextOpen),
             !single,
         )
-        .menu_with_icon_and_disabled(
-            "打开方式…",
-            IconName::File,
-            Box::new(ContextOpenWith),
-            !single || directory,
-        )
+        .when(!directory, |menu| {
+            menu.menu_with_icon_and_disabled(
+                "打开方式…",
+                IconName::File,
+                Box::new(ContextOpenWith),
+                !single,
+            )
+        })
         .menu_with_icon_and_disabled(
             "定位所在目录",
             IconName::FolderOpen,
@@ -333,18 +414,13 @@ impl MainWindow {
             !single,
         )
         .separator()
-        .menu_with_icon_and_disabled("复制路径", IconName::Copy, Box::new(ContextCopyPath), !any)
-        .menu_with_icon_and_disabled(
-            "复制文件",
-            IconName::Copy,
-            Box::new(ContextCopy),
-            !any || busy,
-        )
+        .menu_with_icon("复制路径", IconName::Copy, Box::new(ContextCopyPath))
+        .menu_with_icon_and_disabled("复制文件", IconName::Copy, Box::new(ContextCopy), busy)
         .menu_with_icon_and_disabled(
             "剪切文件",
             Icon::default().path("icons/scissors.svg"),
             Box::new(ContextCut),
-            !any || busy,
+            busy,
         )
         .menu_with_icon_and_disabled(
             "粘贴文件…",
@@ -358,53 +434,33 @@ impl MainWindow {
             Box::new(ContextRename),
             !single || busy,
         )
+        .when(directory, |menu| {
+            menu.separator()
+                .menu_with_icon(
+                    "分析此目录占用",
+                    IconName::ChartPie,
+                    Box::new(ContextAnalyze),
+                )
+                .menu_with_icon("在此目录范围搜索", IconName::Search, Box::new(ContextScope))
+        })
         .separator()
         .menu_with_icon_and_disabled(
-            "分析此目录占用",
-            IconName::ChartPie,
-            Box::new(ContextAnalyze),
-            !directory,
-        )
-        .menu_with_icon_and_disabled(
-            "在此目录范围搜索",
-            IconName::Search,
-            Box::new(ContextScope),
-            !directory,
-        )
-        .menu_with_icon_and_disabled("属性", IconName::Info, Box::new(ContextProperties), !single)
-        .separator()
-        .menu_with_icon("刷新", IconName::RefreshCw, Box::new(WorkspaceRefresh))
-        .menu_with_icon_and_disabled(
-            "全选（当前已加载）",
-            IconName::Check,
-            Box::new(ContextSelectAll),
-            self.workspace.mode == ViewMode::Usage,
-        )
-        .menu_with_icon_and_disabled(
-            if if self.workspace.mode == ViewMode::Search {
-                self.session.read(cx).prefs.search_fit_columns
-            } else {
-                self.session.read(cx).prefs.browser_fit_columns
-            } {
-                "停用自动适宽"
-            } else {
-                "自动适应列宽"
-            },
-            Icon::default().path("icons/columns-3.svg"),
-            Box::new(ContextAutoFit),
-            self.workspace.mode == ViewMode::Usage,
+            "属性",
+            IconName::Info,
+            Box::new(ContextProperties),
+            !single,
         )
     }
     pub(crate) fn show_file_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings_page.is_some() {
             return;
         }
+        self.dismiss_address_menu(cx);
+        self.dismiss_file_menu(cx);
         let menu = PopupMenu::build(window, cx, |menu, window, cx| {
             self.build_file_context_menu(menu, false, window, cx)
                 .action_context(self.focus.clone())
         });
-        self.dismiss_address_menu(cx);
-        self.dismiss_file_menu(cx);
         let token = self.track_native_menu_focus(menu.read(cx).focus_handle(cx), window, cx);
         self.file_actions.keyboard_menu_token = Some(token);
         self.file_actions.menu_subscription =
@@ -419,6 +475,7 @@ impl MainWindow {
                 cx.notify();
             }));
         menu.read(cx).focus_handle(cx).focus(window, cx);
+        self.file_actions.keyboard_menu_position = window.mouse_position();
         self.file_actions.keyboard_menu = Some(menu);
         cx.notify();
     }
@@ -443,7 +500,12 @@ impl MainWindow {
             return;
         }
         let blank = std::mem::take(&mut self.file_actions.context_blank);
-        let hits = self.selected_file_hits();
+        // A blank-area action must never inherit the stale selected row.
+        let hits = if blank {
+            Vec::new()
+        } else {
+            self.selected_file_hits()
+        };
         let single = hits.len() == 1;
         let current_root = self.workspace.mode == ViewMode::Directory && (blank || hits.is_empty());
         match kind {
@@ -459,13 +521,15 @@ impl MainWindow {
                         .collect::<Vec<_>>()
                         .join("\r\n"),
                 ));
-                self.workspace.status = format!("已复制 {} 条路径", hits.len());
-                self.file_actions.summary = self.workspace.status.clone();
+                self.transient_file_notice(format!("已复制 {} 条路径", hits.len()), cx);
             }
             4 | 5 if !hits.is_empty() && !self.file_actions.busy => {
                 self.capture_file_clipboard(hits, kind == 5, cx)
             }
-            6 if !self.file_actions.busy && !self.file_actions.clipboard.sources.is_empty() => {
+            6 if !self.file_actions.busy
+                && !self.file_actions.clipboard.sources.is_empty()
+                && (!blank || self.workspace.mode == ViewMode::Directory) =>
+            {
                 self.file_actions.confirm_target = self.paste_directory();
             }
             7 if single && !self.file_actions.busy => {

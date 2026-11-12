@@ -13,6 +13,7 @@ use crate::{
     disk_usage::{self, Limits, Progress, Scan},
 };
 use gpui_kit::base::InteractiveElementExt as _;
+use gpui_kit::component::menu::ContextMenuExt as _;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -1652,13 +1653,28 @@ impl MainWindow {
     }
     pub(super) fn render_workspace_center(&self, cx: &mut Context<Self>) -> AnyElement {
         match self.workspace.mode {
-            ViewMode::Search => DataTable::new(&self.table)
-                .scrollbar_visible(
-                    true,
-                    self.table.read(cx).delegate().widths.iter().sum::<f32>()
-                        > self.table_viewport_width + 0.5,
+            ViewMode::Search => div()
+                .id("search-table-context")
+                .size_full()
+                .child(
+                    DataTable::new(&self.table)
+                        .scrollbar_visible(
+                            true,
+                            self.table.read(cx).delegate().widths.iter().sum::<f32>()
+                                > self.table_viewport_width + 0.5,
+                        )
+                        .bordered(false),
                 )
-                .bordered(false)
+                .context_menu({
+                    let owner = cx.weak_entity();
+                    move |menu, window, cx| {
+                        owner
+                            .update(cx, |view, cx| {
+                                view.file_context_menu(menu, true, window, cx)
+                            })
+                            .unwrap()
+                    }
+                })
                 .into_any_element(),
             ViewMode::Directory => self.render_directory_table(cx),
             ViewMode::Usage => self.render_workspace_usage(cx).into_any_element(),

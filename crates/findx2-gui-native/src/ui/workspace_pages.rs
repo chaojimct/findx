@@ -123,7 +123,16 @@ impl MainWindow {
             .when_some(self.search_scope.as_ref(), |view, path| {
                 view.child(
                     div()
+                        .id("search-scope-summary")
+                        .min_w_0()
                         .max_w(px(190.))
+                        .tooltip({
+                            let full = display_path(path);
+                            move |window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new(full.clone())
+                                    .build(window, cx)
+                            }
+                        })
                         .text_xs()
                         .text_color(tokens.text_secondary)
                         .text_ellipsis()
@@ -147,10 +156,6 @@ impl MainWindow {
             .child(
                 self.tool_button("search-reveal", "定位", 3, false, cx)
                     .disabled(self.active_workspace_hit().is_none()),
-            )
-            .child(
-                self.tool_button("search-actions", "⋯", 2, false, cx)
-                    .accessibility_label("文件操作"),
             )
             .child(self.tool_button("search-preview", "预览", 0, preview, cx))
     }

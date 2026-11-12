@@ -37,4 +37,5 @@ pub mod navigation;
 
 pub mod usage_view;
 
+mod interaction_logic;
 mod preview_visibility;

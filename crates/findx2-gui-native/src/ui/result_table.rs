@@ -29,11 +29,10 @@ impl TableDelegate for ResultsTable {
         let tokens = *cx.global::<crate::theme::FindxTokens>();
         div()
             .id(("row", row))
-            .when(selected, |v| {
-                v.bg(tokens.row_selected)
-                    .border_b_1()
-                    .border_color(tokens.accent)
-            })
+            // Selection is a full-row fill, never an accent underline.
+            .border_b_1()
+            .border_color(tokens.border_soft)
+            .when(selected, |v| v.bg(tokens.row_selected))
             .on_mouse_down(MouseButton::Left, move |event, _, cx| {
                 let _ = owner.update(cx, |view, cx| {
                     view.selection_pointer(true, row, event.modifiers, cx)
@@ -70,12 +69,18 @@ impl TableDelegate for ResultsTable {
             ("size", "大小"),
             ("mtime", "修改时间"),
         ][ix];
-        Column::new(key, label)
+        let mut column = Column::new(key, label)
             .width(px(self.widths[ix]))
             .min_width(px(MIN_WIDTHS[ix]))
             .max_width(px(1600.))
             .movable(false)
-            .resizable(true)
+            .resizable(true);
+        column.align = if ix == 2 {
+            TextAlign::Right
+        } else {
+            TextAlign::Left
+        };
+        column
     }
     fn cell_label(&self, row: usize, col: usize, _: &App) -> Option<SharedString> {
         let hit = self.hits.get(row)?;
@@ -101,7 +106,19 @@ impl TableDelegate for ResultsTable {
         };
         let tokens = *cx.global::<crate::theme::FindxTokens>();
         if col == 0 {
+            let full_path = hit.path.clone();
+            let menu_open = self
+                .owner
+                .read_with(cx, |view, _| view.file_menu_is_open())
+                .unwrap_or(false);
             return div()
+                .id(("search-name-cell", row))
+                .when(!menu_open, |view| {
+                    view.tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(full_path.clone())
+                            .build(window, cx)
+                    })
+                })
                 .flex()
                 .items_center()
                 .w_full()
@@ -117,6 +134,7 @@ impl TableDelegate for ResultsTable {
                     div()
                         .ml_2()
                         .flex()
+                        .items_center()
                         .flex_1()
                         .min_w_0()
                         .overflow_hidden()
@@ -146,6 +164,8 @@ impl TableDelegate for ResultsTable {
             .min_w_0()
             .overflow_hidden()
             .text_ellipsis()
+            .when(col == 2, |v| v.text_right())
+            .text_color(tokens.text_secondary)
             .child(text)
             .into_any_element()
     }

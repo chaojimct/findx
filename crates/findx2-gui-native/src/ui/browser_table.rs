@@ -32,9 +32,7 @@ impl TableDelegate for BrowserTable {
             .id(("row", row))
             .border_b_1()
             .border_color(tokens.border_soft)
-            .when(selected, |v| {
-                v.bg(tokens.row_selected).border_color(tokens.accent)
-            })
+            .when(selected, |v| v.bg(tokens.row_selected))
             .on_mouse_down(MouseButton::Left, move |event, _, cx| {
                 let _ = owner.update(cx, |view, cx| {
                     view.selection_pointer(false, row, event.modifiers, cx)
@@ -116,10 +114,17 @@ impl TableDelegate for BrowserTable {
         let tokens = *cx.global::<crate::theme::FindxTokens>();
         if col == 0 {
             let full_path = hit.path.clone();
+            let menu_open = self
+                .owner
+                .read_with(cx, |view, _| view.file_menu_is_open())
+                .unwrap_or(false);
             return div()
                 .id(("browser-name-cell", row))
-                .tooltip(move |window, cx| {
-                    gpui_kit::component::tooltip::Tooltip::new(full_path.clone()).build(window, cx)
+                .when(!menu_open, |view| {
+                    view.tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(full_path.clone())
+                            .build(window, cx)
+                    })
                 })
                 .flex()
                 .items_center()

@@ -1888,7 +1888,7 @@ impl Render for MainWindow {
                 view.child(
                     deferred(
                         anchored()
-                            .position(point(px(200.), px(120.)))
+                            .position(self.file_actions.keyboard_menu_position)
                             .snap_to_window_with_margin(px(8.))
                             .child(menu),
                     )

@@ -476,12 +476,6 @@ impl MainWindow {
                     ),
             )
             .child(
-                self.tool_button("directory-actions", "", 2, false, cx)
-                    .w(px(28.))
-                    .px_0()
-                    .accessibility_label("文件操作"),
-            )
-            .child(
                 self.tool_button("directory-preview", "", 0, preview, cx)
                     .w(px(28.))
                     .px_0()
