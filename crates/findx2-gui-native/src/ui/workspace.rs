@@ -195,6 +195,8 @@ pub(super) struct Workspace {
     list_cancel: Arc<AtomicBool>,
     pub(super) listing: bool,
     window: AnyWindowHandle,
+    usage_depth: usize,
+    usage_limit_profile: usize,
     scan: Option<Scan>,
     scan_lookup: HashMap<String, usize>,
     scan_generation: u64,
@@ -283,6 +285,8 @@ impl Workspace {
             list_cancel: Arc::new(AtomicBool::new(false)),
             listing: false,
             window: window.window_handle(),
+            usage_depth: 3,
+            usage_limit_profile: 0,
             scan: None,
             scan_lookup: HashMap::new(),
             scan_generation: 0,
@@ -778,10 +782,10 @@ impl MainWindow {
         let Some(scan) = &self.workspace.scan else {
             return false;
         };
-        let mut children = scan.nodes[ix].children.clone();
-        children.sort_by_key(|&i| std::cmp::Reverse(scan.nodes[i].allocated));
+        let children = &scan.nodes[ix].children;
         let rows = children
             .iter()
+            .take(80)
             .map(|&i| {
                 let n = &scan.nodes[i];
                 SearchHitDto {
@@ -1086,10 +1090,56 @@ impl MainWindow {
         let path = self.workspace.location.clone();
         let cancel = self.workspace.scan_cancel.clone();
         let progress = self.workspace.progress.clone();
+        let limits = Limits::profile(self.workspace.usage_limit_profile);
         self.workspace.scanning = true;
         self.workspace.scan_status = "扫描当前目录 · 搜索可用 · 不跟随链接/挂载".into();
         self.workspace.scan_stale = false;
-        cx.spawn(async move|this,cx|{let result=cx.background_spawn(async move{disk_usage::scan(&path,cancel,progress,Limits::default()).map(|s|{let lookup=s.nodes.iter().enumerate().map(|(i,n)|(key(&n.path),i)).collect::<HashMap<_,_>>();(s,lookup)})}).await;this.update(cx,|this,cx|{if this.workspace.scan_generation!=generation{return;}this.workspace.scanning=false;match result{Ok((s,lookup))=>{this.workspace.scan_status=format!("{} · {} 路径 / {} 秒 · 硬链接去重 {} · 跳过边界 {} · 读取错误 {} · 未知占用 {}",if s.cancelled{"已取消，部分结果"}else if s.partial{"部分扫描（不是全盘结论）"}else{"目录扫描完成"},s.nodes.len(),s.elapsed.as_secs(),s.hardlinks,s.skipped_links,s.errors,s.unknown);this.workspace.scan=Some(s);this.workspace.scan_lookup=lookup;if this.workspace.mode==ViewMode::Usage{let focus=this.active_workspace_hit().map(|h|h.path);this.show_scanned_directory(focus,cx);}},Err(e)=>this.workspace.scan_status=format!("扫描失败：{e}")};cx.notify();}).ok();}).detach();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    disk_usage::scan(&path, cancel, progress, limits).map(|s| {
+                        let lookup = s
+                            .nodes
+                            .iter()
+                            .enumerate()
+                            .map(|(i, n)| (key(&n.path), i))
+                            .collect::<HashMap<_, _>>();
+                        (s, lookup)
+                    })
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.workspace.scan_generation != generation {
+                    return;
+                }
+                this.workspace.scanning = false;
+                match result {
+                    Ok((s, lookup)) => {
+                        this.workspace.scan_status = format!(
+                            "{} · {} 秒 · {} · 硬链接去重 {}",
+                            if s.partial {
+                                "部分结果"
+                            } else {
+                                "目录遍历完成"
+                            },
+                            s.elapsed.as_secs(),
+                            s.partial_reasons(),
+                            s.hardlinks
+                        );
+                        this.workspace.scan = Some(s);
+                        this.workspace.scan_lookup = lookup;
+                        if this.workspace.mode == ViewMode::Usage {
+                            let focus = this.active_workspace_hit().map(|h| h.path);
+                            this.show_scanned_directory(focus, cx);
+                        }
+                    }
+                    Err(e) => this.workspace.scan_status = format!("扫描失败：{e}"),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
     pub(in crate::ui) fn begin_workspace_operation(
@@ -1210,10 +1260,7 @@ impl MainWindow {
                 "后台扫描 · {} 路径 · {} 目录 · 已测 {} · 总量未知",
                 self.workspace.progress.entries.load(Ordering::Relaxed),
                 self.workspace.progress.directories.load(Ordering::Relaxed),
-                search_logic::format_size(
-                    self.workspace.progress.allocated.load(Ordering::Relaxed),
-                    false
-                )
+                disk_usage::format_bytes(self.workspace.progress.allocated.load(Ordering::Relaxed))
             )
         } else if self.workspace.scan_stale {
             format!("缓存可能过期 · {}", self.workspace.scan_status)

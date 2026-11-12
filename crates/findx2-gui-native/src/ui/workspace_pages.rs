@@ -893,7 +893,9 @@ impl MainWindow {
             .bg(tokens.surface);
         if let (Some(scan), Some(root)) = (self.workspace.scan.as_ref(), root) {
             if scan.nodes[root].allocated > 0 {
-                map = map.child(self.render_nested_map(scan, root, selected, 0, cx));
+                let mut budget = 1200;
+                map =
+                    map.child(self.render_nested_map(scan, root, selected, 0, 1., &mut budget, cx));
             } else {
                 map = map.child(self.usage_empty(
                     "已测占用为 0；未知、空文件及硬链接别名仍可在右侧查看",
@@ -913,14 +915,18 @@ impl MainWindow {
         let summary = if let (Some(scan), Some(root)) = (self.workspace.scan.as_ref(), root) {
             let node = &scan.nodes[root];
             format!(
-                "实际 {}   ·   逻辑 {}   ·   {} 路径   ·   {} 秒{}",
-                if node.uncertain {
-                    "未知".to_string()
+                "{}已测 {} · 逻辑 {} · {} 文件 / {} 目录 · {} 秒{}",
+                if self.workspace.scanning {
+                    "上次缓存 · "
+                } else if self.workspace.scan_stale {
+                    "缓存可能过期 · "
                 } else {
-                    search_logic::format_size(node.allocated, false)
+                    ""
                 },
-                search_logic::format_size(node.logical, false),
-                node.entries,
+                disk_usage::format_bytes(node.allocated),
+                disk_usage::format_bytes(node.logical),
+                node.files,
+                node.directories,
                 scan.elapsed.as_secs(),
                 if scan.partial {
                     "   ·   部分结果"
@@ -946,6 +952,13 @@ impl MainWindow {
                     .child(div().flex_1().min_w_0().text_ellipsis().child(summary))
                     .child(div().text_xs().child("单击选择 · 双击目录钻取")),
             )
+            .child(h_flex().h(px(32.)).px_3().gap_2().flex_shrink_0().text_xs()
+                .child(Button::new("usage-depth-down").ghost().icon(IconName::Minus).w(px(24.)).h(px(24.)).px_0().accessibility_label("减少显示层数").disabled(self.workspace.usage_depth<=1).on_click(cx.listener(|this,_,_,cx|{this.workspace.usage_depth=this.workspace.usage_depth.saturating_sub(1).max(1);cx.notify();})))
+                .child(format!("显示 {} 层",self.workspace.usage_depth))
+                .child(Button::new("usage-depth-up").ghost().icon(IconName::Plus).w(px(24.)).h(px(24.)).px_0().accessibility_label("增加显示层数").disabled(self.workspace.usage_depth>=6).on_click(cx.listener(|this,_,_,cx|{this.workspace.usage_depth=(this.workspace.usage_depth+1).min(6);cx.notify();})))
+                .child(div().text_color(tokens.text_tertiary).child("显示层数 ≠ 扫描深度；目录按主要类别着色"))
+                .child(div().flex_1())
+                .child(Button::new("usage-scan-budget").ghost().icon(IconName::Settings).h(px(26.)).label(format!("上限 {}",Limits::profile(self.workspace.usage_limit_profile).label())).tooltip("手动选择下一次扫描的资源上限；较高上限可能占用大量内存，不会自动开始扫描").disabled(self.workspace.scanning).on_click(cx.listener(|this,_,_,cx|{this.workspace.usage_limit_profile=(this.workspace.usage_limit_profile+1)%3;cx.notify();}))))
             .child(
                 h_flex()
                     .flex_1()
@@ -972,7 +985,7 @@ impl MainWindow {
                             "媒体",
                             "代码",
                             "压缩包",
-                            "应用 / 缓存",
+                            "应用数据",
                         ]
                         .into_iter()
                         .enumerate()
@@ -1012,32 +1025,34 @@ impl MainWindow {
         node: usize,
         selected: Option<usize>,
         depth: usize,
+        area: f32,
+        budget: &mut usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tokens = Self::tokens(cx);
-        let mut children = scan.nodes[node].children.clone();
-        children.sort_by_key(|&i| std::cmp::Reverse(scan.nodes[i].allocated));
-        let limit = if depth == 0 { 80 } else { 24 };
+        let children = &scan.nodes[node].children;
+        let limit = (if depth == 0 { 80usize } else { 24usize }).min(budget.saturating_sub(1));
         let mut weights = children
             .iter()
             .take(limit)
             .map(|&i| (i, scan.nodes[i].allocated))
             .collect::<Vec<_>>();
-        let remainder = children
-            .iter()
-            .skip(limit)
-            .fold(0u64, |sum, &i| sum.saturating_add(scan.nodes[i].allocated));
+        let drawn = weights.iter().map(|(_, bytes)| *bytes).sum::<u64>();
+        // Retain directory metadata and every aggregated child byte without walking all children per frame.
+        let remainder = scan.nodes[node].allocated.saturating_sub(drawn);
         if remainder > 0 {
             weights.push((usize::MAX, remainder));
         }
         let mut view = div().size_full().relative().overflow_hidden();
-        for tile in disk_usage::tiles(&weights) {
+        let tiles = disk_usage::tiles(&weights);
+        *budget = budget.saturating_sub(tiles.len());
+        for tile in tiles {
             let index = tile.index;
             if index == usize::MAX {
                 let label = format!(
-                    "其他 {} 项 · {}",
+                    "目录自身 / 其余 {} 项 · {}",
                     children.len().saturating_sub(limit),
-                    search_logic::format_size(remainder, false)
+                    disk_usage::format_bytes(remainder)
                 );
                 view = view.child(
                     div()
@@ -1062,10 +1077,13 @@ impl MainWindow {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| display_path(&n.path));
-            let size = search_logic::format_size(n.allocated, false);
-            let nested =
-                n.directory && !n.children.is_empty() && depth < 2 && tile.w * tile.h > 0.035;
-            let category = usage_category(&n.path, n.directory);
+            let size = disk_usage::format_bytes(n.allocated);
+            let nested = n.directory
+                && !n.children.is_empty()
+                && depth + 1 < self.workspace.usage_depth
+                && tile.w * tile.h * area > 0.002
+                && *budget > 1;
+            let category = n.category;
             let on = selected == Some(index);
             let tile_view = v_flex()
                 .id(SharedString::from(format!("usage-tile-{index}")))
@@ -1079,7 +1097,7 @@ impl MainWindow {
                 .w(relative(tile.w))
                 .h(relative(tile.h))
                 .overflow_hidden()
-                .border_2()
+                .border_1()
                 .border_color(if on { tokens.accent } else { tokens.bg })
                 .bg(tokens.allocation_color(category))
                 .text_color(tokens.text_primary)
@@ -1103,7 +1121,15 @@ impl MainWindow {
                             .mx_1()
                             .mb_1()
                             .overflow_hidden()
-                            .child(self.render_nested_map(scan, index, selected, depth + 1, cx)),
+                            .child(self.render_nested_map(
+                                scan,
+                                index,
+                                selected,
+                                depth + 1,
+                                area * tile.w * tile.h,
+                                budget,
+                                cx,
+                            )),
                     )
                 })
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -1163,6 +1189,18 @@ impl MainWindow {
             } else {
                 0.
             };
+            if let Some(v) = &scan.volume {
+                panel=panel.child(div().text_xs().text_color(tokens.text_secondary).child(format!("系统卷 {}（扫描开始时）\n已用 {} · 可用 {}\n容量 {}",display_path(&v.root),disk_usage::format_bytes(v.used()),disk_usage::format_bytes(v.free),disk_usage::format_bytes(v.total))))
+                    .child(div().text_xs().text_color(tokens.text_tertiary).child("卷已用包含未扫描目录、系统保留/元数据；受权限、链接边界及扫描时点影响，不应与目录合计直接相减当作可清理量。"));
+            }
+            if scan.partial {
+                panel = panel.child(
+                    div()
+                        .text_xs()
+                        .text_color(tokens.warning)
+                        .child(format!("部分结果：{}", scan.partial_reasons())),
+                );
+            }
             panel = panel
                 .child(
                     div()
@@ -1172,17 +1210,24 @@ impl MainWindow {
                         .whitespace_nowrap()
                         .child(name),
                 )
-                .child(div().text_3xl().child(if node.uncertain {
-                    "未知".to_string()
-                } else {
-                    search_logic::format_size(node.allocated, false)
-                }))
                 .child(
                     div()
                         .text_xs()
                         .text_color(tokens.text_secondary)
-                        .child(format!("实际占用 · 当前范围 {ratio:.1}%")),
+                        .child("选中项 · 已测实际占用"),
                 )
+                .child(
+                    div()
+                        .text_3xl()
+                        .child(disk_usage::format_bytes(node.allocated)),
+                )
+                .child(div().text_xs().text_color(tokens.text_secondary).child(
+                    if Some(index) == root {
+                        "当前已测范围根；不是卷已用空间".to_string()
+                    } else {
+                        format!("占当前已测范围 {ratio:.1}%（非扫描覆盖率）")
+                    },
+                ))
                 .child(
                     div()
                         .w_full()
@@ -1202,7 +1247,7 @@ impl MainWindow {
                         .text_color(tokens.text_secondary)
                         .child(format!(
                             "逻辑 {} · {}",
-                            search_logic::format_size(node.logical, false),
+                            disk_usage::format_bytes(node.logical),
                             search_logic::format_time(node.mtime)
                         )),
                 )
@@ -1212,11 +1257,9 @@ impl MainWindow {
                     ))
                 })
                 .when(node.uncertain, |view| {
-                    view.child(
-                        div().text_xs().text_color(tokens.warning).child(
-                            "此项尚未测得实际占用；未知不等于 0，也不能据此判断可删除空间。",
-                        ),
-                    )
+                    view.child(div().text_xs().text_color(tokens.warning).child(
+                        "本项含未知占用；已测值并不完整，未知不等于 0，不能据此判断可删除空间。",
+                    ))
                 })
                 .child(
                     h_flex()
@@ -1295,8 +1338,7 @@ impl MainWindow {
                         .text_color(tokens.text_secondary)
                         .child(format!("子项 · {} 项（按实际占用）", node.children.len())),
                 );
-            let mut children = node.children.clone();
-            children.sort_by_key(|&i| std::cmp::Reverse(scan.nodes[i].allocated));
+            let children = &node.children;
             let count = children.len();
             panel = panel.child(
                 v_flex()
@@ -1305,7 +1347,7 @@ impl MainWindow {
                     .flex_shrink_0()
                     .gap_1()
                     .overflow_y_scrollbar()
-                    .children(children.into_iter().take(80).map(|child| {
+                    .children(children.iter().copied().take(80).map(|child| {
                         let n = &scan.nodes[child];
                         let label = n
                             .path
@@ -1319,7 +1361,7 @@ impl MainWindow {
                             .aria_label(format!(
                                 "{} · {}",
                                 label,
-                                search_logic::format_size(n.allocated, false)
+                                disk_usage::format_bytes(n.allocated)
                             ))
                             .aria_description("单击选择；双击目录钻取")
                             .w_full()
@@ -1343,7 +1385,7 @@ impl MainWindow {
                                     .flex_shrink_0()
                                     .text_xs()
                                     .text_color(tokens.text_secondary)
-                                    .child(search_logic::format_size(n.allocated, false)),
+                                    .child(disk_usage::format_bytes(n.allocated)),
                             )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.select_usage_node(child, false, cx)
@@ -1378,26 +1420,5 @@ impl MainWindow {
             );
         }
         panel.into_any_element()
-    }
-}
-
-fn usage_category(path: &Path, directory: bool) -> usize {
-    if directory {
-        return 0;
-    }
-    match path
-        .extension()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_lowercase()
-        .as_str()
-    {
-        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "rtf" | "txt" => 1,
-        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tif" | "tiff" | "mp4" | "mkv"
-        | "mp3" | "wav" => 2,
-        "rs" | "ts" | "js" | "py" | "c" | "cpp" | "h" | "html" | "css" | "json" | "toml" => 3,
-        "zip" | "7z" | "rar" | "tar" | "gz" => 4,
-        "exe" | "dll" | "msi" | "tmp" | "cache" => 5,
-        _ => 0,
     }
 }

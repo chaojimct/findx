@@ -15,6 +15,10 @@ pub struct Node {
     pub children: Vec<usize>,
     /// Measured paths in this subtree, including this node; drilling never reuses the global count.
     pub entries: u64,
+    pub files: u64,
+    pub directories: u64,
+    pub category: usize,
+    pub own_allocated: u64,
     pub directory: bool,
     pub logical: u64,
     pub mtime: u64,
@@ -38,8 +42,147 @@ pub struct Scan {
     pub partial: bool,
     pub cancelled: bool,
     pub elapsed: Duration,
+    pub entry_limit_reached: bool,
+    pub time_limit_reached: bool,
+    pub limits: Limits,
+    pub volume: Option<VolumeSpace>,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug)]
+pub struct VolumeSpace {
+    pub root: PathBuf,
+    pub total: u64,
+    pub free: u64,
+    pub available: u64,
+}
+impl VolumeSpace {
+    pub fn used(&self) -> u64 {
+        self.total.saturating_sub(self.free)
+    }
+}
+#[cfg(windows)]
+pub fn volume_space(path: &Path) -> Result<VolumeSpace, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetVolumePathNameW},
+        core::PCWSTR,
+    };
+    let input: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut root = vec![0u16; 32768];
+    unsafe {
+        GetVolumePathNameW(PCWSTR(input.as_ptr()), &mut root).map_err(|e| e.to_string())?;
+    }
+    let end = root.iter().position(|v| *v == 0).unwrap_or(root.len());
+    let mut total = 0;
+    let mut free = 0;
+    let mut available = 0;
+    unsafe {
+        GetDiskFreeSpaceExW(
+            PCWSTR(root.as_ptr()),
+            Some(&mut available),
+            Some(&mut total),
+            Some(&mut free),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(VolumeSpace {
+        root: PathBuf::from(String::from_utf16_lossy(&root[..end])),
+        total,
+        free,
+        available,
+    })
+}
+#[cfg(not(windows))]
+pub fn volume_space(_: &Path) -> Result<VolumeSpace, String> {
+    Err("系统卷容量查询仅在 Windows 可用".into())
+}
+/// Binary units are explicit; search/list formatting elsewhere is intentionally unchanged.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut value = bytes as f64;
+    let mut n = 0;
+    while value >= 1024. && n < UNITS.len() - 1 {
+        value /= 1024.;
+        n += 1;
+    }
+    if n == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.2} {}", UNITS[n])
+    }
+}
+pub fn category(path: &Path, directory: bool) -> usize {
+    if directory {
+        return 0;
+    }
+    match path
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "rtf" | "txt" => 1,
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tif" | "tiff" | "mp4" | "mkv"
+        | "mp3" | "wav" => 2,
+        "rs" | "ts" | "js" | "py" | "c" | "cpp" | "h" | "html" | "css" | "json" | "toml" => 3,
+        "zip" | "7z" | "rar" | "tar" | "gz" => 4,
+        "exe" | "dll" | "msi" | "tmp" | "cache" => 5,
+        _ => {
+            if path.components().any(|part| {
+                matches!(
+                    part.as_os_str()
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "appdata"
+                        | "node_modules"
+                        | ".nuget"
+                        | ".cargo"
+                        | "cache"
+                        | "caches"
+                        | "inetcache"
+                        | "gpucache"
+                        | "code cache"
+                        | "temp"
+                        | "target"
+                )
+            }) {
+                5
+            } else {
+                0
+            }
+        }
+    }
+}
+impl Scan {
+    pub fn partial_reasons(&self) -> String {
+        let mut reasons = Vec::new();
+        if self.cancelled {
+            reasons.push("用户取消".to_string());
+        }
+        if self.entry_limit_reached {
+            reasons.push(format!("条目上限 {} 路径", self.limits.entries));
+        }
+        if self.time_limit_reached {
+            reasons.push(format!("时间上限 {} 秒", self.limits.timeout.as_secs()));
+        }
+        if self.errors > 0 {
+            reasons.push(format!("{} 项无法读取", self.errors));
+        }
+        if self.skipped_links > 0 {
+            reasons.push(format!("{} 个链接/挂载/占位边界未跟随", self.skipped_links));
+        }
+        if self.unknown > 0 {
+            reasons.push(format!("{} 项实际占用未知", self.unknown));
+        }
+        if reasons.is_empty() {
+            "本次目录遍历结束；不等于卷全部已用空间".into()
+        } else {
+            reasons.join("；")
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub entries: usize,
     pub timeout: Duration,
@@ -50,6 +193,28 @@ impl Default for Limits {
             entries: 500_000,
             timeout: Duration::from_secs(300),
         }
+    }
+}
+impl Limits {
+    pub fn profile(index: usize) -> Self {
+        match index {
+            1 => Self {
+                entries: 1_000_000,
+                timeout: Duration::from_secs(600),
+            },
+            2 => Self {
+                entries: 2_000_000,
+                timeout: Duration::from_secs(1200),
+            },
+            _ => Self::default(),
+        }
+    }
+    pub fn label(&self) -> String {
+        format!(
+            "{}万 / {}分",
+            self.entries / 10_000,
+            self.timeout.as_secs() / 60
+        )
     }
 }
 #[derive(Debug)]
@@ -179,6 +344,10 @@ pub fn scan(
         partial: false,
         cancelled: false,
         elapsed: Duration::ZERO,
+        entry_limit_reached: false,
+        time_limit_reached: false,
+        limits,
+        volume: volume_space(&root).ok(),
     };
     let mut stack = vec![(root, None)];
     let mut seen = HashSet::new();
@@ -188,8 +357,14 @@ pub fn scan(
             result.cancelled = true;
             break;
         }
-        if result.nodes.len() >= limits.entries || start.elapsed() > limits.timeout {
+        if result.nodes.len() >= limits.entries {
             result.partial = true;
+            result.entry_limit_reached = true;
+            break;
+        }
+        if start.elapsed() > limits.timeout {
+            result.partial = true;
+            result.time_limit_reached = true;
             break;
         }
         let m = match std::fs::symlink_metadata(&path) {
@@ -234,6 +409,10 @@ pub fn scan(
             parent,
             children: vec![],
             entries: 1,
+            files: u64::from(m.is_file()),
+            directories: u64::from(m.is_dir()),
+            category: category(&path, m.is_dir()),
+            own_allocated: allocated,
             directory: m.is_dir(),
             logical: if m.is_file() { m.len() } else { 0 },
             mtime: m
@@ -260,6 +439,7 @@ pub fn scan(
                         if cancel.load(Ordering::Relaxed) || start.elapsed() > limits.timeout {
                             result.partial = true;
                             result.cancelled = cancel.load(Ordering::Relaxed);
+                            result.time_limit_reached = start.elapsed() > limits.timeout;
                             break;
                         }
                         match e {
@@ -269,8 +449,9 @@ pub fn scan(
                                 result.partial = true;
                             }
                         }
-                        if children.len() > limits.entries {
+                        if children.len() >= limits.entries {
                             result.partial = true;
+                            result.entry_limit_reached = true;
                             break;
                         }
                     }
@@ -286,15 +467,38 @@ pub fn scan(
             }
         }
     }
+    let mut colors = result
+        .nodes
+        .iter()
+        .map(|n| {
+            let mut c = [0u64; 6];
+            c[n.category] = n.own_allocated;
+            c
+        })
+        .collect::<Vec<_>>();
     // Postorder aggregation: every child's allocated size is credited once only.
     for i in (0..result.nodes.len()).rev() {
         if let Some(p) = result.nodes[i].parent {
             let logical = result.nodes[i].logical;
             let occupied = result.nodes[i].allocated;
             let entries = result.nodes[i].entries;
+            result.nodes[p].files += result.nodes[i].files;
+            result.nodes[p].directories += result.nodes[i].directories;
+            result.nodes[p].uncertain |= result.nodes[i].uncertain;
+            for k in 0..6 {
+                colors[p][k] = colors[p][k].saturating_add(colors[i][k]);
+            }
             result.nodes[p].entries = result.nodes[p].entries.saturating_add(entries);
             result.nodes[p].logical = result.nodes[p].logical.saturating_add(logical);
             result.nodes[p].allocated = result.nodes[p].allocated.saturating_add(occupied);
+        }
+    }
+    let sizes = result.nodes.iter().map(|n| n.allocated).collect::<Vec<_>>();
+    for (i, n) in result.nodes.iter_mut().enumerate() {
+        n.children
+            .sort_by_key(|&j| (std::cmp::Reverse(sizes[j]), j));
+        if n.directory {
+            n.category = (0..6).max_by_key(|&k| colors[i][k]).unwrap_or(0);
         }
     }
     result.elapsed = start.elapsed();
@@ -479,5 +683,67 @@ mod tests {
             Limits::default(),
         );
         assert!(result.is_err() || result.as_ref().is_ok_and(|s| s.partial && s.cancelled));
+    }
+}
+
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+    #[test]
+    fn binary_units_are_not_decimal_gb() {
+        assert_eq!(format_bytes(1024u64.pow(3)), "1.00 GiB");
+        assert_eq!(format_bytes(1000), "1000 B");
+    }
+    #[test]
+    fn volume_used_is_total_minus_physical_free_not_quota_available() {
+        let v = VolumeSpace {
+            root: PathBuf::new(),
+            total: 100,
+            free: 40,
+            available: 10,
+        };
+        assert_eq!(v.used(), 60);
+    }
+    #[test]
+    fn entry_limit_is_explicit_and_display_does_not_limit_scan_recursion() {
+        let p = std::env::temp_dir().join(format!("findx-du-accounting-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(p.join("a/b/c/d/e/f/g")).unwrap();
+        std::fs::write(p.join("a/b/c/d/e/f/g/media.bmp"), vec![1u8; 16384]).unwrap();
+        let c = || Arc::new(AtomicBool::new(false));
+        let prog = || Arc::new(Progress::default());
+        let limited = scan(
+            &p,
+            c(),
+            prog(),
+            Limits {
+                entries: 3,
+                timeout: Duration::from_secs(3),
+            },
+        )
+        .unwrap();
+        assert!(limited.entry_limit_reached && limited.partial);
+        assert!(limited.partial_reasons().contains("条目上限 3"));
+        let full = scan(&p, c(), prog(), Limits::default()).unwrap();
+        assert!(!full.partial);
+        assert_eq!(full.nodes[0].files, 1);
+        assert_eq!(full.nodes[0].directories, 8);
+        assert_eq!(full.nodes[0].category, 2);
+        assert_eq!(full.nodes[0].entries, 9);
+        std::fs::remove_dir_all(p).unwrap();
+    }
+    #[test]
+    fn profiles_remain_finite_and_explicit() {
+        for i in 0..3 {
+            let l = Limits::profile(i);
+            assert!(l.entries <= 2_000_000 && l.timeout <= Duration::from_secs(1200));
+        }
+        assert_eq!(Limits::profile(0).entries, 500_000);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn volume_api_fixture_obeys_physical_invariants() {
+        let v = volume_space(&std::env::temp_dir()).unwrap();
+        assert!(v.total > 0 && v.free <= v.total && v.used() <= v.total);
     }
 }

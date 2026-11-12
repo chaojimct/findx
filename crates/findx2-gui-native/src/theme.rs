@@ -54,22 +54,22 @@ impl FindxTokens {
     pub fn allocation_color(&self, category: usize) -> Hsla {
         let colors = match (self.style, self.bg.l < 0.4) {
             (ThemeStyle::Warm, false) => {
-                [0xc9d2d8, 0xe0c5bf, 0xe4d4ad, 0xc4d1bf, 0xd1c6db, 0xd9d2b7]
+                [0xc3cedb, 0xb8d8f5, 0xb9dcd0, 0xd5c2ef, 0xf3d29d, 0xf0bfc5]
             }
             (ThemeStyle::VSCode, false) => {
-                [0xc5d6e7, 0xe1c4cd, 0xe5d6b4, 0xbcd4cf, 0xd1cae3, 0xd8d9ba]
+                [0xbacbdf, 0xaed5fa, 0xa8dacd, 0xcbb7ed, 0xf0cb92, 0xeeb1c1]
             }
             (ThemeStyle::Neutral, false) => {
-                [0xcdd1d5, 0xdacdd0, 0xdddbc9, 0xcbd6d2, 0xd3d0dc, 0xd6d6cc]
+                [0xc8d0dc, 0xbcd6ef, 0xbddbd1, 0xd2c2e8, 0xebcfaa, 0xe9c0c8]
             }
             (ThemeStyle::Warm, true) => {
-                [0x484d53, 0x59474a, 0x5e5139, 0x40544c, 0x514959, 0x55543f]
+                [0x3e5266, 0x325d87, 0x315f51, 0x594375, 0x6d542f, 0x754552]
             }
             (ThemeStyle::VSCode, true) => {
-                [0x3b4b5c, 0x59434b, 0x5c503b, 0x3b5355, 0x4e465f, 0x51533d]
+                [0x354a60, 0x28547c, 0x285747, 0x50396e, 0x634c28, 0x6b394b]
             }
             (ThemeStyle::Neutral, true) => {
-                [0x494c50, 0x53484b, 0x545244, 0x45504c, 0x4c4955, 0x4e5047]
+                [0x415267, 0x365d82, 0x365e53, 0x584573, 0x695330, 0x704753]
             }
         };
         rgb(colors[category % colors.len()]).into()
