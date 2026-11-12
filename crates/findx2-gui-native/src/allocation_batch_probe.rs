@@ -1,5 +1,5 @@
-//! Public Windows API experiment, test-only: NEVER used by production scans.
-//! Establishes throughput and the allocation/128-bit identity contract before a future walker change.
+//! Public Windows API allocation/128-bit identity fixture.
+//! Validates the production batch walker against the previous exact per-path implementation.
 use super::*;
 use std::io::Write as _;
 use std::{
@@ -188,4 +188,45 @@ fn bounded_batch_api_fixture_preserves_full_file_ids_and_measures_allocation_dif
             compression.is_ok()
         );
     }
+    let progress = Arc::new(Progress::default());
+    let production = super::scan(
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        progress.clone(),
+        Limits::default(),
+    )
+    .unwrap();
+    assert!(!production.partial && production.unknown == 0);
+    assert_eq!(production.hardlinks, 1);
+    let mut seen = std::collections::HashSet::new();
+    let expected = traditional
+        .values()
+        .filter(|i| seen.insert(i.identity))
+        .map(|i| i.allocated)
+        .sum::<u64>()
+        + info(&root).unwrap().allocated;
+    assert_eq!(
+        production.nodes[0].allocated, expected,
+        "production allocation must match actual refined/deduplicated allocation, not logical size"
+    );
+    for name in ["resident.bin", "sparse.bin", "compressed.bin"] {
+        let node = production
+            .nodes
+            .iter()
+            .find(|n| n.path.file_name().is_some_and(|x| x == name))
+            .unwrap();
+        assert!(!node.uncertain);
+        assert_eq!(
+            node.allocated,
+            traditional[std::ffi::OsStr::new(name)].allocated
+        );
+    }
+    assert!(progress.metadata_calls.load(Ordering::Relaxed) < 16);
+    println!(
+        "production mixed fixture: hardlinks={} unknown={} batch_calls={} metadata_queries={}",
+        production.hardlinks,
+        production.unknown,
+        progress.directory_calls.load(Ordering::Relaxed),
+        progress.metadata_calls.load(Ordering::Relaxed)
+    );
 }

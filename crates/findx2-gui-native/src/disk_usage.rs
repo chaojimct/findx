@@ -1,6 +1,5 @@
 //! Read-only allocated-space model. No search hits, GUI dependency, deletion or persistent index.
 use std::{
-    collections::HashSet,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -31,6 +30,11 @@ pub struct Progress {
     pub entries: AtomicU64,
     pub allocated: AtomicU64,
     pub directories: AtomicU64,
+    pub directory_calls: AtomicU64,
+    pub metadata_calls: AtomicU64,
+    pub active_workers: AtomicU64,
+    pub peak_workers: AtomicU64,
+    pub(crate) preview: std::sync::Mutex<crate::disktree::scan_preview::Builder>,
 }
 #[derive(Debug)]
 pub struct Scan {
@@ -217,10 +221,13 @@ impl Limits {
         )
     }
 }
+#[cfg(not(windows))]
+use std::collections::HashSet;
 #[derive(Debug)]
 struct Info {
     identity: (u64, u128),
     allocated: u64,
+    #[cfg(not(windows))]
     links: u32,
 }
 #[cfg(windows)]
@@ -291,7 +298,6 @@ fn info(path: &Path) -> Result<Info, String> {
             u128::from_le_bytes(id.FileId.Identifier),
         ),
         allocated,
-        links: standard.NumberOfLinks,
     })
 }
 #[cfg(unix)]
@@ -319,6 +325,7 @@ fn boundary(m: &std::fs::Metadata) -> bool {
         m.is_symlink()
     }
 }
+#[cfg(not(windows))]
 pub fn scan(
     root: &Path,
     cancel: Arc<AtomicBool>,
@@ -751,3 +758,23 @@ mod accounting_tests {
 #[cfg(all(test, windows))]
 #[path = "allocation_batch_probe.rs"]
 mod allocation_batch_probe;
+
+#[cfg(windows)]
+#[path = "usage_scan.rs"]
+mod usage_scan;
+#[cfg(windows)]
+pub fn scan(
+    root: &Path,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<Progress>,
+    limits: Limits,
+) -> Result<Scan, String> {
+    usage_scan::scan(root, cancel, progress, limits)
+}
+/// Stable root identity for cache validation; never a recursive freshness claim.
+pub(crate) fn root_identity(root: &Path) -> Option<(u64, u128)> {
+    {
+        let id = info(root).ok()?.identity;
+        (id.1 != 0).then_some(id)
+    }
+}

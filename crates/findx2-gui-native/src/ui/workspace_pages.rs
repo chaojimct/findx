@@ -635,7 +635,9 @@ impl MainWindow {
                         "开始扫描"
                     })
                     .disabled(self.workspace.scanning || self.workspace.op_busy)
-                    .on_click(cx.listener(|this, _, _, cx| this.start_workspace_scan(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.start_workspace_scan(this.scan_node().is_some(), cx)
+                    })),
             )
             .when(self.workspace.scanning, |view| {
                 view.child(
@@ -701,9 +703,10 @@ impl MainWindow {
                     .text_sm()
                     .text_color(tokens.text_secondary)
                     .child(div().flex_1().min_w_0().text_ellipsis().child(summary))
-                    .child(div().text_xs().child("单击选择 · 双击目录钻取")),
+                    .child(Button::new("usage-reset-compact").ghost().h(px(24.)).label(format!("{:.0}%",self.workspace.usage_camera.scale*100.)).tooltip("滚轮以指针缩放；边界再滚进入/返回；Shift 横移，Ctrl 平移，0 复位，不重扫").on_click(cx.listener(|this,_,_,cx|{this.workspace.usage_camera.reset();this.workspace.usage_transition=None;cx.notify();})))
+                    .child(Button::new("usage-advanced-toggle").ghost().icon(IconName::Settings).w(px(26.)).h(px(24.)).px_0().selected(self.workspace.usage_advanced).tooltip("显示层数、减少动态与扫描预算").on_click(cx.listener(|this,_,_,cx|{this.workspace.usage_advanced=!this.workspace.usage_advanced;cx.notify();}))),
             )
-            .child(
+            .when(self.workspace.usage_advanced,|view|view.child(
                 h_flex().h(px(32.)).px_3().gap_1().flex_shrink_0().text_xs()
                     .child(Button::new("usage-depth-down").ghost().icon(IconName::Minus).w(px(24.)).h(px(24.)).px_0()
                         .accessibility_label("减少显示层数").disabled(self.workspace.usage_depth <= 1)
@@ -733,23 +736,14 @@ impl MainWindow {
                         .tooltip("手动选择下一次扫描的资源上限；较高上限可能占用大量内存，不会自动开始扫描")
                         .disabled(self.workspace.scanning)
                         .on_click(cx.listener(|this,_,_,cx|{this.workspace.usage_limit_profile=(this.workspace.usage_limit_profile+1)%3;cx.notify();}))),
-            )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .items_stretch()
-                    .child(map)
-                    .child(self.render_usage_details(selected, root, cx)),
-            )
+            ))
             .child(
                 h_flex()
                     .px_3()
-                    .py_2()
+                    .h(px(26.))
                     .gap_3()
                     .flex_shrink_0()
-                    .border_t_1()
+                    .border_b_1()
                     .border_color(tokens.border)
                     .text_xs()
                     .text_color(tokens.text_secondary)
@@ -778,8 +772,47 @@ impl MainWindow {
                         }),
                     )
                     .child(div().flex_1())
-                    .child("实际占用 ≠ 可回收量"),
+                    .child("滚轮缩放 / 层级 · 双击进入"),
             )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .items_stretch()
+                    .child(map)
+                    .child(self.render_usage_details(selected, root, cx)),
+            )
+            .child(self.render_usage_capacity(cx))
+    }
+
+    fn render_usage_capacity(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = Self::tokens(cx);
+        let mut row = h_flex()
+            .id("usage-volume-capacity")
+            .h(px(30.))
+            .w_full()
+            .px_3()
+            .gap_2()
+            .flex_shrink_0()
+            .border_t_1()
+            .border_color(t.border)
+            .text_xs()
+            .text_color(t.text_secondary);
+        if let Some(v) = self.workspace.scan.as_ref().and_then(|s| s.volume.as_ref()) {
+            let ratio = if v.total > 0 {
+                v.used() as f32 / v.total as f32
+            } else {
+                0.
+            };
+            row=row.child(div().flex_shrink_0().child(format!("卷 {}",display_path(&v.root))))
+                .child(div().flex_1().h(px(4.)).rounded_sm().bg(t.border_soft).child(div().h_full().w(relative(ratio.clamp(0.,1.))).bg(t.accent)))
+                .child(div().flex_shrink_0().child(format!("系统已用 {} · 可用 {}",disk_usage::format_bytes(v.used()),disk_usage::format_bytes(v.available))))
+                .tooltip(|w,cx|gpui_kit::component::tooltip::Tooltip::new("卷容量为扫描时点；系统已用含未扫描目录、保留及元数据。目录实测分配、文件逻辑长度、系统卷已用是三种口径，不相减推算可清理量。当前仅计无名数据流，ADS 不在承诺范围。").build(w,cx));
+        } else {
+            row = row.child("目录逻辑长度 / 已测实际分配 / 系统卷已用为不同口径 · 未知不是 0");
+        }
+        row.into_any_element()
     }
 
     pub(super) fn usage_empty(&self, label: &str, tokens: FindxTokens) -> impl IntoElement {
@@ -830,10 +863,6 @@ impl MainWindow {
             } else {
                 0.
             };
-            if let Some(v) = &scan.volume {
-                panel=panel.child(div().text_xs().text_color(tokens.text_secondary).child(format!("系统卷 {}（扫描开始时）\n已用 {} · 可用 {}\n容量 {}",display_path(&v.root),disk_usage::format_bytes(v.used()),disk_usage::format_bytes(v.free),disk_usage::format_bytes(v.total))))
-                    .child(div().text_xs().text_color(tokens.text_tertiary).child("卷已用包含未扫描目录、系统保留/元数据；受权限、链接边界及扫描时点影响，不应与目录合计直接相减当作可清理量。"));
-            }
             if scan.partial {
                 panel = panel.child(
                     div()
@@ -859,7 +888,7 @@ impl MainWindow {
                 )
                 .child(
                     div()
-                        .text_3xl()
+                        .text_2xl()
                         .child(disk_usage::format_bytes(node.allocated)),
                 )
                 .child(div().text_xs().text_color(tokens.text_secondary).child(
@@ -941,7 +970,10 @@ impl MainWindow {
                                 .px_0()
                                 .tooltip("在文件中定位")
                                 .accessibility_label("在文件中定位")
-                                .on_click(cx.listener(|this, _, _, cx| this.workspace_reveal(cx))),
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_usage_node(index, false, cx);
+                                    this.workspace_reveal(cx)
+                                })),
                         )
                         .when(node.directory, |v| {
                             v.child(

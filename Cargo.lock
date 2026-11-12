@@ -2267,6 +2267,8 @@ dependencies = [
  "libc",
  "quick-xml 0.32.0",
  "raw-window-handle",
+ "rayon",
+ "rustc-hash 2.1.3",
  "serde",
  "serde_json",
  "tokio",

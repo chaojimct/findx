@@ -215,6 +215,7 @@ pub(super) struct Workspace {
     pub(super) listing: bool,
     window: AnyWindowHandle,
     usage_depth: usize,
+    usage_advanced: bool,
     usage_limit_profile: usize,
     scan: Option<Arc<Scan>>,
     usage_scene: Option<Arc<crate::usage_view::Scene>>,
@@ -224,6 +225,17 @@ pub(super) struct Workspace {
     usage_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
     usage_map_focus: FocusHandle,
     usage_transition: Option<usage_ui::Transition>,
+    usage_frame: std::rc::Rc<
+        std::cell::RefCell<
+            Vec<(
+                crate::usage_view::TileKey,
+                crate::usage_view::Rect,
+                Option<crate::usage_view::Rect>,
+            )>,
+        >,
+    >,
+    usage_hover: Option<crate::usage_view::TileKey>,
+    usage_wheel_gate: crate::usage_view::WheelGate,
     scan_lookup: HashMap<String, usize>,
     scan_generation: u64,
     scan_cancel: Arc<AtomicBool>,
@@ -326,6 +338,7 @@ impl Workspace {
             listing: false,
             window: window.window_handle(),
             usage_depth: 3,
+            usage_advanced: false,
             usage_limit_profile: 0,
             scan: None,
             usage_scene: None,
@@ -335,6 +348,9 @@ impl Workspace {
             usage_bounds: Default::default(),
             usage_map_focus: cx.focus_handle(),
             usage_transition: None,
+            usage_frame: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            usage_hover: None,
+            usage_wheel_gate: crate::usage_view::WheelGate::default(),
             scan_lookup: HashMap::new(),
             scan_generation: 0,
             scan_cancel: Arc::new(AtomicBool::new(false)),
@@ -826,7 +842,9 @@ impl MainWindow {
                     self.restore_page_context(state, cx);
                 }
                 let focus = self.active_workspace_hit().map(|h| h.path);
-                self.show_scanned_directory(focus, cx);
+                if !self.show_scanned_directory(focus, cx) {
+                    self.load_usage_cache(cx);
+                }
             }
         }
         self.preview_active_selection(cx);
@@ -969,6 +987,7 @@ impl MainWindow {
             if !self.show_scanned_directory(focus.clone(), cx) {
                 self.workspace.status = "待扫描 · 只有明确开始才会读取占用".into();
                 self.set_workspace_rows(vec![], None, true, cx);
+                self.load_usage_cache(cx);
             }
             cx.notify();
             return;
@@ -1089,9 +1108,8 @@ impl MainWindow {
         if self.workspace.mode == ViewMode::Search {
             self.run_search(cx);
         } else if self.workspace.mode == ViewMode::Usage {
-            self.workspace.scan_status =
-                "请使用「开始扫描 / 重新扫描」明确发起；普通刷新不重扫".into();
-            cx.notify();
+            // F5/刷新 is an explicit gesture; navigation alone only loads cache.
+            self.start_workspace_scan(true, cx);
         } else {
             let p = self.workspace.location.clone();
             let focus = self.active_workspace_hit().map(|h| h.path);
@@ -1205,33 +1223,91 @@ impl MainWindow {
             }
         }
     }
-    fn start_workspace_scan(&mut self, cx: &mut Context<Self>) {
-        if self.workspace.op_busy || self.workspace.scanning {
+    fn load_usage_cache(&mut self, cx: &mut Context<Self>) {
+        if self.workspace.scanning {
             return;
         }
-        self.workspace.scan_cancel.store(true, Ordering::Release);
-        self.workspace.scan_cancel = Arc::new(AtomicBool::new(false));
-        self.workspace.progress = Arc::new(Progress::default());
+        let location = self.workspace.location.clone();
+        let generation = self.workspace.scan_generation;
+        cx.spawn(async move |this, cx| {
+            let requested = location.clone();
+            let value = cx
+                .background_spawn(async move {
+                    crate::usage_cache::Repository::global()
+                        .lookup(&requested)
+                        .map(|value| {
+                            let lookup = value
+                                .scan
+                                .nodes
+                                .iter()
+                                .enumerate()
+                                .map(|(i, n)| (key(&n.path), i))
+                                .collect::<HashMap<_, _>>();
+                            (value, lookup)
+                        })
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.workspace.mode != ViewMode::Usage
+                    || this.workspace.location != location
+                    || this.workspace.scanning
+                    || this.workspace.scan_generation != generation
+                {
+                    return;
+                }
+                if let Some((value, lookup)) = value {
+                    let old_lookup = std::mem::replace(&mut this.workspace.scan_lookup, lookup);
+                    cx.background_executor()
+                        .spawn(async move {
+                            drop(old_lookup);
+                        })
+                        .detach();
+                    this.workspace.scan_status = value.label();
+                    this.workspace.scan_stale = true;
+                    let previous = this.workspace.scan.replace(value.scan);
+                    cx.background_executor()
+                        .spawn(async move {
+                            drop(previous);
+                        })
+                        .detach();
+                    this.show_scanned_directory(None, cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+    fn start_workspace_scan(&mut self, force: bool, cx: &mut Context<Self>) {
+        if self.workspace.op_busy || self.file_actions.busy || self.workspace.scanning {
+            return;
+        }
         self.workspace.scan_generation = self.workspace.scan_generation.wrapping_add(1);
         let generation = self.workspace.scan_generation;
         let path = self.workspace.location.clone();
-        let cancel = self.workspace.scan_cancel.clone();
-        let progress = self.workspace.progress.clone();
-        let limits = Limits::profile(self.workspace.usage_limit_profile);
+        let repository = crate::usage_cache::Repository::global();
+        let job = repository.request(
+            &path,
+            force,
+            Limits::profile(self.workspace.usage_limit_profile),
+        );
+        self.workspace.scan_cancel = job.cancel.clone();
+        self.workspace.progress = job.progress.clone();
         self.workspace.scanning = true;
         self.workspace.scan_status = "扫描当前目录 · 搜索可用 · 不跟随链接/挂载".into();
         self.workspace.scan_stale = false;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    disk_usage::scan(&path, cancel, progress, limits).map(|s| {
-                        let lookup = s
+                    repository.run(&job).map(|value| {
+                        let lookup = value
+                            .scan
                             .nodes
                             .iter()
                             .enumerate()
                             .map(|(i, n)| (key(&n.path), i))
                             .collect::<HashMap<_, _>>();
-                        (s, lookup)
+                        (value, lookup)
                     })
                 })
                 .await;
@@ -1241,19 +1317,16 @@ impl MainWindow {
                 }
                 this.workspace.scanning = false;
                 match result {
-                    Ok((s, lookup)) => {
+                    Ok((value, lookup)) => {
+                        this.workspace.scan_stale =
+                            value.source != crate::usage_cache::Source::Measured;
                         this.workspace.scan_status = format!(
-                            "{} · {} 秒 · {} · 硬链接去重 {}",
-                            if s.partial {
-                                "部分结果"
-                            } else {
-                                "目录遍历完成"
-                            },
-                            s.elapsed.as_secs(),
-                            s.partial_reasons(),
-                            s.hardlinks
+                            "{} · {} · 硬链接去重 {}",
+                            value.label(),
+                            value.scan.partial_reasons(),
+                            value.scan.hardlinks
                         );
-                        let previous_scan = this.workspace.scan.replace(Arc::new(s));
+                        let previous_scan = this.workspace.scan.replace(value.scan);
                         let previous_lookup =
                             std::mem::replace(&mut this.workspace.scan_lookup, lookup);
                         cx.background_executor()
