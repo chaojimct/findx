@@ -673,15 +673,20 @@ impl MainWindow {
                                     .text_size(px(12.))
                                     .overflow_hidden()
                                     .label(names[index].clone())
+                                    .when(index == last, |button| {
+                                        button.font_weight(FontWeight::SEMIBOLD)
+                                    })
                                     .tooltip(tooltip)
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.workspace_navigate(
-                                            path.clone(),
-                                            this.workspace.mode,
-                                            None,
-                                            true,
-                                            cx,
-                                        )
+                                        if key(&path) != key(&this.workspace.location) {
+                                            this.workspace_navigate(
+                                                path.clone(),
+                                                this.workspace.mode,
+                                                None,
+                                                true,
+                                                cx,
+                                            );
+                                        }
                                     })),
                             )
                             .child(
