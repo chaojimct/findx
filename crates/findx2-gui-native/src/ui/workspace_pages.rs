@@ -250,7 +250,7 @@ impl MainWindow {
         )
     }
 
-    fn render_directory_toolbar(&self, _preview: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_directory_toolbar(&self, _preview: bool, cx: &mut Context<Self>) -> AnyElement {
         let tokens = Self::tokens(cx);
         h_flex()
             .w_full()
@@ -272,6 +272,7 @@ impl MainWindow {
                     }))
                     .child(Input::new(&self.workspace.filter_input).cleanable(true)),
             )
+            .into_any_element()
     }
 
     // Sidebar anatomy is fixed for every group and item. No label-sized centring.
@@ -623,7 +624,7 @@ impl MainWindow {
                     .h(px(30.))
                     .label(if self.workspace.scanning {
                         "扫描中…"
-                    } else if self.workspace.scan.is_some() {
+                    } else if self.scan_node().is_some() {
                         "重新扫描"
                     } else {
                         "开始扫描"

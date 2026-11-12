@@ -359,7 +359,7 @@ impl MainWindow {
         &self,
         preview: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let tokens = Self::tokens(cx);
         h_flex()
             .w_full()
@@ -454,17 +454,17 @@ impl MainWindow {
                                     )
                                 },
                             ))
-                    })),
-            )
-            .child(
-                Button::new("new-directory-tab")
-                    .ghost()
-                    .w(px(28.))
-                    .h(px(28.))
-                    .px_0()
-                    .icon(Icon::new(IconName::Plus).size_3p5())
-                    .accessibility_label("新建目录标签")
-                    .on_click(cx.listener(|this, _, w, cx| this.new_directory_tab(w, cx))),
+                    }))
+                    .child(
+                        Button::new("new-directory-tab")
+                            .ghost()
+                            .w(px(28.))
+                            .h(px(28.))
+                            .px_0()
+                            .icon(Icon::new(IconName::Plus).size_3p5())
+                            .accessibility_label("新建目录标签")
+                            .on_click(cx.listener(|this, _, w, cx| this.new_directory_tab(w, cx))),
+                    ),
             )
             .child(
                 self.tool_button("directory-actions", "", 2, false, cx)
@@ -478,6 +478,7 @@ impl MainWindow {
                     .px_0()
                     .accessibility_label("预览"),
             )
+            .into_any_element()
     }
     pub(super) fn render_address(&self, cx: &mut Context<Self>) -> AnyElement {
         let tokens = Self::tokens(cx);
@@ -524,6 +525,30 @@ impl MainWindow {
                     }
                 }
             }))
+            .capture_action(
+                cx.listener(|this, _: &gpui_kit::base::input::Escape, window, cx| {
+                    let input = this.workspace.path.read(cx);
+                    let internal_popup = input.has_selection_focus(window, cx)
+                        && !input.focus_handle(cx).contains_focused(window, cx);
+                    if !this.workspace.editing_path
+                        || internal_popup
+                        || this.address_is_composing(window, cx)
+                    {
+                        cx.propagate();
+                        return;
+                    }
+                    this.cancel_path_edit(cx);
+                    this.focus.focus(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .capture_action(
+                cx.listener(|this, _: &gpui_kit::base::input::Enter, window, cx| {
+                    this.workspace.path_ime_enter =
+                        this.workspace.editing_path && this.address_is_composing(window, cx);
+                    cx.propagate();
+                }),
+            )
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let composing =
                     this.workspace.editing_path && this.address_is_composing(window, cx);
@@ -665,6 +690,7 @@ impl MainWindow {
                             .child(
                                 Button::new(SharedString::from(format!("path-crumb-{index}")))
                                     .ghost()
+                                    .with_size(gpui_kit::component::Size::XSmall)
                                     .h(px(24.))
                                     .w(px((width - 18.).max(18.)))
                                     .min_w_0()

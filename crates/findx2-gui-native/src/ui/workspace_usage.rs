@@ -45,6 +45,14 @@ impl MainWindow {
             return;
         };
         let Some(root) = self.scan_node() else {
+            if self.workspace.usage_scene_key.is_some() || self.workspace.usage_scene.is_some() {
+                self.workspace.usage_scene_generation =
+                    self.workspace.usage_scene_generation.wrapping_add(1);
+                self.workspace.usage_scene_key = None;
+                self.workspace.usage_scene = None;
+                self.workspace.usage_transition = None;
+                self.workspace.usage_camera.reset();
+            }
             return;
         };
         let bounds = self.workspace.usage_bounds.get();
@@ -191,6 +199,14 @@ impl MainWindow {
                 }
                 cx.stop_propagation();
             }));
+        if self.workspace.scan.is_some() && self.scan_node().is_none() {
+            return view
+                .child(self.usage_empty(
+                    "当前目录不在已测范围内。点击开始扫描测量此目录；不会自动扫描。",
+                    tokens,
+                ))
+                .into_any_element();
+        }
         let Some(scan) = self.workspace.scan.as_ref() else {
             return view
                 .child(self.usage_empty(
@@ -234,6 +250,10 @@ impl MainWindow {
             .copied();
         let camera = self.workspace.usage_camera;
         for tile in &scene.tiles {
+            // The root is the map background, not an overlapping clickable sibling.
+            if tile.depth == 0 {
+                continue;
+            }
             let base = self
                 .workspace
                 .usage_transition
@@ -287,6 +307,7 @@ impl MainWindow {
                 .w(px(rect.w))
                 .h(px(rect.h))
                 .overflow_hidden()
+                .occlude()
                 .border_1()
                 .border_color(if index.is_some() && index == selected {
                     tokens.accent
