@@ -39,6 +39,7 @@ pub mod platform;
 pub mod query;
 pub mod search;
 pub mod trigram;
+pub mod usage;
 
 pub use error::Error;
 pub use index::{

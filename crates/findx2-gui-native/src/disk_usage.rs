@@ -38,6 +38,8 @@ pub struct Progress {
 }
 #[derive(Debug)]
 pub struct Scan {
+    /// Some only for engine logical views; allocated fields remain zero/unmeasured.
+    pub logical_generation: Option<(u64, u64)>,
     pub nodes: Vec<Node>,
     pub errors: u64,
     pub skipped_links: u64,
@@ -161,6 +163,13 @@ pub fn category(path: &Path, directory: bool) -> usize {
     }
 }
 impl Scan {
+    pub fn weight(&self, n: &Node) -> u64 {
+        if self.logical_generation.is_some() {
+            n.logical
+        } else {
+            n.allocated
+        }
+    }
     pub fn partial_reasons(&self) -> String {
         let mut reasons = Vec::new();
         if self.cancelled {
@@ -490,6 +499,7 @@ pub fn scan(
     }
     let volume = info(&root)?.identity.0;
     let mut result = Scan {
+        logical_generation: None,
         nodes: vec![],
         errors: 0,
         skipped_links: 0,
@@ -1015,6 +1025,7 @@ mod accounting_tests {
         assert_eq!(stop, Some(Admission::MemoryBudget));
         assert!(count > 0 && count < 100_000);
         let mut scan = Scan {
+            logical_generation: None,
             nodes: vec![],
             errors: 0,
             skipped_links: 0,

@@ -1,4 +1,11 @@
-//! `IndexStore` 与 `IndexBuilder`：SIMD 友好的连续 `names_buf` + 平行 `entries`。
+//! `IndexStore` and `IndexBuilder`: compact indexed namespace.
+/// Volume-qualified mutation targets resolved by the engine runtime, never by a global FRN alias.
+#[derive(Clone, Copy, Debug)]
+pub struct ResolvedMutation {
+    pub entry: Option<u32>,
+    pub parent: u32,
+    pub directory: Option<u32>,
+}
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -884,9 +891,12 @@ impl IndexStore {
 
     /// 增量追加文件条目（假定父目录已在 `dirs` / `dir_index` 中）
     pub fn append_file_entry(&mut self, raw: &RawEntry) -> u32 {
+        self.append_file_entry_at(raw, None)
+    }
+    fn append_file_entry_at(&mut self, raw: &RawEntry, parent: Option<u32>) -> u32 {
         debug_assert!(!raw.is_dir);
         let name_off = self.append_name(raw.name.as_bytes(), true);
-        let dir_idx = *self.dir_index.get(&raw.parent_id).unwrap_or(&0);
+        let dir_idx = parent.unwrap_or_else(|| *self.dir_index.get(&raw.parent_id).unwrap_or(&0));
         let eh = hash_ext8(&raw.name);
         let attrs = FileEntry::pack_attrs_from_windows_file(raw.attrs) | ((eh as u32) << 8);
         let new_idx = self.entries.len() as u32;
@@ -1310,11 +1320,23 @@ impl IndexStore {
 
     /// 新目录（父须在 `dir_index` 中）
     pub fn append_dir_from_raw(&mut self, raw: &RawEntry) -> crate::Result<()> {
+        self.append_dir_from_raw_at(raw, None)
+    }
+    fn append_dir_from_raw_at(
+        &mut self,
+        raw: &RawEntry,
+        scope: Option<&ResolvedMutation>,
+    ) -> crate::Result<()> {
         debug_assert!(raw.is_dir);
-        if self.dir_index.contains_key(&raw.file_id) {
+        if scope.map_or_else(
+            || self.dir_index.contains_key(&raw.file_id),
+            |s| s.directory.is_some(),
+        ) {
             return Ok(());
         }
-        let parent_idx = if raw.parent_id == 0 {
+        let parent_idx = if let Some(scope) = scope {
+            scope.parent
+        } else if raw.parent_id == 0 {
             0u32
         } else {
             *self
@@ -1367,12 +1389,18 @@ impl IndexStore {
     }
 
     /// 已有 FRN 时由 Create（如 `RENAME_NEW_NAME`）回填元数据与路径
-    fn upsert_raw_entry(&mut self, raw: &RawEntry) -> crate::Result<()> {
-        let Some(&idx) = self.frn_to_entry.get(&raw.file_id) else {
+    fn upsert_raw_entry(
+        &mut self,
+        raw: &RawEntry,
+        scope: Option<&ResolvedMutation>,
+    ) -> crate::Result<()> {
+        let Some(idx) =
+            scope.map_or_else(|| self.frn_to_entry.get(&raw.file_id).copied(), |s| s.entry)
+        else {
             if raw.is_dir {
-                self.append_dir_from_raw(raw)?;
+                self.append_dir_from_raw_at(raw, scope)?;
             } else {
-                let _ = self.append_file_entry(raw);
+                let _ = self.append_file_entry_at(raw, scope.map(|s| s.parent));
             }
             return Ok(());
         };
@@ -1388,9 +1416,17 @@ impl IndexStore {
         }
 
         if raw.is_dir {
-            if let Some(di) = self.dirs.iter().position(|d| d.frn == raw.file_id) {
+            if let Some(di) = scope
+                .map_or_else(
+                    || self.dir_index.get(&raw.file_id).copied(),
+                    |s| s.directory,
+                )
+                .map(|i| i as usize)
+            {
                 let name_off = self.append_name(raw.name.as_bytes(), true);
-                let parent_idx = if raw.parent_id == 0 {
+                let parent_idx = if let Some(s) = scope {
+                    s.parent
+                } else if raw.parent_id == 0 {
                     0u32
                 } else {
                     *self.dir_index.get(&raw.parent_id).unwrap_or(&0)
@@ -1437,7 +1473,10 @@ impl IndexStore {
 
         let old = self.entries[idx as usize];
         let name_off = self.append_name(raw.name.as_bytes(), true);
-        let dir_idx = *self.dir_index.get(&raw.parent_id).unwrap_or(&0);
+        let dir_idx = scope.map_or_else(
+            || *self.dir_index.get(&raw.parent_id).unwrap_or(&0),
+            |s| s.parent,
+        );
         let eh = hash_ext8(&raw.name);
         self.ext_remove_idx(idx, old.ext_hash_u8());
         if let Some(e) = self.entries.get_mut(idx as usize) {
@@ -1468,8 +1507,10 @@ impl IndexStore {
         file_id: u64,
         new_parent_id: u64,
         new_name: &str,
+        scope: Option<&ResolvedMutation>,
     ) -> crate::Result<()> {
-        let Some(&idx) = self.frn_to_entry.get(&file_id) else {
+        let Some(idx) = scope.map_or_else(|| self.frn_to_entry.get(&file_id).copied(), |s| s.entry)
+        else {
             return Ok(());
         };
         if self.deleted.contains(idx) {
@@ -1490,7 +1531,7 @@ impl IndexStore {
         if is_dir {
             raw.attrs |= 0x10;
         }
-        self.upsert_raw_entry(&raw)?;
+        self.upsert_raw_entry(&raw, scope)?;
         Ok(())
     }
 
@@ -1543,19 +1584,60 @@ impl IndexStore {
     }
 
     /// USN / 外部增量：Rename、目录 Create、`DataOrMeta` 重排排序向量、扩展名桶
+    /// Fallible preflight for the growing contiguous namespace/log storage.
+    pub fn try_reserve_namespace_change(
+        &mut self,
+        name_bytes: usize,
+        new_entry: bool,
+        new_dir: bool,
+    ) -> std::result::Result<(), String> {
+        self.names_buf
+            .try_reserve(name_bytes.saturating_add(1))
+            .map_err(|_| "index name buffer allocation failed")?;
+        if new_entry {
+            self.entries
+                .try_reserve(1)
+                .map_err(|_| "index entry allocation failed")?;
+            self.frns
+                .try_reserve(1)
+                .map_err(|_| "index identity allocation failed")?;
+        }
+        if new_dir {
+            self.dirs
+                .try_reserve(1)
+                .map_err(|_| "index directory allocation failed")?;
+            self.dir_path_ranges
+                .try_reserve(1)
+                .map_err(|_| "index directory range allocation failed")?;
+        }
+        if let Some(log) = self.mutation_log.as_mut() {
+            log.try_reserve(8)
+                .map_err(|_| "index mutation log allocation failed")?;
+        }
+        Ok(())
+    }
     pub fn apply_change_event(&mut self, ev: &ChangeEvent) -> crate::Result<()> {
+        self.apply_change_event_resolved(ev, None)
+    }
+    pub fn apply_change_event_resolved(
+        &mut self,
+        ev: &ChangeEvent,
+        scope: Option<&ResolvedMutation>,
+    ) -> crate::Result<()> {
         match ev {
             ChangeEvent::Delete { file_id } => {
-                if let Some(&idx) = self.frn_to_entry.get(file_id) {
+                if let Some(idx) =
+                    scope.map_or_else(|| self.frn_to_entry.get(file_id).copied(), |s| s.entry)
+                {
                     self.delete_entry(idx);
                 }
                 Ok(())
             }
             ChangeEvent::Create { entry } => {
-                if self.excluded_for_raw(entry.parent_id, &entry.name) {
+                if scope.is_none() && self.excluded_for_raw(entry.parent_id, &entry.name) {
                     return Ok(());
                 }
-                self.upsert_raw_entry(entry)?;
+                self.upsert_raw_entry(entry, scope)?;
                 Ok(())
             }
             ChangeEvent::CreatePending {
@@ -1566,13 +1648,18 @@ impl IndexStore {
                 attrs,
                 is_dir,
             } => {
-                if self.excluded_for_raw(*parent_id, name) {
+                if scope.is_none() && self.excluded_for_raw(*parent_id, name) {
                     return Ok(());
                 }
-                if self.frn_to_entry.contains_key(file_id) {
+                if scope.map_or_else(
+                    || self.frn_to_entry.contains_key(file_id),
+                    |s| s.entry.is_some(),
+                ) {
                     // Linux 上 delete+recreate 常复用同一 inode：墓碑条目必须复活，
                     // 否则 apply_rename_mapped 对 deleted 直接 return，文件会永久搜不到。
-                    if let Some(&idx) = self.frn_to_entry.get(file_id) {
+                    if let Some(idx) =
+                        scope.map_or_else(|| self.frn_to_entry.get(file_id).copied(), |s| s.entry)
+                    {
                         if self.deleted.contains(idx) {
                             let raw = RawEntry {
                                 file_id: *file_id,
@@ -1585,16 +1672,21 @@ impl IndexStore {
                                 attrs: *attrs,
                                 is_dir: *is_dir,
                             };
-                            self.upsert_raw_entry(&raw)?;
+                            self.upsert_raw_entry(&raw, scope)?;
                             return Ok(());
                         }
                     }
                     // 已有存活条目（迟到的 RENAME_NEW_NAME / 重复 CREATE）：只搬名字/父链，
                     // 保留已有 size/mtime/ctime，再把 attrs 同步到最新。
                     // 追赶扫描 / 重复 Create 时若父链与名字未变，跳过 rename，避免 names 膨胀。
-                    let skip_rename = if let Some(&idx) = self.frn_to_entry.get(file_id) {
+                    let skip_rename = if let Some(idx) =
+                        scope.map_or_else(|| self.frn_to_entry.get(file_id).copied(), |s| s.entry)
+                    {
                         let e = &self.entries[idx as usize];
-                        let parent_dir = self.dir_index.get(parent_id).copied().unwrap_or(0);
+                        let parent_dir = scope.map_or_else(
+                            || self.dir_index.get(parent_id).copied().unwrap_or(0),
+                            |s| s.parent,
+                        );
                         let same_parent = e.dir_idx == parent_dir;
                         let same_name = self.name_bytes(e) == name.as_bytes();
                         same_parent && same_name
@@ -1602,9 +1694,11 @@ impl IndexStore {
                         false
                     };
                     if !skip_rename {
-                        self.apply_rename_mapped(*file_id, *parent_id, name)?;
+                        self.apply_rename_mapped(*file_id, *parent_id, name, scope)?;
                     }
-                    if let Some(&idx) = self.frn_to_entry.get(file_id) {
+                    if let Some(idx) =
+                        scope.map_or_else(|| self.frn_to_entry.get(file_id).copied(), |s| s.entry)
+                    {
                         if !self.deleted.contains(idx) {
                             if let Some(e) = self.entries.get_mut(idx as usize) {
                                 let eh = e.ext_hash_u8();
@@ -1630,7 +1724,7 @@ impl IndexStore {
                         attrs: *attrs,
                         is_dir: *is_dir,
                     };
-                    self.upsert_raw_entry(&raw)?;
+                    self.upsert_raw_entry(&raw, scope)?;
                 }
                 Ok(())
             }
@@ -1640,13 +1734,15 @@ impl IndexStore {
                 new_name,
             } => {
                 // 改名后的新位置若在排除目录里，等同删除（旧位置已不存在，新位置不入库）。
-                if self.excluded_for_raw(*new_parent_id, new_name) {
-                    if let Some(&idx) = self.frn_to_entry.get(file_id) {
+                if scope.is_none() && self.excluded_for_raw(*new_parent_id, new_name) {
+                    if let Some(idx) =
+                        scope.map_or_else(|| self.frn_to_entry.get(file_id).copied(), |s| s.entry)
+                    {
                         self.delete_entry(idx);
                     }
                     return Ok(());
                 }
-                self.apply_rename_mapped(*file_id, *new_parent_id, new_name)
+                self.apply_rename_mapped(*file_id, *new_parent_id, new_name, scope)
             }
             ChangeEvent::DataOrMeta {
                 file_id,
@@ -1655,13 +1751,15 @@ impl IndexStore {
                 ctime,
                 create_if_missing,
             } => {
-                let missing_or_tomb = match self.frn_to_entry.get(file_id) {
+                let missing_or_tomb = match scope
+                    .map_or_else(|| self.frn_to_entry.get(file_id).copied(), |s| s.entry)
+                {
                     None => true,
-                    Some(&idx) => self.deleted.contains(idx),
+                    Some(idx) => self.deleted.contains(idx),
                 };
                 if missing_or_tomb {
                     if let Some(c) = create_if_missing {
-                        if !self.excluded_for_raw(c.parent_id, &c.name) {
+                        if scope.is_some() || !self.excluded_for_raw(c.parent_id, &c.name) {
                             let raw = RawEntry {
                                 file_id: *file_id,
                                 file_id_128: None,
@@ -1673,19 +1771,23 @@ impl IndexStore {
                                 attrs: c.attrs,
                                 is_dir: c.is_dir,
                             };
-                            self.upsert_raw_entry(&raw)?;
+                            self.upsert_raw_entry(&raw, scope)?;
                         }
                     }
                     // 无回填信息或被排除：保持旧语义（静默忽略未知/墓碑 inode）。
-                    let still_bad = match self.frn_to_entry.get(file_id) {
+                    let still_bad = match scope
+                        .map_or_else(|| self.frn_to_entry.get(file_id).copied(), |s| s.entry)
+                    {
                         None => true,
-                        Some(&idx) => self.deleted.contains(idx),
+                        Some(idx) => self.deleted.contains(idx),
                     };
                     if still_bad {
                         return Ok(());
                     }
                 }
-                if let Some(&idx) = self.frn_to_entry.get(file_id) {
+                if let Some(idx) =
+                    scope.map_or_else(|| self.frn_to_entry.get(file_id).copied(), |s| s.entry)
+                {
                     if self.deleted.contains(idx) {
                         return Ok(());
                     }
@@ -2387,9 +2489,8 @@ pub fn merge_index_stores(stores: Vec<IndexStore>) -> crate::Result<IndexStore> 
         }
         for (mut d, (a, b)) in store.dirs.drain(..).zip(store.dir_path_ranges.drain(..)) {
             d.name_offset = d.name_offset.saturating_add(names_shift);
-            if d.parent_idx != 0 {
-                d.parent_idx = d.parent_idx.saturating_add(dir_base);
-            }
+            // Root 0 and children of root 0 are indexes too, not cross-volume sentinels.
+            d.parent_idx = d.parent_idx.saturating_add(dir_base);
             merged_dirs.push(d);
             merged_dir_path_ranges.push(if b > 0 {
                 (a.saturating_add(dp_shift), b)

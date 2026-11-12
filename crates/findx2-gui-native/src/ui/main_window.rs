@@ -364,7 +364,9 @@ impl MainWindow {
                 .as_deref(),
         ) {
             this.workspace_navigate(path, ViewMode::Usage, None, true, cx);
-            this.start_workspace_scan(true, cx);
+            if std::env::var_os("FINDX_NATIVE_USAGE_INDEXED").is_none() {
+                this.start_workspace_scan(true, cx);
+            }
         }
         this.schedule_status_poll(cx);
         if this.preview_file.is_some() {

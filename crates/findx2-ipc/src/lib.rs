@@ -55,6 +55,13 @@ pub enum IpcRequest {
         #[serde(default)]
         offset: usize,
     },
+    UsageCapabilities,
+    UsageChildren {
+        path: String,
+        expected: Option<(u64, u64)>,
+        after: Option<u32>,
+        max_bytes: usize,
+    },
     Status,
     Ping,
 }
@@ -137,6 +144,13 @@ pub enum IpcResponse {
         #[serde(default)]
         tombstone_count: Option<u64>,
     },
+    UsageCapabilitiesResult {
+        logical_tree: u32,
+        allocated: bool,
+    },
+    UsageChildrenResult {
+        page: UsagePageDto,
+    },
     Pong,
     Error {
         message: String,
@@ -196,5 +210,41 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+}
+
+/// Logical-only directory view. No physical allocation inference.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageItemDto {
+    pub id: u32,
+    pub name: String,
+    pub directory: bool,
+    pub logical: u64,
+    pub files: u64,
+    pub directories: u64,
+    pub unknown: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsagePageDto {
+    pub epoch: u64,
+    pub generation: u64,
+    pub root: UsageItemDto,
+    pub children: Vec<UsageItemDto>,
+    pub next: Option<u32>,
+    pub resident_bytes: usize,
+    pub state: String,
+    #[serde(default)]
+    pub watch_error: Option<String>,
+    #[serde(default)]
+    pub metadata_error: Option<String>,
+}
+
+#[cfg(test)]
+mod usage_health_tests {
+    #[test]
+    fn missing_optional_health_fields_decode_as_unknown_without_breaking_pages() {
+        let page: super::UsagePageDto=serde_json::from_value(serde_json::json!({"epoch":1,"generation":2,"root":{"id":0,"name":"fixture","directory":true,"logical":0,"files":0,"directories":1,"unknown":0},"children":[],"next":null,"resident_bytes":0,"state":"metadata freshness not established"})).unwrap();
+        assert!(page.watch_error.is_none());
+        assert!(page.metadata_error.is_none());
     }
 }

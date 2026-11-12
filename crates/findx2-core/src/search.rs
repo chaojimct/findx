@@ -118,7 +118,8 @@ impl Default for BackfillProgress {
 }
 
 pub struct SearchEngine {
-    store: RwLock<IndexStore>,
+    pub(crate) store: RwLock<IndexStore>,
+    pub(crate) usage: parking_lot::Mutex<crate::usage::UsageRuntime>,
     backfill: Arc<BackfillProgress>,
     /// 回填元数据的紧凑 overlay（取代之前的 `DashMap`）：
     /// - 长度固定 = entry_count，按 idx 平铺 16 字节/条；
@@ -126,7 +127,7 @@ pub struct SearchEngine {
     /// - 持久化时（`flush_metadata_overlay_into_store`）才一次性合并进主索引。
     ///
     /// 见 `crate::meta_overlay` 的模块文档了解为什么不用 DashMap。
-    metadata_overlay: Arc<MetaOverlay>,
+    pub(crate) metadata_overlay: Arc<MetaOverlay>,
     /// 索引变更计数：任何影响搜索结果集/排序的写入都 +1（USN 增量、回填合并、
     /// metadata_ready 翻转、overlay 写入/清空）。分页查询缓存凭它失效。
     /// trigram 边车重建不 bump——剪枝只影响候选超集，不影响最终命中与排序。
@@ -168,6 +169,7 @@ impl SearchEngine {
         let entry_count = store.entries.len();
         Self {
             store: RwLock::new(store),
+            usage: parking_lot::Mutex::new(Default::default()),
             backfill: Arc::new(BackfillProgress::default()),
             metadata_overlay: Arc::new(MetaOverlay::new(entry_count)),
             revision: AtomicU64::new(0),
@@ -178,10 +180,13 @@ impl SearchEngine {
     /// 索引变更计数（见字段文档）。service 经 `index_store_mut()` 直接改索引后，
     /// 调本函数使分页缓存失效（USN flush 每批调一次即可，不必每条）。
     pub fn note_external_mutation(&self) {
+        let mut u = self.usage.lock();
+        u.epoch = 0;
+        u.error = Some("index epoch changed; usage requires reinitialization".into());
         self.revision.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn bump_revision(&self) {
+    pub(crate) fn bump_revision(&self) {
         self.revision.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -208,10 +213,13 @@ impl SearchEngine {
         if items.is_empty() {
             return;
         }
+        let _guard = self.store.write();
+        let mut usage = self.usage.lock();
         for &(idx, size, m_ft, c_ft) in items {
             let mtime = crate::index::filetime_to_unix_secs(m_ft);
             let ctime = crate::index::filetime_to_unix_secs(c_ft);
             self.metadata_overlay.put(idx, size, mtime, ctime);
+            usage.overlay_value(idx, size);
         }
         // overlay 参与 size/time 过滤与排序：回填写入即视为索引变更。
         self.bump_revision();
@@ -223,12 +231,12 @@ impl SearchEngine {
     /// 持锁时间正比于 overlay 已填条数；8.5M 全填 ~2-3 秒，但发生时一般无 search 流量
     /// （CLI 退出 / 30s 定时落盘）——影响可控。
     pub fn flush_metadata_overlay_into_store(&self) -> Result<usize> {
+        let mut g = self.store.write();
         let snap = self.metadata_overlay.snapshot();
         if snap.is_empty() {
             return Ok(0);
         }
         let n = snap.len();
-        let mut g = self.store.write();
         // v6：overlay flush 一次几十万条，逐条进增量日志会爆炸；包成一次 FullResync，
         // 下次 commit 走全量分段重写（回填完成时只发生一次）。
         g.bulk_apply(|g| {
@@ -1161,7 +1169,7 @@ impl SearchEngine {
     ) -> Result<()> {
         let mut g = self.store.write();
         g.patch_entry_metadata(idx, size, mtime, ctime)?;
-        drop(g);
+        self.usage.lock().metadata_sync(&g, idx);
         self.bump_revision();
         self.metadata_overlay.put(
             idx,

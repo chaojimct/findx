@@ -127,6 +127,9 @@ fn bare_terms(query: &str) -> String {
 
 fn handle_request(req: IpcRequest) -> IpcResponse {
     match req {
+        IpcRequest::UsageCapabilities | IpcRequest::UsageChildren { .. } => IpcResponse::Error {
+            message: "mock backend does not support indexed usage".into(),
+        },
         IpcRequest::Ping => IpcResponse::Pong,
         IpcRequest::Status => IpcResponse::StatusResult {
             entry_count: 8,

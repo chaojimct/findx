@@ -18,6 +18,11 @@ pub struct SearchOutcome {
 pub type IpcResult<T> = Result<T, String>;
 
 enum Job {
+    Request {
+        endpoint: String,
+        req: IpcRequest,
+        reply: oneshot::Sender<IpcResult<IpcResponse>>,
+    },
     Search {
         endpoint: String,
         query: String,
@@ -42,6 +47,19 @@ pub struct IpcClient {
 }
 
 impl IpcClient {
+    pub fn request(
+        &self,
+        endpoint: String,
+        req: IpcRequest,
+    ) -> oneshot::Receiver<IpcResult<IpcResponse>> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Job::Request {
+            endpoint,
+            req,
+            reply,
+        });
+        rx
+    }
     pub fn start() -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
         std::thread::Builder::new()
@@ -98,6 +116,19 @@ impl IpcClient {
 
 async fn dispatch(job: Job) {
     match job {
+        Job::Request {
+            endpoint,
+            req,
+            reply,
+        } => {
+            let r = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let c = connect_endpoint(&endpoint).await?;
+                write_request(c, req).await
+            })
+            .await
+            .unwrap_or_else(|_| Err("用量 IPC 超时".into()));
+            let _ = reply.send(r);
+        }
         Job::Search {
             endpoint,
             query,

@@ -81,11 +81,10 @@ impl MainWindow {
         if width < 2 || height < 2 {
             return;
         }
-        let root_change = self
-            .workspace
-            .usage_scene
-            .as_ref()
-            .is_some_and(|s| s.key.root != root || s.key.scan != Arc::as_ptr(&scan) as usize);
+        let root_change = self.workspace.usage_scene.as_ref().is_some_and(|s| {
+            s.key.root != root
+                || (!self.workspace.engine_usage && s.key.scan != Arc::as_ptr(&scan) as usize)
+        });
         let detail = if root_change {
             1
         } else {
@@ -115,7 +114,9 @@ impl MainWindow {
                     return;
                 }
                 if let Some(previous) = &this.workspace.usage_scene {
-                    if previous.key.root != scene.key.root || previous.key.scan != scene.key.scan {
+                    if previous.key.root != scene.key.root
+                        || (!this.workspace.engine_usage && previous.key.scan != scene.key.scan)
+                    {
                         this.workspace.usage_transition = None;
                         if previous.key.scan == scene.key.scan
                             && !this.session.read(cx).prefs.usage_reduce_motion
@@ -352,7 +353,7 @@ impl MainWindow {
                                     .file_name()
                                     .map(|x| x.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| display_path(&n.path)),
-                                disk_usage::format_bytes(n.allocated),
+                                disk_usage::format_bytes(scan.weight(n)),
                                 n.uncertain,
                             )
                         }
@@ -377,8 +378,12 @@ impl MainWindow {
                         hovered: self.workspace.usage_hover == Some(tile.key),
                     });
                 }
-                if scan.nodes[scene.key.root].allocated == 0 {
-                    empty = Some("已测占用为 0；未知项、空文件和硬链接别名仍可在右侧查看");
+                if scan.weight(&scan.nodes[scene.key.root]) == 0 {
+                    empty = Some(if scan.logical_generation.is_some() {
+                        "索引逻辑大小为 0；未验证元数据不是已确认空文件"
+                    } else {
+                        "已测占用为 0；未知项、空文件和硬链接别名仍可在右侧查看"
+                    });
                 }
             } else {
                 empty = Some("正在排布已测结果…");
@@ -418,7 +423,15 @@ impl MainWindow {
                 empty = Some("正在批量读取目录元数据 · 尚未有可绘制的实测结果");
             }
         } else {
-            empty = Some("选择目录开始测量；已有快照会直接读取，不会自动全盘扫描");
+            empty = Some(if self.workspace.engine_usage {
+                if self.workspace.engine_busy {
+                    "正在读取引擎索引逻辑目录树…"
+                } else {
+                    "当前服务尚未提供索引逻辑目录树；状态见下方，可明确选择本地实测"
+                }
+            } else {
+                "选择目录开始测量；已有快照会直接读取，不会自动全盘扫描"
+            });
         }
         let paint = draws.clone();
         let menu_owner = cx.weak_entity();

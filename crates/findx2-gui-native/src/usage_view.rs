@@ -272,7 +272,7 @@ pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
             } else {
                 Kind::File
             },
-            n.allocated,
+            scan.weight(n),
         );
         node.files = n.files;
         node.dirs = n.directories.min(u32::MAX as u64) as u32;
@@ -299,18 +299,18 @@ pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
         let mut skipped = 0usize;
         let mut taken = 0usize;
         for &child in children {
-            if scan.nodes[child].allocated == 0 {
+            if scan.weight(&scan.nodes[child]) == 0 {
                 continue;
             }
             if taken >= max_attach || *budget < 2 {
-                leftover = leftover.saturating_add(scan.nodes[child].allocated);
+                leftover = leftover.saturating_add(scan.weight(&scan.nodes[child]));
                 skipped += 1;
                 continue;
             }
             crumbs.push(node.children.len());
             let attached = leaf(scan, child, crumbs, address, budget);
             if scan.nodes[child].directory && !scan.nodes[child].children.is_empty() {
-                expandable.push((scan.nodes[child].allocated, child, crumbs.clone()));
+                expandable.push((scan.weight(&scan.nodes[child]), child, crumbs.clone()));
             }
             node.children.push(attached);
             crumbs.pop();
@@ -396,7 +396,10 @@ pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
             collect_reclaim(child, worth);
         }
     }
-    collect_reclaim(&tree, &mut worth);
+    // Logical bytes are not reclaimable/allocated bytes.
+    if scan.logical_generation.is_none() {
+        collect_reclaim(&tree, &mut worth);
+    }
     worth.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
     worth.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
     worth.truncate(8);
@@ -419,7 +422,7 @@ pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
         rect: viewport,
         depth: 0,
         nested: true,
-        bytes: scan.nodes[key.root].allocated,
+        bytes: scan.weight(&scan.nodes[key.root]),
         header: None,
         category: scan.nodes[key.root].category,
         class: tree.category,
@@ -459,7 +462,7 @@ pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
                     .fold(0u64, u64::saturating_add)
             }
             _ => match tile_key {
-                TileKey::Node(i) => scan.nodes[i].allocated,
+                TileKey::Node(i) => scan.weight(&scan.nodes[i]),
                 TileKey::Other(_) => node.map_or(0, |n| n.bytes),
             },
         };
@@ -617,6 +620,7 @@ mod tests {
             }
         }
         let scan = Scan {
+            logical_generation: None,
             nodes,
             errors: 0,
             skipped_links: 0,
@@ -723,6 +727,7 @@ mod tests {
                 .sort_by_key(|&j| (std::cmp::Reverse(sizes[j]), j));
         }
         let scan = Scan {
+            logical_generation: None,
             nodes,
             errors: 0,
             skipped_links: 0,
@@ -824,6 +829,7 @@ mod tests {
         nodes.push(node("unreadable", Some(0), true, 0, true));
         nodes[0].allocated = 100;
         let scan = Scan {
+            logical_generation: None,
             nodes,
             errors: 1,
             skipped_links: 0,
@@ -1217,5 +1223,64 @@ mod resize_regression_tests {
             },
         );
         assert_eq!((camera.scale, camera.x, camera.y), (4., 375., 225.));
+    }
+}
+#[cfg(test)]
+mod indexed_logical_tests {
+    use super::*;
+    use crate::disk_usage::{Limits, Node, Scan};
+    #[test]
+    fn logical_scene_uses_logical_weights_without_faking_allocated_fields() {
+        let node =
+            |path: &str, parent: Option<usize>, directory: bool, children: Vec<usize>| Node {
+                path: path.into(),
+                parent,
+                children,
+                entries: 1,
+                files: u64::from(!directory),
+                directories: u64::from(directory),
+                category: 0,
+                own_allocated: 0,
+                directory,
+                logical: 4096,
+                mtime: 0,
+                allocated: 0,
+                hardlink_duplicate: false,
+                uncertain: true,
+            };
+        let scan = Scan {
+            logical_generation: Some((9, 10)),
+            nodes: vec![
+                node("C:\\fixture", None, true, vec![1]),
+                node("C:\\fixture\\known.txt", Some(0), false, vec![]),
+            ],
+            errors: 0,
+            skipped_links: 0,
+            hardlinks: 0,
+            unknown: 1,
+            partial: true,
+            cancelled: false,
+            elapsed: std::time::Duration::ZERO,
+            entry_limit_reached: false,
+            time_limit_reached: false,
+            memory_limit_reached: false,
+            alloc_failed: false,
+            limits: Limits::default(),
+            volume: None,
+        };
+        let scene = build_scene(
+            &scan,
+            SceneKey {
+                scan: 1,
+                root: 0,
+                depth: 3,
+                width: 640,
+                height: 480,
+                detail: 1,
+            },
+        );
+        assert!(!scene.tiles.is_empty());
+        assert!(scene.tiles.iter().any(|t| t.bytes == 4096));
+        assert!(scan.nodes.iter().all(|n| n.allocated == 0));
     }
 }

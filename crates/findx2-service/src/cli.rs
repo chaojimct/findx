@@ -47,6 +47,20 @@ pub struct Cli {
     /// 适合超弱机：CPU/磁盘 IO 占用最低，但搜索时大小/时间筛选与排序不准。
     #[arg(long, default_value_t = false, global = true)]
     pub no_backfill: bool,
+    /// Strict fixture mode: no journal, volume probes, watch or automatic volume rebuild.
+    #[arg(long, global = true)]
+    pub no_watch: bool,
+    /// Additional logical-tree memory budget; default one quarter of currently available physical RAM.
+    #[arg(long, global = true)]
+    pub usage_memory_mib: Option<usize>,
+    /// Foreground lifecycle stop signal file (fixture harness only).
+    #[arg(long, global = true)]
+    pub shutdown_file: Option<PathBuf>,
+    /// Explicit new fixture directory only; synthetic identities, never USN/MFT.
+    #[arg(long, global = true)]
+    pub fixture_root: Option<PathBuf>,
+    #[arg(long, global = true)]
+    pub fixture_events: Option<PathBuf>,
 
     /// 追加的排除目录（可多次传入）；优先级 = sidecar ∪ 命令行。
     /// 对历史已入库的命中条目，service 启动时会一次性打"已删除"墓碑。

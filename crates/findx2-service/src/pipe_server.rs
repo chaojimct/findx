@@ -152,15 +152,10 @@ async fn handle_client(
 
     let (r, mut w) = split(server);
     let mut reader = BufReader::new(r);
-    let mut line = String::new();
-
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            debug!(sid, "pipe 会话结束（客户端关闭）");
+        let Some(line) = read_bounded_frame(&mut reader).await? else {
             break;
-        }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -170,7 +165,11 @@ async fn handle_client(
         let req_summary = if trimmed.len() <= 120 {
             trimmed.to_string()
         } else {
-            format!("{}…(共 {} 字节)", &trimmed[..120], trimmed.len())
+            format!(
+                "{}…(共 {} 字节)",
+                trimmed.chars().take(120).collect::<String>(),
+                trimmed.len()
+            )
         };
 
         let resp = match serde_json::from_str::<IpcRequest>(trimmed) {
@@ -212,4 +211,52 @@ async fn handle_client(
     }
 
     Ok(())
+}
+
+/// Pipe buffers are not frame limits. Refuse oversized input before growing it.
+async fn read_bounded_frame<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> anyhow::Result<Option<String>> {
+    const MAX_FRAME: usize = 256 * 1024;
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let take = chunk
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(chunk.len());
+        if bytes.len().saturating_add(take) > MAX_FRAME {
+            anyhow::bail!("IPC request exceeds 256KiB frame budget")
+        }
+        bytes
+            .try_reserve(take)
+            .map_err(|_| anyhow::anyhow!("IPC frame allocation failed"))?;
+        let complete = chunk[take - 1] == b'\n';
+        bytes.extend_from_slice(&chunk[..take]);
+        reader.consume(take);
+        if complete {
+            break;
+        }
+    }
+    Ok(Some(String::from_utf8(bytes)?))
+}
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    #[tokio::test]
+    async fn bounded_memory_frame_handles_utf8_and_rejects_oversize() {
+        let data = "{\"type\":\"ping\",\"name\":\"目录\"}\n";
+        let mut r = BufReader::new(data.as_bytes());
+        assert_eq!(read_bounded_frame(&mut r).await.unwrap().unwrap(), data);
+        let bytes = vec![b'a'; 256 * 1024 + 1];
+        let mut r = BufReader::new(bytes.as_slice());
+        assert!(read_bounded_frame(&mut r).await.is_err());
+    }
 }

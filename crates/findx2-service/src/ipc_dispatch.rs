@@ -9,6 +9,8 @@ pub(crate) type EngineSlot = Arc<RwLock<Option<Arc<SearchEngine>>>>;
 
 pub(crate) fn req_kind_label(r: &IpcRequest) -> &'static str {
     match r {
+        IpcRequest::UsageCapabilities => "UsageCapabilities",
+        IpcRequest::UsageChildren { .. } => "UsageChildren",
         IpcRequest::Ping => "Ping",
         IpcRequest::Status => "Status",
         IpcRequest::Search { .. } => "Search",
@@ -18,6 +20,54 @@ pub(crate) fn req_kind_label(r: &IpcRequest) -> &'static str {
 pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse {
     let engine = slot.read().ok().and_then(|g| g.clone());
     match (req, engine) {
+        (IpcRequest::UsageCapabilities, _) => IpcResponse::UsageCapabilitiesResult {
+            logical_tree: 1,
+            allocated: false,
+        },
+        (
+            IpcRequest::UsageChildren {
+                path,
+                expected,
+                after,
+                max_bytes,
+            },
+            Some(eng),
+        ) => match eng.usage_page(&path, expected, after, max_bytes) {
+            Ok(p) => {
+                let item = |n: findx2_core::usage::UsageItem| findx2_ipc::UsageItemDto {
+                    id: n.id,
+                    name: n.name,
+                    directory: n.directory,
+                    logical: n.logical,
+                    files: n.files,
+                    directories: n.directories,
+                    unknown: n.unknown,
+                };
+                IpcResponse::UsageChildrenResult {
+                    page: findx2_ipc::UsagePageDto {
+                        epoch: p.epoch,
+                        generation: p.generation,
+                        root: item(p.root),
+                        children: p.children.into_iter().map(item).collect(),
+                        next: p.next,
+                        resident_bytes: p.resident_bytes,
+                        watch_error: crate::watch_health::watch_error_summary(),
+                        metadata_error: eng.backfill_error_snapshot(),
+                        state: format!(
+                            "{}; watch={}",
+                            p.state,
+                            crate::watch_health::watch_error_summary().unwrap_or_else(|| {
+                                "no reported error (not proof of metadata freshness)".into()
+                            })
+                        ),
+                    },
+                }
+            }
+            Err(message) => IpcResponse::Error { message },
+        },
+        (IpcRequest::UsageChildren { .. }, None) => IpcResponse::Error {
+            message: "index loading; usage initializing".into(),
+        },
         (IpcRequest::Ping, _) => IpcResponse::Pong,
         (IpcRequest::Status, None) => {
             // 只取一次快照：分三次取可能在两帧之间跨越阶段切换，导致同一响应里的
@@ -192,4 +242,69 @@ pub(crate) fn search_ipc(
         elapsed_ms
     );
     Ok((dtos, total, elapsed_ms))
+}
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    #[test]
+    fn independent_slot_pages_and_rejects_mixed_generations() {
+        let root = findx2_core::RawEntry {
+            file_id: 1,
+            file_id_128: None,
+            parent_id: 0,
+            name: "fixture".into(),
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            attrs: 0x10,
+            is_dir: true,
+        };
+        let g = findx2_core::IndexBuilder::new(b'F', 1, 1, 0)
+            .build_from_raw(vec![], vec![root], true)
+            .unwrap();
+        let e = Arc::new(SearchEngine::new(g));
+        e.enable_usage(1024 * 1024).unwrap();
+        let slot: EngineSlot = Arc::new(RwLock::new(Some(e.clone())));
+        assert!(matches!(
+            process_request(&slot, IpcRequest::UsageCapabilities),
+            IpcResponse::UsageCapabilitiesResult {
+                logical_tree: 1,
+                allocated: false
+            }
+        ));
+        let req = |expected| IpcRequest::UsageChildren {
+            path: "F:\\".into(),
+            expected,
+            after: None,
+            max_bytes: 4096,
+        };
+        let (epoch, generation) = match process_request(&slot, req(None)) {
+            IpcResponse::UsageChildrenResult { page } => (page.epoch, page.generation),
+            _ => panic!("missing actual usage page"),
+        };
+        e.apply_volume_change(
+            b'F',
+            &findx2_core::ChangeEvent::CreatePending {
+                file_id: 2,
+                file_id_128: None,
+                parent_id: 1,
+                name: "new".into(),
+                attrs: 0,
+                is_dir: false,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            process_request(&slot, req(Some((epoch, generation)))),
+            IpcResponse::Error { .. }
+        ));
+        match process_request(&slot, req(None)) {
+            IpcResponse::UsageChildrenResult { page } => {
+                assert_eq!(page.root.files, 1);
+                assert_eq!(page.root.unknown, 1);
+                assert_eq!(page.children[0].name, "new");
+            }
+            _ => panic!("missing updated page"),
+        }
+    }
 }

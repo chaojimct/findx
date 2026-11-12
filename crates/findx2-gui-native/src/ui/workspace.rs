@@ -216,6 +216,12 @@ pub(super) struct Workspace {
     window: AnyWindowHandle,
     usage_depth: usize,
     usage_advanced: bool,
+    engine_usage: bool,
+    engine_busy: bool,
+    engine_checked: bool,
+    engine_next: Option<u32>,
+    engine_generation: Option<(u64, u64)>,
+    engine_tick: u8,
     usage_memory_profile: usize,
     scan: Option<Arc<Scan>>,
     usage_scene: Option<Arc<crate::usage_view::Scene>>,
@@ -339,6 +345,12 @@ impl Workspace {
             window: window.window_handle(),
             usage_depth: 3,
             usage_advanced: false,
+            engine_usage: true,
+            engine_busy: false,
+            engine_checked: false,
+            engine_next: None,
+            engine_generation: None,
+            engine_tick: 0,
             usage_memory_profile: 0,
             scan: None,
             usage_scene: None,
@@ -502,6 +514,15 @@ impl MainWindow {
                     .update(cx, |this, cx| {
                         if this.workspace.scanning {
                             cx.notify();
+                        }
+                        this.workspace.engine_tick = this.workspace.engine_tick.wrapping_add(1);
+                        if this.workspace.engine_tick % 8 == 0
+                            && this.workspace.mode == ViewMode::Usage
+                            && this.workspace.engine_usage
+                            && this.workspace.engine_checked
+                            && !this.workspace.engine_busy
+                        {
+                            this.load_engine_usage(false, cx);
                         }
                     })
                     .is_err()
@@ -842,7 +863,7 @@ impl MainWindow {
                     self.restore_page_context(state, cx);
                 }
                 let focus = self.active_workspace_hit().map(|h| h.path);
-                if !self.show_scanned_directory(focus, cx) {
+                if !self.workspace.suspend_preview && !self.show_scanned_directory(focus, cx) {
                     self.load_usage_cache(cx);
                 }
             }
@@ -927,7 +948,7 @@ impl MainWindow {
                         .to_string_lossy()
                         .into_owned(),
                     path: display_path(&n.path),
-                    size: n.allocated,
+                    size: scan.weight(n),
                     mtime: n.mtime,
                     is_directory: n.directory,
                     name_highlight: vec![],
@@ -947,7 +968,7 @@ impl MainWindow {
         } else {
             format!("占用 · {} 个子项", children.len())
         };
-        self.set_workspace_rows(rows, focus, true, cx);
+        self.set_workspace_rows(rows, focus, scan.logical_generation.is_none(), cx);
         true
     }
     pub(super) fn workspace_navigate(
@@ -969,6 +990,12 @@ impl MainWindow {
                     return;
                 }
             }
+        }
+        // A newer location supersedes an in-flight request. Its completion must
+        // not strand the new scope behind the previous scope's busy flag.
+        if mode == ViewMode::Usage && self.workspace.engine_usage {
+            self.workspace.scan_generation = self.workspace.scan_generation.wrapping_add(1);
+            self.workspace.engine_busy = false;
         }
         let source_hit = self.active_workspace_hit();
         if self.workspace.mode != mode {
@@ -1000,6 +1027,12 @@ impl MainWindow {
         self.update_location_input(cx);
         if mode == ViewMode::Usage {
             self.workspace.usage_focus = focus.clone();
+        }
+        if mode == ViewMode::Usage && self.workspace.engine_usage {
+            self.workspace.usage_camera.reset();
+            self.load_engine_usage(false, cx);
+            cx.notify();
+            return;
         }
         if mode == ViewMode::Usage {
             if !self.show_scanned_directory(focus.clone(), cx) {
@@ -1214,6 +1247,10 @@ impl MainWindow {
         };
         let path = display_path(&n.path);
         let directory = n.directory;
+        if self.workspace.engine_usage && enter && directory {
+            self.workspace_navigate(PathBuf::from(&path), ViewMode::Usage, None, true, cx);
+            return;
+        }
         self.workspace.usage_focus = Some(path.clone());
         if let Some(ix) = self
             .workspace
@@ -1241,7 +1278,214 @@ impl MainWindow {
             }
         }
     }
+    fn select_engine_usage_source(&mut self, cx: &mut Context<Self>) {
+        self.workspace.scan_cancel.store(true, Ordering::Release);
+        self.workspace.scanning = false;
+        self.workspace.scan_generation = self.workspace.scan_generation.wrapping_add(1);
+        self.workspace.engine_usage = true;
+        self.workspace.engine_checked = false;
+        self.workspace.engine_busy = false;
+        self.workspace.engine_generation = None;
+        let old = self.workspace.scan.take();
+        let lookup = std::mem::take(&mut self.workspace.scan_lookup);
+        self.workspace.usage_scene = None;
+        self.workspace.usage_scene_key = None;
+        self.workspace.usage_transition = None;
+        self.workspace.usage_scene_generation += 1;
+        cx.background_executor()
+            .spawn(async move {
+                drop(old);
+                drop(lookup);
+            })
+            .detach();
+        self.load_engine_usage(false, cx);
+        cx.notify();
+    }
+    fn load_engine_usage(&mut self, next: bool, cx: &mut Context<Self>) {
+        if self.workspace.engine_busy {
+            return;
+        }
+        self.workspace.engine_busy = true;
+        self.workspace.scan_generation = self.workspace.scan_generation.wrapping_add(1);
+        let request_generation = self.workspace.scan_generation;
+        let path = display_path(&self.workspace.location);
+        let requested = self.workspace.location.clone();
+        let session = self.session.read(cx);
+        let ipc = session.ipc.clone();
+        let endpoint = session.endpoint.clone();
+        let checked = self.workspace.engine_checked;
+        let expected = if next {
+            self.workspace.engine_generation
+        } else {
+            None
+        };
+        let after = if next {
+            self.workspace.engine_next
+        } else {
+            None
+        };
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                if !checked {
+                    match ipc
+                        .request(endpoint.clone(), findx2_ipc::IpcRequest::UsageCapabilities)
+                        .await
+                        .map_err(|_| "用量能力请求已取消".to_string())??
+                    {
+                        findx2_ipc::IpcResponse::UsageCapabilitiesResult {
+                            logical_tree: 1,
+                            ..
+                        } => {}
+                        _ => return Err(
+                            "当前服务不支持索引逻辑目录树；可明确选择本地实测，不会伪装为引擎数据"
+                                .to_string(),
+                        ),
+                    }
+                }
+                match ipc
+                    .request(
+                        endpoint,
+                        findx2_ipc::IpcRequest::UsageChildren {
+                            path,
+                            expected,
+                            after,
+                            max_bytes: 48 * 1024,
+                        },
+                    )
+                    .await
+                    .map_err(|_| "用量请求已取消".to_string())??
+                {
+                    findx2_ipc::IpcResponse::UsageChildrenResult { page } => Ok(page),
+                    findx2_ipc::IpcResponse::Error { message } => Err(message),
+                    _ => Err("索引用量响应不兼容".into()),
+                }
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                if this.workspace.scan_generation != request_generation {
+                    return;
+                }
+                this.workspace.engine_busy = false;
+                if !this.workspace.engine_usage
+                    || this.workspace.mode != ViewMode::Usage
+                    || this.workspace.location != requested
+                {
+                    return;
+                }
+                let page = match result {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if e.contains("index loading; usage initializing") {
+                            this.workspace.engine_checked = true;
+                        }
+                        this.workspace.scan_status = e;
+                        this.workspace.scan_stale = true;
+                        cx.notify();
+                        return;
+                    }
+                };
+                this.workspace.engine_checked = true;
+                // Health can change without a namespace generation: never hide
+                // journal/backfill failures behind the unchanged-tree fast path.
+                let degraded = page.watch_error.is_some() || page.metadata_error.is_some();
+                this.workspace.scan_stale = degraded;
+                this.workspace.scan_status = format!(
+                    "索引逻辑 · {} · 元数据待验 {} · {} · g{} · {}",
+                    if page.next.is_some() {
+                        "当前分页，尚有子项"
+                    } else {
+                        "当前层完整"
+                    },
+                    page.root.unknown,
+                    if degraded {
+                        "监控/元数据未就绪或降级"
+                    } else {
+                        "监控未报告错误（不代表全量新鲜）"
+                    },
+                    page.generation,
+                    page.state
+                );
+                cx.notify();
+                if !next
+                    && this.workspace.engine_generation == Some((page.epoch, page.generation))
+                    && this
+                        .workspace
+                        .scan
+                        .as_ref()
+                        .is_some_and(|s| s.nodes.first().is_some_and(|n| n.path == requested))
+                {
+                    return;
+                }
+                this.workspace.engine_generation = Some((page.epoch, page.generation));
+                this.workspace.engine_next = page.next;
+                let convert =
+                    |n: &findx2_ipc::UsageItemDto, path: PathBuf, parent: Option<usize>| {
+                        disk_usage::Node {
+                            path,
+                            parent,
+                            children: vec![],
+                            entries: n.files + n.directories,
+                            files: n.files,
+                            directories: n.directories,
+                            category: 0,
+                            own_allocated: 0,
+                            directory: n.directory,
+                            logical: n.logical,
+                            mtime: 0,
+                            allocated: 0,
+                            hardlink_duplicate: false,
+                            uncertain: n.unknown > 0,
+                        }
+                    };
+                let mut nodes = vec![convert(&page.root, requested.clone(), None)];
+                for child in &page.children {
+                    nodes.push(convert(child, requested.join(&child.name), Some(0)));
+                }
+                nodes[0].children = (1..nodes.len()).collect();
+                let scan = Scan {
+                    logical_generation: Some((page.epoch, page.generation)),
+                    nodes,
+                    errors: 0,
+                    skipped_links: 0,
+                    hardlinks: 0,
+                    unknown: page.root.unknown,
+                    partial: page.root.unknown > 0 || page.next.is_some() || degraded,
+                    cancelled: false,
+                    elapsed: Duration::ZERO,
+                    entry_limit_reached: false,
+                    time_limit_reached: false,
+                    memory_limit_reached: false,
+                    alloc_failed: false,
+                    limits: Limits::default(),
+                    volume: None,
+                };
+                match fallible_usage_lookup(&scan) {
+                    Ok(lookup) => this.workspace.scan_lookup = lookup,
+                    Err(e) => {
+                        this.workspace.scan_status = e;
+                        cx.notify();
+                        return;
+                    }
+                }
+                this.workspace.scan = Some(Arc::new(scan));
+                this.workspace.scan_stale = degraded;
+                this.workspace.usage_scene_key = None;
+                this.workspace.usage_scene_generation += 1;
+                let focus = this.workspace.usage_focus.clone();
+                this.show_scanned_directory(focus, cx);
+                this.workspace.status =
+                    "索引逻辑大小 · 非实际占用 · 实时增量/元数据状态见下方".into();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
     fn load_usage_cache(&mut self, cx: &mut Context<Self>) {
+        if self.workspace.engine_usage {
+            self.load_engine_usage(false, cx);
+            return;
+        }
         if self.workspace.scanning {
             return;
         }
@@ -1306,6 +1550,19 @@ impl MainWindow {
         if self.workspace.op_busy || self.file_actions.busy || self.workspace.scanning {
             return;
         }
+        if self.workspace.engine_usage {
+            // Never relabel an indexed-logical picture as measured allocation.
+            self.workspace.scan = None;
+            self.workspace.scan_lookup.clear();
+            self.workspace.usage_scene = None;
+            self.workspace.usage_scene_key = None;
+            self.workspace.usage_transition = None;
+            self.workspace.usage_scene_generation += 1;
+        }
+        self.workspace.engine_usage = false;
+        self.workspace.engine_checked = false;
+        self.workspace.engine_busy = false;
+        self.workspace.engine_generation = None;
         self.workspace.scan_generation = self.workspace.scan_generation.wrapping_add(1);
         let generation = self.workspace.scan_generation;
         let path = self.workspace.location.clone();
@@ -1513,7 +1770,15 @@ impl MainWindow {
                 disk_usage::format_bytes(self.workspace.progress.allocated.load(Ordering::Relaxed))
             )
         } else if self.workspace.scan_stale {
-            format!("缓存可能过期 · {}", self.workspace.scan_status)
+            format!(
+                "{} · {}",
+                if self.workspace.engine_usage {
+                    "索引可能滞后"
+                } else {
+                    "缓存可能过期"
+                },
+                self.workspace.scan_status
+            )
         } else {
             self.workspace.scan_status.clone()
         }

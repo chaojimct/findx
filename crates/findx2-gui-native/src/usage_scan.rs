@@ -482,6 +482,7 @@ pub(super) fn scan(
     pool.scope(|scope| dispatch(scope, &ctx, 0, Some(exact.identity)));
     let enumerated = start.elapsed();
     let mut result = Scan {
+        logical_generation: None,
         nodes: ctx.nodes.into_inner().unwrap_or_else(|e| e.into_inner()),
         errors: ctx.errors.load(Ordering::Relaxed),
         skipped_links: ctx.skipped.load(Ordering::Relaxed),

@@ -278,7 +278,7 @@ impl MainWindow {
                                         .map(|s| s.to_string_lossy().into_owned())
                                         .unwrap_or_else(|| display_path(&n.path)),
                                     directory: n.directory,
-                                    bytes: Some(n.allocated),
+                                    bytes: Some(scan.weight(n)),
                                     uncertain: n.uncertain,
                                 }
                             })

@@ -4,6 +4,7 @@ mod cli;
 mod ipc_dispatch;
 mod load_state;
 mod startup_compact;
+mod usage_fixture;
 mod watch_health;
 
 mod backfill;
@@ -95,6 +96,14 @@ fn try_main() -> anyhow::Result<()> {
             return win_service::dispatch();
         }
 
+        if let Some(root) = &cli.fixture_root {
+            if cli.service || !cli.no_watch || !cli.no_backfill || !cli.no_everything_ipc {
+                anyhow::bail!(
+                    "fixture requires foreground --no-watch --no-backfill --no-everything-ipc"
+                );
+            }
+            usage_fixture::create_index(root, &cli.index)?;
+        }
         let _ = std::fs::remove_file(std::env::temp_dir().join(SERVICE_LAST_ERROR_FILENAME));
 
         return run::run_foreground(
@@ -107,6 +116,10 @@ fn try_main() -> anyhow::Result<()> {
             run::RunFlags {
                 no_everything_ipc: cli.no_everything_ipc,
                 no_backfill: cli.no_backfill,
+                no_watch: cli.no_watch,
+                usage_memory_mib: cli.usage_memory_mib,
+                shutdown_file: cli.shutdown_file.clone(),
+                fixture_events: cli.fixture_events.clone(),
                 extra_excluded_dirs: cli.exclude_dir,
             },
             // 控制台模式：无 Ctrl+C 优雅停（journal 重放兜底），传永不置位标志对齐签名。

@@ -626,6 +626,46 @@ impl MainWindow {
             .bg(tokens.bg)
             .child(self.navigation_buttons(cx))
             .child(
+                Button::new("usage-index-source")
+                    .ghost()
+                    .h(px(24.))
+                    .label("索引逻辑")
+                    .selected(self.workspace.engine_usage)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.select_engine_usage_source(cx);
+                    })),
+            )
+            .when(
+                self.workspace.engine_usage && self.workspace.engine_busy,
+                |v| {
+                    v.child(
+                        Button::new("usage-index-cancel")
+                            .ghost()
+                            .label("取消")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.workspace.scan_generation += 1;
+                                this.workspace.engine_busy = false;
+                                this.workspace.engine_checked = false;
+                                this.workspace.scan_status = "索引分页已取消；引擎继续监听".into();
+                                cx.notify();
+                            })),
+                    )
+                },
+            )
+            .when(
+                self.workspace.engine_usage && self.workspace.engine_next.is_some(),
+                |v| {
+                    v.child(
+                        Button::new("usage-index-next")
+                            .ghost()
+                            .label("下一页")
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.load_engine_usage(true, cx)),
+                            ),
+                    )
+                },
+            )
+            .child(
                 div()
                     .mx_1()
                     .h(px(16.))
@@ -712,9 +752,9 @@ impl MainWindow {
                     .label(if self.workspace.scanning {
                         "扫描中…"
                     } else if self.scan_node().is_some() {
-                        "重新扫描"
+                        "本地实测"
                     } else {
-                        "开始扫描"
+                        "本地实测"
                     })
                     .disabled(self.workspace.scanning || self.workspace.op_busy)
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -880,7 +920,16 @@ impl MainWindow {
             .border_l_1()
             .border_color(tokens.border)
             .bg(tokens.surface);
-        let mut head = v_flex().flex_shrink_0().px_3().py_2().gap_1();
+        let mut head = v_flex()
+            .flex_shrink_0()
+            .px_3()
+            .py_2()
+            .gap_1()
+            .child(div().text_xs().child(if self.workspace.engine_usage {
+                "索引逻辑大小（非实际占用）"
+            } else {
+                "本地实测 · 实际占用"
+            }));
         let mut mid = v_flex()
             .id("usage-detail-scroll")
             .flex_1()
@@ -903,9 +952,9 @@ impl MainWindow {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| display_path(&node.path));
-            let total = root.map(|i| scan.nodes[i].allocated).unwrap_or(0);
+            let total = root.map(|i| scan.weight(&scan.nodes[i])).unwrap_or(0);
             let ratio = if total > 0 {
-                node.allocated as f64 / total as f64 * 100.
+                scan.weight(node) as f64 / total as f64 * 100.
             } else {
                 0.
             };
@@ -922,7 +971,7 @@ impl MainWindow {
                     div()
                         .text_2xl()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(disk_usage::format_bytes(node.allocated)),
+                        .child(disk_usage::format_bytes(scan.weight(node))),
                 )
                 .child(div().w_full().h(px(3.)).rounded_sm().bg(tokens.accent))
                 .child(div().text_xs().text_color(tokens.text_secondary).child(
@@ -970,12 +1019,13 @@ impl MainWindow {
                     )
                 })
                 .when(node.uncertain, |view| {
-                    view.child(
-                        div()
-                            .text_xs()
-                            .text_color(tokens.warning)
-                            .child("含未知占用；未知不是 0"),
-                    )
+                    view.child(div().text_xs().text_color(tokens.warning).child(
+                        if self.workspace.engine_usage {
+                            "含未验证逻辑元数据；非实际占用"
+                        } else {
+                            "含未知占用；未知不是 0"
+                        },
+                    ))
                 })
                 .child(
                     h_flex()
@@ -1081,7 +1131,14 @@ impl MainWindow {
                         .mt_2()
                         .text_xs()
                         .text_color(tokens.text_secondary)
-                        .child(format!("子项 · {count}（按实际占用）")),
+                        .child(format!(
+                            "子项 · {count}（{}）",
+                            if self.workspace.engine_usage {
+                                "索引逻辑大小"
+                            } else {
+                                "按实际占用"
+                            }
+                        )),
                 );
                 mid = mid.child(
                     v_flex()
@@ -1119,7 +1176,7 @@ impl MainWindow {
                                         .flex_shrink_0()
                                         .text_xs()
                                         .text_color(tokens.text_secondary)
-                                        .child(disk_usage::format_bytes(n.allocated)),
+                                        .child(disk_usage::format_bytes(scan.weight(n))),
                                 )
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.select_usage_node(child, false, cx)
@@ -1208,6 +1265,17 @@ impl MainWindow {
     }
 
     fn usage_warning_line(&self, scan: &disk_usage::Scan) -> String {
+        if let Some((epoch, generation)) = scan.logical_generation {
+            return format!(
+                "索引逻辑大小 · e{epoch}/g{generation} · {} 项元数据未验证 · 非实际占用{}",
+                scan.unknown,
+                if self.workspace.engine_next.is_some() {
+                    " · 当前分页，尚有子项"
+                } else {
+                    ""
+                }
+            );
+        }
         let mut parts = Vec::new();
         if scan.is_legacy_entry_truncation() {
             parts.push("旧的条目或时间上限截断结果，请手动重新扫描".into());

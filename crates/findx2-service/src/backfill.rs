@@ -498,14 +498,7 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
     // P2 断点续跑：先载入 overlay 边车，再把已完成的条目从待补集合剔除。
     // overlay 是完成记录本身（只增不改），天然防撕裂：快照只在单卷 quiesce 后落盘，
     // 载入的多余条目无害（正确的 meta），缺的会重新回填。
-    if load_overlay_sidecar(&engine, &index_path).unwrap_or(0) > 0 {
-        for (_letter, slot) in by_volume.iter_mut() {
-            slot.files
-                .retain(|(idx, _)| !engine.metadata_overlay_has(*idx));
-        }
-        total_pending = by_volume.values().map(|v| v.files.len()).sum();
-        info!("断点过滤后剩余待补 {} 条", total_pending);
-    }
+    // Legacy row-index-only overlay is not imported: it has no epoch/identity binding.
 
     if total_pending == 0 {
         info!("无需回填，触发终态落盘（异步线程）");
@@ -571,6 +564,11 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
         global_done: &AtomicUsize,
         _total_pending: usize,
     ) -> anyhow::Result<()> {
+        let tickets: std::collections::HashMap<usize, _> = pending
+            .files
+            .iter()
+            .filter_map(|(idx, _)| engine.metadata_ticket(*idx).map(|t| (*idx, t)))
+            .collect();
         // 建"待回填 FRN 集合"，用于在 NtQueryDirectoryFile 阶段筛选只要的子项。
         let needed: std::collections::HashSet<u64> =
             pending.files.iter().map(|(_, f)| *f).collect();
@@ -658,7 +656,11 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
             buf.push((entry_idx, sz, mt, ct));
             if buf.len() >= OVERLAY_BATCH {
                 let n = buf.len();
-                engine.extend_metadata_overlay_batch(&buf);
+                for &(idx, sz, mt, ct) in &buf {
+                    if let Some(t) = tickets.get(&idx) {
+                        let _ = engine.commit_metadata(*t, sz, mt, ct);
+                    }
+                }
                 engine.add_backfill_done(n as u64);
                 global_done.fetch_add(n, Ordering::Relaxed);
                 buf.clear();
@@ -666,7 +668,11 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
         }
         if !buf.is_empty() {
             let n = buf.len();
-            engine.extend_metadata_overlay_batch(&buf);
+            for &(idx, sz, mt, ct) in &buf {
+                if let Some(t) = tickets.get(&idx) {
+                    let _ = engine.commit_metadata(*t, sz, mt, ct);
+                }
+            }
             engine.add_backfill_done(n as u64);
             global_done.fetch_add(n, Ordering::Relaxed);
         }
@@ -703,7 +709,11 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
                 buf2.push((entry_idx, sz, mt, ct));
                 if buf2.len() >= OVERLAY_BATCH {
                     let n = buf2.len();
-                    engine.extend_metadata_overlay_batch(&buf2);
+                    for &(idx, sz, mt, ct) in &buf2 {
+                        if let Some(t) = tickets.get(&idx) {
+                            let _ = engine.commit_metadata(*t, sz, mt, ct);
+                        }
+                    }
                     engine.add_backfill_done(n as u64);
                     global_done.fetch_add(n, Ordering::Relaxed);
                     buf2.clear();
@@ -711,7 +721,11 @@ fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> a
             }
             if !buf2.is_empty() {
                 let n = buf2.len();
-                engine.extend_metadata_overlay_batch(&buf2);
+                for &(idx, sz, mt, ct) in &buf2 {
+                    if let Some(t) = tickets.get(&idx) {
+                        let _ = engine.commit_metadata(*t, sz, mt, ct);
+                    }
+                }
                 engine.add_backfill_done(n as u64);
                 global_done.fetch_add(n, Ordering::Relaxed);
             }

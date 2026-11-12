@@ -589,6 +589,7 @@ impl Repository {
             })
             .transpose()?;
         let scan = Scan {
+            logical_generation: None,
             nodes,
             errors: header.errors,
             skipped_links: header.skipped,

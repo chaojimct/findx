@@ -130,6 +130,10 @@ fn service_main_impl(_arguments: Vec<OsString>) {
     let flags = crate::run::RunFlags {
         no_everything_ipc: cli.no_everything_ipc,
         no_backfill: cli.no_backfill,
+        no_watch: cli.no_watch,
+        usage_memory_mib: cli.usage_memory_mib,
+        shutdown_file: cli.shutdown_file.clone(),
+        fixture_events: None,
         extra_excluded_dirs: cli.exclude_dir.clone(),
     };
     let runner = {

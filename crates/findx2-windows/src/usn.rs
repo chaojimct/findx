@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStringExt;
 use std::ptr;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender as Sender;
 
 use findx2_core::{ChangeEvent, Result};
 use windows::core::PCWSTR;
@@ -16,9 +16,9 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Ioctl::{
     FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V0, USN_JOURNAL_DATA_V0,
-    USN_REASON_BASIC_INFO_CHANGE, USN_REASON_DATA_EXTEND, USN_REASON_DATA_TRUNCATION,
-    USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE, USN_REASON_RENAME_NEW_NAME,
-    USN_REASON_RENAME_OLD_NAME,
+    USN_REASON_BASIC_INFO_CHANGE, USN_REASON_DATA_EXTEND, USN_REASON_DATA_OVERWRITE,
+    USN_REASON_DATA_TRUNCATION, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE,
+    USN_REASON_RENAME_NEW_NAME, USN_REASON_RENAME_OLD_NAME,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 
@@ -33,6 +33,12 @@ pub struct UsnResume {
 /// 传给监听循环的消息：`ChangeEvent` 或持久化检查点。
 #[derive(Debug)]
 pub enum UsnWatchMsg {
+    /// One bounded journal read, applied before its cursor is acknowledged.
+    NamespaceBatch {
+        events: Vec<ChangeEvent>,
+        journal_id: u64,
+        next_usn: u64,
+    },
     Event(ChangeEvent),
     /// 元数据补拉请求（后台 stat worker 消费；CLI 可同步执行或忽略）。
     /// watch 线程只解析 journal、不做任何 `OpenFileById`，stat 全部走这里异步化——
@@ -217,6 +223,7 @@ pub fn usn_watch_forever(
                 | USN_REASON_FILE_DELETE
                 | USN_REASON_RENAME_OLD_NAME
                 | USN_REASON_RENAME_NEW_NAME
+                | USN_REASON_DATA_OVERWRITE
                 | USN_REASON_DATA_EXTEND
                 | USN_REASON_DATA_TRUNCATION
                 | USN_REASON_BASIC_INFO_CHANGE,
@@ -260,10 +267,6 @@ pub fn usn_watch_forever(
         if returned >= 8 {
             let slice = &out[..returned as usize];
             next_cursor = i64::from_le_bytes(slice[0..8].try_into().unwrap());
-            let _ = tx.send(UsnWatchMsg::Checkpoint {
-                journal_id,
-                next_usn: next_cursor as u64,
-            });
 
             // 整批先解析、按 FRN 合并，再统一投递（见 coalesce_watch_batch）。
             let mut batch: Vec<ParsedWatchRec> = Vec::new();
@@ -272,7 +275,9 @@ pub fn usn_watch_forever(
                 let rec_full = &slice[off..];
                 let record_len = u32::from_le_bytes(rec_full[0..4].try_into().unwrap()) as usize;
                 if record_len < 8 || off + record_len > slice.len() {
-                    break;
+                    return Err(findx2_core::Error::Platform(
+                        "malformed journal record; cursor not acknowledged".into(),
+                    ));
                 }
                 let rec = &slice[off..off + record_len];
                 off += record_len;
@@ -280,10 +285,14 @@ pub fn usn_watch_forever(
                 let Some((file_ref, parent_ref, reason, attrs, name_len, name_off, file_id_128)) =
                     parse_read_usn_record(rec)
                 else {
-                    continue;
+                    return Err(findx2_core::Error::Platform(
+                        "unsupported journal record/identity; cursor not acknowledged".into(),
+                    ));
                 };
-                if name_off + name_len > rec.len() {
-                    continue;
+                if name_off + name_len > rec.len() || name_len % 2 != 0 {
+                    return Err(findx2_core::Error::Platform(
+                        "invalid journal name bounds; cursor not acknowledged".into(),
+                    ));
                 }
                 let wide = u16_slice(&rec[name_off..name_off + name_len]);
                 let name = OsString::from_wide(wide).to_string_lossy().into_owned();
@@ -298,9 +307,11 @@ pub fn usn_watch_forever(
                     file_id_128,
                 });
             }
+            let mut messages = Vec::new();
             for rec in coalesce_watch_batch(batch) {
-                emit_coalesced_watch_rec(&rec, &tx);
+                emit_coalesced_watch_rec(&rec, &mut messages);
             }
+            publish_watch_batch(messages, journal_id, next_cursor as u64, &tx)?;
         }
         // 无 sleep：阻塞式 READ 自带等待节拍；有数据时紧追，无数据时内核挂起。
     }
@@ -347,9 +358,9 @@ fn coalesce_watch_batch(recs: Vec<ParsedWatchRec>) -> Vec<ParsedWatchRec> {
 /// - 仅 OLD → Rename（旧语义；下一批的 NEW_NAME 会以 CreatePending 补齐）；
 /// - CREATE / 仅 NEW_NAME → CreatePending（0 元数据入库，名字立即可搜）+ StatRefresh；
 /// - 纯 DATA/META → 不入库（名字未变），只 StatRefresh 排队异步补 meta。
-fn emit_coalesced_watch_rec(rec: &ParsedWatchRec, tx: &Sender<UsnWatchMsg>) {
+fn emit_coalesced_watch_rec(rec: &ParsedWatchRec, tx: &mut Vec<UsnWatchMsg>) {
     if (rec.reason & USN_REASON_FILE_DELETE) != 0 {
-        let _ = tx.send(UsnWatchMsg::Event(ChangeEvent::Delete {
+        tx.push(UsnWatchMsg::Event(ChangeEvent::Delete {
             file_id: rec.file_ref,
         }));
         // 不 return：同批同 FRN 若还有 CREATE/NEW_NAME（FRN 复用），继续走新建分支。
@@ -358,7 +369,7 @@ fn emit_coalesced_watch_rec(rec: &ParsedWatchRec, tx: &Sender<UsnWatchMsg>) {
     let has_new = (rec.reason & USN_REASON_RENAME_NEW_NAME) != 0;
     if has_old || has_new {
         // 配对或单 OLD 都发 Rename（NEW 侧数据优先；单 OLD 时沿用旧语义）。
-        let _ = tx.send(UsnWatchMsg::Event(ChangeEvent::Rename {
+        tx.push(UsnWatchMsg::Event(ChangeEvent::Rename {
             file_id: rec.file_ref,
             new_parent_id: rec.parent_ref,
             new_name: rec.name.clone(),
@@ -368,7 +379,7 @@ fn emit_coalesced_watch_rec(rec: &ParsedWatchRec, tx: &Sender<UsnWatchMsg>) {
         }
         // 配对/仅 NEW：名字已搬，内容 meta 可能同时变了，顺手排队 stat（目录跳过，size 恒 0）。
         if !rec.is_dir {
-            let _ = tx.send(UsnWatchMsg::StatRefresh {
+            tx.push(UsnWatchMsg::StatRefresh {
                 file_id: rec.file_ref,
                 file_id_128: rec.file_id_128,
             });
@@ -376,7 +387,7 @@ fn emit_coalesced_watch_rec(rec: &ParsedWatchRec, tx: &Sender<UsnWatchMsg>) {
         return;
     }
     if (rec.reason & USN_REASON_FILE_CREATE) != 0 {
-        let _ = tx.send(UsnWatchMsg::Event(ChangeEvent::CreatePending {
+        tx.push(UsnWatchMsg::Event(ChangeEvent::CreatePending {
             file_id: rec.file_ref,
             file_id_128: rec.file_id_128,
             parent_id: rec.parent_ref,
@@ -385,19 +396,20 @@ fn emit_coalesced_watch_rec(rec: &ParsedWatchRec, tx: &Sender<UsnWatchMsg>) {
             is_dir: rec.is_dir,
         }));
         if !rec.is_dir {
-            let _ = tx.send(UsnWatchMsg::StatRefresh {
+            tx.push(UsnWatchMsg::StatRefresh {
                 file_id: rec.file_ref,
                 file_id_128: rec.file_id_128,
             });
         }
         return;
     }
-    if (rec.reason & USN_REASON_DATA_EXTEND) != 0
+    if (rec.reason & USN_REASON_DATA_OVERWRITE) != 0
+        || (rec.reason & USN_REASON_DATA_EXTEND) != 0
         || (rec.reason & USN_REASON_DATA_TRUNCATION) != 0
         || (rec.reason & USN_REASON_BASIC_INFO_CHANGE) != 0
     {
         if !rec.is_dir {
-            let _ = tx.send(UsnWatchMsg::StatRefresh {
+            tx.push(UsnWatchMsg::StatRefresh {
                 file_id: rec.file_ref,
                 file_id_128: rec.file_id_128,
             });
@@ -747,5 +759,70 @@ mod tests {
     fn coalesce_empty_batch() {
         let out = coalesce_watch_batch(vec![]);
         assert!(out.is_empty());
+    }
+}
+
+fn publish_watch_batch(
+    messages: Vec<UsnWatchMsg>,
+    journal_id: u64,
+    next_usn: u64,
+    tx: &Sender<UsnWatchMsg>,
+) -> Result<()> {
+    let mut events = Vec::new();
+    let mut stats = Vec::new();
+    for msg in messages {
+        match msg {
+            UsnWatchMsg::Event(e) => events.push(e),
+            UsnWatchMsg::StatRefresh { .. } => stats.push(msg),
+            _ => {}
+        }
+    }
+    tx.send(UsnWatchMsg::NamespaceBatch {
+        events,
+        journal_id,
+        next_usn,
+    })
+    .map_err(|_| findx2_core::Error::Platform("watch receiver closed".into()))?;
+    for msg in stats {
+        tx.send(msg)
+            .map_err(|_| findx2_core::Error::Platform("watch receiver closed".into()))?;
+    }
+    tx.send(UsnWatchMsg::Checkpoint {
+        journal_id,
+        next_usn,
+    })
+    .map_err(|_| findx2_core::Error::Platform("watch receiver closed".into()))?;
+    Ok(())
+}
+#[cfg(test)]
+mod publish_tests {
+    use super::*;
+    #[test]
+    fn namespace_precedes_stats_and_checkpoint_without_opening_a_volume() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let messages = vec![
+            UsnWatchMsg::StatRefresh {
+                file_id: 7,
+                file_id_128: None,
+            },
+            UsnWatchMsg::Event(ChangeEvent::Delete { file_id: 7 }),
+        ];
+        publish_watch_batch(messages, 9, 20, &tx).unwrap();
+        assert!(matches!(
+            rx.recv().unwrap(),
+            UsnWatchMsg::NamespaceBatch {
+                journal_id: 9,
+                next_usn: 20,
+                ..
+            }
+        ));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            UsnWatchMsg::StatRefresh { file_id: 7, .. }
+        ));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            UsnWatchMsg::Checkpoint { next_usn: 20, .. }
+        ));
     }
 }

@@ -24,6 +24,10 @@ use crate::watch_health::set_watch_error;
 pub(crate) struct RunFlags {
     pub no_everything_ipc: bool,
     pub no_backfill: bool,
+    pub no_watch: bool,
+    pub usage_memory_mib: Option<usize>,
+    pub shutdown_file: Option<std::path::PathBuf>,
+    pub fixture_events: Option<std::path::PathBuf>,
     /// CLI 注入的排除目录（与 sidecar 里的取并集，由 IndexStore 持有运行时副本）。
     pub extra_excluded_dirs: Vec<String>,
 }
@@ -61,8 +65,10 @@ fn is_volume_frozen(letter: char) -> bool {
 fn spawn_stat_worker(
     engine: Arc<SearchEngine>,
     volume_device_path: String,
-) -> std::sync::mpsc::Sender<(u64, Option<[u8; 16]>)> {
-    let (tx, rx) = std::sync::mpsc::channel::<(u64, Option<[u8; 16]>)>();
+) -> std::sync::mpsc::SyncSender<(u64, Option<[u8; 16]>)> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Option<[u8; 16]>)>(
+        (4 * 1024 * 1024) / std::mem::size_of::<(u64, Option<[u8; 16]>)>(),
+    );
     std::thread::Builder::new()
         .name("findx2-stat-worker".into())
         .spawn(move || {
@@ -74,9 +80,7 @@ fn spawn_stat_worker(
             loop {
                 match rx.recv_timeout(std::time::Duration::from_millis(1000)) {
                     Ok((frn, id128)) => {
-                        if pending.len() < 500_000 {
-                            pending.insert(frn, id128);
-                        }
+                        pending.insert(frn, id128);
                         // 攒够一批就刷（5000 条或 1 秒超时，取先到者）。
                         if pending.len() >= 5000 {
                             drain_stat_batch(
@@ -140,6 +144,15 @@ fn drain_stat_batch(
     frns.sort_unstable();
     let id128s: Vec<Option<[u8; 16]>> = frns.iter().map(|f| pending[f]).collect();
     let indices: Vec<usize> = (0..frns.len()).collect();
+    let volume = volume_device_path
+        .chars()
+        .rev()
+        .find(|c| c.is_ascii_alphabetic())
+        .unwrap_or('C') as u8;
+    let tickets: Vec<_> = frns
+        .iter()
+        .map(|&f| engine.metadata_ticket_by_id(volume, f))
+        .collect();
     let updates = findx2_windows::fill_metadata_by_id_pooled(
         volume_device_path,
         &frns,
@@ -160,20 +173,12 @@ fn drain_stat_batch(
         }
         return;
     }
-    // FRN → entry_idx 映射一次查完（读锁），再逐条 patch（写锁短持 + revision）。
-    // idx 下标稳定（entries 只追加不压缩；删除只打墓碑），映射与 patch 之间无需重查。
-    // 注：墓碑条目也会被 patch（无害：搜索过滤在前；且多为“删后 stat 迟到”的无害写）。
-    let targets: Vec<(usize, u64, u64, u64)> = updates
-        .iter()
-        .filter_map(|(local_idx, size, mtime, ctime)| {
-            let frn = *frns.get(*local_idx)?;
-            let idx = engine.entry_idx_by_frn(frn)?;
-            Some((idx, *size, *mtime, *ctime))
-        })
-        .collect();
-    for (idx, size, mtime, ctime) in targets {
-        // patch_entry_metadata 内部 bump revision（分页缓存失效正确）。
-        let _ = engine.patch_entry_metadata(idx, size, mtime, ctime);
+    for (local, size, mtime, ctime) in updates {
+        if let Some(Some(ticket)) = tickets.get(local) {
+            if let Err(e) = engine.commit_metadata(*ticket, size, mtime, ctime) {
+                tracing::warn!("stat commit: {e}");
+            }
+        }
     }
 }
 
@@ -262,6 +267,9 @@ pub(crate) fn run_foreground(
     stop: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let _ = (full_stat, max_scan_threads);
+    if flags.no_watch && (!flags.no_backfill || !flags.no_everything_ipc) {
+        anyhow::bail!("--no-watch requires --no-backfill --no-everything-ipc (strict isolation)");
+    }
     if !index.exists() {
         return Err(anyhow::anyhow!(
             "索引文件 {} 不存在。findx2-service 不再自动建库；请先用 `findx2 index --output {}` 建库（建库需管理员权限）后再启动服务。",
@@ -395,6 +403,23 @@ pub(crate) fn run_foreground(
     }
 
     let engine = Arc::new(SearchEngine::new(store));
+    let budget = if let Some(mib) = flags.usage_memory_mib {
+        mib.checked_mul(1024 * 1024)
+            .ok_or_else(|| anyhow::anyhow!("usage byte budget overflow"))?
+    } else {
+        use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut m = MEMORYSTATUSEX::default();
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        unsafe { GlobalMemoryStatusEx(&mut m) }.map_err(|e| {
+            anyhow::anyhow!("available RAM query failed; specify --usage-memory-mib: {e}")
+        })?;
+        (m.ullAvailPhys / 4) as usize
+    };
+    info!(
+        usage_extra_budget_bytes = budget,
+        "logical tree budget (additional resident/staging, not total process RSS)"
+    );
+    engine.enable_usage(budget).map_err(anyhow::Error::msg)?;
     {
         let mut g = slot.write().expect("EngineSlot 写锁中毒");
         *g = Some(engine.clone());
@@ -402,7 +427,7 @@ pub(crate) fn run_foreground(
 
     // 边车缺失 / 加载时被判不可信（重建窗口内崩溃过）：后台补建一次，
     // 本轮搜索先走全表扫描兜底，构建完成后自动切到剪枝路径。
-    if engine.index_store().trigram.is_none() {
+    if !flags.no_watch && engine.index_store().trigram.is_none() {
         spawn_trigram_rebuild(engine.clone(), index.clone(), "启动时边车缺失或校验失败");
     }
 
@@ -428,7 +453,9 @@ pub(crate) fn run_foreground(
 
     let volumes_watch: Vec<(String, u8)> = {
         let g = engine.index_store();
-        if g.volumes.is_empty() {
+        if flags.no_watch {
+            Vec::new()
+        } else if g.volumes.is_empty() {
             let c = _volume
                 .chars()
                 .find(|ch| ch.is_ascii_alphabetic())
@@ -446,6 +473,15 @@ pub(crate) fn run_foreground(
         }
     };
 
+    if flags.no_watch {
+        crate::watch_health::set_watch_error(
+            'F',
+            Some("isolated no-watch mode: no real USN/MFT; fixture events only".into()),
+        );
+        if let Some(script) = flags.fixture_events.clone() {
+            crate::usage_fixture::spawn_events(engine.clone(), script, stop.clone());
+        }
+    }
     let save_iv = save_interval_secs.max(1);
     // P0-3 journal 保障 + P1-6 MFT 碎片预警（每卷一次，需管理员；失败只记日志）：
     // journal 太小是“长期运行后静默丢变更”的根因，Everything 同款做法。
@@ -479,6 +515,12 @@ pub(crate) fn run_foreground(
                 save_iv,
                 stop_watch,
             ) {
+                crate::watch_health::set_watch_error(
+                    letter as char,
+                    Some(format!(
+                        "watch mutation failed; cursor not acknowledged: {e}"
+                    )),
+                );
                 error!("USN 监听线程退出 ({letter}): {e}");
             }
         }));
@@ -488,6 +530,9 @@ pub(crate) fn run_foreground(
     // pipe 线程 detached：进程退出时由 OS 收割（管道句柄随进程关闭）。
     // 之前这里 `pipe_thread.join()` 永久阻塞，服务停止完全靠 win_service 的 process::exit 硬杀。
     while !stop.load(Ordering::SeqCst) {
+        if flags.shutdown_file.as_ref().is_some_and(|p| p.exists()) {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(200));
     }
     info!("收到停机指令：等待 USN 线程 flush + 落盘（每卷最多 10s）…");
@@ -565,34 +610,18 @@ fn usn_watch_loop(
     // 用 sub-batch（512 一组），每个 sub-batch 一把短写锁，组间不 sleep（让历史回放不至于
     // 拖太久），但每个 sub-batch 之间是新写锁——parking_lot 下让排队中的 search reader
     // 有插队窗口。
-    const SUB_BATCH: usize = 512;
     // 返回实际 apply 的条数（0 = 无事发生），调用方据此置 dirty，避免空闲时也全量写盘。
-    let flush_pending = |pending: &mut Vec<findx2_core::ChangeEvent>| -> usize {
-        if pending.is_empty() {
-            return 0;
-        }
+    let flush_pending = |pending: &mut Vec<findx2_core::ChangeEvent>| -> anyhow::Result<usize> {
         let total = pending.len();
-        let t0 = Instant::now();
-        let drained: Vec<findx2_core::ChangeEvent> = pending.drain(..).collect();
-        for chunk in drained.chunks(SUB_BATCH) {
-            let mut g = engine.index_store_mut();
-            for ev in chunk {
-                if let Err(e) = g.apply_change_event(ev) {
-                    error!("apply_change_event: {e}");
-                }
-            }
-            // g 在每个 chunk 末尾自动释放，下个 chunk 会重新拿写锁——
-            // search reader 有机会在两次写锁之间插进来。
+        // Watermark is advanced only after every event has succeeded. On failure the
+        // previous persisted cursor remains replayable; no error is swallowed.
+        for ev in pending.iter() {
+            engine
+                .apply_volume_change(volume_letter, ev)
+                .map_err(anyhow::Error::msg)?;
         }
-        // 直接改 store 绕过了 engine 的写入方法：手动推进 revision，使分页缓存失效。
-        // 一批只 bump 一次（不必每条）， Staleness 窗口 ≤ 一次 flush。
-        engine.note_external_mutation();
-        let ms = t0.elapsed().as_millis();
-        if ms > 100 {
-            // 超过 100ms 的 flush 大概率是历史回放或大批增量；记下来便于复盘。
-            tracing::info!("USN flush 偏慢：{} 条 / {} ms", total, ms);
-        }
-        total
+        pending.clear();
+        Ok(total)
     };
 
     // 脏计数：累计已 apply 但未提交的 ChangeEvent 条数。
@@ -608,7 +637,7 @@ fn usn_watch_loop(
                              engine: &Arc<SearchEngine>,
                              index_path: &PathBuf|
      -> anyhow::Result<()> {
-        if *dirty_count == 0 {
+        if *dirty_count == 0 && !engine.index_store().has_pending_mutations() {
             return Ok(());
         }
         if !engine.metadata_ready() {
@@ -642,7 +671,7 @@ fn usn_watch_loop(
 
     // worker 启动闭包：每次都重读最新游标（重建后 journal 游标已更新）。
     // 返回 None = 卷元数据都没了（索引被换），退避后外层重试。
-    let make_worker = |tx: mpsc::Sender<findx2_windows::UsnWatchMsg>|
+    let make_worker = |tx: mpsc::SyncSender<findx2_windows::UsnWatchMsg>|
         -> Option<std::thread::JoinHandle<findx2_core::Result<()>>>
     {
         let vol_meta = {
@@ -668,7 +697,7 @@ fn usn_watch_loop(
     // worker 持有发送端，主循环只收不发；重启时整套重建（resume 重读新游标）。
     let mut rx: mpsc::Receiver<findx2_windows::UsnWatchMsg>;
     let mut worker = {
-        let (tx0, rx0) = mpsc::channel::<findx2_windows::UsnWatchMsg>();
+        let (tx0, rx0) = mpsc::sync_channel::<findx2_windows::UsnWatchMsg>(1);
         rx = rx0;
         match make_worker(tx0) {
             Some(w) => w,
@@ -684,7 +713,7 @@ fn usn_watch_loop(
         // 退出前 flush 内存 pending（游标停在最后 Checkpoint，journal 重放覆盖剩余变更）
         // 并落盘一次（metadata_ready 才写，与周期落盘同一守卫）。
         if stop.load(Ordering::SeqCst) {
-            flush_pending(&mut pending);
+            flush_pending(&mut pending)?;
             if engine.metadata_ready() {
                 match persist_index(&engine, &index_path) {
                     Ok(_) => info!("卷 {letter} 停机落盘完成"),
@@ -704,13 +733,24 @@ fn usn_watch_loop(
         }
         match rx.recv_timeout(flush_every) {
             Ok(msg) => match msg {
+                findx2_windows::UsnWatchMsg::NamespaceBatch {
+                    events,
+                    journal_id,
+                    next_usn,
+                } => {
+                    dirty_count += flush_pending(&mut pending)?;
+                    engine
+                        .apply_volume_batch(volume_letter, &events, journal_id, next_usn)
+                        .map_err(anyhow::Error::msg)?;
+                    dirty_count += events.len();
+                }
                 findx2_windows::UsnWatchMsg::Event(ev) => {
                     if pending.is_empty() {
                         batch_started = Instant::now();
                     }
                     pending.push(ev);
                     if pending.len() >= USN_BATCH_MAX_EVENTS {
-                        dirty_count += flush_pending(&mut pending);
+                        dirty_count += flush_pending(&mut pending)?;
                     }
                 }
                 findx2_windows::UsnWatchMsg::StatRefresh {
@@ -719,13 +759,20 @@ fn usn_watch_loop(
                 } => {
                     // 路由给后台 stat worker（watch 线程永不 stat）；发送失败（worker 退出）
                     // 则丢弃——下次同文件变更会重新排队，极端下靠全量重建兜底。
-                    let _ = stat_tx.send((file_id, file_id_128));
+                    dirty_count += flush_pending(&mut pending)?;
+                    if file_id_128.is_some_and(|id| id[8..].iter().any(|&b| b != 0)) {
+                        anyhow::bail!("full 128-bit stat binding unresolved; refusing low64 alias");
+                    }
+                    engine.mark_metadata_dirty(volume_letter, file_id);
+                    stat_tx.send((file_id, file_id_128)).map_err(|_| {
+                        anyhow::anyhow!("stat worker unavailable; metadata remains unknown")
+                    })?;
                 }
                 findx2_windows::UsnWatchMsg::Checkpoint {
                     journal_id,
                     next_usn,
                 } => {
-                    dirty_count += flush_pending(&mut pending);
+                    dirty_count += flush_pending(&mut pending)?;
                     if let Some(v) = engine.index_store_mut().volumes.iter_mut().find(|x| {
                         (x.volume_letter as char).to_ascii_uppercase()
                             == (volume_letter as char).to_ascii_uppercase()
@@ -750,13 +797,13 @@ fn usn_watch_loop(
             },
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if !pending.is_empty() && batch_started.elapsed() >= flush_every {
-                    dirty_count += flush_pending(&mut pending);
+                    dirty_count += flush_pending(&mut pending)?;
                 }
                 try_maybe_persist(&mut dirty_count, &mut last_save, &engine, &index_path)?;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // worker 死了：join 判因后重启（先排空残留消息已由 Disconnected 语义保证）。
-                dirty_count += flush_pending(&mut pending);
+                dirty_count += flush_pending(&mut pending)?;
                 let exit = worker.join();
                 let reason = match &exit {
                     Ok(Ok(())) => "watch 线程异常返回（理论不可达）".to_string(),
@@ -805,7 +852,7 @@ fn usn_watch_loop(
                 // 重建 worker（resume 重读：重建后游标已回绕到 frozen 点）。
                 // 任一分支都必须重建 worker 或直接返回，否则下轮循环用的是已 move 的旧句柄。
                 match make_worker({
-                    let (tx_new, rx_new) = mpsc::channel::<findx2_windows::UsnWatchMsg>();
+                    let (tx_new, rx_new) = mpsc::sync_channel::<findx2_windows::UsnWatchMsg>(1);
                     rx = rx_new;
                     tx_new
                 }) {
@@ -822,7 +869,7 @@ fn usn_watch_loop(
             }
         }
         if !pending.is_empty() && batch_started.elapsed() >= flush_every {
-            dirty_count += flush_pending(&mut pending);
+            dirty_count += flush_pending(&mut pending)?;
         }
     }
 }
@@ -923,6 +970,10 @@ fn rebuild_volume(
         }
     }
     engine.note_external_mutation();
+    engine.clear_metadata_overlay();
+    engine
+        .enable_usage(engine.usage_budget())
+        .map_err(anyhow::Error::msg)?;
 
     // 4) 落盘 + trigram 重建（合并后 trigram=None，先回全表扫描，重建完自动切回剪枝）。
     persist_index(engine, index_path)?;

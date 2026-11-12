@@ -489,7 +489,7 @@ fn run() -> Result<()> {
                 journal_id: vol.usn_journal_id,
                 start_usn: vol.last_usn,
             };
-            let (tx, rx) = mpsc::channel::<findx2_windows::UsnWatchMsg>();
+            let (tx, rx) = mpsc::sync_channel::<findx2_windows::UsnWatchMsg>(1);
             let vol_path = volume.clone();
             let worker = std::thread::spawn(move || {
                 findx2_windows::usn_watch_forever(&vol_path, Some(resume), tx)
@@ -504,6 +504,20 @@ fn run() -> Result<()> {
             loop {
                 match rx.recv_timeout(Duration::from_secs(1)) {
                     Ok(msg) => match msg {
+                        findx2_windows::UsnWatchMsg::NamespaceBatch {
+                            events,
+                            journal_id,
+                            next_usn,
+                        } => {
+                            for ev in events {
+                                store.apply_change_event(&ev)?;
+                            }
+                            if let Some(v) = store.volumes.first_mut() {
+                                v.usn_journal_id = journal_id;
+                                v.last_usn = next_usn;
+                            }
+                            dirty = true;
+                        }
                         findx2_windows::UsnWatchMsg::Event(ev) => {
                             // CreatePending 在 service 侧由后台补 meta；CLI 前台watch 保持旧语义：
                             // 新建条目立刻同步拉一次 meta（CLI 本来就是管理员+前台，无后台线程）。
