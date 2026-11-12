@@ -629,7 +629,14 @@ impl MainWindow {
                 Button::new("usage-index-source")
                     .ghost()
                     .h(px(24.))
-                    .label("索引逻辑")
+                    .label(if self.workspace.engine_usage {
+                        "索引逻辑"
+                    } else if self.workspace.scanning {
+                        "本地实测中"
+                    } else {
+                        "本地实测"
+                    })
+                    .tooltip("当前数据来源；点击选择索引逻辑。不会更新或重启引擎服务")
                     .selected(self.workspace.engine_usage)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.select_engine_usage_source(cx);
@@ -930,6 +937,21 @@ impl MainWindow {
             } else {
                 "本地实测 · 实际占用"
             }));
+        if self.workspace.scanning {
+            let preview = self.workspace.usage_preview.borrow();
+            head = head
+                .child(
+                    div()
+                        .text_lg()
+                        .child(format!("扫描预览 · {}", preview.scope_name)),
+                )
+                .child(div().text_xs().child("仅已测部分 · 总量未知"))
+                .child(
+                    div()
+                        .text_xs()
+                        .child("双击目录深入 / 向上返回；文件操作待扫描结束"),
+                );
+        }
         let mut mid = v_flex()
             .id("usage-detail-scroll")
             .flex_1()
@@ -945,6 +967,39 @@ impl MainWindow {
             .gap_1()
             .border_t_1()
             .border_color(tokens.border);
+        if self.workspace.scanning {
+            use std::sync::atomic::Ordering;
+            let progress = &self.workspace.progress;
+            let preview = self.workspace.usage_preview.borrow();
+            mid = mid
+                .child(div().text_2xl().child(disk_usage::format_bytes(
+                    progress.allocated.load(Ordering::Relaxed),
+                )))
+                .child(div().text_xs().child(format!(
+                    "{} 条路径 · {} 目录",
+                    progress.entries.load(Ordering::Relaxed),
+                    progress.directories.load(Ordering::Relaxed)
+                )))
+                .child(div().text_xs().child(if preview.coarsened {
+                    "预览按资源预算合并；不影响实际扫描"
+                } else {
+                    "层级与面积仅表示目前已测部分"
+                }));
+            if let Some((name, bytes)) = preview.selection_detail() {
+                mid = mid
+                    .child(div().mt_3().text_sm().child(name))
+                    .child(div().text_xs().child(format!(
+                        "已测 {} · 尚未完成",
+                        disk_usage::format_bytes(bytes)
+                    )));
+            }
+            foot = foot.child(
+                div()
+                    .text_xs()
+                    .child("扫描中不提供清理操作；未知占用不是 0"),
+            );
+            return panel.child(head).child(mid).child(foot).into_any_element();
+        }
         if let (Some(scan), Some(index)) = (self.workspace.scan.as_ref(), selected.or(root)) {
             let node = &scan.nodes[index];
             let name = node

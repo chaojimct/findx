@@ -28,6 +28,7 @@ struct PaintTile {
     header: Option<Rect>,
     depth: usize,
     color: Hsla,
+    opacity: f32,
     name: String,
     size: String,
     selected: bool,
@@ -62,6 +63,55 @@ impl MainWindow {
             } else {
                 self.workspace.usage_transition = None;
             }
+        }
+        if self.workspace.scanning {
+            let b = self.workspace.usage_bounds.get();
+            let size = (
+                f32::from(b.size.width).max(0.) as u32,
+                f32::from(b.size.height).max(0.) as u32,
+                self.workspace.usage_depth,
+            );
+            let now = Instant::now();
+            let source = Arc::as_ptr(&self.workspace.progress) as usize;
+            let mut motion = self.workspace.usage_preview.borrow_mut();
+            let snapshot = {
+                let builder = crate::disktree::lock(&self.workspace.progress.preview);
+                (size.0 > 1 && size.1 > 1 && motion.due(builder.revision, size, source, now))
+                    .then(|| builder.snapshot())
+            };
+            if let Some(snapshot) = snapshot {
+                motion.update(
+                    snapshot,
+                    size,
+                    source,
+                    now,
+                    self.session.read(cx).prefs.usage_reduce_motion,
+                );
+                if std::env::var_os("FINDX_NATIVE_USAGE_TRACE").is_some() {
+                    let (paints, ns, max) = usage_view::paint_metrics();
+                    eprintln!(
+                        "usage_preview revision={} builds={} layout_us={} paint_count={} paint_mean_us={} paint_max_us={}",
+                        motion.revision,
+                        motion.builds,
+                        motion.layout_us,
+                        paints,
+                        ns / paints.max(1) / 1000,
+                        max / 1000
+                    );
+                }
+            }
+            if motion.running(now) {
+                window.request_animation_frame();
+            }
+            return;
+        }
+        if self
+            .workspace
+            .usage_preview
+            .borrow()
+            .running(Instant::now())
+        {
+            window.request_animation_frame();
         }
         let Some(scan) = self.workspace.scan.clone() else {
             return;
@@ -105,6 +155,7 @@ impl MainWindow {
         self.workspace.usage_scene_generation =
             self.workspace.usage_scene_generation.wrapping_add(1);
         let generation = self.workspace.usage_scene_generation;
+        let handoff_scan = scan.clone();
         cx.spawn(async move |this, cx| {
             let scene = cx
                 .background_spawn(async move { usage_view::build_scene(&scan, key) })
@@ -113,7 +164,11 @@ impl MainWindow {
                 if this.workspace.usage_scene_generation != generation {
                     return;
                 }
-                if let Some(previous) = &this.workspace.usage_scene {
+                let source = Arc::as_ptr(&this.workspace.progress) as usize;
+                let handing = !this.workspace.engine_usage
+                    && handoff_scan.logical_generation.is_none()
+                    && this.workspace.usage_preview.borrow().can_handoff(source);
+                if let Some(previous) = this.workspace.usage_scene.as_ref().filter(|_| !handing) {
                     if previous.key.root != scene.key.root
                         || (!this.workspace.engine_usage && previous.key.scan != scene.key.scan)
                     {
@@ -158,6 +213,49 @@ impl MainWindow {
                     scene.layout_elapsed.as_micros(),
                     scene.key.detail
                 );
+                if handing {
+                    let target = scene
+                        .tiles
+                        .iter()
+                        .filter(|t| t.depth > 0)
+                        .map(|t| {
+                            let (id, parent, name) = match t.key {
+                                TileKey::Node(i) => (
+                                    i,
+                                    handoff_scan.nodes[i].parent.unwrap_or(0),
+                                    handoff_scan.nodes[i]
+                                        .path
+                                        .file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                ),
+                                TileKey::Other(i) => (
+                                    (1usize << 63) | (1usize << 62) | i,
+                                    scene.key.root,
+                                    "其他小项".into(),
+                                ),
+                            };
+                            crate::disktree::scan_preview::Tile {
+                                id,
+                                parent,
+                                rect: t.rect,
+                                depth: t.depth,
+                                header: t.header.is_some(),
+                                header_h: t.header.map_or(0., |h| h.h),
+                                class: t.class,
+                                name,
+                                bytes: t.bytes,
+                                opacity: 1.,
+                            }
+                        })
+                        .collect();
+                    this.workspace.usage_preview.borrow_mut().handoff(
+                        target,
+                        Instant::now(),
+                        this.session.read(cx).prefs.usage_reduce_motion,
+                    );
+                }
                 // Preserve zoom but clamp its origin after resize/detail relayout.
                 this.workspace.usage_camera.pan(0., 0., scene.viewport);
                 this.workspace.usage_scene = Some(Arc::new(scene));
@@ -168,6 +266,20 @@ impl MainWindow {
         .detach();
     }
     pub(super) fn zoom_usage_center(&mut self, factor: f32, cx: &mut Context<Self>) {
+        if self.workspace.scanning {
+            let b = self.workspace.usage_bounds.get();
+            let v = Rect {
+                x: 0.,
+                y: 0.,
+                w: f32::from(b.size.width),
+                h: f32::from(b.size.height),
+            };
+            self.workspace
+                .usage_camera
+                .zoom(factor, (v.w / 2., v.h / 2.), v);
+            cx.notify();
+            return;
+        }
         if let Some(scene) = &self.workspace.usage_scene {
             self.workspace.usage_transition = None;
             self.workspace.usage_wheel_gate.reset();
@@ -184,6 +296,9 @@ impl MainWindow {
         (f32::from(p.x - b.origin.x), f32::from(p.y - b.origin.y))
     }
     fn usage_hit(&self, p: (f32, f32)) -> Option<TileKey> {
+        if self.workspace.scanning {
+            return usage_view::hit_frame(&self.workspace.usage_frame.borrow(), p);
+        }
         if self.workspace.usage_scene.as_ref().is_none_or(|s| {
             Some(s.key.root) != self.scan_node()
                 || self
@@ -197,6 +312,44 @@ impl MainWindow {
         usage_view::hit_frame(&self.workspace.usage_frame.borrow(), p)
     }
     fn usage_scroll(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
+        if self.workspace.scanning {
+            let b = self.workspace.usage_bounds.get();
+            let viewport = Rect {
+                x: 0.,
+                y: 0.,
+                w: f32::from(b.size.width),
+                h: f32::from(b.size.height),
+            };
+            let (dx, dy) = match event.delta {
+                ScrollDelta::Lines(p) => usage_view::normalized_wheel(p.x, p.y, true),
+                ScrollDelta::Pixels(p) => {
+                    usage_view::normalized_wheel(f32::from(p.x), f32::from(p.y), false)
+                }
+            };
+            match usage_view::wheel_intent(
+                dx,
+                dy,
+                event.modifiers.shift,
+                event.modifiers.control,
+                event.modifiers.alt,
+                event.modifiers.platform,
+            ) {
+                usage_view::WheelIntent::Zoom { steps } => {
+                    let p = self.usage_point(event.position);
+                    self.workspace
+                        .usage_camera
+                        .zoom(1.30f32.powf(steps), p, viewport);
+                }
+                usage_view::WheelIntent::Pan { dx, dy } => {
+                    self.workspace.usage_camera.pan(dx, dy, viewport)
+                }
+                _ => {}
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
         let Some(scene) = self.workspace.usage_scene.clone().filter(|s| {
             Some(s.key.root) == self.scan_node()
                 && self
@@ -321,10 +474,55 @@ impl MainWindow {
             .copied();
         let mut draws = Vec::<PaintTile>::new();
         let mut empty = None;
-        if let (Some(scan), Some(scene)) = (&self.workspace.scan, &self.workspace.usage_scene) {
+        if self.workspace.scanning {
+            let now = Instant::now();
+            let motion = self.workspace.usage_preview.borrow();
+            for t in motion.sample(now) {
+                let rect = self.workspace.usage_camera.rect(t.rect);
+                let mut color = tokens.usage_fill(t.class, t.depth);
+                color.a *= t.opacity;
+                draws.push(PaintTile {
+                    key: TileKey::Other(t.id),
+                    rect,
+                    header: (t.header_h > 0.5).then_some(Rect {
+                        h: t.header_h,
+                        ..rect
+                    }),
+                    depth: t.depth,
+                    color,
+                    opacity: t.opacity,
+                    name: t.name,
+                    size: disk_usage::format_bytes(t.bytes),
+                    selected: motion.selected == Some(t.id),
+                    hovered: self.workspace.usage_hover == Some(TileKey::Other(t.id)),
+                    unknown: false,
+                    class: t.class,
+                });
+            }
+            if draws.is_empty() {
+                empty = Some("本地实测中 · 等待首批已测数据（总量未知）");
+            }
+        } else if let (Some(scan), Some(scene)) =
+            (&self.workspace.scan, &self.workspace.usage_scene)
+        {
             if scene.key.scan == Arc::as_ptr(scan) as usize
                 && Some(scene.key.root) == self.scan_node()
             {
+                let preview = self.workspace.usage_preview.borrow();
+                let blended = if !self.workspace.engine_usage
+                    && preview.scope == scene.key.root
+                    && preview.finalized
+                    && preview.running(Instant::now())
+                {
+                    preview
+                        .sample(Instant::now())
+                        .into_iter()
+                        .map(|t| (t.id, t))
+                        .collect::<std::collections::HashMap<_, _>>()
+                } else {
+                    Default::default()
+                };
+                let mut remaining = blended.clone();
                 for tile in scene.tiles.iter().filter(|t| t.depth > 0) {
                     let sample = |r| {
                         self.workspace.usage_camera.rect(
@@ -335,7 +533,16 @@ impl MainWindow {
                                 .unwrap_or(r),
                         )
                     };
-                    let r = sample(tile.rect);
+                    let id = match tile.key {
+                        TileKey::Node(i) => i,
+                        TileKey::Other(i) => (1usize << 63) | (1usize << 62) | i,
+                    };
+                    let blend = blended.get(&id);
+                    remaining.remove(&id);
+                    let r = blend
+                        .map(|t| self.workspace.usage_camera.rect(t.rect))
+                        .unwrap_or_else(|| sample(tile.rect));
+                    let opacity = blend.map_or(1., |t| t.opacity);
                     if r.w < 1.
                         || r.h < 1.
                         || r.x >= scene.viewport.w
@@ -363,19 +570,47 @@ impl MainWindow {
                             false,
                         ),
                     };
-                    let color = tokens.usage_fill(tile.class, tile.depth);
+                    let mut color = tokens.usage_fill(tile.class, tile.depth);
+                    color.a *= opacity;
                     draws.push(PaintTile {
                         key: tile.key,
                         rect: r,
-                        header: tile.header.map(sample),
+                        header: if let Some(t) = blend {
+                            (t.header_h > 0.5).then_some(Rect { h: t.header_h, ..r })
+                        } else {
+                            tile.header.map(sample)
+                        },
                         depth: tile.depth,
                         color,
+                        opacity,
                         name,
                         size,
                         unknown,
                         class: tile.class,
                         selected: matches!(tile.key,TileKey::Node(i) if Some(i)==selected),
                         hovered: self.workspace.usage_hover == Some(tile.key),
+                    });
+                }
+                for (_, t) in remaining {
+                    let mut color = tokens.usage_fill(t.class, t.depth);
+                    color.a *= t.opacity;
+                    let rect = self.workspace.usage_camera.rect(t.rect);
+                    draws.push(PaintTile {
+                        key: TileKey::Other(t.id),
+                        rect,
+                        header: (t.header_h > 0.5).then_some(Rect {
+                            h: t.header_h,
+                            ..rect
+                        }),
+                        depth: t.depth,
+                        color,
+                        opacity: t.opacity,
+                        name: t.name,
+                        size: disk_usage::format_bytes(t.bytes),
+                        selected: false,
+                        hovered: false,
+                        unknown: false,
+                        class: t.class,
                     });
                 }
                 if scan.weight(&scan.nodes[scene.key.root]) == 0 {
@@ -388,46 +623,16 @@ impl MainWindow {
             } else {
                 empty = Some("正在排布已测结果…");
             }
-        } else if self.workspace.scanning {
-            // Genuine DiskTree coarse preview, deliberately non-actionable. Stable
-            // arrival order and a finite entry budget; final tree is built only once.
-            let preview = crate::disktree::lock(&self.workspace.progress.preview).snapshot();
-            let b = self.workspace.usage_bounds.get();
-            let total = preview.entries.iter().map(|e| e.bytes).sum::<u64>();
-            let mut x = 0.;
-            if total > 0 {
-                for e in preview.entries {
-                    let w = f32::from(b.size.width) * e.bytes as f32 / total as f32;
-                    draws.push(PaintTile {
-                        key: TileKey::Other(usize::MAX),
-                        rect: Rect {
-                            x,
-                            y: 0.,
-                            w,
-                            h: f32::from(b.size.height),
-                        },
-                        header: None,
-                        depth: 1,
-                        color: tokens.allocation_color(0),
-                        name: e.name,
-                        size: disk_usage::format_bytes(e.bytes),
-                        selected: false,
-                        hovered: false,
-                        unknown: false,
-                        class: crate::disktree::classify::Category::Other,
-                    });
-                    x += w;
-                }
-            }
-            if draws.is_empty() {
-                empty = Some("正在批量读取目录元数据 · 尚未有可绘制的实测结果");
-            }
         } else {
             empty = Some(if self.workspace.engine_usage {
                 if self.workspace.engine_busy {
                     "正在读取引擎索引逻辑目录树…"
                 } else {
-                    "当前服务尚未提供索引逻辑目录树；状态见下方，可明确选择本地实测"
+                    if self.workspace.scan_status.contains("不支持") {
+                        self.workspace.scan_status.as_str()
+                    } else {
+                        "当前服务尚未提供索引逻辑目录树；状态见下方，可明确选择本地实测"
+                    }
                 }
             } else {
                 "选择目录开始测量；已有快照会直接读取，不会自动全盘扫描"
@@ -470,6 +675,14 @@ impl MainWindow {
             .on_click(cx.listener(|this, _, window, cx| {
                 let p = this.usage_point(window.mouse_position());
                 this.workspace.usage_map_focus.focus(window, cx);
+                if this.workspace.scanning {
+                    if let Some(TileKey::Other(id)) = this.usage_hit(p) {
+                        this.workspace.usage_preview.borrow_mut().selected = Some(id);
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 match this.usage_hit(p) {
                     Some(TileKey::Node(i)) => this.select_usage_node(i, false, cx),
                     _ => {
@@ -481,6 +694,19 @@ impl MainWindow {
                 cx.stop_propagation();
             }))
             .on_double_click(cx.listener(|this, _, window, cx| {
+                if this.workspace.scanning {
+                    if let Some(TileKey::Other(id)) =
+                        this.usage_hit(this.usage_point(window.mouse_position()))
+                    {
+                        let entered = this.workspace.usage_preview.borrow_mut().enter(id);
+                        if entered {
+                            this.workspace.usage_camera.reset();
+                            cx.notify();
+                        }
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 if let Some(TileKey::Node(i)) =
                     this.usage_hit(this.usage_point(window.mouse_position()))
                 {
@@ -579,7 +805,7 @@ impl MainWindow {
                             }
                             for d in &paint {
                                 let label = d.header.unwrap_or(d.rect);
-                                if label.w < 48. || label.h < 16. {
+                                if label.w < 48. || label.h < 16. || d.opacity < 0.65 {
                                     continue;
                                 }
                                 let clip = screen(label);
@@ -594,7 +820,11 @@ impl MainWindow {
                                         },
                                         ..font("Segoe UI")
                                     },
-                                    color: tokens.text_primary,
+                                    color: {
+                                        let mut c = tokens.text_primary;
+                                        c.a *= d.opacity;
+                                        c
+                                    },
                                     ..Default::default()
                                 };
                                 let line = window.text_system().shape_line(
@@ -620,7 +850,11 @@ impl MainWindow {
                                     let run = TextRun {
                                         len: d.size.len(),
                                         font: font("Segoe UI"),
-                                        color: tokens.text_secondary,
+                                        color: {
+                                            let mut c = tokens.text_secondary;
+                                            c.a *= d.opacity;
+                                            c
+                                        },
                                         ..Default::default()
                                     };
                                     let line = window.text_system().shape_line(
@@ -651,7 +885,11 @@ impl MainWindow {
                                     let run = TextRun {
                                         len: d.size.len(),
                                         font: font("Segoe UI"),
-                                        color: tokens.text_secondary,
+                                        color: {
+                                            let mut c = tokens.text_secondary;
+                                            c.a *= d.opacity;
+                                            c
+                                        },
                                         ..Default::default()
                                     };
                                     let line = window.text_system().shape_line(

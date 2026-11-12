@@ -204,26 +204,68 @@ fn dispatch_one<'s>(
     if ctx.stopped() {
         return;
     }
+    #[cfg(debug_assertions)]
+    if std::env::var_os("FINDX_NATIVE_FIXTURE_LOCK").is_some()
+        && std::env::var_os("FINDX_NATIVE_SCAN_FIXTURE_DELAY_MS").is_some()
+    {
+        let ms = std::env::var("FINDX_NATIVE_SCAN_FIXTURE_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(1000);
+        for _ in 0..ms / 10 {
+            if ctx.stopped() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     let active = ctx.progress.active_workers.fetch_add(1, Ordering::Relaxed) + 1;
     ctx.progress
         .peak_workers
         .fetch_max(active, Ordering::Relaxed);
-    let preview_name = {
+    let preview_path = {
         let nodes = lock(&ctx.nodes);
-        let mut top = parent;
-        while let Some(p) = nodes[top].parent {
-            if p == 0 {
-                break;
+        let mut chain = Vec::new();
+        let mut at = Some(parent);
+        while let Some(i) = at {
+            if i != 0 {
+                chain.push(i);
             }
-            top = p;
+            at = nodes[i].parent;
         }
-        nodes[top]
-            .path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
+        chain.reverse();
+        chain
+            .into_iter()
+            .take(6)
+            .map(|i| {
+                (
+                    i,
+                    nodes[i]
+                        .path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .chars()
+                        .take(192)
+                        .collect::<String>(),
+                )
+            })
+            .collect::<Vec<_>>()
     };
-    let mut preview_bytes = 0u64;
-    let mut preview_files = 0u64;
+    let classes = [
+        crate::disktree::classify::Category::Code,
+        crate::disktree::classify::Category::AgentScratch,
+        crate::disktree::classify::Category::Toolchain,
+        crate::disktree::classify::Category::Synced,
+        crate::disktree::classify::Category::Git,
+        crate::disktree::classify::Category::Media,
+        crate::disktree::classify::Category::Documents,
+        crate::disktree::classify::Category::Cache,
+        crate::disktree::classify::Category::Other,
+    ];
+    let mut preview_bytes = [0u64; 9];
+    let mut preview_files = [0u64; 9];
     let mut preview_items = 0usize;
     let mut emit = |mut e: Entry| {
         if ctx.stopped() {
@@ -330,13 +372,26 @@ fn dispatch_one<'s>(
         if e.directory {
             ctx.progress.directories.fetch_add(1, Ordering::Relaxed);
         }
-        preview_bytes = preview_bytes.saturating_add(occupied);
-        preview_files += u64::from(!e.directory);
+        let class = crate::disktree::scan_preview::file_class(&e.path) as usize;
+        preview_bytes[class] = preview_bytes[class].saturating_add(occupied);
+        preview_files[class] += u64::from(!e.directory);
         preview_items += 1;
         if preview_items >= 128 {
-            lock(&ctx.progress.preview).add(preview_name.as_deref(), preview_bytes, preview_files);
-            preview_bytes = 0;
-            preview_files = 0;
+            {
+                let mut p = lock(&ctx.progress.preview);
+                for i in 0..9 {
+                    if preview_bytes[i] > 0 || preview_files[i] > 0 {
+                        p.add_path(
+                            &preview_path,
+                            classes[i],
+                            preview_bytes[i],
+                            preview_files[i],
+                        );
+                    }
+                }
+            }
+            preview_bytes = [0; 9];
+            preview_files = [0; 9];
             preview_items = 0;
         }
         if e.directory {
@@ -409,7 +464,17 @@ fn dispatch_one<'s>(
         }
     }
     if preview_items > 0 {
-        lock(&ctx.progress.preview).add(preview_name.as_deref(), preview_bytes, preview_files);
+        let mut p = lock(&ctx.progress.preview);
+        for i in 0..9 {
+            if preview_bytes[i] > 0 || preview_files[i] > 0 {
+                p.add_path(
+                    &preview_path,
+                    classes[i],
+                    preview_bytes[i],
+                    preview_files[i],
+                );
+            }
+        }
     }
     ctx.progress.active_workers.fetch_sub(1, Ordering::Relaxed);
 }

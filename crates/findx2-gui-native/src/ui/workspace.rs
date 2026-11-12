@@ -225,6 +225,9 @@ pub(super) struct Workspace {
     usage_memory_profile: usize,
     scan: Option<Arc<Scan>>,
     usage_scene: Option<Arc<crate::usage_view::Scene>>,
+    usage_preview: std::cell::RefCell<crate::disktree::scan_preview::Motion>,
+    usage_fixture_seen: usize,
+    active_scan_root: Option<PathBuf>,
     usage_scene_key: Option<crate::usage_view::SceneKey>,
     usage_scene_generation: u64,
     usage_camera: crate::usage_view::Camera,
@@ -354,6 +357,9 @@ impl Workspace {
             usage_memory_profile: 0,
             scan: None,
             usage_scene: None,
+            usage_preview: Default::default(),
+            usage_fixture_seen: 0,
+            active_scan_root: None,
             usage_scene_key: None,
             usage_scene_generation: 0,
             usage_camera: Default::default(),
@@ -515,6 +521,8 @@ impl MainWindow {
                         if this.workspace.scanning {
                             cx.notify();
                         }
+                        #[cfg(debug_assertions)]
+                        this.usage_fixture_commands(cx);
                         this.workspace.engine_tick = this.workspace.engine_tick.wrapping_add(1);
                         if this.workspace.engine_tick % 8 == 0
                             && this.workspace.mode == ViewMode::Usage
@@ -997,6 +1005,12 @@ impl MainWindow {
             self.workspace.scan_generation = self.workspace.scan_generation.wrapping_add(1);
             self.workspace.engine_busy = false;
         }
+        let path =
+            if self.workspace.scanning && mode == ViewMode::Usage && !self.workspace.engine_usage {
+                self.workspace.active_scan_root.clone().unwrap_or(path)
+            } else {
+                path
+            };
         let source_hit = self.active_workspace_hit();
         if self.workspace.mode != mode {
             self.workspace.suspend_preview = true;
@@ -1120,6 +1134,14 @@ impl MainWindow {
         cx.notify();
     }
     pub(super) fn workspace_history(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.workspace.scanning && !forward {
+            let up = self.workspace.usage_preview.borrow_mut().up();
+            if up {
+                self.workspace.usage_camera.reset();
+                cx.notify();
+                return;
+            }
+        }
         let current = self.current_route();
         let Some(route) = self.workspace.history.travel(current, forward) else {
             return;
@@ -1133,6 +1155,14 @@ impl MainWindow {
         }
     }
     pub(super) fn workspace_up(&mut self, cx: &mut Context<Self>) {
+        if self.workspace.scanning {
+            let up = self.workspace.usage_preview.borrow_mut().up();
+            if up {
+                self.workspace.usage_camera.reset();
+                cx.notify();
+                return;
+            }
+        }
         let path = if self.workspace.mode == ViewMode::Search {
             self.active_workspace_hit()
                 .and_then(|h| PathBuf::from(h.path).parent().map(Path::to_path_buf))
@@ -1278,9 +1308,58 @@ impl MainWindow {
             }
         }
     }
+    #[cfg(debug_assertions)]
+    fn usage_fixture_commands(&mut self, cx: &mut Context<Self>) {
+        if self.session.read(cx).live || std::env::var_os("FINDX_NATIVE_FIXTURE_LOCK").is_none() {
+            return;
+        }
+        let Some(path) = std::env::var_os("FINDX_NATIVE_USAGE_FIXTURE_COMMANDS") else {
+            return;
+        };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return;
+        };
+        if meta.len() > 16384 {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        for command in text
+            .lines()
+            .skip(self.workspace.usage_fixture_seen)
+            .collect::<Vec<_>>()
+        {
+            self.workspace.usage_fixture_seen += 1;
+            match command {
+                "zoom" => self.zoom_usage_center(1.3, cx),
+                "reset" => {
+                    self.workspace.usage_camera.reset();
+                    cx.notify();
+                }
+                "drill" => {
+                    let id = self.workspace.usage_preview.borrow().first_child();
+                    if let Some(id) = id {
+                        self.workspace.usage_preview.borrow_mut().enter(id);
+                        self.workspace.usage_camera.reset();
+                        cx.notify();
+                    }
+                }
+                "up" => self.workspace_up(cx),
+                "cancel" => {
+                    self.workspace.scan_cancel.store(true, Ordering::Release);
+                    self.workspace.scan_status = "正在取消；已测部分将保留".into();
+                    cx.notify();
+                }
+                _ => {}
+            }
+            eprintln!("usage_fixture command={command}");
+        }
+    }
     fn select_engine_usage_source(&mut self, cx: &mut Context<Self>) {
         self.workspace.scan_cancel.store(true, Ordering::Release);
         self.workspace.scanning = false;
+        self.workspace.active_scan_root = None;
         self.workspace.scan_generation = self.workspace.scan_generation.wrapping_add(1);
         self.workspace.engine_usage = true;
         self.workspace.engine_checked = false;
@@ -1337,7 +1416,7 @@ impl MainWindow {
                             ..
                         } => {}
                         _ => return Err(
-                            "当前服务不支持索引逻辑目录树；可明确选择本地实测，不会伪装为引擎数据"
+                            "当前引擎不支持目录占用接口；需更新引擎，或选择本地实测（不会自动更新服务）"
                                 .to_string(),
                         ),
                     }
@@ -1378,8 +1457,8 @@ impl MainWindow {
                         if e.contains("index loading; usage initializing") {
                             this.workspace.engine_checked = true;
                         }
+                        this.workspace.scan_stale = !e.contains("不支持");
                         this.workspace.scan_status = e;
-                        this.workspace.scan_stale = true;
                         cx.notify();
                         return;
                     }
@@ -1592,6 +1671,7 @@ impl MainWindow {
             Limits::memory_profile(self.workspace.usage_memory_profile),
         );
         self.workspace.scan_cancel = job.cancel.clone();
+        self.workspace.active_scan_root = Some(path.clone());
         self.workspace.progress = job.progress.clone();
         self.workspace.scanning = true;
         self.workspace.scan_status = "扫描当前目录 · 搜索可用 · 不跟随链接/挂载".into();
@@ -1622,6 +1702,7 @@ impl MainWindow {
                     return;
                 }
                 this.workspace.scanning = false;
+                this.workspace.active_scan_root = None;
                 match result {
                     Ok((value, lookup)) => {
                         this.workspace.scan_stale =
@@ -1636,7 +1717,11 @@ impl MainWindow {
                             })
                             .detach();
                         if this.workspace.mode == ViewMode::Usage {
-                            let focus = this.active_workspace_hit().map(|h| h.path);
+                            let scope=this.workspace.usage_preview.borrow().scope;
+                            let scope_path=this.workspace.scan.as_ref().and_then(|s|s.nodes.get(scope)).filter(|n|n.directory).map(|n|n.path.clone());
+                            if let Some(path)=scope_path{this.workspace.location=path;this.update_location_input(cx);}
+                            let selected=this.workspace.usage_preview.borrow().selected;
+                            let focus=selected.and_then(|i|this.workspace.scan.as_ref().and_then(|s|s.nodes.get(i))).map(|n|display_path(&n.path));
                             this.show_scanned_directory(focus, cx);
                         }
                     }
