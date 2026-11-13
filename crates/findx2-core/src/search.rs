@@ -799,11 +799,7 @@ impl SearchEngine {
         if let Some(ref pp) = q.parent_path {
             // Everything：`parent:` / `infolder:` 为父目录路径**全等**（仅该文件夹的直接子项）。
             // 旧版「父路径子串」请用 `parentcontains:`。
-            if q.parent_path_substring {
-                hits.retain(|&idx| match_parent_path(store, idx as usize, pp));
-            } else {
-                hits.retain(|&idx| match_parent_path_exact(store, idx as usize, pp));
-            }
+            retain_parent_path_matches(store, &mut hits, pp, q.parent_path_substring);
         }
 
         if let Some(ref not_n) = q.not_substring {
@@ -2374,12 +2370,13 @@ fn path_candidate_ids(
     // 真实 v6 索引里 `dir[0]` 是自指的死节点（如 `$RmMetadata`，其 `parent_idx == 0`），
     // 而真正的卷根是那个**名字为空**的目录；空名拼路径时不贡献分隔符，
     // 所以卷根本身不参与匹配、`dir[0]` 更是永远访问不到。
+    let mut chain: Vec<u32> = Vec::new();
     for di in (0..ndirs).rev() {
         if dir_cls[di] != CLS_UNKNOWN {
             continue;
         }
         // 收集自底向上的链，直到撞上已定论节点，或某节点的 parent_idx == 0。
-        let mut chain: Vec<u32> = Vec::new();
+        chain.clear();
         let mut cur = di as u32;
         let verdict = loop {
             match dir_cls.get(cur as usize).copied().unwrap_or(CLS_NONE) {
@@ -2396,7 +2393,7 @@ fn path_candidate_ids(
             }
             cur = p;
         };
-        for c in chain {
+        for &c in &chain {
             dir_cls[c as usize] = verdict;
         }
     }
@@ -2447,6 +2444,12 @@ fn path_candidate_ids(
             || (Vec::new(), Vec::new()),
             |mut acc, idx| {
                 let e = &store.entries[idx as usize];
+                // An exact directory prefix proves the whole entry path matches.
+                // Do not demote it to expensive validation on filename variants.
+                if dir_cls.get(e.dir_idx as usize)==Some(&CLS_FULL) {
+                    acc.0.push(idx);
+                    return acc;
+                }
                 // 名字侧：tri 位图不含此条目 → 名字必不含任何变体，跳过小写化+比对。
                 let in_tri = tri_union.as_ref().map_or(true, |bm| bm.contains(idx));
                 if in_tri {
@@ -2504,6 +2507,54 @@ fn path_candidate_ids(
         exact: exact_v.into_iter().collect(),
         check: check_v.into_iter().collect(),
     })
+}
+
+/// Query-scoped, one-byte-per-directory memo. No retained path strings or
+/// cross-generation cache. Windows single-volume paths depend only on dir_idx;
+/// Unix/multi-volume/invalid-directory cases retain the legacy per-entry path.
+fn retain_parent_path_matches(
+    store: &IndexStore,
+    hits: &mut Vec<u32>,
+    needle: &str,
+    substring: bool,
+) {
+    if hits.len() < 4096 || store.volumes.len() != 1 || store.volumes[0].is_unix() {
+        if substring {
+            hits.retain(|&i| match_parent_path(store, i as usize, needle));
+        } else {
+            hits.retain(|&i| match_parent_path_exact(store, i as usize, needle));
+        }
+        return;
+    }
+    let key = path_key(needle);
+    let mut verdict = Vec::new();
+    if verdict.try_reserve_exact(store.dirs.len()).is_err() {
+        if substring {
+            hits.retain(|&i| match_parent_path(store, i as usize, needle));
+        } else {
+            hits.retain(|&i| match_parent_path_exact(store, i as usize, needle));
+        }
+        return;
+    }
+    verdict.resize(store.dirs.len(), 0u8);
+    hits.retain(|&i| {
+        let parent = store.entries[i as usize].dir_idx as usize;
+        if let Some(&v) = verdict.get(parent) {
+            if v != 0 {
+                return v == 2;
+            }
+        }
+        let hay = parent_path_haystack(store, i as usize);
+        let yes = if substring {
+            hay.contains(&key)
+        } else {
+            hay == key
+        };
+        if let Some(v) = verdict.get_mut(parent) {
+            *v = if yes { 2 } else { 1 };
+        }
+        yes
+    });
 }
 
 fn parent_path_haystack(store: &IndexStore, entry_idx: usize) -> String {
@@ -3160,3 +3211,122 @@ fn needle_byte_ranges_for_name_match(
 pub(crate) type IbRegexUnit<'a> = IbRegex<'a>;
 #[cfg(not(feature = "pinyin"))]
 pub(crate) struct IbRegexUnit<'a>(std::marker::PhantomData<&'a ()>);
+
+#[cfg(test)]
+mod directory_filter_memo_tests {
+    use super::*;
+    use crate::index::IndexBuilder;
+    use crate::platform::RawEntry;
+    fn raw(id: u64, parent: u64, name: String, is_dir: bool) -> RawEntry {
+        RawEntry {
+            file_id: id,
+            file_id_128: None,
+            parent_id: parent,
+            name,
+            size: 17,
+            mtime: 1,
+            ctime: 1,
+            attrs: if is_dir { 0x10 } else { 0 },
+            is_dir,
+        }
+    }
+    fn fixture(unix: bool) -> IndexStore {
+        let dirs = vec![
+            raw(10, 0, "C:".into(), true),
+            raw(20, 10, "dev".into(), true),
+            raw(30, 10, "other".into(), true),
+            raw(40, 20, "deep".into(), true),
+        ];
+        let files = (0..6000)
+            .map(|i| {
+                raw(
+                    10000 + i,
+                    match i % 3 {
+                        0 => 40,
+                        1 => 20,
+                        _ => 30,
+                    },
+                    format!("dev_note_{i}.bin"),
+                    false,
+                )
+            })
+            .collect();
+        let b = if unix {
+            IndexBuilder::new(0, 1, 2, 3).with_unix_volume("fixture:/unix", "/fixture")
+        } else {
+            IndexBuilder::new(b'C', 1, 2, 3)
+        };
+        b.build_from_raw(files, dirs, true).unwrap()
+    }
+    fn compare(s: &IndexStore) {
+        for key in ["C:", "c:/dev", "c:/dev/deep", "dev", "", "missing"] {
+            for sub in [false, true] {
+                let mut expect: Vec<u32> = (0..s.entries.len() as u32).collect();
+                let mut got = expect.clone();
+                if sub {
+                    expect.retain(|&i| match_parent_path(s, i as usize, key))
+                } else {
+                    expect.retain(|&i| match_parent_path_exact(s, i as usize, key))
+                }
+                retain_parent_path_matches(s, &mut got, key, sub);
+                assert_eq!(got, expect, "parent key={key}, substring={sub}");
+            }
+        }
+    }
+    #[test]
+    fn directory_memo_matches_legacy_and_invalid_parent_fallback() {
+        let mut s = fixture(false);
+        compare(&s);
+        s.entries[0].dir_idx = u32::MAX;
+        compare(&s);
+    }
+    #[test]
+    fn directory_memo_is_query_local_after_directory_rename() {
+        let mut s = fixture(false);
+        compare(&s);
+        let d = s
+            .dirs
+            .iter()
+            .find(|d| {
+                s.names_buf[d.name_offset as usize..d.name_offset as usize + d.name_len as usize]
+                    == *b"dev"
+            })
+            .unwrap()
+            .clone();
+        s.names_buf[d.name_offset as usize..d.name_offset as usize + 3].copy_from_slice(b"new");
+        s.dir_paths_buf.clear();
+        s.dir_path_ranges.fill((0, 0));
+        compare(&s);
+    }
+    #[test]
+    fn unix_and_multi_volume_keep_per_entry_semantics() {
+        let s = fixture(true);
+        compare(&s);
+        let mut s = fixture(false);
+        s.volumes.push(s.volumes[0].clone());
+        compare(&s);
+    }
+    #[test]
+    fn exact_directory_prefix_not_demoted_by_filename_variant() {
+        let s = fixture(false);
+        let table = build_dir_path_table(&s);
+        let c = path_candidate_ids(&s, &table, br"dev\deep").unwrap();
+        let deep = s
+            .dirs
+            .iter()
+            .position(|d| {
+                s.names_buf[d.name_offset as usize..d.name_offset as usize + d.name_len as usize]
+                    == *b"deep"
+            })
+            .unwrap();
+        let mut checked = 0;
+        for (i, e) in s.entries.iter().enumerate() {
+            if e.dir_idx as usize == deep {
+                assert!(c.exact.contains(i as u32));
+                assert!(!c.check.contains(i as u32));
+                checked += 1;
+            }
+        }
+        assert!(checked > 1000);
+    }
+}

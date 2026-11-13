@@ -6,8 +6,8 @@ use crate::index::ResolvedMutation;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 const NIL: u32 = u32::MAX;
-const ACTIVE: u32 = 1;
-const ROOT_ALIAS: u32 = 2;
+const ACTIVE: u8 = 1;
+const ROOT_ALIAS: u8 = 2;
 const CURSOR_SLOTS: usize = 1024;
 const SCAN_WORK_BYTES: usize = 64 * 1024;
 static CURSOR_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -53,41 +53,46 @@ impl Totals {
         self.unknown = self.unknown.saturating_sub(b.unknown);
     }
 }
-/// 64-byte directory aggregate. No names, sizes or FRNs are duplicated here.
+/// 48-byte directory aggregate. Counts are bounded by the u32 namespace IDs.
+/// Public totals remain u64; checked writes fail closed instead of truncating.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct DirAgg {
     logical: u64,
-    files: u64,
-    dirs: u64,
-    unknown: u64,
+    files: u32,
+    dirs: u32,
+    unknown: u32,
     parent: u32,
     first_dir: u32,
     next_dir: u32,
     prev_dir: u32,
     owner_entry: u32,
     first_file: u32,
-    flags: u32,
+    flags: u8,
     volume_slot: u8,
-    pad: [u8; 3],
+    pad: [u8; 2],
 }
 impl DirAgg {
     fn empty(parent: u32, volume_slot: u8) -> Self {
         Self {
             logical: 0, files: 0, dirs: 0, unknown: 0,
             parent, first_dir: NIL, next_dir: NIL, prev_dir: NIL,
-            owner_entry: NIL, first_file: NIL, flags: ACTIVE, volume_slot, pad: [0; 3],
+            owner_entry: NIL, first_file: NIL, flags: ACTIVE, volume_slot, pad: [0; 2],
         }
     }
     fn totals(&self) -> Totals {
-        Totals { bytes: self.logical, files: self.files, dirs: self.dirs, unknown: self.unknown }
+        Totals { bytes: self.logical, files: self.files as u64, dirs: self.dirs as u64, unknown: self.unknown as u64 }
     }
-    fn set_totals(&mut self, t: Totals) {
-        self.logical = t.bytes; self.files = t.files; self.dirs = t.dirs; self.unknown = t.unknown;
+    fn set_totals(&mut self, t: Totals) -> Result<(), String> {
+        let files=u32::try_from(t.files).map_err(|_|"usage file count exceeds namespace index space")?;
+        let dirs=u32::try_from(t.dirs).map_err(|_|"usage directory count exceeds namespace index space")?;
+        let unknown=u32::try_from(t.unknown).map_err(|_|"usage unknown count exceeds namespace index space")?;
+        self.logical=t.bytes; self.files=files; self.dirs=dirs; self.unknown=unknown;
+        Ok(())
     }
     fn active(self) -> bool { self.flags & ACTIVE != 0 }
 }
-const _: () = assert!(std::mem::size_of::<DirAgg>() == 64);
+const _: () = assert!(std::mem::size_of::<DirAgg>() == 48);
 /// 8-byte intrusive file sibling links; parent is FileEntry.dir_idx.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -263,6 +268,7 @@ impl UsageRuntime {
     fn build(g: &IndexStore, budget: usize) -> Result<Self, String> {
         let n = g.entries.len();
         let d = g.dirs.len();
+        if n >= NIL as usize || d >= NIL as usize { return Err("usage namespace exceeds reserved u32 index space".into()); }
         let mut t = Self { budget, freshness: Freshness::with_len(n)?, ..Self::default() };
         t.reserve(n, d)?;
         let staging = d.saturating_mul(9);
@@ -290,9 +296,11 @@ impl UsageRuntime {
             t.dirs[root].volume_slot = g.volume_slot_of(v.volume_letter).unwrap_or(0) as u8;
             assigned[root] = true;
         }
+        // Reuse ancestry staging rather than allocating for each directory.
+        let mut path = Vec::new();
         for i in 0..d {
             if assigned[i] { continue; }
-            let mut path = Vec::new();
+            path.clear();
             let mut at = i;
             let slot = loop {
                 if assigned[at] { break t.dirs[at].volume_slot; }
@@ -303,7 +311,7 @@ impl UsageRuntime {
                 if p == at { break 0; }
                 at = p;
             };
-            for x in path.into_iter().rev() {
+            for &x in path.iter().rev() {
                 t.dirs[x].volume_slot = slot;
                 let p=t.dirs[x].parent;
                 if g.dirs[x].name_len==0 && (t.dirs[p as usize].parent==p || t.dirs[p as usize].flags & ROOT_ALIAS != 0) {
@@ -339,7 +347,7 @@ impl UsageRuntime {
             if t.dirs[di].active() {
                 let mut tot = t.dirs[di].totals();
                 tot.add(Totals::dir_self());
-                t.dirs[di].set_totals(tot);
+                t.dirs[di].set_totals(tot)?;
             }
         }
         for (idx, e) in g.entries.iter().enumerate() {
@@ -353,7 +361,7 @@ impl UsageRuntime {
                 let w = Totals::file(e.size, unknown);
                 let mut tot = t.dirs[p as usize].totals();
                 tot.add(w);
-                t.dirs[p as usize].set_totals(tot);
+                t.dirs[p as usize].set_totals(tot)?;
             }
         }
         // Bottom-up: bubble child subtree totals (already include each dir's own dirs=1 and direct files).
@@ -375,7 +383,7 @@ impl UsageRuntime {
             let parent = &mut t.dirs[p as usize];
             let mut tot = parent.totals();
             tot.add(add);
-            parent.set_totals(tot);
+            parent.set_totals(tot)?;
             remaining[p as usize] -= 1;
             if remaining[p as usize] == 0 { leaves.push(p); }
         }
@@ -432,7 +440,7 @@ impl UsageRuntime {
             let n = &mut self.dirs[p as usize];
             let mut tot = n.totals();
             if add { tot.add(w) } else { tot.sub(w) }
-            n.set_totals(tot);
+            if let Err(error)=n.set_totals(tot) { self.error=Some(error); return; }
             let active = n.active();
             let next = n.parent;
             if !active || next == p { break; }
@@ -465,7 +473,7 @@ impl UsageRuntime {
             let bytes = g.names_buf.get(start..start + d.name_len as usize).unwrap_or(b"");
             (String::from_utf8_lossy(bytes).into_owned(), di)
         };
-        Ok(UsageItem { id, name, directory: true, logical: n.logical, files: n.files, directories: n.dirs, unknown: n.unknown })
+        Ok(UsageItem { id, name, directory: true, logical: n.logical, files: n.files as u64, directories: n.dirs as u64, unknown: n.unknown as u64 })
     }
     fn item_file(&self, g: &IndexStore, idx: u32, size_of_file: &impl Fn(usize) -> u64) -> Result<UsageItem, String> {
         let e = g.entries.get(idx as usize).ok_or("usage entry unavailable")?;
@@ -1132,7 +1140,7 @@ impl SearchEngine {
                 r.ensure_dir_slot(di, new_parent, slot)?;
                 r.dirs[di as usize] = DirAgg::empty(new_parent, slot);
                 r.dirs[di as usize].owner_entry = idx;
-                r.dirs[di as usize].set_totals(Totals::dir_self());
+                r.dirs[di as usize].set_totals(Totals::dir_self())?;
                 if new_parent != di { r.link_dir(di, new_parent); }
                 if !after.deleted { r.ancestors(if new_parent == di { NIL } else { new_parent }, Totals::dir_self(), true); }
                 r.generation += 1;
@@ -1862,11 +1870,11 @@ mod scale_tests {
             + links.capacity() * std::mem::size_of::<FileLinks>()
             + fresh.capacity_bytes();
         record_mem("sidecar_arrays_6m", mem0, mem1, &format!("payload_capacity_bytes={payload} dir_len={} dir_cap={} file_len={} file_cap={} fresh_cap={}", dirs.len(), dirs.capacity(), links.len(), links.capacity(), fresh.capacity_bytes()));
-        let expected = 64 * d + 8 * n + n.div_ceil(4);
-        assert_eq!(std::mem::size_of::<DirAgg>(), 64);
+        let expected = 48 * d + 8 * n + n.div_ceil(4);
+        assert_eq!(std::mem::size_of::<DirAgg>(), 48);
         assert_eq!(std::mem::size_of::<FileLinks>(), 8);
-        assert!(payload <= expected + 64 * d, "capacity may grow but must stay near tight payload, got {payload} vs {expected}");
-        assert!(payload < 120 * 1024 * 1024, "production-scale sidecar payload should stay near the 92.41MiB model, got {payload}");
+        assert!(payload <= expected + 48 * d, "capacity may grow but must stay near tight payload, got {payload} vs {expected}");
+        assert!(payload < 120 * 1024 * 1024, "production-scale sidecar payload should stay near the compact payload model, got {payload}");
         eprintln!("production-scale compact payload bytes={payload} tight={expected} dir_cap={} file_cap={}", dirs.capacity(), links.capacity());
     }
 }
@@ -2009,4 +2017,11 @@ mod internal_unlink_transaction_tests {
   let recovered=[ChangeEvent::Rename{file_id:42,new_parent_id:2,new_name:"surviving.bin".into()}];
   for cursor in [30,40]{e.apply_volume_batch(b'C',&recovered,7,cursor).unwrap();assert!(!e.has_pending_namespace(b'C'));let page=e.usage_page("C:\\",None,None,4096).unwrap();assert_eq!(page.root.logical,150);assert_eq!(page.root.files,1);}
  }
+}
+
+#[cfg(test)]mod compact_aggregate_tests {
+ use super::*;
+ #[test]fn compact_counts_keep_public_u64_and_full_logical_range(){let mut d=DirAgg::empty(0,0);d.set_totals(Totals{bytes:u64::MAX,files:u32::MAX as u64,dirs:u32::MAX as u64,unknown:u32::MAX as u64}).unwrap();assert_eq!(std::mem::size_of::<DirAgg>(),48);assert_eq!(d.totals().bytes,u64::MAX);assert_eq!(d.totals().unknown,u32::MAX as u64);}
+ #[test]fn overflowing_count_fails_atomically_not_wrapped(){let mut d=DirAgg::empty(0,0);d.set_totals(Totals::file(7,true)).unwrap();let old=d.totals();for v in [Totals{files:u32::MAX as u64+1,..old},Totals{dirs:u32::MAX as u64+1,..old},Totals{unknown:u32::MAX as u64+1,..old}]{assert!(d.set_totals(v).is_err());assert_eq!(d.totals(),old);}}
+ #[test]fn ancestor_overflow_is_truthful_usage_error(){let mut r=UsageRuntime::default();r.dirs.push(DirAgg::empty(0,0));r.dirs[0].set_totals(Totals{files:u32::MAX as u64,..Totals::default()}).unwrap();r.ancestors(0,Totals::file(1,false),true);assert!(r.error.is_some());assert_eq!(r.dirs[0].totals().files,u32::MAX as u64);}
 }
