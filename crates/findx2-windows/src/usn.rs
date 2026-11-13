@@ -328,92 +328,62 @@ struct ParsedWatchRec {
     file_id_128: Option<[u8; 16]>,
 }
 
-/// 同一批 READ 内同 FRN 多记录合并：reason 按位或，name/parent/attrs 取最后一条。
-/// 保序：输出按 FRN 首次出现顺序（跨文件因果 preserved；单文件风暴压成一条）。
-/// 纯函数，可单测（无需管理员/USN）。
+/// Merge metadata storms within one lifecycle, keeping separate delete/create segments.
+/// The batch-local map never grows with the indexed corpus.
 fn coalesce_watch_batch(recs: Vec<ParsedWatchRec>) -> Vec<ParsedWatchRec> {
-    let mut order: Vec<u64> = Vec::new();
-    let mut map: HashMap<u64, ParsedWatchRec> = HashMap::new();
+    let mut out: Vec<ParsedWatchRec> = Vec::with_capacity(recs.len());
+    let mut latest: HashMap<u64, usize> = HashMap::new();
     for r in recs {
-        if let Some(acc) = map.get_mut(&r.file_ref) {
-            acc.reason |= r.reason;
+        if let Some(&idx) = latest.get(&r.file_ref) {
+            let acc = &mut out[idx];
+            let was_deleted = acc.reason & USN_REASON_FILE_DELETE != 0;
+            let is_deleted = r.reason & USN_REASON_FILE_DELETE != 0;
+            if was_deleted && !is_deleted && r.reason & USN_REASON_FILE_CREATE != 0 {
+                // Separate records, not cumulative CREATE|DELETE in one record.
+                latest.insert(r.file_ref, out.len());
+                out.push(r);
+                continue;
+            }
+            acc.reason = if was_deleted || is_deleted { USN_REASON_FILE_DELETE } else { acc.reason | r.reason };
             acc.parent_ref = r.parent_ref;
             acc.name = r.name;
             acc.attrs = r.attrs;
             acc.is_dir = r.is_dir;
-            if r.file_id_128.is_some() {
-                acc.file_id_128 = r.file_id_128;
-            }
+            if r.file_id_128.is_some() { acc.file_id_128 = r.file_id_128; }
         } else {
-            order.push(r.file_ref);
-            map.insert(r.file_ref, r);
+            latest.insert(r.file_ref, out.len());
+            out.push(r);
         }
     }
-    order.into_iter().filter_map(|k| map.remove(&k)).collect()
+    out
 }
 
-/// 合并后的单条投递（watch 线程内，永不做 `OpenFileById`）：
-/// - Delete（含其它位时先删后走新建分支——FRN 复用场景）；
-/// - OLD+NEW 配对 → 一条 Rename（NEW 侧 parent/name）；
-/// - 仅 OLD → Rename（旧语义；下一批的 NEW_NAME 会以 CreatePending 补齐）；
-/// - CREATE / 仅 NEW_NAME → CreatePending（0 元数据入库，名字立即可搜）+ StatRefresh；
-/// - 纯 DATA/META → 不入库（名字未变），只 StatRefresh 排队异步补 meta。
+/// DELETE is terminal even with cumulative CREATE/RENAME bits. CREATE or
+/// NEW_NAME upserts a possibly unknown identity. OLD_NAME alone waits for NEW.
+/// Emit at most one stat refresh for each live coalesced lifecycle segment.
 fn emit_coalesced_watch_rec(rec: &ParsedWatchRec, tx: &mut Vec<UsnWatchMsg>) {
-    if (rec.reason & USN_REASON_FILE_DELETE) != 0 {
-        tx.push(UsnWatchMsg::Event(ChangeEvent::Delete {
-            file_id: rec.file_ref,
-        }));
-        // 不 return：同批同 FRN 若还有 CREATE/NEW_NAME（FRN 复用），继续走新建分支。
-    }
-    let has_old = (rec.reason & USN_REASON_RENAME_OLD_NAME) != 0;
-    let has_new = (rec.reason & USN_REASON_RENAME_NEW_NAME) != 0;
-    if has_old || has_new {
-        // 配对或单 OLD 都发 Rename（NEW 侧数据优先；单 OLD 时沿用旧语义）。
-        tx.push(UsnWatchMsg::Event(ChangeEvent::Rename {
-            file_id: rec.file_ref,
-            new_parent_id: rec.parent_ref,
-            new_name: rec.name.clone(),
-        }));
-        if has_old && !has_new {
-            return;
-        }
-        // 配对/仅 NEW：名字已搬，内容 meta 可能同时变了，顺手排队 stat（目录跳过，size 恒 0）。
-        if !rec.is_dir {
-            tx.push(UsnWatchMsg::StatRefresh {
-                file_id: rec.file_ref,
-                file_id_128: rec.file_id_128,
-            });
-        }
+    if rec.reason & USN_REASON_FILE_DELETE != 0 {
+        tx.push(UsnWatchMsg::Event(ChangeEvent::Delete { file_id: rec.file_ref }));
         return;
     }
-    if (rec.reason & USN_REASON_FILE_CREATE) != 0 {
+    let has_old = rec.reason & USN_REASON_RENAME_OLD_NAME != 0;
+    let has_new = rec.reason & USN_REASON_RENAME_NEW_NAME != 0;
+    let has_create = rec.reason & USN_REASON_FILE_CREATE != 0;
+    if has_create || has_new {
         tx.push(UsnWatchMsg::Event(ChangeEvent::CreatePending {
-            file_id: rec.file_ref,
-            file_id_128: rec.file_id_128,
-            parent_id: rec.parent_ref,
-            name: rec.name.clone(),
-            attrs: rec.attrs,
-            is_dir: rec.is_dir,
+            file_id: rec.file_ref, file_id_128: rec.file_id_128,
+            parent_id: rec.parent_ref, name: rec.name.clone(),
+            attrs: rec.attrs, is_dir: rec.is_dir,
         }));
         if !rec.is_dir {
-            tx.push(UsnWatchMsg::StatRefresh {
-                file_id: rec.file_ref,
-                file_id_128: rec.file_id_128,
-            });
+            tx.push(UsnWatchMsg::StatRefresh { file_id: rec.file_ref, file_id_128: rec.file_id_128 });
         }
         return;
     }
-    if (rec.reason & USN_REASON_DATA_OVERWRITE) != 0
-        || (rec.reason & USN_REASON_DATA_EXTEND) != 0
-        || (rec.reason & USN_REASON_DATA_TRUNCATION) != 0
-        || (rec.reason & USN_REASON_BASIC_INFO_CHANGE) != 0
-    {
-        if !rec.is_dir {
-            tx.push(UsnWatchMsg::StatRefresh {
-                file_id: rec.file_ref,
-                file_id_128: rec.file_id_128,
-            });
-        }
+    if has_old { return; }
+    if rec.reason & (USN_REASON_DATA_OVERWRITE | USN_REASON_DATA_EXTEND
+        | USN_REASON_DATA_TRUNCATION | USN_REASON_BASIC_INFO_CHANGE) != 0 && !rec.is_dir {
+        tx.push(UsnWatchMsg::StatRefresh { file_id: rec.file_ref, file_id_128: rec.file_id_128 });
     }
 }
 
@@ -753,6 +723,77 @@ mod tests {
         assert!(out[0].reason & USN_REASON_RENAME_NEW_NAME != 0);
         assert!(out[0].reason & USN_REASON_RENAME_OLD_NAME != 0);
         assert_eq!(out[1].file_ref, 2);
+    }
+
+    #[test]
+    fn accumulated_create_delete_does_not_resurrect_a_ghost() {
+        let records = coalesce_watch_batch(vec![
+            rec(42, USN_REASON_FILE_CREATE, "temporary"),
+            rec(42, USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE, "temporary"),
+        ]);
+        let mut messages = Vec::new();
+        for r in &records { emit_coalesced_watch_rec(r, &mut messages); }
+        let events: Vec<_> = messages.into_iter().filter_map(|m| match m {
+            UsnWatchMsg::Event(e) => Some(e), _ => None,
+        }).collect();
+        assert_eq!(events.len(), 1, "a cumulative CREATE|DELETE record is terminal, not delete then phantom create");
+        assert!(matches!(&events[0], ChangeEvent::Delete { file_id: 42 }));
+    }
+
+    #[test]
+    fn created_then_renamed_directory_is_materialized_not_unknown_rename() {
+        let mut records = vec![
+            rec(43, USN_REASON_FILE_CREATE, "temporary-dir"),
+            rec(43, USN_REASON_RENAME_OLD_NAME, "temporary-dir"),
+            rec(43, USN_REASON_RENAME_NEW_NAME, "final-dir"),
+        ];
+        for r in &mut records { r.is_dir = true; r.attrs = 0x10; }
+        let records = coalesce_watch_batch(records);
+        let mut messages = Vec::new();
+        for r in &records { emit_coalesced_watch_rec(r, &mut messages); }
+        assert!(matches!(&messages[0], UsnWatchMsg::Event(ChangeEvent::CreatePending {
+            file_id: 43, is_dir: true, name, ..
+        }) if name == "final-dir"), "unknown directory must exist before its child events can attach");
+    }
+
+    #[test]
+    fn separate_delete_then_create_preserves_both_lifecycle_segments() {
+        let records = coalesce_watch_batch(vec![
+            rec(42, USN_REASON_FILE_DELETE, "old"),
+            rec(42, USN_REASON_FILE_CREATE, "new"),
+            rec(42, USN_REASON_DATA_EXTEND, "new"),
+        ]);
+        assert_eq!(records.len(), 2);
+        let mut messages = Vec::new();
+        for r in &records { emit_coalesced_watch_rec(r, &mut messages); }
+        assert!(matches!(&messages[0], UsnWatchMsg::Event(ChangeEvent::Delete { file_id: 42 })));
+        assert!(matches!(&messages[1], UsnWatchMsg::Event(ChangeEvent::CreatePending { file_id: 42, name, .. }) if name == "new"));
+        assert_eq!(messages.iter().filter(|m| matches!(m, UsnWatchMsg::StatRefresh { .. })).count(), 1);
+    }
+
+    #[test]
+    fn new_name_alone_upserts_unknown_identity() {
+        let mut messages = Vec::new();
+        emit_coalesced_watch_rec(&rec(45, USN_REASON_RENAME_NEW_NAME, "arrived"), &mut messages);
+        assert!(matches!(&messages[0], UsnWatchMsg::Event(ChangeEvent::CreatePending { file_id: 45, .. })));
+    }
+
+    #[test]
+    fn renamed_new_directory_can_own_same_batch_children() {
+        let root = findx2_core::platform::RawEntry { file_id: 100, file_id_128: None, parent_id: 0, name: String::new(), size: 0, mtime: 0, ctime: 0, attrs: 0x10, is_dir: true };
+        let store = findx2_core::IndexBuilder::new(b'C', 1, 7, 10).build_from_raw(vec![], vec![root], true).unwrap();
+        let engine = findx2_core::SearchEngine::new(store);
+        engine.enable_usage(1024 * 1024).unwrap();
+        let mut parent = rec(43, USN_REASON_FILE_CREATE | USN_REASON_RENAME_OLD_NAME | USN_REASON_RENAME_NEW_NAME, "final-dir");
+        parent.is_dir = true; parent.attrs = 0x10;
+        let mut child = rec(44, USN_REASON_FILE_CREATE, "child"); child.parent_ref = 43;
+        let mut messages = Vec::new();
+        for r in coalesce_watch_batch(vec![parent, child]) { emit_coalesced_watch_rec(&r, &mut messages); }
+        let events: Vec<_> = messages.into_iter().filter_map(|m| match m { UsnWatchMsg::Event(e) => Some(e), _ => None }).collect();
+        engine.apply_volume_batch(b'C', &events, 7, 20).unwrap();
+        assert!(!engine.has_pending_namespace(b'C'));
+        assert!(engine.index_store().entry_on_volume(b'C', 44).is_some());
+        assert_eq!(engine.index_store().volumes[0].last_usn, 20);
     }
 
     #[test]
