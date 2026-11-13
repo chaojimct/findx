@@ -563,6 +563,7 @@ pub(crate) fn run_foreground(
     }
     if unfinished == 0 {
         info!("All watch workers finished normal shutdown");
+        info!(counts=?findx2_windows::metadata_terminal_counts(), "metadata terminal buckets: missing/access/sharing/invalid_id/not_found/other/success");
     } else {
         tracing::warn!(unfinished, "Shutdown grace expired; do not claim all workers flushed; retained durable cursor requires replay");
     }

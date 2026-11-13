@@ -215,6 +215,7 @@ pub fn usn_watch_forever(
         None => jd.NextUsn as i64,
     };
     let journal_id = jd.UsnJournalID;
+    let mut diagnostic_batch = 0u32;
 
     loop {
         let read_data = READ_USN_JOURNAL_DATA_V0 {
@@ -265,6 +266,7 @@ pub fn usn_watch_forever(
         }
 
         if returned >= 8 {
+            diagnostic_batch = diagnostic_batch.wrapping_add(1);
             let slice = &out[..returned as usize];
             next_cursor = i64::from_le_bytes(slice[0..8].try_into().unwrap());
 
@@ -294,6 +296,7 @@ pub fn usn_watch_forever(
                         "invalid journal name bounds; cursor not acknowledged".into(),
                     ));
                 }
+                trace_numeric_record(volume_path, journal_id, rec, file_ref, parent_ref, reason, attrs, diagnostic_batch);
                 let wide = u16_slice(&rec[name_off..name_off + name_len]);
                 let name = OsString::from_wide(wide).to_string_lossy().into_owned();
                 let is_dir = (attrs & 0x10) != 0;
@@ -318,6 +321,28 @@ pub fn usn_watch_forever(
 }
 
 /// 单条已解析的 USN 监听记录（批合并的输入单元）。
+
+fn trace_numeric_record(volume: &str, journal: u64, raw: &[u8], id: u64, parent: u64, reason: u32, attrs: u32, batch: u32) {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+    static TRACE: OnceLock<Mutex<Option<(std::io::BufWriter<std::fs::File>, usize)>>> = OnceLock::new();
+    let state = TRACE.get_or_init(|| Mutex::new(std::env::var_os("FINDX2_USN_NUMERIC_TRACE").and_then(|p| std::fs::OpenOptions::new().write(true).create_new(true).open(p).ok()).map(|f| (std::io::BufWriter::with_capacity(16384, f), 0))));
+    let Ok(mut guard) = state.lock() else { return; };
+    let Some((writer, count)) = guard.as_mut() else { return; };
+    if *count >= 262144 { return; }
+    let version = u16::from_le_bytes([raw[4],raw[5]]);
+    let offset = if version == 2 { 24 } else { 40 };
+    let Some(usn) = raw.get(offset..offset+8) else { return; };
+    let mut record = [0u8;48];
+    record[0..8].copy_from_slice(&journal.to_le_bytes());record[8..16].copy_from_slice(&id.to_le_bytes());
+    record[16..24].copy_from_slice(&parent.to_le_bytes());record[24..32].copy_from_slice(usn);
+    record[32..36].copy_from_slice(&reason.to_le_bytes());record[36..40].copy_from_slice(&attrs.to_le_bytes());
+    record[40..42].copy_from_slice(&version.to_le_bytes());record[42]=volume.bytes().find(|b| b.is_ascii_alphabetic()).unwrap_or(0);
+    record[43..47].copy_from_slice(&batch.to_le_bytes());
+    if writer.write_all(&record).is_err() { *count=262144;return; }
+    *count+=1;if *count%128==0 || *count==262144 { let _=writer.flush(); }
+}
+
 struct ParsedWatchRec {
     file_ref: u64,
     parent_ref: u64,

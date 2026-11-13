@@ -1030,6 +1030,8 @@ impl SearchEngine {
         let (mut creates, mut renames, mut deletes, mut other) = (0, 0, 0, 0);
         let (mut absent_parent, mut deleted_parent, mut directory_mismatch, mut live_parent) = (0, 0, 0, 0);
         let mut known_identity = 0;
+        let detailed = std::env::var_os("FINDX2_PENDING_ID_DIAGNOSTICS").is_some();
+        let mut identities = String::new();
         for (_, _, ev) in o.ordered.iter().filter(|(v, _, _)| *v == volume).take(64) {
             sampled += 1;
             if g.entry_on_volume(volume, OrphanQueue::identity(ev)).is_some() { known_identity += 1; }
@@ -1040,6 +1042,13 @@ impl SearchEngine {
                 ChangeEvent::Delete { .. } => { deletes += 1; None }
                 _ => { other += 1; None }
             };
+            if detailed {
+                use std::fmt::Write;
+                let id = OrphanQueue::identity(ev);
+                let kind = match ev { ChangeEvent::Create { .. } => "create", ChangeEvent::CreatePending { .. } => "create_pending", ChangeEvent::Rename { .. } => "rename", ChangeEvent::Delete { .. } => "delete", _ => "metadata" };
+                let state = g.entry_on_volume(volume, id).map(|i| if g.entries[i as usize].is_deleted() { "deleted" } else { "live" }).unwrap_or("absent");
+                let _ = write!(identities, " [vol={} type={} id={} seq={} parent={} pseq={} state={}]", volume, kind, id, id >> 48, parent.unwrap_or(0), parent.unwrap_or(0) >> 48, state);
+            }
             if let Some(parent) = parent {
                 match g.entry_on_volume(volume, parent) {
                     None => absent_parent += 1,
@@ -1049,7 +1058,7 @@ impl SearchEngine {
                 }
             }
         }
-        format!("sample={sampled}/64 creates={creates} renames={renames} deletes={deletes} other={other} absent_parent={absent_parent} deleted_parent={deleted_parent} directory_mismatch={directory_mismatch} live_parent={live_parent} known_identity={known_identity}")
+        format!("sample={sampled}/64 creates={creates} renames={renames} deletes={deletes} other={other} absent_parent={absent_parent} deleted_parent={deleted_parent} directory_mismatch={directory_mismatch} live_parent={live_parent} known_identity={known_identity}{identities}")
     }
     pub fn has_pending_namespace(&self, volume: u8) -> bool {
         self.orphans.lock().ordered.iter().any(|(v, _, _)| *v == volume)
