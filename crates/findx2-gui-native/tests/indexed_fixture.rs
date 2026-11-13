@@ -20,7 +20,7 @@ fn page(client:&IpcClient,endpoint:&str,path:&str)->UsagePageDto {
 #[ignore="explicit isolated service fixture; requires FINDX_T109_SERVICE_EXE"]
 fn compact_service_native_client_render_model_and_delayed_metadata() {
  let exe=PathBuf::from(std::env::var_os("FINDX_T109_SERVICE_EXE").expect("explicit isolated exe required"));
- assert!(["native-usage-t109","native-usage-t109b","native-usage-t109c"].iter().any(|name|exe.parent().unwrap().file_name().unwrap()==*name));
+ assert!(["native-usage-t109","native-usage-t109b","native-usage-t109c","native-usage-t115"].iter().any(|name|exe.parent().unwrap().file_name().unwrap()==*name));
  let nonce=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
  let root=std::env::temp_dir().join(format!("findx-t109-integration-{}-{nonce}",std::process::id()));
  let data=root.join("synthetic");std::fs::create_dir_all(data.join("nested")).unwrap();

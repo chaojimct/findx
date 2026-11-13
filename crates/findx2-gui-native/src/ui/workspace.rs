@@ -218,6 +218,7 @@ pub(super) struct Workspace {
     usage_advanced: bool,
     engine_usage: bool,
     engine_busy: bool,
+    engine_cancel: Arc<AtomicBool>,
     engine_checked: bool,
     engine_next: Option<u32>,
     engine_generation: Option<(u64, u64)>,
@@ -350,6 +351,7 @@ impl Workspace {
             usage_advanced: false,
             engine_usage: true,
             engine_busy: false,
+            engine_cancel: Arc::new(AtomicBool::new(false)),
             engine_checked: false,
             engine_next: None,
             engine_generation: None,
@@ -844,6 +846,8 @@ impl MainWindow {
         cx.notify();
     }
     pub(super) fn workspace_switch(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        self.workspace.engine_cancel.store(true, Ordering::Release);
+        self.workspace.engine_busy=false;
         self.cancel_path_edit(cx);
         self.dismiss_address_menu(cx);
         self.dismiss_file_menu(cx);
@@ -999,6 +1003,8 @@ impl MainWindow {
                 }
             }
         }
+        self.workspace.engine_cancel.store(true, Ordering::Release);
+        self.workspace.engine_busy=false;
         // A newer location supersedes an in-flight request. Its completion must
         // not strand the new scope behind the previous scope's busy flag.
         if mode == ViewMode::Usage && self.workspace.engine_usage {
@@ -1385,6 +1391,9 @@ impl MainWindow {
             return;
         }
         self.workspace.engine_busy = true;
+        self.workspace.engine_cancel.store(true, Ordering::Release);
+        self.workspace.engine_cancel=Arc::new(AtomicBool::new(false));
+        let cancel=self.workspace.engine_cancel.clone();
         self.workspace.scan_generation = self.workspace.scan_generation.wrapping_add(1);
         let request_generation = self.workspace.scan_generation;
         let path = display_path(&self.workspace.location);
@@ -1421,22 +1430,23 @@ impl MainWindow {
                         ),
                     }
                 }
-                match ipc
-                    .request(
-                        endpoint,
-                        findx2_ipc::IpcRequest::UsageChildren {
-                            path,
-                            expected,
-                            after,
-                            max_bytes: 48 * 1024,
-                        },
-                    )
-                    .await
-                    .map_err(|_| "用量请求已取消".to_string())??
-                {
-                    findx2_ipc::IpcResponse::UsageChildrenResult { page } => Ok(page),
-                    findx2_ipc::IpcResponse::Error { message } => Err(message),
-                    _ => Err("索引用量响应不兼容".into()),
+                let mut guard=crate::indexed_usage::EmptyPageGuard::new(expected,after);
+                let mut cursor=after;
+                let mut stamp=expected;
+                loop {
+                    crate::indexed_usage::ensure_not_cancelled(&cancel)?;
+                    let response=ipc.request(endpoint.clone(),findx2_ipc::IpcRequest::UsageChildren{
+                        path:path.clone(),expected:stamp,after:cursor,max_bytes:48*1024,
+                    }).await.map_err(|_|"usage request cancelled".to_string())??;
+                    crate::indexed_usage::ensure_not_cancelled(&cancel)?;
+                    let page=match response {
+                        findx2_ipc::IpcResponse::UsageChildrenResult{page}=>page,
+                        findx2_ipc::IpcResponse::Error{message}=>return Err(message),
+                        _=>return Err("incompatible indexed usage response".into()),
+                    };
+                    if let Some(next)=guard.follow(&page)? {
+                        stamp=Some((page.epoch,page.generation));cursor=Some(next);
+                    } else {return Ok((page,guard.skipped()))}
                 }
             }
             .await;
@@ -1451,7 +1461,7 @@ impl MainWindow {
                 {
                     return;
                 }
-                let page = match result {
+                let (page,skipped_empty) = match result {
                     Ok(p) => p,
                     Err(e) => {
                         if e.contains("index loading; usage initializing") {
@@ -1484,6 +1494,7 @@ impl MainWindow {
                     page.generation,
                     page.state
                 );
+                if skipped_empty>0 {this.workspace.scan_status.push_str(&format!(" [{} empty pages skipped; continuation retained]",skipped_empty));}
                 cx.notify();
                 if !next
                     && this.workspace.engine_generation == Some((page.epoch, page.generation))
@@ -1586,6 +1597,8 @@ impl MainWindow {
         .detach();
     }
     pub(super) fn start_workspace_scan(&mut self, force: bool, cx: &mut Context<Self>) {
+        self.workspace.engine_cancel.store(true, Ordering::Release);
+        self.workspace.engine_busy=false;
         if self.workspace.op_busy || self.file_actions.busy || self.workspace.scanning {
             return;
         }

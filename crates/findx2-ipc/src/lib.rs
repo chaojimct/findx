@@ -59,6 +59,8 @@ pub enum IpcRequest {
     UsageChildren {
         path: String,
         expected: Option<(u64, u64)>,
+        /// Opaque server continuation, never a directory/entry index.
+        /// Scoped to path + epoch/generation; an expired lease requires refresh.
         after: Option<u32>,
         max_bytes: usize,
     },

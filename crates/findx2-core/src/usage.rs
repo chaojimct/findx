@@ -7,6 +7,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 const NIL: u32 = u32::MAX;
 const ACTIVE: u32 = 1;
+const ROOT_ALIAS: u32 = 2;
+const CURSOR_SLOTS: usize = 1024;
+const SCAN_WORK_BYTES: usize = 64 * 1024;
+static CURSOR_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+#[derive(Clone, Copy, Debug)]
+struct PageContinuation { token:u32, epoch:u64, generation:u64, root:u32, dir:Option<u32>, file:Option<u32> }
+
 static EPOCH: AtomicU64 = AtomicU64::new(1);
 fn next_epoch() -> u64 {
     static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -204,6 +211,7 @@ pub(crate) struct UsageRuntime {
     pub budget: usize,
     pub error: Option<String>,
     ancestor_visits: u64,
+    page_cursors: Vec<Option<PageContinuation>>,
 }
 impl Default for Freshness { fn default() -> Self { Self { bytes: Vec::new() } } }
 impl UsageRuntime {
@@ -211,6 +219,7 @@ impl UsageRuntime {
         self.dirs.capacity() * std::mem::size_of::<DirAgg>()
             + self.file_links.capacity() * std::mem::size_of::<FileLinks>()
             + self.freshness.capacity_bytes()
+            + self.page_cursors.capacity() * std::mem::size_of::<Option<PageContinuation>>()
             + (self.roots.capacity() + self.tickets.capacity() + self.excluded_ids.capacity()) * 32
     }
     fn reserve(&mut self, n: usize, d: usize) -> Result<(), String> {
@@ -225,7 +234,9 @@ impl UsageRuntime {
         let predicted = pd.saturating_mul(std::mem::size_of::<DirAgg>())
             .saturating_add(pn.saturating_mul(std::mem::size_of::<FileLinks>()))
             .saturating_add(pf);
-        if predicted > self.budget {
+        let other=(self.roots.capacity()+self.tickets.capacity()+self.excluded_ids.capacity())*32
+            +self.page_cursors.capacity()*std::mem::size_of::<Option<PageContinuation>>();
+        if predicted.saturating_add(other) > self.budget {
             return Err("usage resource budget: expanded directory aggregates/file links would exceed byte budget".into());
         }
         self.dirs.try_reserve(d).map_err(|_| "usage directory aggregate allocation failed")?;
@@ -292,8 +303,13 @@ impl UsageRuntime {
                 if p == at { break 0; }
                 at = p;
             };
-            for x in path.into_iter().chain([i]) {
+            for x in path.into_iter().rev() {
                 t.dirs[x].volume_slot = slot;
+                let p=t.dirs[x].parent;
+                if g.dirs[x].name_len==0 && (t.dirs[p as usize].parent==p || t.dirs[p as usize].flags & ROOT_ALIAS != 0) {
+                    t.dirs[x].flags=ROOT_ALIAS;
+                    t.dirs[x].parent=t.logical_parent(p);
+                }
                 assigned[x] = true;
             }
         }
@@ -305,8 +321,13 @@ impl UsageRuntime {
             if let Some(di) = g.dir_on_volume(letter, frn) {
                 let di = di as usize;
                 t.dirs[di].owner_entry = idx as u32;
+                if t.dirs[di].flags & ROOT_ALIAS != 0 {
+                    let root=t.logical_parent(di as u32);
+                    t.dirs[root as usize].owner_entry=idx as u32;
+                    continue;
+                }
                 t.dirs[di].flags = if e.is_deleted() { 0 } else { ACTIVE };
-                let p = e.dir_idx;
+                let p = t.logical_parent(e.dir_idx);
                 if (p as usize) < d && p as usize != di {
                     t.dirs[di].parent = p;
                 }
@@ -314,7 +335,7 @@ impl UsageRuntime {
         }
         for di in 0..d {
             let p = t.dirs[di].parent;
-            if p as usize != di { t.link_dir(di as u32, p); }
+            if p as usize != di && t.dirs[di].active() { t.link_dir(di as u32, p); }
             if t.dirs[di].active() {
                 let mut tot = t.dirs[di].totals();
                 tot.add(Totals::dir_self());
@@ -323,9 +344,9 @@ impl UsageRuntime {
         }
         for (idx, e) in g.entries.iter().enumerate() {
             if e.is_dir_entry() { continue; }
-            let p = e.dir_idx;
+            let p = t.logical_parent(e.dir_idx);
             if (p as usize) >= d { return Err("usage entry volume unresolved".into()); }
-            t.link_file(idx as u32, p);
+            if !e.is_deleted() { t.link_file(idx as u32, p); }
             let unknown = !g.metadata_ready;
             t.freshness.set(idx, u8::from(!unknown));
             if !e.is_deleted() {
@@ -364,7 +385,11 @@ impl UsageRuntime {
         if t.bytes() > budget { return Err("usage actual capacity exceeds byte budget".into()); }
         Ok(t)
     }
+    fn logical_parent(&self, p:u32)->u32 {
+        match self.dirs.get(p as usize) {Some(n) if n.flags & ROOT_ALIAS != 0=>n.parent,_=>p}
+    }
     fn link_dir(&mut self, id: u32, p: u32) {
+        let p=self.logical_parent(p);
         let first = self.dirs[p as usize].first_dir;
         self.dirs[id as usize].parent = p;
         self.dirs[id as usize].next_dir = first;
@@ -375,6 +400,7 @@ impl UsageRuntime {
     fn unlink_dir(&mut self, id: u32) {
         let n = self.dirs[id as usize];
         if n.parent == NIL || n.parent as usize == id as usize { return; }
+        if n.prev_dir==NIL && n.next_dir==NIL && self.dirs[n.parent as usize].first_dir!=id{return;}
         if n.prev_dir == NIL { self.dirs[n.parent as usize].first_dir = n.next_dir; }
         else { self.dirs[n.prev_dir as usize].next_dir = n.next_dir; }
         if n.next_dir != NIL { self.dirs[n.next_dir as usize].prev_dir = n.prev_dir; }
@@ -382,20 +408,24 @@ impl UsageRuntime {
         self.dirs[id as usize].prev_dir = NIL;
     }
     fn link_file(&mut self, idx: u32, p: u32) {
+        let p=self.logical_parent(p);
         let first = self.dirs[p as usize].first_file;
         self.file_links[idx as usize] = FileLinks { next: first, prev: NIL };
         if first != NIL { self.file_links[first as usize].prev = idx; }
         self.dirs[p as usize].first_file = idx;
     }
     fn unlink_file(&mut self, idx: u32, p: u32) {
+        let p=self.logical_parent(p);
         let n = self.file_links[idx as usize];
         if p == NIL { return; }
+        if n.prev==NIL && n.next==NIL && self.dirs[p as usize].first_file!=idx{return;}
         if n.prev == NIL { self.dirs[p as usize].first_file = n.next; }
         else { self.file_links[n.prev as usize].next = n.next; }
         if n.next != NIL { self.file_links[n.next as usize].prev = n.prev; }
         self.file_links[idx as usize] = FileLinks::default();
     }
     fn ancestors(&mut self, mut p: u32, w: Totals, add: bool) {
+        p=self.logical_parent(p);
         let mut guard = 0usize;
         while p != NIL {
             self.ancestor_visits = self.ancestor_visits.saturating_add(1);
@@ -412,6 +442,7 @@ impl UsageRuntime {
         }
     }
     fn visible_dir(&self, mut id: u32) -> bool {
+        id=self.logical_parent(id);
         let mut guard = 0usize;
         while (id as usize) < self.dirs.len() {
             let n = self.dirs[id as usize];
@@ -451,6 +482,10 @@ impl UsageRuntime {
     fn resolve(&self, g: &IndexStore, path: &str, size_of_file: &impl Fn(usize) -> u64) -> Result<u32, String> {
         let path = path.replace('/', "\\");
         let path = path.trim_end_matches('\\');
+        if g.excluded_dirs.iter().any(|e| {
+            let e=e.trim_end_matches(char::from(92));
+            path.get(..e.len()).is_some_and(|p|p.eq_ignore_ascii_case(e)) && (path.len()==e.len() || path.as_bytes().get(e.len())==Some(&92))
+        }) {return Err("path explicitly excluded from indexed scope".into())}
         let (v, tail) = g.volumes.iter().find_map(|v| {
             let root = v.root_prefix.trim_end_matches('\\');
             if path.eq_ignore_ascii_case(root) { Some((v, "")) }
@@ -466,7 +501,11 @@ impl UsageRuntime {
             let mut found = None;
             let mut child = self.dirs[di as usize].first_dir;
             while child != NIL {
-                if self.dirs[child as usize].active() && self.item_dir(g, child)?.name.eq_ignore_ascii_case(part) {
+                if self.dirs[child as usize].active() && {
+                    let n=&self.dirs[child as usize];
+                    let bytes=if n.owner_entry!=NIL {g.name_bytes(&g.entries[n.owner_entry as usize])} else {let d=&g.dirs[child as usize];&g.names_buf[d.name_offset as usize..d.name_offset as usize+d.name_len as usize]};
+                    String::from_utf8_lossy(bytes).eq_ignore_ascii_case(part)
+                } {
                     found = Some(child);
                     break;
                 }
@@ -478,29 +517,25 @@ impl UsageRuntime {
         if !self.visible_dir(di) { return Err("path excluded/deleted".into()); }
         Ok(di)
     }
-    fn page_after(&self, g: &IndexStore, root: u32, after: Option<u32>) -> Result<(Option<u32>, Option<u32>), String> {
-        let Some(a) = after else {
-            return Ok((some_if(self.dirs[root as usize].first_dir), some_if(self.dirs[root as usize].first_file)));
-        };
-        let mut d = self.dirs[root as usize].first_dir;
-        while d != NIL {
-            let owner = self.dirs[d as usize].owner_entry;
-            if owner == a || d == a {
-                return Ok((some_if(self.dirs[d as usize].next_dir), some_if(self.dirs[root as usize].first_file)));
-            }
-            d = self.dirs[d as usize].next_dir;
+    fn page_after(&self, _g:&IndexStore,root:u32,after:Option<u32>)->Result<(Option<u32>,Option<u32>),String>{
+        let Some(token)=after else{return Ok((some_if(self.dirs[root as usize].first_dir),some_if(self.dirs[root as usize].first_file)))};
+        let cursor=self.page_cursors.get(token as usize%CURSOR_SLOTS).and_then(|c|*c)
+            .filter(|c|c.token==token&&c.epoch==self.epoch&&c.generation==self.generation&&c.root==root)
+            .ok_or("usage page cursor expired or outside scope; restart pagination")?;
+        Ok((cursor.dir,cursor.file))
+    }
+    fn continuation(&mut self,root:u32,dir:Option<u32>,file:Option<u32>)->Result<Option<u32>,String>{
+        if dir.is_none()&&file.is_none(){return Ok(None)}
+        if self.page_cursors.is_empty(){
+            let extra=CURSOR_SLOTS*std::mem::size_of::<Option<PageContinuation>>();
+            if self.bytes().saturating_add(extra)>self.budget{return Err("usage cursor resource budget exceeded".into())}
+            self.page_cursors.try_reserve_exact(CURSOR_SLOTS).map_err(|_|"usage cursor allocation failed")?;
+            self.page_cursors.resize(CURSOR_SLOTS,None);
         }
-        let mut f = self.dirs[root as usize].first_file;
-        while f != NIL {
-            if f == a {
-                if g.entries.get(a as usize).map(|e| e.dir_idx) != Some(root) {
-                    return Err("page cursor outside scope".into());
-                }
-                return Ok((None, some_if(self.file_links[f as usize].next)));
-            }
-            f = self.file_links[f as usize].next;
-        }
-        Err("page cursor outside scope".into())
+        let seq=CURSOR_SEQUENCE.fetch_add(1,Ordering::Relaxed);
+        let token=u32::try_from(seq).map_err(|_|"usage cursor token space exhausted; restart process")?;
+        self.page_cursors[token as usize%CURSOR_SLOTS]=Some(PageContinuation{token,epoch:self.epoch,generation:self.generation,root,dir,file});
+        Ok(Some(token))
     }
     fn invalidate_ticket(&mut self, idx: usize) { self.tickets.remove(&idx); }
     fn issue_ticket(&mut self, idx: usize) -> Result<u64, String> {
@@ -584,7 +619,7 @@ impl SearchEngine {
     }
     pub fn usage_page(&self, path: &str, expected: Option<(u64, u64)>, after: Option<u32>, max_bytes: usize) -> Result<UsagePage, String> {
         let g = self.store.read();
-        let r = self.usage.lock();
+        let mut r = self.usage.lock();
         if let Some(e) = &r.error { return Err(e.clone()); }
         if r.epoch == 0 { return Err("indexed usage unavailable / initialization required".into()); }
         if expected.is_some_and(|v| v != (r.epoch, r.generation)) { return Err("usage generation changed; restart page".into()); }
@@ -595,51 +630,48 @@ impl SearchEngine {
         let mut bytes = 0usize;
         let mut examined = 0usize;
         let budget = max_bytes.clamp(1024, 256 * 1024);
-        let mut last = None;
+
         while let Some(d) = next_dir {
             examined += std::mem::size_of::<DirAgg>();
-            if examined >= budget && last.is_some() { break; }
+            if examined > SCAN_WORK_BYTES { break; }
             let n = r.dirs[d as usize];
             let following = some_if(n.next_dir);
             if n.active() {
                 let item = r.item_dir(&g, d)?;
-                let cur = if n.owner_entry == NIL { d } else { n.owner_entry };
-                let cost = item.name.len() + 128;
-                if bytes + cost > budget && !children.is_empty() { next_dir = Some(d); break; }
+                let cost = item.name.bytes().map(|b|if b<32{6}else if b==34||b==92{2}else{1}).sum::<usize>()+256;
+                if cost>budget && children.is_empty(){return Err("usage child exceeds page output budget; request a larger page".into())}
+                if bytes + cost > budget { next_dir = Some(d); break; }
                 children.try_reserve(1).map_err(|_| "usage page allocation failed")?;
                 bytes += cost;
                 children.push(item);
-                last = Some(cur);
-            } else {
-                last = Some(if n.owner_entry == NIL { d } else { n.owner_entry });
             }
             next_dir = following;
         }
         if next_dir.is_none() {
             while let Some(f) = next_file {
                 examined += std::mem::size_of::<FileLinks>();
-                if examined >= budget && last.is_some() { break; }
+                if examined > SCAN_WORK_BYTES { break; }
                 let following = some_if(r.file_links[f as usize].next);
                 let e = &g.entries[f as usize];
                 if !e.is_deleted() {
                     let item = r.item_file(&g, f, &size_of_file)?;
-                    let cost = item.name.len() + 128;
-                    if bytes + cost > budget && !children.is_empty() { next_file = Some(f); break; }
+                    let cost = item.name.bytes().map(|b|if b<32{6}else if b==34||b==92{2}else{1}).sum::<usize>()+256;
+                    if cost>budget && children.is_empty(){return Err("usage child exceeds page output budget; request a larger page".into())}
+                    if bytes + cost > budget { next_file = Some(f); break; }
                     children.try_reserve(1).map_err(|_| "usage page allocation failed")?;
                     bytes += cost;
                     children.push(item);
-                    last = Some(f);
-                } else { last = Some(f); }
+                }
                 next_file = following;
             }
         }
-        let more = next_dir.or(next_file);
+        let next=r.continuation(root,next_dir,next_file)?;
         Ok(UsagePage {
             epoch: r.epoch,
             generation: r.generation,
             root: r.item_dir(&g, root)?,
             children,
-            next: if more.is_some() { last } else { None },
+            next,
             resident_bytes: r.bytes(),
             state: "indexed logical bytes; canonical indexed paths; allocation not measured; journal/metadata freshness tracked separately".into(),
         })
@@ -998,7 +1030,7 @@ impl SearchEngine {
         if after.is_dir || before.is_dir {
             let di = after.di.or(before.di).ok_or("usage missing directory identity")?;
             let slot = g.volume_slot_of(volume).unwrap_or(0) as u8;
-            let new_parent = after.parent;
+            let new_parent = r.logical_parent(after.parent);
             if before.di.is_none() || (before.di.map(|x| x as usize).unwrap_or(usize::MAX) >= r.dirs.len()) {
                 r.ensure_dir_slot(di, new_parent, slot)?;
                 r.dirs[di as usize] = DirAgg::empty(new_parent, slot);
@@ -1010,13 +1042,16 @@ impl SearchEngine {
                 return Ok(());
             }
             let di = before.di.unwrap_or(di);
-            let old_parent = before.parent;
+            if r.dirs[di as usize].flags & ROOT_ALIAS != 0 {
+                if after.deleted {return Err("volume root identity changed; usage requires reinitialization".into())}
+                r.generation+=1;return Ok(())
+            }
+            let old_parent = r.logical_parent(before.parent);
             let w = r.dirs[di as usize].totals();
             if !before.deleted { r.ancestors(if old_parent == di { NIL } else { old_parent }, w, false); }
-            if new_parent != old_parent {
-                if old_parent != di { r.unlink_dir(di); }
-                if new_parent != di { r.link_dir(di, new_parent); } else { r.dirs[di as usize].parent = di; }
-            }
+            if old_parent!=di && (!before.deleted || after.deleted) {r.unlink_dir(di);}
+            if !after.deleted && new_parent!=di {r.link_dir(di,new_parent);} else {r.dirs[di as usize].parent=new_parent;}
+
             r.dirs[di as usize].owner_entry = idx;
             r.dirs[di as usize].flags = if after.deleted { 0 } else { ACTIVE };
             if !after.deleted { r.ancestors(if new_parent == di { NIL } else { new_parent }, w, true); }
@@ -1024,7 +1059,7 @@ impl SearchEngine {
             r.generation += 1;
             return Ok(());
         }
-        let new_parent = after.parent;
+        let new_parent = r.logical_parent(after.parent);
         let new_size = after.size;
         let old_unknown = r.freshness.get(idx as usize) != 1;
         let known = match ev {
@@ -1057,7 +1092,7 @@ impl SearchEngine {
             r.generation += 1;
             return Ok(());
         }
-        if before.parent != new_parent {
+        if r.logical_parent(before.parent) != new_parent {
             if !before.deleted { r.ancestors(before.parent, old, false); r.unlink_file(idx, before.parent); }
             r.link_file(idx, new_parent);
             if !after.deleted { r.ancestors(new_parent, Totals::file(new_size, new_unknown), true); }
@@ -1096,6 +1131,83 @@ mod tests {
         e
     }
     fn size(e: &SearchEngine) -> u64 { e.usage_page("C:\\", None, None, 1024).unwrap().root.logical }
+    fn ntfs_shape(letter:u8)->IndexStore {
+        crate::IndexBuilder::new(letter,1,7,10).build_from_raw(
+            vec![raw(10,4,"leaf.bin",100,false),raw(11,5,"root.bin",20,false),raw(12,1,"orphan.bin",7,false)],
+            vec![raw(1,0,"sentinel",0,true),raw(5,1,"",0,true),raw(2,5,"Users",0,true),raw(3,2,"tester",0,true),raw(4,3,"completion",0,true),raw(6,5,"Windows",0,true),raw(7,5,"right",0,true)],true).unwrap()
+    }
+    #[test]
+    fn transparent_ntfs_root_paths_and_namespace_deltas(){
+        let e=SearchEngine::new(ntfs_shape(b'C'));e.enable_usage(16*1024*1024).unwrap();
+        let root=e.usage_page("C:/",None,None,4096).unwrap();
+        assert_eq!(root.root.logical,127);assert_eq!(root.root.directories,6);
+        assert!(root.children.iter().any(|c|c.name=="Users"));
+        assert!(root.children.iter().any(|c|c.name=="root.bin"));
+        assert!(root.children.iter().all(|c|!c.name.is_empty()));
+        for path in ["C:/Users/tester/completion/","c://uSeRs//TESTER/completion","C:/Users/tester/completion"].map(|p|p.replace('/',&char::from(92).to_string())) {
+            assert_eq!(e.usage_page(&path,None,None,4096).unwrap().root.logical,100);
+        }
+        assert!(e.usage_page("C:/Users/tester/missing",None,None,1024).is_err());
+        assert!(e.usage_page("C:/Users/../Windows",None,None,1024).is_err());
+        e.apply_volume_change(b'C',&ChangeEvent::Create{entry:raw(13,5,"added",30,false)}).unwrap();
+        assert_eq!(size(&e),157);
+        let t=e.metadata_ticket_by_id(b'C',13).unwrap();assert!(e.commit_metadata(t,40,0,0).unwrap());assert_eq!(size(&e),167);
+        e.apply_volume_change(b'C',&ChangeEvent::Rename{file_id:2,new_parent_id:7,new_name:"Users".into()}).unwrap();
+        assert_eq!(size(&e),167);assert_eq!(e.usage_page("C:/right/Users/tester/completion",None,None,4096).unwrap().root.logical,100);
+        assert!(e.usage_page("C:/Users/tester/completion",None,None,4096).is_err());
+        e.apply_volume_change(b'C',&ChangeEvent::Delete{file_id:13}).unwrap();assert_eq!(size(&e),127);
+        e.apply_volume_change(b'C',&ChangeEvent::DataOrMeta{file_id:5,size:None,mtime:Some(0),ctime:None,create_if_missing:None}).unwrap();
+        assert!(e.usage_available());assert_eq!(size(&e),127);
+    }
+    #[test]
+    fn explicit_exclusion_is_not_reported_as_a_missing_parent(){
+        let mut g=ntfs_shape(b'C');g.excluded_dirs=vec!["C:/Users/tester/completion".replace('/',&char::from(92).to_string())];
+        let e=SearchEngine::new(g);e.enable_usage(16*1024*1024).unwrap();
+        assert!(e.usage_page("c:/users/tester/completion",None,None,1024).unwrap_err().contains("explicitly excluded"));
+        assert!(e.usage_page("C:/Users/tester/completion-other",None,None,1024).unwrap_err().contains("not present"));
+    }
+    #[test]
+    fn transparent_roots_on_two_volumes_do_not_mix_identity(){
+        let g=crate::merge_index_stores(vec![ntfs_shape(b'C'),ntfs_shape(b'D')]).unwrap();
+        let e=SearchEngine::new(g);e.enable_usage(16*1024*1024).unwrap();
+        for v in ['C','D'] {assert_eq!(e.usage_page(&format!("{v}:/Users/tester/completion"),None,None,4096).unwrap().root.logical,100);}
+    }
+    #[test]
+    fn live_chain_build_omits_deleted_prefix_and_resurrection_is_safe(){
+        let mut g=ntfs_shape(b'C');let template=*g.entries.iter().find(|e|!e.is_dir_entry()).unwrap();
+        for i in 0..17000 {let mut f=template;f.attrs|=crate::FileEntry::ATTR_DELETED;f.dir_idx=0;g.entries.push(f);g.frns.push(1000+i);}
+        let e=SearchEngine::new(g);e.enable_usage(16*1024*1024).unwrap();
+        let page=e.usage_page("C:/",None,None,1024).unwrap();assert!(!page.children.is_empty());
+        assert_eq!(page.root.logical,127);
+        // Retained inactive prefix explicitly exercises the server's independent
+        // work budget/continuation, not a fake reparenting of live input records.
+        {let mut r=e.usage.lock();for idx in 10..17000 {r.link_file(idx,0);}}
+        let mut page=e.usage_page("C:/",None,None,1024).unwrap();let stamp=(page.epoch,page.generation);let mut empty=0;let mut observed=0;
+        for _ in 0..20 {observed+=page.children.len();if page.children.is_empty()&&page.next.is_some(){empty+=1;}
+            let Some(next)=page.next else{break};page=e.usage_page("C:/",Some(stamp),Some(next),1024).unwrap();}
+        assert!(empty>=1);assert!(observed>0);assert!(page.next.is_none());
+    }
+    #[test]
+    fn opaque_cursors_are_scoped_constant_seek_and_expire_explicitly(){
+        let files=(0..200).map(|i|raw(100+i,1,&format!("file-{i}"),1,false)).collect();
+        let g=crate::IndexBuilder::new(b'C',1,7,10).build_from_raw(files,vec![raw(1,0,"root",0,true),raw(2,1,"other",0,true)],true).unwrap();
+        let e=SearchEngine::new(g);e.enable_usage(16*1024*1024).unwrap();
+        let mut page=e.usage_page("C:/",None,None,1024).unwrap();let first=page.next.unwrap();let stamp=(page.epoch,page.generation);let mut seen=std::collections::HashSet::new();let mut pages=0;
+        loop {for child in &page.children{assert!(seen.insert(child.name.clone()));}pages+=1;
+            let Some(next)=page.next else{break};page=e.usage_page("C:/",Some(stamp),Some(next),1024).unwrap();assert!(pages<100);}
+        assert_eq!(seen.len(),201);assert!(pages>50);
+        assert!(e.usage_page("C:/other",Some(stamp),Some(first),1024).unwrap_err().contains("scope"));
+        for _ in 0..CURSOR_SLOTS+1{e.usage_page("C:/",None,None,1024).unwrap();}
+        assert!(e.usage_page("C:/",Some(stamp),Some(first),1024).unwrap_err().contains("expired"));
+        assert!(e.usage.lock().page_cursors.capacity()<=CURSOR_SLOTS);
+    }
+    #[test]
+    fn page_output_budget_rejects_oversized_item_without_truncating_coverage(){
+        let name="x".repeat(1100);let g=crate::IndexBuilder::new(b'C',1,7,10).build_from_raw(vec![raw(10,1,&name,1,false)],vec![raw(1,0,"root",0,true)],true).unwrap();
+        let e=SearchEngine::new(g);e.enable_usage(1024*1024).unwrap();
+        assert!(e.usage_page("C:/",None,None,1024).unwrap_err().contains("output budget"));
+        let p=e.usage_page("C:/",None,None,4096).unwrap();assert_eq!(p.children.len(),1);assert!(p.next.is_none());
+    }
     #[test]
     fn replacement_revokes_tickets_observations_and_overlay_for_reused_slots() {
         let e=engine();
@@ -1692,7 +1804,7 @@ impl SearchEngine {
         let Some(dir)=r.dirs.get(di) else{return Ok(None)};
         if !dir.active(){return Ok(None);}
         if dir.unknown>0 && dir.first_file!=NIL {
-            return Ok(Some((g.volumes[dir.volume_slot as usize].volume_letter,g.dirs[di].frn)));
+            return Ok(Some((g.volumes[dir.volume_slot as usize].volume_letter,if dir.owner_entry!=NIL {g.frns[dir.owner_entry as usize]} else {g.dirs[di].frn})));
         }
         Ok(None)
     }
