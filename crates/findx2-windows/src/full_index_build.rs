@@ -39,16 +39,22 @@ fn write_index_progress(path: &Path, v: &serde_json::Value) -> std::io::Result<(
     std::fs::write(path, s.as_bytes())
 }
 
+// A scan may take minutes and generate journal changes itself. The durable
+// resume cursor must precede all scanning, never be sampled after metadata IO.
+fn capture_before_scan<C, T, E>(
+    capture: impl FnOnce() -> C,
+    scan: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<(C, T), E> {
+    let checkpoint = capture();
+    let data = scan()?;
+    Ok((checkpoint, data))
+}
+
 fn index_one_volume(
     volume_trim: &str,
     full_stat: bool,
     metadata_ready: bool,
 ) -> findx2_core::Result<IndexStore> {
-    let (files, dirs) = if full_stat {
-        crate::scan_volume(volume_trim)?
-    } else {
-        crate::scan_volume_fast(volume_trim)?
-    };
     let letter = volume_trim
         .chars()
         .find(|c| c.is_ascii_alphabetic())
@@ -59,18 +65,28 @@ fn index_one_volume(
     // journal 游标记 0 = 该卷无增量（watch 线程会报错并进健康上报，由用户决定）。
     // P2 ReFS 审计结论：枚举有 walkdir 回退、metadata 有 OpenFileById，唯独 journal 体系
     // （USN 不可用）需要这层降级。
-    let (journal_id, next_usn) = match crate::UsnJournalWatcher::new(volume_trim).probe() {
-        Ok(usn) => (usn.journal_id, usn.next_usn),
-        Err(e) => {
-            findx2_core::progress!(
+    // Establish a journal before capturing the pre-scan resume point, including first use.
+    let _ = crate::ensure_usn_journal(volume_trim);
+    let ((journal_id, next_usn), (files, dirs)) = capture_before_scan(
+        || match crate::UsnJournalWatcher::new(volume_trim).probe() {
+            Ok(usn) => (usn.journal_id, usn.next_usn),
+            Err(e) => {
+                findx2_core::progress!(
                 "卷 {} USN journal 不可用（{e}，如 ReFS/未格式化 journal）：该卷建库后无增量更新",
                 volume_trim
             );
-            (0, 0)
-        }
-    };
+                (0, 0)
+            }
+        },
+        || {
+            if full_stat {
+                crate::scan_volume(volume_trim)
+            } else {
+                crate::scan_volume_fast(volume_trim)
+            }
+        },
+    )?;
     // 建库顺手保障 journal（P0-3；有管理员才成功，否则内部降级跳过）。
-    let _ = crate::ensure_usn_journal(volume_trim);
     let builder = IndexBuilder::new(letter, serial, journal_id, next_usn);
     findx2_core::progress!(
         "正在构建卷 {} 的内存索引结构（百万级时排序可能需数分钟，请见下方进度）…",
@@ -284,4 +300,38 @@ pub fn build_full_disk_index(
     tracing::info!("已写入 {}，条目 {}", output.display(), entry_count);
     println!("已写入 {}，条目 {}", output.display(), entry_count);
     Ok(())
+}
+
+#[cfg(test)]
+mod watermark_tests {
+    use super::capture_before_scan;
+    use std::cell::{Cell, RefCell};
+    #[test]
+    fn checkpoint_precedes_scan_and_its_journal_mutations() {
+        let journal = Cell::new(100u64);
+        let order = RefCell::new(Vec::new());
+        let (checkpoint, data) = capture_before_scan(
+            || {
+                order.borrow_mut().push("checkpoint");
+                journal.get()
+            },
+            || {
+                order.borrow_mut().push("scan");
+                journal.set(500);
+                Ok::<_, &str>(42)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            checkpoint, 100,
+            "using post-scan 500 silently skips the scan interval"
+        );
+        assert_eq!(data, 42);
+        assert_eq!(*order.borrow(), vec!["checkpoint", "scan"]);
+    }
+    #[test]
+    fn failed_scan_does_not_yield_a_committable_result() {
+        let result = capture_before_scan(|| 100u64, || Err::<(), _>("scan failed"));
+        assert_eq!(result, Err("scan failed"));
+    }
 }

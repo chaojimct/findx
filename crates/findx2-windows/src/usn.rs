@@ -794,6 +794,14 @@ mod tests {
         assert!(!engine.has_pending_namespace(b'C'));
         assert!(engine.index_store().entry_on_volume(b'C', 44).is_some());
         assert_eq!(engine.index_store().volumes[0].last_usn, 20);
+        let rows = engine.index_store().entry_count();
+        let before = engine.usage_page("C:\\", None, None, 4096).unwrap().root;
+        engine.apply_volume_batch(b'C', &events, 7, 21).unwrap();
+        let after = engine.usage_page("C:\\", None, None, 4096).unwrap().root;
+        assert_eq!(engine.index_store().entry_count(), rows, "replay must not append duplicate identities");
+        assert_eq!((after.logical, after.files, after.directories, after.unknown),
+                   (before.logical, before.files, before.directories, before.unknown),
+                   "replay must not double-count subtree aggregates");
     }
 
     #[test]
