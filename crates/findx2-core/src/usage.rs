@@ -622,6 +622,7 @@ impl SearchEngine {
         let mut r = self.usage.lock();
         if let Some(e) = &r.error { return Err(e.clone()); }
         if r.epoch == 0 { return Err("indexed usage unavailable / initialization required".into()); }
+        if after.is_some() && expected.is_none(){return Err("usage cursor requires epoch/generation; restart pagination".into());}
         if expected.is_some_and(|v| v != (r.epoch, r.generation)) { return Err("usage generation changed; restart page".into()); }
         let size_of_file = |idx: usize| self.effective_size(&g, idx);
         let root = r.resolve(&g, path, &size_of_file)?;
@@ -1196,6 +1197,7 @@ mod tests {
         loop {for child in &page.children{assert!(seen.insert(child.name.clone()));}pages+=1;
             let Some(next)=page.next else{break};page=e.usage_page("C:/",Some(stamp),Some(next),1024).unwrap();assert!(pages<100);}
         assert_eq!(seen.len(),201);assert!(pages>50);
+        assert!(e.usage_page("C:/",None,Some(first),1024).unwrap_err().contains("epoch/generation"));
         assert!(e.usage_page("C:/other",Some(stamp),Some(first),1024).unwrap_err().contains("scope"));
         for _ in 0..CURSOR_SLOTS+1{e.usage_page("C:/",None,None,1024).unwrap();}
         assert!(e.usage_page("C:/",Some(stamp),Some(first),1024).unwrap_err().contains("expired"));
