@@ -117,6 +117,7 @@ impl MainWindow {
             return;
         };
         let Some(root) = self.scan_node() else {
+            if self.workspace.usage_pending_from.is_some(){return}
             self.workspace.usage_scene_generation =
                 self.workspace.usage_scene_generation.wrapping_add(1);
             self.workspace.usage_scene_key = None;
@@ -133,6 +134,7 @@ impl MainWindow {
         }
         let root_change = self.workspace.usage_scene.as_ref().is_some_and(|s| {
             s.key.root != root
+                || self.workspace.usage_scene_scan.as_ref().and_then(|old|old.nodes.get(s.key.root)).map(|n|&n.path)!=scan.nodes.get(root).map(|n|&n.path)
                 || (!self.workspace.engine_usage && s.key.scan != self.usage_scan_identity(&scan))
         });
         let detail = if root_change {
@@ -143,7 +145,7 @@ impl MainWindow {
         let key = SceneKey {
             scan: self.usage_scan_identity(&scan),
             root,
-            depth: self.workspace.usage_depth,
+            depth: usage_view::PRESENTATION_DEPTH,
             width,
             height,
             detail,
@@ -151,6 +153,7 @@ impl MainWindow {
         if self.workspace.usage_scene_key.as_ref() == Some(&key) {
             return;
         }
+        if !usage_view::claim_layout(&mut self.workspace.usage_layout_inflight){return}
         self.workspace.usage_scene_key = Some(key.clone());
         self.workspace.usage_scene_generation =
             self.workspace.usage_scene_generation.wrapping_add(1);
@@ -161,8 +164,8 @@ impl MainWindow {
                 .background_spawn(async move { usage_view::build_scene(&scan, key) })
                 .await;
             this.update(cx, |this, cx| {
-                if this.workspace.usage_scene_generation != generation {
-                    return;
+                if !usage_view::finish_layout(&mut this.workspace.usage_layout_inflight,generation,this.workspace.usage_scene_generation) {
+                    cx.notify();return;
                 }
                 let source = Arc::as_ptr(&this.workspace.progress) as usize;
                 let handing = !this.workspace.engine_usage
@@ -170,39 +173,13 @@ impl MainWindow {
                     && this.workspace.usage_preview.borrow().can_handoff(source);
                 if let Some(previous) = this.workspace.usage_scene.as_ref().filter(|_| !handing) {
                     if previous.key.root != scene.key.root
+                        || this.workspace.usage_scene_scan.as_ref().and_then(|old|old.nodes.get(previous.key.root)).map(|n|&n.path)!=handoff_scan.nodes.get(scene.key.root).map(|n|&n.path)
                         || (!this.workspace.engine_usage && previous.key.scan != scene.key.scan)
                     {
                         this.workspace.usage_transition = None;
-                        if previous.key.scan == scene.key.scan
-                            && !this.session.read(cx).prefs.usage_reduce_motion
-                        {
-                            let camera = this.workspace.usage_camera;
-                            let regions = if let Some(target) = previous
-                                .tiles
-                                .iter()
-                                .find(|t| t.key == TileKey::Node(scene.key.root))
-                            {
-                                Some((
-                                    camera.rect(tile_body(target.rect, target.header)),
-                                    scene.viewport,
-                                ))
-                            } else if let Some(target) = scene
-                                .tiles
-                                .iter()
-                                .find(|t| t.key == TileKey::Node(previous.key.root))
-                            {
-                                Some((previous.viewport, tile_body(target.rect, target.header)))
-                            } else {
-                                None
-                            };
-                            if let Some((src, dst)) = regions {
-                                if src.w > 0. && dst.w > 0. {
-                                    this.workspace.usage_transition = Some(Transition {
-                                        layout: LayoutTransition::new(src.into(), dst.into()),
-                                    });
-                                }
-                            }
-                        }
+                        // A focal transform of only the NEW scene leaves the rest
+                        // of the viewport unpainted. Root swaps are atomic, not a
+                        // zoom from a small child rectangle over an empty canvas.
                         this.workspace.usage_camera.reset();
                         this.workspace.usage_hover = None;
                     }
@@ -261,6 +238,7 @@ impl MainWindow {
                 // Publish immutable geometry and its matching node snapshot together.
                 this.workspace.usage_scene_scan = Some(handoff_scan);
                 this.workspace.usage_scene = Some(Arc::new(scene));
+                this.workspace.usage_pending_from=None;
                 cx.notify();
             })
             .ok();
@@ -268,6 +246,7 @@ impl MainWindow {
         .detach();
     }
     pub(super) fn zoom_usage_center(&mut self, factor: f32, cx: &mut Context<Self>) {
+        if self.workspace.usage_pending_from.is_some(){return}
         if self.workspace.scanning {
             let b = self.workspace.usage_bounds.get();
             let v = Rect {
@@ -298,6 +277,7 @@ impl MainWindow {
         (f32::from(p.x - b.origin.x), f32::from(p.y - b.origin.y))
     }
     fn usage_hit(&self, p: (f32, f32)) -> Option<TileKey> {
+        if self.workspace.usage_pending_from.is_some(){return None}
         if self.workspace.scanning {
             return usage_view::hit_frame(&self.workspace.usage_frame.borrow(), p);
         }
@@ -504,17 +484,17 @@ impl MainWindow {
             if draws.is_empty() {
                 empty = Some("本地实测中 · 等待首批已测数据（总量未知）");
             }
-        } else if self.workspace.engine_usage && self.scan_node().is_none() {
+        } else if self.workspace.engine_usage && self.scan_node().is_none() && self.workspace.usage_pending_from.is_none() {
             empty = Some(if self.workspace.engine_busy {
                 "正在读取索引目录…（最长 45 秒，可取消）"
             } else { self.workspace.scan_status.as_str() });
         } else if let (Some(scan), Some(scene)) =
             (self.usage_render_scan(), &self.workspace.usage_scene)
         {
-            if (if self.workspace.engine_usage {
+            if self.workspace.usage_pending_from.is_some() || ((if self.workspace.engine_usage {
                 crate::indexed_usage::scene_can_paint(scan, scene.key.root, &self.workspace.location)
             } else { scene.key.scan == self.usage_scan_identity(scan) })
-                && Some(scene.key.root) == self.scan_node()
+                && Some(scene.key.root) == self.scan_node())
             {
                 let preview = self.workspace.usage_preview.borrow();
                 let blended = if !self.workspace.engine_usage
@@ -531,7 +511,7 @@ impl MainWindow {
                     Default::default()
                 };
                 let mut remaining = blended.clone();
-                for tile in scene.tiles.iter().filter(|t| t.depth > 0) {
+                for tile in scene.tiles.iter().filter(|t| usage_view::visible_at_depth(t.depth,self.workspace.usage_depth)) {
                     let sample = |r| {
                         self.workspace.usage_camera.rect(
                             self.workspace
@@ -583,7 +563,7 @@ impl MainWindow {
                     draws.push(PaintTile {
                         key: tile.key,
                         rect: r,
-                        header: if let Some(t) = blend {
+                        header: if tile.depth>=self.workspace.usage_depth {None} else if let Some(t) = blend {
                             (t.header_h > 0.5).then_some(Rect { h: t.header_h, ..r })
                         } else {
                             tile.header.map(sample)
@@ -952,6 +932,9 @@ impl MainWindow {
             );
         if let Some(message) = empty {
             view = view.child(self.usage_empty(message, tokens));
+        }
+        if let Some(label)=self.usage_pending_label() {
+            view=view.child(div().absolute().top_2().left_2().right_2().px_2().py_1().rounded_sm().bg(tokens.surface).border_1().border_color(tokens.border).text_xs().text_ellipsis().child(label));
         }
         view.into_any_element()
     }

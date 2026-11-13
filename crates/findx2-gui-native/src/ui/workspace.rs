@@ -116,7 +116,7 @@ struct PageContext {
     pub(in crate::ui) location: PathBuf,
     pub(in crate::ui) table: Entity<TableState<BrowserTable>>,
     pub(in crate::ui) rows: Vec<SearchHitDto>,
-    all_rows: Vec<SearchHitDto>,
+    all_rows: Arc<Vec<SearchHitDto>>,
     pub(in crate::ui) selected_rows: std::collections::BTreeSet<usize>,
     pub(in crate::ui) selected: Option<usize>,
     history: History,
@@ -183,7 +183,9 @@ pub(super) struct Workspace {
     search_preview: Option<ForceState>,
     filter_input: Entity<InputState>,
     filter_text: String,
-    all_rows: Vec<SearchHitDto>,
+    filter_generation: u64,
+    filter_cancel: Arc<AtomicBool>,
+    all_rows: Arc<Vec<SearchHitDto>>,
     pub(super) editing_path: bool,
     path_edit: crate::navigation::AddressEdit,
     path_error: Option<String>,
@@ -232,6 +234,8 @@ pub(super) struct Workspace {
     active_scan_root: Option<PathBuf>,
     usage_scene_key: Option<crate::usage_view::SceneKey>,
     usage_scene_generation: u64,
+    usage_layout_inflight: bool,
+    usage_pending_from: Option<PathBuf>,
     usage_tree_revision: usize,
     usage_camera: crate::usage_view::Camera,
     usage_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
@@ -318,7 +322,9 @@ impl Workspace {
             search_preview: None,
             filter_input,
             filter_text: String::new(),
-            all_rows: vec![],
+            filter_generation: 0,
+            filter_cancel: Arc::new(AtomicBool::new(false)),
+            all_rows: Arc::new(vec![]),
             editing_path: false,
             path_edit: Default::default(),
             path_error: None,
@@ -367,6 +373,8 @@ impl Workspace {
             active_scan_root: None,
             usage_scene_key: None,
             usage_scene_generation: 0,
+            usage_layout_inflight: false,
+            usage_pending_from: None,
             usage_tree_revision: 1,
             usage_camera: Default::default(),
             usage_bounds: Default::default(),
@@ -458,17 +466,12 @@ impl MainWindow {
 
         self.subscribe_workspace_table(self.workspace.table.clone(), cx);
         let filter = self.workspace.filter_input.clone();
-        self._subscriptions
-            .push(cx.subscribe(&filter, |this, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) && this.workspace.mode == ViewMode::Directory
-                {
-                    this.workspace.filter_text =
-                        this.workspace.filter_input.read(cx).value().to_string();
-                    let focus = this.active_workspace_hit().map(|h| h.path);
-                    let all = this.workspace.all_rows.clone();
-                    this.set_workspace_rows(all, focus, false, cx);
-                }
-            }));
+        self._subscriptions.push(cx.subscribe_in(&filter,window,|this,_,event:&InputEvent,window,cx|{
+            if matches!(event,InputEvent::Change) && this.workspace.mode==ViewMode::Directory {
+                let composing=this.workspace.filter_input.update(cx,|i,cx|i.marked_text_range(window,cx).is_some());
+                this.directory_filter_changed(composing,cx);
+            }
+        }));
         let target = self.workspace.target.clone();
         self._subscriptions
             .push(cx.subscribe(&target, |this, _, ev: &InputEvent, cx| {
@@ -707,7 +710,7 @@ impl MainWindow {
         let mut state = self.workspace.snapshot(Some(ForceState::Hide), true);
         state.table = table;
         state.rows.clear();
-        state.all_rows.clear();
+        state.all_rows = Arc::new(vec![]);
         state.selected_rows.clear();
         state.selected = None;
         state.filter.clear();
@@ -850,6 +853,8 @@ impl MainWindow {
         cx.notify();
     }
     pub(super) fn workspace_switch(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        self.workspace.filter_cancel.store(true,Ordering::Release);
+        self.workspace.filter_generation=self.workspace.filter_generation.wrapping_add(1);
         self.workspace.engine_cancel.store(true, Ordering::Release);
         self.workspace.engine_busy=false;
         self.cancel_path_edit(cx);
@@ -901,15 +906,41 @@ impl MainWindow {
         allocated: bool,
         cx: &mut Context<Self>,
     ) {
-        self.workspace.all_rows = rows.clone();
-        let filter = self.workspace.filter_text.to_lowercase();
-        let rows = if self.workspace.mode == ViewMode::Directory && !filter.is_empty() {
-            rows.into_iter()
-                .filter(|row| row.name.to_lowercase().contains(&filter))
-                .collect::<Vec<_>>()
-        } else {
-            rows
-        };
+        self.workspace.filter_cancel.store(true,Ordering::Release);
+        self.workspace.filter_generation=self.workspace.filter_generation.wrapping_add(1);
+        self.workspace.all_rows=Arc::new(rows);
+        if self.workspace.mode==ViewMode::Directory && !self.workspace.filter_text.is_empty() {
+            self.schedule_directory_filter(focus,cx);return;
+        }
+        let rows=self.workspace.all_rows.as_ref().clone();
+        self.apply_workspace_rows(rows,focus,allocated,cx);
+    }
+    fn directory_filter_changed(&mut self,composing:bool,cx:&mut Context<Self>) {
+        self.workspace.filter_text=self.workspace.filter_input.read(cx).value().to_string();
+        self.workspace.filter_cancel.store(true,Ordering::Release);
+        self.workspace.filter_generation=self.workspace.filter_generation.wrapping_add(1);
+        if !composing {let focus=self.active_workspace_hit().map(|h|h.path);self.schedule_directory_filter(focus,cx);}
+    }
+    fn schedule_directory_filter(&mut self,focus:Option<String>,cx:&mut Context<Self>) {
+        self.workspace.filter_cancel.store(true,Ordering::Release);
+        self.workspace.filter_cancel=Arc::new(AtomicBool::new(false));
+        self.workspace.filter_generation=self.workspace.filter_generation.wrapping_add(1);
+        let generation=self.workspace.filter_generation;
+        let cancel=self.workspace.filter_cancel.clone();
+        let source=self.workspace.all_rows.clone();let work=source.clone();
+        let scope=key(&self.workspace.location);let query=self.workspace.filter_text.clone();
+        cx.spawn(async move |this,cx|{
+            cx.background_executor().timer(Duration::from_millis(80)).await;
+            if cancel.load(Ordering::Acquire){return}
+            let work_cancel=cancel.clone();
+            let rows=cx.background_spawn(async move {crate::directory_filter::filter_rows(&work,&query,&work_cancel)}).await;
+            this.update(cx,|this,cx|{
+                if cancel.load(Ordering::Acquire) || this.workspace.filter_generation!=generation || this.workspace.mode!=ViewMode::Directory || key(&this.workspace.location)!=scope || !Arc::ptr_eq(&source,&this.workspace.all_rows){return}
+                if let Some(rows)=rows {let focus=this.active_workspace_hit().map(|h|h.path).or(focus);this.apply_workspace_rows(rows,focus,false,cx);}
+            }).ok();
+        }).detach();
+    }
+    fn apply_workspace_rows(&mut self,rows:Vec<SearchHitDto>,focus:Option<String>,allocated:bool,cx:&mut Context<Self>) {
         self.workspace.selected = focus.as_ref().and_then(|p| {
             rows.iter()
                 .position(|h| key(Path::new(&h.path)) == key(Path::new(p)))
@@ -936,8 +967,14 @@ impl MainWindow {
         }
         cx.notify();
     }
+    fn usage_pending_label(&self)->Option<String> {
+        self.workspace.usage_pending_from.as_ref().map(|old| {
+            let state=if self.workspace.engine_busy {"正在读取新目录"}else if self.scan_node().is_some(){"正在排布新目录"}else{"目录切换未完成"};
+            format!("{state} · 当前画面仍为 {}（暂停图块操作）",display_path(old))
+        })
+    }
     fn usage_render_scan(&self) -> Option<&Arc<Scan>> {
-        if self.workspace.engine_usage { self.workspace.usage_scene_scan.as_ref() } else { self.workspace.scan.as_ref() }
+        self.workspace.usage_scene_scan.as_ref().or(self.workspace.scan.as_ref())
     }
     fn usage_scan_identity(&self, scan: &Arc<Scan>) -> usize {
         crate::indexed_usage::scene_identity(self.workspace.engine_usage, self.workspace.usage_tree_revision, Arc::as_ptr(scan) as usize)
@@ -1008,11 +1045,13 @@ impl MainWindow {
                     .map(PathBuf::from)
                     .as_deref(),
             ) {
-                if path.canonicalize().ok().as_ref() != Some(&root) {
+                if path.canonicalize().ok().is_none_or(|p| !p.starts_with(&root)) {
                     return;
                 }
             }
         }
+        self.workspace.filter_cancel.store(true,Ordering::Release);
+        self.workspace.filter_generation=self.workspace.filter_generation.wrapping_add(1);
         self.workspace.engine_cancel.store(true, Ordering::Release);
         self.workspace.engine_busy=false;
         // A newer location supersedes an in-flight request. Its completion must
@@ -1052,6 +1091,10 @@ impl MainWindow {
         self.workspace.show_actions = false;
         self.workspace.mode = mode;
         self.workspace.pending_hit = pending;
+        if mode==ViewMode::Usage && key(&self.workspace.location)!=key(&path) && self.workspace.usage_pending_from.is_none() {
+            self.workspace.usage_pending_from=self.workspace.usage_scene.as_ref().and_then(|scene|
+                self.workspace.usage_scene_scan.as_ref().and_then(|scan|scan.nodes.get(scene.key.root)).map(|n|n.path.clone()));
+        }
         self.workspace.location = PathBuf::from(display_path(&path));
         self.workspace.operation = None;
         self.update_location_input(cx);
@@ -1059,14 +1102,17 @@ impl MainWindow {
             self.workspace.usage_focus = focus.clone();
         }
         if mode == ViewMode::Usage && self.workspace.engine_usage {
-            // Never retain another directory's inspector/scene while IPC is pending.
-            self.workspace.scan_cancel.store(true, Ordering::Release);
-            self.workspace.scanning = false;
-            self.workspace.active_scan_root = None;
-            self.workspace.scan = None;
+            // Retain only the last published immutable frame, explicitly labelled
+            // as the previous directory and non-interactive until atomic handoff.
+            if self.workspace.usage_pending_from.is_none() {
+                self.workspace.usage_pending_from=self.workspace.usage_scene.as_ref().and_then(|scene|
+                    self.workspace.usage_scene_scan.as_ref().and_then(|scan|scan.nodes.get(scene.key.root)).map(|n|n.path.clone()));
+            }
+            self.workspace.scan_cancel.store(true,Ordering::Release);
+            self.workspace.scanning=false;
+            self.workspace.active_scan_root=None;
+            self.workspace.scan=None;
             self.workspace.scan_lookup.clear();
-            self.workspace.usage_scene = None;
-            self.workspace.usage_scene_scan = None;
             self.workspace.usage_scene_key = None;
             self.workspace.usage_scene_generation = self.workspace.usage_scene_generation.wrapping_add(1);
             self.workspace.usage_transition = None;
@@ -1078,7 +1124,6 @@ impl MainWindow {
             self.workspace.engine_generation = None;
             self.workspace.scan_status = "正在读取索引目录（最长 45 秒，可取消）".into();
             self.set_workspace_rows(vec![], None, false, cx);
-            self.workspace.usage_camera.reset();
             self.load_engine_usage(false, cx);
             cx.notify();
             return;
@@ -1106,7 +1151,7 @@ impl MainWindow {
         self.workspace.listing = true;
         self.workspace.status = "读取目录中 · 搜索仍可使用".into();
         self.workspace.rows.clear();
-        self.workspace.all_rows.clear();
+        self.workspace.all_rows = Arc::new(vec![]);
         self.workspace.selected_rows.clear();
         self.workspace.selected = None;
         self.workspace.table.update(cx, |t, cx| {
@@ -1304,6 +1349,8 @@ impl MainWindow {
         }
     }
     fn select_usage_node(&mut self, index: usize, enter: bool, cx: &mut Context<Self>) {
+        if self.workspace.usage_pending_from.is_some(){return}
+
         let Some(scan) = self.workspace.scan.as_ref() else {
             return;
         };
@@ -1367,6 +1414,15 @@ impl MainWindow {
         {
             self.workspace.usage_fixture_seen += 1;
             match command {
+                "depth+" => {self.workspace.usage_depth=(self.workspace.usage_depth+1).min(6);cx.notify();},
+                "depth-" => {self.workspace.usage_depth=self.workspace.usage_depth.saturating_sub(1).max(1);cx.notify();},
+                c if c.starts_with("path:") => self.workspace_navigate(PathBuf::from(&c[5..]),ViewMode::Usage,None,true,cx),
+                c if c.starts_with("directory:") => self.workspace_navigate(PathBuf::from(&c[10..]),ViewMode::Directory,None,true,cx),
+                c if c.starts_with("filter:") => {
+                    let input=self.workspace.filter_input.clone();let value=c[7..].to_string();
+                    let _=self.workspace.window.update(cx,move |_,w,cx|input.update(cx,|i,cx|i.set_value(value,w,cx)));
+                    self.directory_filter_changed(false,cx);
+                },
                 "zoom" => self.zoom_usage_center(1.3, cx),
                 "reset" => {
                     self.workspace.usage_camera.reset();
@@ -1382,6 +1438,7 @@ impl MainWindow {
                 }
                 "up" => self.workspace_up(cx),
                 "cancel" => {
+                    if self.workspace.engine_usage {self.cancel_engine_usage(cx);continue;}
                     self.workspace.scan_cancel.store(true, Ordering::Release);
                     self.workspace.scan_status = "正在取消；已测部分将保留".into();
                     cx.notify();
@@ -1391,12 +1448,24 @@ impl MainWindow {
             eprintln!("usage_fixture command={command}");
         }
     }
+    fn cancel_engine_usage(&mut self,cx:&mut Context<Self>) {
+        self.workspace.engine_cancel.store(true,Ordering::Release);
+        self.workspace.scan_generation=self.workspace.scan_generation.wrapping_add(1);
+        self.workspace.engine_busy=false;self.workspace.engine_checked=false;
+        if self.workspace.usage_pending_from.is_some() {
+            self.workspace.scan=None;self.workspace.scan_lookup.clear();
+            self.workspace.usage_scene_key=None;
+            self.workspace.usage_scene_generation=self.workspace.usage_scene_generation.wrapping_add(1);
+        }
+        self.workspace.scan_status="已取消索引目录请求；刷新可重试".into();cx.notify();
+    }
     fn select_engine_usage_source(&mut self, cx: &mut Context<Self>) {
         self.workspace.scan_cancel.store(true, Ordering::Release);
         self.workspace.scanning = false;
         self.workspace.active_scan_root = None;
         self.workspace.scan_generation = self.workspace.scan_generation.wrapping_add(1);
         self.workspace.engine_usage = true;
+        self.workspace.usage_pending_from=None;
         self.workspace.engine_checked = false;
         self.workspace.engine_busy = false;
         self.workspace.engine_generation = None;
@@ -1646,6 +1715,8 @@ impl MainWindow {
         .detach();
     }
     pub(super) fn start_workspace_scan(&mut self, force: bool, cx: &mut Context<Self>) {
+        self.workspace.filter_cancel.store(true,Ordering::Release);
+        self.workspace.filter_generation=self.workspace.filter_generation.wrapping_add(1);
         self.workspace.engine_cancel.store(true, Ordering::Release);
         self.workspace.engine_busy=false;
         if self.workspace.op_busy || self.file_actions.busy || self.workspace.scanning {

@@ -14,7 +14,12 @@ path = "src/lib.rs"
 name = "findx2-gui-native"
 path = "src/main.rs"
 
+[features]
+default = ["pinyin"]
+pinyin = ["dep:ib-matcher"]
+
 [dependencies]
+ib-matcher = { version = "0.4", optional = true, features = ["pinyin"] }
 encoding_rs = "0.8"
 raw-window-handle = "0.6"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }

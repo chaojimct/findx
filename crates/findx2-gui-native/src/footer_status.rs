@@ -222,18 +222,14 @@ pub fn compact_usage(detail: &str, unknown: Option<u64>, scanning: bool, stale: 
     if detail.contains("超时") {
         return "读取超时 · 可重试".into();
     }
-    if detail.contains("失败")
-        || detail.contains("错误")
-        || detail.contains("异常")
-        || detail.contains("不支持")
-        || detail.contains("不可用")
-    {
+    let has_result=detail.contains("索引逻辑 ·");
+    if !has_result && (detail.contains("失败") || detail.contains("错误") || detail.contains("异常") || detail.contains("不支持") || detail.contains("不可用")) {
         return "读取异常 · 查看详情".into();
     }
-    if detail.contains("取消") {
+    if detail.contains("已取消") || detail.starts_with("取消") {
         return "已取消 · 保留已读结果".into();
     }
-    if scanning || detail.contains("index loading") {
+    if scanning || detail.contains("index loading") || detail.starts_with("正在读取") {
         return "正在读取…".into();
     }
     let mut s = "索引大小".to_string();
@@ -371,4 +367,8 @@ mod tests {
         );
         assert!(compact_usage("索引请求失败", None, false, true).contains("异常"));
     }
+    #[test]fn cancellable_pending_is_not_reported_as_already_cancelled(){assert_eq!(compact_usage("正在读取索引目录（最长 45 秒，可取消）",None,false,false),"正在读取…");}
+
+    #[test]fn no_reported_watch_error_is_not_a_read_failure(){assert_eq!(compact_usage("索引逻辑 · 当前层完整 · 监控未报告错误（不代表全量新鲜）",Some(0),false,false),"索引大小");}
+
 }

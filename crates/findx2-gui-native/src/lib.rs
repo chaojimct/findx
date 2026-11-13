@@ -46,3 +46,5 @@ pub mod usage_cache;
 pub mod indexed_usage;
 
 pub mod footer_status;
+
+pub mod directory_filter;

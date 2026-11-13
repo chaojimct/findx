@@ -1284,3 +1284,15 @@ mod indexed_logical_tests {
         assert!(scan.nodes.iter().all(|n| n.allocated == 0));
     }
 }
+
+/// Layout the bounded geometry once to the maximum UI depth. Depth +/- only
+/// changes visibility, so existing tile rectangles and the published scene stay put.
+pub const PRESENTATION_DEPTH:usize=6;
+pub fn visible_at_depth(tile_depth:usize,depth:usize)->bool {tile_depth>0 && tile_depth<=depth.clamp(1,PRESENTATION_DEPTH)}
+pub fn claim_layout(inflight:&mut bool)->bool {if *inflight {false}else{*inflight=true;true}}
+pub fn finish_layout(inflight:&mut bool,issued:u64,current:u64)->bool {*inflight=false;issued==current}
+#[cfg(test)] mod scene_lifecycle_regressions {
+ use super::*;
+ #[test]fn depth_visibility_does_not_mutate_geometry_or_need_a_new_key(){let key=SceneKey{scan:1,root:0,depth:PRESENTATION_DEPTH,width:900,height:600,detail:1};let before=key.clone();for depth in [3,4,2,6,1,3]{assert!(visible_at_depth(1,depth));assert!(!visible_at_depth(depth+1,depth));assert_eq!(key,before);}}
+ #[test]fn rapid_requests_are_single_flight_and_stale_cancelled_results_cannot_publish(){let mut busy=false;assert!(claim_layout(&mut busy));for _ in 0..100{assert!(!claim_layout(&mut busy));}assert!(!finish_layout(&mut busy,1,4));assert!(claim_layout(&mut busy));assert!(finish_layout(&mut busy,4,4));assert!(!busy);}
+}

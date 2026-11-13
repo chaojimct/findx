@@ -777,12 +777,7 @@ impl MainWindow {
                         .tooltip("停止后续枚举；已测部分会保留，不会当作完整结果")
                         .on_click(cx.listener(|this, _, _, cx| {
                             if this.workspace.engine_usage {
-                                this.workspace.engine_cancel.store(true, Ordering::Release);
-                                this.workspace.scan_generation = this.workspace.scan_generation.wrapping_add(1);
-                                this.workspace.engine_busy = false;
-                                this.workspace.engine_checked = false;
-                                this.workspace.scan_status = "已取消索引目录请求；刷新可重试".into();
-                                cx.notify();
+                                this.cancel_engine_usage(cx);
                                 return;
                             }
                             this.workspace.scan_cancel.store(true, Ordering::Release);
@@ -936,6 +931,11 @@ impl MainWindow {
             .border_l_1()
             .border_color(tokens.border)
             .bg(tokens.surface);
+        if let Some(label)=self.usage_pending_label() {
+            return panel.child(div().p_3().text_sm().child(label))
+                .child(div().px_3().text_xs().child(format!("目标：{}",display_path(&self.workspace.location))))
+                .child(div().px_3().py_2().text_xs().child(self.workspace.scan_status.clone())).into_any_element();
+        }
         let mut head = v_flex()
             .flex_shrink_0()
             .px_3()
