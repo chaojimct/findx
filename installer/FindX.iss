@@ -1,4 +1,4 @@
-; FindX 2 (Tauri) Inno Setup
+; FindX native Windows Inno Setup (publication blocked until upgrade gates pass)
 ; 构建: 1) 在仓库根/ gui 中完成 tauri build --no-bundle
 ;       2) powershell -File installer\stage-inno.ps1
 ;       3) iscc /DMyAppVersion=x.y.z installer\FindX.iss
@@ -6,8 +6,12 @@
 ;
 ; 与 v1 的 FindX.iss 类似：多任务（服务注册、PATH、桌面快捷方式、安装后启动），无 .NET 检测。
 
+#ifndef UpgradeGatesApproved
+  #error "Upgrade gates are not approved. Run scripts/check_release.py --require-ready before enabling installer compilation."
+#endif
+
 #ifndef MyAppVersion
-  #define MyAppVersion "2.4.6"
+  #define MyAppVersion "2.5.0"
 #endif
 
 #define MyAppName      "FindX"

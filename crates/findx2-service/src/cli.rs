@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "findx2-service")]
+#[command(name = "findx2-service", version)]
 pub struct Cli {
     /// Windows 服务模式（须由 SCM 启动；手动调试请删此参数用前台）
     #[arg(long, global = true)]
@@ -77,4 +77,15 @@ pub enum ServiceCmd {
     Install,
     /// 卸载 Windows 服务（需管理员）
     Uninstall,
+}
+
+#[cfg(test)]
+mod version_probe_tests {
+    use super::*;
+    #[test]
+    fn version_probe_exits_during_argument_parsing_without_loading_or_watching() {
+        let error=Cli::try_parse_from(["findx2-service", "--version"]).unwrap_err();
+        assert_eq!(error.kind(),clap::error::ErrorKind::DisplayVersion);
+        assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
 }

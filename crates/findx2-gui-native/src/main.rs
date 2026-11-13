@@ -11,6 +11,10 @@ fn main() {
         findx2_gui_native::office_host::host_main(&raw);
         return;
     }
+    if raw.len() == 2 && matches!(raw[1].as_str(), "--version" | "-V") {
+        println!("FindX {} (native)", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if raw.get(1).is_some_and(|s| s == "--document-preview-worker") {
         findx2_gui_native::preview_worker::worker_main();
         return;

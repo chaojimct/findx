@@ -1,6 +1,6 @@
 [package]
 name = "findx2-windows"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "findx2 Windows：MFT 枚举与 USN 增量"

@@ -1,6 +1,6 @@
 [package]
 name = "findx2-core"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "findx2 核心：索引、查询、持久化（平台无关）"

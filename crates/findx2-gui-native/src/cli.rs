@@ -17,6 +17,14 @@ impl LaunchOptions {
 }
 
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOptions, String> {
+    let installed = std::env::current_exe().ok().is_some_and(|exe| {
+        exe.file_name().is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("FindX.exe"))
+            && exe.with_file_name("FindX.installed").is_file()
+    });
+    parse_args_for_install(args, installed)
+}
+
+fn parse_args_for_install(args: impl IntoIterator<Item = String>, installed: bool) -> Result<LaunchOptions, String> {
     let mut pipe_name = DEFAULT_ISOLATED_PIPE.to_string();
     let mut pipe_set = false;
     let mut mock = false;
@@ -49,6 +57,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
             other => return Err(format!("未知参数: {other}\n{}", help_text())),
         }
     }
+    if installed && !mock && !pipe_set { live = true; }
     if live && mock {
         return Err(
             "--live 与 --mock 不能同时使用。--live 连接现有生产服务；--mock 使用隔离模拟数据。"
@@ -142,4 +151,14 @@ mod tests {
     fn live_and_mock_conflict() {
         assert!(parse_args(args("findx2-gui-native --live --mock")).is_err());
     }
+    #[test]
+    fn installed_alias_defaults_to_existing_service_without_starting_it() {
+        let opt=parse_args_for_install(args("FindX.exe"),true).unwrap();
+        assert!(opt.live);assert_eq!(opt.pipe_name, PRODUCTION_PIPE);
+        let opt=parse_args_for_install(args("FindX.exe --mock"),true).unwrap();
+        assert!(!opt.live);assert!(opt.mock);assert_eq!(opt.pipe_name,DEFAULT_ISOLATED_PIPE);
+        let opt=parse_args_for_install(args("FindX.exe --pipe isolated-fixture"),true).unwrap();
+        assert!(!opt.live);assert_eq!(opt.pipe_name,"isolated-fixture");
+    }
+
 }

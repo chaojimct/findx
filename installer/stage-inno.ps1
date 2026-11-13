@@ -1,75 +1,71 @@
-﻿# 将 tauri build --no-bundle 的 target/release 产物整理到 installer/stage，供 iscc 打包。
-# 在仓库根目录或传入 -RepoRoot 后执行。失败时给出明确错误（缺 FindX.exe 等）。
-# 可选 -ReleaseDir：指定含 FindX.exe/findx2-gui.exe 的 release 目录（优先于默认 target\release），
-# 用于本机 target\release 下 exe 被服务/杀软占用无法覆盖时，配合 CARGO_TARGET_DIR 另目录构建。
+# Stage only; never installs, stops processes, or changes services.
 param(
   [string] $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
-  [string] $ReleaseDir = ""
+  [string] $ReleaseDir = "",
+  [ValidateSet("native", "webview")] [string] $Gui = "native",
+  [string] $StageDir = "",
+  [switch] $PlanOnly
 )
-
 $ErrorActionPreference = "Stop"
-$stage = Join-Path $RepoRoot "installer\stage"
-$releaseCandidates = @(
-  (Join-Path $RepoRoot "target\release"),
-  (Join-Path $RepoRoot "target\x86_64-pc-windows-msvc\release"),
-  (Join-Path $RepoRoot "gui\target\release")
-)
+$RepoRoot = [IO.Path]::GetFullPath($RepoRoot).TrimEnd('\')
+$versionMatch = [regex]::Match([IO.File]::ReadAllText((Join-Path $RepoRoot 'Cargo.toml')), '(?ms)\[workspace\.package\].*?^version\s*=\s*"([^"]+)"')
+if (-not $versionMatch.Success) { throw 'Missing workspace product version' }
+$version = $versionMatch.Groups[1].Value
 if ($ReleaseDir) {
-  if (-not (Test-Path $ReleaseDir)) { throw "-ReleaseDir path not found: $ReleaseDir" }
-  $rd = (Resolve-Path $ReleaseDir).Path
-  $releaseCandidates = @($rd) + $releaseCandidates
-  Write-Host "[stage-inno] prefer -ReleaseDir: $rd"
-}
-$rel = $null
-foreach ($c in $releaseCandidates) {
-  $fx = Join-Path $c "FindX.exe"
-  $gui = Join-Path $c "findx2-gui.exe"
-  if ((Test-Path $fx) -or (Test-Path $gui)) {
-    $rel = $c
-    Write-Host "[stage-inno] using release dir: $rel"
-    break
-  }
-}
-if (-not $rel) {
-  Write-Host "[stage-inno] no FindX.exe / findx2-gui.exe in:"
-  $releaseCandidates | ForEach-Object { Write-Host "  $_" }
-  $t = Join-Path $RepoRoot "target"
-  if (Test-Path $t) {
-    Write-Host "[stage-inno] children of $t :"
-    Get-ChildItem $t -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name)" }
-  }
-  throw "GUI release build not found. Run from gui: npm run tauri build -- --no-bundle"
-}
-$mainFindX = Join-Path $rel "FindX.exe"
-$mainGui = Join-Path $rel "findx2-gui.exe"
-if (Test-Path $mainFindX) { $main = $mainFindX }
-else { $main = $mainGui }
-$res = Join-Path $rel "resources"
-Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
-$null = New-Item -ItemType Directory -Path $stage
-# Installer expects {app}\FindX.exe
-Copy-Item -Path $main -Destination (Join-Path $stage "FindX.exe") -Force
-if (Test-Path $res) {
-  $stageRes = Join-Path $stage "resources"
-  Copy-Item -Path $res -Destination $stageRes -Recurse
-  Write-Host "[stage-inno] copied resources from $res"
+  $candidates = @([IO.Path]::GetFullPath($ReleaseDir)) # Explicit means strict: never mix another build.
 } else {
-  # GUI 运行时不强依赖 resources/ 目录（CLI/服务通过 current_exe 同目录解析），
-  # 因此 --no-bundle 时缺 resources 不再视为错误，[Files] 中 resources\* 为可选项。
-  Write-Host "[stage-inno] no folder $res ; skipping (resources is optional)"
+  $candidates = @((Join-Path $RepoRoot 'target\release'),(Join-Path $RepoRoot 'target\x86_64-pc-windows-msvc\release'),(Join-Path $RepoRoot 'gui\target\release'))
 }
-Get-ChildItem -Path $rel -Filter *.dll -File -ErrorAction SilentlyContinue | ForEach-Object {
-  Copy-Item -Path $_.FullName -Destination $stage
-}
-foreach ($f in @("findx2.exe", "fx.exe", "findx2-service.exe")) {
-  $p = Join-Path $rel $f
-  if (-not (Test-Path $p)) {
-    throw "missing $p ; ensure bundle:win-exes and cargo build -p findx2-cli -p findx2-service --release"
+$guiNames = if ($Gui -eq 'native') { @('findx2-gui-native.exe') } else { @('FindX.exe','findx2-gui.exe') }
+$rel=$null; $main=$null
+foreach ($candidate in $candidates) {
+  foreach ($name in $guiNames) {
+    $file=Join-Path $candidate $name
+    if (Test-Path -LiteralPath $file -PathType Leaf) { $rel=$candidate; $main=$file; break }
   }
-  Copy-Item -Path $p -Destination $stage
+  if ($rel) { break }
 }
-$n = (Get-ChildItem -Path $stage -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
-if ($n -lt 1) {
-  throw "Stage has no files: $stage"
+if (-not $rel) { throw "Missing $Gui GUI in requested build directories; native requires findx2-gui-native.exe (pinyin default feature)." }
+$files=@(@{source=$main;name='FindX.exe'})
+foreach ($name in @('findx2.exe','fx.exe','findx2-service.exe')) {
+  $file=Join-Path $rel $name
+  if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing companion in SAME build directory: $file" }
+  $files+=@{source=$file;name=$name}
 }
-Write-Host "[stage-inno] done: $stage file-count=$n"
+Get-ChildItem -LiteralPath $rel -Filter '*.dll' -File | ForEach-Object { $files+=@{source=$_.FullName;name=$_.Name} }
+# Preview workers re-exec FindX.exe; preserve any explicitly generated resources.
+$res=Join-Path $rel 'resources'
+if (Test-Path -LiteralPath $res -PathType Container) {
+  Get-ChildItem -LiteralPath $res -Recurse -File | ForEach-Object { $files+=@{source=$_.FullName;name=('resources\'+$_.FullName.Substring($res.Length+1))} }
+}
+if (-not $StageDir) { $StageDir=Join-Path $RepoRoot 'installer\stage' }
+$StageDir=[IO.Path]::GetFullPath($StageDir)
+if (-not $StageDir.StartsWith($RepoRoot+'\',[StringComparison]::OrdinalIgnoreCase)) { throw 'StageDir must be inside this checkout; never target an installation or index directory.' }
+$payload=@($files | ForEach-Object { [ordered]@{name=$_.name;sha256=(Get-FileHash -LiteralPath $_.source -Algorithm SHA256).Hash.ToLower();length=(Get-Item -LiteralPath $_.source).Length} })
+$manifest=[ordered]@{version=$version;gui=$Gui;main_source=(Split-Path $main -Leaf);files=$payload;installation_performed=$false}
+if ($PlanOnly) { $manifest | ConvertTo-Json -Depth 6; return }
+if ($Gui -eq 'native' -and (Get-Item -LiteralPath $main).VersionInfo.ProductVersion -ne $version) { throw 'Native Windows PE ProductVersion does not match workspace version; rebuild candidate first.' }
+if (Test-Path -LiteralPath $StageDir) {
+  $old=Join-Path $StageDir 'stage-manifest.json'
+  if (Test-Path -LiteralPath $old) {
+    $previous=Get-Content -LiteralPath $old -Raw | ConvertFrom-Json
+    $same=$previous.version -eq $version -and $previous.gui -eq $Gui -and $previous.files.Count -eq $payload.Count
+    foreach ($f in $payload) {
+      $at=Join-Path $StageDir $f.name
+      if (-not (Test-Path -LiteralPath $at -PathType Leaf)) { $same=$false; break }
+      if ((Get-FileHash -LiteralPath $at -Algorithm SHA256).Hash.ToLower() -ne $f.sha256) { $same=$false;break }
+    }
+    if ($same) { Write-Host "Verified existing identical stage: $StageDir"; return }
+  }
+  throw 'Stage already exists or is incomplete/different. Choose a fresh StageDir; no existing artifact is deleted or overwritten.'
+}
+$null=New-Item -ItemType Directory -Path $StageDir
+foreach ($file in $files) {
+  $dest=Join-Path $StageDir $file.name
+  $null=New-Item -ItemType Directory -Force -Path (Split-Path $dest -Parent)
+  # CreateNew is fail-closed even under a concurrent staging attempt.
+  $input=[IO.File]::OpenRead($file.source)
+  try { $output=[IO.File]::Open($dest,[IO.FileMode]::CreateNew);try {$input.CopyTo($output);$output.Flush($true)} finally {$output.Dispose()} } finally {$input.Dispose()}
+}
+[IO.File]::WriteAllText((Join-Path $StageDir 'stage-manifest.json'),($manifest | ConvertTo-Json -Depth 6),[Text.UTF8Encoding]::new($false))
+Write-Host "Staged $Gui $version at $StageDir; not installed and not approved for publication."

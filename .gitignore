@@ -55,3 +55,6 @@ gui/src-tauri/gen/
 /index.bin*
 /index.bin.v6/
 
+
+# Python release/preflight tooling
+__pycache__/
