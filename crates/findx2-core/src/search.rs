@@ -2370,13 +2370,12 @@ fn path_candidate_ids(
     // 真实 v6 索引里 `dir[0]` 是自指的死节点（如 `$RmMetadata`，其 `parent_idx == 0`），
     // 而真正的卷根是那个**名字为空**的目录；空名拼路径时不贡献分隔符，
     // 所以卷根本身不参与匹配、`dir[0]` 更是永远访问不到。
-    let mut chain: Vec<u32> = Vec::new();
     for di in (0..ndirs).rev() {
         if dir_cls[di] != CLS_UNKNOWN {
             continue;
         }
         // 收集自底向上的链，直到撞上已定论节点，或某节点的 parent_idx == 0。
-        chain.clear();
+        let mut chain: Vec<u32> = Vec::new();
         let mut cur = di as u32;
         let verdict = loop {
             match dir_cls.get(cur as usize).copied().unwrap_or(CLS_NONE) {
@@ -2393,7 +2392,7 @@ fn path_candidate_ids(
             }
             cur = p;
         };
-        for &c in &chain {
+        for c in chain {
             dir_cls[c as usize] = verdict;
         }
     }
@@ -2444,12 +2443,6 @@ fn path_candidate_ids(
             || (Vec::new(), Vec::new()),
             |mut acc, idx| {
                 let e = &store.entries[idx as usize];
-                // An exact directory prefix proves the whole entry path matches.
-                // Do not demote it to expensive validation on filename variants.
-                if dir_cls.get(e.dir_idx as usize)==Some(&CLS_FULL) {
-                    acc.0.push(idx);
-                    return acc;
-                }
                 // 名字侧：tri 位图不含此条目 → 名字必不含任何变体，跳过小写化+比对。
                 let in_tri = tri_union.as_ref().map_or(true, |bm| bm.contains(idx));
                 if in_tri {
@@ -2509,9 +2502,6 @@ fn path_candidate_ids(
     })
 }
 
-/// Query-scoped, one-byte-per-directory memo. No retained path strings or
-/// cross-generation cache. Windows single-volume paths depend only on dir_idx;
-/// Unix/multi-volume/invalid-directory cases retain the legacy per-entry path.
 fn retain_parent_path_matches(
     store: &IndexStore,
     hits: &mut Vec<u32>,
@@ -3305,28 +3295,5 @@ mod directory_filter_memo_tests {
         let mut s = fixture(false);
         s.volumes.push(s.volumes[0].clone());
         compare(&s);
-    }
-    #[test]
-    fn exact_directory_prefix_not_demoted_by_filename_variant() {
-        let s = fixture(false);
-        let table = build_dir_path_table(&s);
-        let c = path_candidate_ids(&s, &table, br"dev\deep").unwrap();
-        let deep = s
-            .dirs
-            .iter()
-            .position(|d| {
-                s.names_buf[d.name_offset as usize..d.name_offset as usize + d.name_len as usize]
-                    == *b"deep"
-            })
-            .unwrap();
-        let mut checked = 0;
-        for (i, e) in s.entries.iter().enumerate() {
-            if e.dir_idx as usize == deep {
-                assert!(c.exact.contains(i as u32));
-                assert!(!c.check.contains(i as u32));
-                checked += 1;
-            }
-        }
-        assert!(checked > 1000);
     }
 }
