@@ -419,7 +419,9 @@ pub(crate) fn run_foreground(
         usage_extra_budget_bytes = budget,
         "logical tree budget (additional resident/staging, not total process RSS)"
     );
-    engine.enable_usage(budget).map_err(anyhow::Error::msg)?;
+    if let Err(e) = engine.enable_usage(budget) {
+        tracing::error!("logical usage tree unavailable: {e}; search continues without indexed usage");
+    }
     {
         let mut g = slot.write().expect("EngineSlot 写锁中毒");
         *g = Some(engine.clone());
@@ -613,13 +615,18 @@ fn usn_watch_loop(
     // 返回实际 apply 的条数（0 = 无事发生），调用方据此置 dirty，避免空闲时也全量写盘。
     let flush_pending = |pending: &mut Vec<findx2_core::ChangeEvent>| -> anyhow::Result<usize> {
         let total = pending.len();
-        // Watermark is advanced only after every event has succeeded. On failure the
-        // previous persisted cursor remains replayable; no error is swallowed.
-        for ev in pending.iter() {
-            engine
-                .apply_volume_change(volume_letter, ev)
-                .map_err(anyhow::Error::msg)?;
-        }
+        if total == 0 { return Ok(0); }
+        let (journal_id, last_usn) = {
+            let g = engine.index_store();
+            let v = g.volumes.iter().find(|v| v.volume_letter == volume_letter)
+                .ok_or_else(|| anyhow::anyhow!("pending namespace volume unavailable"))?;
+            (v.usn_journal_id, v.last_usn)
+        };
+        engine.apply_volume_batch(volume_letter, pending, journal_id, last_usn)
+            .map_err(|e| {
+                set_watch_error(letter, Some(format!("legacy namespace batch failed; cursor retained: {e}")));
+                anyhow::anyhow!(e)
+            })?;
         pending.clear();
         Ok(total)
     };
@@ -708,6 +715,10 @@ fn usn_watch_loop(
         }
     };
 
+    // A fatal namespace failure fences all subsequent cursors. Do not consume a later
+    // successful batch as proof the failed prefix committed. Search remains available;
+    // restart/rebuild is required and resumes from the retained durable watermark.
+    let mut namespace_blocked = false;
     loop {
         // 停机检查：recv_timeout 只有 50ms 粒度，这里最多 50ms 响应一次。
         // 退出前 flush 内存 pending（游标停在最后 Checkpoint，journal 重放覆盖剩余变更）
@@ -722,6 +733,11 @@ fn usn_watch_loop(
             }
             info!("卷 {letter} USN 监听线程停机退出");
             return Ok(());
+        }
+        if namespace_blocked {
+            let _ = rx.recv_timeout(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
         }
         // 重建冻结期（本卷）：排空丢弃，不 apply 不推进游标；journal 重放会补回。
         // 其它卷不受影响（标志按卷）。
@@ -739,10 +755,21 @@ fn usn_watch_loop(
                     next_usn,
                 } => {
                     dirty_count += flush_pending(&mut pending)?;
-                    engine
-                        .apply_volume_batch(volume_letter, &events, journal_id, next_usn)
-                        .map_err(anyhow::Error::msg)?;
-                    dirty_count += events.len();
+                    match engine.apply_volume_batch(volume_letter, &events, journal_id, next_usn) {
+                        Ok(()) => {
+                            set_watch_error(letter, engine.has_pending_namespace(volume_letter).then(||
+                                "missing-parent namespace events pending; durable cursor pinned for restart replay".into()));
+                            dirty_count += events.len();
+                        }
+                        Err(e) => {
+                            set_watch_error(
+                                letter,
+                                Some(format!("watch mutation failed; cursor not acknowledged: {e}")),
+                            );
+                            error!("USN batch not committed ({letter}); namespace fenced until restart/rebuild: {e}");
+                            namespace_blocked = true;
+                        }
+                    }
                 }
                 findx2_windows::UsnWatchMsg::Event(ev) => {
                     if pending.is_empty() {
@@ -773,12 +800,14 @@ fn usn_watch_loop(
                     next_usn,
                 } => {
                     dirty_count += flush_pending(&mut pending)?;
-                    if let Some(v) = engine.index_store_mut().volumes.iter_mut().find(|x| {
-                        (x.volume_letter as char).to_ascii_uppercase()
-                            == (volume_letter as char).to_ascii_uppercase()
-                    }) {
-                        v.usn_journal_id = journal_id;
-                        v.last_usn = next_usn;
+                    if let Err(e) = engine.apply_volume_batch(volume_letter, &[], journal_id, next_usn) {
+                        set_watch_error(letter, Some(format!("checkpoint rejected; namespace fenced: {e}")));
+                        namespace_blocked = true;
+                        continue;
+                    }
+                    if engine.has_pending_namespace(volume_letter) {
+                        set_watch_error(letter, Some("missing-parent namespace events pending; durable cursor pinned for restart replay".into()));
+                        continue;
                     }
                     // 存活确认：收到 journal 心跳即视为健康，复位退避/重建计数。
                     backoff = Duration::from_secs(1);
@@ -971,9 +1000,9 @@ fn rebuild_volume(
     }
     engine.note_external_mutation();
     engine.clear_metadata_overlay();
-    engine
-        .enable_usage(engine.usage_budget())
-        .map_err(anyhow::Error::msg)?;
+    if let Err(e) = engine.enable_usage(engine.usage_budget()) {
+        tracing::error!("logical usage tree unavailable after rebuild: {e}; search continues");
+    }
 
     // 4) 落盘 + trigram 重建（合并后 trigram=None，先回全表扫描，重建完自动切回剪枝）。
     persist_index(engine, index_path)?;

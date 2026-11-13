@@ -20,8 +20,11 @@ pub(crate) fn req_kind_label(r: &IpcRequest) -> &'static str {
 pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse {
     let engine = slot.read().ok().and_then(|g| g.clone());
     match (req, engine) {
+        (IpcRequest::UsageCapabilities, Some(eng)) if eng.usage_available() => {
+            IpcResponse::UsageCapabilitiesResult { logical_tree: 1, allocated: false }
+        }
         (IpcRequest::UsageCapabilities, _) => IpcResponse::UsageCapabilitiesResult {
-            logical_tree: 1,
+            logical_tree: 0,
             allocated: false,
         },
         (
@@ -131,7 +134,7 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                         volume_letter: vol
                             .filter(|v| v.volume_letter != 0)
                             .map(|v| v.volume_letter as char),
-                        healthy: true,
+                        healthy: crate::watch_health::watch_error_summary().is_none(),
                         metadata_ready: g.metadata_ready,
                         backfill_done,
                         backfill_total,
@@ -158,7 +161,7 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                         last_usn: 0,
                         journal_id: 0,
                         volume_letter: None,
-                        healthy: true,
+                        healthy: crate::watch_health::watch_error_summary().is_none(),
                         metadata_ready: false,
                         backfill_done: backfill.0,
                         backfill_total: backfill.1,
@@ -305,6 +308,42 @@ mod usage_tests {
                 assert_eq!(page.children[0].name, "new");
             }
             _ => panic!("missing updated page"),
+        }
+    }
+
+    #[test]
+    fn watch_error_makes_status_unhealthy() {
+        let root = findx2_core::RawEntry {
+            file_id: 1,
+            file_id_128: None,
+            parent_id: 0,
+            name: "fixture".into(),
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            attrs: 0x10,
+            is_dir: true,
+        };
+        let g = findx2_core::IndexBuilder::new(b'F', 1, 1, 0)
+            .build_from_raw(vec![], vec![root], true)
+            .unwrap();
+        let e = Arc::new(SearchEngine::new(g));
+        let slot: EngineSlot = Arc::new(RwLock::new(Some(e)));
+        crate::watch_health::set_watch_error('Z', Some("parent identity missing; batch not committed".into()));
+        match process_request(&slot, IpcRequest::Status) {
+            IpcResponse::StatusResult { healthy, watch_error, .. } => {
+                assert!(!healthy, "Status.healthy must reflect a visible watch error");
+                assert!(watch_error.as_ref().is_some_and(|s| s.contains("parent identity missing")));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        crate::watch_health::set_watch_error('Z', None);
+        match process_request(&slot, IpcRequest::Status) {
+            IpcResponse::StatusResult { healthy, watch_error, .. } => {
+                assert!(healthy, "Status.healthy must clear when watch errors are cleared");
+                assert!(watch_error.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
         }
     }
 }

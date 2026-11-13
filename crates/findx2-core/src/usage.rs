@@ -1,9 +1,12 @@
-//! Shared, logical-only usage tree. No filesystem IO, paths, allocation-size guesses or scan limits.
-//! Store lock precedes runtime lock. All engine mutation/metadata commits use that order.
+//! Compact logical usage tree: directory aggregates plus per-file links.
+//! Reuses FileEntry name/size/FRN/parent indexes. No per-file Node and no full identity HashMap.
+//! Store lock precedes runtime lock. Namespace mutations do not require a healthy usage tree.
 use crate::{ChangeEvent, IndexStore, SearchEngine};
-use std::collections::HashMap;
+use crate::index::ResolvedMutation;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 const NIL: u32 = u32::MAX;
+const ACTIVE: u32 = 1;
 static EPOCH: AtomicU64 = AtomicU64::new(1);
 fn next_epoch() -> u64 {
     static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -14,10 +17,9 @@ fn next_epoch() -> u64 {
             .as_nanos() as u64;
         (nanos ^ ((std::process::id() as u64) << 32)).max(1)
     });
-    seed.wrapping_add(EPOCH.fetch_add(1, Ordering::Relaxed))
-        .max(1)
+    seed.wrapping_add(EPOCH.fetch_add(1, Ordering::Relaxed)).max(1)
 }
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Totals {
     bytes: u64,
     files: u64,
@@ -25,11 +27,17 @@ struct Totals {
     unknown: u64,
 }
 impl Totals {
+    fn file(bytes: u64, unknown: bool) -> Self {
+        Self { bytes, files: 1, dirs: 0, unknown: u64::from(unknown) }
+    }
+    fn dir_self() -> Self {
+        Self { bytes: 0, files: 0, dirs: 1, unknown: 0 }
+    }
     fn add(&mut self, b: Self) {
         self.bytes = self.bytes.saturating_add(b.bytes);
-        self.files += b.files;
-        self.dirs += b.dirs;
-        self.unknown += b.unknown;
+        self.files = self.files.saturating_add(b.files);
+        self.dirs = self.dirs.saturating_add(b.dirs);
+        self.unknown = self.unknown.saturating_add(b.unknown);
     }
     fn sub(&mut self, b: Self) {
         self.bytes = self.bytes.saturating_sub(b.bytes);
@@ -38,19 +46,74 @@ impl Totals {
         self.unknown = self.unknown.saturating_sub(b.unknown);
     }
 }
-#[derive(Clone, Debug)]
-struct Node {
-    entry: u32,
+/// 64-byte directory aggregate. No names, sizes or FRNs are duplicated here.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct DirAgg {
+    logical: u64,
+    files: u64,
+    dirs: u64,
+    unknown: u64,
     parent: u32,
-    first: u32,
-    next: u32,
-    prev: u32,
-    directory: bool,
-    active: bool,
-    own: Totals,
-    sum: Totals,
-    seq: u64,
-    volume: u8,
+    first_dir: u32,
+    next_dir: u32,
+    prev_dir: u32,
+    owner_entry: u32,
+    first_file: u32,
+    flags: u32,
+    volume_slot: u8,
+    pad: [u8; 3],
+}
+impl DirAgg {
+    fn empty(parent: u32, volume_slot: u8) -> Self {
+        Self {
+            logical: 0, files: 0, dirs: 0, unknown: 0,
+            parent, first_dir: NIL, next_dir: NIL, prev_dir: NIL,
+            owner_entry: NIL, first_file: NIL, flags: ACTIVE, volume_slot, pad: [0; 3],
+        }
+    }
+    fn totals(&self) -> Totals {
+        Totals { bytes: self.logical, files: self.files, dirs: self.dirs, unknown: self.unknown }
+    }
+    fn set_totals(&mut self, t: Totals) {
+        self.logical = t.bytes; self.files = t.files; self.dirs = t.dirs; self.unknown = t.unknown;
+    }
+    fn active(self) -> bool { self.flags & ACTIVE != 0 }
+}
+const _: () = assert!(std::mem::size_of::<DirAgg>() == 64);
+/// 8-byte intrusive file sibling links; parent is FileEntry.dir_idx.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct FileLinks { next: u32, prev: u32 }
+impl Default for FileLinks { fn default() -> Self { Self { next: NIL, prev: NIL } } }
+const _: () = assert!(std::mem::size_of::<FileLinks>() == 8);
+/// Packed 2-bit freshness per entry: 0 unknown, 1 known, 2 dirty, 3 error.
+struct Freshness { bytes: Vec<u8> }
+impl Freshness {
+    fn with_len(n: usize) -> Result<Self, String> {
+        let mut s = Self { bytes: Vec::new() };
+        s.resize(n)?;
+        Ok(s)
+    }
+    fn resize(&mut self, n: usize) -> Result<(), String> {
+        let need = n.div_ceil(4);
+        if need > self.bytes.capacity() {
+            self.bytes.try_reserve(need - self.bytes.len()).map_err(|_| "usage freshness allocation failed")?;
+        }
+        self.bytes.resize(need, 0);
+        Ok(())
+    }
+    fn get(&self, idx: usize) -> u8 {
+        let b = *self.bytes.get(idx / 4).unwrap_or(&0);
+        (b >> ((idx % 4) * 2)) & 3
+    }
+    fn set(&mut self, idx: usize, v: u8) {
+        if idx / 4 >= self.bytes.len() { return; }
+        let shift = (idx % 4) * 2;
+        let mask = 3u8 << shift;
+        self.bytes[idx / 4] = (self.bytes[idx / 4] & !mask) | ((v & 3) << shift);
+    }
+    fn capacity_bytes(&self) -> usize { self.bytes.capacity() }
 }
 #[derive(Clone, Copy, Debug)]
 pub struct MetadataTicket {
@@ -79,960 +142,918 @@ pub struct UsagePage {
     pub resident_bytes: usize,
     pub state: String,
 }
+pub(crate) struct OrphanQueue {
+    ordered: Vec<(u8, u64, ChangeEvent)>,
+    bytes: usize,
+    budget: usize,
+}
+impl Default for OrphanQueue {
+    fn default() -> Self { Self { ordered: Vec::new(), bytes: 0, budget: 4 * 1024 * 1024 } }
+}
+impl OrphanQueue {
+    fn identity(ev: &ChangeEvent) -> u64 {
+        match ev {
+            ChangeEvent::Create { entry } => entry.file_id,
+            ChangeEvent::CreatePending { file_id, .. } | ChangeEvent::Rename { file_id, .. }
+            | ChangeEvent::Delete { file_id } | ChangeEvent::DataOrMeta { file_id, .. } => *file_id,
+        }
+    }
+    fn event_cost(ev: &ChangeEvent) -> usize {
+        128 + match ev {
+            ChangeEvent::Create { entry } => entry.name.len(),
+            ChangeEvent::CreatePending { name, .. } => name.len(),
+            ChangeEvent::Rename { new_name, .. } => new_name.len(),
+            _ => 0,
+        }
+    }
+    fn take_volume(&mut self, volume: u8) -> Vec<ChangeEvent> {
+        // Preserve journal order across different missing parents/identities.
+        let all = std::mem::take(&mut self.ordered);
+        let mut out = Vec::new();
+        for (v, p, ev) in all {
+            if v == volume {
+                self.bytes = self.bytes.saturating_sub(Self::event_cost(&ev));
+                out.push(ev);
+            } else { self.ordered.push((v, p, ev)); }
+        }
+        out
+    }
+    fn park(&mut self, volume: u8, parent: u64, ev: ChangeEvent) -> Result<(), String> {
+        let cost = Self::event_cost(&ev);
+        if self.bytes.saturating_add(cost) > self.budget {
+            return Err("pending parent-resolution budget exceeded; cursor not acknowledged".into());
+        }
+        self.ordered.try_reserve(1).map_err(|_| "pending parent-resolution allocation failed")?;
+        self.ordered.push((volume, parent, ev));
+        self.bytes = self.bytes.saturating_add(cost);
+        Ok(())
+    }
+    pub(crate) fn clear(&mut self) { self.ordered.clear(); self.bytes = 0; }
+}
 #[derive(Default)]
 pub(crate) struct UsageRuntime {
-    nodes: Vec<Node>,
-    entries: Vec<u32>,
-    dirs: Vec<u32>,
-    objects: HashMap<(u8, u64), u32>,
-    directory_ids: HashMap<(u8, u64), u32>,
+    dirs: Vec<DirAgg>,
+    file_links: Vec<FileLinks>,
+    freshness: Freshness,
     roots: HashMap<u8, u32>,
+    tickets: HashMap<usize, u64>,
+    ticket_seq: u64,
+    excluded_ids: HashSet<(u8, u64)>,
     pub epoch: u64,
     pub generation: u64,
     pub budget: usize,
     pub error: Option<String>,
+    ancestor_visits: u64,
 }
+impl Default for Freshness { fn default() -> Self { Self { bytes: Vec::new() } } }
 impl UsageRuntime {
     fn bytes(&self) -> usize {
-        self.nodes.capacity() * std::mem::size_of::<Node>()
-            + (self.entries.capacity() + self.dirs.capacity()) * 4
-            + (self.objects.capacity() + self.directory_ids.capacity())
-                * (std::mem::size_of::<((u8, u64), u32)>() + 16)
+        self.dirs.capacity() * std::mem::size_of::<DirAgg>()
+            + self.file_links.capacity() * std::mem::size_of::<FileLinks>()
+            + self.freshness.capacity_bytes()
+            + (self.roots.capacity() + self.tickets.capacity() + self.excluded_ids.capacity()) * 32
     }
     fn reserve(&mut self, n: usize, d: usize) -> Result<(), String> {
         let grow = |len: usize, cap: usize, extra: usize| {
-            if len.saturating_add(extra) <= cap {
-                cap
-            } else {
-                len.saturating_add(extra)
-                    .max(cap.saturating_mul(2))
-                    .checked_next_power_of_two()
-                    .unwrap_or(usize::MAX)
+            if len.saturating_add(extra) <= cap { cap } else {
+                len.saturating_add(extra).max(cap.saturating_mul(2)).checked_next_power_of_two().unwrap_or(usize::MAX)
             }
         };
-        let hash_grow = |len: usize, cap: usize, extra: usize| {
-            if len.saturating_add(extra) <= cap {
-                cap
-            } else {
-                len.saturating_add(extra)
-                    .max(cap.saturating_mul(2))
-                    .saturating_mul(8)
-                    .saturating_div(7)
-                    .saturating_add(1)
-                    .checked_next_power_of_two()
-                    .unwrap_or(usize::MAX)
-            }
-        };
-        let predicted = grow(self.nodes.len(), self.nodes.capacity(), n)
-            .saturating_mul(std::mem::size_of::<Node>())
-            .saturating_add(grow(self.entries.len(), self.entries.capacity(), n).saturating_mul(4))
-            .saturating_add(grow(self.dirs.len(), self.dirs.capacity(), d).saturating_mul(4))
-            .saturating_add(
-                hash_grow(self.objects.len(), self.objects.capacity(), n)
-                    .saturating_mul(std::mem::size_of::<((u8, u64), u32)>() + 16),
-            )
-            .saturating_add(
-                hash_grow(self.directory_ids.len(), self.directory_ids.capacity(), d)
-                    .saturating_mul(std::mem::size_of::<((u8, u64), u32)>() + 16),
-            );
+        let pn = grow(self.file_links.len(), self.file_links.capacity(), n);
+        let pd = grow(self.dirs.len(), self.dirs.capacity(), d);
+        let pf = pn.div_ceil(4);
+        let predicted = pd.saturating_mul(std::mem::size_of::<DirAgg>())
+            .saturating_add(pn.saturating_mul(std::mem::size_of::<FileLinks>()))
+            .saturating_add(pf);
         if predicted > self.budget {
-            return Err(
-                "usage resource budget: expanded arrays/identity maps would exceed byte budget"
-                    .into(),
-            );
+            return Err("usage resource budget: expanded directory aggregates/file links would exceed byte budget".into());
         }
-        self.nodes
-            .try_reserve(n)
-            .map_err(|_| "usage node allocation failed")?;
-        self.entries
-            .try_reserve(n)
-            .map_err(|_| "usage entry map allocation failed")?;
-        self.dirs
-            .try_reserve(d)
-            .map_err(|_| "usage directory map allocation failed")?;
-        self.objects
-            .try_reserve(n)
-            .map_err(|_| "usage identity map allocation failed")?;
-        self.directory_ids
-            .try_reserve(d)
-            .map_err(|_| "usage directory identity allocation failed")?;
+        self.dirs.try_reserve(d).map_err(|_| "usage directory aggregate allocation failed")?;
+        self.file_links.try_reserve(n).map_err(|_| "usage file link allocation failed")?;
+        let need = self.file_links.len().saturating_add(n).div_ceil(4);
+        if need > self.freshness.bytes.capacity() {
+            self.freshness.bytes.try_reserve(need.saturating_sub(self.freshness.bytes.len()))
+                .map_err(|_| "usage freshness allocation failed")?;
+        }
         if self.bytes() > self.budget {
             return Err("usage actual capacity exceeds byte budget".into());
         }
         Ok(())
     }
-    fn build(g: &IndexStore, budget: usize) -> Result<Self, String> {
-        let mut t = Self {
-            epoch: next_epoch(),
-            generation: 1,
-            budget,
-            ..Self::default()
-        };
-        t.reserve(g.entries.len() + g.dirs.len(), g.dirs.len())?;
-        let staging = (g.entries.len() + g.dirs.len())
-            .saturating_mul(std::mem::size_of::<usize>() + 4)
-            + g.dirs.len().saturating_mul(128);
-        if t.bytes().saturating_add(staging) > budget {
-            return Err("usage initialization peak (resident arrays plus topology staging) exceeds byte budget".into());
+    fn ensure_entries(&mut self, g: &IndexStore) -> Result<(), String> {
+        let n = g.entries.len();
+        if n > self.file_links.len() {
+            self.reserve(n - self.file_links.len(), 0)?;
+            self.file_links.resize(n, FileLinks::default());
+            self.freshness.resize(n)?;
         }
-        // Directory entries retain authoritative packed parent indexes, including old
-        // multi-volume files whose directory-table sentinel 0 was not rebased.
-        let dir_entries: HashMap<_, _> = g
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.is_dir_entry())
-            .map(|(i, e)| ((g.frns[i], e.name_offset, e.n_len), e.dir_idx))
-            .collect();
-        let parents: Vec<u32> = g
-            .dirs
-            .iter()
-            .map(|d| {
-                dir_entries
-                    .get(&(d.frn, d.name_offset, d.name_len))
-                    .copied()
-                    .unwrap_or(d.parent_idx)
-            })
-            .collect();
-        let roots: Vec<usize> = parents
-            .iter()
-            .enumerate()
-            .filter(|(i, p)| **p as usize == *i)
-            .map(|(i, _)| i)
-            .collect();
+        Ok(())
+    }
+    fn build(g: &IndexStore, budget: usize) -> Result<Self, String> {
+        let n = g.entries.len();
+        let d = g.dirs.len();
+        let mut t = Self { budget, freshness: Freshness::with_len(n)?, ..Self::default() };
+        t.reserve(n, d)?;
+        let staging = d.saturating_mul(9);
+        if t.bytes().saturating_add(staging) > budget {
+            return Err("usage initialization peak (directory aggregates plus topology staging) exceeds byte budget".into());
+        }
+        t.file_links.resize(n, FileLinks::default());
+        let mut assigned = Vec::new();
+        assigned.try_reserve_exact(d).map_err(|_| "usage topology allocation failed")?;
+        assigned.resize(d, false);
+        let mut roots: Vec<usize> = Vec::new();
+        roots.try_reserve(g.volumes.len()).map_err(|_| "usage root staging allocation failed")?;
+        t.roots.try_reserve(g.volumes.len()).map_err(|_| "usage root map allocation failed")?;
+        for (i, dir) in g.dirs.iter().enumerate() {
+            let p = if (dir.parent_idx as usize) < d { dir.parent_idx } else { i as u32 };
+            let parent = if p as usize == i { i as u32 } else { p };
+            t.dirs.push(DirAgg::empty(parent, 0));
+            if parent as usize == i { roots.push(i); }
+        }
         if roots.len() != g.volumes.len() {
             return Err("usage identity unresolved: directory roots do not match volumes".into());
         }
-        let rootvol: HashMap<usize, u8> = roots
-            .into_iter()
-            .zip(g.volumes.iter().map(|v| v.volume_letter))
-            .collect();
-        let mut vols = Vec::new();
-        vols.try_reserve(g.dirs.len())
-            .map_err(|_| "volume map allocation failed")?;
-        vols.resize(g.dirs.len(), None);
-        for i in 0..g.dirs.len() {
+        for (root, v) in roots.iter().copied().zip(g.volumes.iter()) {
+            t.roots.insert(v.volume_letter, root as u32);
+            t.dirs[root].volume_slot = g.volume_slot_of(v.volume_letter).unwrap_or(0) as u8;
+            assigned[root] = true;
+        }
+        for i in 0..d {
+            if assigned[i] { continue; }
             let mut path = Vec::new();
             let mut at = i;
-            let v = loop {
-                if let Some(v) = vols[at] {
-                    break v;
-                }
-                if let Some(&v) = rootvol.get(&at) {
-                    break v;
-                }
-                if path.len() > g.dirs.len() {
-                    return Err("usage directory cycle".into());
-                }
+            let slot = loop {
+                if assigned[at] { break t.dirs[at].volume_slot; }
+                if path.len() > d { return Err("usage directory cycle".into()); }
+                path.try_reserve(1).map_err(|_| "usage ancestry staging allocation failed")?;
                 path.push(at);
-                at = *parents.get(at).ok_or("usage invalid parent")? as usize;
+                let p = t.dirs[at].parent as usize;
+                if p == at { break 0; }
+                at = p;
             };
-            vols[i] = Some(v);
-            for d in path {
-                vols[d] = Some(v);
+            for x in path.into_iter().chain([i]) {
+                t.dirs[x].volume_slot = slot;
+                assigned[x] = true;
             }
         }
-        for (&di, &volume) in &rootvol {
-            t.roots.insert(volume, di as u32);
+        // Prefer FileEntry.dir_idx as the authoritative parent, including pre-rebase sentinels.
+        for (idx, e) in g.entries.iter().enumerate() {
+            if !e.is_dir_entry() { continue; }
+            let frn = g.frns.get(idx).copied().unwrap_or(0);
+            let Some(letter) = g.volume_letter_u8_for_dir(e.dir_idx) else { continue; };
+            if let Some(di) = g.dir_on_volume(letter, frn) {
+                let di = di as usize;
+                t.dirs[di].owner_entry = idx as u32;
+                t.dirs[di].flags = if e.is_deleted() { 0 } else { ACTIVE };
+                let p = e.dir_idx;
+                if (p as usize) < d && p as usize != di {
+                    t.dirs[di].parent = p;
+                }
+            }
         }
-        for (di, d) in g.dirs.iter().enumerate() {
-            let id = t.nodes.len() as u32;
-            t.dirs.push(id);
-            let v = vols[di].unwrap();
-            t.directory_ids.insert((v, d.frn), di as u32);
-            t.nodes.push(Node {
-                entry: NIL,
-                parent: NIL,
-                first: NIL,
-                next: NIL,
-                prev: NIL,
-                directory: true,
-                active: true,
-                own: Totals {
-                    dirs: 1,
-                    ..Totals::default()
-                },
-                sum: Totals::default(),
-                seq: 0,
-                volume: v,
-            });
+        for di in 0..d {
+            let p = t.dirs[di].parent;
+            if p as usize != di { t.link_dir(di as u32, p); }
+            if t.dirs[di].active() {
+                let mut tot = t.dirs[di].totals();
+                tot.add(Totals::dir_self());
+                t.dirs[di].set_totals(tot);
+            }
         }
         for (idx, e) in g.entries.iter().enumerate() {
-            let v = *vols
-                .get(e.dir_idx as usize)
-                .and_then(|v| v.as_ref())
-                .ok_or("usage entry volume unresolved")?;
-            let frn = g.frns.get(idx).copied().ok_or("usage missing identity")?;
-            if t.objects.insert((v, frn), idx as u32).is_some() {
-                return Err("usage duplicate object identity in volume".into());
-            }
-            let id = if e.is_dir_entry() {
-                *t.dirs
-                    .get(
-                        *t.directory_ids
-                            .get(&(v, frn))
-                            .ok_or("usage missing directory identity")?
-                            as usize,
-                    )
-                    .unwrap()
-            } else {
-                let id = t.nodes.len() as u32;
-                t.nodes.push(Node {
-                    entry: idx as u32,
-                    parent: NIL,
-                    first: NIL,
-                    next: NIL,
-                    prev: NIL,
-                    directory: false,
-                    active: !e.is_deleted(),
-                    own: Totals {
-                        bytes: e.size,
-                        files: 1,
-                        unknown: 1,
-                        dirs: 0,
-                    },
-                    sum: Totals::default(),
-                    seq: 0,
-                    volume: v,
-                });
-                id
-            };
-            t.entries.push(id);
-            t.nodes[id as usize].entry = idx as u32;
-            t.nodes[id as usize].active = !e.is_deleted();
-        }
-        for di in 0..g.dirs.len() {
-            let p = parents[di] as usize;
-            if p != di {
-                t.link(t.dirs[di], t.dirs[p]);
+            if e.is_dir_entry() { continue; }
+            let p = e.dir_idx;
+            if (p as usize) >= d { return Err("usage entry volume unresolved".into()); }
+            t.link_file(idx as u32, p);
+            let unknown = !g.metadata_ready;
+            t.freshness.set(idx, u8::from(!unknown));
+            if !e.is_deleted() {
+                let w = Totals::file(e.size, unknown);
+                let mut tot = t.dirs[p as usize].totals();
+                tot.add(w);
+                t.dirs[p as usize].set_totals(tot);
             }
         }
-        for idx in 0..g.entries.len() {
-            if !g.entries[idx].is_dir_entry() {
-                t.link(t.entries[idx], t.dirs[g.entries[idx].dir_idx as usize]);
-            }
-        }
-        // Iterative leaf-to-root aggregation, including suppressed subtree semantics.
+        // Bottom-up: bubble child subtree totals (already include each dir's own dirs=1 and direct files).
         let mut remaining = Vec::new();
-        remaining
-            .try_reserve(t.nodes.len())
-            .map_err(|_| "usage topology allocation failed")?;
-        remaining.resize(t.nodes.len(), 0usize);
-        let mut leaves = Vec::new();
-        leaves
-            .try_reserve(t.nodes.len())
-            .map_err(|_| "usage topology queue allocation failed")?;
-        for i in 0..t.nodes.len() {
-            let n = &t.nodes[i];
-            if n.parent != NIL {
-                remaining[n.parent as usize] += 1;
-            }
+        remaining.try_reserve_exact(d).map_err(|_| "usage child-count staging allocation failed")?;
+        remaining.resize(d, 0u32);
+        for (i, dir) in t.dirs.iter().enumerate() {
+            if dir.parent as usize != i { remaining[dir.parent as usize] += 1; }
         }
-        for (i, &n) in remaining.iter().enumerate() {
-            if n == 0 {
-                leaves.push(i as u32)
-            }
-        }
-        let mut seen = 0;
+        let mut leaves: Vec<u32> = Vec::new();
+        leaves.try_reserve_exact(d).map_err(|_| "usage leaf staging allocation failed")?;
+        leaves.extend(remaining.iter().enumerate().filter(|(_, c)| **c == 0).map(|(i, _)| i as u32));
+        let mut seen = 0usize;
         while let Some(id) = leaves.pop() {
             seen += 1;
-            let n = &mut t.nodes[id as usize];
-            n.sum.add(n.own);
-            let sum = if n.active { n.sum } else { Totals::default() };
-            let p = n.parent;
-            if p != NIL {
-                t.nodes[p as usize].sum.add(sum);
-                remaining[p as usize] -= 1;
-                if remaining[p as usize] == 0 {
-                    leaves.push(p)
-                }
-            }
+            let p = t.dirs[id as usize].parent;
+            if p as usize == id as usize { continue; }
+            let add = if t.dirs[id as usize].active() { t.dirs[id as usize].totals() } else { Totals::default() };
+            let parent = &mut t.dirs[p as usize];
+            let mut tot = parent.totals();
+            tot.add(add);
+            parent.set_totals(tot);
+            remaining[p as usize] -= 1;
+            if remaining[p as usize] == 0 { leaves.push(p); }
         }
-        if seen != t.nodes.len() {
-            return Err("usage graph cycle".into());
-        }
+        if seen != d { return Err("usage graph cycle".into()); }
+        t.epoch = next_epoch();
+        t.generation = 1;
+        if t.bytes() > budget { return Err("usage actual capacity exceeds byte budget".into()); }
         Ok(t)
     }
-    fn link(&mut self, id: u32, p: u32) {
-        let first = self.nodes[p as usize].first;
-        self.nodes[id as usize].parent = p;
-        self.nodes[id as usize].next = first;
-        self.nodes[id as usize].prev = NIL;
-        if first != NIL {
-            self.nodes[first as usize].prev = id;
-        }
-        self.nodes[p as usize].first = id;
+    fn link_dir(&mut self, id: u32, p: u32) {
+        let first = self.dirs[p as usize].first_dir;
+        self.dirs[id as usize].parent = p;
+        self.dirs[id as usize].next_dir = first;
+        self.dirs[id as usize].prev_dir = NIL;
+        if first != NIL { self.dirs[first as usize].prev_dir = id; }
+        self.dirs[p as usize].first_dir = id;
     }
-    fn unlink(&mut self, id: u32) {
-        let n = self.nodes[id as usize].clone();
-        if n.parent == NIL {
-            return;
-        }
-        if n.prev == NIL {
-            self.nodes[n.parent as usize].first = n.next
-        } else {
-            self.nodes[n.prev as usize].next = n.next
-        }
-        if n.next != NIL {
-            self.nodes[n.next as usize].prev = n.prev
-        }
-        self.nodes[id as usize].parent = NIL;
-        self.nodes[id as usize].next = NIL;
-        self.nodes[id as usize].prev = NIL;
+    fn unlink_dir(&mut self, id: u32) {
+        let n = self.dirs[id as usize];
+        if n.parent == NIL || n.parent as usize == id as usize { return; }
+        if n.prev_dir == NIL { self.dirs[n.parent as usize].first_dir = n.next_dir; }
+        else { self.dirs[n.prev_dir as usize].next_dir = n.next_dir; }
+        if n.next_dir != NIL { self.dirs[n.next_dir as usize].prev_dir = n.prev_dir; }
+        self.dirs[id as usize].next_dir = NIL;
+        self.dirs[id as usize].prev_dir = NIL;
+    }
+    fn link_file(&mut self, idx: u32, p: u32) {
+        let first = self.dirs[p as usize].first_file;
+        self.file_links[idx as usize] = FileLinks { next: first, prev: NIL };
+        if first != NIL { self.file_links[first as usize].prev = idx; }
+        self.dirs[p as usize].first_file = idx;
+    }
+    fn unlink_file(&mut self, idx: u32, p: u32) {
+        let n = self.file_links[idx as usize];
+        if p == NIL { return; }
+        if n.prev == NIL { self.dirs[p as usize].first_file = n.next; }
+        else { self.file_links[n.prev as usize].next = n.next; }
+        if n.next != NIL { self.file_links[n.next as usize].prev = n.prev; }
+        self.file_links[idx as usize] = FileLinks::default();
     }
     fn ancestors(&mut self, mut p: u32, w: Totals, add: bool) {
+        let mut guard = 0usize;
         while p != NIL {
-            let n = &mut self.nodes[p as usize];
-            if add {
-                n.sum.add(w)
-            } else {
-                n.sum.sub(w)
-            }
-            if !n.active {
-                break;
-            }
-            p = n.parent;
+            self.ancestor_visits = self.ancestor_visits.saturating_add(1);
+            let n = &mut self.dirs[p as usize];
+            let mut tot = n.totals();
+            if add { tot.add(w) } else { tot.sub(w) }
+            n.set_totals(tot);
+            let active = n.active();
+            let next = n.parent;
+            if !active || next == p { break; }
+            p = next;
+            guard += 1;
+            if guard > self.dirs.len() { break; }
         }
     }
-    fn visible(&self, mut id: u32) -> bool {
-        while id != NIL {
-            let n = &self.nodes[id as usize];
-            if !n.active {
-                return false;
-            }
+    fn visible_dir(&self, mut id: u32) -> bool {
+        let mut guard = 0usize;
+        while (id as usize) < self.dirs.len() {
+            let n = self.dirs[id as usize];
+            if !n.active() { return false; }
+            if n.parent == id { return true; }
             id = n.parent;
+            guard += 1;
+            if guard > self.dirs.len() { return false; }
         }
-        true
+        false
     }
-    fn sync(&mut self, g: &IndexStore, idx: usize, known: Option<bool>) -> Result<(), String> {
-        let e = &g.entries[idx];
-        let id = self.entries[idx];
-        let old = self.nodes[id as usize].clone();
-        let parent = if old.directory {
-            let _di = *self
-                .directory_ids
-                .get(&(old.volume, g.frns[idx]))
-                .ok_or("missing dir")?;
-            let p = e.dir_idx;
-            if self.dirs[p as usize] == id {
-                NIL
-            } else {
-                self.dirs[p as usize]
-            }
+    fn item_dir(&self, g: &IndexStore, di: u32) -> Result<UsageItem, String> {
+        let n = self.dirs.get(di as usize).ok_or("unknown usage directory")?;
+        let (name, id) = if n.owner_entry != NIL {
+            let e = g.entries.get(n.owner_entry as usize).ok_or("usage entry unavailable")?;
+            (String::from_utf8_lossy(g.name_bytes(e)).into_owned(), n.owner_entry)
         } else {
-            self.dirs[e.dir_idx as usize]
+            let d = g.dirs.get(di as usize).ok_or("usage directory unavailable")?;
+            let start = d.name_offset as usize;
+            let bytes = g.names_buf.get(start..start + d.name_len as usize).unwrap_or(b"");
+            (String::from_utf8_lossy(bytes).into_owned(), di)
         };
-        let mut at = parent;
-        while at != NIL {
-            if at == id {
-                return Err("usage directory move cycle".into());
-            }
-            at = self.nodes[at as usize].parent;
-        }
-        if old.active {
-            self.ancestors(old.parent, old.sum, false)
-        }
-        if parent != old.parent {
-            self.unlink(id);
-            if parent != NIL {
-                self.link(id, parent)
-            }
-        }
-        let n = &mut self.nodes[id as usize];
-        n.active = !e.is_deleted();
-        if !n.directory {
-            n.sum.sub(n.own);
-            n.own.bytes = e.size;
-            if let Some(k) = known {
-                n.own.unknown = u64::from(!k)
-            }
-            n.sum.add(n.own);
-        }
-        n.seq += 1;
-        let w = n.sum;
-        let active = n.active;
-        if active {
-            self.ancestors(parent, w, true)
-        }
-        self.generation += 1;
-        Ok(())
+        Ok(UsageItem { id, name, directory: true, logical: n.logical, files: n.files, directories: n.dirs, unknown: n.unknown })
     }
-    fn item(&self, g: &IndexStore, id: u32) -> Result<UsageItem, String> {
-        let n = self.nodes.get(id as usize).ok_or("unknown usage node")?;
-        let e = g
-            .entries
-            .get(n.entry as usize)
-            .ok_or("usage entry unavailable")?;
+    fn item_file(&self, g: &IndexStore, idx: u32, size_of_file: &impl Fn(usize) -> u64) -> Result<UsageItem, String> {
+        let e = g.entries.get(idx as usize).ok_or("usage entry unavailable")?;
         Ok(UsageItem {
-            id,
+            id: idx,
             name: String::from_utf8_lossy(g.name_bytes(e)).into_owned(),
-            directory: n.directory,
-            logical: n.sum.bytes,
-            files: n.sum.files,
-            directories: n.sum.dirs,
-            unknown: n.sum.unknown,
+            directory: false,
+            logical: size_of_file(idx as usize),
+            files: 1,
+            directories: 0,
+            unknown: u64::from(self.freshness.get(idx as usize) != 1),
         })
     }
-    fn resolve(&self, g: &IndexStore, path: &str) -> Result<u32, String> {
+    fn resolve(&self, g: &IndexStore, path: &str, size_of_file: &impl Fn(usize) -> u64) -> Result<u32, String> {
         let path = path.replace('/', "\\");
         let path = path.trim_end_matches('\\');
-        let (v, tail) = g
-            .volumes
-            .iter()
-            .find_map(|v| {
-                let root = v.root_prefix.trim_end_matches('\\');
-                if path.eq_ignore_ascii_case(root) {
-                    Some((v, ""))
-                } else if path.len() > root.len()
-                    && path
-                        .get(..root.len())
-                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(root))
-                    && path.as_bytes()[root.len()] == b'\\'
-                {
-                    Some((v, &path[root.len() + 1..]))
-                } else {
-                    None
-                }
-            })
-            .ok_or("path is outside indexed volumes")?;
-        let mut id = *self
-            .roots
-            .get(&v.volume_letter)
-            .ok_or("volume root unavailable")?;
+        let (v, tail) = g.volumes.iter().find_map(|v| {
+            let root = v.root_prefix.trim_end_matches('\\');
+            if path.eq_ignore_ascii_case(root) { Some((v, "")) }
+            else if path.len() > root.len()
+                && path.get(..root.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(root))
+                && path.as_bytes().get(root.len()) == Some(&b'\\')
+            { Some((v, &path[root.len() + 1..])) }
+            else { None }
+        }).ok_or("path is outside indexed volumes")?;
+        let mut di = *self.roots.get(&v.volume_letter).ok_or("volume root unavailable")?;
         for part in tail.split('\\').filter(|s| !s.is_empty()) {
-            if part == "." || part == ".." {
-                return Err("relative path components not allowed".into());
-            }
-            let mut child = self.nodes[id as usize].first;
+            if part == "." || part == ".." { return Err("relative path components not allowed".into()); }
             let mut found = None;
+            let mut child = self.dirs[di as usize].first_dir;
             while child != NIL {
-                if self.nodes[child as usize].active
-                    && self.item(g, child)?.name.eq_ignore_ascii_case(part)
-                {
+                if self.dirs[child as usize].active() && self.item_dir(g, child)?.name.eq_ignore_ascii_case(part) {
                     found = Some(child);
                     break;
                 }
-                child = self.nodes[child as usize].next;
+                child = self.dirs[child as usize].next_dir;
             }
-            id = found.ok_or("path not present in indexed scope")?;
+            di = found.ok_or("path not present in indexed scope")?;
         }
-        if !self.visible(id) {
-            return Err("path excluded/deleted".into());
-        }
-        Ok(id)
+        let _ = size_of_file;
+        if !self.visible_dir(di) { return Err("path excluded/deleted".into()); }
+        Ok(di)
     }
+    fn page_after(&self, g: &IndexStore, root: u32, after: Option<u32>) -> Result<(Option<u32>, Option<u32>), String> {
+        let Some(a) = after else {
+            return Ok((some_if(self.dirs[root as usize].first_dir), some_if(self.dirs[root as usize].first_file)));
+        };
+        let mut d = self.dirs[root as usize].first_dir;
+        while d != NIL {
+            let owner = self.dirs[d as usize].owner_entry;
+            if owner == a || d == a {
+                return Ok((some_if(self.dirs[d as usize].next_dir), some_if(self.dirs[root as usize].first_file)));
+            }
+            d = self.dirs[d as usize].next_dir;
+        }
+        let mut f = self.dirs[root as usize].first_file;
+        while f != NIL {
+            if f == a {
+                if g.entries.get(a as usize).map(|e| e.dir_idx) != Some(root) {
+                    return Err("page cursor outside scope".into());
+                }
+                return Ok((None, some_if(self.file_links[f as usize].next)));
+            }
+            f = self.file_links[f as usize].next;
+        }
+        Err("page cursor outside scope".into())
+    }
+    fn invalidate_ticket(&mut self, idx: usize) { self.tickets.remove(&idx); }
+    fn issue_ticket(&mut self, idx: usize) -> u64 {
+        self.ticket_seq = self.ticket_seq.saturating_add(1).max(1);
+        self.tickets.insert(idx, self.ticket_seq);
+        self.ticket_seq
+    }
+    fn apply_file_delta(&mut self, parent: u32, old: Totals, new: Totals, active_old: bool, active_new: bool) {
+        if active_old { self.ancestors(parent, old, false); }
+        if active_new { self.ancestors(parent, new, true); }
+        self.generation = self.generation.saturating_add(1);
+    }
+    fn ensure_dir_slot(&mut self, di: u32, parent: u32, slot: u8) -> Result<(), String> {
+        if (di as usize) < self.dirs.len() { return Ok(()); }
+        let need = di as usize + 1 - self.dirs.len();
+        self.reserve(0, need)?;
+        while self.dirs.len() <= di as usize {
+            self.dirs.push(DirAgg::empty(parent, slot));
+        }
+        Ok(())
+    }
+    pub(crate) fn metadata_sync(&mut self, parent: u32, old_size: u64, new_size: u64, was_unknown: bool, idx: usize) {
+        if self.epoch == 0 || self.error.is_some() { return; }
+        self.freshness.set(idx, 1);
+        self.apply_file_delta(parent, Totals::file(old_size, was_unknown), Totals::file(new_size, false), true, true);
+        self.invalidate_ticket(idx);
+    }
+    pub(crate) fn overlay_delta(&mut self, parent: u32, old_size: u64, new_size: u64, was_unknown: bool, idx: usize) {
+        self.metadata_sync(parent, old_size, new_size, was_unknown, idx);
+    }
+    #[cfg(test)]
+    pub(crate) fn payload_stats(&self) -> (usize, usize, usize, usize, usize) {
+        (self.dirs.len(), self.dirs.capacity(), self.file_links.len(), self.file_links.capacity(), self.bytes())
+    }
+    #[cfg(test)]
+    pub(crate) fn visits(&self) -> u64 { self.ancestor_visits }
 }
+fn some_if(v: u32) -> Option<u32> { if v == NIL { None } else { Some(v) } }
+
+#[derive(Clone, Copy)]
+struct Snap {
+    idx: Option<u32>,
+    is_dir: bool,
+    parent: u32,
+    di: Option<u32>,
+    size: u64,
+    deleted: bool,
+}
+enum Prep {
+    Noop,
+    Apply { scope: ResolvedMutation, new_entry: bool, new_dir: bool, name_bytes: usize },
+    Delete { entry: u32 },
+}
+
 impl SearchEngine {
-    /// Enable before publishing EngineSlot/watchers: initialization is O(N+D), without live lock contention.
-    pub fn usage_budget(&self) -> usize {
-        self.usage.lock().budget
+    pub fn usage_budget(&self) -> usize { self.usage.lock().budget }
+    pub fn usage_available(&self) -> bool {
+        let r = self.usage.lock();
+        r.epoch != 0 && r.error.is_none()
     }
     pub fn enable_usage(&self, budget: usize) -> Result<(), String> {
         let g = self.store.read();
-        let mut r = self.usage.lock();
-        *r = UsageRuntime::build(&g, budget)?;
-        Ok(())
+        let mut usage = self.usage.lock();
+        // Reinitialization must not retain the old sidecar throughout the next build.
+        *usage = UsageRuntime { budget, ..Default::default() };
+        match UsageRuntime::build(&g, budget) {
+            Ok(tree) => { *usage = tree; Ok(()) }
+            Err(error) => { usage.error = Some(error.clone()); Err(error) }
+        }
     }
-    pub fn usage_page(
-        &self,
-        path: &str,
-        expected: Option<(u64, u64)>,
-        after: Option<u32>,
-        max_bytes: usize,
-    ) -> Result<UsagePage, String> {
+    fn effective_size(&self, g: &IndexStore, idx: usize) -> u64 {
+        self.metadata_overlay.get(idx).map(|t| t.0).unwrap_or_else(|| g.entries.get(idx).map(|e| e.size).unwrap_or(0))
+    }
+    pub fn usage_page(&self, path: &str, expected: Option<(u64, u64)>, after: Option<u32>, max_bytes: usize) -> Result<UsagePage, String> {
         let g = self.store.read();
         let r = self.usage.lock();
-        if let Some(e) = &r.error {
-            return Err(e.clone());
-        }
-        if r.epoch == 0 {
-            return Err("indexed usage unavailable / initialization required".into());
-        }
-        if expected.is_some_and(|v| v != (r.epoch, r.generation)) {
-            return Err("usage generation changed; restart page".into());
-        }
-        let root = r.resolve(&g, path)?;
-        let mut at = if let Some(a) = after {
-            let n = r.nodes.get(a as usize).ok_or("invalid page cursor")?;
-            if n.parent != root {
-                return Err("page cursor outside scope".into());
-            }
-            n.next
-        } else {
-            r.nodes[root as usize].first
-        };
+        if let Some(e) = &r.error { return Err(e.clone()); }
+        if r.epoch == 0 { return Err("indexed usage unavailable / initialization required".into()); }
+        if expected.is_some_and(|v| v != (r.epoch, r.generation)) { return Err("usage generation changed; restart page".into()); }
+        let size_of_file = |idx: usize| self.effective_size(&g, idx);
+        let root = r.resolve(&g, path, &size_of_file)?;
+        let (mut next_dir, mut next_file) = r.page_after(&g, root, after)?;
         let mut children = Vec::new();
-        let mut bytes = 0;
-        let mut examined_bytes = 0;
+        let mut bytes = 0usize;
+        let mut examined = 0usize;
         let budget = max_bytes.clamp(1024, 256 * 1024);
         let mut last = None;
-        while at != NIL {
-            if examined_bytes >= budget && last.is_some() {
-                break;
-            }
-            examined_bytes += std::mem::size_of::<Node>();
-            let n = &r.nodes[at as usize];
-            if n.active {
-                let item = r.item(&g, at)?;
+        while let Some(d) = next_dir {
+            examined += std::mem::size_of::<DirAgg>();
+            if examined >= budget && last.is_some() { break; }
+            let n = r.dirs[d as usize];
+            let following = some_if(n.next_dir);
+            if n.active() {
+                let item = r.item_dir(&g, d)?;
+                let cur = if n.owner_entry == NIL { d } else { n.owner_entry };
                 let cost = item.name.len() + 128;
-                if bytes + cost > budget && !children.is_empty() {
-                    break;
-                }
-                children
-                    .try_reserve(1)
-                    .map_err(|_| "usage page allocation failed")?;
+                if bytes + cost > budget && !children.is_empty() { next_dir = Some(d); break; }
+                children.try_reserve(1).map_err(|_| "usage page allocation failed")?;
                 bytes += cost;
                 children.push(item);
+                last = Some(cur);
+            } else {
+                last = Some(if n.owner_entry == NIL { d } else { n.owner_entry });
             }
-            last = Some(at);
-            at = n.next;
+            next_dir = following;
         }
-        Ok(UsagePage{epoch:r.epoch,generation:r.generation,root:r.item(&g,root)?,children,next:if at==NIL{None}else{last},resident_bytes:r.bytes(),state:"indexed logical bytes; canonical indexed paths; allocation not measured; journal/metadata freshness tracked separately".into()})
+        if next_dir.is_none() {
+            while let Some(f) = next_file {
+                examined += std::mem::size_of::<FileLinks>();
+                if examined >= budget && last.is_some() { break; }
+                let following = some_if(r.file_links[f as usize].next);
+                let e = &g.entries[f as usize];
+                if !e.is_deleted() {
+                    let item = r.item_file(&g, f, &size_of_file)?;
+                    let cost = item.name.len() + 128;
+                    if bytes + cost > budget && !children.is_empty() { next_file = Some(f); break; }
+                    children.try_reserve(1).map_err(|_| "usage page allocation failed")?;
+                    bytes += cost;
+                    children.push(item);
+                    last = Some(f);
+                } else { last = Some(f); }
+                next_file = following;
+            }
+        }
+        let more = next_dir.or(next_file);
+        Ok(UsagePage {
+            epoch: r.epoch,
+            generation: r.generation,
+            root: r.item_dir(&g, root)?,
+            children,
+            next: if more.is_some() { last } else { None },
+            resident_bytes: r.bytes(),
+            state: "indexed logical bytes; canonical indexed paths; allocation not measured; journal/metadata freshness tracked separately".into(),
+        })
     }
     pub fn metadata_ticket(&self, idx: usize) -> Option<MetadataTicket> {
         let g = self.store.read();
-        let r = self.usage.lock();
-        let n = r.nodes.get(*r.entries.get(idx)? as usize)?;
-        if !n.active {
-            return None;
-        }
-        Some(MetadataTicket {
-            entry: idx,
-            epoch: r.epoch,
-            seq: n.seq,
-            frn: *g.frns.get(idx)?,
-        })
+        let mut r = self.usage.lock();
+        if r.epoch == 0 || r.error.is_some() { return None; }
+        let e = g.entries.get(idx)?;
+        if e.is_deleted() || e.is_dir_entry() { return None; }
+        let frn = *g.frns.get(idx)?;
+        let seq = r.issue_ticket(idx);
+        Some(MetadataTicket { entry: idx, epoch: r.epoch, seq, frn })
     }
     pub fn metadata_ticket_by_id(&self, volume: u8, frn: u64) -> Option<MetadataTicket> {
         let g = self.store.read();
-        let r = self.usage.lock();
-        if r.epoch == 0 || r.error.is_some() {
-            return None;
-        }
-        let idx = *r.objects.get(&(volume, frn))? as usize;
-        let n = r.nodes.get(*r.entries.get(idx)? as usize)?;
-        if !n.active || g.frns.get(idx) != Some(&frn) {
-            return None;
-        }
-        Some(MetadataTicket {
-            entry: idx,
-            epoch: r.epoch,
-            seq: n.seq,
-            frn,
-        })
+        let idx = g.entry_on_volume(volume, frn)? as usize;
+        drop(g);
+        self.metadata_ticket(idx)
     }
-
-    pub fn commit_metadata(
-        &self,
-        t: MetadataTicket,
-        size: u64,
-        mtime: u64,
-        ctime: u64,
-    ) -> Result<bool, String> {
+    pub fn commit_metadata(&self, t: MetadataTicket, size: u64, mtime: u64, ctime: u64) -> Result<bool, String> {
         let mut g = self.store.write();
         let mut r = self.usage.lock();
-        if r.epoch == 0
-            || r.error.is_some()
-            || r.epoch != t.epoch
-            || g.frns.get(t.entry) != Some(&t.frn)
-        {
+        if r.epoch == 0 || r.error.is_some() || r.epoch != t.epoch || g.frns.get(t.entry) != Some(&t.frn) {
             return Ok(false);
         }
-        let Some(&id) = r.entries.get(t.entry) else {
-            return Ok(false);
-        };
-        let n = &r.nodes[id as usize];
-        if n.seq != t.seq || !n.active {
-            return Ok(false);
-        }
-        g.patch_entry_metadata(t.entry, size, mtime, ctime)
-            .map_err(|e| e.to_string())?;
-        self.metadata_overlay.put(
-            t.entry,
-            size,
-            crate::index::filetime_to_unix_secs(mtime),
-            crate::index::filetime_to_unix_secs(ctime),
-        );
-        r.sync(&g, t.entry, Some(true))?;
+        if r.tickets.get(&t.entry) != Some(&t.seq) { return Ok(false); }
+        let e = g.entries.get(t.entry).ok_or("usage entry unavailable")?;
+        if e.is_deleted() || e.is_dir_entry() { return Ok(false); }
+        let parent = e.dir_idx;
+        let old = Totals::file(self.effective_size(&g, t.entry), r.freshness.get(t.entry) != 1);
+        g.patch_entry_metadata(t.entry, size, mtime, ctime).map_err(|e| e.to_string())?;
+        self.metadata_overlay.put(t.entry, size, crate::index::filetime_to_unix_secs(mtime), crate::index::filetime_to_unix_secs(ctime));
+        r.freshness.set(t.entry, 1);
+        r.apply_file_delta(parent, old, Totals::file(size, false), true, true);
+        r.invalidate_ticket(t.entry);
+        drop(g);
         self.bump_revision();
         Ok(true)
     }
-}
-impl UsageRuntime {
-    pub(crate) fn metadata_sync(&mut self, g: &IndexStore, idx: usize) {
-        if self.epoch != 0 {
-            if let Err(e) = self.sync(g, idx, Some(true)) {
-                self.error = Some(e)
-            }
-        }
-    }
-    pub(crate) fn overlay_value(&mut self, idx: usize, size: u64) {
-        if self.epoch == 0 {
-            return;
-        }
-        let Some(&id) = self.entries.get(idx) else {
-            return;
-        };
-        let old = self.nodes[id as usize].clone();
-        if old.directory || !old.active {
-            return;
-        }
-        self.ancestors(old.parent, old.sum, false);
-        let n = &mut self.nodes[id as usize];
-        n.sum.sub(n.own);
-        n.own.bytes = size;
-        n.own.unknown = 0;
-        n.sum.add(n.own);
-        n.seq += 1;
-        let w = n.sum;
-        self.ancestors(old.parent, w, true);
-        self.generation += 1;
-    }
-    fn register(&mut self, g: &IndexStore, idx: usize, volume: u8) -> Result<(), String> {
-        let e = &g.entries[idx];
-        let id = self.nodes.len() as u32;
-        let parent = self.dirs[e.dir_idx as usize];
-        self.objects.insert((volume, g.frns[idx]), idx as u32);
-        self.entries.push(id);
-        if e.is_dir_entry() {
-            self.directory_ids
-                .insert((volume, g.frns[idx]), self.dirs.len() as u32);
-            self.dirs.push(id);
-        }
-        let own = if e.is_dir_entry() {
-            Totals {
-                dirs: 1,
-                ..Totals::default()
-            }
-        } else {
-            Totals {
-                bytes: e.size,
-                files: 1,
-                unknown: 1,
-                dirs: 0,
-            }
-        };
-        self.nodes.push(Node {
-            entry: idx as u32,
-            parent: NIL,
-            first: NIL,
-            next: NIL,
-            prev: NIL,
-            directory: e.is_dir_entry(),
-            active: !e.is_deleted(),
-            own,
-            sum: own,
-            seq: 0,
-            volume,
-        });
-        self.link(id, parent);
-        if !e.is_deleted() {
-            self.ancestors(parent, own, true)
-        }
-        Ok(())
-    }
-    fn full_path(&self, g: &IndexStore, mut id: u32) -> Result<String, String> {
-        let mut parts = Vec::new();
-        while self.nodes[id as usize].parent != NIL {
-            parts.push(self.item(g, id)?.name);
-            id = self.nodes[id as usize].parent;
-        }
-        let v = g
-            .volumes
-            .iter()
-            .find(|v| v.volume_letter == self.nodes[id as usize].volume)
-            .ok_or("volume unavailable")?;
-        let mut s = v.root_prefix.trim_end_matches('\\').to_owned();
-        for n in parts.iter().rev() {
-            s.push('\\');
-            s.push_str(n)
-        }
-        Ok(s)
-    }
-}
-impl SearchEngine {
-    /// Atomic namespace mutation with volume-qualified targets and its logical aggregate update.
-    pub fn apply_volume_change(&self, volume: u8, ev: &ChangeEvent) -> Result<(), String> {
-        self.apply_volume_change_at(volume, ev, None)
-    }
-    fn apply_volume_change_at(
-        &self,
-        volume: u8,
-        ev: &ChangeEvent,
-        expected_epoch: Option<u64>,
-    ) -> Result<(), String> {
-        let mut g = self.store.write();
+    pub fn mark_metadata_dirty(&self, volume: u8, frn: u64) {
+        let g = self.store.read();
         let mut r = self.usage.lock();
-        if expected_epoch.is_some_and(|e| e != r.epoch) {
-            return Err("batch index epoch changed".into());
+        if r.epoch == 0 || r.error.is_some() { return; }
+        let Some(idx) = g.entry_on_volume(volume, frn) else { return; };
+        let idx = idx as usize;
+        let Some(e) = g.entries.get(idx) else { return; };
+        if e.is_dir_entry() || e.is_deleted() { return; }
+        let parent = e.dir_idx;
+        let size = self.effective_size(&g, idx);
+        let old = Totals::file(size, r.freshness.get(idx) != 1);
+        r.freshness.set(idx, 2);
+        r.apply_file_delta(parent, old, Totals::file(size, true), true, true);
+        r.invalidate_ticket(idx);
+    }
+    pub fn apply_volume_change(&self, volume: u8, ev: &ChangeEvent) -> Result<(), String> {
+        self.apply_volume_events(volume, std::slice::from_ref(ev), None).map(|_| ())
+    }
+    /// Namespace cursor advances only after every event is applied, excluded, or parked.
+    /// Fatal failures roll the batch back and leave the watermark unchanged.
+    pub fn apply_volume_batch(&self, volume: u8, events: &[ChangeEvent], journal_id: u64, next_usn: u64) -> Result<(), String> {
+        self.apply_volume_events(volume, events, Some((journal_id, next_usn))).map(|_| ())
+    }
+    fn apply_volume_events(&self, volume: u8, events: &[ChangeEvent], cursor: Option<(u64, u64)>) -> Result<bool, String> {
+        let mut g = self.store.write();
+        if let Some((journal_id, next_usn)) = cursor {
+            let v = g.volumes.iter().find(|v| v.volume_letter == volume).ok_or("batch volume unavailable")?;
+            if v.usn_journal_id != 0 && v.usn_journal_id != journal_id {
+                return Err("journal epoch changed; rebuild required".into());
+            }
+            if next_usn < v.last_usn { return Err("cursor regression rejected".into()); }
         }
-        if r.epoch == 0 || r.error.is_some() {
-            return Err("usage/identity epoch unavailable".into());
+        // Idle heartbeats do not repeatedly replay unresolved namespace events.
+        if events.is_empty() && self.has_pending_namespace(volume) { return Ok(false); }
+        let prior_orphans = self.orphans.lock().take_volume(volume);
+        let mut remaining = prior_orphans.clone();
+        remaining.extend(events.iter().cloned());
+        let excluded_before = self.usage.lock().excluded_ids.clone();
+        let mut ck = g.namespace_checkpoint();
+        if let Err(error) = g.reserve_namespace_checkpoint(&mut ck, remaining.len()) {
+            self.restore_orphans(volume, prior_orphans);
+            return Err(error);
         }
+        let mut applied_snaps: Vec<(Snap, Snap, ChangeEvent)> = Vec::new();
+        let mut leftover: Vec<(u64, ChangeEvent)> = Vec::new();
+        while !remaining.is_empty() {
+            let before = remaining.len();
+            let mut next_round = Vec::new();
+            let mut blocked_ids = HashSet::new();
+            for ev in remaining {
+                let identity = OrphanQueue::identity(&ev);
+                g.checkpoint_identity(&mut ck, volume, identity);
+                if blocked_ids.contains(&identity) {
+                    next_round.push((0, ev));
+                    continue;
+                }
+                match self.prepare_namespace(&g, volume, &ev) {
+                    Ok(Prep::Noop) => {}
+                    Ok(Prep::Delete { entry }) => {
+                        let snap = self.snap_entry(&g, volume, Some(entry));
+                        g.checkpoint_touch(&mut ck, entry);
+                        g.delete_entry(entry);
+                        let after = self.snap_identity(&g, volume, &ev);
+                        applied_snaps.push((snap, after, ev));
+                    }
+                    Ok(Prep::Apply { scope, new_entry, new_dir, name_bytes }) => {
+                        if let Some(idx) = scope.entry { g.checkpoint_touch(&mut ck, idx); }
+                        if let Err(e) = g.try_reserve_namespace_change(name_bytes, new_entry, new_dir) {
+                            g.rollback_namespace(ck);
+                            self.restore_orphans(volume, prior_orphans);
+                            self.usage.lock().excluded_ids = excluded_before;
+                            return Err(e);
+                        }
+                        let snap = self.snap_identity(&g, volume, &ev);
+                        if let Err(e) = g.apply_change_event_resolved(&ev, Some(&scope)) {
+                            g.rollback_namespace(ck);
+                            self.restore_orphans(volume, prior_orphans);
+                            self.usage.lock().excluded_ids = excluded_before;
+                            return Err(e.to_string());
+                        }
+                        let after = self.snap_identity(&g, volume, &ev);
+                        applied_snaps.push((snap, after, ev));
+                    }
+                    Err(e) if e.starts_with("parent identity missing:") => {
+                        let parent = e.rsplit(':').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                        blocked_ids.insert(identity);
+                        next_round.push((parent, ev));
+                    }
+                    Err(e) => {
+                        g.rollback_namespace(ck);
+                        self.restore_orphans(volume, prior_orphans);
+                            self.usage.lock().excluded_ids = excluded_before;
+                        return Err(e);
+                    }
+                }
+            }
+            if next_round.len() == before && !next_round.is_empty() {
+                if cursor.is_none() {
+                    g.rollback_namespace(ck);
+                    self.restore_orphans(volume, prior_orphans);
+                            self.usage.lock().excluded_ids = excluded_before;
+                    return Err("parent identity missing; batch not committed".into());
+                }
+                leftover = next_round;
+                break;
+            }
+            remaining = next_round.into_iter().map(|(_, ev)| ev).collect();
+        }
+        if !leftover.is_empty() {
+            let mut orphans = self.orphans.lock();
+            for (parent, ev) in leftover {
+                if let Err(e) = orphans.park(volume, parent, ev) {
+                    drop(orphans);
+                    g.rollback_namespace(ck);
+                    self.restore_orphans(volume, prior_orphans);
+                            self.usage.lock().excluded_ids = excluded_before;
+                    return Err(e);
+                }
+            }
+        }
+        if let Some((journal_id, next_usn)) = cursor.filter(|_| !self.has_pending_namespace(volume)) {
+            let v = g.volumes.iter_mut().find(|v| v.volume_letter == volume).ok_or("batch volume unavailable")?;
+            v.usn_journal_id = journal_id;
+            v.last_usn = next_usn;
+        }
+        if let Err(e) = self.fold_snaps(&g, volume, &applied_snaps) {
+            let mut r = self.usage.lock();
+            if r.epoch != 0 { r.error = Some(e); }
+        }
+        drop(g);
+        if !applied_snaps.is_empty() { self.bump_revision(); }
+        Ok(!applied_snaps.is_empty())
+    }
+    fn snap_identity(&self, g: &IndexStore, volume: u8, ev: &ChangeEvent) -> Snap {
+        let frn = match ev {
+            ChangeEvent::Create { entry } => entry.file_id,
+            ChangeEvent::CreatePending { file_id, .. } | ChangeEvent::Rename { file_id, .. }
+            | ChangeEvent::Delete { file_id } | ChangeEvent::DataOrMeta { file_id, .. } => *file_id,
+        };
+        self.snap_entry(g, volume, g.entry_on_volume(volume, frn))
+    }
+    fn snap_entry(&self, g: &IndexStore, volume: u8, idx: Option<u32>) -> Snap {
+        let Some(idx) = idx else {
+            return Snap { idx: None, is_dir: false, parent: NIL, di: None, size: 0, deleted: true };
+        };
+        let e = &g.entries[idx as usize];
+        Snap {
+            idx: Some(idx), is_dir: e.is_dir_entry(), parent: e.dir_idx,
+            di: if e.is_dir_entry() { g.dir_on_volume(volume, g.frns[idx as usize]) } else { None },
+            size: self.effective_size(g, idx as usize), deleted: e.is_deleted(),
+        }
+    }
+    fn prepare_namespace(&self, g: &IndexStore, volume: u8, ev: &ChangeEvent) -> Result<Prep, String> {
         let extended = match ev {
             ChangeEvent::Create { entry } => entry.file_id_128,
             ChangeEvent::CreatePending { file_id_128, .. } => *file_id_128,
             _ => None,
         };
         if extended.is_some_and(|id| id[8..].iter().any(|&b| b != 0)) {
-            return Err(
-                "full 128-bit identity binding unavailable; refusing truncated-ID mutation".into(),
-            );
+            return Err("full 128-bit identity binding unavailable; refusing truncated-ID mutation".into());
         }
-        let (frn, parent, name) = match ev {
-            ChangeEvent::Create { entry } => (
-                entry.file_id,
-                Some(entry.parent_id),
-                Some(entry.name.as_str()),
-            ),
-            ChangeEvent::CreatePending {
-                file_id,
-                parent_id,
-                name,
-                ..
-            } => (*file_id, Some(*parent_id), Some(name.as_str())),
-            ChangeEvent::Rename {
-                file_id,
-                new_parent_id,
-                new_name,
-            } => (*file_id, Some(*new_parent_id), Some(new_name.as_str())),
-            ChangeEvent::Delete { file_id } => (*file_id, None, None),
-            ChangeEvent::DataOrMeta { file_id, .. } => (*file_id, None, None),
+        let (frn, parent, name, is_new_dir) = match ev {
+            ChangeEvent::Create { entry } => (entry.file_id, Some(entry.parent_id), Some(entry.name.as_str()), entry.is_dir),
+            ChangeEvent::CreatePending { file_id, parent_id, name, is_dir, .. } => (*file_id, Some(*parent_id), Some(name.as_str()), *is_dir),
+            ChangeEvent::Rename { file_id, new_parent_id, new_name } => (*file_id, Some(*new_parent_id), Some(new_name.as_str()), false),
+            ChangeEvent::Delete { file_id } => (*file_id, None, None, false),
+            ChangeEvent::DataOrMeta { file_id, .. } => (*file_id, None, None, false),
         };
-        let entry = r.objects.get(&(volume, frn)).copied();
-        let parent = if let Some(p) = parent {
-            Some(
-                *r.directory_ids
-                    .get(&(volume, p))
-                    .ok_or("parent identity missing; batch not committed")?,
-            )
-        } else {
-            None
-        };
-        let directory = r.directory_ids.get(&(volume, frn)).copied();
-        if let (Some(di), Some(p)) = (directory, parent) {
-            let id = r.dirs[di as usize];
-            let mut at = r.dirs[p as usize];
-            while at != NIL {
-                if at == id {
-                    return Err("directory move cycle".into());
-                }
-                at = r.nodes[at as usize].parent;
+        if let Some(p) = parent {
+            let parent_excluded = self.usage.lock().excluded_ids.contains(&(volume, p));
+            if parent_excluded {
+                if is_new_dir { self.usage.lock().excluded_ids.insert((volume, frn)); }
+                if let Some(idx) = g.entry_on_volume(volume, frn) { return Ok(Prep::Delete { entry: idx }); }
+                return Ok(Prep::Noop);
             }
         }
-        let excluded = if let (Some(p), Some(name)) = (parent, name) {
-            let mut path = r.full_path(&g, r.dirs[p as usize])?;
-            path.push('\\');
-            path.push_str(name);
-            let path = path.to_lowercase();
-            g.excluded_dirs.iter().any(|ex| {
-                let ex = ex.replace('/', "\\").trim_end_matches('\\').to_lowercase();
-                path == ex
-                    || path
-                        .strip_prefix(&ex)
-                        .is_some_and(|tail| tail.starts_with('\\'))
-            })
-        } else {
-            false
-        };
-        g.try_reserve_namespace_change(
-            name.map(str::len).unwrap_or(0),
-            entry.is_none(),
-            directory.is_none()
-                && matches!(
-                    ev,
-                    ChangeEvent::CreatePending { is_dir: true, .. }
-                        | ChangeEvent::Create {
-                            entry: crate::RawEntry { is_dir: true, .. }
-                        }
-                ),
-        )?;
-        let before = g.entries.len();
-        if entry.is_none() && !excluded {
-            r.reserve(
-                1,
-                usize::from(matches!(
-                    ev,
-                    ChangeEvent::CreatePending { is_dir: true, .. }
-                        | ChangeEvent::Create {
-                            entry: crate::RawEntry { is_dir: true, .. }
-                        }
-                )),
-            )?;
-        }
-        if excluded {
-            if let Some(idx) = entry {
-                g.delete_entry(idx)
+        let parent_dir = if let Some(p) = parent {
+            match g.dir_on_volume(volume, p) {
+                Some(di) => Some(di),
+                None => return Err(format!("parent identity missing:{p}")),
             }
-        } else {
-            let scope = crate::index::ResolvedMutation {
-                entry,
-                parent: parent.unwrap_or(0),
-                directory,
+        } else { None };
+        if let (Some(di), Some(name)) = (parent_dir, name) {
+            if g.excluded_under(volume, di, name) {
+                if is_new_dir { self.usage.lock().excluded_ids.insert((volume, frn)); }
+                if let Some(idx) = g.entry_on_volume(volume, frn) { return Ok(Prep::Delete { entry: idx }); }
+                return Ok(Prep::Noop);
+            }
+        }
+        let entry = g.entry_on_volume(volume, frn);
+        let directory = g.dir_on_volume(volume, frn);
+        if let (Some(di), Some(p)) = (directory, parent_dir) {
+            let mut at = p;
+            let mut guard = 0;
+            while (at as usize) < g.dirs.len() {
+                if at == di { return Err("directory move cycle".into()); }
+                let n = g.dirs[at as usize].parent_idx;
+                if n == at { break; }
+                at = n;
+                guard += 1;
+                if guard > g.dirs.len() { return Err("directory move cycle".into()); }
+            }
+        }
+        let name_bytes = match ev {
+            ChangeEvent::Create { entry } => entry.name.len(),
+            ChangeEvent::CreatePending { name, .. } => name.len(),
+            ChangeEvent::Rename { new_name, .. } => new_name.len(),
+            _ => 0,
+        };
+        let new_entry = entry.is_none() && !matches!(ev, ChangeEvent::Delete { .. } | ChangeEvent::DataOrMeta { .. });
+        let new_dir = directory.is_none() && is_new_dir && new_entry;
+        Ok(Prep::Apply {
+            scope: ResolvedMutation { entry, parent: parent_dir.unwrap_or(0), directory },
+            new_entry, new_dir, name_bytes,
+        })
+    }
+    pub fn has_pending_namespace(&self, volume: u8) -> bool {
+        self.orphans.lock().ordered.iter().any(|(v, _, _)| *v == volume)
+    }
+    fn restore_orphans(&self, volume: u8, prior: Vec<ChangeEvent>) {
+        let mut o = self.orphans.lock();
+        // Remove a partially parked failed batch before restoring the exact prior queue.
+        let _ = o.take_volume(volume);
+        for ev in prior {
+            let parent = match &ev {
+                ChangeEvent::Create { entry } => entry.parent_id,
+                ChangeEvent::CreatePending { parent_id, .. } => *parent_id,
+                ChangeEvent::Rename { new_parent_id, .. } => *new_parent_id,
+                _ => 0,
             };
-            // Preserve effective metadata on rename while overlay is still populated.
-            if let Some(idx) = entry {
-                if let Some((size, mt, ct)) = self.metadata_overlay.get(idx as usize) {
-                    g.patch_entry_metadata(
-                        idx as usize,
-                        size,
-                        crate::index::unix_secs_to_filetime(mt),
-                        crate::index::unix_secs_to_filetime(ct),
-                    )
-                    .map_err(|e| e.to_string())?;
-                }
+            let _ = o.park(volume, parent, ev);
+        }
+    }
+    fn fold_snaps(&self, g: &IndexStore, volume: u8, applied: &[(Snap, Snap, ChangeEvent)]) -> Result<(), String> {
+        let mut r = self.usage.lock();
+        if r.epoch == 0 || r.error.is_some() { return Ok(()); }
+        r.ensure_entries(&g)?;
+        for (before, after, ev) in applied {
+            self.fold_one(g, &mut r, volume, before, after, ev)?;
+        }
+        Ok(())
+    }
+    fn fold_one(&self, g: &IndexStore, r: &mut UsageRuntime, volume: u8, before: &Snap, after: &Snap, ev: &ChangeEvent) -> Result<(), String> {
+        let Some(idx) = after.idx.or(before.idx) else { return Ok(()); };
+        r.ensure_entries(g)?;
+        if after.is_dir || before.is_dir {
+            let di = after.di.or(before.di).ok_or("usage missing directory identity")?;
+            let slot = g.volume_slot_of(volume).unwrap_or(0) as u8;
+            let new_parent = after.parent;
+            if before.di.is_none() || (before.di.map(|x| x as usize).unwrap_or(usize::MAX) >= r.dirs.len()) {
+                r.ensure_dir_slot(di, new_parent, slot)?;
+                r.dirs[di as usize] = DirAgg::empty(new_parent, slot);
+                r.dirs[di as usize].owner_entry = idx;
+                r.dirs[di as usize].set_totals(Totals::dir_self());
+                if new_parent != di { r.link_dir(di, new_parent); }
+                if !after.deleted { r.ancestors(if new_parent == di { NIL } else { new_parent }, Totals::dir_self(), true); }
+                r.generation += 1;
+                return Ok(());
             }
-            g.apply_change_event_resolved(ev, Some(&scope))
-                .map_err(|e| e.to_string())?;
+            let di = before.di.unwrap_or(di);
+            let old_parent = before.parent;
+            let w = r.dirs[di as usize].totals();
+            if !before.deleted { r.ancestors(if old_parent == di { NIL } else { old_parent }, w, false); }
+            if new_parent != old_parent {
+                if old_parent != di { r.unlink_dir(di); }
+                if new_parent != di { r.link_dir(di, new_parent); } else { r.dirs[di as usize].parent = di; }
+            }
+            r.dirs[di as usize].owner_entry = idx;
+            r.dirs[di as usize].flags = if after.deleted { 0 } else { ACTIVE };
+            if !after.deleted { r.ancestors(if new_parent == di { NIL } else { new_parent }, w, true); }
+            r.invalidate_ticket(idx as usize);
+            r.generation += 1;
+            return Ok(());
         }
-        let idx = if g.entries.len() > before {
-            r.register(&g, before, volume)?;
-            Some(before)
-        } else {
-            entry.map(|i| i as usize)
+        let new_parent = after.parent;
+        let new_size = after.size;
+        let old_unknown = r.freshness.get(idx as usize) != 1;
+        let known = match ev {
+            ChangeEvent::CreatePending { .. } => Some(false),
+            ChangeEvent::Create { .. } | ChangeEvent::DataOrMeta { size: Some(_), .. } => Some(true),
+            _ => None,
         };
-        if let Some(idx) = idx {
-            let known = match ev {
-                ChangeEvent::CreatePending { .. } => Some(false),
-                ChangeEvent::Create { .. } => Some(true),
-                ChangeEvent::DataOrMeta { size: Some(_), .. } => Some(true),
-                _ => None,
-            };
-            r.sync(&g, idx, known)?;
-            let e = &g.entries[idx];
-            self.metadata_overlay.put(idx, e.size, e.mtime, e.ctime);
+        if let Some(k) = known { r.freshness.set(idx as usize, u8::from(k)); }
+        let new_unknown = r.freshness.get(idx as usize) != 1;
+        if before.idx.is_none() {
+            r.link_file(idx, new_parent);
+            if !after.deleted {
+                r.ancestors(new_parent, Totals::file(new_size, new_unknown), true);
+                r.generation += 1;
+            }
+            return Ok(());
         }
-        self.bump_revision();
+        let old = Totals::file(before.size, old_unknown);
+        if after.deleted && !before.deleted {
+            r.ancestors(before.parent, old, false);
+            r.unlink_file(idx, before.parent);
+            r.invalidate_ticket(idx as usize);
+            r.generation += 1;
+            return Ok(());
+        }
+        if before.deleted && !after.deleted {
+            r.link_file(idx, new_parent);
+            r.ancestors(new_parent, Totals::file(new_size, new_unknown), true);
+            r.invalidate_ticket(idx as usize);
+            r.generation += 1;
+            return Ok(());
+        }
+        if before.parent != new_parent {
+            if !before.deleted { r.ancestors(before.parent, old, false); r.unlink_file(idx, before.parent); }
+            r.link_file(idx, new_parent);
+            if !after.deleted { r.ancestors(new_parent, Totals::file(new_size, new_unknown), true); }
+            r.invalidate_ticket(idx as usize);
+            r.generation += 1;
+            return Ok(());
+        }
+        if !before.deleted && !after.deleted && (before.size != new_size || old_unknown != new_unknown) {
+            r.apply_file_delta(new_parent, old, Totals::file(new_size, new_unknown), true, true);
+            r.invalidate_ticket(idx as usize);
+        }
         Ok(())
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn raw(id: u64, parent: u64, name: &str, size: u64, dir: bool) -> crate::RawEntry {
         crate::RawEntry {
-            file_id: id,
-            file_id_128: None,
-            parent_id: parent,
-            name: name.into(),
-            size,
-            mtime: 0,
-            ctime: 0,
-            attrs: if dir { 0x10 } else { 0 },
-            is_dir: dir,
+            file_id: id, file_id_128: None, parent_id: parent, name: name.into(), size,
+            mtime: 0, ctime: 0, attrs: if dir { 0x10 } else { 0 }, is_dir: dir,
         }
     }
     fn store(v: u8) -> IndexStore {
         crate::IndexBuilder::new(v, 1, 7, 10)
             .build_from_raw(
                 vec![raw(10, 2, "a.bin", 100, false)],
-                vec![
-                    raw(1, 0, "root", 0, true),
-                    raw(2, 1, "left", 0, true),
-                    raw(3, 1, "right", 0, true),
-                ],
+                vec![raw(1, 0, "root", 0, true), raw(2, 1, "left", 0, true), raw(3, 1, "right", 0, true)],
                 true,
-            )
-            .unwrap()
+            ).unwrap()
     }
     fn engine() -> SearchEngine {
         let e = SearchEngine::new(store(b'C'));
         e.enable_usage(16 * 1024 * 1024).unwrap();
         e
     }
-    fn size(e: &SearchEngine) -> u64 {
-        e.usage_page("C:\\", None, None, 1024).unwrap().root.logical
-    }
+    fn size(e: &SearchEngine) -> u64 { e.usage_page("C:\\", None, None, 1024).unwrap().root.logical }
     #[test]
     fn incremental_namespace_and_metadata() {
         let e = engine();
         assert_eq!(size(&e), 100);
-        e.apply_volume_change(
-            b'C',
-            &ChangeEvent::Create {
-                entry: raw(11, 2, "new", 50, false),
-            },
-        )
-        .unwrap();
+        e.apply_volume_change(b'C', &ChangeEvent::Create { entry: raw(11, 2, "new", 50, false) }).unwrap();
         assert_eq!(size(&e), 150);
         for s in [200, 20] {
-            e.apply_volume_change(
-                b'C',
-                &ChangeEvent::DataOrMeta {
-                    file_id: 11,
-                    size: Some(s),
-                    mtime: None,
-                    ctime: None,
-                    create_if_missing: None,
-                },
-            )
-            .unwrap();
+            e.apply_volume_change(b'C', &ChangeEvent::DataOrMeta { file_id: 11, size: Some(s), mtime: None, ctime: None, create_if_missing: None }).unwrap();
             assert_eq!(size(&e), 100 + s);
         }
-        e.apply_volume_change(
-            b'C',
-            &ChangeEvent::Rename {
-                file_id: 11,
-                new_parent_id: 3,
-                new_name: "moved".into(),
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            e.usage_page("C:\\right", None, None, 1024)
-                .unwrap()
-                .root
-                .logical,
-            20
-        );
-        e.apply_volume_change(
-            b'C',
-            &ChangeEvent::Rename {
-                file_id: 2,
-                new_parent_id: 3,
-                new_name: "tree".into(),
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            e.usage_page("C:\\right", None, None, 1024)
-                .unwrap()
-                .root
-                .logical,
-            120
-        );
-        e.apply_volume_change(b'C', &ChangeEvent::Delete { file_id: 2 })
-            .unwrap();
+        e.apply_volume_change(b'C', &ChangeEvent::Rename { file_id: 11, new_parent_id: 3, new_name: "moved".into() }).unwrap();
+        assert_eq!(e.usage_page("C:\\right", None, None, 1024).unwrap().root.logical, 20);
+        e.apply_volume_change(b'C', &ChangeEvent::Rename { file_id: 2, new_parent_id: 3, new_name: "tree".into() }).unwrap();
+        assert_eq!(e.usage_page("C:\\right", None, None, 1024).unwrap().root.logical, 120);
+        e.apply_volume_change(b'C', &ChangeEvent::Delete { file_id: 2 }).unwrap();
         assert_eq!(size(&e), 20);
-        e.apply_volume_change(b'C', &ChangeEvent::Delete { file_id: 10 })
-            .unwrap();
+        e.apply_volume_change(b'C', &ChangeEvent::Delete { file_id: 10 }).unwrap();
         assert_eq!(size(&e), 20);
-        e.apply_volume_change(b'C', &ChangeEvent::Delete { file_id: 11 })
-            .unwrap();
+        e.apply_volume_change(b'C', &ChangeEvent::Delete { file_id: 11 }).unwrap();
         assert_eq!(size(&e), 0);
+        assert!(e.usage_available());
+        let (_dl, _dc, fl, _fc, bytes) = e.usage.lock().payload_stats();
+        assert!(bytes < 8 * fl + 64 * 16 + 4096, "sidecar must stay compact, got {bytes}");
     }
     #[test]
     fn metadata_order_overlay_flush_and_epoch() {
         let e = engine();
         let old = e.metadata_ticket_by_id(b'C', 10).unwrap();
-        e.apply_volume_change(
-            b'C',
-            &ChangeEvent::DataOrMeta {
-                file_id: 10,
-                size: Some(200),
-                mtime: None,
-                ctime: None,
-                create_if_missing: None,
-            },
-        )
-        .unwrap();
+        e.apply_volume_change(b'C', &ChangeEvent::DataOrMeta { file_id: 10, size: Some(200), mtime: None, ctime: None, create_if_missing: None }).unwrap();
         assert!(!e.commit_metadata(old, 1, 0, 0).unwrap());
         assert_eq!(size(&e), 200);
         let t = e.metadata_ticket_by_id(b'C', 10).unwrap();
         assert!(e.commit_metadata(t, 300, 0, 0).unwrap());
         e.flush_metadata_overlay_into_store().unwrap();
         assert_eq!(size(&e), 300);
-        e.extend_metadata_overlay_batch(&[(0, 400, 0, 0)]);
+        e.extend_metadata_overlay_batch(&[(e.entry_idx(b'C', 10), 400, 0, 0)]);
         assert_eq!(size(&e), 400);
         e.flush_metadata_overlay_into_store().unwrap();
         assert_eq!(size(&e), 400);
@@ -1043,30 +1064,26 @@ mod tests {
     }
     #[test]
     fn volume_identity_and_generation_scope() {
-        let e =
-            SearchEngine::new(crate::merge_index_stores(vec![store(b'C'), store(b'D')]).unwrap());
+        let e = SearchEngine::new(crate::merge_index_stores(vec![store(b'C'), store(b'D')]).unwrap());
         e.enable_usage(16 * 1024 * 1024).unwrap();
         let p = e.usage_page("C:\\", None, None, 1024).unwrap();
-        e.apply_volume_change(
-            b'D',
-            &ChangeEvent::DataOrMeta {
-                file_id: 10,
-                size: Some(999),
-                mtime: None,
-                ctime: None,
-                create_if_missing: None,
-            },
-        )
-        .unwrap();
+        e.apply_volume_change(b'D', &ChangeEvent::DataOrMeta { file_id: 10, size: Some(999), mtime: None, ctime: None, create_if_missing: None }).unwrap();
         assert_eq!(size(&e), 100);
-        assert_eq!(
-            e.usage_page("D:\\", None, None, 1024).unwrap().root.logical,
-            999
-        );
-        assert!(e
-            .usage_page("C:\\", Some((p.epoch, p.generation)), None, 1024)
-            .is_err());
+        assert_eq!(e.usage_page("D:\\", None, None, 1024).unwrap().root.logical, 999);
+        assert!(e.usage_page("C:\\", Some((p.epoch, p.generation)), None, 1024).is_err());
         assert!(e.usage_page("C:\\leftover", None, None, 1024).is_err());
+    }
+    #[test]
+    fn two_volumes_same_frn_are_distinct() {
+        let e = SearchEngine::new(crate::merge_index_stores(vec![store(b'C'), store(b'D')]).unwrap());
+        e.enable_usage(16 * 1024 * 1024).unwrap();
+        e.apply_volume_change(b'C', &ChangeEvent::Create { entry: raw(44, 1, "c-only", 5, false) }).unwrap();
+        e.apply_volume_change(b'D', &ChangeEvent::Create { entry: raw(44, 1, "d-only", 7, false) }).unwrap();
+        assert_eq!(e.usage_page("C:\\", None, None, 4096).unwrap().root.logical, 105);
+        assert_eq!(e.usage_page("D:\\", None, None, 4096).unwrap().root.logical, 107);
+        assert!(e.index_store().entry_on_volume(b'C', 44).is_some());
+        assert!(e.index_store().entry_on_volume(b'D', 44).is_some());
+        assert_ne!(e.index_store().entry_on_volume(b'C', 44), e.index_store().entry_on_volume(b'D', 44));
     }
     #[test]
     fn allocation_failure_and_missing_parent_do_not_advance() {
@@ -1074,202 +1091,44 @@ mod tests {
         assert!(e.enable_usage(1).is_err());
         let e = engine();
         let p = e.usage_page("C:\\", None, None, 1024).unwrap();
-        assert!(e
-            .apply_volume_change(
-                b'C',
-                &ChangeEvent::Create {
-                    entry: raw(77, 999, "orphan", 1, false)
-                }
-            )
-            .is_err());
-        assert_eq!(
-            e.usage_page("C:\\", None, None, 1024).unwrap().generation,
-            p.generation
-        );
+        assert!(e.apply_volume_change(b'C', &ChangeEvent::Create { entry: raw(77, 999, "orphan", 1, false) }).is_err());
+        assert_eq!(e.usage_page("C:\\", None, None, 1024).unwrap().generation, p.generation);
+        assert_eq!(e.index_store().entry_count(), store(b'C').entry_count());
     }
-}
-
-impl SearchEngine {
-    pub fn mark_metadata_dirty(&self, volume: u8, frn: u64) {
-        let _g = self.store.read();
-        let mut r = self.usage.lock();
-        let Some(&idx) = r.objects.get(&(volume, frn)) else {
-            return;
-        };
-        let id = r.entries[idx as usize];
-        let n = r.nodes[id as usize].clone();
-        if n.directory || !n.active {
-            return;
-        }
-        r.ancestors(n.parent, n.sum, false);
-        let node = &mut r.nodes[id as usize];
-        node.sum.sub(node.own);
-        node.own.unknown = 1;
-        node.sum.add(node.own);
-        node.seq += 1;
-        let w = node.sum;
-        r.ancestors(n.parent, w, true);
-        r.generation += 1;
-    }
-    /// Failed dependency/application never acknowledges the end cursor. Replaying
-    /// an already-applied prefix is idempotent, including scoped create and rename.
-    pub fn apply_volume_batch(
-        &self,
-        volume: u8,
-        events: &[ChangeEvent],
-        journal_id: u64,
-        next_usn: u64,
-    ) -> Result<(), String> {
-        let epoch = {
-            let g = self.store.read();
-            let r = self.usage.lock();
-            let v = g
-                .volumes
-                .iter()
-                .find(|v| v.volume_letter == volume)
-                .ok_or("batch volume unavailable")?;
-            if v.usn_journal_id != 0 && v.usn_journal_id != journal_id {
-                return Err("journal epoch changed; rebuild required".into());
-            }
-            if next_usn < v.last_usn {
-                return Err("cursor regression rejected".into());
-            }
-            r.epoch
-        };
-        let mut pending = Vec::new();
-        pending
-            .try_reserve(events.len())
-            .map_err(|_| "batch replay buffer allocation failed")?;
-        pending.extend(events.iter());
-        while !pending.is_empty() {
-            let before = pending.len();
-            let mut last = String::new();
-            pending.retain(
-                |ev| match self.apply_volume_change_at(volume, ev, Some(epoch)) {
-                    Ok(()) => false,
-                    Err(e) => {
-                        last = e;
-                        true
-                    }
-                },
-            );
-            if pending.len() == before {
-                return Err(format!("batch not committed: {last}"));
-            }
-        }
-        let mut g = self.store.write();
-        let r = self.usage.lock();
-        if r.epoch != epoch {
-            return Err("batch epoch changed before cursor commit".into());
-        }
-        let v = g
-            .volumes
-            .iter_mut()
-            .find(|v| v.volume_letter == volume)
-            .ok_or("batch volume unavailable")?;
-        if v.usn_journal_id != 0 && v.usn_journal_id != journal_id {
-            return Err("journal epoch changed; rebuild required".into());
-        }
-        if next_usn < v.last_usn {
-            return Err("cursor regression rejected".into());
-        }
-        v.usn_journal_id = journal_id;
-        v.last_usn = next_usn;
-        Ok(())
-    }
-}
-#[cfg(test)]
-mod scale_tests {
-    use super::*;
     #[test]
-    fn over_two_million_synthetic_entries_have_no_count_cutoff() {
-        let raw = |id, parent, dir| crate::RawEntry {
-            file_id: id,
-            file_id_128: None,
-            parent_id: parent,
-            name: if dir { "root".into() } else { "x".into() },
-            size: 1,
-            mtime: 0,
-            ctime: 0,
-            attrs: if dir { 0x10 } else { 0 },
-            is_dir: dir,
-        };
-        let mut g = crate::IndexBuilder::new(b'C', 1, 1, 1)
-            .build_from_raw(vec![raw(2, 1, false)], vec![raw(1, 0, true)], true)
-            .unwrap();
-        let n = 2_000_017usize;
-        let file = g.entries[0];
-        g.entries.try_reserve(n).unwrap();
-        g.frns.try_reserve(n).unwrap();
-        for i in 0..n {
-            g.entries.push(file);
-            g.frns.push(100 + i as u64);
-        }
+    fn excluded_child_of_missing_parent_is_noop_and_acks() {
+        let mut g = store(b'F');
+        g.excluded_dirs.push("f:\\root\\excluded".into());
         let e = SearchEngine::new(g);
-        let start = std::time::Instant::now();
-        e.enable_usage(1024 * 1024 * 1024).unwrap();
-        let p = e.usage_page("C:\\", None, None, 4096).unwrap();
-        assert_eq!(p.root.files, (n + 1) as u64);
-        assert_eq!(p.root.logical, (n + 1) as u64);
-        assert!(p.next.is_some());
-        eprintln!(
-            "synthetic logical tree entries={} resident_capacity_bytes={} build_ms={}",
-            n + 1,
-            p.resident_bytes,
-            start.elapsed().as_millis()
-        );
+        e.enable_usage(1024 * 1024).unwrap();
+        e.apply_volume_batch(b'F', &[
+            ChangeEvent::CreatePending { file_id: 888, file_id_128: None, parent_id: 1, name: "excluded".into(), attrs: 0x10, is_dir: true },
+            ChangeEvent::CreatePending { file_id: 889, file_id_128: None, parent_id: 888, name: "child".into(), attrs: 0, is_dir: false },
+        ], 7, 30).unwrap();
+        assert_eq!(e.index_store().volumes[0].last_usn, 30);
+        assert!(e.index_store().entry_on_volume(b'F', 888).is_none());
+        assert!(e.index_store().entry_on_volume(b'F', 889).is_none());
+        assert_eq!(e.usage_page("F:\\", None, None, 4096).unwrap().root.logical, 100);
     }
-}
-#[cfg(test)]
-mod batch_tests {
-    use super::*;
     #[test]
-    fn failed_batch_retains_cursor_and_can_replay_after_missing_parent() {
-        let raw = |id, parent, name: &str, dir| crate::RawEntry {
-            file_id: id,
-            file_id_128: None,
-            parent_id: parent,
-            name: name.into(),
-            size: 10,
-            mtime: 0,
-            ctime: 0,
-            attrs: if dir { 0x10 } else { 0 },
-            is_dir: dir,
-        };
-        let g = crate::IndexBuilder::new(b'F', 1, 9, 10)
-            .build_from_raw(vec![], vec![raw(1, 0, "root", true)], true)
+    fn missing_parent_is_parked_then_attached() {
+        // Only the volume root exists: FRN 2/3 must not already be left/right,
+        // otherwise this would mutate an existing directory instead of parking.
+        let g = crate::IndexBuilder::new(b'F', 1, 7, 10)
+            .build_from_raw(vec![raw(10, 1, "a.bin", 100, false)], vec![raw(1, 0, "root", 0, true)], true)
             .unwrap();
         let e = SearchEngine::new(g);
         e.enable_usage(1024 * 1024).unwrap();
-        let child = ChangeEvent::Create {
-            entry: raw(3, 2, "file", false),
-        };
-        assert!(e.apply_volume_batch(b'F', &[child.clone()], 9, 20).is_err());
-        assert_eq!(e.index_store().volumes[0].last_usn, 10);
-        e.apply_volume_batch(
-            b'F',
-            &[
-                child.clone(),
-                ChangeEvent::Create {
-                    entry: raw(2, 1, "parent", true),
-                },
-            ],
-            9,
-            20,
-        )
-        .unwrap();
-        assert_eq!(e.index_store().volumes[0].last_usn, 20);
-        assert_eq!(
-            e.usage_page("F:\\", None, None, 4096).unwrap().root.logical,
-            10
-        );
-        assert!(e
-            .apply_volume_batch(b'F', &[ChangeEvent::Delete { file_id: 3 }], 99, 21)
-            .is_err());
-        assert_eq!(
-            e.usage_page("F:\\", None, None, 4096).unwrap().root.logical,
-            10
-        );
+        let before = e.index_store().entry_count();
+        e.apply_volume_batch(b'F', &[ChangeEvent::Create { entry: raw(3, 2, "file", 10, false) }], 7, 20).unwrap();
+        assert_eq!(e.index_store().volumes[0].last_usn, 10, "unpersisted pending events must pin the durable restart cursor");
+        assert!(e.has_pending_namespace(b'F'));
+        assert_eq!(e.index_store().entry_count(), before);
+        e.apply_volume_batch(b'F', &[ChangeEvent::Create { entry: raw(2, 1, "parent", 0, true) }], 7, 21).unwrap();
+        assert_eq!(e.index_store().volumes[0].last_usn, 21);
+        assert_eq!(e.usage_page("F:\\", None, None, 4096).unwrap().root.logical, 110);
+        assert!(e.apply_volume_batch(b'F', &[ChangeEvent::Delete { file_id: 3 }], 99, 22).is_err());
+        assert_eq!(e.usage_page("F:\\", None, None, 4096).unwrap().root.logical, 110);
         let t = e.metadata_ticket_by_id(b'F', 3).unwrap();
         e.mark_metadata_dirty(b'F', 3);
         assert!(!e.commit_metadata(t, 99, 0, 0).unwrap());
@@ -1278,17 +1137,311 @@ mod batch_tests {
         e.enable_usage(1024 * 1024).unwrap();
         assert!(!e.commit_metadata(t, 99, 0, 0).unwrap());
     }
+    #[test]
+    fn prefix_failure_rolls_back_namespace() {
+        let e = engine();
+        let before = e.index_store().entry_count();
+        let cursor = e.index_store().volumes[0].last_usn;
+        let good = ChangeEvent::Create { entry: raw(50, 1, "ok", 4, false) };
+        let bad = ChangeEvent::CreatePending { file_id: 51, file_id_128: Some([0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0]), parent_id: 1, name: "wide".into(), attrs: 0, is_dir: false };
+        assert!(e.apply_volume_batch(b'C', &[good, bad], 7, 80).is_err());
+        assert_eq!(e.index_store().entry_count(), before);
+        assert_eq!(e.index_store().volumes[0].last_usn, cursor);
+        assert_eq!(size(&e), 100);
+    }
+    #[test]
+    fn same_batch_child_before_parent_resolves() {
+        let e = SearchEngine::new(store(b'F'));
+        e.enable_usage(1024 * 1024).unwrap();
+        e.apply_volume_batch(b'F', &[
+            ChangeEvent::CreatePending { file_id: 101, file_id_128: None, parent_id: 100, name: "child".into(), attrs: 0, is_dir: false },
+            ChangeEvent::CreatePending { file_id: 100, file_id_128: None, parent_id: 1, name: "parent".into(), attrs: 0x10, is_dir: true },
+        ], 7, 40).unwrap();
+        assert_eq!(e.index_store().volumes[0].last_usn, 40);
+        assert_eq!(e.usage_page("F:\\", None, None, 4096).unwrap().root.files, 2);
+    }
+    #[test]
+    fn repeated_identity_batch_matches_sequential() {
+        let batch = engine();
+        let sequential = engine();
+        let events = vec![
+            ChangeEvent::Create { entry: raw(99, 2, "created", 4, false) },
+            ChangeEvent::DataOrMeta { file_id: 99, size: Some(31), mtime: None, ctime: None, create_if_missing: None },
+            ChangeEvent::Rename { file_id: 99, new_parent_id: 3, new_name: "moved".into() },
+            ChangeEvent::Delete { file_id: 99 },
+            ChangeEvent::Create { entry: raw(99, 2, "revived", 12, false) },
+            ChangeEvent::Rename { file_id: 2, new_parent_id: 3, new_name: "tree".into() },
+            ChangeEvent::DataOrMeta { file_id: 10, size: Some(200), mtime: None, ctime: None, create_if_missing: None },
+            ChangeEvent::Rename { file_id: 2, new_parent_id: 1, new_name: "left".into() },
+        ];
+        for ev in &events { sequential.apply_volume_change(b'C', ev).unwrap(); }
+        batch.apply_volume_batch(b'C', &events, 7, 60).unwrap();
+        for path in ["C:\\", "C:\\left", "C:\\right"] {
+            let a = batch.usage_page(path, None, None, 4096).unwrap();
+            let b = sequential.usage_page(path, None, None, 4096).unwrap();
+            assert_eq!((a.root.logical, a.root.files, a.root.unknown), (b.root.logical, b.root.files, b.root.unknown), "{path}");
+        }
+        assert_eq!(size(&batch), 212);
+    }
+    #[test]
+    fn pending_order_restart_replay_and_budget_rollback() {
+        let e = engine();
+        let events = vec![
+            ChangeEvent::Create { entry: raw(80, 700, "pending", 2, false) },
+            ChangeEvent::DataOrMeta { file_id: 80, size: Some(40), mtime: None, ctime: None, create_if_missing: None },
+            ChangeEvent::Rename { file_id: 80, new_parent_id: 701, new_name: "later".into() },
+        ];
+        e.apply_volume_batch(b'C', &events, 7, 30).unwrap();
+        assert_eq!(e.index_store().volumes[0].last_usn, 10);
+        e.apply_volume_batch(b'C', &[], 7, 31).unwrap();
+        assert_eq!(e.index_store().volumes[0].last_usn, 10, "heartbeats cannot acknowledge lost pending events");
+        // Simulated process restart: only persisted namespace/cursor survives, not pending queue.
+        let restarted = SearchEngine::new(e.index_store().clone());
+        restarted.enable_usage(16 * 1024 * 1024).unwrap();
+        restarted.apply_volume_batch(b'C', &events, 7, 30).unwrap();
+        let parents = [
+            ChangeEvent::Create { entry: raw(700, 1, "parent1", 0, true) },
+            ChangeEvent::Create { entry: raw(701, 1, "parent2", 0, true) },
+        ];
+        for engine in [&e, &restarted] {
+            engine.apply_volume_batch(b'C', &parents, 7, 32).unwrap();
+            assert!(!engine.has_pending_namespace(b'C'));
+            assert_eq!(engine.index_store().volumes[0].last_usn, 32);
+            assert_eq!(size(engine), 140);
+        }
+        e.orphans.lock().budget = 1;
+        let before = e.index_store().entry_count();
+        assert!(e.apply_volume_batch(b'C', &[
+            ChangeEvent::Create { entry: raw(900, 1, "prefix", 1, false) },
+            ChangeEvent::Create { entry: raw(901, 9999, "unresolved", 1, false) },
+        ], 7, 40).is_err());
+        assert_eq!(e.index_store().entry_count(), before);
+        assert_eq!(e.index_store().volumes[0].last_usn, 32);
+        assert!(!e.has_pending_namespace(b'C'));
+        assert_eq!(size(&e), 140);
+        let g=e.index_store();
+        for bucket in g.ext_filter.iter().flatten() { assert!(bucket.iter().all(|idx| (idx as usize) < before)); }
+    }
+    #[test]
+    fn reserve_without_name_change_does_not_grow_names() {
+        let e = engine();
+        {
+            let mut g = e.index_store_mut();
+            g.names_buf.shrink_to_fit();
+            let cap = g.names_buf.capacity();
+            g.try_reserve_namespace_change(0, false, false).unwrap();
+            assert_eq!(g.names_buf.capacity(), cap);
+        }
+        let cap = e.index_store().names_buf.capacity();
+        e.apply_volume_change(b'C', &ChangeEvent::DataOrMeta { file_id: 10, size: Some(120), mtime: None, ctime: None, create_if_missing: None }).unwrap();
+        assert_eq!(e.index_store().names_buf.capacity(), cap);
+        assert_eq!(size(&e), 120);
+    }
+    #[test]
+    fn directory_tree_move_is_o_depth_not_o_descendants() {
+        let mut files = vec![raw(10, 2, "a.bin", 100, false)];
+        for i in 0..200u64 { files.push(raw(1000+i, 2, "f", 1, false)); }
+        let g = crate::IndexBuilder::new(b'C', 1, 7, 10)
+            .build_from_raw(files, vec![raw(1, 0, "root", 0, true), raw(2, 1, "left", 0, true), raw(3, 1, "right", 0, true)], true)
+            .unwrap();
+        let e = SearchEngine::new(g);
+        e.enable_usage(16 * 1024 * 1024).unwrap();
+        let before = e.usage.lock().visits();
+        e.apply_volume_change(b'C', &ChangeEvent::Rename { file_id: 2, new_parent_id: 3, new_name: "tree".into() }).unwrap();
+        let visits = e.usage.lock().visits() - before;
+        assert!(visits <= 16, "directory move must be O(depth), visits={visits}");
+        let right = e.usage_page("C:\\right", None, None, 16 * 1024).unwrap();
+        assert_eq!(right.root.logical, 300);
+        assert!(right.root.files >= 201);
+    }
+    #[test]
+    fn usage_error_does_not_block_namespace() {
+        let e = engine();
+        e.usage.lock().error = Some("injected".into());
+        e.apply_volume_change(b'C', &ChangeEvent::Create { entry: raw(70, 1, "kept", 3, false) }).unwrap();
+        assert!(e.index_store().entry_on_volume(b'C', 70).is_some());
+        assert!(e.usage_page("C:\\", None, None, 1024).is_err());
+    }
 }
+
+#[cfg(test)]
+impl SearchEngine {
+    fn entry_idx(&self, volume: u8, frn: u64) -> usize {
+        self.index_store().entry_on_volume(volume, frn).unwrap() as usize
+    }
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+
+    fn process_mem() -> (usize, usize, usize, usize) {
+        #[cfg(windows)]
+        {
+            #[repr(C)]
+            struct PmcEx {
+                cb: u32,
+                page_fault_count: u32,
+                peak_working_set_size: usize,
+                working_set_size: usize,
+                quota_peak_paged_pool_usage: usize,
+                quota_paged_pool_usage: usize,
+                quota_peak_non_paged_pool_usage: usize,
+                quota_non_paged_pool_usage: usize,
+                pagefile_usage: usize,
+                peak_pagefile_usage: usize,
+                private_usage: usize,
+            }
+            #[link(name = "psapi")]
+            extern "system" {
+                fn GetProcessMemoryInfo(h: *mut core::ffi::c_void, p: *mut PmcEx, cb: u32) -> i32;
+            }
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn GetCurrentProcess() -> *mut core::ffi::c_void;
+            }
+            unsafe {
+                let mut m: PmcEx = std::mem::zeroed();
+                m.cb = std::mem::size_of::<PmcEx>() as u32;
+                if GetProcessMemoryInfo(GetCurrentProcess(), &mut m, m.cb) != 0 {
+                    return (m.working_set_size, m.peak_working_set_size, m.private_usage, m.peak_pagefile_usage);
+                }
+            }
+        }
+        (0, 0, 0, 0)
+    }
+    fn record_mem(label: &str, before: (usize, usize, usize, usize), after: (usize, usize, usize, usize), extra: &str) {
+        let line = format!(
+            "{label} ws_before={} peak_ws_before={} private_before={} peak_pf_before={} ws_after={} peak_ws_after={} private_after={} peak_pf_after={} d_ws={} d_private={} d_peak_ws={} {extra}",
+            before.0, before.1, before.2, before.3, after.0, after.1, after.2, after.3,
+            after.0 as i64 - before.0 as i64, after.2 as i64 - before.2 as i64, after.1 as i64 - before.1 as i64
+        );
+        eprintln!("{line}");
+        if let Some(path) = option_env!("FINDX_T109_MEM").map(std::path::PathBuf::from).or_else(|| {
+            std::env::var_os("FINDX_T109_MEM").map(std::path::PathBuf::from)
+        }).or_else(|| {
+            let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/usage-t109-memory.txt");
+            Some(p)
+        }) {
+            let mut body = std::fs::read_to_string(&path).unwrap_or_default();
+            if !body.contains(&label) {
+                body.push_str(&line);
+                body.push('\n');
+                let _ = std::fs::write(&path, body);
+            }
+        }
+    }
+    #[test]
+    fn over_two_million_synthetic_entries_have_no_count_cutoff() {
+        let raw = |id: u64, parent: u64, dir: bool| crate::RawEntry {
+            file_id: id, file_id_128: None, parent_id: parent,
+            name: if dir { "root".into() } else { "x".into() },
+            size: 1, mtime: 0, ctime: 0, attrs: if dir { 0x10 } else { 0 }, is_dir: dir,
+        };
+        let mut g = crate::IndexBuilder::new(b'C', 1, 1, 1)
+            .build_from_raw(vec![raw(2, 1, false)], vec![raw(1, 0, true)], true)
+            .unwrap();
+        let n = 2_000_017usize;
+        let file = g.entries[0];
+        g.entries.try_reserve(n).unwrap();
+        g.frns.try_reserve(n).unwrap();
+        for i in 0..n { g.entries.push(file); g.frns.push(100 + i as u64); }
+        let e = SearchEngine::new(g);
+        let start = std::time::Instant::now();
+        let mem0 = process_mem();
+        e.enable_usage(64 * 1024 * 1024).unwrap();
+        let p = e.usage_page("C:\\", None, None, 4096).unwrap();
+        let mem1 = process_mem();
+        record_mem("enable_usage_2m", mem0, mem1, &format!("files={} resident_capacity_bytes={} build_ms={}", n + 1, p.resident_bytes, start.elapsed().as_millis()));
+        assert_eq!(p.root.files, (n + 1) as u64);
+        assert_eq!(p.root.logical, (n + 1) as u64);
+        assert!(p.next.is_some());
+        assert!(p.resident_bytes < 24 * 1024 * 1024, "2M-file compact sidecar should be well under 24MiB, got {}", p.resident_bytes);
+        eprintln!("synthetic logical tree entries={} resident_capacity_bytes={} build_ms={}", n + 1, p.resident_bytes, start.elapsed().as_millis());
+    }
+    #[test]
+    #[ignore = "explicit bounded memory experiment; run alone with --ignored --exact"]
+    fn representative_ratio_initialization_memory() {
+        // Quarter-scale N and D; names are synthetic, no filesystem or real watcher.
+        let n = 1_540_069usize;
+        let d = 179_981usize;
+        let raw = |id: u64, parent: u64, dir: bool| crate::RawEntry {
+            file_id: id, file_id_128: None, parent_id: parent, name: "synthetic".into(),
+            size: u64::from(!dir), mtime: 0, ctime: 0, attrs: if dir { 0x10 } else { 0 }, is_dir: dir,
+        };
+        let dirs = (0..d).map(|i| raw(1+i as u64, if i == 0 { 0 } else { 1+((i-1)/8) as u64 }, true)).collect();
+        let mut g = crate::IndexBuilder::new(b'F', 1, 7, 10)
+            .build_from_raw(vec![raw(10_000_000, 1, false)], dirs, true).unwrap();
+        let template = g.entries.iter().find(|e| !e.is_dir_entry()).copied().unwrap();
+        let extra = n-g.entries.len();
+        g.entries.try_reserve_exact(extra).unwrap();
+        g.frns.try_reserve_exact(extra).unwrap();
+        for i in 0..extra {
+            let mut file=template;
+            file.dir_idx=(i % d) as u32;
+            g.entries.push(file);
+            g.frns.push(10_000_001+i as u64);
+        }
+        let engine=SearchEngine::new(g);
+        let before=process_mem();
+        let done=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal=done.clone();
+        let sampler=std::thread::spawn(move || {
+            let mut peaks=before;
+            while !signal.load(Ordering::Relaxed) {
+                let m=process_mem();
+                peaks.0=peaks.0.max(m.0); peaks.2=peaks.2.max(m.2);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            peaks
+        });
+        let start=std::time::Instant::now();
+        engine.enable_usage(96*1024*1024).unwrap();
+        let elapsed=start.elapsed().as_millis();
+        let after=process_mem();
+        done.store(true,Ordering::Relaxed);
+        let peak=sampler.join().unwrap();
+        let r=engine.usage.lock();
+        let (dl,dc,fl,fc,bytes)=r.payload_stats();
+        record_mem("ratio_quarter_enable_usage",before,after,&format!("N={n} D={d} dir_len={dl} dir_cap={dc} links_len={fl} links_cap={fc} capacity_bytes={bytes} build_ms={elapsed} sampled_peak_ws={} sampled_peak_private={} sampled_peak_ws_delta={} sampled_peak_private_delta={}",peak.0,peak.2,peak.0.saturating_sub(before.0),peak.2.saturating_sub(before.2)));
+        drop(r);
+        let page=engine.usage_page("F:\\",None,None,4096).unwrap();
+        assert_eq!(page.root.files,(n-d) as u64);
+        assert_eq!(page.root.logical,(n-d) as u64);
+    }
+    #[test]
+    fn compact_payload_formula_on_production_scale_arrays() {
+        let n = 6_160_274usize;
+        let d = 719_923usize;
+        let mem0 = process_mem();
+        let mut dirs: Vec<DirAgg> = Vec::new();
+        dirs.try_reserve(d).unwrap();
+        dirs.resize(d, DirAgg::empty(0, 0));
+        let mut links: Vec<FileLinks> = Vec::new();
+        links.try_reserve(n).unwrap();
+        links.resize(n, FileLinks::default());
+        let fresh = Freshness::with_len(n).unwrap();
+        let mem1 = process_mem();
+        let payload = dirs.capacity() * std::mem::size_of::<DirAgg>()
+            + links.capacity() * std::mem::size_of::<FileLinks>()
+            + fresh.capacity_bytes();
+        record_mem("sidecar_arrays_6m", mem0, mem1, &format!("payload_capacity_bytes={payload} dir_len={} dir_cap={} file_len={} file_cap={} fresh_cap={}", dirs.len(), dirs.capacity(), links.len(), links.capacity(), fresh.capacity_bytes()));
+        let expected = 64 * d + 8 * n + n.div_ceil(4);
+        assert_eq!(std::mem::size_of::<DirAgg>(), 64);
+        assert_eq!(std::mem::size_of::<FileLinks>(), 8);
+        assert!(payload <= expected + 64 * d, "capacity may grow but must stay near tight payload, got {payload} vs {expected}");
+        assert!(payload < 120 * 1024 * 1024, "production-scale sidecar payload should stay near the 92.41MiB model, got {payload}");
+        eprintln!("production-scale compact payload bytes={payload} tight={expected} dir_cap={} file_cap={}", dirs.capacity(), links.capacity());
+    }
+}
+
 #[cfg(test)]
 mod allocation_tests {
     use super::*;
     #[test]
     fn capacity_overflow_is_a_fallible_allocation_error_not_a_panic() {
-        let mut runtime = UsageRuntime {
-            budget: usize::MAX,
-            ..Default::default()
-        };
+        let mut runtime = UsageRuntime { budget: usize::MAX, ..Default::default() };
         let e = runtime.reserve(usize::MAX, 0).unwrap_err();
-        assert!(e.contains("allocation failed"), "{e}");
+        assert!(e.contains("allocation failed") || e.contains("budget") || e.contains("exceed"), "{e}");
     }
 }

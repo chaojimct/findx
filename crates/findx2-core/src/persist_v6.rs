@@ -425,6 +425,37 @@ pub fn v6_load(layout: &V6Layout) -> Result<IndexStore> {
     let deleted = rebuild_deleted(&entries);
 
     let volumes: Vec<VolumeState> = m.volumes.iter().map(VolumeState::from).collect();
+    if volumes.len() > 1 {
+        dir_index = FrnIdxMap::with_capacity(dirs.len());
+        for (i, d) in dirs.iter().enumerate() {
+            let mut at = i as u32;
+            for _ in 0..=dirs.len() {
+                let p = dirs[at as usize].parent_idx;
+                if p as usize == at as usize || (p as usize) >= dirs.len() { break; }
+                at = p;
+            }
+            let roots: Vec<u32> = dirs.iter().enumerate().filter(|(j, e)| e.parent_idx as usize == *j).map(|(j, _)| j as u32).collect();
+            let slot = roots.iter().position(|r| *r == at).unwrap_or(0) as u32;
+            dir_index.push_unsorted_on(d.frn, i as u32, slot);
+        }
+        dir_index.finalize_build();
+        frn_to_entry = FrnIdxMap::with_capacity(frns.len());
+        for (i, fr) in frns.iter().enumerate() {
+            if *fr == 0 { continue; }
+            let dir_idx = entries.get(i).map(|e| e.dir_idx).unwrap_or(0);
+            let mut at = dir_idx;
+            for _ in 0..=dirs.len() {
+                if (at as usize) >= dirs.len() { break; }
+                let p = dirs[at as usize].parent_idx;
+                if p as usize == at as usize { break; }
+                at = p;
+            }
+            let roots: Vec<u32> = dirs.iter().enumerate().filter(|(j, e)| e.parent_idx as usize == *j).map(|(j, _)| j as u32).collect();
+            let slot = roots.iter().position(|r| *r == at).unwrap_or(0) as u32;
+            frn_to_entry.push_unsorted_on(*fr, i as u32, slot);
+        }
+        frn_to_entry.finalize_build();
+    }
     let excluded_dirs = load_exclude_sidecar(&layout.index_bin);
 
     // trigram 边车挂载（.tri mmap + .tri.pending，与 v5 同语义）+ cjk 位图重建。

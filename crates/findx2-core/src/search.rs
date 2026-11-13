@@ -120,6 +120,7 @@ impl Default for BackfillProgress {
 pub struct SearchEngine {
     pub(crate) store: RwLock<IndexStore>,
     pub(crate) usage: parking_lot::Mutex<crate::usage::UsageRuntime>,
+    pub(crate) orphans: parking_lot::Mutex<crate::usage::OrphanQueue>,
     backfill: Arc<BackfillProgress>,
     /// 回填元数据的紧凑 overlay（取代之前的 `DashMap`）：
     /// - 长度固定 = entry_count，按 idx 平铺 16 字节/条；
@@ -170,6 +171,7 @@ impl SearchEngine {
         Self {
             store: RwLock::new(store),
             usage: parking_lot::Mutex::new(Default::default()),
+            orphans: parking_lot::Mutex::new(Default::default()),
             backfill: Arc::new(BackfillProgress::default()),
             metadata_overlay: Arc::new(MetaOverlay::new(entry_count)),
             revision: AtomicU64::new(0),
@@ -180,6 +182,7 @@ impl SearchEngine {
     /// 索引变更计数（见字段文档）。service 经 `index_store_mut()` 直接改索引后，
     /// 调本函数使分页缓存失效（USN flush 每批调一次即可，不必每条）。
     pub fn note_external_mutation(&self) {
+        self.orphans.lock().clear();
         let mut u = self.usage.lock();
         u.epoch = 0;
         u.error = Some("index epoch changed; usage requires reinitialization".into());
@@ -213,13 +216,16 @@ impl SearchEngine {
         if items.is_empty() {
             return;
         }
-        let _guard = self.store.write();
+        let guard = self.store.write();
         let mut usage = self.usage.lock();
         for &(idx, size, m_ft, c_ft) in items {
             let mtime = crate::index::filetime_to_unix_secs(m_ft);
             let ctime = crate::index::filetime_to_unix_secs(c_ft);
+            let parent = guard.entries.get(idx).map(|e| e.dir_idx).unwrap_or(0);
+            let old = self.metadata_overlay.get(idx).map(|t| t.0).unwrap_or_else(|| guard.entries.get(idx).map(|e| e.size).unwrap_or(0));
+            let was_unknown = self.metadata_overlay.get(idx).is_none();
             self.metadata_overlay.put(idx, size, mtime, ctime);
-            usage.overlay_value(idx, size);
+            usage.overlay_delta(parent, old, size, was_unknown, idx);
         }
         // overlay 参与 size/time 过滤与排序：回填写入即视为索引变更。
         self.bump_revision();
@@ -1168,8 +1174,11 @@ impl SearchEngine {
         ctime: u64,
     ) -> Result<()> {
         let mut g = self.store.write();
+        let parent = g.entries.get(idx).map(|e| e.dir_idx).unwrap_or(0);
+        let old = self.metadata_overlay.get(idx).map(|t| t.0).unwrap_or_else(|| g.entries.get(idx).map(|e| e.size).unwrap_or(0));
+        let was_unknown = self.metadata_overlay.get(idx).is_none();
         g.patch_entry_metadata(idx, size, mtime, ctime)?;
-        self.usage.lock().metadata_sync(&g, idx);
+        self.usage.lock().metadata_sync(parent, old, size, was_unknown, idx);
         self.bump_revision();
         self.metadata_overlay.put(
             idx,

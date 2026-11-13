@@ -34,11 +34,19 @@ use crate::platform::{ChangeEvent, RawEntry};
 /// `get` 的成本：
 /// - cold path = 二分 23 次比较（log2 8.5M），实测 < 100 ns，比哈希慢可忽略；
 /// - 搜索热路径根本不用 `frn_to_entry`，所以这点开销不进 P50。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ScopedIdentity {
+    frn: u64,
+    idx: u32,
+    volume_slot: u32,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct FrnIdxMap {
-    sorted: Vec<(u64, u32)>,
-    /// USN 增量过来的 (frn -> idx) 覆盖；rebuild_sorted 时会被吸收。
-    overlay: FxHashMap<u64, u32>,
+    sorted: Vec<ScopedIdentity>,
+    /// USN 增量过来的 ((frn, volume_slot) -> idx) 覆盖。
+    overlay: FxHashMap<(u64, u32), u32>,
 }
 
 impl FrnIdxMap {
@@ -64,13 +72,15 @@ impl FrnIdxMap {
     pub fn finalize_build(&mut self) {
         // rayon 并行排序：加载路径 8.5M 条目时省 ~1.5s（单线程 unstable sort 是启动大头之一）；
         // 小数据（<4096）rayon 自动退化为串行，无额外开销。
-        self.sorted.par_sort_unstable_by_key(|&(k, _)| k);
-        // 重复 frn 保留最后一次：从尾部往前扫，重复时丢弃前者。
+        self.sorted.par_sort_unstable_by_key(|s| (s.frn, s.volume_slot));
+        // 仅对同一 (frn, volume_slot) 去重并保留最后一次，两卷相同 FRN 同时保留。
         if self.sorted.len() > 1 {
             let mut write = 0usize;
             for read in 0..self.sorted.len() {
-                if read + 1 < self.sorted.len() && self.sorted[read].0 == self.sorted[read + 1].0 {
-                    // 当前 read 与下一个同 key，丢弃 read。
+                if read + 1 < self.sorted.len()
+                    && self.sorted[read].frn == self.sorted[read + 1].frn
+                    && self.sorted[read].volume_slot == self.sorted[read + 1].volume_slot
+                {
                     continue;
                 }
                 if write != read {
@@ -85,30 +95,59 @@ impl FrnIdxMap {
 
     /// 构建期 push（不去重、不排序），结束后请调用 `finalize_build`。
     pub fn push_unsorted(&mut self, frn: u64, idx: u32) {
-        self.sorted.push((frn, idx));
+        self.push_unsorted_on(frn, idx, 0);
+    }
+    pub fn push_unsorted_on(&mut self, frn: u64, idx: u32, volume_slot: u32) {
+        self.sorted.push(ScopedIdentity { frn, idx, volume_slot });
     }
 
     /// 增量场景：写入覆盖表（与 HashMap 的 insert 语义一致：返回旧值 / None）。
     /// 不直接改 sorted 段，避免 O(N) shift。
     pub fn insert(&mut self, frn: u64, idx: u32) -> Option<u32> {
-        if let Some(prev) = self.overlay.insert(frn, idx) {
+        self.insert_scoped(frn, idx, 0)
+    }
+    pub fn insert_scoped(&mut self, frn: u64, idx: u32, volume_slot: u32) -> Option<u32> {
+        if let Some(prev) = self.overlay.insert((frn, volume_slot), idx) {
             return Some(prev);
         }
-        // 第一次覆盖该 key：返回 sorted 中的旧值（如果有），保持 HashMap 行为。
-        self.get_idx(frn)
+        self.get_scoped(frn, volume_slot)
     }
 
     /// 与 `HashMap::get` 同名同形：返回 `Option<&u32>`。
     /// overlay 命中时直接借出 overlay 内的 u32 引用；sorted 命中时借 sorted 段内的 u32 引用。
     /// 二者借用都来自 &self，借用期 ≤ &self，符合 Rust 别名规则。
     pub fn get(&self, frn: &u64) -> Option<&u32> {
-        if let Some(v) = self.overlay.get(frn) {
+        let mut found: Option<&u32> = None;
+        for ((f, _), v) in &self.overlay {
+            if f == frn {
+                if let Some(prev) = found {
+                    if prev != v { return None; }
+                } else { found = Some(v); }
+            }
+        }
+        let i = self.sorted.partition_point(|s| s.frn < *frn);
+        let mut j = i;
+        while j < self.sorted.len() && self.sorted[j].frn == *frn {
+            if self.overlay.contains_key(&(*frn, self.sorted[j].volume_slot)) {
+                j += 1;
+                continue;
+            }
+            let v = &self.sorted[j].idx;
+            if let Some(prev) = found {
+                if *prev != *v { return None; }
+            } else { found = Some(v); }
+            j += 1;
+        }
+        found
+    }
+    pub fn get_scoped(&self, frn: u64, volume_slot: u32) -> Option<u32> {
+        if let Some(&v) = self.overlay.get(&(frn, volume_slot)) {
             return Some(v);
         }
-        match self.sorted.binary_search_by_key(frn, |&(k, _)| k) {
-            Ok(i) => Some(&self.sorted[i].1),
-            Err(_) => None,
-        }
+        self.sorted
+            .binary_search_by_key(&(frn, volume_slot), |s| (s.frn, s.volume_slot))
+            .ok()
+            .map(|i| self.sorted[i].idx)
     }
 
     /// 值版本，省去 `*x.get(...).unwrap_or(&0)` 写法。
@@ -132,16 +171,20 @@ impl FrnIdxMap {
     /// 合并相邻 store 时使用：把 (k, v) 序列耗尽地拷贝出来（包含 overlay）。
     /// 调用方必须自行 finalize_build。
     pub fn drain(&mut self) -> impl Iterator<Item = (u64, u32)> + '_ {
-        // 先 drain sorted，再 drain overlay（顺序不重要：overlay 覆盖 sorted 的语义在合并阶段不存在）。
-        let sorted_iter = self.sorted.drain(..);
-        let overlay_iter = self.overlay.drain();
+        self.drain_scoped().map(|(frn, idx, _slot)| (frn, idx))
+    }
+    pub fn drain_scoped(&mut self) -> impl Iterator<Item = (u64, u32, u32)> + '_ {
+        let sorted_iter = self.sorted.drain(..).map(|s| (s.frn, s.idx, s.volume_slot));
+        let overlay_iter = self.overlay.drain().map(|((frn, slot), idx)| (frn, idx, slot));
         sorted_iter.chain(overlay_iter)
     }
+    pub fn clone_overlay(&self) -> FxHashMap<(u64, u32), u32> { self.overlay.clone() }
+    pub fn restore_overlay(&mut self, overlay: FxHashMap<(u64, u32), u32>) { self.overlay = overlay; }
 
     /// 内存占用估算（用于诊断 / progress 日志）。
     pub fn approx_bytes(&self) -> usize {
-        self.sorted.capacity() * std::mem::size_of::<(u64, u32)>()
-            + self.overlay.capacity() * (std::mem::size_of::<(u64, u32)>() + 8)
+        self.sorted.capacity() * std::mem::size_of::<ScopedIdentity>()
+            + self.overlay.capacity() * (std::mem::size_of::<((u64, u32), u32)>() + 8)
     }
 }
 
@@ -379,6 +422,28 @@ impl FileEntry {
         a &= !Self::ATTR_DELETED;
         a
     }
+}
+
+pub struct NamespaceCheckpoint {
+    names_len: usize,
+    entries_len: usize,
+    dirs_len: usize,
+    frns_len: usize,
+    ranges_len: usize,
+    paths_len: usize,
+    log_len: Option<usize>,
+    frn_overlay: FxHashMap<(u64, u32), Option<u32>>,
+    dir_overlay: FxHashMap<(u64, u32), Option<u32>>,
+    saved: FxHashMap<u32, SlotSnap>,
+}
+struct SlotSnap {
+    idx: u32,
+    entry: FileEntry,
+    frn: u64,
+    deleted: bool,
+    tri: bool,
+    cjk: bool,
+    dir: Option<(u32, DirEntry, (u32, u32))>,
 }
 
 /// 主索引（P0-2 单卷重建需要整体克隆：读锁下 memcpy，搜索不阻塞）。
@@ -916,7 +981,8 @@ impl IndexStore {
             .get_or_insert_with(RoaringBitmap::new)
             .insert(new_idx);
         self.frns.push(raw.file_id);
-        self.frn_to_entry.insert(raw.file_id, new_idx);
+        let slot = self.volume_slot_of(self.volume_letter_u8_for_dir(dir_idx).unwrap_or(0)).unwrap_or(0);
+        self.frn_to_entry.insert_scoped(raw.file_id, new_idx, slot);
         self.note_name_change(new_idx);
         self.log_mut(Mutation::PushFile {
             entry,
@@ -1353,7 +1419,8 @@ impl IndexStore {
             name_len: raw.name.len() as u16,
         });
         self.dir_path_ranges.push((0, 0));
-        self.dir_index.insert(raw.file_id, di);
+        let slot = self.volume_slot_of(self.volume_letter_u8_for_dir(parent_idx).unwrap_or(0)).unwrap_or(0);
+        self.dir_index.insert_scoped(raw.file_id, di, slot);
 
         let eh = hash_ext8(&raw.name);
         let attrs = FileEntry::ATTR_IS_DIR | ((eh as u32) << 8);
@@ -1377,7 +1444,7 @@ impl IndexStore {
         self.entries.push(entry);
         self.ext_insert_idx(new_idx, eh);
         self.frns.push(raw.file_id);
-        self.frn_to_entry.insert(raw.file_id, new_idx);
+        self.frn_to_entry.insert_scoped(raw.file_id, new_idx, slot);
         self.note_name_change(new_idx);
         self.log_mut(Mutation::PushDir {
             entry,
@@ -1583,6 +1650,167 @@ impl IndexStore {
             .unwrap_or('C')
     }
 
+    pub fn volume_slot_of(&self, letter: u8) -> Option<u32> {
+        self.volumes.iter().position(|v| v.volume_letter == letter).map(|i| i as u32)
+    }
+    pub fn dir_root_idx(&self, mut di: u32) -> u32 {
+        let mut guard = 0usize;
+        while (di as usize) < self.dirs.len() {
+            let p = self.dirs[di as usize].parent_idx;
+            if p == di { return di; }
+            di = p;
+            guard += 1;
+            if guard > self.dirs.len() { break; }
+        }
+        di
+    }
+    pub fn volume_letter_u8_for_dir(&self, dir_idx: u32) -> Option<u8> {
+        if self.volumes.len() == 1 {
+            return self.volumes.first().map(|v| v.volume_letter);
+        }
+        let root = self.dir_root_idx(dir_idx);
+        let roots: Vec<u32> = self
+            .dirs
+            .iter()
+            .enumerate()
+            .filter(|(i, d)| d.parent_idx as usize == *i)
+            .map(|(i, _)| i as u32)
+            .collect();
+        roots
+            .iter()
+            .position(|r| *r == root)
+            .and_then(|i| self.volumes.get(i).map(|v| v.volume_letter))
+    }
+    pub fn entry_on_volume(&self, letter: u8, frn: u64) -> Option<u32> {
+        let slot = self.volume_slot_of(letter)?;
+        if let Some(idx) = self.frn_to_entry.get_scoped(frn, slot) {
+            return Some(idx);
+        }
+        let idx = *self.frn_to_entry.get(&frn)?;
+        if self.entry_belongs_to_volume(idx, letter) { Some(idx) } else { None }
+    }
+    pub fn dir_on_volume(&self, letter: u8, frn: u64) -> Option<u32> {
+        let slot = self.volume_slot_of(letter)?;
+        if let Some(idx) = self.dir_index.get_scoped(frn, slot) {
+            return Some(idx);
+        }
+        let idx = *self.dir_index.get(&frn)?;
+        if self.volume_letter_u8_for_dir(idx) == Some(letter) { Some(idx) } else { None }
+    }
+    fn entry_belongs_to_volume(&self, idx: u32, letter: u8) -> bool {
+        self.volume_for_entry_by_parent(idx as usize)
+            .or_else(|| self.volume_for_entry(idx as usize))
+            .map(|v| v.volume_letter == letter)
+            .unwrap_or(false)
+    }
+    pub fn excluded_under(&self, letter: u8, parent_dir: u32, name: &str) -> bool {
+        if self.excluded_dirs.is_empty() { return false; }
+        let Some(vol) = self.volumes.iter().find(|v| v.volume_letter == letter) else { return false; };
+        let parent_path = self.resolve_dir_path_lower(parent_dir);
+        let mut full = compose_volume_dir_path(vol, parent_path.as_ref());
+        let sep = vol.path_sep_byte() as char;
+        if !full.ends_with(sep) && !full.is_empty() { full.push(sep); }
+        for c in name.chars() { full.push(c.to_ascii_lowercase()); }
+        self.excluded_dirs.iter().any(|ex| paths_excluded(&full, ex, vol.path_sep_byte()))
+    }
+    pub fn namespace_checkpoint(&self) -> NamespaceCheckpoint {
+        NamespaceCheckpoint {
+            names_len: self.names_buf.len(),
+            entries_len: self.entries.len(),
+            dirs_len: self.dirs.len(),
+            frns_len: self.frns.len(),
+            ranges_len: self.dir_path_ranges.len(),
+            paths_len: self.dir_paths_buf.len(),
+            log_len: self.mutation_log.as_ref().map(|l| l.len()),
+            frn_overlay: FxHashMap::default(),
+            dir_overlay: FxHashMap::default(),
+            saved: FxHashMap::default(),
+        }
+    }
+    pub fn reserve_namespace_checkpoint(&mut self, ck: &mut NamespaceCheckpoint, count: usize) -> Result<(), String> {
+        ck.saved.try_reserve(count).map_err(|_| "namespace before-image allocation failed")?;
+        ck.frn_overlay.try_reserve(count).map_err(|_| "namespace FRN undo allocation failed")?;
+        ck.dir_overlay.try_reserve(count).map_err(|_| "namespace directory undo allocation failed")?;
+        self.frn_to_entry.overlay.try_reserve(count).map_err(|_| "namespace FRN overlay allocation failed")?;
+        self.dir_index.overlay.try_reserve(count).map_err(|_| "namespace directory overlay allocation failed")?;
+        Ok(())
+    }
+    pub fn checkpoint_identity(&self, ck: &mut NamespaceCheckpoint, volume: u8, frn: u64) {
+        let slot=self.volume_slot_of(volume).unwrap_or(0);
+        let key=(frn,slot);
+        ck.frn_overlay.entry(key).or_insert_with(|| self.frn_to_entry.overlay.get(&key).copied());
+        ck.dir_overlay.entry(key).or_insert_with(|| self.dir_index.overlay.get(&key).copied());
+    }
+    pub fn checkpoint_touch(&self, ck: &mut NamespaceCheckpoint, idx: u32) {
+        if ck.saved.contains_key(&idx) || idx as usize >= ck.entries_len { return; }
+        let Some(entry) = self.entries.get(idx as usize).copied() else { return; };
+        let frn = self.frns.get(idx as usize).copied().unwrap_or(0);
+        let dir = if entry.is_dir_entry() {
+            self.dir_on_volume(self.volume_letter_u8_for_dir(entry.dir_idx).unwrap_or(0), frn)
+                .or_else(|| self.dir_index.get(&frn).copied())
+                .and_then(|di| {
+                    let d = self.dirs.get(di as usize)?.clone();
+                    let range = self.dir_path_ranges.get(di as usize).copied().unwrap_or((0, 0));
+                    Some((di, d, range))
+                })
+        } else { None };
+        ck.saved.insert(idx, SlotSnap {
+            idx,
+            entry,
+            frn,
+            deleted: self.deleted.contains(idx),
+            tri: self.tri_pending.contains(idx),
+            cjk: self.cjk_names.contains(idx),
+            dir,
+        });
+    }
+    pub fn rollback_namespace(&mut self, ck: NamespaceCheckpoint) {
+        let appended = ck.entries_len as u32..=u32::MAX;
+        self.deleted.remove_range(appended.clone());
+        self.tri_pending.remove_range(appended.clone());
+        self.cjk_names.remove_range(appended.clone());
+        for bucket in self.ext_filter.iter_mut().flatten() { bucket.remove_range(appended.clone()); }
+        if self.entries.len() > ck.entries_len {
+            self.entries.truncate(ck.entries_len);
+        }
+        if self.frns.len() > ck.frns_len { self.frns.truncate(ck.frns_len); }
+        if self.dirs.len() > ck.dirs_len { self.dirs.truncate(ck.dirs_len); }
+        if self.dir_path_ranges.len() > ck.ranges_len { self.dir_path_ranges.truncate(ck.ranges_len); }
+        if self.names_buf.len() > ck.names_len { self.names_buf.truncate(ck.names_len); }
+        if self.dir_paths_buf.len() > ck.paths_len { self.dir_paths_buf.truncate(ck.paths_len); }
+        if let (Some(log), Some(len)) = (self.mutation_log.as_mut(), ck.log_len) {
+            log.truncate(len);
+        }
+        for (_, s) in ck.saved {
+            if (s.idx as usize) < self.entries.len() {
+                let old_eh = self.entries[s.idx as usize].ext_hash_u8();
+                self.ext_remove_idx(s.idx, old_eh);
+                self.entries[s.idx as usize] = s.entry;
+                if (s.idx as usize) < self.frns.len() { self.frns[s.idx as usize] = s.frn; }
+                self.ext_insert_idx(s.idx, s.entry.ext_hash_u8());
+                if s.deleted { self.deleted.insert(s.idx); } else { self.deleted.remove(s.idx); }
+                if s.tri { self.tri_pending.insert(s.idx); } else { self.tri_pending.remove(s.idx); }
+                if s.cjk { self.cjk_names.insert(s.idx); } else { self.cjk_names.remove(s.idx); }
+            }
+            if let Some((di, dir, range)) = s.dir {
+                if (di as usize) < self.dirs.len() {
+                    self.dirs[di as usize] = dir;
+                    if (di as usize) < self.dir_path_ranges.len() {
+                        self.dir_path_ranges[di as usize] = range;
+                    }
+                }
+            }
+        }
+        for (key, value) in ck.frn_overlay {
+            if let Some(v) = value { self.frn_to_entry.overlay.insert(key, v); }
+            else { self.frn_to_entry.overlay.remove(&key); }
+        }
+        for (key, value) in ck.dir_overlay {
+            if let Some(v) = value { self.dir_index.overlay.insert(key, v); }
+            else { self.dir_index.overlay.remove(&key); }
+        }
+    }
+
     /// USN / 外部增量：Rename、目录 Create、`DataOrMeta` 重排排序向量、扩展名桶
     /// Fallible preflight for the growing contiguous namespace/log storage.
     pub fn try_reserve_namespace_change(
@@ -1591,9 +1819,11 @@ impl IndexStore {
         new_entry: bool,
         new_dir: bool,
     ) -> std::result::Result<(), String> {
-        self.names_buf
-            .try_reserve(name_bytes.saturating_add(1))
-            .map_err(|_| "index name buffer allocation failed")?;
+        if name_bytes > 0 {
+            self.names_buf
+                .try_reserve(name_bytes.saturating_add(1))
+                .map_err(|_| "index name buffer allocation failed")?;
+        }
         if new_entry {
             self.entries
                 .try_reserve(1)
@@ -2507,12 +2737,13 @@ pub fn merge_index_stores(stores: Vec<IndexStore>) -> crate::Result<IndexStore> 
 
         merged_frns.extend(store.frns.drain(..));
 
-        for (k, v) in store.dir_index.drain() {
-            dir_index.push_unsorted(k, v.saturating_add(dir_base));
+        let vol_start = merged_volumes.len() as u32;
+        for (k, v, slot) in store.dir_index.drain_scoped() {
+            dir_index.push_unsorted_on(k, v.saturating_add(dir_base), vol_start.saturating_add(slot));
         }
 
-        for (k, v) in store.frn_to_entry.drain() {
-            frn_to_entry.push_unsorted(k, v.saturating_add(entry_base));
+        for (k, v, slot) in store.frn_to_entry.drain_scoped() {
+            frn_to_entry.push_unsorted_on(k, v.saturating_add(entry_base), vol_start.saturating_add(slot));
         }
 
         for idx in store.deleted.into_iter() {
