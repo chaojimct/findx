@@ -44,3 +44,5 @@ pub mod disktree;
 pub mod usage_cache;
 
 pub mod indexed_usage;
+
+pub mod footer_status;

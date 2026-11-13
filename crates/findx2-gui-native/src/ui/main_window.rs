@@ -9,7 +9,7 @@ use search_session::SearchSnapshot;
 #[path = "workspace.rs"]
 mod workspace;
 use gpui_kit::component::Disableable as _;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use workspace::{ViewMode, Workspace};
 
 use findx2_ipc::SearchHitDto;
@@ -107,6 +107,9 @@ pub struct MainWindow {
     search_status: SharedString,
     search_gen: u64,
     status_gen: u64,
+    status_inflight: bool,
+    footer_counts_inflight: bool,
+    footer_counts_at: Option<Instant>,
     preview_diagnostics: bool,
     preview: PreviewState,
     preview_memo: std::collections::HashMap<(String, u64, u64), crate::preview_worker::PdfOptions>,
@@ -292,6 +295,9 @@ impl MainWindow {
             search_status: "就绪".into(),
             search_gen: 0,
             status_gen: 0,
+            status_inflight: false,
+            footer_counts_inflight: false,
+            footer_counts_at: None,
             preview_diagnostics: false,
             preview: PreviewState::empty(),
             preview_memo: std::collections::HashMap::new(),
@@ -639,6 +645,10 @@ impl MainWindow {
     }
 
     fn poll_status(&mut self, cx: &mut Context<Self>) {
+        // At most one status request. Otherwise the 2s timer can continually
+        // supersede a 5s timeout and leave a genuinely offline engine "online".
+        if self.status_inflight { return; }
+        self.status_inflight = true;
         self.status_gen = self.status_gen.wrapping_add(1);
         let generation = self.status_gen;
         let (endpoint, ipc, backfill) = self.session.read_with(cx, |s, _| {
@@ -652,17 +662,21 @@ impl MainWindow {
                 },
             )
         });
-        let rx = ipc.status(endpoint);
+        self.session.update(cx,|s,_|s.engine_footer.set_source(&endpoint));
+        let rx = ipc.status(endpoint.clone());
         cx.spawn(async move |this, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("IPC 通道已关闭".into()));
             this.update(cx, |this, cx| {
                 if this.status_gen != generation {
                     return;
                 }
+                this.status_inflight = false;
+                if this.session.read(cx).endpoint!=endpoint {return;}
                 this.session.update(cx, |session, cx| {
+                    session.engine_footer.observe(&result);
+                    session.connected = session.engine_footer.connected;
                     match result {
                         Ok(resp) => {
-                            session.connected = true;
                             session.status_raw = serde_json::to_string_pretty(&resp)
                                 .unwrap_or_else(|e| e.to_string());
                             session.status_checked = search_logic::format_time(
@@ -682,11 +696,39 @@ impl MainWindow {
                     }
                     cx.notify();
                 });
+                this.poll_footer_counts(cx);
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    fn poll_footer_counts(&mut self, cx: &mut Context<Self>) {
+        if self.footer_counts_inflight || self.footer_counts_at.is_some_and(|t|t.elapsed()<Duration::from_secs(10)) {return;}
+        let Some((scope,endpoint,ipc))=self.session.read_with(cx,|s,_|
+            s.engine_footer.scope().map(|v|(v,s.endpoint.clone(),s.ipc.clone()))) else {return;};
+        self.footer_counts_inflight=true;
+        self.footer_counts_at=Some(Instant::now());
+        let rx=ipc.footer_counts(endpoint.clone(),scope);
+        cx.spawn(async move |this,cx| {
+            let result=rx.await.unwrap_or_else(|_|Err("统计通道已关闭".into()));
+            this.update(cx,|this,cx| {
+                this.footer_counts_inflight=false;
+                this.session.update(cx,|s,cx| {
+                    if s.endpoint!=endpoint || s.engine_footer.scope()!=Some(scope) {return;}
+                    match result {
+                        Ok(findx2_ipc::IpcResponse::UsageChildrenResult{page})=>s.engine_footer.accept_counts(scope,&page),
+                        Ok(findx2_ipc::IpcResponse::Error{message})=>s.engine_footer.count_error=Some(message),
+                        Ok(_)=>s.engine_footer.count_error=Some("统计响应不可用".into()),
+                        Err(e)=>s.engine_footer.count_error=Some(e),
+                    }
+                    // Footer only: never touch scan, scene keys, selection or zoom.
+                    cx.notify();
+                });
+                cx.notify();
+            }).ok();
+        }).detach();
     }
 
     fn record_reset(&mut self, reason: &str) {
@@ -2005,8 +2047,10 @@ impl MainWindow {
                 format!("{} · {}", self.search_status, self.file_actions.summary)
             }
         } else {
-            self.workspace_scan_status()
+            self.workspace_footer_label()
         };
+        let footer = self.session.read(cx).engine_footer.clone();
+        let left_detail = if self.workspace.mode==ViewMode::Usage {self.workspace_scan_status()} else {left.clone()};
         h_flex()
             .w_full()
             .h(px(32.))
@@ -2020,7 +2064,15 @@ impl MainWindow {
             .border_color(tokens.border)
             .text_xs()
             .text_color(tokens.text_secondary)
-            .child(div().flex_1().min_w_0().text_ellipsis().child(left))
+            .child(div().id("footer-operation-summary").flex_1().min_w_0().text_ellipsis()
+                .tooltip(move |window,cx|gpui_kit::component::tooltip::Tooltip::new(left_detail.clone()).build(window,cx))
+                .child(left))
+            .when(self.workspace.mode==ViewMode::Search,|v| {
+                let detail=footer.tooltip();
+                v.child(div().id("footer-index-counts").flex_shrink_0().text_xs()
+                    .tooltip(move |window,cx|gpui_kit::component::tooltip::Tooltip::new(detail.clone()).build(window,cx))
+                    .child(footer.counts_label()))
+            })
             .when(
                 self.workspace.mode == ViewMode::Search && self.workspace.scanning,
                 |v| {
@@ -2039,16 +2091,16 @@ impl MainWindow {
             .child(
                 Button::new("workspace-index-status")
                     .ghost()
-                    .icon(Icon::default().path(if self.session.read(cx).connected {
-                        "icons/circle-check.svg"
-                    } else {
+                    .icon(Icon::default().path(if footer.warning() {
                         "icons/circle-alert.svg"
+                    } else {
+                        "icons/circle-check.svg"
                     }))
-                    .w(px(24.))
+                    .label(footer.label())
                     .h(px(24.))
-                    .px_0()
-                    .tooltip(index.summary.clone())
-                    .accessibility_label("索引连接状态"),
+                    .text_color(if footer.warning(){tokens.warning}else{tokens.text_secondary})
+                    .tooltip(footer.tooltip())
+                    .accessibility_label("引擎状态和索引统计"),
             )
             .into_any_element()
     }

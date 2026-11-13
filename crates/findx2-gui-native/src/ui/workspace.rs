@@ -1869,6 +1869,15 @@ impl MainWindow {
         cx.notify();
     }
 
+    pub(super) fn workspace_footer_label(&self) -> String {
+        let detail=self.workspace_scan_status();
+        if self.workspace.engine_usage {
+            crate::footer_status::compact_usage(&detail,
+                self.workspace.scan.as_ref().map(|s|s.unknown),
+                self.workspace.scanning,self.workspace.scan_stale)
+        } else {detail}
+    }
+
     pub(super) fn workspace_scan_status(&self) -> String {
         if self.workspace.scanning {
             format!(

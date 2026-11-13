@@ -36,6 +36,7 @@ enum Job {
         endpoint: String,
         reply: oneshot::Sender<IpcResult<IpcResponse>>,
     },
+    FooterCounts { endpoint: String, volume: char, reply: oneshot::Sender<IpcResult<IpcResponse>> },
     Ping {
         endpoint: String,
         reply: oneshot::Sender<IpcResult<()>>,
@@ -114,6 +115,12 @@ impl IpcClient {
         rx
     }
 
+    /// A bounded root aggregate only; never enumerate a whole tree for footer counts.
+    pub fn footer_counts(&self, endpoint:String, volume:char)->oneshot::Receiver<IpcResult<IpcResponse>> {
+        let (reply,rx)=oneshot::channel();
+        let _=self.tx.send(Job::FooterCounts{endpoint,volume,reply});rx
+    }
+
     pub fn ping(&self, endpoint: String) -> oneshot::Receiver<IpcResult<()>> {
         let (reply, rx) = oneshot::channel();
         let _ = self.tx.send(Job::Ping { endpoint, reply });
@@ -166,6 +173,13 @@ async fn dispatch(job: Job) {
                     .await
                     .unwrap_or_else(|_| Err("Status 响应超时（5 秒）".into()));
             let _ = reply.send(result);
+        }
+        Job::FooterCounts {endpoint,volume,reply} => {
+            let result=tokio::time::timeout(std::time::Duration::from_secs(3),async {
+                let client=connect_endpoint(&endpoint).await?;
+                write_request(client,IpcRequest::UsageChildren{path:format!("{volume}:\\"),expected:None,after:None,max_bytes:1024}).await
+            }).await.unwrap_or_else(|_|Err("分项统计刷新超时（3 秒）".into()));
+            let _=reply.send(result);
         }
         Job::Ping { endpoint, reply } => {
             let _ = reply.send(ipc_ping(endpoint).await);
