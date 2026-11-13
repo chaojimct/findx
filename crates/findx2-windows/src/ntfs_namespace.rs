@@ -23,6 +23,39 @@ fn rewrite_bound_event(binding:UnlinkBinding,volume:u8,serial:u32,journal:u64,ev
     Ok(result)
 }
 
+/// FILE_LINK_ENTRY_INFORMATION.FileNameLength counts WCHARs, not bytes.
+/// Bounds use actual returned bytes and each record's next offset.
+/// Microsoft ntifs documentation and a local public-hardlink query confirm
+/// the units. Malformed/truncated enumeration always fails closed.
+fn parse_hardlink_records(buffer:&[u8],internal_parent:u64)->Result<Vec<OrdinaryLink>,String>{
+ if buffer.len()<8{return Err("incomplete hardlink header".into());}
+ let needed=u32::from_le_bytes(buffer[..4].try_into().unwrap()) as usize;
+ if needed>buffer.len(){return Err("incomplete hardlink result; cursor retained".into());}
+ let count=u32::from_le_bytes(buffer[4..8].try_into().unwrap()) as usize;
+ if count>1024{return Err("hardlink query exceeds 1024-link bound; cursor retained".into());}
+ let mut offset=8usize;let mut links=Vec::new();
+ for index in 0..count{
+  let head_end=offset.checked_add(20).filter(|&n|n<=buffer.len()).ok_or("malformed hardlink record")?;
+  let next=u32::from_le_bytes(buffer[offset..offset+4].try_into().unwrap()) as usize;
+  let parent=u64::from_le_bytes(buffer[offset+8..offset+16].try_into().unwrap());
+  let units=u32::from_le_bytes(buffer[offset+16..head_end].try_into().unwrap()) as usize;
+  let bytes=units.checked_mul(2).ok_or("hardlink filename length overflow")?;
+  let end=head_end.checked_add(bytes).ok_or("hardlink filename bounds overflow")?;
+  let record_end=if next==0{buffer.len()}else{
+   if next<20 || next%8!=0{return Err("invalid hardlink record offset".into());}
+   offset.checked_add(next).filter(|&n|n<buffer.len()).ok_or("invalid hardlink record offset")?
+  };
+  if end>record_end || units==0{return Err("invalid hardlink name bounds".into());}
+  if (index+1<count && next==0)||(index+1==count && next!=0){return Err("incomplete hardlink record chain; cursor retained".into());}
+  if parent!=internal_parent{
+   let wide:Vec<u16>=buffer[head_end..end].chunks_exact(2).map(|b|u16::from_le_bytes([b[0],b[1]])).collect();
+   links.push(OrdinaryLink{parent,name:String::from_utf16_lossy(&wide)});
+  }
+  offset=record_end;
+ }
+ Ok(links)
+}
+
 #[cfg(windows)]
 mod windows_resolver {
  use super::*;
@@ -89,20 +122,7 @@ mod windows_resolver {
     let count=u32::from_le_bytes(buffer[4..8].try_into().unwrap()) as usize;
     if count==0 && info.nNumberOfLinks>0{return Err("positive link count but no link records; cursor retained".into());}
     if count>1024{return Err("hardlink query exceeds 1024-link bound; cursor retained".into());}
-    let mut offset=8usize;let mut links=Vec::new();
-    for _ in 0..count{
-     if offset+20>buffer.len(){return Err("malformed hardlink record".into());}
-     let next=u32::from_le_bytes(buffer[offset..offset+4].try_into().unwrap()) as usize;
-     let parent=u64::from_le_bytes(buffer[offset+8..offset+16].try_into().unwrap());
-     let len=u32::from_le_bytes(buffer[offset+16..offset+20].try_into().unwrap()) as usize;
-     if len%2!=0 || offset+20+len>buffer.len(){return Err("invalid hardlink name bounds".into());}
-     if parent!=binding.parent{
-      let wide:Vec<u16>=buffer[offset+20..offset+20+len].chunks_exact(2).map(|b|u16::from_le_bytes([b[0],b[1]])).collect();
-      links.push(OrdinaryLink{parent,name:String::from_utf16_lossy(&wide)});
-     }
-     if next==0{break;}if next<20 || offset+next>=buffer.len(){return Err("invalid hardlink offset".into());}offset+=next;
-    }
-    Ok(links)
+    parse_hardlink_records(&buffer[..ios.information],binding.parent)
    })();unsafe{let _=CloseHandle(handle);}result
   }
   pub fn rewrite(&mut self,events:&[ChangeEvent],pending:&[ChangeEvent],missing_parents:&[u64],journal:u64,known_parent:impl Fn(u64)->bool,known_identity:impl Fn(u64)->bool)->Result<Vec<ChangeEvent>,String>{
@@ -161,4 +181,27 @@ mod tests {
  #[test]fn different_parent_sequence_not_filtered(){let e=ev(900+(1u64<<48));assert!(matches!(rewrite_bound_event(b(),b'C',1,7,&e,Some(&[])).unwrap().as_slice(),[ChangeEvent::CreatePending{..}]));}
  #[test]fn unresolved_links_fail_closed(){assert!(rewrite_bound_event(b(),b'C',1,7,&ev(900),None).is_err());}
  #[test]fn several_links_preserve_exact_case(){let links=[OrdinaryLink{parent:900,name:"internal".into()},OrdinaryLink{parent:2,name:"KeepCASE.bin".into()},OrdinaryLink{parent:3,name:"other.bin".into()}];let v=rewrite_bound_event(b(),b'C',1,7,&ev(900),Some(&links)).unwrap();assert!(matches!(&v[0],ChangeEvent::Rename{new_name,new_parent_id:2,..} if new_name=="KeepCASE.bin"));}
+}
+
+#[cfg(test)]mod hardlink_buffer_tests{
+ use super::*;
+ fn encoded(names:&[(u64,&str)])->Vec<u8>{
+  let mut b=vec![0u8;8];b[4..8].copy_from_slice(&(names.len() as u32).to_le_bytes());
+  for (i,(parent,name)) in names.iter().enumerate(){
+   let start=b.len();let wide:Vec<_>=name.encode_utf16().collect();let n=(20+wide.len()*2+7)&!7;b.resize(start+n,0);
+   if i+1<names.len(){b[start..start+4].copy_from_slice(&(n as u32).to_le_bytes());}
+   b[start+8..start+16].copy_from_slice(&parent.to_le_bytes());b[start+16..start+20].copy_from_slice(&(wide.len() as u32).to_le_bytes());
+   for (j,c) in wide.iter().enumerate(){b[start+20+j*2..start+22+j*2].copy_from_slice(&c.to_le_bytes());}
+  }
+  let len=b.len() as u32;b[..4].copy_from_slice(&len.to_le_bytes());b
+ }
+ #[test]fn odd_even_and_surrogate_names_are_full_wchar_sequences(){
+  let unicode=String::from_utf16(&[0x4e2d,0x6587,0xd83d,0xde00,0x2e,0x78]).unwrap();
+  let names=[(2,"odd.txt"),(3,"evenfile.txt"),(4,unicode.as_str())];let b=encoded(&names);let links=parse_hardlink_records(&b,900).unwrap();
+  for (l,(parent,name)) in links.iter().zip(names){assert_eq!(l.parent,parent);assert_eq!(l.name,name);}
+ }
+ #[test]fn excludes_only_verified_internal_parent(){let b=encoded(&[(900,"internal"),(2,"KeepCASE.bin")]);let l=parse_hardlink_records(&b,900).unwrap();assert_eq!(l.len(),1);assert_eq!(l[0].name,"KeepCASE.bin");}
+ #[test]fn truncated_names_do_not_become_final_unlinks(){let mut b=encoded(&[(2,"odd.txt")]);b.truncate(30);assert!(parse_hardlink_records(&b,900).is_err());}
+ #[test]fn cross_record_name_length_is_rejected(){let mut b=encoded(&[(2,"odd.txt"),(3,"next")]);b[24..28].copy_from_slice(&1000u32.to_le_bytes());assert!(parse_hardlink_records(&b,900).is_err());}
+ #[test]fn broken_chain_and_excessive_count_fail_closed(){let mut b=encoded(&[(2,"one"),(3,"two")]);b[8..12].copy_from_slice(&0u32.to_le_bytes());assert!(parse_hardlink_records(&b,900).is_err());let mut b=encoded(&[(2,"one")]);b[4..8].copy_from_slice(&1025u32.to_le_bytes());assert!(parse_hardlink_records(&b,900).is_err());}
 }
