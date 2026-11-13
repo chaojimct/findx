@@ -113,6 +113,10 @@ pub fn spawn_events(engine: Arc<SearchEngine>, script: PathBuf, stop: Arc<Atomic
                                     is_dir: c.directory,
                                 },
                             },
+                            "pending" => ChangeEvent::CreatePending {
+                                file_id: c.file_id, file_id_128: None, parent_id: c.parent_id,
+                                name: c.name, attrs: if c.directory {0x10} else {0}, is_dir:c.directory,
+                            },
                             "delete" => ChangeEvent::Delete { file_id: c.file_id },
                             "rename" => ChangeEvent::Rename {
                                 file_id: c.file_id,

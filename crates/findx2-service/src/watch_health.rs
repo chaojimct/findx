@@ -33,3 +33,32 @@ pub(crate) fn watch_error_summary() -> Option<String> {
     items.sort();
     Some(items.join("; "))
 }
+
+/// Shared production/fake-watcher namespace gate. A failed prefix fences all later
+/// cursors until explicit watcher reconstruction; it never implies search shutdown.
+#[derive(Default)]
+pub(crate) struct NamespaceGate { pub blocked: bool }
+impl NamespaceGate {
+    pub fn apply(&mut self, engine: &findx2_core::SearchEngine, volume: u8,
+        events: &[findx2_core::ChangeEvent], journal_id: u64, next_usn: u64) -> Result<(), String> {
+        if self.blocked { return Err("namespace fenced; explicit restart/recovery required".into()); }
+        match engine.apply_volume_batch(volume, events, journal_id, next_usn) {
+            Ok(()) => {
+                set_watch_error(volume as char, engine.has_pending_namespace(volume).then(||
+                    "missing-parent namespace events pending; durable cursor pinned for restart replay".into()));
+                Ok(())
+            }
+            Err(error) => {
+                self.blocked = true;
+                set_watch_error(volume as char, Some(format!("namespace fenced; cursor retained: {error}")));
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_health_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|p|p.into_inner())
+}

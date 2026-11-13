@@ -313,6 +313,7 @@ mod usage_tests {
 
     #[test]
     fn watch_error_makes_status_unhealthy() {
+        let _health = crate::watch_health::test_health_guard();
         let root = findx2_core::RawEntry {
             file_id: 1,
             file_id_128: None,
@@ -346,4 +347,36 @@ mod usage_tests {
             other => panic!("unexpected {other:?}"),
         }
     }
+    #[test]
+    fn fake_watcher_fences_failed_prefix_and_recovers_only_after_restart() {
+        let _health = crate::watch_health::test_health_guard();
+        use findx2_core::{ChangeEvent, RawEntry};
+        let raw=|id,parent,dir| RawEntry {file_id:id,file_id_128:None,parent_id:parent,name:"synthetic".into(),size:1,mtime:0,ctime:0,attrs:if dir {0x10}else{0},is_dir:dir};
+        let g=findx2_core::IndexBuilder::new(b'F',1,7,10).build_from_raw(vec![],vec![raw(1,0,true)],true).unwrap();
+        let e=Arc::new(SearchEngine::new(g)); e.enable_usage(1024*1024).unwrap();
+        let slot:EngineSlot=Arc::new(RwLock::new(Some(e.clone())));
+        let (tx,rx)=std::sync::mpsc::channel::<(Vec<ChangeEvent>, u64)>();
+        let engine=e.clone();
+        let worker=std::thread::spawn(move || {
+            let mut gate=crate::watch_health::NamespaceGate::default();
+            for (events,cursor) in rx {
+                let _=gate.apply(&engine,b'F',&events,7,cursor);
+            }
+            gate.blocked
+        });
+        tx.send((vec![ChangeEvent::Create{entry:raw(2,1,false)},ChangeEvent::CreatePending{file_id:3,file_id_128:Some([1;16]),parent_id:1,name:"bad".into(),attrs:0,is_dir:false}],20)).unwrap();
+        tx.send((vec![ChangeEvent::Create{entry:raw(4,1,false)}],21)).unwrap();
+        tx.send((vec![],22)).unwrap(); drop(tx);
+        assert!(worker.join().unwrap());
+        assert_eq!(e.index_store().volumes[0].last_usn,10);
+        assert!(e.index_store().entry_on_volume(b'F',2).is_none());
+        assert!(e.index_store().entry_on_volume(b'F',4).is_none());
+        assert!(matches!(process_request(&slot,IpcRequest::Status),IpcResponse::StatusResult{healthy:false,watch_error:Some(_),..}));
+        assert!(matches!(process_request(&slot,IpcRequest::UsageChildren{path:"F:\\".into(),expected:None,after:None,max_bytes:4096}),IpcResponse::UsageChildrenResult{..}));
+        let mut recovered=crate::watch_health::NamespaceGate::default();
+        recovered.apply(&e,b'F',&[ChangeEvent::Create{entry:raw(2,1,false)}],7,20).unwrap();
+        assert_eq!(e.index_store().volumes[0].last_usn,20);
+        assert!(matches!(process_request(&slot,IpcRequest::Status),IpcResponse::StatusResult{healthy:true,watch_error:None,..}));
+    }
+
 }

@@ -716,6 +716,8 @@ impl SearchEngine {
             return Err(error);
         }
         let mut applied_snaps: Vec<(Snap, Snap, ChangeEvent)> = Vec::new();
+        // Overlay writes are transactional too: publish only after namespace commit.
+        let mut metadata_after: HashMap<usize, (u64, u32, u32)> = HashMap::new();
         let mut leftover: Vec<(u64, ChangeEvent)> = Vec::new();
         while !remaining.is_empty() {
             let before = remaining.len();
@@ -731,10 +733,28 @@ impl SearchEngine {
                 match self.prepare_namespace(&g, volume, &ev) {
                     Ok(Prep::Noop) => {}
                     Ok(Prep::Delete { entry }) => {
-                        let snap = self.snap_entry(&g, volume, Some(entry));
+                        let mut snap = self.snap_entry(&g, volume, Some(entry));
+                        if let Some(value) = metadata_after.get(&(entry as usize)) { snap.size = value.0; }
                         g.checkpoint_touch(&mut ck, entry);
                         g.delete_entry(entry);
-                        let after = self.snap_identity(&g, volume, &ev);
+                        let mut after = self.snap_identity(&g, volume, &ev);
+                        if let Some(idx) = after.idx.map(|i| i as usize) {
+                            let entry = &g.entries[idx];
+                            let base = metadata_after.get(&idx).copied().or_else(|| self.metadata_overlay.get(idx))
+                                .unwrap_or((entry.size, entry.mtime, entry.ctime));
+                            let updated = match &ev {
+                                ChangeEvent::Create { .. } => Some((entry.size, entry.mtime, entry.ctime)),
+                                ChangeEvent::DataOrMeta { size, mtime, ctime, .. } => Some((
+                                    size.unwrap_or(base.0),
+                                    mtime.map(crate::index::filetime_to_unix_secs).unwrap_or(base.1),
+                                    ctime.map(crate::index::filetime_to_unix_secs).unwrap_or(base.2))),
+                                _ => None,
+                            };
+                            if !entry.is_dir_entry() {
+                                if let Some(value) = updated { metadata_after.insert(idx, value); }
+                                if let Some(value) = metadata_after.get(&idx) { after.size = value.0; }
+                            }
+                        }
                         applied_snaps.push((snap, after, ev));
                     }
                     Ok(Prep::Apply { scope, new_entry, new_dir, name_bytes }) => {
@@ -745,14 +765,32 @@ impl SearchEngine {
                             self.usage.lock().excluded_ids = excluded_before;
                             return Err(e);
                         }
-                        let snap = self.snap_identity(&g, volume, &ev);
+                        let mut snap = self.snap_identity(&g, volume, &ev);
+                        if let Some(value) = snap.idx.and_then(|i| metadata_after.get(&(i as usize))) { snap.size = value.0; }
                         if let Err(e) = g.apply_change_event_resolved(&ev, Some(&scope)) {
                             g.rollback_namespace(ck);
                             self.restore_orphans(volume, prior_orphans);
                             self.usage.lock().excluded_ids = excluded_before;
                             return Err(e.to_string());
                         }
-                        let after = self.snap_identity(&g, volume, &ev);
+                        let mut after = self.snap_identity(&g, volume, &ev);
+                        if let Some(idx) = after.idx.map(|i| i as usize) {
+                            let entry = &g.entries[idx];
+                            let base = metadata_after.get(&idx).copied().or_else(|| self.metadata_overlay.get(idx))
+                                .unwrap_or((entry.size, entry.mtime, entry.ctime));
+                            let updated = match &ev {
+                                ChangeEvent::Create { .. } => Some((entry.size, entry.mtime, entry.ctime)),
+                                ChangeEvent::DataOrMeta { size, mtime, ctime, .. } => Some((
+                                    size.unwrap_or(base.0),
+                                    mtime.map(crate::index::filetime_to_unix_secs).unwrap_or(base.1),
+                                    ctime.map(crate::index::filetime_to_unix_secs).unwrap_or(base.2))),
+                                _ => None,
+                            };
+                            if !entry.is_dir_entry() {
+                                if let Some(value) = updated { metadata_after.insert(idx, value); }
+                                if let Some(value) = metadata_after.get(&idx) { after.size = value.0; }
+                            }
+                        }
                         applied_snaps.push((snap, after, ev));
                     }
                     Err(e) if e.starts_with("parent identity missing:") => {
@@ -797,6 +835,9 @@ impl SearchEngine {
             v.usn_journal_id = journal_id;
             v.last_usn = next_usn;
         }
+        for (&idx, &(size, mtime, ctime)) in &metadata_after {
+            self.metadata_overlay.put(idx, size, mtime, ctime);
+        }
         if let Err(e) = self.fold_snaps(&g, volume, &applied_snaps) {
             let mut r = self.usage.lock();
             if r.epoch != 0 { r.error = Some(e); }
@@ -824,6 +865,26 @@ impl SearchEngine {
             size: self.effective_size(g, idx as usize), deleted: e.is_deleted(),
         }
     }
+    fn note_excluded_identity(&self, volume: u8, frn: u64) -> Result<(), String> {
+        self.note_excluded_identity_with_budget(volume, frn, 4 * 1024 * 1024)
+    }
+    fn note_excluded_identity_with_budget(&self, volume: u8, frn: u64, budget: usize) -> Result<(), String> {
+        let mut usage = self.usage.lock();
+        let ids = &mut usage.excluded_ids;
+        if ids.contains(&(volume, frn)) { return Ok(()); }
+        if ids.len().saturating_add(1).saturating_mul(32) > budget {
+            return Err("excluded-identity resource budget exceeded; namespace batch must replay after recovery".into());
+        }
+        if ids.len() == ids.capacity() && ids.capacity().max(3).saturating_mul(2).saturating_mul(32) > budget {
+            return Err("excluded-identity growth would exceed resource budget; cursor retained".into());
+        }
+        ids.try_reserve(1).map_err(|_| "excluded-identity allocation failed")?;
+        if ids.capacity().saturating_mul(32) > budget {
+            return Err("excluded-identity capacity budget exceeded; cursor retained".into());
+        }
+        ids.insert((volume, frn));
+        Ok(())
+    }
     fn prepare_namespace(&self, g: &IndexStore, volume: u8, ev: &ChangeEvent) -> Result<Prep, String> {
         let extended = match ev {
             ChangeEvent::Create { entry } => entry.file_id_128,
@@ -843,7 +904,7 @@ impl SearchEngine {
         if let Some(p) = parent {
             let parent_excluded = self.usage.lock().excluded_ids.contains(&(volume, p));
             if parent_excluded {
-                if is_new_dir { self.usage.lock().excluded_ids.insert((volume, frn)); }
+                if is_new_dir { self.note_excluded_identity(volume, frn)?; }
                 if let Some(idx) = g.entry_on_volume(volume, frn) { return Ok(Prep::Delete { entry: idx }); }
                 return Ok(Prep::Noop);
             }
@@ -856,7 +917,7 @@ impl SearchEngine {
         } else { None };
         if let (Some(di), Some(name)) = (parent_dir, name) {
             if g.excluded_under(volume, di, name) {
-                if is_new_dir { self.usage.lock().excluded_ids.insert((volume, frn)); }
+                if is_new_dir { self.note_excluded_identity(volume, frn)?; }
                 if let Some(idx) = g.entry_on_volume(volume, frn) { return Ok(Prep::Delete { entry: idx }); }
                 return Ok(Prep::Noop);
             }
@@ -910,6 +971,7 @@ impl SearchEngine {
         if r.epoch == 0 || r.error.is_some() { return Ok(()); }
         r.ensure_entries(&g)?;
         for (before, after, ev) in applied {
+            if let Some(idx) = after.idx.or(before.idx) { r.invalidate_ticket(idx as usize); }
             self.fold_one(g, &mut r, volume, before, after, ev)?;
         }
         Ok(())
@@ -1159,6 +1221,44 @@ mod tests {
         ], 7, 40).unwrap();
         assert_eq!(e.index_store().volumes[0].last_usn, 40);
         assert_eq!(e.usage_page("F:\\", None, None, 4096).unwrap().root.files, 2);
+    }
+    #[test]
+    fn excluded_identity_resource_budget_is_explicit_and_bounded() {
+        let e=engine();
+        let mut accepted=0;
+        for id in 1000..1100 {
+            match e.note_excluded_identity_with_budget(b'C',id,256) {
+                Ok(()) => accepted+=1,
+                Err(message) => { assert!(message.contains("budget")); break; }
+            }
+        }
+        assert!(accepted>0 && accepted<100);
+        let usage=e.usage.lock();
+        assert_eq!(usage.excluded_ids.len(),accepted);
+        assert!(usage.excluded_ids.capacity()*32<=256);
+    }
+    #[test]
+    fn namespace_metadata_supersedes_overlay_and_stale_ticket() {
+        let e=engine();
+        let idx=e.entry_idx(b'C',10);
+        e.extend_metadata_overlay_batch(&[(idx,300,0,0)]);
+        let stale=e.metadata_ticket_by_id(b'C',10).unwrap();
+        e.apply_volume_batch(b'C',&[
+            ChangeEvent::DataOrMeta { file_id:10,size:Some(400),mtime:None,ctime:None,create_if_missing:None },
+            ChangeEvent::Rename { file_id:10,new_parent_id:3,new_name:"moved".into() },
+            ChangeEvent::DataOrMeta { file_id:10,size:None,mtime:Some(crate::index::unix_secs_to_filetime(123)),ctime:None,create_if_missing:None },
+        ],7,20).unwrap();
+        assert_eq!(size(&e),400);
+        assert_eq!(e.metadata_overlay.get(idx).unwrap().0,400);
+        assert_eq!(e.metadata_overlay.get(idx).unwrap().1,123);
+        assert!(!e.commit_metadata(stale,1,0,0).unwrap());
+        e.flush_metadata_overlay_into_store().unwrap();
+        assert_eq!(e.index_store().entries[idx].size,400);
+        assert_eq!(size(&e),400);
+        let bad=ChangeEvent::CreatePending {file_id:80,file_id_128:Some([1;16]),parent_id:1,name:"bad".into(),attrs:0,is_dir:false};
+        assert!(e.apply_volume_batch(b'C',&[ChangeEvent::DataOrMeta {file_id:10,size:Some(900),mtime:None,ctime:None,create_if_missing:None},bad],7,21).is_err());
+        assert_eq!(e.metadata_overlay.get(idx).unwrap().0,400,"rolled-back metadata cannot leak into overlay");
+        assert_eq!(size(&e),400);
     }
     #[test]
     fn repeated_identity_batch_matches_sequential() {

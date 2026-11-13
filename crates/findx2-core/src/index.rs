@@ -1731,8 +1731,6 @@ impl IndexStore {
         ck.saved.try_reserve(count).map_err(|_| "namespace before-image allocation failed")?;
         ck.frn_overlay.try_reserve(count).map_err(|_| "namespace FRN undo allocation failed")?;
         ck.dir_overlay.try_reserve(count).map_err(|_| "namespace directory undo allocation failed")?;
-        self.frn_to_entry.overlay.try_reserve(count).map_err(|_| "namespace FRN overlay allocation failed")?;
-        self.dir_index.overlay.try_reserve(count).map_err(|_| "namespace directory overlay allocation failed")?;
         Ok(())
     }
     pub fn checkpoint_identity(&self, ck: &mut NamespaceCheckpoint, volume: u8, frn: u64) {
@@ -1825,6 +1823,7 @@ impl IndexStore {
                 .map_err(|_| "index name buffer allocation failed")?;
         }
         if new_entry {
+            self.frn_to_entry.overlay.try_reserve(1).map_err(|_| "namespace FRN overlay allocation failed")?;
             self.entries
                 .try_reserve(1)
                 .map_err(|_| "index entry allocation failed")?;
@@ -1833,6 +1832,7 @@ impl IndexStore {
                 .map_err(|_| "index identity allocation failed")?;
         }
         if new_dir {
+            self.dir_index.overlay.try_reserve(1).map_err(|_| "namespace directory overlay allocation failed")?;
             self.dirs
                 .try_reserve(1)
                 .map_err(|_| "index directory allocation failed")?;

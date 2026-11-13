@@ -42,3 +42,5 @@ mod preview_visibility;
 
 pub mod disktree;
 pub mod usage_cache;
+
+pub mod indexed_usage;

@@ -29,9 +29,22 @@ use clap::Parser;
 /// 与 GUI 超时提示一致：进程启动失败或 run_foreground 返回 Err 时写入，便于无控制台时排查。
 pub(crate) const SERVICE_LAST_ERROR_FILENAME: &str = "findx2-service-last-error.txt";
 
+// Isolated foreground fixtures must not write the formal service diagnostic file,
+// including parse/startup failures before RunFlags exist.
+fn startup_error_path() -> std::path::PathBuf {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--no-watch" || a == "--fixture-root") {
+        if let Some(i) = args.iter().position(|a| a == "--index" || a == "-i") {
+            if let Some(index) = args.get(i + 1) { return std::path::PathBuf::from(index).with_extension("last-error.txt"); }
+        }
+        return std::env::temp_dir().join(format!("findx2-fixture-{}-last-error.txt", std::process::id()));
+    }
+    std::env::temp_dir().join(SERVICE_LAST_ERROR_FILENAME)
+}
+
 fn main() {
     if let Err(e) = try_main() {
-        let path = std::env::temp_dir().join(SERVICE_LAST_ERROR_FILENAME);
+        let path = startup_error_path();
         let text = format!("{e:#}\n");
         let _ = std::fs::write(&path, &text);
         eprintln!(
@@ -62,7 +75,7 @@ fn try_main() -> anyhow::Result<()> {
     let cli = match cli::Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
-            let path = std::env::temp_dir().join(SERVICE_LAST_ERROR_FILENAME);
+            let path = startup_error_path();
             let text = format!("{e}");
             let _ = std::fs::write(&path, &text);
             e.exit();
@@ -104,7 +117,10 @@ fn try_main() -> anyhow::Result<()> {
             }
             usage_fixture::create_index(root, &cli.index)?;
         }
-        let _ = std::fs::remove_file(std::env::temp_dir().join(SERVICE_LAST_ERROR_FILENAME));
+        // Strict fixtures must not clear the formal service's shared diagnostic file.
+        if !cli.no_watch {
+            let _ = std::fs::remove_file(std::env::temp_dir().join(SERVICE_LAST_ERROR_FILENAME));
+        }
 
         return run::run_foreground(
             cli.index,
@@ -132,7 +148,10 @@ fn try_main() -> anyhow::Result<()> {
         if cli.cmd.is_some() {
             anyhow::bail!("install/uninstall 仅支持 Windows 服务");
         }
-        let _ = std::fs::remove_file(std::env::temp_dir().join(SERVICE_LAST_ERROR_FILENAME));
+        // Strict fixtures must not clear the formal service's shared diagnostic file.
+        if !cli.no_watch {
+            let _ = std::fs::remove_file(std::env::temp_dir().join(SERVICE_LAST_ERROR_FILENAME));
+        }
         return run_unix::run_foreground(
             cli.index,
             run_unix::normalize_unix_volume(&cli.volume),

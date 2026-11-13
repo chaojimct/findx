@@ -267,6 +267,9 @@ pub(crate) fn run_foreground(
     stop: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let _ = (full_stat, max_scan_threads);
+    if flags.no_watch && normalize_pipe_path(&pipe_name).eq_ignore_ascii_case(r"\\.\pipe\findx2") {
+        anyhow::bail!("strict fixture must not use the formal findx2 pipe");
+    }
     if flags.no_watch && (!flags.no_backfill || !flags.no_everything_ipc) {
         anyhow::bail!("--no-watch requires --no-backfill --no-everything-ipc (strict isolation)");
     }
@@ -718,7 +721,7 @@ fn usn_watch_loop(
     // A fatal namespace failure fences all subsequent cursors. Do not consume a later
     // successful batch as proof the failed prefix committed. Search remains available;
     // restart/rebuild is required and resumes from the retained durable watermark.
-    let mut namespace_blocked = false;
+    let mut namespace_gate = crate::watch_health::NamespaceGate::default();
     loop {
         // 停机检查：recv_timeout 只有 50ms 粒度，这里最多 50ms 响应一次。
         // 退出前 flush 内存 pending（游标停在最后 Checkpoint，journal 重放覆盖剩余变更）
@@ -734,7 +737,7 @@ fn usn_watch_loop(
             info!("卷 {letter} USN 监听线程停机退出");
             return Ok(());
         }
-        if namespace_blocked {
+        if namespace_gate.blocked {
             let _ = rx.recv_timeout(Duration::from_millis(100));
             std::thread::sleep(Duration::from_millis(100));
             continue;
@@ -755,7 +758,7 @@ fn usn_watch_loop(
                     next_usn,
                 } => {
                     dirty_count += flush_pending(&mut pending)?;
-                    match engine.apply_volume_batch(volume_letter, &events, journal_id, next_usn) {
+                    match namespace_gate.apply(&engine, volume_letter, &events, journal_id, next_usn) {
                         Ok(()) => {
                             set_watch_error(letter, engine.has_pending_namespace(volume_letter).then(||
                                 "missing-parent namespace events pending; durable cursor pinned for restart replay".into()));
@@ -767,7 +770,7 @@ fn usn_watch_loop(
                                 Some(format!("watch mutation failed; cursor not acknowledged: {e}")),
                             );
                             error!("USN batch not committed ({letter}); namespace fenced until restart/rebuild: {e}");
-                            namespace_blocked = true;
+                            namespace_gate.blocked = true;
                         }
                     }
                 }
@@ -800,9 +803,9 @@ fn usn_watch_loop(
                     next_usn,
                 } => {
                     dirty_count += flush_pending(&mut pending)?;
-                    if let Err(e) = engine.apply_volume_batch(volume_letter, &[], journal_id, next_usn) {
+                    if let Err(e) = namespace_gate.apply(&engine, volume_letter, &[], journal_id, next_usn) {
                         set_watch_error(letter, Some(format!("checkpoint rejected; namespace fenced: {e}")));
-                        namespace_blocked = true;
+                        namespace_gate.blocked = true;
                         continue;
                     }
                     if engine.has_pending_namespace(volume_letter) {

@@ -361,3 +361,46 @@ fn v6_auto_prefers_v6_over_v5() {
     let _ = std::fs::remove_file(&p);
     let _ = std::fs::remove_dir_all(&layout.dir);
 }
+
+#[test]
+fn pending_namespace_manifest_crash_retains_replay_watermark() {
+    use findx2_core::SearchEngine;
+    let nonce=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir=std::env::temp_dir().join(format!("findx-t109-crash-{}-{nonce}",std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let layout=V6Layout::for_index(&dir.join("synthetic.bin"));
+    let raw=|id,parent,is_dir| RawEntry{file_id:id,file_id_128:None,parent_id:parent,name:"synthetic".into(),size:10,mtime:0,ctime:0,attrs:if is_dir{0x10}else{0},is_dir};
+    let store=IndexBuilder::new(b'F',1,7,10).build_from_raw(vec![],vec![raw(1,0,true)],true).unwrap();
+    let e=SearchEngine::new(store);e.enable_usage(1024*1024).unwrap();
+    let pending=[ChangeEvent::Create{entry:raw(50,99,false)}];
+    e.apply_volume_batch(b'F',&pending,7,20).unwrap();
+    assert_eq!(e.index_store().volumes[0].last_usn,10);
+    v6_save_full(&layout,&e.index_store()).unwrap();
+    let restart=SearchEngine::new(v6_load(&layout).unwrap());
+    restart.enable_usage(1024*1024).unwrap();
+    restart.index_store_mut().set_track_mutations(true);
+    restart.apply_volume_batch(b'F',&pending,7,20).unwrap();
+    // The in-memory queue does not survive process death. Its durable recovery
+    // evidence is the old watermark, which must stay pinned in the manifest.
+    let retained_manifest=std::fs::read(layout.dir.join("manifest.json")).unwrap();
+    let parent=[ChangeEvent::Create{entry:raw(99,1,true)}];
+    restart.apply_volume_batch(b'F',&parent,7,21).unwrap();
+    assert_eq!(restart.index_store().volumes[0].last_usn,21);
+    let batch=batch_of(&mut restart.index_store_mut());
+    assert!(matches!(v6_try_commit(&layout,&batch).unwrap(),CommitOutcome::Delta{..}));
+    assert_eq!(v6_load(&layout).unwrap().volumes[0].last_usn,21);
+    // Crash injection: data writes happened but manifest rename did not. Restore
+    // exactly the previous manifest, leaving actual uncommitted data tails present.
+    std::fs::write(layout.dir.join("manifest.json"),&retained_manifest).unwrap();
+    let loaded=v6_load(&layout).unwrap();
+    assert_eq!(loaded.volumes[0].last_usn,10,"uncommitted tail must not advance restart cursor");
+    let recovered=SearchEngine::new(loaded);recovered.enable_usage(1024*1024).unwrap();
+    recovered.apply_volume_batch(b'F',&pending,7,20).unwrap();
+    recovered.apply_volume_batch(b'F',&parent,7,21).unwrap();
+    let page=recovered.usage_page("F:\\",None,None,4096).unwrap();
+    assert_eq!(page.root.logical,10);
+    assert_eq!(page.root.files,1);
+    v6_save_full(&layout,&recovered.index_store()).unwrap();
+    assert_eq!(v6_load(&layout).unwrap().volumes[0].last_usn,21);
+    std::fs::remove_dir_all(dir).unwrap();
+}

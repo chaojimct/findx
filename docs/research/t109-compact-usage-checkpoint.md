@@ -46,3 +46,39 @@ Raw evidence: target/usage-t109-memory.txt (synthetic counts only).
 - Do not declare whole-volume performance or readiness to switch the formal service.
 
 Build output directory: target/native-usage-t109; existing t97/t100 and Program Files outputs untouched. Current artifacts are development builds; never launched. Service must be refreshed after the latest checkpoint changes.
+
+## 2026-11-13 11:13 Asia/Shanghai: correctness and isolated integration milestone
+
+Additional fixes:
+- Namespace metadata is now staged and published to MetaOverlay only after namespace success. It overrides earlier overlay values; metadata-only partial updates preserve other effective fields. Rejected prefixes cannot leak overlay writes. Any committed namespace event invalidates an outstanding metadata ticket, including same-size/time-only updates.
+- Excluded identities have an explicit 4MiB capacity-charge resource guard and fallible allocation; resource exhaustion fails the transaction and retains the cursor, never silently drops events.
+- Metadata-only batches no longer pre-reserve growing FRN/directory overlays. Identity undo remains O(batch), not a clone of the historical overlay.
+- Production watch uses NamespaceGate, also exercised through a fake channel-driven watcher. Failed prefix + subsequent event + heartbeat stay fenced and unhealthy; explicit reconstructed gate can replay/recover.
+- Unique temporary V6 crash fixture commits resolved data, then restores the exact previous manifest to simulate data written before manifest publication. Reload retains the old cursor, safely replays pending events, and recovers one correct file. This is an on-disk tail/manifest fault injection, NOT OS/power-loss testing.
+- Native GUI indexed-page conversion was extracted unchanged into indexed_usage::scan_from_page and remains on the production UI path. Local actual-allocation scan and all prior UI behavior remain intact.
+- Strict no-watch fixtures reject the formal pipe and no longer clear or overwrite formal shared startup diagnostics, including startup errors. Fixture event script can synthesize delayed metadata with the pending operation.
+
+Completed locked verification:
+- core full package (service feature union): 74 passed, 1 explicit memory experiment ignored by default (that experiment was run successfully separately).
+- service: 10 unit + 1 integration passed; unit runtime 79.19s in the final run.
+- native GUI: 178 passed, 1 ignored; IPC: 2 passed, serial test execution.
+- latest service + native GUI dev builds succeeded.
+- finite real named-pipe fixture: explicit temporary synthetic tree, --no-watch --no-backfill --no-everything-ipc, 32MiB usage budget, unique non-formal pipe; native production IpcClient + actual UI render-model mapper. Initial logical 33B/2 files, delayed create visible with unknown metadata, then 77B/3 files/unknown=0. Stale generation rejected; allocated stays 0. Final observed pending visibility 107ms and metadata visibility 107ms (fixture polls every 100ms, NOT production USN latency). Only four render-model nodes allocated. Fixture service exited and its temporary files were removed.
+- This verifies native client/render-model integration, NOT an interactive pixel/screenshot visual acceptance test. No user's GUI process was launched or modified.
+
+Final development artifacts under target/native-usage-t109:
+- findx2-service.exe SHA256 7D1EBBA2D899F7AF6E29F6CC3C7912E54129775D65D247C864782EFE5DA8AE12
+- findx2-gui-native.exe SHA256 9A921D49F417D921D3BA767A0F0C6A27AA0A202307F7F2DB869E29584AA445B5
+
+Evidence logs on MZ: terminals/219997.txt (core/service), terminals/219999.txt (GUI/IPC/build/real-pipe integration). Prior 219990 also completed successfully but its artifact hashes are superseded.
+
+### Important remaining rollout conditions / precise limitations
+- No all-volume performance, real USN, MFT or production-index test has been performed. No rollout approval.
+- Earlier suspicion of GUI shared fault-injection race was NOT substantiated: source has a real GlobalMemoryStatusEx pressure guard (97% load or <64MiB free), and allocation-failure tests attempt actual fallible reservations, not a shared injector. Keep the initial parallel 14 AllocFailed failures as an unresolved resource-sensitive test boundary; do not bypass production memory protection. Serial suite is green.
+- Final audit found the existing Windows full-volume backfill still constructs whole-pending-set maps, and metadata ticket issuance can grow UsageRuntime.tickets for that whole pass; HashMap capacity can remain after removals. The initialization-only measurements above do NOT cover enabled backfill transient/retained maps. Before claiming bounded service memory with backfill enabled, bound/chunk the in-flight ticket lifetime and audit existing backfill temporaries. These were not exercised against real volumes and were not silently counted in the 92.41MiB payload.
+- Unticketed compatibility overlay-write API cannot infer whether externally supplied metadata was observed before or after a mutation; Windows production backfill/stat paths use generation-scoped tickets. Unix/unversioned producer behavior remains outside this Windows verification.
+- All container/OOM recovery is not guaranteed (event clones/bitmap internals and some temporaries still use infallible allocation). Explicit try_reserve/resource paths covered by tests do fail without acknowledging a namespace prefix.
+- Missing-parent queues may require explicit recovery/restart/rebuild if the parent never becomes resolvable. The service remains visibly degraded with a retained restart cursor; it must not pretend such a queue is healthy or complete. Excluded identity cache itself is runtime-only.
+- Legacy runtime same-condition comparison remains unmeasured. Do not replace the legacy layout estimate with a fabricated process measurement.
+
+11:12 Asia/Shanghai read-only check: FindX2Search still Running, PID7428; another existing Program Files service process PID19600 was also observed, not touched or attributed. No isolated fixture processes remained. Formal index/baseline/deployment paths untouched.
