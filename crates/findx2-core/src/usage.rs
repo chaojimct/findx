@@ -769,9 +769,25 @@ impl SearchEngine {
             let before = remaining.len();
             let mut next_round = Vec::new();
             let mut blocked_ids = HashSet::new();
+            // A later terminal delete proves the earlier unresolved namespace
+            // prefix for this exact volume-qualified FRN no longer exists. Keep
+            // per-batch cutoffs so later recreation is not discarded; one linear
+            // retain below avoids rescanning the pending queue for every delete.
+            let mut superseded_before: HashMap<u64, usize> = HashMap::new();
             for ev in remaining {
                 let identity = OrphanQueue::identity(&ev);
                 g.checkpoint_identity(&mut ck, volume, identity);
+                if matches!(&ev, ChangeEvent::Delete { .. }) && blocked_ids.remove(&identity) {
+                    if !superseded_before.contains_key(&identity) {
+                        if let Err(e) = superseded_before.try_reserve(1) {
+                            g.rollback_namespace(ck);
+                            self.restore_orphans(volume, prior_orphans);
+                            self.usage.lock().excluded_ids = excluded_before;
+                            return Err(format!("terminal namespace recovery allocation failed: {e}"));
+                        }
+                    }
+                    superseded_before.insert(identity, next_round.len());
+                }
                 if blocked_ids.contains(&identity) {
                     next_round.push((0, ev));
                     continue;
@@ -852,6 +868,13 @@ impl SearchEngine {
                     }
                 }
             }
+            let mut position = 0;
+            next_round.retain(|(_, ev)| {
+                let keep = superseded_before.get(&OrphanQueue::identity(ev))
+                    .map_or(true, |cutoff| position >= *cutoff);
+                position += 1;
+                keep
+            });
             if next_round.len() == before && !next_round.is_empty() {
                 if cursor.is_none() {
                     g.rollback_namespace(ck);
@@ -1397,6 +1420,48 @@ mod tests {
         e.enable_usage(1024 * 1024).unwrap();
         assert!(!e.commit_metadata(t, 99, 0, 0).unwrap());
     }
+    #[test]
+    fn missing_parent_deleted_identity_unpins_cursor() {
+        let e = engine();
+        let before = e.usage_page("C:\\", None, None, 4096).unwrap().root.logical;
+        e.apply_volume_batch(b'C', &[ChangeEvent::Create { entry: raw(777, 999, "transient", 17, false) }], 7, 20).unwrap();
+        assert!(e.has_pending_namespace(b'C'));
+        e.apply_volume_batch(b'C', &[ChangeEvent::Delete { file_id: 777 }], 7, 21).unwrap();
+        assert!(!e.has_pending_namespace(b'C'), "terminal delete supersedes unmaterialized create, rather than parking forever");
+        assert_eq!(e.index_store().volumes[0].last_usn, 21);
+        assert!(e.index_store().entry_on_volume(b'C', 777).is_none());
+        assert_eq!(e.usage_page("C:\\", None, None, 4096).unwrap().root.logical, before);
+    }
+
+    #[test]
+    fn missing_parent_rename_then_delete_removes_existing_entry() {
+        let e = engine();
+        e.apply_volume_batch(b'C', &[
+            ChangeEvent::Rename { file_id: 10, new_parent_id: 999, new_name: "unresolved".into() },
+            ChangeEvent::Delete { file_id: 10 },
+        ], 7, 23).unwrap();
+        assert!(!e.has_pending_namespace(b'C'));
+        assert_eq!(e.index_store().volumes[0].last_usn, 23);
+        assert!(e.index_store().entries[e.index_store().entry_on_volume(b'C', 10).unwrap() as usize].is_deleted());
+        assert_eq!(e.usage_page("C:\\", None, None, 4096).unwrap().root.logical, 0);
+    }
+
+    #[test]
+    fn missing_parent_delete_does_not_cancel_later_recreation() {
+        let e = engine();
+        e.apply_volume_batch(b'C', &[
+            ChangeEvent::Create { entry: raw(777, 999, "old", 17, false) },
+            ChangeEvent::Delete { file_id: 777 },
+            ChangeEvent::Create { entry: raw(777, 998, "new", 19, false) },
+        ], 7, 25).unwrap();
+        assert!(e.has_pending_namespace(b'C'));
+        assert_ne!(e.index_store().volumes[0].last_usn, 25);
+        e.apply_volume_batch(b'C', &[ChangeEvent::Create { entry: raw(998, 1, "recovered", 0, true) }], 7, 26).unwrap();
+        assert!(!e.has_pending_namespace(b'C'));
+        assert_eq!(e.index_store().volumes[0].last_usn, 26);
+        assert_eq!(e.usage_page("C:\\", None, None, 4096).unwrap().root.logical, 119);
+    }
+
     #[test]
     fn prefix_failure_rolls_back_namespace() {
         let e = engine();
