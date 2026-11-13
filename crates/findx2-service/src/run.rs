@@ -563,6 +563,14 @@ pub(crate) fn run_foreground(
     }
     if unfinished == 0 {
         info!("All watch workers finished normal shutdown");
+        // Namespace workers are quiescent. Persist their cursor even if metadata
+        // coverage is incomplete; keep metadata_ready=false and fold the bounded
+        // overlay pages into the base first, never advance a cursor alone.
+        match persist_shutdown_checkpoint(&engine, &index) {
+            Ok(true) => info!("Normal shutdown checkpoint committed (metadata readiness preserved)"),
+            Ok(false) => tracing::warn!("Shutdown checkpoint deferred by another persister; durable cursor requires replay"),
+            Err(e) => error!("Shutdown checkpoint failed; retained durable cursor requires replay: {e:#}"),
+        }
         info!(counts=?findx2_windows::metadata_terminal_counts(), "metadata terminal buckets: missing/access/sharing/invalid_id/not_found/other/success");
     } else {
         tracing::warn!(unfinished, "Shutdown grace expired; do not claim all workers flushed; retained durable cursor requires replay");
@@ -1164,6 +1172,14 @@ fn probe_journal_wrap_warning(volume_path: &str, letter: char, cursor_usn: u64) 
     None
 }
 
+fn persist_shutdown_checkpoint(engine: &SearchEngine, path: &Path) -> anyhow::Result<bool> {
+    if !engine.metadata_ready() {
+        let folded = engine.flush_metadata_overlay_into_store()?;
+        info!(folded, "Shutdown folded partial metadata overlay; coverage remains incomplete");
+    }
+    persist_index(engine, path)
+}
+
 pub(crate) fn persist_index(engine: &SearchEngine, path: &Path) -> anyhow::Result<bool> {
     // v6 增量提交，分两步：
     // 1. 短写锁：drain 日志 + 快照长度/游标（µs~ms 级；与 apply/Checkpoint 同一把写锁，
@@ -1288,6 +1304,23 @@ mod tests {
         IndexBuilder::new(letter, 1, journal, usn)
             .build_from_raw(files, dirs, true)
             .unwrap()
+    }
+
+    #[test]
+    fn partial_backfill_shutdown_persists_namespace_cursor_without_claiming_ready() {
+        let dir=std::env::temp_dir().join(format!("findx-partial-shutdown-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();let path=dir.join("synthetic.bin");let layout=findx2_core::V6Layout::for_index(&path);
+        let mut store=tiny_store(b'C',7,100,"public-file.txt");store.metadata_ready=false;store.set_track_mutations(true);
+        findx2_core::v6_save_full(&layout,&store).unwrap();
+        let engine=findx2_core::SearchEngine::new(store);engine.enable_usage(16*1024*1024).unwrap();
+        let ticket=engine.metadata_ticket_by_id(b'C',1).unwrap();assert!(engine.commit_metadata(ticket,456,0,0).unwrap());
+        engine.apply_volume_batch(b'C',&[findx2_core::ChangeEvent::Create {entry:RawEntry{file_id:2,file_id_128:None,parent_id:100,name:"public-new.txt".into(),size:123,mtime:0,ctime:0,attrs:0,is_dir:false}}],7,200).unwrap();
+        assert!(super::persist_shutdown_checkpoint(&engine,&path).unwrap());
+        let restored=findx2_core::v6_load(&layout).unwrap();
+        assert!(!restored.metadata_ready);assert_eq!(restored.volumes[0].last_usn,200);
+        let i=restored.entry_on_volume(b'C',1).unwrap();assert_eq!(restored.entries[i as usize].size,456);
+        assert!(restored.entry_on_volume(b'C',2).is_some());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
