@@ -10,7 +10,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use findx2_core::{
-    load_index_bin_with_progress, v6_load, v6_save_full, v6_try_commit, CommitBatch, CommitOutcome,
+    load_index_bin_with_progress, v6_load, v6_save_full, v6_try_commit, CommitOutcome,
     SearchEngine, V6Layout,
 };
 use tracing::{error, info};
@@ -1194,30 +1194,9 @@ pub(crate) fn persist_index(engine: &SearchEngine, path: &Path) -> anyhow::Resul
             return Ok(false);
         }
     };
-    let batch = {
-        let mut g = engine.index_store_mut();
-        let mutations = g.take_mutations();
-        if mutations.is_empty() {
-            return Ok(true);
-        }
-        // v6：同一把写锁下一次性快照（日志 + 长度 + 游标 + tri_pending），
-        // 保证 manifest 游标不超前于已提交数据。
-        let (tri_snap, has_trigram) = match g.trigram.as_ref() {
-            Some(t) => (t.snapshot_entry_count(), true),
-            None => (0, false),
-        };
-        CommitBatch {
-            mutations,
-            entry_count: g.entries.len(),
-            dir_count: g.dirs.len(),
-            names_len: g.names_buf.len(),
-            dir_paths_len: g.dir_paths_buf.len(),
-            metadata_ready: g.metadata_ready,
-            volumes: g.volumes.clone(),
-            tri_pending: g.tri_pending.clone(),
-            tri_snap,
-            has_trigram,
-        }
+    let batch = match engine.take_persistence_batch() {
+        Some(batch) => batch,
+        None => return Ok(true),
     };
     let v6 = V6Layout::for_index(path);
     let t0 = Instant::now();

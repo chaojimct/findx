@@ -8,6 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const NIL: u32 = u32::MAX;
 const ACTIVE: u8 = 1;
 const ROOT_ALIAS: u8 = 2;
+// Capability bits live only on existing volume roots. Keep the runtime/engine
+// layout and directory stride unchanged; no auxiliary parent index is needed.
+const PARENT_SEARCH_VALID: u8 = 4;
+const PARENT_SEARCH_DEEP_VALID: u8 = 8;
 const CURSOR_SLOTS: usize = 1024;
 const SCAN_WORK_BYTES: usize = 64 * 1024;
 static CURSOR_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -269,6 +273,8 @@ impl UsageRuntime {
         let n = g.entries.len();
         let d = g.dirs.len();
         if n >= NIL as usize || d >= NIL as usize { return Err("usage namespace exceeds reserved u32 index space".into()); }
+        let mut parent_search_valid = true;
+        let mut parent_search_deep_valid = true;
         let mut t = Self { budget, freshness: Freshness::with_len(n)?, ..Self::default() };
         t.reserve(n, d)?;
         let staging = d.saturating_mul(9);
@@ -328,6 +334,10 @@ impl UsageRuntime {
             let Some(letter) = g.volume_letter_u8_for_dir(e.dir_idx) else { continue; };
             if let Some(di) = g.dir_on_volume(letter, frn) {
                 let di = di as usize;
+                let prior = t.dirs[di].owner_entry;
+                if prior != NIL && prior != idx as u32 && !g.entries[prior as usize].is_deleted() {
+                    parent_search_valid = false;
+                }
                 t.dirs[di].owner_entry = idx as u32;
                 if t.dirs[di].flags & ROOT_ALIAS != 0 {
                     let root=t.logical_parent(di as u32);
@@ -388,10 +398,40 @@ impl UsageRuntime {
             if remaining[p as usize] == 0 { leaves.push(p); }
         }
         if seen != d { return Err("usage graph cycle".into()); }
+        // Reuse existing build staging to mark reachable active parents. No
+        // additional persistent directory/entry index or path strings are kept.
+        assigned.fill(false);
+        leaves.clear();
+        leaves.extend(t.roots.values().copied());
+        while let Some(id) = leaves.pop() {
+            if assigned[id as usize] { continue; }
+            assigned[id as usize] = true;
+            let mut child = t.dirs[id as usize].first_dir;
+            while child != NIL {
+                leaves.push(child);
+                child = t.dirs[child as usize].next_dir;
+            }
+        }
+        for entry in &g.entries {
+            if !entry.is_deleted() && !assigned.get(t.logical_parent(entry.dir_idx) as usize).copied().unwrap_or(false) {
+                parent_search_deep_valid = false;
+                break;
+            }
+        }
+        for &root in t.roots.values() {
+            t.dirs[root as usize].flags |= if parent_search_valid { PARENT_SEARCH_VALID } else { 0 }
+                | if parent_search_deep_valid { PARENT_SEARCH_DEEP_VALID } else { 0 };
+        }
         t.epoch = next_epoch();
         t.generation = 1;
         if t.bytes() > budget { return Err("usage actual capacity exceeds byte budget".into()); }
         Ok(t)
+    }
+    pub(crate) fn invalidate_parent_search(&mut self, deep_only: bool) {
+        let mask = if deep_only { PARENT_SEARCH_DEEP_VALID } else { PARENT_SEARCH_VALID | PARENT_SEARCH_DEEP_VALID };
+        for &root in self.roots.values() {
+            if let Some(n) = self.dirs.get_mut(root as usize) { n.flags &= !mask; }
+        }
     }
     fn logical_parent(&self, p:u32)->u32 {
         match self.dirs.get(p as usize) {Some(n) if n.flags & ROOT_ALIAS != 0=>n.parent,_=>p}
@@ -1132,10 +1172,19 @@ impl SearchEngine {
     fn fold_one(&self, g: &IndexStore, r: &mut UsageRuntime, volume: u8, before: &Snap, after: &Snap, ev: &ChangeEvent) -> Result<(), String> {
         let Some(idx) = after.idx.or(before.idx) else { return Ok(()); };
         r.ensure_entries(g)?;
+        // Replaced identities and kind changes can invalidate link ownership.
+        // Retain the exhaustive query rather than publishing an incomplete set.
+        if before.idx.is_some() && after.idx.is_some()
+            && (before.idx != after.idx || before.is_dir != after.is_dir) {
+            r.invalidate_parent_search(false);
+        }
         if after.is_dir || before.is_dir {
             let di = after.di.or(before.di).ok_or("usage missing directory identity")?;
             let slot = g.volume_slot_of(volume).unwrap_or(0) as u8;
             let new_parent = r.logical_parent(after.parent);
+            // Also guard the new-directory early return: a later replacement
+            // parent can share a stale hidden subtree's searchable path.
+            if !after.deleted && !r.visible_dir(new_parent) { r.invalidate_parent_search(true); }
             if before.di.is_none() || (before.di.map(|x| x as usize).unwrap_or(usize::MAX) >= r.dirs.len()) {
                 r.ensure_dir_slot(di, new_parent, slot)?;
                 r.dirs[di as usize] = DirAgg::empty(new_parent, slot);
@@ -1153,18 +1202,28 @@ impl SearchEngine {
             }
             let old_parent = r.logical_parent(before.parent);
             let w = r.dirs[di as usize].totals();
+            // A non-empty deleted directory may retain searchable stale children
+            // in the namespace. Its old path must use the legacy scan, not zero.
+            if after.deleted && !before.deleted && (w.files != 0 || w.dirs > 1) {
+                r.invalidate_parent_search(true);
+            }
+            if !after.deleted && !r.visible_dir(new_parent) {
+                r.invalidate_parent_search(true);
+            }
             if !before.deleted { r.ancestors(if old_parent == di { NIL } else { old_parent }, w, false); }
             if old_parent!=di && (!before.deleted || after.deleted) {r.unlink_dir(di);}
             if !after.deleted && new_parent!=di {r.link_dir(di,new_parent);} else {r.dirs[di as usize].parent=new_parent;}
 
             r.dirs[di as usize].owner_entry = idx;
-            r.dirs[di as usize].flags = if after.deleted { 0 } else { ACTIVE };
+            r.dirs[di as usize].flags = (if after.deleted { 0 } else { ACTIVE })
+                | (r.dirs[di as usize].flags & (PARENT_SEARCH_VALID | PARENT_SEARCH_DEEP_VALID));
             if !after.deleted { r.ancestors(if new_parent == di { NIL } else { new_parent }, w, true); }
             r.invalidate_ticket(idx as usize);
             r.generation += 1;
             return Ok(());
         }
         let new_parent = r.logical_parent(after.parent);
+        if !after.deleted && !r.visible_dir(new_parent) { r.invalidate_parent_search(true); }
         let new_size = after.size;
         let old_unknown = r.freshness.get(idx as usize) != 1;
         let known = match ev {
@@ -2024,4 +2083,105 @@ mod internal_unlink_transaction_tests {
  #[test]fn compact_counts_keep_public_u64_and_full_logical_range(){let mut d=DirAgg::empty(0,0);d.set_totals(Totals{bytes:u64::MAX,files:u32::MAX as u64,dirs:u32::MAX as u64,unknown:u32::MAX as u64}).unwrap();assert_eq!(std::mem::size_of::<DirAgg>(),48);assert_eq!(d.totals().bytes,u64::MAX);assert_eq!(d.totals().unknown,u32::MAX as u64);}
  #[test]fn overflowing_count_fails_atomically_not_wrapped(){let mut d=DirAgg::empty(0,0);d.set_totals(Totals::file(7,true)).unwrap();let old=d.totals();for v in [Totals{files:u32::MAX as u64+1,..old},Totals{dirs:u32::MAX as u64+1,..old},Totals{unknown:u32::MAX as u64+1,..old}]{assert!(d.set_totals(v).is_err());assert_eq!(d.totals(),old);}}
  #[test]fn ancestor_overflow_is_truthful_usage_error(){let mut r=UsageRuntime::default();r.dirs.push(DirAgg::empty(0,0));r.dirs[0].set_totals(Totals{files:u32::MAX as u64,..Totals::default()}).unwrap();r.ancestors(0,Totals::file(1,false),true);assert!(r.error.is_some());assert_eq!(r.dirs[0].totals().files,u32::MAX as u64);}
+}
+
+impl SearchEngine {
+    /// A conservative exact-parent shortcut. Unsupported predicates and uncertain
+    /// graph states return None, leaving the complete legacy query unchanged.
+    #[inline(never)]
+    pub(crate) fn direct_parent_candidates(&self, g: &IndexStore, q: &crate::ParsedQuery) -> Option<Vec<u32>> {
+        let needle = q.parent_path.as_deref()?;
+        let drive = q.drive?.to_ascii_uppercase() as u8;
+        let mut supported = crate::ParsedQuery::default();
+        supported.parent_path = q.parent_path.clone();
+        supported.drive = q.drive;
+        supported.sort_by = q.sort_by;
+        supported.sort_desc = q.sort_desc;
+        supported.limit = q.limit;
+        supported.only_files = q.only_files;
+        supported.only_dirs = q.only_dirs;
+        if *q != supported || needle.split('/').any(|p| p == "." || p == "..") { return None; }
+        let volumes: Vec<_> = g.volumes.iter().filter(|v| v.volume_letter == drive).collect();
+        if volumes.len() != 1 || volumes[0].is_unix() { return None; }
+        if !self.orphans.lock().ordered.is_empty() { return None; }
+        let r = self.usage.lock();
+        if r.epoch == 0 || r.error.is_some()
+            || r.dirs.len() != g.dirs.len() || r.file_links.len() != g.entries.len() { return None; }
+        let root = *r.roots.get(&drive)?;
+        let flags = r.dirs.get(root as usize)?.flags;
+        if flags & PARENT_SEARCH_VALID == 0
+            || !needle.is_empty() && flags & PARENT_SEARCH_DEEP_VALID == 0 { return None; }
+        let mut frontier = vec![root];
+        // Enumerate ALL case-fold-equal branches, unlike the Usage view's
+        // single-directory resolver. This also preserves case-sensitive NTFS
+        // directories queried with the search language's insensitive parent key.
+        for part in needle.split('/').filter(|p| !p.is_empty()) {
+            let mut next = Vec::new();
+            for &parent in &frontier {
+                let mut d = r.dirs.get(parent as usize)?.first_dir;
+                let mut steps = 0;
+                while d != NIL {
+                    let n = r.dirs.get(d as usize)?;
+                    let raw = g.dirs.get(d as usize)?;
+                    let name = if n.owner_entry != NIL { g.name_bytes(g.entries.get(n.owner_entry as usize)?) }
+                        else { g.names_buf.get(raw.name_offset as usize..raw.name_offset as usize + raw.name_len as usize)? };
+                    if String::from_utf8_lossy(name).eq_ignore_ascii_case(part) { next.push(d); }
+                    d = n.next_dir;
+                    steps += 1;
+                    if steps > r.dirs.len() { return None; }
+                }
+            }
+            // An unreachable old directory can still have indexed children.
+            // Missing paths deliberately fall back; do not invent an empty set.
+            if next.is_empty() { return None; }
+            frontier = next;
+        }
+        let mut ids = Vec::new();
+        for &parent in &frontier {
+            let mut d = r.dirs.get(parent as usize)?.first_dir;
+            let mut steps = 0;
+            while d != NIL {
+                let n = r.dirs.get(d as usize)?;
+                if n.owner_entry != NIL { ids.push(n.owner_entry); }
+                d = n.next_dir;
+                steps += 1;
+                if steps > r.dirs.len() { return None; }
+            }
+            let mut f = r.dirs.get(parent as usize)?.first_file;
+            steps = 0;
+            while f != NIL {
+                ids.push(f);
+                f = r.file_links.get(f as usize)?.next;
+                steps += 1;
+                if steps > g.entries.len() { return None; }
+            }
+            if parent == root {
+                for (di, n) in r.dirs.iter().enumerate() {
+                    if (di as u32 == root || n.flags & ROOT_ALIAS != 0 && r.logical_parent(di as u32) == root)
+                        && n.owner_entry != NIL { ids.push(n.owner_entry); }
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids.retain(|&i| {
+            let Some(e) = g.entries.get(i as usize) else { return false; };
+            !e.is_deleted() && (!q.only_files || !e.is_dir_entry()) && (!q.only_dirs || e.is_dir_entry())
+                && g.volume_for_entry(i as usize).is_some_and(|v| v.volume_letter == drive)
+                && crate::search::match_parent_path_exact(g, i as usize, needle)
+        });
+        Some(ids)
+    }
+}
+
+#[cfg(test)]
+mod parent_direct_capability_tests {
+ use super::*;
+ use crate::{IndexBuilder, QueryParser, SearchOptions, RawEntry};
+ fn raw(id:u64,parent:u64,name:&str,dir:bool)->RawEntry {RawEntry{file_id:id,file_id_128:None,parent_id:parent,name:name.into(),size:0,mtime:0,ctime:0,attrs:if dir{16}else{0},is_dir:dir}}
+ fn engine()->SearchEngine {let mut s=IndexBuilder::new(b'C',1,2,3).build_from_raw(vec![raw(30,20,"inside",false),raw(31,10,"outside",false)],vec![raw(10,0,"",true),raw(20,10,"dev",true)],true).unwrap();s.set_track_mutations(true);let e=SearchEngine::new(s);e.enable_usage(16*1024*1024).unwrap();e}
+ #[test]fn eligible_root_and_deep_use_links_not_fallback(){let e=engine();for text in ["parent:C:/","parent:C:/dev"]{let q=QueryParser::parse(text).unwrap();let direct=e.direct_parent_candidates(&e.store.read(),&q).expect("eligible branch must not silently scan");assert!(!direct.is_empty());let (legacy,total)=e.search(&q,&SearchOptions::default()).unwrap();assert_eq!(direct.len(),total as usize);let mut ids:Vec<_>=legacy.iter().map(|h|h.entry_idx).collect();ids.sort_unstable();assert_eq!(direct,ids);}}
+ #[test]fn parked_namespace_disables_links_until_attachment(){let e=engine();let q=QueryParser::parse("parent:C:/").unwrap();e.apply_volume_batch(b'C',&[ChangeEvent::Create{entry:raw(44,999,"parked",false)}],2,4).unwrap();assert!(e.direct_parent_candidates(&e.store.read(),&q).is_none());e.apply_volume_batch(b'C',&[ChangeEvent::Create{entry:raw(999,10,"attached",true)}],2,5).unwrap();assert!(e.direct_parent_candidates(&e.store.read(),&q).is_some());let q=QueryParser::parse("parent:C:/attached").unwrap();assert_eq!(e.direct_parent_candidates(&e.store.read(),&q).unwrap().len(),1);}
+ #[test]fn checkpoint_drain_preserves_graph_and_atomic_cursor(){let e=engine();e.apply_volume_batch(b'C',&[ChangeEvent::Create{entry:raw(32,20,"new",false)}],2,4).unwrap();let batch=e.take_persistence_batch().expect("mutation checkpoint");assert!(!batch.mutations.is_empty());let g=e.index_store();assert_eq!(batch.entry_count,g.entries.len());assert_eq!(batch.dir_count,g.dirs.len());assert_eq!(batch.volumes[0].last_usn,g.volumes[0].last_usn);assert_eq!(batch.volumes[0].last_usn,4);drop(g);let q=QueryParser::parse("parent:C:/dev").unwrap();let ids=e.direct_parent_candidates(&e.store.read(),&q).expect("checkpoint is not a namespace mutation");assert_eq!(ids.len(),2);assert!(e.take_persistence_batch().is_none());}
+ #[test]fn uncertain_graph_and_predicates_fall_back(){let e=engine();for text in ["parent:dev","parent:C:/missing","parent:C:/dev size:>0","parent:C:/dev ext:log"]{let q=QueryParser::parse(text).unwrap();assert!(e.direct_parent_candidates(&e.store.read(),&q).is_none(),"{text}");}e.apply_volume_change(b'C',&ChangeEvent::Delete{file_id:20}).unwrap();let q=QueryParser::parse("parent:C:/dev").unwrap();assert!(e.direct_parent_candidates(&e.store.read(),&q).is_none());let q=QueryParser::parse("parent:C:/").unwrap();assert!(e.direct_parent_candidates(&e.store.read(),&q).is_some());drop(e.index_store_mut());assert!(e.direct_parent_candidates(&e.store.read(),&q).is_none());}
 }

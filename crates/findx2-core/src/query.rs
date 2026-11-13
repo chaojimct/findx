@@ -20,7 +20,7 @@ pub enum SortField {
 }
 
 /// 解析后的查询（AND 组合；`!` 为子串排除）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedQuery {
     /// 顶层 `|` OR 分支（除首段外的各段解析结果；首段字段在本 struct 其余字段上）
     pub or_branches: Vec<ParsedQuery>,

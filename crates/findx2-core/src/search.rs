@@ -439,8 +439,14 @@ impl SearchEngine {
                 // miss：读锁下全量扫描 + 排到 K（K 覆盖将来翻页，见 CachedTop）。
                 // 读锁持有期间 writer 进不来，扫完再取 revision 打标签，
                 // 保证「数据 ⇒ 标签」的时序正确。
-                let unordered =
-                    Self::search_unordered(&store, &self.metadata_overlay, q, opt, pin_res_ref)?;
+                let unordered = if q.parent_path.is_some() {
+                    match self.direct_parent_candidates(&store, q) {
+                        Some(ids) => ids,
+                        None => Self::search_unordered(&store, &self.metadata_overlay, q, opt, pin_res_ref)?,
+                    }
+                } else {
+                    Self::search_unordered(&store, &self.metadata_overlay, q, opt, pin_res_ref)?
+                };
                 if lock_wait.as_millis() > 10 || cpu_started.elapsed().as_millis() > 100 {
                     crate::progress!("search_phase scan_lock_wait_ms={} scan_cpu_ms={}",lock_wait.as_millis(),cpu_started.elapsed().as_millis());
                 }
@@ -1171,8 +1177,36 @@ impl SearchEngine {
         self.store.read()
     }
 
+    /// Drain only persistence bookkeeping under the namespace lock. This cannot
+    /// mutate child links, unlike the unrestricted index_store_mut escape hatch.
+    /// Cursor, lengths and mutations remain one atomic checkpoint snapshot.
+    pub fn take_persistence_batch(&self) -> Option<crate::CommitBatch> {
+        let mut g = self.store.write();
+        let mutations = g.take_mutations();
+        if mutations.is_empty() { return None; }
+        let (tri_snap, has_trigram) = match g.trigram.as_ref() {
+            Some(t) => (t.snapshot_entry_count(), true),
+            None => (0, false),
+        };
+        Some(crate::CommitBatch {
+            mutations,
+            entry_count: g.entries.len(),
+            dir_count: g.dirs.len(),
+            names_len: g.names_buf.len(),
+            dir_paths_len: g.dir_paths_buf.len(),
+            metadata_ready: g.metadata_ready,
+            volumes: g.volumes.clone(),
+            tri_pending: g.tri_pending.clone(),
+            tri_snap,
+            has_trigram,
+        })
+    }
+
     pub fn index_store_mut(&self) -> parking_lot::RwLockWriteGuard<'_, IndexStore> {
-        self.store.write()
+        let guard = self.store.write();
+        // An unrestricted external writer cannot promise to maintain child links.
+        self.usage.lock().invalidate_parent_search(false);
+        guard
     }
 
     /// 重建 trigram 边车并热替换进内存（service 运行期调用，不重启）。
@@ -2561,7 +2595,7 @@ fn parent_path_haystack(store: &IndexStore, entry_idx: usize) -> String {
 }
 
 /// `parent:` / `infolder:`：父目录路径与给定路径**精确一致**（忽略大小写、斜杠方向）。
-fn match_parent_path_exact(store: &IndexStore, entry_idx: usize, parent_needle: &str) -> bool {
+pub(crate) fn match_parent_path_exact(store: &IndexStore, entry_idx: usize, parent_needle: &str) -> bool {
     parent_path_haystack(store, entry_idx) == path_key(parent_needle)
 }
 
