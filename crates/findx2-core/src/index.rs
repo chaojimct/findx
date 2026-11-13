@@ -2073,13 +2073,18 @@ impl IndexStore {
     ///
     /// 增量 Create/CreatePending 追加的条目会超出原始 first_entry_idx 范围，
     /// `volume_for_entry` 会错误地选择最后一个卷。此方法通过父目录的所属卷来推导。
+    fn directory_for_display(&self, frn: u64) -> Option<u32> {
+        if self.volumes.len() == 1 { self.dir_index.get_scoped(frn, 0) }
+        else { self.dir_index.get(&frn).copied() }
+    }
+
     fn volume_for_entry_by_parent(&self, idx: usize) -> Option<&VolumeState> {
         let e = self.entries.get(idx)?;
 
         // 对于目录条目，从 frn 查找 dir_idx
         if e.is_dir_entry() {
             let fr = self.frns.get(idx).copied().unwrap_or(0);
-            if let Some(&di) = self.dir_index.get(&fr) {
+            if let Some(di) = self.directory_for_display(fr) {
                 // 递归查找该目录的祖先，直到找到根目录
                 return self.volume_for_dir_idx(di);
             }
@@ -2091,6 +2096,10 @@ impl IndexStore {
 
     /// 从目录 idx 查找所属的卷（递归向上直到找到根目录或匹配的卷）
     fn volume_for_dir_idx(&self, mut dir_idx: u32) -> Option<&VolumeState> {
+        if self.volumes.len() == 1 {
+            self.dirs.get(dir_idx as usize)?;
+            return self.volumes.first();
+        }
         if self.volumes.is_empty() {
             return None;
         }
@@ -2223,7 +2232,7 @@ impl IndexStore {
             let prefix = vol.map(|v| v.root_prefix.as_str()).unwrap_or("/");
             if e.is_dir_entry() {
                 let fr = self.frns.get(idx).copied().unwrap_or(0);
-                if let Some(&di) = self.dir_index.get(&fr) {
+                if let Some(di) = self.directory_for_display(fr) {
                     // Unix 使用保留原始大小写的路径
                     let pbytes = self.build_dir_path_original_case(di);
                     if !pbytes.is_empty() {
@@ -2252,7 +2261,7 @@ impl IndexStore {
             // 1000 个目录 hits × 100 万 dirs ≈ 10 亿次比较 ≈ 600ms（实测「android」就被这个挡住）。
             // dir_index 已是 FRN→dirs 下标的 FxHashMap，直接 O(1) 查询即可。
             let fr = self.frns.get(idx).copied().unwrap_or(0);
-            if let Some(&di) = self.dir_index.get(&fr) {
+            if let Some(di) = self.directory_for_display(fr) {
                 let pbytes = self.resolve_dir_path_lower(di);
                 if !pbytes.is_empty() {
                     let p = std::str::from_utf8(pbytes.as_ref())?;
