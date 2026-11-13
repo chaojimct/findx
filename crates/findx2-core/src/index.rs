@@ -1686,7 +1686,10 @@ impl IndexStore {
         if let Some(idx) = self.frn_to_entry.get_scoped(frn, slot) {
             return Some(idx);
         }
-        let idx = *self.frn_to_entry.get(&frn)?;
+        // Compatibility imports used slot 0 for unscoped identities. Do not
+        // call get(): it linearly scans the entire incremental overlay on every
+        // scoped miss (including every new FRN while holding the store writer).
+        let idx = self.frn_to_entry.get_scoped(frn, 0)?;
         if self.entry_belongs_to_volume(idx, letter) { Some(idx) } else { None }
     }
     pub fn dir_on_volume(&self, letter: u8, frn: u64) -> Option<u32> {
@@ -1694,7 +1697,9 @@ impl IndexStore {
         if let Some(idx) = self.dir_index.get_scoped(frn, slot) {
             return Some(idx);
         }
-        let idx = *self.dir_index.get(&frn)?;
+        // A file FRN is normally absent from the directory map; this miss is
+        // hot in every watch event. Legacy fallback must also be a keyed lookup.
+        let idx = self.dir_index.get_scoped(frn, 0)?;
         if self.volume_letter_u8_for_dir(idx) == Some(letter) { Some(idx) } else { None }
     }
     fn entry_belongs_to_volume(&self, idx: u32, letter: u8) -> bool {

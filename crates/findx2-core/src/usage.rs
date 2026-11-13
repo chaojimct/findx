@@ -742,7 +742,10 @@ impl SearchEngine {
         self.apply_volume_events(volume, events, Some((journal_id, next_usn))).map(|_| ())
     }
     fn apply_volume_events(&self, volume: u8, events: &[ChangeEvent], cursor: Option<(u64, u64)>) -> Result<bool, String> {
+        let lock_started = std::time::Instant::now();
         let mut g = self.store.write();
+        let write_wait = lock_started.elapsed();
+        let apply_started = std::time::Instant::now();
         if let Some((journal_id, next_usn)) = cursor {
             let v = g.volumes.iter().find(|v| v.volume_letter == volume).ok_or("batch volume unavailable")?;
             if v.usn_journal_id != 0 && v.usn_journal_id != journal_id {
@@ -924,6 +927,9 @@ impl SearchEngine {
         }
         if !applied_snaps.is_empty() { self.bump_revision(); }
         drop(g);
+        if apply_started.elapsed().as_millis() > 25 || write_wait.as_millis() > 25 {
+            crate::progress!("watch_batch events={} applied={} write_wait_ms={} hold_ms={}", events.len(), applied_snaps.len(), write_wait.as_millis(), apply_started.elapsed().as_millis());
+        }
         Ok(!applied_snaps.is_empty())
     }
     fn snap_identity(&self, g: &IndexStore, volume: u8, ev: &ChangeEvent) -> Snap {
