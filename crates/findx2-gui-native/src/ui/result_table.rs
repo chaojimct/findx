@@ -169,17 +169,9 @@ impl TableDelegate for ResultsTable {
             .child(text)
             .into_any_element()
     }
-    fn render_empty(
-        &mut self,
-        _: &mut Window,
-        _: &mut Context<TableState<Self>>,
-    ) -> impl IntoElement {
-        div()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .child("输入关键词搜索文件")
+    fn render_empty(&mut self, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
+        let label = self.owner.read_with(cx, |view, cx| view.search_empty_message(cx)).unwrap_or_default();
+        div().size_full().flex().items_center().justify_center().child(label)
     }
     fn has_more(&self, _: &App) -> bool {
         self.more

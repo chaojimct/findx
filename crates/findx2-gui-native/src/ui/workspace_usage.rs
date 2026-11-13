@@ -133,7 +133,7 @@ impl MainWindow {
         }
         let root_change = self.workspace.usage_scene.as_ref().is_some_and(|s| {
             s.key.root != root
-                || s.key.scan != self.usage_scan_identity(&scan)
+                || (!self.workspace.engine_usage && s.key.scan != self.usage_scan_identity(&scan))
         });
         let detail = if root_change {
             1
@@ -170,7 +170,7 @@ impl MainWindow {
                     && this.workspace.usage_preview.borrow().can_handoff(source);
                 if let Some(previous) = this.workspace.usage_scene.as_ref().filter(|_| !handing) {
                     if previous.key.root != scene.key.root
-                        || previous.key.scan != scene.key.scan
+                        || (!this.workspace.engine_usage && previous.key.scan != scene.key.scan)
                     {
                         this.workspace.usage_transition = None;
                         if previous.key.scan == scene.key.scan
@@ -258,6 +258,8 @@ impl MainWindow {
                 }
                 // Preserve zoom but clamp its origin after resize/detail relayout.
                 this.workspace.usage_camera.pan(0., 0., scene.viewport);
+                // Publish immutable geometry and its matching node snapshot together.
+                this.workspace.usage_scene_scan = Some(handoff_scan);
                 this.workspace.usage_scene = Some(Arc::new(scene));
                 cx.notify();
             })
@@ -507,9 +509,11 @@ impl MainWindow {
                 "正在读取索引目录…（最长 45 秒，可取消）"
             } else { self.workspace.scan_status.as_str() });
         } else if let (Some(scan), Some(scene)) =
-            (&self.workspace.scan, &self.workspace.usage_scene)
+            (self.usage_render_scan(), &self.workspace.usage_scene)
         {
-            if scene.key.scan == self.usage_scan_identity(scan)
+            if (if self.workspace.engine_usage {
+                crate::indexed_usage::scene_can_paint(scan, scene.key.root, &self.workspace.location)
+            } else { scene.key.scan == self.usage_scan_identity(scan) })
                 && Some(scene.key.root) == self.scan_node()
             {
                 let preview = self.workspace.usage_preview.borrow();

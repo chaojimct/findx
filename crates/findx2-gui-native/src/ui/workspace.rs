@@ -226,6 +226,7 @@ pub(super) struct Workspace {
     usage_memory_profile: usize,
     scan: Option<Arc<Scan>>,
     usage_scene: Option<Arc<crate::usage_view::Scene>>,
+    usage_scene_scan: Option<Arc<Scan>>,
     usage_preview: std::cell::RefCell<crate::disktree::scan_preview::Motion>,
     usage_fixture_seen: usize,
     active_scan_root: Option<PathBuf>,
@@ -360,6 +361,7 @@ impl Workspace {
             usage_memory_profile: 0,
             scan: None,
             usage_scene: None,
+            usage_scene_scan: None,
             usage_preview: Default::default(),
             usage_fixture_seen: 0,
             active_scan_root: None,
@@ -934,6 +936,9 @@ impl MainWindow {
         }
         cx.notify();
     }
+    fn usage_render_scan(&self) -> Option<&Arc<Scan>> {
+        if self.workspace.engine_usage { self.workspace.usage_scene_scan.as_ref() } else { self.workspace.scan.as_ref() }
+    }
     fn usage_scan_identity(&self, scan: &Arc<Scan>) -> usize {
         crate::indexed_usage::scene_identity(self.workspace.engine_usage, self.workspace.usage_tree_revision, Arc::as_ptr(scan) as usize)
     }
@@ -1061,6 +1066,7 @@ impl MainWindow {
             self.workspace.scan = None;
             self.workspace.scan_lookup.clear();
             self.workspace.usage_scene = None;
+            self.workspace.usage_scene_scan = None;
             self.workspace.usage_scene_key = None;
             self.workspace.usage_scene_generation = self.workspace.usage_scene_generation.wrapping_add(1);
             self.workspace.usage_transition = None;
@@ -1397,6 +1403,7 @@ impl MainWindow {
         let old = self.workspace.scan.take();
         let lookup = std::mem::take(&mut self.workspace.scan_lookup);
         self.workspace.usage_scene = None;
+            self.workspace.usage_scene_scan = None;
         self.workspace.usage_scene_key = None;
         self.workspace.usage_transition = None;
         self.workspace.usage_scene_generation += 1;
@@ -1419,6 +1426,7 @@ impl MainWindow {
         let cancel=self.workspace.engine_cancel.clone();
         self.workspace.scan_generation = self.workspace.scan_generation.wrapping_add(1);
         let request_generation = self.workspace.scan_generation;
+        if std::env::var_os("FINDX_NATIVE_USAGE_TRACE").is_some() { eprintln!("usage_request start token={} revision={}", request_generation, self.workspace.usage_tree_revision); }
         let path = display_path(&self.workspace.location);
         let requested = self.workspace.location.clone();
         let session = self.session.read(cx);
@@ -1523,6 +1531,9 @@ impl MainWindow {
                     page.state
                 );
                 if skipped_empty>0 {this.workspace.scan_status.push_str(&format!(" [{} empty pages skipped; continuation retained]",skipped_empty));}
+                if std::env::var_os("FINDX_NATIVE_USAGE_TRACE").is_some() {
+                    eprintln!("usage_response token={} epoch={} generation={} bytes={} children={} unknown={} same_layout={}", request_generation, page.epoch, page.generation, page.root.logical, page.children.len(), page.root.unknown, this.workspace.scan.as_ref().is_some_and(|s| crate::indexed_usage::same_layout(s,&requested,&page)));
+                }
                 this.workspace.engine_generation = Some((page.epoch, page.generation));
                 this.workspace.engine_next = page.next;
                 // Generation/unknown ticks must update the badge only. Replacing
@@ -1645,6 +1656,7 @@ impl MainWindow {
             self.workspace.scan = None;
             self.workspace.scan_lookup.clear();
             self.workspace.usage_scene = None;
+            self.workspace.usage_scene_scan = None;
             self.workspace.usage_scene_key = None;
             self.workspace.usage_transition = None;
             self.workspace.usage_scene_generation += 1;

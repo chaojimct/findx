@@ -217,6 +217,14 @@ mod navigation_scene_tests {
         assert!(scene.tiles.iter().any(|t| t.depth > 0 && t.rect.w > 0. && t.rect.h > 0.));
         assert_ne!(scene.key.scan, scene_identity(true, 3, Arc::as_ptr(&live) as usize));
         assert!(!same_layout(&live, &root, &page(4, 278, 101)));
+        // While a genuine metric update is building a new scene, the previous
+        // published snapshot stays drawable, but never under another address.
+        let changed = scan_from_page(&page(4,278,101),root.clone());
+        assert!(!same_layout(&live,&root,&page(4,278,101)));
+        assert!(scene_can_paint(&live,scene.key.root,&root));
+        assert!(scene_can_paint(&changed,0,&root));
+        assert!(!scene_can_paint(&live,scene.key.root,&PathBuf::from(r"C:\Other")));
+
         assert!(!same_layout(&live, &PathBuf::from(r"C:\Users"), &badge));
     }
     #[test]
@@ -228,4 +236,10 @@ mod navigation_scene_tests {
         assert!(request_is_current(3,3,&root,&root,false));
         assert_eq!(scene_identity(false,2,12345),12345);
     }
+}
+
+/// A pending same-scope metric/layout refresh must keep its immutable published
+/// snapshot drawable. Scope changes must never paint another directory's scene.
+pub fn scene_can_paint(scan: &Scan, root: usize, requested: &std::path::Path) -> bool {
+    scan.nodes.get(root).is_some_and(|n| n.path == requested)
 }

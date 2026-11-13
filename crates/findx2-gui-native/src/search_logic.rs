@@ -774,3 +774,18 @@ mod tests {
         assert_eq!(unix_secs_from_mtime(0), 0);
     }
 }
+
+pub fn empty_result_label(has_query: bool, loading: bool, status: &str) -> &str {
+    if loading { "正在搜索…" }
+    else if has_query { status }
+    else { "输入关键词搜索文件" }
+}
+
+#[cfg(test)] mod empty_state_tests {
+    #[test] fn nonempty_pending_query_never_requests_input() {
+        assert_eq!(super::empty_result_label(true,true,"pending"),"正在搜索…");
+        assert_eq!(super::empty_result_label(true,false,"No matches"),"No matches");
+        assert_eq!(super::empty_result_label(true,false,"Error: timeout"),"Error: timeout");
+        assert_eq!(super::empty_result_label(false,false,"ready"),"输入关键词搜索文件");
+    }
+}

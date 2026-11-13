@@ -433,6 +433,9 @@ impl MainWindow {
             }));
     }
 
+    pub(super) fn search_empty_message(&self, cx: &App) -> String {
+        crate::search_logic::empty_result_label(!self.current_query(cx).trim().is_empty(), self.loading, self.search_status.as_ref()).into()
+    }
     fn current_query(&self, cx: &App) -> String {
         let raw = self.search.read(cx).value().to_string();
         search_logic::build_full_query(
