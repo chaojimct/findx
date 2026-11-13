@@ -74,6 +74,12 @@ mod tests {
   assert_eq!(report.committed,n+1);assert!(report.peak_items<=4096);assert!(report.peak_ticket_bytes<1024*1024);assert_eq!(e.metadata_ticket_storage().0,0);assert!(e.metadata_ticket_storage().2<=64*1024);
   assert_eq!(e.metadata_coverage(epoch).unwrap().unknown,0);
   assert!(!e.index_store().has_pending_mutations(),"backfill must not retain N per-file mutation records");
+  let (dirty_slots,dirty_serialized_bytes)=e.pending_metadata_bitmap();
+  assert_eq!(dirty_slots,n as u64+1);
+  assert!(dirty_serialized_bytes < (n+1)/8+16*1024,"coalesced dirty bitmap must not become N full mutation records");
+  assert!(e.has_pending_persistence(),"partial metadata must schedule a checkpoint even without namespace mutations");
+  println!("checkpoint_dirty_slots={dirty_slots} serialized_bitmap_bytes={dirty_serialized_bytes} transient_snapshot_bytes_per_dirty_slot={}",std::mem::size_of::<(u32,[u8;16])>());
+
   let line=format!("bounded_fake_backfill files={} batches={} attempted={} committed={} peak_items={} peak_ticket_cap={} peak_ticket_bytes={} retained_ticket_bytes={} active_charge_budget={} d_ws={} d_private={} sampled_peak_d_ws={} sampled_peak_d_private={} elapsed_ms={elapsed}",n+1,report.batches,report.attempted,report.committed,report.peak_items,report.peak_ticket_capacity,report.peak_ticket_bytes,e.metadata_ticket_storage().2,limits.active_bytes,after.0 as i64-baseline.0 as i64,after.1 as i64-baseline.1 as i64,peak.0.saturating_sub(baseline.0),peak.1.saturating_sub(baseline.1));
   println!("{line}");
   let evidence=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/backfill-t109-memory.txt");

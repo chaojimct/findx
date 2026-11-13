@@ -755,9 +755,9 @@ impl SearchEngine {
         if e.is_deleted() || e.is_dir_entry() { return Ok(false); }
         let parent = e.dir_idx;
         let old = Totals::file(self.effective_size(&g, t.entry), r.freshness.get(t.entry) != 1);
-        if g.metadata_ready || self.metadata_drain_active() || t.entry >= self.metadata_overlay.capacity() {
-            g.patch_entry_metadata(t.entry, size, mtime, ctime).map_err(|e| e.to_string())?;
-        }
+        // Ticket validation, store mutation and overlay publication share one lock.
+        // Do not confuse incomplete metadata coverage with an inconsistent snapshot.
+        self.mirror_metadata_for_persistence(&mut g,t.entry,size,mtime,ctime).map_err(|e| e.to_string())?;
         self.metadata_overlay.put(t.entry, size, crate::index::filetime_to_unix_secs(mtime), crate::index::filetime_to_unix_secs(ctime));
         r.freshness.set(t.entry, 1);
         r.apply_file_delta(parent, old, Totals::file(size, false), true, true);
@@ -2031,7 +2031,7 @@ impl SearchEngine {
             let e=&g.entries[idx];
             if e.is_deleted()||e.is_dir_entry()||r.freshness.get(idx)==1 {continue;}
             let parent=e.dir_idx;let old=Totals::file(self.effective_size(&g,idx),true);
-            if g.metadata_ready||self.metadata_drain_active()||idx>=self.metadata_overlay.capacity(){g.patch_entry_metadata(idx,size,mtime,ctime).map_err(|e|e.to_string())?;}
+            self.mirror_metadata_for_persistence(&mut g,idx,size,mtime,ctime).map_err(|e|e.to_string())?;
             self.metadata_overlay.put(idx,size,crate::index::filetime_to_unix_secs(mtime),crate::index::filetime_to_unix_secs(ctime));
             r.freshness.set(idx,1);r.invalidate_ticket(idx);
             r.apply_file_delta(parent,old,Totals::file(size,false),true,true);committed+=1;

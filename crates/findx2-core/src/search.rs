@@ -126,12 +126,15 @@ pub struct SearchEngine {
     backfill: Arc<BackfillProgress>,
     /// 回填元数据的紧凑 overlay（取代之前的 `DashMap`）：
     /// - 长度固定 = entry_count，按 idx 平铺 16 字节/条；
-    /// - 全程**无锁**：回填线程写、search 线程读，永远不竞 IndexStore 的 RwLock；
-    /// - 持久化时（`flush_metadata_overlay_into_store`）才一次性合并进主索引。
+    /// - Overlay query reads are lock-free; producer publication holds the namespace lock.
+    /// - Accepted metadata is also mirrored into the store and compact dirty bitmap.
     ///
     /// 见 `crate::meta_overlay` 的模块文档了解为什么不用 DashMap。
     pub(crate) metadata_overlay: Arc<MetaOverlay>,
     metadata_drains: AtomicUsize,
+    // Protected in store -> dirty order. Accepted producer values are already in
+    // the store; this bitmap only identifies slots to snapshot on checkpoint.
+    metadata_dirty: parking_lot::Mutex<RoaringBitmap>,
     /// 索引变更计数：任何影响搜索结果集/排序的写入都 +1（USN 增量、回填合并、
     /// metadata_ready 翻转、overlay 写入/清空）。分页查询缓存凭它失效。
     /// trigram 边车重建不 bump——剪枝只影响候选超集，不影响最终命中与排序。
@@ -178,6 +181,7 @@ impl SearchEngine {
             backfill: Arc::new(BackfillProgress::default()),
             metadata_overlay: Arc::new(MetaOverlay::new(entry_count)),
             metadata_drains: AtomicUsize::new(0),
+            metadata_dirty: parking_lot::Mutex::new(RoaringBitmap::new()),
             revision: AtomicU64::new(0),
             page_cache: parking_lot::Mutex::new(None),
         }
@@ -205,6 +209,7 @@ impl SearchEngine {
         runtime.budget = budget;
         runtime.error = Some("index epoch changed; usage requires reinitialization".into());
         self.metadata_overlay.clear();
+        self.metadata_dirty.lock().clear();
         *g = store;
         self.bump_revision();
     }
@@ -238,7 +243,7 @@ impl SearchEngine {
         self.metadata_overlay.snapshot()
     }
 
-    /// 并行回填后批量写入 overlay。**完全无锁**。
+    /// Publish a backfill batch under the namespace lock, including persistence dirtiness.
     /// 入参 `(idx, size, mtime_filetime, ctime_filetime)`——为了兼容老调用方仍给 FILETIME，
     /// 这里转成 unix 秒存进紧凑 overlay。
     pub fn extend_metadata_overlay_batch(&self, items: &[(usize, u64, u64, u64)]) {
@@ -253,10 +258,10 @@ impl SearchEngine {
             let parent = guard.entries.get(idx).map(|e| e.dir_idx).unwrap_or(0);
             let old = self.metadata_overlay.get(idx).map(|t| t.0).unwrap_or_else(|| guard.entries.get(idx).map(|e| e.size).unwrap_or(0));
             let was_unknown = self.metadata_overlay.get(idx).is_none();
-            if guard.metadata_ready || self.metadata_drain_active() {
-                // Valid producers use existing slots; mirror late writes while a bounded drain runs.
-                let _ = guard.patch_entry_metadata(idx, size, m_ft, c_ft);
-            }
+            // Mirror accepted backfill under the SAME namespace lock as the overlay.
+            // Coverage is independent of persistence consistency: an incomplete store
+            // can now be checkpointed without a tearing, multi-page overlay drain.
+            let _ = self.mirror_metadata_for_persistence(&mut guard, idx, size, m_ft, c_ft);
             self.metadata_overlay.put(idx, size, mtime, ctime);
             usage.overlay_delta(parent, old, size, was_unknown, idx);
         }
@@ -1182,7 +1187,31 @@ impl SearchEngine {
     /// Cursor, lengths and mutations remain one atomic checkpoint snapshot.
     pub fn take_persistence_batch(&self) -> Option<crate::CommitBatch> {
         let mut g = self.store.write();
-        let mutations = g.take_mutations();
+        let mut mutations = g.take_mutations();
+        let mut dirty = self.metadata_dirty.lock();
+        if !dirty.is_empty() {
+            if !mutations.iter().any(|m| matches!(m, crate::index::Mutation::FullResync)) {
+                let mut patches = Vec::new();
+                if patches.try_reserve_exact(dirty.len() as usize).is_err() {
+                    // Natural allocation failure is not a reason to lose dirty data.
+                    // Full snapshot IO can consume the authoritative store directly.
+                    mutations.push(crate::index::Mutation::FullResync);
+                } else {
+                    for idx in dirty.iter() {
+                        if let Some(e) = g.entries.get(idx as usize) {
+                            let mut bytes = [0; 16];
+                            bytes[..8].copy_from_slice(&e.size.to_le_bytes());
+                            bytes[8..12].copy_from_slice(&e.mtime.to_le_bytes());
+                            bytes[12..].copy_from_slice(&e.ctime.to_le_bytes());
+                            patches.push((idx, bytes));
+                        }
+                    }
+                    mutations.push(crate::index::Mutation::MetadataBatch(patches));
+                }
+            }
+            dirty.clear();
+        }
+        drop(dirty);
         if mutations.is_empty() { return None; }
         let (tri_snap, has_trigram) = match g.trigram.as_ref() {
             Some(t) => (t.snapshot_entry_count(), true),
@@ -1200,6 +1229,44 @@ impl SearchEngine {
             tri_snap,
             has_trigram,
         })
+    }
+
+    /// All callers hold the namespace write lock. No per-file mutation payload is
+    /// retained during backfill; repeated writes to one slot coalesce in a bitmap.
+    pub(crate) fn mirror_metadata_for_persistence(&self, g: &mut IndexStore, idx: usize,
+        size: u64, mtime: u64, ctime: u64) -> Result<()> {
+        let e = g.entries.get_mut(idx).ok_or_else(|| crate::Error::Platform("metadata slot out of bounds".into()))?;
+        e.size = size;
+        e.mtime = crate::index::filetime_to_unix_secs(mtime);
+        e.ctime = crate::index::filetime_to_unix_secs(ctime);
+        if g.mutation_log.is_some() { self.metadata_dirty.lock().insert(idx as u32); }
+        Ok(())
+    }
+
+    pub fn has_pending_persistence(&self) -> bool {
+        let g = self.store.read();
+        g.has_pending_mutations() || !self.metadata_dirty.lock().is_empty()
+    }
+
+    /// Diagnostic: serialized bitmap bytes, NOT resident/capacity measurement.
+    pub fn pending_metadata_bitmap(&self) -> (u64, usize) {
+        let _g = self.store.read();
+        let dirty = self.metadata_dirty.lock();
+        (dirty.len(), dirty.serialized_size())
+    }
+
+    /// Return an unacknowledged batch ahead of concurrent mutations. A failed legacy
+    /// v6 writer may already have modified prefixes, so retry must repair from the
+    /// authoritative store, not blindly append the same delta a second time.
+    /// FullResync suppresses further per-item logging until that retry is captured;
+    /// original log records are retained, without cloning their payloads.
+    pub fn restore_persistence_batch(&self, mut batch: crate::CommitBatch) {
+        let mut g = self.store.write();
+        batch.mutations.extend(g.take_mutations());
+        if !matches!(batch.mutations.last(), Some(crate::index::Mutation::FullResync)) {
+            batch.mutations.push(crate::index::Mutation::FullResync);
+        }
+        g.mutation_log = Some(batch.mutations);
     }
 
     pub fn index_store_mut(&self) -> parking_lot::RwLockWriteGuard<'_, IndexStore> {

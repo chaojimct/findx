@@ -664,37 +664,17 @@ fn usn_watch_loop(
     // 脏计数：累计已 apply 但未提交的 ChangeEvent 条数。
     // 纯 Checkpoint（游标推进但无事件）只更新内存里的 last_usn，不触发落盘。
     // 提交条件 = 脏数达阈值（忙时及时落盘， bound 崩溃回放量）或间隔到（闲时兜底）。
-    // v6 单次提交只是 KB 级 patch + 一次 manifest rename，30s 节奏零压力。
-    const COMMIT_THRESHOLD: usize = 4096;
+    // Coalesced metadata delta cost scales with dirty slots, not total corpus size.
     let mut dirty_count: usize = 0;
 
-    // 尝试按条件落盘：有脏 &&（量够 || 间隔到）&& 回填完成。返回后调用方按是否真实写入更新状态。
-    let try_maybe_persist = |dirty_count: &mut usize,
+    // Checkpoint coverage is independent of consistency; retries retain dirty state.
+    let mut checkpoint_retry_after = None;
+    let mut try_maybe_persist = |dirty_count: &mut usize,
                              last_save: &mut Instant,
                              engine: &Arc<SearchEngine>,
-                             index_path: &PathBuf|
-     -> anyhow::Result<()> {
-        if *dirty_count == 0 && !engine.index_store().has_pending_mutations() {
-            return Ok(());
-        }
-        if !engine.metadata_ready() {
-            return Ok(());
-        }
-        // 回填未完成时不写盘：overlay 不在分段文件里，且此时 store 里的 size/mtime 还是旧的；
-        // 等回填完成后 spawn_final_persist 一次 FullResync 全量，期间脏计数在内存里攒着。
-        if *dirty_count < COMMIT_THRESHOLD && last_save.elapsed() < save_every {
-            return Ok(());
-        }
-        if persist_index(engine, index_path)? {
-            *dirty_count = 0;
-            *last_save = Instant::now();
-            // v6：主数据已落盘，按上游策略检查 trigram 增量阈值（后台重建，不阻塞）。
-            maybe_rebuild_trigram(engine, index_path);
-        } else {
-            // 另一卷线程正在提交，本轮跳过但保持计数 + 不重置计时器，
-            // 下个 flush 周期会立刻重试。
-            tracing::debug!("persist 跳过（另有提交者），保持 dirty 下轮重试");
-        }
+                             index_path: &PathBuf| -> anyhow::Result<()> {
+        persist_periodic_checkpoint_retrying(engine, index_path, dirty_count, last_save,
+            &mut checkpoint_retry_after, save_every);
         Ok(())
     };
 
@@ -753,14 +733,13 @@ fn usn_watch_loop(
     loop {
         // 停机检查：recv_timeout 只有 50ms 粒度，这里最多 50ms 响应一次。
         // 退出前 flush 内存 pending（游标停在最后 Checkpoint，journal 重放覆盖剩余变更）
-        // 并落盘一次（metadata_ready 才写，与周期落盘同一守卫）。
+        // Try a partial-coverage checkpoint without claiming crash atomicity.
         if stop.load(Ordering::SeqCst) {
             flush_pending(&mut pending)?;
-            if engine.metadata_ready() {
-                match persist_index(&engine, &index_path) {
-                    Ok(_) => info!("卷 {letter} 停机落盘完成"),
-                    Err(e) => error!("卷 {letter} 停机落盘失败（journal 重放兜底）: {e}"),
-                }
+            match persist_index(&engine, &index_path) {
+                Ok(true) => info!("Volume {letter} shutdown checkpoint IO completed (legacy v6; not crash-atomic)"),
+                Ok(false) => info!("Volume {letter} shutdown checkpoint deferred to active writer"),
+                Err(e) => error!("Volume {letter} shutdown checkpoint failed; journal retained: {e}"),
             }
             info!("卷 {letter} USN 监听线程停机退出");
             return Ok(());
@@ -861,7 +840,7 @@ fn usn_watch_loop(
                     // 注：这里只改 USN 游标，不影响搜索结果/排序，故不 bump revision
                     //（否则每次 checkpoint 都会误杀分页缓存）。真正改条目的是上面的 flush_pending。
                     // v6：落盘走增量提交（KB 级），脏门控在 try_maybe_persist 里；
-                    // 回填未完成时不提交（overlay 不在分段文件里），回填终态一次 FullResync。
+                    // Accepted partial metadata is mirrored and can be checkpointed.
                     try_maybe_persist(&mut dirty_count, &mut last_save, &engine, &index_path)?;
                 }
             },
@@ -1173,55 +1152,133 @@ fn probe_journal_wrap_warning(volume_path: &str, letter: char, cursor_usn: u64) 
 }
 
 fn persist_shutdown_checkpoint(engine: &SearchEngine, path: &Path) -> anyhow::Result<bool> {
-    if !engine.metadata_ready() {
-        let folded = engine.flush_metadata_overlay_into_store()?;
-        info!(folded, "Shutdown folded partial metadata overlay; coverage remains incomplete");
-    }
+    // No paged overlay fold: accepted producers mirror into the store.
     persist_index(engine, path)
 }
 
+// Disk failures are not namespace failures: keep the watcher alive and retry
+// independently of last successful save. Do not hot-loop full repair on ENOSPC.
+fn persist_periodic_checkpoint_retrying(
+    engine: &Arc<SearchEngine>, path: &Path, dirty_count: &mut usize,
+    last_save: &mut Instant, retry_after: &mut Option<Instant>, save_every: Duration,
+) {
+    if retry_after.is_some_and(|next| Instant::now() < next) { return; }
+    match persist_periodic_checkpoint(engine, path, dirty_count, last_save, save_every) {
+        Ok(()) => *retry_after = None,
+        Err(error) => {
+            *retry_after = Some(Instant::now() + Duration::from_secs(5));
+            tracing::warn!(%error, state="waiting", dirty=true, waiting="retry_backoff",
+                retry_after_ms=5000, durable=false,
+                "Checkpoint IO failure does not terminate the namespace watcher");
+        }
+    }
+}
+
+fn persist_periodic_checkpoint(
+    engine: &Arc<SearchEngine>, path: &Path, dirty_count: &mut usize,
+    last_save: &mut Instant, save_every: Duration,
+) -> anyhow::Result<()> {
+    const THRESHOLD: usize = 4096;
+    if *dirty_count == 0 && !engine.has_pending_persistence() { return Ok(()); }
+    if *dirty_count < THRESHOLD && last_save.elapsed() < save_every { return Ok(()); }
+    if persist_index(engine, path)? {
+        *dirty_count = 0;
+        *last_save = Instant::now();
+        if engine.metadata_ready() { maybe_rebuild_trigram(engine, path); }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct PersistenceIoHealth {
+    last_io_success_ms: Option<u128>,
+    last_io_failure_ms: Option<u128>,
+    last_error: Option<String>,
+}
+fn persistence_io_health() -> &'static std::sync::Mutex<PersistenceIoHealth> {
+    static HEALTH: std::sync::OnceLock<std::sync::Mutex<PersistenceIoHealth>> = std::sync::OnceLock::new();
+    HEALTH.get_or_init(Default::default)
+}
+
+// Retain a drained batch on error AND unwinding. Recover the writer mutex after
+// poison so a panic cannot silently disable all future persistence attempts.
+struct UnacknowledgedBatch<'a> {
+    engine: &'a SearchEngine,
+    batch: Option<findx2_core::CommitBatch>,
+}
+impl Drop for UnacknowledgedBatch<'_> {
+    fn drop(&mut self) {
+        if let Some(batch) = self.batch.take() { self.engine.restore_persistence_batch(batch); }
+    }
+}
+
 pub(crate) fn persist_index(engine: &SearchEngine, path: &Path) -> anyhow::Result<bool> {
-    // v6 增量提交，分两步：
-    // 1. 短写锁：drain 日志 + 快照长度/游标（µs~ms 级；与 apply/Checkpoint 同一把写锁，
-    //    因此 manifest 游标永远不超前于已提交数据——崩溃回放只会重复，不会丢）。
-    // 2. 锁外文件 IO：原地 pwrite / 尾部 append（KB 级）+ sync + 原子 manifest。
-    // try_lock：同一时刻只允许一个卷线程提交；拿不到锁的保持 dirty 下轮重试。
-    // 返回值：true=本轮已处理（含"无事发生"），false=被跳过。
-    let guard = match persist_lock().try_lock() {
+    persist_index_with(engine, path, |layout, batch| {
+        v6_try_commit(layout, batch).map_err(|e| anyhow::anyhow!("{e:#}"))
+    })
+}
+
+fn persist_index_with(
+    engine: &SearchEngine, path: &Path,
+    writer: impl FnOnce(&V6Layout, &findx2_core::CommitBatch) -> anyhow::Result<CommitOutcome>,
+) -> anyhow::Result<bool> {
+    let _guard = match persist_lock().try_lock() {
         Ok(g) => g,
-        Err(_) => {
-            tracing::debug!("persist_index: 另一卷线程正在提交，本轮跳过");
+        Err(std::sync::TryLockError::Poisoned(e)) => {
+            tracing::warn!("Recovering checkpoint writer after panic; retained batch requires full repair");
+            e.into_inner()
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            tracing::debug!(state="waiting", dirty=true, waiting="writer_busy", durable=false,
+                "Checkpoint deferred; dirty state retained");
             return Ok(false);
         }
     };
-    let batch = match engine.take_persistence_batch() {
-        Some(batch) => batch,
-        None => return Ok(true),
-    };
-    let v6 = V6Layout::for_index(path);
-    let t0 = Instant::now();
-    match v6_try_commit(&v6, &batch).map_err(|e| anyhow::anyhow!("{e:#}"))? {
-        CommitOutcome::Delta {
-            applied,
-            bytes,
-            generation,
-        } => {
-            tracing::debug!(
-                "v6 commit：{applied} 条 / {bytes} B / gen {generation}（{:.1}ms）",
-                t0.elapsed().as_secs_f64() * 1000.0
-            );
+    let Some(batch) = engine.take_persistence_batch() else { return Ok(true); };
+    let mut pending = UnacknowledgedBatch { engine, batch: Some(batch) };
+    let batch = pending.batch.as_ref().unwrap();
+    let layout = V6Layout::for_index(path);
+    let started = Instant::now();
+    let result = (|| -> anyhow::Result<()> {
+        match writer(&layout, batch)? {
+            CommitOutcome::Delta { applied, bytes, generation } => {
+                tracing::debug!(applied, bytes, generation, "Checkpoint delta IO completed");
+            }
+            CommitOutcome::NeedFull { reason } => {
+                info!(%reason, "Checkpoint requires full repair/snapshot");
+                let store = engine.index_store();
+                let generation = v6_save_full(&layout, &store).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+                info!(generation, "Checkpoint full snapshot IO completed");
+            }
         }
-        CommitOutcome::NeedFull { reason } => {
-            // 降级：全量分段重写（回填完成/批量墓碑/校验错位时，低频）。
-            // 持读锁做文件 IO（数秒），期间 USN 写被挡——与旧 v5 全量同代价，但只在低频路径触发。
-            info!("v6 commit 降级全量（{reason}），开始分段重写…");
-            let store = engine.index_store();
-            let gen = v6_save_full(&v6, &store).map_err(|e| anyhow::anyhow!("{e:#}"))?;
-            info!("v6 全量重写完成（generation {gen}）");
+        Ok(())
+    })();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+    let mut health = persistence_io_health().lock().unwrap_or_else(|e| e.into_inner());
+    match result {
+        Ok(()) => {
+            pending.batch.take(); // acknowledge only after the ENTIRE writer succeeds
+            health.last_io_success_ms = Some(now);
+            health.last_error = None;
+            info!(state="io_completed", dirty=engine.has_pending_persistence(),
+                metadata_ready=engine.metadata_ready(),
+                last_io_success_ms=?health.last_io_success_ms, last_io_failure_ms=?health.last_io_failure_ms,
+                elapsed_ms=started.elapsed().as_millis() as u64,
+                durable=false, transactional=false,
+                "Checkpoint IO completed; legacy v6 crash-atomicity remains a release blocker");
+            Ok(true)
+        }
+        Err(error) => {
+            drop(pending); // restore first, including mutations arriving during IO
+            health.last_io_failure_ms = Some(now);
+            health.last_error = Some(format!("{error:#}"));
+            tracing::error!(state="failed", dirty=true, retry="full_snapshot", durable=false,
+                metadata_ready=engine.metadata_ready(),
+                last_io_success_ms=?health.last_io_success_ms, last_io_failure_ms=?health.last_io_failure_ms,
+                error=%error, "Checkpoint failed; batch retained for repair");
+            Err(error)
         }
     }
-    drop(guard);
-    Ok(true)
 }
 
 #[cfg(test)]
@@ -1300,6 +1357,215 @@ mod tests {
         let i=restored.entry_on_volume(b'C',1).unwrap();assert_eq!(restored.entries[i as usize].size,456);
         assert!(restored.entry_on_volume(b'C',2).is_some());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+
+    fn checkpoint_fixture(label: &str) -> (std::path::PathBuf, std::sync::Arc<findx2_core::SearchEngine>) {
+        let dir = std::env::temp_dir().join(format!("findx-t153-{label}-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path=dir.join("synthetic.bin");
+        let mut store=tiny_store(b'C',7,100,"public-file.txt");
+        store.metadata_ready=false;store.set_track_mutations(true);
+        findx2_core::v6_save_full(&findx2_core::V6Layout::for_index(&path),&store).unwrap();
+        let engine=std::sync::Arc::new(findx2_core::SearchEngine::new(store));
+        engine.enable_usage(16*1024*1024).unwrap();
+        (path,engine)
+    }
+    fn checkpoint_patch(engine: &findx2_core::SearchEngine, size:u64) {
+        let ticket=engine.metadata_ticket_by_id(b'C',1).unwrap();
+        assert!(engine.commit_metadata(ticket,size,0,0).unwrap());
+    }
+    fn restored_size(path:&std::path::Path) -> u64 {
+        let store=findx2_core::v6_load(&findx2_core::V6Layout::for_index(path)).unwrap();
+        assert!(!store.metadata_ready);
+        let size=store.entries[store.entry_on_volume(b'C',1).unwrap() as usize].size;
+        let reader=findx2_core::SearchEngine::new(store);
+        let q=findx2_core::QueryParser::parse("public-file.txt").unwrap();
+        let (hits,total)=reader.search(&q,&findx2_core::SearchOptions::default()).unwrap();
+        assert_eq!(total,1);assert_eq!(hits.len(),1);assert_eq!(hits[0].size,size);
+        size
+    }
+
+    #[test]
+    fn checkpoint_partial_metadata_is_journaled_before_any_overlay_drain() {
+        let (path,engine)=checkpoint_fixture("mirroring");
+        checkpoint_patch(&engine,456);
+        engine.set_backfill_error(Some("80 metadata access errors remain".into()));
+        let batch=engine.take_persistence_batch().expect("accepted partial metadata must create a persistence batch");
+        assert!(!batch.metadata_ready);
+        assert!(batch.mutations.iter().any(|m| matches!(m,findx2_core::Mutation::MetadataBatch(items) if items.iter().any(|(_,bytes)| u64::from_le_bytes(bytes[..8].try_into().unwrap())==456))));
+        let store=engine.index_store();
+        assert_eq!(store.entries[store.entry_on_volume(b'C',1).unwrap() as usize].size,456);
+        drop(store);
+        engine.restore_persistence_batch(batch);
+        assert!(!engine.metadata_ready());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_periodic_partial_coverage_preserves_namespace_and_cursor() {
+        let (path,engine)=checkpoint_fixture("periodic");
+        checkpoint_patch(&engine,456);
+        engine.set_backfill_error(Some("80 metadata access errors remain".into()));
+        engine.apply_volume_batch(b'C',&[findx2_core::ChangeEvent::Create {entry:RawEntry{file_id:2,file_id_128:None,parent_id:100,name:"public-new.txt".into(),size:123,mtime:0,ctime:0,attrs:0,is_dir:false}}],7,200).unwrap();
+        let new_ticket=engine.metadata_ticket_by_id(b'C',2).unwrap();
+        assert!(engine.commit_metadata(new_ticket,999,0,0).unwrap());
+        let mut dirty=1;
+        let mut last=std::time::Instant::now();
+        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
+        assert_eq!(restored_size(&path),10,"not due must remain unchanged");
+        last-=std::time::Duration::from_secs(31);
+        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
+        assert_eq!(dirty,0);
+        assert_eq!(restored_size(&path),456);
+        let restored=findx2_core::v6_load(&findx2_core::V6Layout::for_index(&path)).unwrap();
+        assert_eq!(restored.volumes[0].last_usn,200);
+        let new=restored.entry_on_volume(b'C',2).unwrap() as usize;
+        assert_eq!(restored.entries[new].size,999);
+        assert!(!engine.metadata_ready());
+        assert_eq!(engine.backfill_error_snapshot().as_deref(),Some("80 metadata access errors remain"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_io_failure_retains_batch_and_concurrent_writes_then_retries() {
+        let (path,engine)=checkpoint_fixture("failure-retry");
+        // Real filesystem failure: a required segment is missing. The writer
+        // fails after draining; no permission changes or real index are involved.
+        checkpoint_patch(&engine,456);
+        let segment=findx2_core::V6Layout::for_index(&path).dir.join("entries.dat");
+        let backup=segment.with_extension("owned-backup");
+        std::fs::rename(&segment,&backup).unwrap();
+        assert!(super::persist_index(&engine,&path).is_err());
+        assert!(engine.has_pending_persistence());
+        std::fs::rename(&backup,&segment).unwrap();
+        checkpoint_patch(&engine,789);
+        engine.apply_volume_batch(b'C',&[],7,201).unwrap();
+        assert!(super::persist_index(&engine,&path).unwrap());
+        assert_eq!(restored_size(&path),789);
+        let restored=findx2_core::v6_load(&findx2_core::V6Layout::for_index(&path)).unwrap();
+        assert_eq!(restored.volumes[0].last_usn,201);
+        assert!(!engine.has_pending_persistence());
+        // A mutation arriving during the drained batch IO remains queued; on a
+        // reported failure it is repaired together with the old batch.
+        checkpoint_patch(&engine,900);
+        assert!(super::persist_index_with(&engine,&path,|_,_| {
+            let worker=engine.clone();
+            std::thread::spawn(move||checkpoint_patch(&worker,901)).join().unwrap();
+            anyhow::bail!("injected writer access failure after concurrent accepted metadata")
+        }).is_err());
+        assert!(engine.has_pending_persistence());
+        assert!(super::persist_index(&engine,&path).unwrap());
+        assert_eq!(restored_size(&path),901);
+        assert!(super::persist_index(&engine,&path).unwrap());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+
+
+    #[test]
+    fn checkpoint_success_does_not_acknowledge_metadata_arriving_during_io() {
+        let (path,engine)=checkpoint_fixture("late-after-snapshot");
+        checkpoint_patch(&engine,456);
+        assert!(super::persist_index_with(&engine,&path,|layout,batch| {
+            let result=findx2_core::v6_try_commit(layout,batch).map_err(|e|anyhow::anyhow!("{e:#}"))?;
+            let writer=engine.clone();
+            std::thread::spawn(move||checkpoint_patch(&writer,789)).join().unwrap();
+            Ok(result)
+        }).unwrap());
+        assert_eq!(restored_size(&path),456);
+        assert!(engine.has_pending_persistence(),"newer accepted metadata cannot be acknowledged by an older batch");
+        assert!(super::persist_index(&engine,&path).unwrap());
+        assert_eq!(restored_size(&path),789);
+        assert!(!engine.has_pending_persistence());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_disk_failure_does_not_end_watcher_and_retry_is_backed_off() {
+        let (path,engine)=checkpoint_fixture("periodic-retry");
+        checkpoint_patch(&engine,456);
+        let segment=findx2_core::V6Layout::for_index(&path).dir.join("entries.dat");
+        let backup=segment.with_extension("owned-backup");
+        std::fs::rename(&segment,&backup).unwrap();
+        let mut dirty=2;
+        let mut last=std::time::Instant::now()-std::time::Duration::from_secs(31);
+        let original=last;
+        let mut retry=None;
+        super::persist_periodic_checkpoint_retrying(&engine,&path,&mut dirty,&mut last,&mut retry,std::time::Duration::from_secs(30));
+        assert_eq!(last,original);assert_eq!(dirty,2);assert!(retry.is_some());
+        assert!(engine.has_pending_persistence());
+        std::fs::rename(&backup,&segment).unwrap();
+        super::persist_periodic_checkpoint_retrying(&engine,&path,&mut dirty,&mut last,&mut retry,std::time::Duration::from_secs(30));
+        assert_eq!(last,original,"backoff is separate from the successful-save clock");
+        assert_eq!(restored_size(&path),10);
+        retry=Some(std::time::Instant::now()-std::time::Duration::from_secs(1));
+        super::persist_periodic_checkpoint_retrying(&engine,&path,&mut dirty,&mut last,&mut retry,std::time::Duration::from_secs(30));
+        assert_eq!(dirty,0);assert!(last>original);assert!(retry.is_none());
+        assert_eq!(restored_size(&path),456);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_repeated_metadata_writes_coalesce_and_observation_is_logged() {
+        let (path,engine)=checkpoint_fixture("coalesced");
+        for size in 0..10_000 { checkpoint_patch(&engine,size); }
+        assert_eq!(engine.pending_metadata_bitmap().0,1);
+        assert!(!engine.index_store().has_pending_mutations(),"no retained per-update enum log");
+        let batch=engine.take_persistence_batch().unwrap();
+        assert_eq!(batch.mutations.len(),1);
+        match &batch.mutations[0] {
+            findx2_core::Mutation::MetadataBatch(items) => {
+                assert_eq!(items.len(),1);
+                assert_eq!(u64::from_le_bytes(items[0].1[..8].try_into().unwrap()),9999);
+                assert_eq!(std::mem::size_of_val(&items[0]),20);
+            }
+            _ => panic!("expected compact final metadata projection"),
+        }
+        engine.restore_persistence_batch(batch);
+        assert!(super::persist_index(&engine,&path).unwrap());
+        assert_eq!(restored_size(&path),9999);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        // Exercise the directory/FRN observation producer separately from tickets.
+        let (path,engine)=checkpoint_fixture("observation");
+        let stamp=engine.begin_metadata_observation(engine.metadata_epoch()).unwrap();
+        assert_eq!(engine.commit_metadata_observation(b'C',stamp,&[(1,321,0,0)],4096).unwrap(),1);
+        assert!(engine.has_pending_persistence());
+        assert!(super::persist_index(&engine,&path).unwrap());
+        assert_eq!(restored_size(&path),321);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_busy_keeps_dirty_and_clock_and_does_not_drain() {
+        let (path,engine)=checkpoint_fixture("busy");
+        checkpoint_patch(&engine,456);
+        let guard=super::persist_lock().lock().unwrap_or_else(|e|e.into_inner());
+        let mut dirty=5;
+        let mut last=std::time::Instant::now()-std::time::Duration::from_secs(31);
+        let before=last;
+        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
+        assert_eq!(dirty,5);assert_eq!(last,before);
+        assert!(engine.has_pending_persistence());
+        drop(guard);
+        assert!(super::persist_index(&engine,&path).unwrap());
+        assert_eq!(restored_size(&path),456);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_unwind_requeues_and_does_not_permanently_poison_writer() {
+        let (path,engine)=checkpoint_fixture("unwind");
+        checkpoint_patch(&engine,456);
+        let unwind=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||{
+            let _=super::persist_index_with(&engine,&path,|_,_| panic!("owned fixture writer panic"));
+        }));
+        assert!(unwind.is_err());
+        assert!(engine.has_pending_persistence());
+        assert!(super::persist_index(&engine,&path).unwrap());
+        assert_eq!(restored_size(&path),456);
+        assert!(!engine.has_pending_persistence());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

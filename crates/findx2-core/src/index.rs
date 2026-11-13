@@ -501,6 +501,9 @@ pub struct IndexStore {
 ///   commit 见到它就走全量分段重写（仍远少于 v5 的单文件全量 + 原子 rename 开销，且低频）。
 #[derive(Debug, Clone)]
 pub enum Mutation {
+    /// Coalesced backfill checkpoint: packed disk metadata, 20 transient bytes/slot,
+    /// instead of retaining one large Mutation enum for every producer update.
+    MetadataBatch(Vec<(u32, [u8; 16])>),
     /// `DataOrMeta` / 单条元数据 patch：只改 `entries[idx]` 的 size/mtime/ctime（16B 原地 pwrite）。
     Meta {
         idx: u32,

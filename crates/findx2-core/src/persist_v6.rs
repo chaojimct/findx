@@ -643,6 +643,16 @@ pub fn v6_try_commit(layout: &V6Layout, batch: &CommitBatch) -> Result<CommitOut
             Mutation::FullResync => {
                 return need_full("batch 含 FullResync".into());
             }
+            Mutation::MetadataBatch(patches) => {
+                // This final coalesced projection follows structural mutations;
+                // it can also contain metadata for files appended by this batch.
+                for (idx, data) in patches {
+                    if *idx as usize >= cur_e { return need_full("metadata batch slot out of bounds".into()); }
+                    pwrite(&mut fe, (*idx as usize * ENTRY_SIZE) as u64, data)?;
+                    bytes += 16;
+                }
+                t_e |= !patches.is_empty();
+            }
             Mutation::Meta {
                 idx,
                 size,
