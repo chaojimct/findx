@@ -141,7 +141,11 @@ impl MainWindow {
             self.workspace.usage_camera.scale.floor().clamp(1., 5.) as u32
         };
         let key = SceneKey {
-            scan: Arc::as_ptr(&scan) as usize,
+            scan: if self.workspace.engine_usage {
+                0
+            } else {
+                Arc::as_ptr(&scan) as usize
+            },
             root,
             depth: self.workspace.usage_depth,
             width,

@@ -127,6 +127,52 @@ pub fn summarize_status(resp: &IpcResponse, enable_metadata_backfill: bool) -> I
     }
 }
 
+
+/// try_index_store lock contention returns zeros with loading=true and no stage.
+/// That is not a real reload and must not flip the status bar or Usage layout.
+pub fn is_non_authoritative_status(resp: &IpcResponse) -> bool {
+    match resp {
+        IpcResponse::StatusResult {
+            entry_count,
+            last_usn,
+            journal_id,
+            volume_letter,
+            loading,
+            loading_stage,
+            tombstone_count,
+            ..
+        } => {
+            *loading
+                && *entry_count == 0
+                && *last_usn == 0
+                && *journal_id == 0
+                && volume_letter.is_none()
+                && tombstone_count.is_none()
+                && loading_stage
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+        }
+        _ => false,
+    }
+}
+
+pub fn apply_status(
+    previous: Option<&IndexStatusView>,
+    resp: &IpcResponse,
+    enable_metadata_backfill: bool,
+) -> IndexStatusView {
+    if is_non_authoritative_status(resp) {
+        if let Some(prev) = previous {
+            if prev.summary.starts_with("索引") && !prev.summary.contains("加载中") {
+                return prev.clone();
+            }
+        }
+    }
+    summarize_status(resp, enable_metadata_backfill)
+}
+
 pub fn disconnected_status(message: &str) -> IndexStatusView {
     IndexStatusView {
         summary: "未连接隔离后端".into(),
@@ -193,4 +239,53 @@ mod tests {
             Some("索引: 加载中 · 解析条目（3/8 阶段）")
         );
     }
+
+    #[test]
+    fn lock_contention_zero_loading_does_not_replace_ready_status() {
+        let ready = IpcResponse::StatusResult {
+            entry_count: 1_234_567,
+            dir_count: 1,
+            last_usn: 9,
+            journal_id: 1,
+            volume_letter: Some('C'),
+            healthy: true,
+            metadata_ready: false,
+            backfill_done: 10,
+            backfill_total: 100,
+            loading: false,
+            loading_stage: None,
+            loading_elapsed_secs: None,
+            loading_phase_done: None,
+            loading_phase_total: None,
+            watch_error: None,
+            backfill_error: None,
+            tombstone_count: Some(1),
+        };
+        let prev = summarize_status(&ready, true);
+        let contention = IpcResponse::StatusResult {
+            entry_count: 0,
+            dir_count: 0,
+            last_usn: 0,
+            journal_id: 0,
+            volume_letter: None,
+            healthy: true,
+            metadata_ready: false,
+            backfill_done: 10,
+            backfill_total: 100,
+            loading: true,
+            loading_stage: None,
+            loading_elapsed_secs: None,
+            loading_phase_done: None,
+            loading_phase_total: None,
+            watch_error: None,
+            backfill_error: None,
+            tombstone_count: None,
+        };
+        let kept = apply_status(Some(&prev), &contention, true);
+        assert_eq!(kept, prev);
+        assert!(!kept.summary.contains("加载中"));
+        let first = apply_status(None, &contention, true);
+        assert_eq!(first.summary, "索引 · 加载中");
+    }
+
 }

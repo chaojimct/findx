@@ -36,7 +36,7 @@ pub struct Progress {
     pub peak_workers: AtomicU64,
     pub(crate) preview: std::sync::Mutex<crate::disktree::scan_preview::Builder>,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Scan {
     /// Some only for engine logical views; allocated fields remain zero/unmeasured.
     pub logical_generation: Option<(u64, u64)>,

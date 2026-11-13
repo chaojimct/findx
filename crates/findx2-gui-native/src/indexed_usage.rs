@@ -73,6 +73,45 @@ impl EmptyPageGuard {
  pub fn skipped(&self)->usize{self.hops}
 }
 
+
+/// Child identities and order only; generation, unknown counts and logical totals are ignored.
+pub fn same_structure(scan:&Scan, requested:&std::path::Path, page:&findx2_ipc::UsagePageDto)->bool{
+    let Some(root)=scan.nodes.first() else {return false};
+    if root.path!=requested || !root.directory || !page.root.directory {return false;}
+    if let Some((epoch,_))=scan.logical_generation { if epoch!=page.epoch {return false;} }
+    if root.children.len()!=page.children.len() {return false;}
+    root.children.iter().zip(page.children.iter()).all(|(&ix,child)|{
+        let n=match scan.nodes.get(ix){Some(n)=>n,None=>return false};
+        n.directory==child.directory && n.path.file_name().and_then(|x|x.to_str())==Some(child.name.as_str())
+    })
+}
+
+/// Update logical totals/unknown flags without replacing the node graph or scan allocation identity.
+pub fn patch_metrics(scan:&mut Scan, page:&findx2_ipc::UsagePageDto){
+    let degraded=page.watch_error.is_some()||page.metadata_error.is_some();
+    if let Some(root)=scan.nodes.first_mut(){
+        root.logical=page.root.logical;
+        root.files=page.root.files;
+        root.directories=page.root.directories;
+        root.entries=page.root.files.saturating_add(page.root.directories);
+        root.uncertain=page.root.unknown>0;
+    }
+    if let Some(children)=scan.nodes.first().map(|n|n.children.clone()){
+        for (&ix,child) in children.iter().zip(page.children.iter()){
+            if let Some(n)=scan.nodes.get_mut(ix){
+                n.logical=child.logical;
+                n.files=child.files;
+                n.directories=child.directories;
+                n.entries=child.files.saturating_add(child.directories);
+                n.uncertain=child.unknown>0;
+            }
+        }
+    }
+    scan.logical_generation=Some((page.epoch,page.generation));
+    scan.unknown=page.root.unknown;
+    scan.partial=page.root.unknown>0||page.next.is_some()||degraded;
+}
+
 #[cfg(test)]
 mod continuation_tests {
  use super::*;
@@ -102,4 +141,35 @@ mod continuation_tests {
   assert_eq!(last,None);assert_eq!(g.skipped(),MAX_EMPTY_PAGE_HOPS);
   let mut resumed=EmptyPageGuard::new(Some((1,2)),Some(16));assert_eq!(resumed.follow(&page(Some(17),false)).unwrap(),Some(17));
  }
+}
+
+#[cfg(test)]
+mod structure_tests {
+    use super::*;
+    use std::path::PathBuf;
+    fn item(name:&str,logical:u64,unknown:u64)->findx2_ipc::UsageItemDto{
+        findx2_ipc::UsageItemDto{id:1,name:name.into(),directory:true,logical,files:3,directories:2,unknown}
+    }
+    fn page(generation:u64,unknown:u64,logical:u64,child_name:&str,child_logical:u64)->findx2_ipc::UsagePageDto{
+        findx2_ipc::UsagePageDto{epoch:9,generation,root:item("dev",logical,unknown),children:vec![item(child_name,child_logical,0)],next:None,resident_bytes:0,state:"ok".into(),watch_error:None,metadata_error:None}
+    }
+    #[test]fn generation_and_unknown_ticks_keep_structure(){
+        let requested=PathBuf::from(r"C:\Users\chaoj\dev");
+        let first=page(7,1,100,"tools",80);
+        let mut scan=scan_from_page(&first,requested.clone());
+        let later=page(12,4,100,"tools",80);
+        assert!(same_structure(&scan,&requested,&later));
+        let ptr=scan.nodes.as_ptr();
+        patch_metrics(&mut scan,&later);
+        assert_eq!(scan.nodes.as_ptr(),ptr);
+        assert_eq!(scan.logical_generation,Some((9,12)));
+        assert_eq!(scan.unknown,4);
+        assert_eq!(scan.nodes[0].uncertain,true);
+        assert_eq!(scan.nodes[0].logical,100);
+        assert_eq!(scan.nodes[1].logical,80);
+        let renamed=page(13,4,100,"other",80);
+        assert!(!same_structure(&scan,&requested,&renamed));
+        let mut other_epoch=later; other_epoch.epoch=10;
+        assert!(!same_structure(&scan,&requested,&other_epoch));
+    }
 }

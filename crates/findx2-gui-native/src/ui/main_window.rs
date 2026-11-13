@@ -663,7 +663,7 @@ impl MainWindow {
                                     .as_secs(),
                             );
                             session.last_error = None;
-                            session.index_status = status_logic::summarize_status(&resp, backfill);
+                            session.index_status = status_logic::apply_status(Some(&session.index_status), &resp, backfill);
                         }
                         Err(err) => {
                             session.connected = false;

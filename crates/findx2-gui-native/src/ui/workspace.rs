@@ -1495,19 +1495,28 @@ impl MainWindow {
                     page.state
                 );
                 if skipped_empty>0 {this.workspace.scan_status.push_str(&format!(" [{} empty pages skipped; continuation retained]",skipped_empty));}
-                cx.notify();
-                if !next
-                    && this.workspace.engine_generation == Some((page.epoch, page.generation))
-                    && this
-                        .workspace
-                        .scan
-                        .as_ref()
-                        .is_some_and(|s| s.nodes.first().is_some_and(|n| n.path == requested))
-                {
-                    return;
-                }
                 this.workspace.engine_generation = Some((page.epoch, page.generation));
                 this.workspace.engine_next = page.next;
+                // Generation/unknown ticks must update the badge only. Replacing
+                // the scan graph or clearing the scene key rebuilds the treemap
+                // and flashes the whole page while totals stay the same.
+                if !next
+                    && this.workspace.scan.as_ref().is_some_and(|s| {
+                        crate::indexed_usage::same_structure(s, &requested, &page)
+                    })
+                {
+                    if let Some(scan) = this.workspace.scan.as_mut() {
+                        if let Some(scan) = Arc::get_mut(scan) {
+                            crate::indexed_usage::patch_metrics(scan, &page);
+                        } else {
+                            let mut owned = (**scan).clone();
+                            crate::indexed_usage::patch_metrics(&mut owned, &page);
+                            *scan = Arc::new(owned);
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
                 let scan = crate::indexed_usage::scan_from_page(&page, requested.clone());
                 match fallible_usage_lookup(&scan) {
                     Ok(lookup) => this.workspace.scan_lookup = lookup,
