@@ -935,7 +935,7 @@ impl MainWindow {
             let work_cancel=cancel.clone();
             let rows=cx.background_spawn(async move {crate::directory_filter::filter_rows(&work,&query,&work_cancel)}).await;
             this.update(cx,|this,cx|{
-                if cancel.load(Ordering::Acquire) || this.workspace.filter_generation!=generation || this.workspace.mode!=ViewMode::Directory || key(&this.workspace.location)!=scope || !Arc::ptr_eq(&source,&this.workspace.all_rows){return}
+                if !crate::directory_filter::can_publish(cancel.load(Ordering::Acquire), generation, this.workspace.filter_generation, this.workspace.mode==ViewMode::Directory, key(&this.workspace.location)==scope, Arc::ptr_eq(&source,&this.workspace.all_rows)){return}
                 if let Some(rows)=rows {let focus=this.active_workspace_hit().map(|h|h.path).or(focus);this.apply_workspace_rows(rows,focus,false,cx);}
             }).ok();
         }).detach();
@@ -1423,6 +1423,18 @@ impl MainWindow {
                     let _=self.workspace.window.update(cx,move |_,w,cx|input.update(cx,|i,cx|i.set_value(value,w,cx)));
                     self.directory_filter_changed(false,cx);
                 },
+                "select-first" => {
+                    self.workspace_select(0, cx);
+                    self.workspace.table.update(cx, |t,cx| t.set_selected_row(0,cx));
+                    cx.notify();
+                },
+                "select-last" => {
+                    let ix=self.workspace.rows.len().saturating_sub(1);
+                    self.workspace_select(ix, cx);
+                    self.workspace.table.update(cx, |t,cx| {t.set_selected_row(ix,cx);t.scroll_to_row(ix,cx);});
+                    cx.notify();
+                },
+                "refresh-directory" => self.workspace_refresh(cx),
                 "zoom" => self.zoom_usage_center(1.3, cx),
                 "reset" => {
                     self.workspace.usage_camera.reset();

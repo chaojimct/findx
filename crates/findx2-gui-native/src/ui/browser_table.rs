@@ -145,7 +145,25 @@ impl TableDelegate for BrowserTable {
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis()
-                        .child(hit.name.clone()),
+                        .child(
+                            StyledText::new(hit.name.clone()).with_highlights(
+                                crate::search_logic::highlight_byte_ranges(
+                                    &hit.name,
+                                    &hit.name_highlight,
+                                )
+                                .into_iter()
+                                .map(|range| {
+                                    (
+                                        range,
+                                        HighlightStyle {
+                                            color: Some(tokens.hit_fg),
+                                            background_color: Some(tokens.hit_bg),
+                                            ..Default::default()
+                                        },
+                                    )
+                                }),
+                            ),
+                        ),
                 )
                 .into_any_element();
         }

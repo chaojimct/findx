@@ -627,6 +627,19 @@ fn unix_local_utc_offset_secs(unix: u64) -> i64 {
     }
 }
 
+/// Convert persisted scalar marks to UTF-8 runs for one native shaped text
+/// element. Styling runs rather than separate flex children preserves shaping,
+/// glyph widths, clipping and ellipsis exactly as an unhighlighted filename.
+pub fn highlight_byte_ranges(name: &str, ranges: &[[u32; 2]]) -> Vec<std::ops::Range<usize>> {
+    if ranges.is_empty() { return Vec::new(); }
+    let mut offset = 0;
+    highlight_segments(name, ranges).into_iter().filter_map(|(text, on)| {
+        let start = offset;
+        offset += text.len();
+        on.then_some(start..offset)
+    }).collect()
+}
+
 /// 把 Unicode 标量下标半开区间切成 (text, highlighted) 段。
 pub fn highlight_segments<'a>(name: &'a str, ranges: &[[u32; 2]]) -> Vec<(&'a str, bool)> {
     let chars: Vec<(usize, char)> = name.char_indices().collect();
