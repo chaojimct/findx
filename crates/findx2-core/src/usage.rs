@@ -773,7 +773,7 @@ impl SearchEngine {
             // prefix for this exact volume-qualified FRN no longer exists. Keep
             // per-batch cutoffs so later recreation is not discarded; one linear
             // retain below avoids rescanning the pending queue for every delete.
-            let mut superseded_before: HashMap<u64, usize> = HashMap::new();
+            let mut superseded_before: HashMap<u64, (usize,Option<usize>)> = HashMap::new();
             for ev in remaining {
                 let identity = OrphanQueue::identity(&ev);
                 g.checkpoint_identity(&mut ck, volume, identity);
@@ -786,7 +786,15 @@ impl SearchEngine {
                             return Err(format!("terminal namespace recovery allocation failed: {e}"));
                         }
                     }
-                    superseded_before.insert(identity, next_round.len());
+                    superseded_before.insert(identity, (next_round.len(),None));
+                }
+                // A later fully resolved placement supersedes only earlier unresolved
+                // namespace positions, NOT metadata for this surviving identity.
+                if blocked_ids.contains(&identity) && matches!(&ev,ChangeEvent::Rename{..}|ChangeEvent::Create{..}) && matches!(self.prepare_namespace(&g,volume,&ev),Ok(Prep::Apply{..})) {
+                    if !superseded_before.contains_key(&identity) {
+                        if let Err(e)=superseded_before.try_reserve(1){g.rollback_namespace(ck);self.restore_orphans(volume,prior_orphans);self.usage.lock().excluded_ids=excluded_before;return Err(format!("namespace rebind allocation failed: {e}"));}
+                    }
+                    blocked_ids.remove(&identity);superseded_before.entry(identity).or_insert((0,None)).1=Some(next_round.len());
                 }
                 if blocked_ids.contains(&identity) {
                     next_round.push((0, ev));
@@ -871,7 +879,7 @@ impl SearchEngine {
             let mut position = 0;
             next_round.retain(|(_, ev)| {
                 let keep = superseded_before.get(&OrphanQueue::identity(ev))
-                    .map_or(true, |cutoff| position >= *cutoff);
+                    .map_or(true, |(terminal,rebind)| position>=*terminal && rebind.map_or(true,|cutoff| position>=cutoff || matches!(ev,ChangeEvent::DataOrMeta{..})));
                 position += 1;
                 keep
             });
@@ -1059,6 +1067,26 @@ impl SearchEngine {
             }
         }
         format!("sample={sampled}/64 creates={creates} renames={renames} deletes={deletes} other={other} absent_parent={absent_parent} deleted_parent={deleted_parent} directory_mismatch={directory_mismatch} live_parent={live_parent} known_identity={known_identity}{identities}")
+    }
+    pub fn namespace_identity_live(&self,volume:u8,id:u64)->bool {let g=self.store.read();g.entry_on_volume(volume,id).is_some_and(|i|!g.entries[i as usize].is_deleted())}
+    pub fn namespace_parent_resolvable(&self,volume:u8,mut parent:u64,events:&[ChangeEvent])->bool {
+        let g=self.store.read();
+        for _ in 0..64 {
+            if g.dir_on_volume(volume,parent).is_some(){return true;}
+            let next=events.iter().find_map(|e|match e{ChangeEvent::CreatePending{file_id,parent_id,is_dir:true,..} if *file_id==parent=>Some(*parent_id),ChangeEvent::Create{entry} if entry.is_dir && entry.file_id==parent=>Some(entry.parent_id),_=>None});
+            match next{Some(p) if p!=parent=>parent=p,_=>return false}
+        }
+        false
+    }
+    pub fn namespace_recovery_inputs(&self, volume:u8, events:&[ChangeEvent])->(Vec<u64>,Vec<ChangeEvent>) {
+        let g=self.store.read();
+        let pending:Vec<ChangeEvent>=self.orphans.lock().ordered.iter().filter(|(v,_,_)|*v==volume).take(64).map(|(_,_,e)|e.clone()).collect();
+        let mut missing:Vec<u64>=events.iter().chain(pending.iter()).filter_map(|e|match e{ChangeEvent::CreatePending{parent_id,..}=>Some(*parent_id),ChangeEvent::Rename{new_parent_id,..}=>Some(*new_parent_id),_=>None}).filter(|p|g.dir_on_volume(volume,*p).is_none()).collect();
+        missing.sort_unstable();missing.dedup();
+        let mut prioritized:Vec<u64>=pending.iter().filter_map(|e|match e{ChangeEvent::CreatePending{parent_id,..}=>Some(*parent_id),ChangeEvent::Rename{new_parent_id,..}=>Some(*new_parent_id),_=>None}).filter(|p|g.dir_on_volume(volume,*p).is_none()).collect();
+        prioritized.sort_unstable();prioritized.dedup();prioritized.truncate(64);
+        for p in missing{if prioritized.len()==64{break;}if !prioritized.contains(&p){prioritized.push(p);}}
+        (prioritized,pending)
     }
     pub fn has_pending_namespace(&self, volume: u8) -> bool {
         self.orphans.lock().ordered.iter().any(|(v, _, _)| *v == volume)
@@ -1961,4 +1989,18 @@ impl SearchEngine {
         g.metadata_ready=true;
         self.metadata_overlay.clear();self.bump_revision();Ok(true)
     }
+}
+
+#[cfg(test)]
+mod internal_unlink_transaction_tests {
+ use super::*;
+ #[test]
+ fn parked_internal_alias_rebind_is_atomic_and_idempotent(){
+  let raw=|id,parent,name:&str,dir|crate::RawEntry{file_id:id,file_id_128:None,parent_id:parent,name:name.into(),size:if dir{0}else{100},mtime:0,ctime:0,attrs:if dir{16}else{0},is_dir:dir};
+  let store=crate::IndexBuilder::new(b'C',1,7,10).build_from_raw(vec![raw(42,2,"old.bin",false)],vec![raw(1,0,"root",true),raw(2,1,"ordinary",true)],true).unwrap();
+  let e=SearchEngine::new(store);e.enable_usage(16*1024*1024).unwrap();
+  e.apply_volume_batch(b'C',&[ChangeEvent::CreatePending{file_id:42,file_id_128:None,parent_id:900,name:"internal".into(),attrs:0,is_dir:false},ChangeEvent::DataOrMeta{file_id:42,size:Some(150),mtime:None,ctime:None,create_if_missing:None}],7,20).unwrap();assert!(e.has_pending_namespace(b'C'));
+  let recovered=[ChangeEvent::Rename{file_id:42,new_parent_id:2,new_name:"surviving.bin".into()}];
+  for cursor in [30,40]{e.apply_volume_batch(b'C',&recovered,7,cursor).unwrap();assert!(!e.has_pending_namespace(b'C'));let page=e.usage_page("C:\\",None,None,4096).unwrap();assert_eq!(page.root.logical,150);assert_eq!(page.root.files,1);}
+ }
 }

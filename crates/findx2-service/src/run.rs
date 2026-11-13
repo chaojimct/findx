@@ -741,6 +741,7 @@ fn usn_watch_loop(
     // successful batch as proof the failed prefix committed. Search remains available;
     // restart/rebuild is required and resumes from the retained durable watermark.
     let mut namespace_gate = crate::watch_health::NamespaceGate::default();
+    let mut unlink_resolver:Option<findx2_windows::NtfsUnlinkResolver>=None;
     loop {
         // 停机检查：recv_timeout 只有 50ms 粒度，这里最多 50ms 响应一次。
         // 退出前 flush 内存 pending（游标停在最后 Checkpoint，journal 重放覆盖剩余变更）
@@ -777,6 +778,16 @@ fn usn_watch_loop(
                     next_usn,
                 } => {
                     dirty_count += flush_pending(&mut pending)?;
+                    let prepared=(||->Result<Vec<findx2_core::ChangeEvent>,String>{
+                        let (missing,parked)=engine.namespace_recovery_inputs(volume_letter,&events);
+                        if missing.is_empty() && unlink_resolver.is_none(){return Ok(events.clone());}
+                        if unlink_resolver.is_none(){
+                            let serial={let g=engine.index_store();g.volumes.iter().find(|v|v.volume_letter==volume_letter).ok_or("unlink volume unavailable")?.volume_serial};
+                            unlink_resolver=Some(findx2_windows::NtfsUnlinkResolver::new(&volume_path,volume_letter,serial,journal_id)?);
+                        }
+                        unlink_resolver.as_mut().unwrap().rewrite(&events,&parked,&missing,journal_id,|p|engine.namespace_parent_resolvable(volume_letter,p,&events),|id|engine.namespace_identity_live(volume_letter,id))
+                    })();
+                    let events=match prepared{Ok(e)=>e,Err(e)=>{set_watch_error(letter,Some(format!("internal namespace resolution failed; cursor retained: {e}")));namespace_gate.blocked=true;continue;}};
                     match namespace_gate.apply(&engine, volume_letter, &events, journal_id, next_usn) {
                         Ok(()) => {
                             set_watch_error(letter, engine.has_pending_namespace(volume_letter).then(||

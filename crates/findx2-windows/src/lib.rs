@@ -30,4 +30,11 @@ pub use volumes::{enumerate_local_drive_letters, is_ssd};
 #[cfg(windows)]
 pub use nt_dir_query::DirMetadataReader;
 
+#[cfg(windows)]
 pub use open_by_id::metadata_terminal_counts;
+
+#[cfg(windows)]
+mod ntfs_namespace;
+
+#[cfg(windows)]
+pub use ntfs_namespace::NtfsUnlinkResolver;

@@ -441,7 +441,7 @@ pub(crate) unsafe fn query_usn_journal(
     Ok(out)
 }
 
-fn open_volume_handle(path: &str) -> Result<windows::Win32::Foundation::HANDLE> {
+pub(crate) fn open_volume_handle(path: &str) -> Result<windows::Win32::Foundation::HANDLE> {
     let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
     let h = unsafe {
         CreateFileW(
@@ -464,7 +464,7 @@ fn open_volume_handle(path: &str) -> Result<windows::Win32::Foundation::HANDLE> 
     }
 }
 
-fn volume_device_path(volume: &str) -> String {
+pub(crate) fn volume_device_path(volume: &str) -> String {
     let v = volume.trim().trim_end_matches('\\');
     if v.len() == 1
         && v.chars()
