@@ -3298,7 +3298,7 @@ mod directory_filter_memo_tests {
         assert!(!retain_parent_path_matches(&store, &mut hits, "missing", false));
         assert_eq!(hits, before);
         let engine = SearchEngine::new(store);
-        let query = QueryParser::parse("parent:missing dev_note_1").unwrap();
+        let query = crate::QueryParser::parse("parent:missing dev_note_1").unwrap();
         let (hits, total) = engine.search(&query, &SearchOptions::default()).unwrap();
         assert!(hits.is_empty());
         assert_eq!(total, 0);
