@@ -313,3 +313,92 @@ unsafe fn enumerate_dir_into(dir_h: HANDLE, buf: &mut [u64], out: &mut Vec<DirMe
         // 下一轮 syscall 会续接剩余条目（GetFileInformationByHandleEx 对同一句柄是有状态的）。
     }
 }
+
+/// Stateful bounded directory reader. One reusable syscall buffer and one page of
+/// records; even a directory containing millions of files never builds a result Vec
+/// for the whole directory. The caller consumes each page before issuing another IO.
+#[cfg(windows)]
+pub struct DirMetadataReader {
+    volume:Option<HANDLE>, directory:Option<HANDLE>, buffer:Vec<u64>, records:Vec<DirMetaRec>,
+}
+#[cfg(windows)]
+impl DirMetadataReader {
+    fn storage(bytes:usize)->Result<(Vec<u64>,Vec<DirMetaRec>),String> {
+        if !(4096..=1024*1024).contains(&bytes){return Err("directory IO page byte budget must be 4KiB..1MiB".into());}
+        let mut buffer=Vec::new();buffer.try_reserve_exact(bytes/8).map_err(|_|"directory IO buffer allocation failed")?;buffer.resize(bytes/8,0);
+        let max_records=bytes/std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO,FileName);
+        let mut records=Vec::new();records.try_reserve_exact(max_records).map_err(|_|"directory record page allocation failed")?;
+        Ok((buffer,records))
+    }
+    pub fn open_volume(path:&str,bytes:usize)->Result<Self,String> {
+        let (buffer,records)=Self::storage(bytes)?;
+        let wide:Vec<u16>=path.encode_utf16().chain(Some(0)).collect();
+        let handle=unsafe{CreateFileW(PCWSTR(wide.as_ptr()),GENERIC_READ.0,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,None,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,None)}.map_err(|e|e.to_string())?;
+        Ok(Self{volume:Some(handle),directory:None,buffer,records})
+    }
+    /// Explicit finite public-fixture directories only; no volume/journal access.
+    pub fn open_path(path:&std::path::Path,bytes:usize)->Result<Self,String> {
+        use std::os::windows::ffi::OsStrExt;
+        let (buffer,records)=Self::storage(bytes)?;
+        let wide:Vec<u16>=path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle=unsafe{CreateFileW(PCWSTR(wide.as_ptr()),FILE_LIST_DIRECTORY.0,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,None,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,None)}.map_err(|e|e.to_string())?;
+        Ok(Self{volume:None,directory:Some(handle),buffer,records})
+    }
+    pub fn start_directory(&mut self,frn:u64,id128:Option<[u8;16]>)->Result<(),String> {
+        if let Some(old)=self.directory.take(){let _=unsafe{CloseHandle(old)};}
+        let volume=self.volume.ok_or("reader has no volume handle")?;
+        self.directory=unsafe{open_dir_by_id(volume,frn,id128)};
+        if self.directory.is_none(){return Err("directory metadata open failed; fallback required".into());}
+        Ok(())
+    }
+    pub fn capacity_bytes(&self)->usize{self.buffer.capacity()*8+self.records.capacity()*std::mem::size_of::<DirMetaRec>()}
+    pub fn read_page(&mut self)->Result<Option<&[DirMetaRec]>,String> {
+        let dir=self.directory.ok_or("directory reader is not positioned")?;
+        self.records.clear();
+        let bytes=self.buffer.len()*8;
+        let base=self.buffer.as_mut_ptr() as *mut u8;
+        if let Err(error)=unsafe{GetFileInformationByHandleEx(dir,FileIdBothDirectoryInfo,base as *mut _,bytes as u32)} {
+            if error.code().0 as u32 & 0xffff == 18 {return Ok(None);}
+            return Err(error.to_string());
+        }
+        let header=std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO,FileName);
+        let mut offset=0usize;
+        loop {
+            if offset.saturating_add(header)>bytes{return Err("invalid directory record page".into());}
+            let rec=unsafe{&*(base.add(offset) as *const FILE_ID_BOTH_DIR_INFO)};
+            if offset.saturating_add(header).saturating_add(rec.FileNameLength as usize)>bytes{return Err("invalid directory name length".into());}
+            if rec.FileAttributes&0x10==0 {
+                if self.records.len()==self.records.capacity(){return Err("directory record page exceeds reserved byte budget".into());}
+                self.records.push((rec.FileId as u64,rec.EndOfFile.max(0) as u64,rec.LastWriteTime as u64,rec.CreationTime as u64));
+            }
+            if rec.NextEntryOffset==0{break;}
+            let next=rec.NextEntryOffset as usize;
+            if next<header || next%8!=0 || offset.saturating_add(next)>=bytes{return Err("invalid directory record link".into());}
+            offset+=next;
+        }
+        Ok(Some(&self.records))
+    }
+}
+#[cfg(windows)]
+impl Drop for DirMetadataReader {
+    fn drop(&mut self){
+        if let Some(h)=self.directory.take(){let _=unsafe{CloseHandle(h)};}
+        if let Some(h)=self.volume.take(){let _=unsafe{CloseHandle(h)};}
+    }
+}
+
+#[cfg(all(test,windows))]
+mod streaming_fixture_tests {
+ use super::*;
+ #[test]
+ fn bounded_reader_consumes_finite_public_directory_in_multiple_pages(){
+  let nonce=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let root=std::env::temp_dir().join(format!("findx-t109-public-directory-{}-{nonce}",std::process::id()));std::fs::create_dir(&root).unwrap();
+  for i in 0..512 {std::fs::write(root.join(format!("synthetic-{i}.bin")),vec![1u8;i%17]).unwrap();}
+  let mut reader=DirMetadataReader::open_path(&root,4096).unwrap();let capacity=reader.capacity_bytes();let mut count=0;let mut pages=0;let mut bytes=0;
+  while let Some(records)=reader.read_page().unwrap(){pages+=1;count+=records.len();bytes+=records.iter().map(|r|r.1).sum::<u64>();assert!(reader.capacity_bytes()==capacity);}
+  assert_eq!(count,512);assert!(pages>1);assert_eq!(bytes,(0..512).map(|i|(i%17) as u64).sum::<u64>());assert!(capacity<8192);
+  println!("public-path directory streaming records={count} pages={pages} fixed_capacity_bytes={capacity}; no volume/journal/MFT access");
+  drop(reader);std::fs::remove_dir_all(root).unwrap();
+ }
+}

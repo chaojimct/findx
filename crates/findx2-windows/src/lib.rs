@@ -26,3 +26,6 @@ pub use usn::{
 };
 #[cfg(windows)]
 pub use volumes::{enumerate_local_drive_letters, is_ssd};
+
+#[cfg(windows)]
+pub use nt_dir_query::DirMetadataReader;

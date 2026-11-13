@@ -189,6 +189,7 @@ impl SearchEngine {
         self.revision.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn metadata_revision(&self) -> u64 { self.revision.load(Ordering::Relaxed) }
     pub(crate) fn bump_revision(&self) {
         self.revision.fetch_add(1, Ordering::Relaxed);
     }
@@ -236,31 +237,29 @@ impl SearchEngine {
     ///
     /// 持锁时间正比于 overlay 已填条数；8.5M 全填 ~2-3 秒，但发生时一般无 search 流量
     /// （CLI 退出 / 30s 定时落盘）——影响可控。
-    pub fn flush_metadata_overlay_into_store(&self) -> Result<usize> {
-        let mut g = self.store.write();
-        let snap = self.metadata_overlay.snapshot();
-        if snap.is_empty() {
-            return Ok(0);
-        }
-        let n = snap.len();
-        // v6：overlay flush 一次几十万条，逐条进增量日志会爆炸；包成一次 FullResync，
-        // 下次 commit 走全量分段重写（回填完成时只发生一次）。
-        g.bulk_apply(|g| {
-            for (idx, size, mtime, ctime) in &snap {
-                // patch_entry_metadata 入参 (size, mtime_FILETIME, ctime_FILETIME)，转回去。
-                let _ = g.patch_entry_metadata(
-                    *idx,
-                    *size,
-                    crate::index::unix_secs_to_filetime(*mtime),
-                    crate::index::unix_secs_to_filetime(*ctime),
-                );
+    pub fn flush_metadata_overlay_into_store(&self) -> Result<usize> { self.flush_metadata_overlay_for_epoch(None) }
+    pub(crate) fn flush_metadata_overlay_for_epoch(&self,epoch:Option<u64>) -> Result<usize> {
+        const SLOTS:usize=8192;
+        let mut records=Vec::new();
+        records.try_reserve_exact(SLOTS).map_err(|_|crate::Error::Platform("metadata flush page allocation failed".into()))?;
+        let mut total=0;
+        for start in (0..self.metadata_overlay.capacity()).step_by(SLOTS) {
+            let mut g=self.store.write();
+            if epoch.is_some_and(|e|self.usage.lock().epoch!=e){return Err(crate::Error::Platform("metadata flush epoch changed".into()));}
+            self.metadata_overlay.snapshot_range_into(start,start.saturating_add(SLOTS),&mut records);
+            if !records.is_empty() {
+                g.bulk_apply(|g| {
+                    for &(idx,size,mtime,ctime) in &records {
+                        let _=g.patch_entry_metadata(idx,size,crate::index::unix_secs_to_filetime(mtime),crate::index::unix_secs_to_filetime(ctime));
+                    }
+                });
+                total+=records.len();
             }
-        });
-        drop(g);
-        self.bump_revision();
-        // 合并完不立刻 clear——并发 backfill 可能此刻还在 put 新条目，clear 会丢数据。
-        // 留给上层（确认回填彻底完成后）显式 clear。
-        Ok(n)
+            drop(g);
+            std::thread::yield_now();
+        }
+        if total>0 {self.bump_revision();}
+        Ok(total)
     }
 
     /// 显式清空 overlay。**只在 metadata_ready 翻 true 之后**或者明确确定回填线程已停时调用。
@@ -1192,17 +1191,22 @@ impl SearchEngine {
     /// 标记元数据回填已完成。`ready=true` 时会把 overlay 一次性 flush 进主索引，并清空 overlay。
     /// 这一步**只发生在回填线程结束**，外部不再有写入，因此 flush + clear 无并发风险。
     pub fn set_metadata_ready(&self, ready: bool) -> Result<()> {
-        if ready {
-            self.flush_metadata_overlay_into_store()?;
+        {
+            let mut g=self.store.write();
+            // Once true, concurrent ticket commits also patch the store directly.
+            // Thus a bounded drain followed by clear cannot lose a late overlay write.
+            g.metadata_ready=ready;
         }
-        let mut g = self.store.write();
-        g.metadata_ready = ready;
-        drop(g);
-        self.bump_revision();
         if ready {
-            self.clear_backfill_progress();
+            if let Err(error)=self.flush_metadata_overlay_into_store() {
+                self.store.write().metadata_ready=false;
+                return Err(error);
+            }
+            let _g=self.store.write();
             self.metadata_overlay.clear();
+            self.clear_backfill_progress();
         }
+        self.bump_revision();
         Ok(())
     }
 }

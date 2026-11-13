@@ -503,10 +503,18 @@ impl UsageRuntime {
         Err("page cursor outside scope".into())
     }
     fn invalidate_ticket(&mut self, idx: usize) { self.tickets.remove(&idx); }
-    fn issue_ticket(&mut self, idx: usize) -> u64 {
-        self.ticket_seq = self.ticket_seq.saturating_add(1).max(1);
-        self.tickets.insert(idx, self.ticket_seq);
-        self.ticket_seq
+    fn issue_ticket(&mut self, idx: usize) -> Result<u64, String> {
+        let cap=self.tickets.capacity();
+        let predicted=if self.tickets.len()<cap || self.tickets.contains_key(&idx) {cap} else {cap.max(3).saturating_mul(2)};
+        let extra=predicted.saturating_sub(cap).saturating_mul(32);
+        let ticket_budget=(self.budget/8).min(8*1024*1024);
+        if predicted.saturating_mul(32)>ticket_budget || self.bytes().saturating_add(extra)>self.budget {
+            return Err("metadata in-flight ticket byte budget exhausted; producer must drain or retry".into());
+        }
+        if !self.tickets.contains_key(&idx) {self.tickets.try_reserve(1).map_err(|_| "metadata ticket allocation failed")?;}
+        self.ticket_seq=self.ticket_seq.checked_add(1).ok_or("metadata ticket sequence exhausted")?;
+        self.tickets.insert(idx,self.ticket_seq);
+        Ok(self.ticket_seq)
     }
     fn apply_file_delta(&mut self, parent: u32, old: Totals, new: Totals, active_old: bool, active_new: bool) {
         if active_old { self.ancestors(parent, old, false); }
@@ -643,7 +651,10 @@ impl SearchEngine {
         let e = g.entries.get(idx)?;
         if e.is_deleted() || e.is_dir_entry() { return None; }
         let frn = *g.frns.get(idx)?;
-        let seq = r.issue_ticket(idx);
+        let seq = match r.issue_ticket(idx) {
+            Ok(seq)=>seq,
+            Err(error)=>{ self.set_backfill_error(Some(error)); return None; }
+        };
         Some(MetadataTicket { entry: idx, epoch: r.epoch, seq, frn })
     }
     pub fn metadata_ticket_by_id(&self, volume: u8, frn: u64) -> Option<MetadataTicket> {
@@ -663,13 +674,15 @@ impl SearchEngine {
         if e.is_deleted() || e.is_dir_entry() { return Ok(false); }
         let parent = e.dir_idx;
         let old = Totals::file(self.effective_size(&g, t.entry), r.freshness.get(t.entry) != 1);
-        g.patch_entry_metadata(t.entry, size, mtime, ctime).map_err(|e| e.to_string())?;
+        if g.metadata_ready || t.entry >= self.metadata_overlay.capacity() {
+            g.patch_entry_metadata(t.entry, size, mtime, ctime).map_err(|e| e.to_string())?;
+        }
         self.metadata_overlay.put(t.entry, size, crate::index::filetime_to_unix_secs(mtime), crate::index::filetime_to_unix_secs(ctime));
         r.freshness.set(t.entry, 1);
         r.apply_file_delta(parent, old, Totals::file(size, false), true, true);
         r.invalidate_ticket(t.entry);
-        drop(g);
         self.bump_revision();
+        drop(g);
         Ok(true)
     }
     pub fn mark_metadata_dirty(&self, volume: u8, frn: u64) {
@@ -842,8 +855,8 @@ impl SearchEngine {
             let mut r = self.usage.lock();
             if r.epoch != 0 { r.error = Some(e); }
         }
-        drop(g);
         if !applied_snaps.is_empty() { self.bump_revision(); }
+        drop(g);
         Ok(!applied_snaps.is_empty())
     }
     fn snap_identity(&self, g: &IndexStore, volume: u8, ev: &ChangeEvent) -> Snap {
@@ -1543,5 +1556,112 @@ mod allocation_tests {
         let mut runtime = UsageRuntime { budget: usize::MAX, ..Default::default() };
         let e = runtime.reserve(usize::MAX, 0).unwrap_err();
         assert!(e.contains("allocation failed") || e.contains("budget") || e.contains("exceed"), "{e}");
+    }
+}
+
+/// A read observation is bounded to one directory syscall page. Unrelated writes
+/// conservatively reject the page; the single linear fallback pass retries misses.
+#[derive(Clone, Copy, Debug)]
+pub struct MetadataObservation { epoch:u64, revision:u64 }
+#[derive(Clone, Copy, Debug)]
+pub struct MetadataWorkItem { pub ticket:MetadataTicket, pub volume:u8, pub frn:u64 }
+pub struct MetadataWorkBatch { pub next_index:usize, pub items:Vec<MetadataWorkItem> }
+#[derive(Clone, Copy, Debug)]
+pub struct MetadataCoverage {pub files:usize,pub known:usize,pub unknown:usize}
+impl SearchEngine {
+    pub fn metadata_epoch(&self)->u64 { self.usage.lock().epoch }
+    pub fn metadata_ticket_storage(&self)->(usize,usize,usize) {
+        let r=self.usage.lock();(r.tickets.len(),r.tickets.capacity(),r.tickets.capacity()*32)
+    }
+    pub fn release_metadata_ticket(&self,t:MetadataTicket) {
+        let mut r=self.usage.lock();
+        if r.epoch==t.epoch && r.tickets.get(&t.entry)==Some(&t.seq) {r.tickets.remove(&t.entry);}
+    }
+    pub fn reclaim_metadata_ticket_capacity(&self) {
+        let mut r=self.usage.lock();
+        // Only pass completion/cancellation, never per-file shrink churn.
+        if r.tickets.capacity()*32>64*1024 && r.tickets.len()<r.tickets.capacity()/4 {
+            let keep=r.tickets.len().saturating_mul(2);
+            r.tickets.shrink_to(keep);
+        }
+    }
+    pub fn metadata_coverage(&self,epoch:u64)->Result<MetadataCoverage,String> {
+        let _g=self.store.read();let r=self.usage.lock();
+        if r.epoch!=epoch||r.error.is_some(){return Err("metadata coverage epoch unavailable or changed".into());}
+        let mut c=MetadataCoverage{files:0,known:0,unknown:0};
+        for &root in r.roots.values(){let d=&r.dirs[root as usize];c.files+=d.files as usize;c.unknown+=d.unknown as usize;}
+        c.known=c.files.saturating_sub(c.unknown);Ok(c)
+    }
+    pub fn metadata_work_batch(&self,epoch:u64,start:usize,end:usize,active_bytes:usize)->Result<MetadataWorkBatch,String> {
+        // Includes item, registry growth, IO vectors and returned updates. This is
+        // a work-window charge, NOT a total-file truncation limit.
+        let cap=active_bytes/256;
+        if cap==0{return Err("metadata active byte budget cannot admit one work item".into());}
+        let g=self.store.read();let mut r=self.usage.lock();
+        if r.epoch!=epoch||r.error.is_some()||epoch==0{return Err("metadata work epoch unavailable or changed".into());}
+        let mut items:Vec<MetadataWorkItem>=Vec::new();
+        items.try_reserve_exact(cap).map_err(|_|"metadata work-window allocation failed")?;
+        let mut next=start;
+        let scan_end=start.saturating_add(32768).min(end).min(g.entries.len());
+        while next<scan_end && items.len()<cap {
+            let idx=next;next+=1;let e=&g.entries[idx];
+            if e.is_deleted()||e.is_dir_entry()||r.freshness.get(idx)==1{continue;}
+            let seq=match r.issue_ticket(idx) {Ok(seq)=>seq,Err(error)=>{
+                for item in &items { if r.tickets.get(&item.ticket.entry)==Some(&item.ticket.seq){r.tickets.remove(&item.ticket.entry);} }
+                return Err(error);
+            }};
+            let frn=g.frns[idx];
+            items.push(MetadataWorkItem{ticket:MetadataTicket{entry:idx,epoch,seq,frn},volume:g.volumes[r.dirs[e.dir_idx as usize].volume_slot as usize].volume_letter,frn});
+        }
+        Ok(MetadataWorkBatch{next_index:next,items})
+    }
+    pub fn pending_metadata_directory(&self,epoch:u64,di:usize)->Result<Option<(u8,u64)>,String> {
+        let g=self.store.read();let r=self.usage.lock();
+        if r.epoch!=epoch||r.error.is_some(){return Err("metadata directory epoch changed".into());}
+        let Some(dir)=r.dirs.get(di) else{return Ok(None)};
+        if !dir.active(){return Ok(None);}
+        if dir.unknown>0 && dir.first_file!=NIL {
+            return Ok(Some((g.volumes[dir.volume_slot as usize].volume_letter,g.dirs[di].frn)));
+        }
+        Ok(None)
+    }
+    pub fn begin_metadata_observation(&self,epoch:u64)->Result<MetadataObservation,String> {
+        let _g=self.store.read();let r=self.usage.lock();
+        if r.epoch!=epoch||r.error.is_some(){return Err("metadata observation epoch changed".into());}
+        Ok(MetadataObservation{epoch,revision:self.metadata_revision()})
+    }
+    pub fn commit_metadata_observation(&self,volume:u8,stamp:MetadataObservation,records:&[(u64,u64,u64,u64)],active_bytes:usize)->Result<usize,String> {
+        if records.len().saturating_mul(32)>active_bytes{return Err("metadata observation page exceeds byte budget".into());}
+        let mut g=self.store.write();let mut r=self.usage.lock();
+        if r.epoch!=stamp.epoch||r.error.is_some(){return Err("metadata observation epoch changed".into());}
+        if self.metadata_revision()!=stamp.revision{return Ok(0);}
+        let mut committed=0;
+        for &(frn,size,mtime,ctime) in records {
+            let Some(idx)=g.entry_on_volume(volume,frn).map(|i|i as usize) else{continue};
+            let e=&g.entries[idx];
+            if e.is_deleted()||e.is_dir_entry()||r.freshness.get(idx)==1 {continue;}
+            let parent=e.dir_idx;let old=Totals::file(self.effective_size(&g,idx),true);
+            if g.metadata_ready||idx>=self.metadata_overlay.capacity(){g.patch_entry_metadata(idx,size,mtime,ctime).map_err(|e|e.to_string())?;}
+            self.metadata_overlay.put(idx,size,crate::index::filetime_to_unix_secs(mtime),crate::index::filetime_to_unix_secs(ctime));
+            r.freshness.set(idx,1);r.invalidate_ticket(idx);
+            r.apply_file_delta(parent,old,Totals::file(size,false),true,true);committed+=1;
+        }
+        if committed>0 {self.bump_revision();}
+        Ok(committed)
+    }
+}
+
+impl SearchEngine {
+    pub fn complete_metadata_if_covered(&self,epoch:u64)->Result<bool,String> {
+        {
+            let mut g=self.store.write();let r=self.usage.lock();
+            if r.epoch!=epoch||r.error.is_some(){return Err("metadata completion epoch changed".into());}
+            if r.roots.values().any(|&id|r.dirs[id as usize].unknown>0){return Ok(false);}
+            g.metadata_ready=true;
+        }
+        self.flush_metadata_overlay_for_epoch(Some(epoch)).map_err(|e|e.to_string())?;
+        let _g=self.store.write();
+        if self.usage.lock().epoch!=epoch{return Err("metadata completion epoch changed".into());}
+        self.metadata_overlay.clear();self.bump_revision();Ok(true)
     }
 }

@@ -116,6 +116,15 @@ impl MetaOverlay {
         self.filled.store(0, Ordering::Relaxed);
     }
 
+    /// Bounded snapshot into reusable caller storage. The caller holds the store
+    /// write lock, also used by all production overlay writers.
+    pub fn snapshot_range_into(&self,start:usize,end:usize,out:&mut Vec<(usize,u64,u32,u32)>) {
+        out.clear();
+        for i in start..end.min(self.sizes.len()) {
+            if let Some((size,mtime,ctime))=self.get(i) {out.push((i,size,mtime,ctime));}
+        }
+    }
+
     /// 遍历所有"已回填"槽位的快照。**不持锁**——并发 put 可能让快照漏掉刚写进来的，
     /// 但回填阶段无关紧要：下一轮 flush 还会再扫一遍。返回 `(idx, size, mtime, ctime)`。
     /// 用于持久化时把 overlay 倒进主索引。

@@ -89,6 +89,9 @@ pub(crate) fn spawn_backfill(engine: Arc<SearchEngine>, index_path: std::path::P
 /// overlay flush 在 `bulk_apply` 里记一条 `FullResync`，`persist_index` 见到后走
 /// v6 全量分段重写（与旧 v5 一次 549MB 同量级，但一生一次）。独立线程跑，不阻塞调用者。
 fn spawn_final_persist(engine: Arc<SearchEngine>, path: std::path::PathBuf) {
+    spawn_final_persist_for_epoch(engine,path,None)
+}
+fn spawn_final_persist_for_epoch(engine:Arc<SearchEngine>,path:std::path::PathBuf,epoch:Option<u64>) {
     std::thread::Builder::new()
         .name("findx2-final-persist".into())
         .spawn(move || {
@@ -96,7 +99,10 @@ fn spawn_final_persist(engine: Arc<SearchEngine>, path: std::path::PathBuf) {
             // 1) flush overlay 进主索引（写锁 ~2-5s @ 8.5M 全填）。
             //    这步发生时回填线程已退出，不会再有新 put；search 会被这次写锁阻塞数秒。
             //    虽然不完美，但只发生一次，可接受。
-            match engine.set_metadata_ready(true) {
+            let ready=if let Some(epoch)=epoch {
+                engine.complete_metadata_if_covered(epoch).map_err(anyhow::Error::msg).and_then(|complete|if complete{Ok(())}else{Err(anyhow::anyhow!("metadata coverage changed before finalization"))})
+            }else{engine.set_metadata_ready(true).map_err(anyhow::Error::from)};
+            match ready {
                 Ok(_) => info!(
                     "终态落盘：metadata_ready=true 已写入索引（耗时 {:?}）",
                     t0.elapsed()
@@ -298,11 +304,6 @@ fn unix_dir_name<'a>(
 }
 
 /// 单卷待回填集合（P1-5 按卷画像独立建池时跨函数传递）。
-#[cfg(windows)]
-struct VolPending {
-    files: Vec<(usize, u64)>,
-    dirs: Vec<u64>,
-}
 
 /// overlay 断点边车 `<index>.overlay.bin`（P2 回填续跑）。
 /// 格式（LE）：magic "FXOV" u32 + version u32(1) + entry_count u64 + count u64 +
@@ -406,354 +407,63 @@ fn delete_overlay_sidecar(index_path: &std::path::Path) {
 }
 
 #[cfg(windows)]
-fn backfill_loop(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) -> anyhow::Result<()> {
-    use findx2_windows::{fetch_dir_meta_batched, fill_metadata_by_id_pooled};
-
-    // ⚠️ 关键修复：rayon thread-pool starvation。
-    //
-    // `fetch_dir_meta_batched` / `fill_metadata_by_id_pooled` 内部用 rayon 全局池
-    // 并发跑 NtQueryDirectoryFile / OpenFileById，**每个 worker 阻塞在内核 syscall
-    // 上数秒**（HDD 上更久）。8.5M 文件的卷会把全局池所有 worker 占满 10+ 秒。
-    //
-    // 而 search 路径里的 par_iter / par_chunks 也排队走全局池——结果表现就是：
-    //   "回填启动后 search 一律卡 10 秒，回填进度也不走（因为 syscall 还在跑）"。
-    //
-    // 解决：给 backfill 单开一个专属池，限制为 cpu_count/2 个线程（足够打满磁盘 IO，
-    // 不会饿死 search）。整个 backfill 主流程包在 install() 里，子函数里的 par_iter
-    // 自动走专属池——search 永远走全局池，互不抢占。
-    let total_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8);
-    // P1-5 HDD 自适应：seek 惩罚盘用小并发（磁头抖动是 HDD 第一杀手，2 线程顺序
-    // 往往比 14 线程随机快数倍）；SSD 保持 CPU-2 打满队列。池按卷建（各卷画像不同）。
-    let ssd_threads = total_threads.saturating_sub(2).max(2).min(total_threads);
-    info!(
-        "回填线程配置：SSD 卷 {} 线程 / HDD 卷 2 线程（剩余留给 search）",
-        ssd_threads,
-    );
-
-    let total_entries = engine.index_store().entry_count();
-    // 扫描阶段也上报进度，避免 GUI 把 total=0 误读成「回填没跑」。
-    engine.set_backfill_error(None);
-    engine.set_backfill_total(total_entries as u64);
-    info!("后台回填启动：索引共 {total_entries} 条，扫描待补元数据条目 …");
-    let scan_start = Instant::now();
-
-    // 1) 扫描待补：按 (盘符 -> {files: [(entry_idx, frn, dir_idx)], dirs: [frn]}) 分组。
-    //    - files：真正要回填的目标（size==0 的文件），同时记下 dir_idx 供后续 parent 反查；
-    //    - dirs：用来驱动 NtQueryDirectoryFile 快路径（一次 syscall 拿一目录的所有子项 meta）。
-    //
-    // ⚠️ **关键并发设计**：read lock 一次性持有时间必须**毫秒级**，绝对不能是秒级。
-    // 8.5M 条目的循环在 release 上 ~1s，但服务里同时跑 USN watcher 的 write 需求，
-    // SRW Lock 一旦让 writer 排队，**所有后续 reader（包括 search）也会排队**——结果就是
-    // "回填一启动 GUI 完全卡死"。因此把扫描拆成 N 个分段，每段读锁拿出来 ~64K 条 entry 就立刻
-    // 放锁、给 search/USN write 一个调度窗口、再续。
-    let mut by_volume: std::collections::BTreeMap<char, VolPending> =
-        std::collections::BTreeMap::new();
-    let mut total_pending = 0usize;
-
-    let total_entries_count = total_entries;
-    const SCAN_CHUNK: usize = 65_536;
-    let mut start = 0usize;
-    while start < total_entries_count {
-        let end = (start + SCAN_CHUNK).min(total_entries_count);
-        // 单段最多握 ~1ms read lock；释放后 sleep 让出调度。
-        {
-            let g = engine.index_store();
-            for i in start..end {
-                let e = match g.entries.get(i) {
-                    Some(e) => e,
-                    None => break,
-                };
-                let frn = match g.frns.get(i) {
-                    Some(&f) if f != 0 => f,
-                    _ => continue,
-                };
-                let letter = g.volume_letter_for_entry(i);
-                let slot = by_volume.entry(letter).or_insert_with(|| VolPending {
-                    files: Vec::new(),
-                    dirs: Vec::new(),
-                });
-                if e.is_dir_entry() {
-                    slot.dirs.push(frn);
-                } else if e.size == 0 {
-                    // 判据：`size==0 && !is_dir`。fast 首遍 mtime 已是 USN TimeStamp 非 0，
-                    // size 才是"尚未回填"的真正信号。空文件（size==0）会被多跑一次，可忽略。
-                    slot.files.push((i, frn));
-                    total_pending += 1;
-                }
-            }
+fn backfill_loop(engine:Arc<SearchEngine>,index_path:std::path::PathBuf)->anyhow::Result<()> {
+    use crate::metadata_pipeline::{Limits,ticket_pass};
+    use findx2_windows::{DirMetadataReader,fill_metadata_by_id_pooled};
+    let epoch=engine.metadata_epoch();
+    let coverage=engine.metadata_coverage(epoch).map_err(anyhow::Error::msg)?;
+    engine.set_backfill_error(None);engine.set_backfill_total(coverage.unknown as u64);
+    let workers=std::thread::available_parallelism().map(|n|n.get()/2).unwrap_or(2).clamp(1,4);
+    let limits=Limits{workers,..Limits::default()};
+    let cancel=Arc::new(AtomicBool::new(false));
+    let dirs=engine.index_store().dirs.len();
+    let mut reader:Option<(u8,DirMetadataReader)>=None;
+    let mut selected_volume=None;let mut failed_volumes=[false;256];
+    let mut directory_pages=0usize;let mut directory_committed=0usize;let mut directory_errors=0usize;
+    // One serial streaming reader keeps observation ordering sound and reserves
+    // bounded memory even for a giant directory. File-ID fallback uses a separate
+    // bounded IO pool, never Rayon's search pool. No repeated directory rescans.
+    for di in 0..dirs {
+        let Some((volume,frn))=engine.pending_metadata_directory(epoch,di).map_err(anyhow::Error::msg)? else{continue};
+        if failed_volumes[volume as usize]{directory_errors+=1;continue;}
+        if selected_volume!=Some(volume){
+            selected_volume=Some(volume);
+            let path=format!("\\\\.\\{}:",volume as char);
+            reader=DirMetadataReader::open_volume(&path,limits.directory_bytes).ok().map(|r|(volume,r));
+            if reader.is_none(){failed_volumes[volume as usize]=true;}
         }
-        // 让 search / USN write 插队。1ms 看似短，但足以让排队的 writer 跑一轮 batch。
-        std::thread::sleep(Duration::from_millis(1));
-        start = end;
+        let Some((_,r))=reader.as_mut() else{directory_errors+=1;continue};
+        if r.start_directory(frn,None).is_err(){directory_errors+=1;continue;}
+        loop {
+            let stamp=engine.begin_metadata_observation(epoch).map_err(anyhow::Error::msg)?;
+            match r.read_page(){
+                Ok(Some(records))=>{
+                    directory_pages+=1;
+                    let committed=engine.commit_metadata_observation(volume,stamp,records,limits.directory_bytes).map_err(anyhow::Error::msg)?;
+                    directory_committed+=committed;engine.add_backfill_done(committed as u64);
+                }
+                Ok(None)=>break,
+                Err(_)=>{directory_errors+=1;break;}
+            }
+            std::thread::yield_now();
+        }
     }
-    info!(
-        "回填扫描完成：耗时 {:?}，待补文件 {} 条（分布在 {} 个卷）",
-        scan_start.elapsed(),
-        total_pending,
-        by_volume.len()
-    );
-
-    // P2 断点续跑：先载入 overlay 边车，再把已完成的条目从待补集合剔除。
-    // overlay 是完成记录本身（只增不改），天然防撕裂：快照只在单卷 quiesce 后落盘，
-    // 载入的多余条目无害（正确的 meta），缺的会重新回填。
-    // Legacy row-index-only overlay is not imported: it has no epoch/identity binding.
-
-    if total_pending == 0 {
-        info!("无需回填，触发终态落盘（异步线程）");
-        delete_overlay_sidecar(&index_path);
-        spawn_final_persist(engine, index_path);
+    let reader_bytes=reader.as_ref().map(|r|r.1.capacity_bytes()).unwrap_or(0);drop(reader);
+    let pool=rayon::ThreadPoolBuilder::new().num_threads(limits.workers).thread_name(|i|format!("findx2-backfill-bounded-{i}")).build()?;
+    let report=ticket_pass(&engine,epoch,&cancel,limits,|volume,items|{
+        let path=format!("\\\\.\\{}:",volume as char);
+        let frns:Vec<_>=items.iter().map(|i|i.frn).collect();
+        let ids=vec![None;items.len()];let indices:Vec<_>=(0..items.len()).collect();
+        Ok(pool.install(||fill_metadata_by_id_pooled(&path,&frns,&ids,&indices,None,Some(cancel.clone()))))
+    }).map_err(anyhow::Error::msg)?;
+    let coverage=engine.metadata_coverage(epoch).map_err(anyhow::Error::msg)?;
+    info!(directory_pages,directory_committed,directory_errors,reader_bytes,?report,unknown=coverage.unknown,"bounded metadata pass complete");
+    if coverage.unknown!=0 {
+        engine.set_backfill_error(Some(format!("元数据回填遍历完成但仍有 {} 条未验证（失败/并发变更）；metadata_ready 保持 false，重启/重建后可重试",coverage.unknown)));
         return Ok(());
     }
-
-    engine.set_backfill_total(total_pending as u64);
-    let cancel = Arc::new(AtomicBool::new(false));
-    let global_done = Arc::new(AtomicUsize::new(0));
-
-    // 2) 逐卷：先走 NtQueryDirectoryFile 批量快路径，剩余未命中的走 OpenFileById 兜底。
-    //    每卷独立专属池（线程数按卷画像：HDD 2 线程顺序、SSD 高并发），子函数里的 par_iter
-    //    自动走当前池——search 永远走全局池，互不抢占。
-    for (letter, pending) in &by_volume {
-        if pending.files.is_empty() {
-            continue;
-        }
-        let vol_path = format!("\\\\.\\{}:", letter);
-        let is_hdd = findx2_windows::volume_incurs_seek_penalty(&format!("{letter}:"));
-        let vol_threads = if is_hdd { 2 } else { ssd_threads };
-        let backfill_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(vol_threads)
-            .thread_name(|i| format!("findx2-backfill-{i}"))
-            .build()
-            .map_err(|e| anyhow::anyhow!("创建回填专属线程池失败：{e}"))?;
-        info!(
-            "回填 卷 {}: 待补文件 {} 条，驱动目录 {} 个 ({})，画像={}，线程={}",
-            letter,
-            pending.files.len(),
-            pending.dirs.len(),
-            vol_path,
-            if is_hdd { "HDD" } else { "SSD" },
-            vol_threads,
-        );
-        backfill_pool.install(|| {
-            backfill_one_volume(
-                &engine,
-                *letter,
-                &vol_path,
-                pending,
-                cancel.clone(),
-                &global_done,
-                total_pending,
-            )
-        })?;
-        // P2 断点：每卷完成后落一次 overlay（该卷已 quiesce，快照一致）。
-        // HDD 上 136MB 写 ~10-20 秒，后台线程跑，不阻塞 search。
-        if let Err(e) = save_overlay_sidecar(&engine, &index_path) {
-            tracing::warn!("断点边车保存失败: {e:#}");
-        }
-    }
-
-    /// 单卷回填主体（P1-5：调用方已按卷画像建好专属池，整个函数跑在 `install` 里，
-    /// 内部所有 par_iter 自动走该池）。
-    fn backfill_one_volume(
-        engine: &Arc<SearchEngine>,
-        letter: char,
-        vol_path: &str,
-        pending: &VolPending,
-        cancel: Arc<AtomicBool>,
-        global_done: &AtomicUsize,
-        _total_pending: usize,
-    ) -> anyhow::Result<()> {
-        let tickets: std::collections::HashMap<usize, _> = pending
-            .files
-            .iter()
-            .filter_map(|(idx, _)| engine.metadata_ticket(*idx).map(|t| (*idx, t)))
-            .collect();
-        // 建"待回填 FRN 集合"，用于在 NtQueryDirectoryFile 阶段筛选只要的子项。
-        let needed: std::collections::HashSet<u64> =
-            pending.files.iter().map(|(_, f)| *f).collect();
-
-        // 2.1 NtQueryDirectoryFile 批量。优化：
-        //  - 只扫描"含有待补文件"的目录（needed 集合的 parent 集），其它目录开了也白开；
-        //  - 按 FRN 升序排，让 MFT 物理读连续，Windows 内核 Mcb cache 命中率↑。
-        //
-        // 待补文件 frn 集合 = needed；其 parent 集合需要从 entries 反查。
-        // 同样按 chunk 拿读锁——避免一次握几秒锁阻死 search/USN write。
-        let mut parent_set: std::collections::HashSet<u64> =
-            std::collections::HashSet::with_capacity(pending.files.len());
-        const PARENT_CHUNK: usize = 32_768;
-        for chunk in pending.files.chunks(PARENT_CHUNK) {
-            {
-                let g = engine.index_store();
-                for &(idx, _frn) in chunk {
-                    let dir_idx = g.entries[idx].dir_idx as usize;
-                    if let Some(d) = g.dirs.get(dir_idx) {
-                        parent_set.insert(d.frn);
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let mut dir_frns: Vec<(u64, Option<[u8; 16]>)> = pending
-            .dirs
-            .iter()
-            .filter(|&&f| parent_set.contains(&f))
-            .map(|&f| (f, None))
-            .collect();
-        dir_frns.sort_unstable_by_key(|(frn, _)| *frn);
-        info!(
-            "回填 卷 {}: 实际扫描目录 {}/{}（按 FRN 排序，已剔除无待补子文件的目录）",
-            letter,
-            dir_frns.len(),
-            pending.dirs.len(),
-        );
-        // 接 progress 回调：每完成一批目录就按比例推进 backfill_done，
-        // 让 GUI 能实时看到 D 盘那种"扫几分钟才返回"的卷在动而不是僵住。
-        // 估算系数：该卷待补文件 / 实际扫描目录数（每目录平均 ~N 个待补文件）。
-        let vol_files = pending.files.len() as u64;
-        let _vol_dirs = dir_frns.len().max(1) as u64;
-        let last_reported = std::sync::atomic::AtomicU64::new(0);
-        let engine_cb = Arc::clone(engine);
-        let progress_cb = move |cur: usize, total: usize| {
-            // 把 [0..vol_dirs] 映射到 [0..vol_files]，单调推进。
-            let projected = (cur as u64).saturating_mul(vol_files) / (total.max(1) as u64);
-            let prev = last_reported.swap(projected, Ordering::Relaxed);
-            if projected > prev {
-                engine_cb.add_backfill_done(projected - prev);
-            }
-        };
-        let dir_recs = fetch_dir_meta_batched(
-            &vol_path,
-            &dir_frns,
-            Some(&progress_cb),
-            Some(cancel.clone()),
-        );
-        // 进度回调里推过的"估算量"在真正写 overlay 前归零，避免双重计数。
-        // 真正的命中量在下面循环里按 hit_frns 重新累加。
-        engine.reset_backfill_done_to(global_done.load(Ordering::Relaxed) as u64);
-
-        // 从 entry 视角建 frn→entry_idx（仅在待回填集合里），用于把 NtQuery 的返回映射回 entry。
-        let mut frn_to_entry: std::collections::HashMap<u64, usize> =
-            std::collections::HashMap::with_capacity(pending.files.len() * 2);
-        for &(idx, frn) in &pending.files {
-            frn_to_entry.insert(frn, idx);
-        }
-
-        // 记录 NtQuery 命中的 frn，避免后续兜底重复跑。
-        let mut hit_frns: std::collections::HashSet<u64> =
-            std::collections::HashSet::with_capacity(needed.len());
-        let mut buf: Vec<(usize, u64, u64, u64)> = Vec::with_capacity(OVERLAY_BATCH);
-        for (frn, sz, mt, ct) in dir_recs {
-            if !needed.contains(&frn) {
-                continue;
-            }
-            let Some(&entry_idx) = frn_to_entry.get(&frn) else {
-                continue;
-            };
-            if !hit_frns.insert(frn) {
-                continue;
-            }
-            buf.push((entry_idx, sz, mt, ct));
-            if buf.len() >= OVERLAY_BATCH {
-                let n = buf.len();
-                for &(idx, sz, mt, ct) in &buf {
-                    if let Some(t) = tickets.get(&idx) {
-                        let _ = engine.commit_metadata(*t, sz, mt, ct);
-                    }
-                }
-                engine.add_backfill_done(n as u64);
-                global_done.fetch_add(n, Ordering::Relaxed);
-                buf.clear();
-            }
-        }
-        if !buf.is_empty() {
-            let n = buf.len();
-            for &(idx, sz, mt, ct) in &buf {
-                if let Some(t) = tickets.get(&idx) {
-                    let _ = engine.commit_metadata(*t, sz, mt, ct);
-                }
-            }
-            engine.add_backfill_done(n as u64);
-            global_done.fetch_add(n, Ordering::Relaxed);
-        }
-        info!(
-            "回填 卷 {}: NtQueryDirectoryFile 命中 {}/{}",
-            letter,
-            hit_frns.len(),
-            pending.files.len(),
-        );
-
-        // 2.2 剩余未命中 → OpenFileById 兜底（极少数孤儿 / reparse 目录扫不到）。
-        let remain: Vec<(usize, u64)> = pending
-            .files
-            .iter()
-            .filter(|(_, f)| !hit_frns.contains(f))
-            .copied()
-            .collect();
-        if !remain.is_empty() {
-            info!("回填 卷 {}: OpenFileById 兜底 {} 条", letter, remain.len());
-            let frns: Vec<u64> = remain.iter().map(|(_, f)| *f).collect();
-            let id128s: Vec<Option<[u8; 16]>> = vec![None; frns.len()];
-            let local_indices: Vec<usize> = (0..frns.len()).collect();
-            let updates = fill_metadata_by_id_pooled(
-                &vol_path,
-                &frns,
-                &id128s,
-                &local_indices,
-                None,
-                Some(cancel.clone()),
-            );
-            let mut buf2: Vec<(usize, u64, u64, u64)> = Vec::with_capacity(OVERLAY_BATCH);
-            for (local_idx, sz, mt, ct) in updates {
-                let (entry_idx, _frn) = remain[local_idx];
-                buf2.push((entry_idx, sz, mt, ct));
-                if buf2.len() >= OVERLAY_BATCH {
-                    let n = buf2.len();
-                    for &(idx, sz, mt, ct) in &buf2 {
-                        if let Some(t) = tickets.get(&idx) {
-                            let _ = engine.commit_metadata(*t, sz, mt, ct);
-                        }
-                    }
-                    engine.add_backfill_done(n as u64);
-                    global_done.fetch_add(n, Ordering::Relaxed);
-                    buf2.clear();
-                }
-            }
-            if !buf2.is_empty() {
-                let n = buf2.len();
-                for &(idx, sz, mt, ct) in &buf2 {
-                    if let Some(t) = tickets.get(&idx) {
-                        let _ = engine.commit_metadata(*t, sz, mt, ct);
-                    }
-                }
-                engine.add_backfill_done(n as u64);
-                global_done.fetch_add(n, Ordering::Relaxed);
-            }
-        }
-        info!("回填 卷 {} 完成", letter);
-        Ok(())
-    }
-
-    // 3) 终态落盘异步化。
-    //    回填扫描循环到此结束，所有元数据都在 overlay 里。
-    //    flush + 写盘 549MB 是耗时操作（HDD 上可能 10+ 秒），扔到独立线程跑，
-    //    本回填线程可以立刻退出，不阻塞任何东西。
-    let done_count = global_done.load(Ordering::Relaxed);
-    info!("后台元数据回填完成：done={}/{}", done_count, total_pending);
-    if done_count == 0 {
-        // 回填了 0 条——可能是权限不足或句柄打开全部失败。
-        // 不触发终态落盘，不设 metadata_ready=true，下次启动 service 时重试。
-        error!(
-            "回填完成但成功 0 条（共 {} 条待补），可能是权限不足或卷句柄打开失败。\
-             不标记 metadata_ready=true，下次启动时将重试。",
-            total_pending
-        );
-        engine.set_backfill_error(Some(
-            "元数据回填失败（可能需要管理员权限）；时间与大小筛选可能不准".into(),
-        ));
-        return Ok(());
-    }
-    info!("触发终态落盘（异步线程）");
-    spawn_final_persist(engine, index_path);
+    // No full overlay sidecar snapshot. The existing overlay is drained in bounded
+    // pages at final persist; failure coverage never becomes metadata_ready=true.
+    spawn_final_persist_for_epoch(engine,index_path,Some(epoch));
     Ok(())
 }

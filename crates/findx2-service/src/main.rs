@@ -8,6 +8,7 @@ mod usage_fixture;
 mod watch_health;
 
 mod backfill;
+mod metadata_pipeline;
 #[cfg(windows)]
 mod everything_ipc;
 #[cfg(windows)]
