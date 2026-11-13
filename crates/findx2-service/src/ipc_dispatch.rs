@@ -211,22 +211,16 @@ pub(crate) fn search_ipc(
         .map_err(|e| e.to_string())?;
     let search_us = t_search.elapsed().as_micros() as u64;
     let t_format = std::time::Instant::now();
-    let store = engine.index_store();
     let dtos: Vec<findx2_ipc::SearchHitDto> = hits
         .into_iter()
         .map(|h| {
-            let is_directory = store
-                .entries
-                .get(h.entry_idx as usize)
-                .map(|e| e.is_dir_entry())
-                .unwrap_or(false);
             findx2_ipc::SearchHitDto {
                 entry_idx: h.entry_idx,
                 name: h.name,
                 path: h.path,
                 size: h.size,
                 mtime: h.mtime,
-                is_directory,
+                is_directory: h.is_directory,
                 name_highlight: h.name_highlight,
             }
         })
@@ -379,4 +373,15 @@ mod usage_tests {
         assert!(matches!(process_request(&slot,IpcRequest::Status),IpcResponse::StatusResult{healthy:true,watch_error:None,..}));
     }
 
+}
+
+#[cfg(test)] mod search_snapshot_tests {
+    #[test] fn directory_kind_is_carried_by_search_snapshot() {
+        let raw=|id,parent,name:&str,dir|findx2_core::RawEntry { file_id:id,file_id_128:None,parent_id:parent,name:name.into(),size:if dir {0}else{123},mtime:0,ctime:0,attrs:if dir{16}else{0},is_dir:dir };
+        let store=findx2_core::IndexBuilder::new(b'F',1,7,0).build_from_raw(vec![raw(10,2,"public-file.txt",false)],vec![raw(1,0,"root",true),raw(2,1,"public-folder",true)],true).unwrap();
+        let engine=findx2_core::SearchEngine::new(store);
+        let (hits,_,_)=super::search_ipc(&engine,"public",false,50,0).unwrap();
+        assert!(hits.iter().any(|h| h.name=="public-folder" && h.is_directory));
+        assert!(hits.iter().any(|h| h.name=="public-file.txt" && !h.is_directory));
+    }
 }

@@ -89,6 +89,8 @@ pub(crate) type PinList<'a> = [()];
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchHit {
     pub entry_idx: u32,
+    #[serde(default)]
+    pub is_directory: bool,
     pub name: String,
     pub path: String,
     pub size: u64,
@@ -406,6 +408,13 @@ impl SearchEngine {
         let pin_res_ref: &PinList<'_> = &[];
 
         let want_end = offset.saturating_add(limit);
+        // Pin one coherent store snapshot through cache validation, scan, sort
+        // and page construction. Releasing then reacquiring here can queue
+        // behind a long namespace writer even after the search has completed.
+        let lock_started = std::time::Instant::now();
+        let store = self.store.read();
+        let lock_wait = lock_started.elapsed();
+        let cpu_started = std::time::Instant::now();
         let rev_now = self.revision.load(Ordering::Relaxed);
         // 1) 缓存命中？要求缓存的已排序深度覆盖本页页尾（只读 clone，不占锁做构建）。
         let cached: Option<CachedTop> = {
@@ -430,9 +439,11 @@ impl SearchEngine {
                 // miss：读锁下全量扫描 + 排到 K（K 覆盖将来翻页，见 CachedTop）。
                 // 读锁持有期间 writer 进不来，扫完再取 revision 打标签，
                 // 保证「数据 ⇒ 标签」的时序正确。
-                let store = self.store.read();
                 let unordered =
                     Self::search_unordered(&store, &self.metadata_overlay, q, opt, pin_res_ref)?;
+                if lock_wait.as_millis() > 10 || cpu_started.elapsed().as_millis() > 100 {
+                    crate::progress!("search_phase scan_lock_wait_ms={} scan_cpu_ms={}",lock_wait.as_millis(),cpu_started.elapsed().as_millis());
+                }
                 let tag = self.revision.load(Ordering::Relaxed);
                 let total = unordered.len() as u32;
                 let k = want_end.max(PAGE_CACHE_TOP).min(unordered.len());
@@ -458,7 +469,7 @@ impl SearchEngine {
             top[offset..].iter().take(limit).copied().collect()
         };
         drop(top);
-        let store = self.store.read();
+        let page_cpu_started = std::time::Instant::now();
         let dbg_page = std::env::var("FINDX2_DEBUG_SEARCH").is_ok();
         let (out, _) = Self::build_hit_page(
             &store,
@@ -469,6 +480,9 @@ impl SearchEngine {
             pin_res_ref,
             dbg_page,
         )?;
+        if lock_wait.as_millis() > 10 || page_cpu_started.elapsed().as_millis() > 100 {
+            crate::progress!("search_phase initial_lock_wait_ms={} page_build_cpu_ms={}",lock_wait.as_millis(),page_cpu_started.elapsed().as_millis());
+        }
         Ok((out, total))
     }
 
@@ -1122,6 +1136,7 @@ impl SearchEngine {
                     }
                     Ok(SearchHit {
                         entry_idx: idx,
+                        is_directory: e.is_dir_entry(),
                         name,
                         path,
                         size,

@@ -317,6 +317,7 @@ fn run() -> Result<()> {
                         .into_iter()
                         .map(|d| SearchHit {
                             entry_idx: d.entry_idx,
+                            is_directory: d.is_directory,
                             name: d.name,
                             path: d.path,
                             size: d.size,
