@@ -9,7 +9,7 @@ use search_session::SearchSnapshot;
 #[path = "workspace.rs"]
 mod workspace;
 use gpui_kit::component::Disableable as _;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use workspace::{ViewMode, Workspace};
 
 use findx2_ipc::SearchHitDto;
@@ -108,8 +108,6 @@ pub struct MainWindow {
     search_gen: u64,
     status_gen: u64,
     status_inflight: bool,
-    footer_counts_inflight: bool,
-    footer_counts_at: Option<Instant>,
     preview_diagnostics: bool,
     preview: PreviewState,
     preview_memo: std::collections::HashMap<(String, u64, u64), crate::preview_worker::PdfOptions>,
@@ -296,8 +294,6 @@ impl MainWindow {
             search_gen: 0,
             status_gen: 0,
             status_inflight: false,
-            footer_counts_inflight: false,
-            footer_counts_at: None,
             preview_diagnostics: false,
             preview: PreviewState::empty(),
             preview_memo: std::collections::HashMap::new(),
@@ -696,39 +692,11 @@ impl MainWindow {
                     }
                     cx.notify();
                 });
-                this.poll_footer_counts(cx);
                 cx.notify();
             })
             .ok();
         })
         .detach();
-    }
-
-    fn poll_footer_counts(&mut self, cx: &mut Context<Self>) {
-        if self.footer_counts_inflight || self.footer_counts_at.is_some_and(|t|t.elapsed()<Duration::from_secs(10)) {return;}
-        let Some((scope,endpoint,ipc))=self.session.read_with(cx,|s,_|
-            s.engine_footer.scope().map(|v|(v,s.endpoint.clone(),s.ipc.clone()))) else {return;};
-        self.footer_counts_inflight=true;
-        self.footer_counts_at=Some(Instant::now());
-        let rx=ipc.footer_counts(endpoint.clone(),scope);
-        cx.spawn(async move |this,cx| {
-            let result=rx.await.unwrap_or_else(|_|Err("统计通道已关闭".into()));
-            this.update(cx,|this,cx| {
-                this.footer_counts_inflight=false;
-                this.session.update(cx,|s,cx| {
-                    if s.endpoint!=endpoint || s.engine_footer.scope()!=Some(scope) {return;}
-                    match result {
-                        Ok(findx2_ipc::IpcResponse::UsageChildrenResult{page})=>s.engine_footer.accept_counts(scope,&page),
-                        Ok(findx2_ipc::IpcResponse::Error{message})=>s.engine_footer.count_error=Some(message),
-                        Ok(_)=>s.engine_footer.count_error=Some("统计响应不可用".into()),
-                        Err(e)=>s.engine_footer.count_error=Some(e),
-                    }
-                    // Footer only: never touch scan, scene keys, selection or zoom.
-                    cx.notify();
-                });
-                cx.notify();
-            }).ok();
-        }).detach();
     }
 
     fn record_reset(&mut self, reason: &str) {
@@ -2068,7 +2036,7 @@ impl MainWindow {
                 .tooltip(move |window,cx|gpui_kit::component::tooltip::Tooltip::new(left_detail.clone()).build(window,cx))
                 .child(left))
             .when(self.workspace.mode==ViewMode::Search,|v| {
-                let detail=footer.tooltip();
+                let detail=footer.counts_tooltip();
                 v.child(div().id("footer-index-counts").flex_shrink_0().text_xs()
                     .tooltip(move |window,cx|gpui_kit::component::tooltip::Tooltip::new(detail.clone()).build(window,cx))
                     .child(footer.counts_label()))
@@ -2093,6 +2061,8 @@ impl MainWindow {
                     .ghost()
                     .icon(Icon::default().path(if footer.warning() {
                         "icons/circle-alert.svg"
+                    } else if footer.needs_details() {
+                        "icons/info.svg"
                     } else {
                         "icons/circle-check.svg"
                     }))
