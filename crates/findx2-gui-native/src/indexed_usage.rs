@@ -173,3 +173,59 @@ mod structure_tests {
         assert!(!same_structure(&scan,&requested,&other_epoch));
     }
 }
+
+/// One identity for scene construction, paint, scroll and hit testing.
+/// Engine revisions change only for geometry/scope changes, never badge ticks.
+pub fn scene_identity(engine: bool, revision: usize, address: usize) -> usize {
+    if engine { revision } else { address }
+}
+pub fn same_layout(scan: &Scan, requested: &std::path::Path, page: &findx2_ipc::UsagePageDto) -> bool {
+    same_structure(scan, requested, page)
+        && scan.nodes[0].logical == page.root.logical
+        && scan.nodes[0].children.iter().zip(&page.children)
+            .all(|(&i, child)| scan.nodes[i].logical == child.logical)
+}
+
+/// A result belongs to exactly one navigation request, not merely a root index (all engine pages use root 0).
+pub fn request_is_current(current: u64, request: u64, current_path: &std::path::Path, requested: &std::path::Path, cancelled: bool) -> bool {
+    current == request && current_path == requested && !cancelled
+}
+#[cfg(test)]
+mod navigation_scene_tests {
+    use super::*;
+    use crate::usage_view::{build_scene, SceneKey};
+    use std::sync::Arc;
+    fn page(generation: u64, unknown: u64, bytes: u64) -> findx2_ipc::UsagePageDto {
+        let item = |name: &str, logical| findx2_ipc::UsageItemDto { id: 1, name: name.into(), directory: true, logical, files: 10, directories: 2, unknown };
+        findx2_ipc::UsagePageDto { epoch: 9, generation, root: item("C:", bytes), children: vec![item("Users", bytes)], next: None, resident_bytes: 0, state: "ok".into(), watch_error: None, metadata_error: None }
+    }
+    #[test]
+    fn root_navigation_scene_is_visible_and_badges_during_pending_layout_do_not_invalidate_it() {
+        let root = PathBuf::from(r"C:\");
+        let first = page(1, 0, 100);
+        let captured = Arc::new(scan_from_page(&first, root.clone()));
+        let identity = scene_identity(true, 2, Arc::as_ptr(&captured) as usize);
+        let key = SceneKey { scan: identity, root: 0, depth: 3, width: 960, height: 640, detail: 1 };
+        // The background task retains the old Arc; a badge update clones its scan.
+        let mut live = (*captured).clone();
+        let badge = page(3, 278, 100);
+        assert!(same_layout(&live, &root, &badge));
+        patch_metrics(&mut live, &badge);
+        let live = Arc::new(live);
+        let scene = build_scene(&captured, key);
+        assert_eq!(scene.key.scan, scene_identity(true, 2, Arc::as_ptr(&live) as usize));
+        assert!(scene.tiles.iter().any(|t| t.depth > 0 && t.rect.w > 0. && t.rect.h > 0.));
+        assert_ne!(scene.key.scan, scene_identity(true, 3, Arc::as_ptr(&live) as usize));
+        assert!(!same_layout(&live, &root, &page(4, 278, 101)));
+        assert!(!same_layout(&live, &PathBuf::from(r"C:\Users"), &badge));
+    }
+    #[test]
+    fn navigation_cancel_and_late_results_cannot_clobber_root() {
+        let root=PathBuf::from(r"C:\"); let users=PathBuf::from(r"C:\Users");
+        assert!(!request_is_current(3,2,&root,&users,false));
+        assert!(!request_is_current(3,3,&root,&users,false));
+        assert!(!request_is_current(3,3,&root,&root,true));
+        assert!(request_is_current(3,3,&root,&root,false));
+        assert_eq!(scene_identity(false,2,12345),12345);
+    }
+}

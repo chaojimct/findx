@@ -21,6 +21,7 @@ enum Job {
     Request {
         endpoint: String,
         req: IpcRequest,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         reply: oneshot::Sender<IpcResult<IpcResponse>>,
     },
     Search {
@@ -56,8 +57,14 @@ impl IpcClient {
         let _ = self.tx.send(Job::Request {
             endpoint,
             req,
+            cancel: None,
             reply,
         });
+        rx
+    }
+    pub fn request_cancellable(&self, endpoint: String, req: IpcRequest, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) -> oneshot::Receiver<IpcResult<IpcResponse>> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Job::Request { endpoint, req, cancel: Some(cancel), reply });
         rx
     }
     pub fn start() -> Self {
@@ -119,14 +126,22 @@ async fn dispatch(job: Job) {
         Job::Request {
             endpoint,
             req,
-            reply,
+            cancel,
+            mut reply,
         } => {
-            let r = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let r = tokio::select! {
+                result = tokio::time::timeout(std::time::Duration::from_secs(45), async {
                 let c = connect_endpoint(&endpoint).await?;
                 write_request(c, req).await
-            })
-            .await
-            .unwrap_or_else(|_| Err("用量 IPC 超时".into()));
+            }) => result.unwrap_or_else(|_| Err("索引目录请求超时（45 秒）；刷新可重试".into())),
+                _ = async {
+                    loop {
+                        if cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) { break; }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                } => Err("索引目录请求已取消".into()),
+                _ = reply.closed() => return,
+            };
             let _ = reply.send(r);
         }
         Job::Search {

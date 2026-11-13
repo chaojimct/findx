@@ -133,7 +133,7 @@ impl MainWindow {
         }
         let root_change = self.workspace.usage_scene.as_ref().is_some_and(|s| {
             s.key.root != root
-                || (!self.workspace.engine_usage && s.key.scan != Arc::as_ptr(&scan) as usize)
+                || s.key.scan != self.usage_scan_identity(&scan)
         });
         let detail = if root_change {
             1
@@ -141,11 +141,7 @@ impl MainWindow {
             self.workspace.usage_camera.scale.floor().clamp(1., 5.) as u32
         };
         let key = SceneKey {
-            scan: if self.workspace.engine_usage {
-                0
-            } else {
-                Arc::as_ptr(&scan) as usize
-            },
+            scan: self.usage_scan_identity(&scan),
             root,
             depth: self.workspace.usage_depth,
             width,
@@ -174,7 +170,7 @@ impl MainWindow {
                     && this.workspace.usage_preview.borrow().can_handoff(source);
                 if let Some(previous) = this.workspace.usage_scene.as_ref().filter(|_| !handing) {
                     if previous.key.root != scene.key.root
-                        || (!this.workspace.engine_usage && previous.key.scan != scene.key.scan)
+                        || previous.key.scan != scene.key.scan
                     {
                         this.workspace.usage_transition = None;
                         if previous.key.scan == scene.key.scan
@@ -309,7 +305,7 @@ impl MainWindow {
                     .workspace
                     .scan
                     .as_ref()
-                    .is_none_or(|scan| s.key.scan != Arc::as_ptr(scan) as usize)
+                    .is_none_or(|scan| s.key.scan != self.usage_scan_identity(scan))
         }) {
             return None;
         }
@@ -360,7 +356,7 @@ impl MainWindow {
                     .workspace
                     .scan
                     .as_ref()
-                    .is_some_and(|scan| s.key.scan == Arc::as_ptr(scan) as usize)
+                    .is_some_and(|scan| s.key.scan == self.usage_scan_identity(scan))
         }) else {
             return;
         };
@@ -506,10 +502,14 @@ impl MainWindow {
             if draws.is_empty() {
                 empty = Some("本地实测中 · 等待首批已测数据（总量未知）");
             }
+        } else if self.workspace.engine_usage && self.scan_node().is_none() {
+            empty = Some(if self.workspace.engine_busy {
+                "正在读取索引目录…（最长 45 秒，可取消）"
+            } else { self.workspace.scan_status.as_str() });
         } else if let (Some(scan), Some(scene)) =
             (&self.workspace.scan, &self.workspace.usage_scene)
         {
-            if scene.key.scan == Arc::as_ptr(scan) as usize
+            if scene.key.scan == self.usage_scan_identity(scan)
                 && Some(scene.key.root) == self.scan_node()
             {
                 let preview = self.workspace.usage_preview.borrow();

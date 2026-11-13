@@ -768,7 +768,7 @@ impl MainWindow {
                         this.start_workspace_scan(this.scan_node().is_some(), cx)
                     })),
             )
-            .when(self.workspace.scanning, |view| {
+            .when(self.workspace.scanning || self.workspace.engine_busy, |view| {
                 view.child(
                     Button::new("cancel-workspace-scan")
                         .icon(IconName::Close)
@@ -776,6 +776,15 @@ impl MainWindow {
                         .h(px(28.))
                         .tooltip("停止后续枚举；已测部分会保留，不会当作完整结果")
                         .on_click(cx.listener(|this, _, _, cx| {
+                            if this.workspace.engine_usage {
+                                this.workspace.engine_cancel.store(true, Ordering::Release);
+                                this.workspace.scan_generation = this.workspace.scan_generation.wrapping_add(1);
+                                this.workspace.engine_busy = false;
+                                this.workspace.engine_checked = false;
+                                this.workspace.scan_status = "已取消索引目录请求；刷新可重试".into();
+                                cx.notify();
+                                return;
+                            }
                             this.workspace.scan_cancel.store(true, Ordering::Release);
                             this.workspace.scan_status = "正在取消；已测部分将保留".into();
                             cx.notify();

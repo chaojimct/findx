@@ -231,6 +231,7 @@ pub(super) struct Workspace {
     active_scan_root: Option<PathBuf>,
     usage_scene_key: Option<crate::usage_view::SceneKey>,
     usage_scene_generation: u64,
+    usage_tree_revision: usize,
     usage_camera: crate::usage_view::Camera,
     usage_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
     usage_map_focus: FocusHandle,
@@ -364,6 +365,7 @@ impl Workspace {
             active_scan_root: None,
             usage_scene_key: None,
             usage_scene_generation: 0,
+            usage_tree_revision: 1,
             usage_camera: Default::default(),
             usage_bounds: Default::default(),
             usage_map_focus: cx.focus_handle(),
@@ -932,6 +934,9 @@ impl MainWindow {
         }
         cx.notify();
     }
+    fn usage_scan_identity(&self, scan: &Arc<Scan>) -> usize {
+        crate::indexed_usage::scene_identity(self.workspace.engine_usage, self.workspace.usage_tree_revision, Arc::as_ptr(scan) as usize)
+    }
     fn scan_node(&self) -> Option<usize> {
         self.workspace
             .scan_lookup
@@ -1049,6 +1054,24 @@ impl MainWindow {
             self.workspace.usage_focus = focus.clone();
         }
         if mode == ViewMode::Usage && self.workspace.engine_usage {
+            // Never retain another directory's inspector/scene while IPC is pending.
+            self.workspace.scan_cancel.store(true, Ordering::Release);
+            self.workspace.scanning = false;
+            self.workspace.active_scan_root = None;
+            self.workspace.scan = None;
+            self.workspace.scan_lookup.clear();
+            self.workspace.usage_scene = None;
+            self.workspace.usage_scene_key = None;
+            self.workspace.usage_scene_generation = self.workspace.usage_scene_generation.wrapping_add(1);
+            self.workspace.usage_transition = None;
+            self.workspace.usage_frame.borrow_mut().clear();
+            self.workspace.usage_hover = None;
+            self.workspace.usage_focus = None;
+            self.workspace.pending_hit = None;
+            self.workspace.engine_next = None;
+            self.workspace.engine_generation = None;
+            self.workspace.scan_status = "正在读取索引目录（最长 45 秒，可取消）".into();
+            self.set_workspace_rows(vec![], None, false, cx);
             self.workspace.usage_camera.reset();
             self.load_engine_usage(false, cx);
             cx.notify();
@@ -1416,7 +1439,7 @@ impl MainWindow {
             let result = async {
                 if !checked {
                     match ipc
-                        .request(endpoint.clone(), findx2_ipc::IpcRequest::UsageCapabilities)
+                        .request_cancellable(endpoint.clone(), findx2_ipc::IpcRequest::UsageCapabilities, cancel.clone())
                         .await
                         .map_err(|_| "用量能力请求已取消".to_string())??
                     {
@@ -1435,9 +1458,9 @@ impl MainWindow {
                 let mut stamp=expected;
                 loop {
                     crate::indexed_usage::ensure_not_cancelled(&cancel)?;
-                    let response=ipc.request(endpoint.clone(),findx2_ipc::IpcRequest::UsageChildren{
+                    let response=ipc.request_cancellable(endpoint.clone(),findx2_ipc::IpcRequest::UsageChildren{
                         path:path.clone(),expected:stamp,after:cursor,max_bytes:48*1024,
-                    }).await.map_err(|_|"usage request cancelled".to_string())??;
+                    }, cancel.clone()).await.map_err(|_|"usage request cancelled".to_string())??;
                     crate::indexed_usage::ensure_not_cancelled(&cancel)?;
                     let page=match response {
                         findx2_ipc::IpcResponse::UsageChildrenResult{page}=>page,
@@ -1451,9 +1474,11 @@ impl MainWindow {
             }
             .await;
             this.update(cx, |this, cx| {
-                if this.workspace.scan_generation != request_generation {
-                    return;
-                }
+                if !crate::indexed_usage::request_is_current(
+                    this.workspace.scan_generation, request_generation,
+                    &this.workspace.location, &requested,
+                    cancel.load(Ordering::Acquire),
+                ) { return; }
                 this.workspace.engine_busy = false;
                 if !this.workspace.engine_usage
                     || this.workspace.mode != ViewMode::Usage
@@ -1469,6 +1494,9 @@ impl MainWindow {
                         }
                         this.workspace.scan_stale = !e.contains("不支持");
                         this.workspace.scan_status = e;
+                        // Do not hammer a busy/failed engine every two seconds.
+                        // Explicit refresh or navigation can retry.
+                        this.workspace.engine_checked = false;
                         cx.notify();
                         return;
                     }
@@ -1502,7 +1530,7 @@ impl MainWindow {
                 // and flashes the whole page while totals stay the same.
                 if !next
                     && this.workspace.scan.as_ref().is_some_and(|s| {
-                        crate::indexed_usage::same_structure(s, &requested, &page)
+                        crate::indexed_usage::same_layout(s, &requested, &page)
                     })
                 {
                     if let Some(scan) = this.workspace.scan.as_mut() {
@@ -1526,6 +1554,7 @@ impl MainWindow {
                         return;
                     }
                 }
+                this.workspace.usage_tree_revision = this.workspace.usage_tree_revision.wrapping_add(1);
                 this.workspace.scan = Some(Arc::new(scan));
                 this.workspace.scan_stale = degraded;
                 this.workspace.usage_scene_key = None;

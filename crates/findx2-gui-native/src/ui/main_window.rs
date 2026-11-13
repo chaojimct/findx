@@ -368,6 +368,12 @@ impl MainWindow {
                 this.start_workspace_scan(true, cx);
             }
         }
+        // Read-only live startup route; never enables a filesystem scan.
+        if this.session.read(cx).live {
+            if let Some(path) = std::env::var_os("FINDX_NATIVE_LIVE_USAGE_PATH") {
+                this.workspace_navigate(std::path::PathBuf::from(path), ViewMode::Usage, None, true, cx);
+            }
+        }
         this.schedule_status_poll(cx);
         if this.preview_file.is_some() {
             this.request_preview(cx);
