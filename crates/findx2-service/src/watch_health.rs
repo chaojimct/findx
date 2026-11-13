@@ -45,7 +45,7 @@ impl NamespaceGate {
         match engine.apply_volume_batch(volume, events, journal_id, next_usn) {
             Ok(()) => {
                 set_watch_error(volume as char, engine.has_pending_namespace(volume).then(||
-                    "missing-parent namespace events pending; durable cursor pinned for restart replay".into()));
+                    format!("missing-parent namespace events pending; durable cursor pinned for restart replay; {}", engine.pending_namespace_diagnostics(volume))));
                 Ok(())
             }
             Err(error) => {

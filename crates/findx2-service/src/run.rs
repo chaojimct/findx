@@ -761,7 +761,7 @@ fn usn_watch_loop(
                     match namespace_gate.apply(&engine, volume_letter, &events, journal_id, next_usn) {
                         Ok(()) => {
                             set_watch_error(letter, engine.has_pending_namespace(volume_letter).then(||
-                                "missing-parent namespace events pending; durable cursor pinned for restart replay".into()));
+                                format!("missing-parent namespace events pending; durable cursor pinned for restart replay; {}", engine.pending_namespace_diagnostics(volume_letter))));
                             dirty_count += events.len();
                         }
                         Err(e) => {
@@ -809,7 +809,7 @@ fn usn_watch_loop(
                         continue;
                     }
                     if engine.has_pending_namespace(volume_letter) {
-                        set_watch_error(letter, Some("missing-parent namespace events pending; durable cursor pinned for restart replay".into()));
+                        set_watch_error(letter, Some(format!("missing-parent namespace events pending; durable cursor pinned for restart replay; {}", engine.pending_namespace_diagnostics(volume_letter))));
                         continue;
                     }
                     // 存活确认：收到 journal 心跳即视为健康，复位退避/重建计数。

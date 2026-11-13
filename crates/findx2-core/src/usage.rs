@@ -1021,6 +1021,36 @@ impl SearchEngine {
             new_entry, new_dir, name_bytes,
         })
     }
+    /// Bounded, name-free diagnostics for a pinned namespace watermark.
+    /// Inspect at most 64 queued records; never clone their names or paths.
+    pub fn pending_namespace_diagnostics(&self, volume: u8) -> String {
+        let g = self.store.read();
+        let o = self.orphans.lock();
+        let mut sampled = 0;
+        let (mut creates, mut renames, mut deletes, mut other) = (0, 0, 0, 0);
+        let (mut absent_parent, mut deleted_parent, mut directory_mismatch, mut live_parent) = (0, 0, 0, 0);
+        let mut known_identity = 0;
+        for (_, _, ev) in o.ordered.iter().filter(|(v, _, _)| *v == volume).take(64) {
+            sampled += 1;
+            if g.entry_on_volume(volume, OrphanQueue::identity(ev)).is_some() { known_identity += 1; }
+            let parent = match ev {
+                ChangeEvent::Create { entry } => { creates += 1; Some(entry.parent_id) }
+                ChangeEvent::CreatePending { parent_id, .. } => { creates += 1; Some(*parent_id) }
+                ChangeEvent::Rename { new_parent_id, .. } => { renames += 1; Some(*new_parent_id) }
+                ChangeEvent::Delete { .. } => { deletes += 1; None }
+                _ => { other += 1; None }
+            };
+            if let Some(parent) = parent {
+                match g.entry_on_volume(volume, parent) {
+                    None => absent_parent += 1,
+                    Some(i) if g.entries[i as usize].is_deleted() => deleted_parent += 1,
+                    Some(_) if g.dir_on_volume(volume, parent).is_none() => directory_mismatch += 1,
+                    Some(_) => live_parent += 1,
+                }
+            }
+        }
+        format!("sample={sampled}/64 creates={creates} renames={renames} deletes={deletes} other={other} absent_parent={absent_parent} deleted_parent={deleted_parent} directory_mismatch={directory_mismatch} live_parent={live_parent} known_identity={known_identity}")
+    }
     pub fn has_pending_namespace(&self, volume: u8) -> bool {
         self.orphans.lock().ordered.iter().any(|(v, _, _)| *v == volume)
     }
