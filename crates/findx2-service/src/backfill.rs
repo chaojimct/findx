@@ -117,10 +117,22 @@ fn spawn_final_persist_for_epoch(engine:Arc<SearchEngine>,path:std::path::PathBu
             //    Windows 走 v6：FullResync → 全量分段重写。
             //    非 Windows（Unix 回填桩）走旧 v5 直写。
             let t1 = Instant::now();
-            #[cfg(windows)]
-            if let Err(e) = crate::run::persist_index(&engine, &path) {
-                error!("终态落盘：persist_index 失败: {e:#}");
+            if epoch.is_some_and(|e| engine.metadata_epoch() != e) {
+                info!("obsolete metadata finalizer skipped");
                 return;
+            }
+            #[cfg(windows)]
+            match crate::run::persist_index(&engine, &path) {
+                Ok(true) => {},
+                Ok(false) => {
+                    engine.set_backfill_error(Some("metadata covered; terminal persistence deferred by concurrent commit; regular persistence will retry".into()));
+                    return;
+                },
+                Err(e) => {
+                    error!("terminal metadata persistence failed: {e:#}");
+                    engine.set_backfill_error(Some(format!("metadata covered but terminal persistence failed: {e:#}")));
+                    return;
+                }
             }
             #[cfg(not(windows))]
             {
@@ -131,6 +143,7 @@ fn spawn_final_persist_for_epoch(engine:Arc<SearchEngine>,path:std::path::PathBu
                 }
             }
             // 终态已落盘：断点边车使命完成，删除（下次回填从头也不怕，因为 ready=true 不会再回填）。
+            if epoch.is_some_and(|e| engine.metadata_epoch() != e) { return; }
             delete_overlay_sidecar(&path);
             info!(
                 "终态落盘：v6 已写盘（写盘耗时 {:?}，全程 {:?}）",

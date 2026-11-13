@@ -674,7 +674,7 @@ impl SearchEngine {
         if e.is_deleted() || e.is_dir_entry() { return Ok(false); }
         let parent = e.dir_idx;
         let old = Totals::file(self.effective_size(&g, t.entry), r.freshness.get(t.entry) != 1);
-        if g.metadata_ready || t.entry >= self.metadata_overlay.capacity() {
+        if g.metadata_ready || self.metadata_drain_active() || t.entry >= self.metadata_overlay.capacity() {
             g.patch_entry_metadata(t.entry, size, mtime, ctime).map_err(|e| e.to_string())?;
         }
         self.metadata_overlay.put(t.entry, size, crate::index::filetime_to_unix_secs(mtime), crate::index::filetime_to_unix_secs(ctime));
@@ -849,6 +849,9 @@ impl SearchEngine {
             v.last_usn = next_usn;
         }
         for (&idx, &(size, mtime, ctime)) in &metadata_after {
+            if self.metadata_drain_active() {
+                g.patch_entry_metadata(idx, size, crate::index::unix_secs_to_filetime(mtime), crate::index::unix_secs_to_filetime(ctime)).map_err(|e| e.to_string())?;
+            }
             self.metadata_overlay.put(idx, size, mtime, ctime);
         }
         if let Err(e) = self.fold_snaps(&g, volume, &applied_snaps) {
@@ -1093,6 +1096,74 @@ mod tests {
         e
     }
     fn size(e: &SearchEngine) -> u64 { e.usage_page("C:\\", None, None, 1024).unwrap().root.logical }
+    #[test]
+    fn replacement_revokes_tickets_observations_and_overlay_for_reused_slots() {
+        let e=engine();
+        let ticket=e.metadata_ticket_by_id(b'C',10).unwrap();
+        let epoch=ticket.epoch;
+        let stamp=e.begin_metadata_observation(epoch).unwrap();
+        let mut fresh=store(b'C');
+        fresh.metadata_ready=false;
+        fresh.patch_entry_metadata(ticket.entry,7,0,0).unwrap();
+        e.replace_index_store(fresh);
+        assert_eq!(e.metadata_overlay_len(),0);
+        assert_eq!(e.metadata_ticket_storage().0,0);
+        e.enable_usage(16*1024*1024).unwrap();
+        assert!(!e.commit_metadata(ticket,999,0,0).unwrap());
+        assert!(e.commit_metadata_observation(b'C',stamp,&[(10,888,0,0)],1024).is_err());
+        assert!(e.flush_metadata_overlay_for_epoch(Some(epoch)).is_err());
+        assert!(e.complete_metadata_if_covered(epoch).is_err());
+        assert_eq!(e.index_store().entries[ticket.entry].size,7);
+        assert!(!e.index_store().metadata_ready);
+    }
+    #[test]
+    fn replacement_between_flush_pages_rejects_old_finalizer() {
+        let mut initial=store(b'C');
+        let file=*initial.entries.iter().find(|e|!e.is_dir_entry()).unwrap();
+        for i in 0..8192 {initial.entries.push(file);initial.frns.push(1000+i);}
+        let e=SearchEngine::new(initial);e.enable_usage(16*1024*1024).unwrap();
+        e.set_metadata_ready(false).unwrap();
+        let ticket=e.metadata_ticket_by_id(b'C',10).unwrap();
+        assert!(e.commit_metadata(ticket,555,0,0).unwrap());
+        let result=e.complete_metadata_with_pages(ticket.epoch, |_| {
+            assert!(!e.index_store().metadata_ready);
+            let mut fresh=store(b'C');fresh.metadata_ready=false;
+            fresh.patch_entry_metadata(ticket.entry,7,0,0).unwrap();
+            e.replace_index_store(fresh);
+            e.enable_usage(16*1024*1024).unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(e.index_store().entries[ticket.entry].size,7);
+        assert!(!e.index_store().metadata_ready);
+        assert!(!e.metadata_drain_active());
+    }
+    #[test]
+    fn completion_rechecks_unknown_after_each_bounded_drain() {
+        let e=engine(); e.set_metadata_ready(false).unwrap();
+        let epoch=e.metadata_epoch();
+        assert!(!e.complete_metadata_with_pages(epoch, |_| {
+            assert!(!e.index_store().metadata_ready);
+            e.mark_metadata_dirty(b'C',10);
+        }).unwrap());
+        assert!(!e.index_store().metadata_ready);
+        assert_eq!(e.metadata_coverage(epoch).unwrap().unknown,1);
+        assert!(!e.metadata_drain_active());
+    }
+    #[test]
+    fn late_ticket_and_namespace_metadata_survive_bounded_drain_clear() {
+        let e=engine(); e.set_metadata_ready(false).unwrap();
+        let epoch=e.metadata_epoch();
+        assert!(e.complete_metadata_with_pages(epoch, |_| {
+            assert!(!e.index_store().metadata_ready);
+            let t=e.metadata_ticket_by_id(b'C',10).unwrap();
+            assert!(e.commit_metadata(t,777,0,0).unwrap());
+            e.apply_volume_change(b'C',&ChangeEvent::DataOrMeta{file_id:10,size:None,mtime:Some(crate::index::unix_secs_to_filetime(123)),ctime:None,create_if_missing:None}).unwrap();
+        }).unwrap());
+        let g=e.index_store();let idx=g.entry_on_volume(b'C',10).unwrap() as usize;
+        assert_eq!(g.entries[idx].size,777);assert_eq!(g.entries[idx].mtime,123);
+        assert!(g.metadata_ready);assert_eq!(e.metadata_overlay_len(),0);
+        assert!(!e.metadata_drain_active());
+    }
     #[test]
     fn incremental_namespace_and_metadata() {
         let e = engine();
@@ -1641,7 +1712,7 @@ impl SearchEngine {
             let e=&g.entries[idx];
             if e.is_deleted()||e.is_dir_entry()||r.freshness.get(idx)==1 {continue;}
             let parent=e.dir_idx;let old=Totals::file(self.effective_size(&g,idx),true);
-            if g.metadata_ready||idx>=self.metadata_overlay.capacity(){g.patch_entry_metadata(idx,size,mtime,ctime).map_err(|e|e.to_string())?;}
+            if g.metadata_ready||self.metadata_drain_active()||idx>=self.metadata_overlay.capacity(){g.patch_entry_metadata(idx,size,mtime,ctime).map_err(|e|e.to_string())?;}
             self.metadata_overlay.put(idx,size,crate::index::filetime_to_unix_secs(mtime),crate::index::filetime_to_unix_secs(ctime));
             r.freshness.set(idx,1);r.invalidate_ticket(idx);
             r.apply_file_delta(parent,old,Totals::file(size,false),true,true);committed+=1;
@@ -1653,15 +1724,23 @@ impl SearchEngine {
 
 impl SearchEngine {
     pub fn complete_metadata_if_covered(&self,epoch:u64)->Result<bool,String> {
+        self.complete_metadata_with_pages(epoch, |_| {})
+    }
+    fn complete_metadata_with_pages(&self,epoch:u64,after_page:impl FnMut(usize))->Result<bool,String> {
+        let _drain = self.begin_metadata_drain();
         {
-            let mut g=self.store.write();let r=self.usage.lock();
+            let _g=self.store.write();let r=self.usage.lock();
             if r.epoch!=epoch||r.error.is_some(){return Err("metadata completion epoch changed".into());}
             if r.roots.values().any(|&id|r.dirs[id as usize].unknown>0){return Ok(false);}
-            g.metadata_ready=true;
         }
-        self.flush_metadata_overlay_for_epoch(Some(epoch)).map_err(|e|e.to_string())?;
-        let _g=self.store.write();
-        if self.usage.lock().epoch!=epoch{return Err("metadata completion epoch changed".into());}
+        self.flush_metadata_overlay_pages(Some(epoch),after_page).map_err(|e|e.to_string())?;
+        let mut g=self.store.write();let r=self.usage.lock();
+        if r.epoch!=epoch||r.error.is_some(){return Err("metadata completion epoch changed".into());}
+        // A watcher may dirty metadata between flush pages. Recheck coverage
+        // before publishing ready; producers mirror late writes during drain.
+        if r.roots.values().any(|&id|r.dirs[id as usize].unknown>0){return Ok(false);}
+        if !g.metadata_ready {g.mark_full_resync();}
+        g.metadata_ready=true;
         self.metadata_overlay.clear();self.bump_revision();Ok(true)
     }
 }

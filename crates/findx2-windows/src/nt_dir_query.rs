@@ -361,22 +361,30 @@ impl DirMetadataReader {
             if error.code().0 as u32 & 0xffff == 18 {return Ok(None);}
             return Err(error.to_string());
         }
+        self.decode_page()?;
+        Ok(Some(&self.records))
+    }
+    fn decode_page(&mut self)->Result<(),String> {
+        self.records.clear();
+        let bytes=self.buffer.len()*8;
+        let base=self.buffer.as_ptr() as *const u8;
         let header=std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO,FileName);
         let mut offset=0usize;
         loop {
-            if offset.saturating_add(header)>bytes{return Err("invalid directory record page".into());}
+            if offset.saturating_add(size_of::<FILE_ID_BOTH_DIR_INFO>())>bytes{return Err("short directory record page".into());}
             let rec=unsafe{&*(base.add(offset) as *const FILE_ID_BOTH_DIR_INFO)};
-            if offset.saturating_add(header).saturating_add(rec.FileNameLength as usize)>bytes{return Err("invalid directory name length".into());}
+            let name_bytes=rec.FileNameLength as usize;
+            if name_bytes<2 || name_bytes%2!=0 || offset.saturating_add(header).saturating_add(name_bytes)>bytes{return Err("invalid directory name length".into());}
             if rec.FileAttributes&0x10==0 {
                 if self.records.len()==self.records.capacity(){return Err("directory record page exceeds reserved byte budget".into());}
                 self.records.push((rec.FileId as u64,rec.EndOfFile.max(0) as u64,rec.LastWriteTime as u64,rec.CreationTime as u64));
             }
             if rec.NextEntryOffset==0{break;}
             let next=rec.NextEntryOffset as usize;
-            if next<header || next%8!=0 || offset.saturating_add(next)>=bytes{return Err("invalid directory record link".into());}
+            if next<header.saturating_add(name_bytes) || next%8!=0 || offset.saturating_add(next)>=bytes{return Err("invalid directory record link".into());}
             offset+=next;
         }
-        Ok(Some(&self.records))
+        Ok(())
     }
 }
 #[cfg(windows)]
@@ -390,6 +398,22 @@ impl Drop for DirMetadataReader {
 #[cfg(all(test,windows))]
 mod streaming_fixture_tests {
  use super::*;
+ #[test]
+ fn streaming_parser_rejects_short_overlapping_and_invalid_name_pages(){
+  let (buffer,records)=DirMetadataReader::storage(4096).unwrap();
+  let mut reader=DirMetadataReader{volume:None,directory:None,buffer,records};
+  let write=|r:&mut DirMetadataReader,name:u32,next:u32|{
+   let mut rec:FILE_ID_BOTH_DIR_INFO=unsafe{std::mem::zeroed()};rec.FileNameLength=name;rec.NextEntryOffset=next;rec.FileId=10;rec.EndOfFile=7;
+   unsafe{std::ptr::write(r.buffer.as_mut_ptr() as *mut FILE_ID_BOTH_DIR_INFO,rec);}
+  };
+  write(&mut reader,2,0);reader.decode_page().unwrap();assert_eq!(reader.records.len(),1);
+  write(&mut reader,3,0);assert!(reader.decode_page().unwrap_err().contains("name"));
+  write(&mut reader,u32::MAX-1,0);assert!(reader.decode_page().unwrap_err().contains("name"));
+  let header=std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO,FileName);
+  write(&mut reader,256,((header+7)/8*8) as u32);assert!(reader.decode_page().unwrap_err().contains("link"));
+  write(&mut reader,2,0);reader.buffer.truncate(size_of::<FILE_ID_BOTH_DIR_INFO>()/8-1);
+  assert!(reader.decode_page().unwrap_err().contains("short"));
+ }
  #[test]
  fn bounded_reader_consumes_finite_public_directory_in_multiple_pages(){
   let nonce=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();

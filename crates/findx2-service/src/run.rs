@@ -971,8 +971,7 @@ fn rebuild_volume(
     // 服务停太久、FirstUsn 已经越过 frozen 时，回绕会让下一轮立刻再断档，
     // 全卷重建无限循环。这时新扫描自带的 NextUsn 才是能接上的游标。
     {
-        let mut g = engine.index_store_mut();
-        *g = merged;
+        let mut g = merged;
         // v6：整库换入后旧分段文件整体失效。恢复 tracking 并记 FullResync，
         // 下次 commit 走全量分段重写（换入的 store 可能 tracking 已关/日志为空，
         // 不显式标记就会静默分叉）。
@@ -1000,9 +999,8 @@ fn rebuild_volume(
             }
             v.last_usn = resume;
         }
+        engine.replace_index_store(g);
     }
-    engine.note_external_mutation();
-    engine.clear_metadata_overlay();
     if let Err(e) = engine.enable_usage(engine.usage_budget()) {
         tracing::error!("logical usage tree unavailable after rebuild: {e}; search continues");
     }
@@ -1015,7 +1013,6 @@ fn rebuild_volume(
         "单卷重建后边车重建",
     );
     // 合并后 metadata_ready=false（fast 重枚举），必须重新拉起回填；旧 overlay 下标已失效。
-    engine.clear_metadata_overlay();
     crate::backfill::spawn_backfill(Arc::clone(engine), index_path.to_path_buf());
     info!("卷 {letter} 重建完成（frozen={frozen}），恢复增量监听");
     Ok(())

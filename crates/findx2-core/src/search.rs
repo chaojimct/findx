@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 // 用 parking_lot::RwLock 替代 std::sync::RwLock：
 // - std 在 Windows 上是 SRW Lock，writer 一旦排队，**所有后续 reader 都被阻塞**——
@@ -129,6 +129,7 @@ pub struct SearchEngine {
     ///
     /// 见 `crate::meta_overlay` 的模块文档了解为什么不用 DashMap。
     pub(crate) metadata_overlay: Arc<MetaOverlay>,
+    metadata_drains: AtomicUsize,
     /// 索引变更计数：任何影响搜索结果集/排序的写入都 +1（USN 增量、回填合并、
     /// metadata_ready 翻转、overlay 写入/清空）。分页查询缓存凭它失效。
     /// trigram 边车重建不 bump——剪枝只影响候选超集，不影响最终命中与排序。
@@ -174,6 +175,7 @@ impl SearchEngine {
             orphans: parking_lot::Mutex::new(Default::default()),
             backfill: Arc::new(BackfillProgress::default()),
             metadata_overlay: Arc::new(MetaOverlay::new(entry_count)),
+            metadata_drains: AtomicUsize::new(0),
             revision: AtomicU64::new(0),
             page_cache: parking_lot::Mutex::new(None),
         }
@@ -187,6 +189,30 @@ impl SearchEngine {
         u.epoch = 0;
         u.error = Some("index epoch changed; usage requires reinitialization".into());
         self.revision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Atomically replace slot identities and revoke all old producer leases.
+    /// Never swap through index_store_mut followed by note_external_mutation:
+    /// that leaves a window where an old ticket can write a reused slot.
+    pub fn replace_index_store(&self, store: IndexStore) {
+        let mut g = self.store.write();
+        self.orphans.lock().clear();
+        let mut runtime = self.usage.lock();
+        let budget = runtime.budget;
+        *runtime = Default::default();
+        runtime.budget = budget;
+        runtime.error = Some("index epoch changed; usage requires reinitialization".into());
+        self.metadata_overlay.clear();
+        *g = store;
+        self.bump_revision();
+    }
+
+    pub(crate) fn begin_metadata_drain(&self) -> MetadataDrainGuard<'_> {
+        self.metadata_drains.fetch_add(1, Ordering::AcqRel);
+        MetadataDrainGuard(&self.metadata_drains)
+    }
+    pub(crate) fn metadata_drain_active(&self) -> bool {
+        self.metadata_drains.load(Ordering::Acquire) != 0
     }
 
     pub(crate) fn metadata_revision(&self) -> u64 { self.revision.load(Ordering::Relaxed) }
@@ -217,7 +243,7 @@ impl SearchEngine {
         if items.is_empty() {
             return;
         }
-        let guard = self.store.write();
+        let mut guard = self.store.write();
         let mut usage = self.usage.lock();
         for &(idx, size, m_ft, c_ft) in items {
             let mtime = crate::index::filetime_to_unix_secs(m_ft);
@@ -225,6 +251,10 @@ impl SearchEngine {
             let parent = guard.entries.get(idx).map(|e| e.dir_idx).unwrap_or(0);
             let old = self.metadata_overlay.get(idx).map(|t| t.0).unwrap_or_else(|| guard.entries.get(idx).map(|e| e.size).unwrap_or(0));
             let was_unknown = self.metadata_overlay.get(idx).is_none();
+            if guard.metadata_ready || self.metadata_drain_active() {
+                // Valid producers use existing slots; mirror late writes while a bounded drain runs.
+                let _ = guard.patch_entry_metadata(idx, size, m_ft, c_ft);
+            }
             self.metadata_overlay.put(idx, size, mtime, ctime);
             usage.overlay_delta(parent, old, size, was_unknown, idx);
         }
@@ -239,6 +269,9 @@ impl SearchEngine {
     /// （CLI 退出 / 30s 定时落盘）——影响可控。
     pub fn flush_metadata_overlay_into_store(&self) -> Result<usize> { self.flush_metadata_overlay_for_epoch(None) }
     pub(crate) fn flush_metadata_overlay_for_epoch(&self,epoch:Option<u64>) -> Result<usize> {
+        self.flush_metadata_overlay_pages(epoch, |_| {})
+    }
+    pub(crate) fn flush_metadata_overlay_pages(&self,epoch:Option<u64>,mut after_page:impl FnMut(usize)) -> Result<usize> {
         const SLOTS:usize=8192;
         let mut records=Vec::new();
         records.try_reserve_exact(SLOTS).map_err(|_|crate::Error::Platform("metadata flush page allocation failed".into()))?;
@@ -256,8 +289,11 @@ impl SearchEngine {
                 total+=records.len();
             }
             drop(g);
+            after_page(start);
             std::thread::yield_now();
         }
+        let _g = self.store.read();
+        if epoch.is_some_and(|e|self.usage.lock().epoch!=e){return Err(crate::Error::Platform("metadata flush epoch changed".into()));}
         if total>0 {self.bump_revision();}
         Ok(total)
     }
@@ -265,6 +301,7 @@ impl SearchEngine {
     /// 显式清空 overlay。**只在 metadata_ready 翻 true 之后**或者明确确定回填线程已停时调用。
     /// 清空改变 size/time 的可见值（回退到主索引），同样 bump revision。
     pub fn clear_metadata_overlay(&self) {
+        let _g = self.store.write();
         self.metadata_overlay.clear();
         self.bump_revision();
     }
@@ -1188,27 +1225,32 @@ impl SearchEngine {
         Ok(())
     }
 
-    /// 标记元数据回填已完成。`ready=true` 时会把 overlay 一次性 flush 进主索引，并清空 overlay。
-    /// 这一步**只发生在回填线程结束**，外部不再有写入，因此 flush + clear 无并发风险。
+    /// Compatibility setter; versioned Windows backfill additionally checks coverage.
+    /// A scoped drain mirrors concurrent producer writes, then publishes readiness.
     pub fn set_metadata_ready(&self, ready: bool) -> Result<()> {
-        {
-            let mut g=self.store.write();
-            // Once true, concurrent ticket commits also patch the store directly.
-            // Thus a bounded drain followed by clear cannot lose a late overlay write.
-            g.metadata_ready=ready;
-        }
         if ready {
-            if let Err(error)=self.flush_metadata_overlay_into_store() {
-                self.store.write().metadata_ready=false;
-                return Err(error);
-            }
-            let _g=self.store.write();
+            let _drain = self.begin_metadata_drain();
+            let epoch = { let _g = self.store.read(); self.usage.lock().epoch };
+            self.flush_metadata_overlay_for_epoch(Some(epoch))?;
+            let mut g = self.store.write();
+            if self.usage.lock().epoch != epoch { return Err(crate::Error::Platform("metadata completion epoch changed".into())); }
+            if !g.metadata_ready { g.mark_full_resync(); }
+            g.metadata_ready = true;
             self.metadata_overlay.clear();
             self.clear_backfill_progress();
+        } else {
+            let mut g = self.store.write();
+            if g.metadata_ready { g.mark_full_resync(); }
+            g.metadata_ready = false;
         }
         self.bump_revision();
         Ok(())
     }
+}
+
+pub(crate) struct MetadataDrainGuard<'a>(&'a AtomicUsize);
+impl Drop for MetadataDrainGuard<'_> {
+    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); }
 }
 
 #[inline]
