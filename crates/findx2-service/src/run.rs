@@ -256,6 +256,17 @@ pub(crate) fn never_stop_flag() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
 
+// A shutdown-file request must publish the same shared STOP observed by
+// watch workers; merely leaving the waiter made every shutdown consume 10 s.
+fn shutdown_requested(stop: &AtomicBool, marker: Option<&Path>) -> bool {
+    if stop.load(Ordering::SeqCst) { return true; }
+    if marker.is_some_and(|path| path.exists()) {
+        stop.store(true, Ordering::SeqCst);
+        return true;
+    }
+    false
+}
+
 pub(crate) fn run_foreground(
     index: PathBuf,
     _volume: String,
@@ -534,20 +545,27 @@ pub(crate) fn run_foreground(
     // 停机等待：STOP 置位（或控制台模式的永不置位标志）→ 等 USN 线程 flush+落盘后返回。
     // pipe 线程 detached：进程退出时由 OS 收割（管道句柄随进程关闭）。
     // 之前这里 `pipe_thread.join()` 永久阻塞，服务停止完全靠 win_service 的 process::exit 硬杀。
-    while !stop.load(Ordering::SeqCst) {
-        if flags.shutdown_file.as_ref().is_some_and(|p| p.exists()) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
+    while !shutdown_requested(&stop, flags.shutdown_file.as_deref()) {
+        std::thread::sleep(Duration::from_millis(50));
     }
-    info!("收到停机指令：等待 USN 线程 flush + 落盘（每卷最多 10s）…");
+    info!("Shutdown requested; shared STOP published, waiting for watch flush (shared 10s grace)");
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut unfinished = 0usize;
     for h in usn_handles {
         while !h.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if h.is_finished() {
+            if h.join().is_err() { tracing::warn!("watch worker panicked during shutdown"); }
+        } else {
+            unfinished += 1;
         }
     }
-    info!("停机收尾完成，run_foreground 退出");
+    if unfinished == 0 {
+        info!("All watch workers finished normal shutdown");
+    } else {
+        tracing::warn!(unfinished, "Shutdown grace expired; do not claim all workers flushed; retained durable cursor requires replay");
+    }
     Ok(())
 }
 
@@ -1201,6 +1219,34 @@ pub(crate) fn persist_index(engine: &SearchEngine, path: &Path) -> anyhow::Resul
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shutdown_marker_publishes_shared_stop_and_releases_fake_watcher() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let marker = std::env::temp_dir().join(format!("findx-shutdown-unit-{}-{stamp}.signal", std::process::id()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(!super::shutdown_requested(&stop, Some(&marker)));
+        let worker_stop = stop.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            while !worker_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            tx.send(()).unwrap();
+        });
+        std::fs::write(&marker, b"owned test stop").unwrap();
+        let started = std::time::Instant::now();
+        assert!(super::shutdown_requested(&stop, Some(&marker)));
+        assert!(stop.load(std::sync::atomic::Ordering::SeqCst));
+        rx.recv_timeout(std::time::Duration::from_secs(1)).expect("watcher must observe stop, not sit through the ten-second grace");
+        worker.join().unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        std::fs::remove_file(marker).unwrap();
+    }
+    #[test]
+    fn preexisting_external_stop_does_not_require_a_marker() {
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        assert!(super::shutdown_requested(&stop, None));
+    }
     use super::{merge_rebuilt_volume, resume_usn_after_rebuild};
     use findx2_core::{IndexBuilder, RawEntry};
 
