@@ -799,7 +799,13 @@ impl SearchEngine {
         if let Some(ref pp) = q.parent_path {
             // Everything：`parent:` / `infolder:` 为父目录路径**全等**（仅该文件夹的直接子项）。
             // 旧版「父路径子串」请用 `parentcontains:`。
-            retain_parent_path_matches(store, &mut hits, pp, q.parent_path_substring);
+            if !retain_parent_path_matches(store, &mut hits, pp, q.parent_path_substring) {
+                if q.parent_path_substring {
+                    hits.retain(|&idx| match_parent_path(store, idx as usize, pp));
+                } else {
+                    hits.retain(|&idx| match_parent_path_exact(store, idx as usize, pp));
+                }
+            }
         }
 
         if let Some(ref not_n) = q.not_substring {
@@ -2502,29 +2508,22 @@ fn path_candidate_ids(
     })
 }
 
+// Keep parent-only allocation/loops out of the ordinary query hot function.
+// False leaves hits untouched for the caller's original per-entry fallback.
+#[inline(never)]
 fn retain_parent_path_matches(
     store: &IndexStore,
     hits: &mut Vec<u32>,
     needle: &str,
     substring: bool,
-) {
+) -> bool {
     if hits.len() < 4096 || store.volumes.len() != 1 || store.volumes[0].is_unix() {
-        if substring {
-            hits.retain(|&i| match_parent_path(store, i as usize, needle));
-        } else {
-            hits.retain(|&i| match_parent_path_exact(store, i as usize, needle));
-        }
-        return;
+        return false;
     }
     let key = path_key(needle);
     let mut verdict = Vec::new();
     if verdict.try_reserve_exact(store.dirs.len()).is_err() {
-        if substring {
-            hits.retain(|&i| match_parent_path(store, i as usize, needle));
-        } else {
-            hits.retain(|&i| match_parent_path_exact(store, i as usize, needle));
-        }
-        return;
+        return false;
     }
     verdict.resize(store.dirs.len(), 0u8);
     hits.retain(|&i| {
@@ -2545,6 +2544,7 @@ fn retain_parent_path_matches(
         }
         yes
     });
+    true
 }
 
 fn parent_path_haystack(store: &IndexStore, entry_idx: usize) -> String {
@@ -3258,7 +3258,9 @@ mod directory_filter_memo_tests {
                 } else {
                     expect.retain(|&i| match_parent_path_exact(s, i as usize, key))
                 }
-                retain_parent_path_matches(s, &mut got, key, sub);
+                if !retain_parent_path_matches(s, &mut got, key, sub) {
+                got.retain(|&i| if sub { match_parent_path(s, i as usize, key) } else { match_parent_path_exact(s, i as usize, key) });
+            }
                 assert_eq!(got, expect, "parent key={key}, substring={sub}");
             }
         }
@@ -3288,6 +3290,20 @@ mod directory_filter_memo_tests {
         s.dir_path_ranges.fill((0, 0));
         compare(&s);
     }
+    #[test]
+    fn small_memo_fallback_is_untouched_and_caller_still_filters() {
+        let store = fixture(false);
+        let mut hits: Vec<u32> = (0..100).collect();
+        let before = hits.clone();
+        assert!(!retain_parent_path_matches(&store, &mut hits, "missing", false));
+        assert_eq!(hits, before);
+        let engine = SearchEngine::new(store);
+        let query = QueryParser::parse("parent:missing dev_note_1").unwrap();
+        let (hits, total) = engine.search(&query, &SearchOptions::default()).unwrap();
+        assert!(hits.is_empty());
+        assert_eq!(total, 0);
+    }
+
     #[test]
     fn unix_and_multi_volume_keep_per_entry_semantics() {
         let s = fixture(true);
