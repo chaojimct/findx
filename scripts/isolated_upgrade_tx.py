@@ -127,7 +127,23 @@ def copy_file_atomic(src, dest, *, create_new=False):
     if create_new and dest.exists():
         tmp.unlink()
         raise UpgradeError("refusing to overwrite existing file: %s" % dest)
-    os.replace(tmp, dest)
+    # Windows can briefly keep a just-executed exe mapped; retry sharing/access denials.
+    last = None
+    for attempt in range(12):
+        try:
+            os.replace(tmp, dest)
+            last = None
+            break
+        except PermissionError as exc:
+            last = exc
+            time.sleep(0.05 * (attempt + 1))
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in (5, 32):
+                raise
+            last = exc
+            time.sleep(0.05 * (attempt + 1))
+    if last is not None:
+        raise last
 
 
 def tree_manifest(root):

@@ -42,3 +42,5 @@ release/2.5.0.json 保持 publish_ready=false。发布工作流在构建/上传�
 Additional drill: installed 2.4.10 CLI and candidate both read the same public v5/v6 copies without changing any hash. The second-volume root has pre-existing redundant backslashes in BOTH versions. Windows path normalization preserves its D:\public.txt identity; exact canonical-path validation remains a P1 gate, not proof of new data loss. An ignored reproduction is retained. Production index contents were not read.
 
 Stage C (隔离安装事务，见 docs/UPGRADE-T154-STAGE-C.md)：已在仓库内隔离树完成 exe + 全部夹具边车 + 配置 + 模拟 SCM/Run 的成功路径与失败回退到上一完整集合。正式安装目录、正式索引/配置、真实 SCM、真实 HKCU Run 均未改写。实验 C 库不能替代正式全卷索引。2.5.0 候选只在 checkout 内 staging，并带 SHA-256 manifest；因 UpgradeGatesApproved 未满足，不编译 Inno setup。发布门仍全部关闭。
+
+Stage t156（隔离打包 + 版本检测 + 打包升级覆盖，见 docs/UPGRADE-T156-PACKAGING.md）：已用独立 IsolatedFixturePackaging 模式打出 2.5.0 isolated-fixture setup，未使用 UpgradeGatesApproved，也未编译正式 FindX.iss。版本检测矩阵与隔离树上 2.4.10→2.5.0 打包升级（成功与回退）已验收。正式安装未替换。公开自动更新通道仍未实现，publish_ready 仍为 false。
