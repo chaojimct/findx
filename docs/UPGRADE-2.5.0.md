@@ -17,9 +17,9 @@
 - 备份/恢复单位：index.bin、整个 index.bin.v6（全部段和 manifest）、.tri/.tri.pending、.exclude.json、配置及实际 SCM/Run 状态；有其他边车时一并列入清单。冻结写入后计算每个文件 SHA-256、长度、相对名、产品/格式版本、卷标识和 USN 游标。
 - 本机 ProgramData 的索引/manifest 内容读取受本地执行权限限制，本批只核查目录元数据与源码，不据此认定正式库覆盖哪些卷。当前实验仅 C 根，绝不能用它直接替代用户旧库/全盘覆盖。
 - 逐卷比较 volume identity、根前缀、序列号、journal ID 与 durable USN。只有身份一致、journal 未换且 FirstUsn ≤ durable cursor ≤ NextUsn 才能走增量恢复；否则重建受影响卷并明确告知。不能承诺所有旧库免重建。
-- 当前 metadata_ready=false 会阻止周期 checkpoint，正常停机折叠 overlay 的测试不等于断电安全。v6 原位 patch 在旧 manifest 下仍可能可见；Windows 写入还有删除目标再 rename、忽略部分 sync 错误的问题。发布前必须修复并做故障注入证明，不能把“管道在线/搜索有结果”当持久化成功。
+- Stage A 已让部分元数据在 metadata_ready=false 时也能做周期 checkpoint；Stage B 已用世代 COW + published.json 保护已提交代，并通过隔离故障注入。这些是协议测试，不等于真实断电、控制器缓存或正式安装升级成功。发布门保持关闭。不能把“管道在线/搜索有结果”当持久化成功。
 
-## 最小事务切换（待实现/验收，不是本批已执行）
+## 最小事务切换（隔离夹具已实现并验收；正式安装仍未执行，发布门保持关闭）
 1. 只读 preflight：确认安装版、进程 PID/精确路径、SCM 实际命令、所有卷覆盖、磁盘可用空间、配置来源和权限；下载候选到独立版本目录，验证可信来源、签名/哈希与版本一致。
 2. 明示 UAC 和停机影响；用户取消即退出，正式安装、服务、索引和自启动完全不变。未通过兼容/持久化 gate 时不得进入切换。
 3. 请求唯一 writer 正常 checkpoint 并停机，等 SCM 真正 STOPPED 和句柄释放；失败就中止，不全局强杀、不启动第二个 watch。记录原来是否 Running，不擅自启动原本 Stopped 的服务。
@@ -40,3 +40,5 @@ release/2.5.0.json 保持 publish_ready=false。发布工作流在构建/上传�
 
 
 Additional drill: installed 2.4.10 CLI and candidate both read the same public v5/v6 copies without changing any hash. The second-volume root has pre-existing redundant backslashes in BOTH versions. Windows path normalization preserves its D:\public.txt identity; exact canonical-path validation remains a P1 gate, not proof of new data loss. An ignored reproduction is retained. Production index contents were not read.
+
+Stage C (隔离安装事务，见 docs/UPGRADE-T154-STAGE-C.md)：已在仓库内隔离树完成 exe + 全部夹具边车 + 配置 + 模拟 SCM/Run 的成功路径与失败回退到上一完整集合。正式安装目录、正式索引/配置、真实 SCM、真实 HKCU Run 均未改写。实验 C 库不能替代正式全卷索引。2.5.0 候选只在 checkout 内 staging，并带 SHA-256 manifest；因 UpgradeGatesApproved 未满足，不编译 Inno setup。发布门仍全部关闭。

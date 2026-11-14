@@ -167,3 +167,64 @@ fn known_legacy_second_volume_path_is_not_canonical() {
     let loaded = load_index_bin(&legacy).unwrap();
     assert_eq!(loaded.entry_display_path(2).unwrap(), r"D:\public.txt");
 }
+
+fn store_with_pinyin() -> IndexStore {
+    let mut all = Vec::new();
+    for (letter, id, extra) in [
+        (b'C', 100, Some("\u{7eff}\u{6c34}\u{9752}\u{5c71}.txt")),
+        (b'D', 200, None),
+    ] {
+        let raw = |file_id, parent_id, name: &str, is_dir| RawEntry {
+            file_id,
+            file_id_128: None,
+            parent_id,
+            name: name.into(),
+            size: if is_dir { 0 } else { 42 },
+            mtime: 1,
+            ctime: 1,
+            attrs: if is_dir { 0x10 } else { 0 },
+            is_dir,
+        };
+        let mut files = vec![raw(id + 1, id, "public.txt", false)];
+        if let Some(name) = extra {
+            files.push(raw(id + 2, id, name, false));
+        }
+        all.push(
+            IndexBuilder::new(letter, id as u32, id * 10, id * 100)
+                .build_from_raw(files, vec![raw(id, 0, "", true)], true)
+                .unwrap(),
+        );
+    }
+    let mut s = merge_index_stores(all).unwrap();
+    s.metadata_ready = false;
+    s
+}
+
+/// Writes a public v5 two-volume fixture when FINDX_EXPORT_LEGACY_FIXTURE is set.
+/// Never opens an installed or experimental live index.
+#[test]
+fn export_stage_c_legacy_fixtures_if_requested() {
+    let Some(out) = std::env::var_os("FINDX_EXPORT_LEGACY_FIXTURE") else {
+        return;
+    };
+    let out = PathBuf::from(out);
+    std::fs::create_dir_all(&out).unwrap();
+    let source = store_with_pinyin();
+    let current = out.join("current-v6.bin");
+    save_index_bin(&current, &source).unwrap();
+    let v5 = v5_bytes(&std::fs::read(&current).unwrap());
+    let dest = out.join("index.bin");
+    std::fs::write(&dest, &v5).unwrap();
+    let loaded = load_index_bin(&dest).unwrap();
+    assert_eq!(loaded.volumes.len(), 2);
+    assert!(!loaded.metadata_ready);
+    let needle = "\u{7eff}\u{6c34}\u{9752}\u{5c71}.txt".as_bytes();
+    assert!(
+        loaded
+            .entries
+            .iter()
+            .any(|e| loaded.name_bytes(e) == needle),
+        "pinyin probe entry must be present"
+    );
+    println!("exported_legacy_v5={}", dest.display());
+}

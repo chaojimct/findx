@@ -42,6 +42,11 @@ if (-not $StageDir) { $StageDir=Join-Path $RepoRoot 'installer\stage' }
 $StageDir=[IO.Path]::GetFullPath($StageDir)
 if (-not $StageDir.StartsWith($RepoRoot+'\',[StringComparison]::OrdinalIgnoreCase)) { throw 'StageDir must be inside this checkout; never target an installation or index directory.' }
 $payload=@($files | ForEach-Object { [ordered]@{name=$_.name;sha256=(Get-FileHash -LiteralPath $_.source -Algorithm SHA256).Hash.ToLower();length=(Get-Item -LiteralPath $_.source).Length} })
+# Official Inno writes this marker next to FindX.exe; staging stays inside the checkout and never installs.
+$markerName='FindX.installed'
+$markerBytes=[byte[]](0x31,0x0D,0x0A)
+$markerSha=([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($markerBytes))).Replace('-','').ToLower()
+$payload+=[ordered]@{name=$markerName;sha256=$markerSha;length=$markerBytes.Length;synthesized=$true}
 $manifest=[ordered]@{version=$version;gui=$Gui;main_source=(Split-Path $main -Leaf);files=$payload;installation_performed=$false}
 if ($PlanOnly) { $manifest | ConvertTo-Json -Depth 6; return }
 if ($Gui -eq 'native' -and (Get-Item -LiteralPath $main).VersionInfo.ProductVersion -ne $version) { throw 'Native Windows PE ProductVersion does not match workspace version; rebuild candidate first.' }
@@ -67,5 +72,9 @@ foreach ($file in $files) {
   $input=[IO.File]::OpenRead($file.source)
   try { $output=[IO.File]::Open($dest,[IO.FileMode]::CreateNew);try {$input.CopyTo($output);$output.Flush($true)} finally {$output.Dispose()} } finally {$input.Dispose()}
 }
+$markerDest=Join-Path $StageDir $markerName
+$markerOut=[IO.File]::Open($markerDest,[IO.FileMode]::CreateNew)
+try {$markerOut.Write($markerBytes,0,$markerBytes.Length);$markerOut.Flush($true)} finally {$markerOut.Dispose()}
+if ((Get-FileHash -LiteralPath $markerDest -Algorithm SHA256).Hash.ToLower() -ne $markerSha) { throw 'FindX.installed hash mismatch after staging' }
 [IO.File]::WriteAllText((Join-Path $StageDir 'stage-manifest.json'),($manifest | ConvertTo-Json -Depth 6),[Text.UTF8Encoding]::new($false))
 Write-Host "Staged $Gui $version at $StageDir; not installed and not approved for publication."
