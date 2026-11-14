@@ -4,7 +4,7 @@ use findx2_core::{
     index::{IndexBuilder, IndexStore},
     load_index_bin, load_store_auto, merge_index_stores,
     platform::RawEntry,
-    save_index_bin, v6_load, v6_save_full,
+    generation_dir, published_path, read_published, save_index_bin, v6_load, v6_save_full,
 };
 use std::{
     io::{Seek, SeekFrom, Write},
@@ -108,29 +108,49 @@ fn v5_two_volume_copy_upgrade_and_exact_backup_rollback() {
     assert_eq!(std::fs::read(&rollback).unwrap(), old);
 }
 #[test]
-fn release_blocker_old_manifest_does_not_undo_an_in_place_prefix_patch() {
-    let dir = fixture("crash-prefix");
+fn legacy_flat_in_place_prefix_is_still_unsafe() {
+    let dir = fixture("legacy-prefix");
     let source = store();
     let layout = V6Layout::for_index(&dir.join("fixture.bin"));
     v6_save_full(&layout, &source).unwrap();
+    let ptr = read_published(&layout).unwrap().unwrap();
+    let gen = generation_dir(&layout, ptr.manifest.generation);
+    for name in ["entries.dat","frns.dat","dirs.dat","ranges.dat","names.dat","dirpaths.dat","manifest.json"] {
+        std::fs::copy(gen.join(name), layout.dir.join(name)).unwrap();
+    }
+    std::fs::remove_file(published_path(&layout)).unwrap();
+    std::fs::rename(layout.dir.join("gen"), dir.join("set-aside-gen")).unwrap();
     let manifest = std::fs::read(layout.dir.join("manifest.json")).unwrap();
     let changed = source.entries[0].size + 123;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(layout.dir.join("entries.dat"))
-        .unwrap();
+    let mut file = std::fs::OpenOptions::new().write(true).open(layout.dir.join("entries.dat")).unwrap();
     file.seek(SeekFrom::Start(0)).unwrap();
     file.write_all(&changed.to_le_bytes()).unwrap();
     file.sync_all().unwrap();
     drop(file);
-    assert_eq!(
-        std::fs::read(layout.dir.join("manifest.json")).unwrap(),
-        manifest
-    );
+    assert_eq!(std::fs::read(layout.dir.join("manifest.json")).unwrap(), manifest);
     assert_eq!(v6_load(&layout).unwrap().entries[0].size, changed);
-    println!(
-        "EXPECTED_RELEASE_BLOCKER: unchanged old manifest cannot undo an uncommitted in-place prefix patch; this is NOT a passing power-loss-safety test"
-    );
+    println!("legacy flat v6 remains unsafe under in-place prefix patches; transactional save must copy, not patch, this format");
+}
+
+#[test]
+fn transactional_save_copies_legacy_and_ignores_later_prefix_patches() {
+    let dir = fixture("cow-protect");
+    let source = store();
+    let layout = V6Layout::for_index(&dir.join("fixture.bin"));
+    v6_save_full(&layout, &source).unwrap();
+    let original = source.entries[0].size;
+    // A leftover or pre-migration flat file must not change the published generation.
+    std::fs::write(layout.dir.join("entries.dat"), [0xFFu8; 32]).unwrap();
+    assert_eq!(v6_load(&layout).unwrap().entries[0].size, original);
+    // In-place mutation of the live generation is detected, not mixed with leftover files.
+    let ptr = read_published(&layout).unwrap().unwrap();
+    let live = generation_dir(&layout, ptr.manifest.generation).join("entries.dat");
+    let mut file = std::fs::OpenOptions::new().write(true).open(&live).unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(&(original + 123).to_le_bytes()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    assert!(v6_load(&layout).is_err(), "corrupt published generation must not load mixed leftover bytes");
 }
 
 // Existing in both installed 2.4.10 CLI and candidate. Windows normalizes these

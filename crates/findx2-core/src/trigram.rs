@@ -417,12 +417,18 @@ pub fn build_and_save(store: &IndexStore, index_path: &Path) -> Result<()> {
         f.write_all(&hdr)?;
         f.write_all(&table_bytes)?;
         f.write_all(&blobs)?;
-        f.sync_data().ok();
+        f.sync_all().map_err(|e| crate::Error::Persist(format!("trigram sync failed: {e}")))?;
     }
-    #[cfg(windows)]
-    let _ = std::fs::remove_file(&tri_path);
-    std::fs::rename(&tmp_path, &tri_path)?;
-
+    let layout = crate::persist_v6::V6Layout::for_index(index_path);
+    if crate::persist_tx::has_published(&layout) {
+        // Leave the durable staging file for generation publish; do not replace
+        // the live classic sidecar or pending file ahead of that commit.
+        let staging = trigram_staging_path(index_path);
+        let _ = std::fs::remove_file(&staging);
+        std::fs::rename(&tmp_path, &staging)?;
+        return Ok(());
+    }
+    crate::persist_tx::atomic_rename_replace(&tmp_path, &tri_path)?;
     save_pending_sidecar(index_path, &RoaringBitmap::new(), n as u32)?;
 
     crate::progress!(
@@ -440,6 +446,11 @@ pub fn build_and_save(store: &IndexStore, index_path: &Path) -> Result<()> {
 pub fn tri_sidecar_path(index_path: &Path) -> PathBuf {
     let mut p = index_path.as_os_str().to_owned();
     p.push(".tri");
+    PathBuf::from(p)
+}
+pub fn trigram_staging_path(index_path: &Path) -> PathBuf {
+    let mut p = index_path.as_os_str().to_owned();
+    p.push(".tri.staging");
     PathBuf::from(p)
 }
 
@@ -469,16 +480,20 @@ pub fn save_pending_sidecar(
         PathBuf::from(p)
     };
     let _ = std::fs::remove_file(&tmp_path);
-    std::fs::write(&tmp_path, &body)?;
-    #[cfg(windows)]
-    let _ = std::fs::remove_file(&path);
-    std::fs::rename(&tmp_path, &path)?;
+    {
+        let mut f = File::create(&tmp_path)?;
+        f.write_all(&body)?;
+        f.sync_all().map_err(|e| crate::Error::Persist(format!("pending sidecar sync failed: {e}")))?;
+    }
+    crate::persist_tx::atomic_rename_replace(&tmp_path, &path)?;
     Ok(())
 }
 
 /// 读 pending 边车；文件缺失 / 损坏返回 None（调用方应按保守策略处理）。
 pub fn load_pending_sidecar(index_path: &Path) -> Option<(RoaringBitmap, u32)> {
-    let path = pending_sidecar_path(index_path);
+    load_pending_from_path(&pending_sidecar_path(index_path))
+}
+pub fn load_pending_from_path(path: &Path) -> Option<(RoaringBitmap, u32)> {
     let body = std::fs::read(path).ok()?;
     if body.len() < 4 {
         return None;

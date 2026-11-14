@@ -737,7 +737,7 @@ fn usn_watch_loop(
         if stop.load(Ordering::SeqCst) {
             flush_pending(&mut pending)?;
             match persist_index(&engine, &index_path) {
-                Ok(true) => info!("Volume {letter} shutdown checkpoint IO completed (legacy v6; not crash-atomic)"),
+                Ok(true) => info!("Volume {letter} shutdown checkpoint generation published (protocol durable, not physical power-loss certified)"),
                 Ok(false) => info!("Volume {letter} shutdown checkpoint deferred to active writer"),
                 Err(e) => error!("Volume {letter} shutdown checkpoint failed; journal retained: {e}"),
             }
@@ -1264,8 +1264,8 @@ fn persist_index_with(
                 metadata_ready=engine.metadata_ready(),
                 last_io_success_ms=?health.last_io_success_ms, last_io_failure_ms=?health.last_io_failure_ms,
                 elapsed_ms=started.elapsed().as_millis() as u64,
-                durable=false, transactional=false,
-                "Checkpoint IO completed; legacy v6 crash-atomicity remains a release blocker");
+                durable=true, transactional=true,
+                "Checkpoint generation published; protocol durable, not a certified physical power-loss result");
             Ok(true)
         }
         Err(error) => {
@@ -1433,12 +1433,12 @@ mod tests {
         // Real filesystem failure: a required segment is missing. The writer
         // fails after draining; no permission changes or real index are involved.
         checkpoint_patch(&engine,456);
-        let segment=findx2_core::V6Layout::for_index(&path).dir.join("entries.dat");
-        let backup=segment.with_extension("owned-backup");
-        std::fs::rename(&segment,&backup).unwrap();
+        // Do not sabotage the published generation file; an injected writer failure
+        // keeps the committed generation intact and still retains the drained batch.
+        findx2_core::set_persist_fault(findx2_core::PersistFault::AfterDataSync);
         assert!(super::persist_index(&engine,&path).is_err());
+        findx2_core::clear_persist_fault();
         assert!(engine.has_pending_persistence());
-        std::fs::rename(&backup,&segment).unwrap();
         checkpoint_patch(&engine,789);
         engine.apply_volume_batch(b'C',&[],7,201).unwrap();
         assert!(super::persist_index(&engine,&path).unwrap());
@@ -1485,17 +1485,15 @@ mod tests {
     fn checkpoint_disk_failure_does_not_end_watcher_and_retry_is_backed_off() {
         let (path,engine)=checkpoint_fixture("periodic-retry");
         checkpoint_patch(&engine,456);
-        let segment=findx2_core::V6Layout::for_index(&path).dir.join("entries.dat");
-        let backup=segment.with_extension("owned-backup");
-        std::fs::rename(&segment,&backup).unwrap();
+        findx2_core::set_persist_fault(findx2_core::PersistFault::DiskFull { max_bytes: 16 });
         let mut dirty=2;
         let mut last=std::time::Instant::now()-std::time::Duration::from_secs(31);
         let original=last;
         let mut retry=None;
         super::persist_periodic_checkpoint_retrying(&engine,&path,&mut dirty,&mut last,&mut retry,std::time::Duration::from_secs(30));
+        findx2_core::clear_persist_fault();
         assert_eq!(last,original);assert_eq!(dirty,2);assert!(retry.is_some());
         assert!(engine.has_pending_persistence());
-        std::fs::rename(&backup,&segment).unwrap();
         super::persist_periodic_checkpoint_retrying(&engine,&path,&mut dirty,&mut last,&mut retry,std::time::Duration::from_secs(30));
         assert_eq!(last,original,"backoff is separate from the successful-save clock");
         assert_eq!(restored_size(&path),10);

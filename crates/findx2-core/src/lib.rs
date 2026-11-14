@@ -26,6 +26,7 @@ pub mod index;
 pub mod meta_overlay;
 pub mod persist;
 pub mod persist_v6;
+pub mod persist_tx;
 
 pub use persist::{
     exclude_sidecar_path, load_exclude_sidecar, load_index_bin, load_index_bin_with_progress,
@@ -33,6 +34,10 @@ pub use persist::{
 };
 pub use persist_v6::{
     load_store_auto, v6_load, v6_save_full, v6_try_commit, CommitBatch, CommitOutcome, V6Layout,
+};
+pub use persist_tx::{
+    clear_persist_fault, generation_dir, generation_disk_bytes, has_published, published_path,
+    read_published, set_persist_fault, PersistFault,
 };
 
 pub mod platform;

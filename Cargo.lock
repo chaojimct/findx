@@ -2216,6 +2216,7 @@ name = "findx2-core"
 version = "2.5.0"
 dependencies = [
  "chrono",
+ "crc32fast",
  "dashmap",
  "fxhash",
  "glob",

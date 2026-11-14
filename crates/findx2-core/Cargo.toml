@@ -19,6 +19,7 @@ parking_lot = "0.12"
 rayon = "1.10"
 roaring = "0.10"
 zstd = "0.13"
+crc32fast = "1"
 glob = "0.3"
 regex = "1.10"
 serde = { version = "1", features = ["derive"] }

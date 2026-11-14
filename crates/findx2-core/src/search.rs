@@ -1294,13 +1294,32 @@ impl SearchEngine {
             crate::trigram::build_and_save(&store, index_path)?;
             pending_before
         };
-        let new_tri =
-            crate::trigram::TrigramIndex::load(&crate::trigram::tri_sidecar_path(index_path))?
-                .ok_or_else(|| crate::Error::Persist("trigram 重建后加载失败".into()))?;
+        let layout = crate::persist_v6::V6Layout::for_index(index_path);
+        let tri_src = if crate::persist_tx::has_published(&layout) {
+            crate::trigram::trigram_staging_path(index_path)
+        } else {
+            crate::trigram::tri_sidecar_path(index_path)
+        };
+        let new_tri = crate::trigram::TrigramIndex::load(&tri_src)?
+            .ok_or_else(|| crate::Error::Persist("trigram 重建后加载失败".into()))?;
         {
             let mut store = self.index_store_mut();
+            let mut remaining = store.tri_pending.clone();
+            remaining -= &pending_before;
+            if crate::persist_tx::has_published(&layout) {
+                crate::persist_tx::publish_trigram_snapshot(
+                    &layout,
+                    &tri_src,
+                    &remaining,
+                    new_tri.snapshot_entry_count(),
+                )?;
+                let _ = crate::persist_tx::atomic_rename_replace(
+                    &tri_src,
+                    &crate::trigram::tri_sidecar_path(index_path),
+                );
+            }
             store.trigram = Some(Arc::new(new_tri));
-            store.tri_pending -= &pending_before;
+            store.tri_pending = remaining;
         }
         Ok(())
     }

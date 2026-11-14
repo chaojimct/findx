@@ -222,7 +222,7 @@ fn v6_delta_commit_structural_changes_and_delete() {
 }
 
 #[test]
-fn v6_empty_commit_is_noop_and_crash_tail_tolerated() {
+fn v6_empty_commit_is_noop_and_uncommitted_junk_is_ignored() {
     let (_p, layout) = tmp_index("noop");
     let mut store = sample_store();
     v6_save_full(&layout, &store).unwrap();
@@ -235,19 +235,12 @@ fn v6_empty_commit_is_noop_and_crash_tail_tolerated() {
         }
         CommitOutcome::NeedFull { reason } => panic!("unexpected NeedFull: {reason}"),
     }
-    // 模拟崩溃 torn tail：entries.dat 尾部追加垃圾，未更新 manifest
-    {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(layout.dir.join("entries.dat"))
-            .unwrap();
-        f.write_all(&[0xFFu8; 128]).unwrap();
-    }
-    // load 只读 manifest 前缀，容忍 tail
+    // Uncommitted junk in a future generation directory must not be loaded.
+    let junk = findx2_core::generation_dir(&layout, 999);
+    std::fs::create_dir_all(&junk).unwrap();
+    std::fs::write(junk.join("entries.dat"), [0xFFu8; 128]).unwrap();
     let loaded = v6_load(&layout).unwrap();
     assert_eq!(loaded.entry_count(), store.entry_count());
-    // 下一次 commit 会把 tail 截掉
     store
         .apply_change_event(&ChangeEvent::DataOrMeta {
             file_id: 2,
@@ -259,13 +252,12 @@ fn v6_empty_commit_is_noop_and_crash_tail_tolerated() {
         .unwrap();
     let batch = batch_of(&mut store);
     match v6_try_commit(&layout, &batch).unwrap() {
-        CommitOutcome::Delta { .. } => {}
+        CommitOutcome::Delta { generation, .. } => {
+            let live = findx2_core::generation_dir(&layout, generation).join("entries.dat");
+            assert_eq!(std::fs::metadata(live).unwrap().len(), (store.entries.len() * 32) as u64);
+        }
         CommitOutcome::NeedFull { reason } => panic!("unexpected NeedFull: {reason}"),
     }
-    let meta_len = std::fs::metadata(layout.dir.join("entries.dat"))
-        .unwrap()
-        .len();
-    assert_eq!(meta_len, (store.entries.len() * 32) as u64);
     let _ = std::fs::remove_dir_all(&layout.dir);
 }
 
@@ -277,8 +269,8 @@ fn v6_corrupt_manifest_falls_back_to_v5_and_commit_heals() {
     findx2_core::save_index_bin(&p, &store).unwrap();
     // 写一个 v6 骨架然后破坏 manifest
     v6_save_full(&layout, &store).unwrap();
-    std::fs::write(layout.dir.join("manifest.json"), b"{broken json").unwrap();
-    // load 回退 v5
+    std::fs::write(findx2_core::published_path(&layout), b"{broken json").unwrap();
+    // load 回退 v5；损坏的 published 指针不得与段文件混装
     let loaded = load_store_auto(&p).unwrap();
     assert_eq!(loaded.entry_count(), store.entry_count());
     // commit 不 Err，而是 NeedFull → 全量自愈
@@ -380,20 +372,15 @@ fn pending_namespace_manifest_crash_retains_replay_watermark() {
     restart.enable_usage(1024*1024).unwrap();
     restart.index_store_mut().set_track_mutations(true);
     restart.apply_volume_batch(b'F',&pending,7,20).unwrap();
-    // The in-memory queue does not survive process death. Its durable recovery
-    // evidence is the old watermark, which must stay pinned in the manifest.
-    let retained_manifest=std::fs::read(layout.dir.join("manifest.json")).unwrap();
     let parent=[ChangeEvent::Create{entry:raw(99,1,true)}];
     restart.apply_volume_batch(b'F',&parent,7,21).unwrap();
     assert_eq!(restart.index_store().volumes[0].last_usn,21);
     let batch=batch_of(&mut restart.index_store_mut());
-    assert!(matches!(v6_try_commit(&layout,&batch).unwrap(),CommitOutcome::Delta{..}));
-    assert_eq!(v6_load(&layout).unwrap().volumes[0].last_usn,21);
-    // Crash injection: data writes happened but manifest rename did not. Restore
-    // exactly the previous manifest, leaving actual uncommitted data tails present.
-    std::fs::write(layout.dir.join("manifest.json"),&retained_manifest).unwrap();
+    findx2_core::set_persist_fault(findx2_core::PersistFault::BeforePublish);
+    assert!(v6_try_commit(&layout,&batch).is_err());
+    findx2_core::clear_persist_fault();
     let loaded=v6_load(&layout).unwrap();
-    assert_eq!(loaded.volumes[0].last_usn,10,"uncommitted tail must not advance restart cursor");
+    assert_eq!(loaded.volumes[0].last_usn,10,"uncommitted generation must not advance restart cursor");
     let recovered=SearchEngine::new(loaded);recovered.enable_usage(1024*1024).unwrap();
     recovered.apply_volume_batch(b'F',&pending,7,20).unwrap();
     recovered.apply_volume_batch(b'F',&parent,7,21).unwrap();
