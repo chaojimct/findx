@@ -28,8 +28,21 @@ fn launch_window_size() -> Size<Pixels> {
     size(px(1100.), px(720.))
 }
 
+#[cfg(windows)]
+fn set_official_app_user_model_id() {
+    use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+    use windows::core::w;
+    unsafe {
+        let _ = SetCurrentProcessExplicitAppUserModelID(w!("FindX.FindX"));
+    }
+}
+
 pub fn start(opts: LaunchOptions) {
     let title = opts.window_title().to_string();
+    if opts.official_product {
+        #[cfg(windows)]
+        set_official_app_user_model_id();
+    }
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
@@ -93,8 +106,11 @@ pub fn open_settings_window(session: Entity<AppSession>, cx: &mut App) {
         }
     }
 
+    let official = session.read(cx).official_product;
     let live = session.read(cx).live;
-    let title = if live {
+    let title = if official {
+        "FindX 设置"
+    } else if live {
         "FindX2 设置 (native)"
     } else {
         "FindX2 设置 (isolated)"

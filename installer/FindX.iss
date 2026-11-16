@@ -11,7 +11,7 @@
 #endif
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.5.0"
+  #define MyAppVersion "2.5.1"
 #endif
 
 #define MyAppName      "FindX"
@@ -93,8 +93,11 @@ Name: "{group}\卸载 {#MyAppName}";     Filename: "{uninstallexe}";    Componen
 Name: "{autodesktop}\{#MyAppName}";   Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; Components: main
 
 [Run]
+; Interactive installs keep the postlaunch checkbox (checkedonce).
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent shellexec; Tasks: postlaunch; Components: main
-Filename: "{app}\{#MyAppExeName}";   Flags: nowait postinstall shellexec; Check: WizardSilent; Tasks: postlaunch; Components: main
+; Silent / very-silent upgrades (including in-app /VERYSILENT) always start the
+; official GUI, independent of leftover checkedonce postlaunch task state.
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait postinstall skipifnotsilent; Components: main
 
 [UninstallRun]
 ; 先停服务再杀进程、最后 uninstall（卸载器仍应能找到 {app}\findx2-service.exe）

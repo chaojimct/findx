@@ -36,7 +36,7 @@ BEGIN
   BLOCK "040904B0"
   BEGIN
    VALUE "CompanyName", "FindX\0"
-   VALUE "FileDescription", "FindX Native\0"
+   VALUE "FileDescription", "FindX\0"
    VALUE "FileVersion", "{version}\0"
    VALUE "ProductName", "FindX\0"
    VALUE "ProductVersion", "{version}\0"

@@ -188,7 +188,7 @@ fn find_owner() -> usize {
                 let mut title = [0u16; 128];
                 let n = GetWindowTextW(h, &mut title);
                 if n > 0
-                    && String::from_utf16_lossy(&title[..n as usize]).starts_with("FindX Native (")
+                    && crate::isolation::is_main_window_title(&String::from_utf16_lossy(&title[..n as usize]))
                 {
                     *(data.0 as *mut usize) = h.0 as usize;
                     return false.into();

@@ -7,7 +7,7 @@ FindX 原生 GPUI 客户端（搜索主窗 + 设置壳 + 主题/折叠/诊断 + 
 - **`--live`**：作为只读 IPC 客户端连接现有生产管道 `findx2`。不启动、不重启 `findx2-service`，不写 `ProgramData` 索引，也不做 compact/rebuild/install。
 - 设置和偏好始终写入 `%LOCALAPPDATA%\FindX-native-dev\`（Unix：`$XDG_DATA_HOME/FindX-native-dev`），不读写正式 GUI 的设置文件。
 
-窗口标题区分模式：`FindX Native (live)` 与 `FindX Native (isolated)`。
+正式安装入口（`FindX.exe` + `FindX.installed`，连接生产管道）窗口标题、任务栏与 PE ProductName 均为 `FindX`。开发或显式隔离启动仍使用 `FindX Native (live)` / `FindX Native (isolated)`。Release 构建使用 Windows 子系统，正常启动不弹出控制台；`--version` / `--help` 会按需附加控制台。
 
 ## 启动
 

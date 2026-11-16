@@ -1,0 +1,69 @@
+{
+  "version": "2.5.1",
+  "baseline": "2.5.0",
+  "channel": "trial-publish",
+  "publish_ready": false,
+  "windows_gui": "native",
+  "gates": [
+    {
+      "id": "partial-metadata-periodic-durability",
+      "priority": "P0",
+      "required": true,
+      "passed": false
+    },
+    {
+      "id": "v6-powerfail-and-persist-error-propagation",
+      "priority": "P0",
+      "required": true,
+      "passed": false
+    },
+    {
+      "id": "installer-transaction-health-and-rollback",
+      "priority": "P0",
+      "required": true,
+      "passed": false
+    },
+    {
+      "id": "full-volume-coverage-and-usn-identity",
+      "priority": "P0",
+      "required": true,
+      "passed": false
+    },
+    {
+      "id": "service-path-ipc-generation-single-instance",
+      "priority": "P0",
+      "required": true,
+      "passed": false
+    },
+    {
+      "id": "legacy-preferences-and-startup-resume",
+      "priority": "P1",
+      "required": true,
+      "passed": false
+    },
+    {
+      "id": "deep-parent-fallback-performance",
+      "priority": "P1",
+      "required": true,
+      "passed": false
+    },
+    {
+      "id": "global-file-directory-split-counts",
+      "priority": "P2",
+      "required": false,
+      "passed": false
+    },
+    {
+      "id": "native-real-update-channel",
+      "priority": "P2",
+      "required": false,
+      "passed": false
+    },
+    {
+      "id": "legacy-multivolume-canonical-root-paths",
+      "priority": "P1",
+      "required": true,
+      "passed": false
+    }
+  ]
+}

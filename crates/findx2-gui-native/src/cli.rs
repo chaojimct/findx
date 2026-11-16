@@ -8,11 +8,13 @@ pub struct LaunchOptions {
     pub live: bool,
     pub diag: bool,
     pub preview_file: Option<String>,
+    /// Official installed FindX.exe + FindX.installed, production entry, not a fixture.
+    pub official_product: bool,
 }
 
 impl LaunchOptions {
     pub fn window_title(&self) -> &'static str {
-        isolation::window_title(self.live)
+        isolation::window_title(self.official_product, self.live)
     }
 }
 
@@ -67,6 +69,7 @@ fn parse_args_for_install(args: impl IntoIterator<Item = String>, installed: boo
     if live && !pipe_set {
         pipe_name = PRODUCTION_PIPE.to_string();
     }
+    let official_product = installed && !mock && (live && (!pipe_set || isolation::is_production_pipe(&pipe_name)));
     let endpoint = isolation::normalize_pipe_ex(&pipe_name, live)?;
     Ok(LaunchOptions {
         pipe_name,
@@ -75,6 +78,7 @@ fn parse_args_for_install(args: impl IntoIterator<Item = String>, installed: boo
         live,
         diag,
         preview_file,
+        official_product,
     })
 }
 
@@ -138,7 +142,8 @@ mod tests {
         assert!(opt.live);
         assert!(!opt.mock);
         assert_eq!(opt.pipe_name, PRODUCTION_PIPE);
-        assert_eq!(opt.window_title(), "FindX Native (live)");
+        assert!(!opt.official_product);
+        assert_eq!(opt.window_title(), isolation::LIVE_DEV_WINDOW_TITLE);
         #[cfg(windows)]
         assert_eq!(opt.endpoint, r"\\.\pipe\findx2");
 
@@ -155,10 +160,19 @@ mod tests {
     fn installed_alias_defaults_to_existing_service_without_starting_it() {
         let opt=parse_args_for_install(args("FindX.exe"),true).unwrap();
         assert!(opt.live);assert_eq!(opt.pipe_name, PRODUCTION_PIPE);
+        assert!(opt.official_product);
+        assert_eq!(opt.window_title(), isolation::OFFICIAL_WINDOW_TITLE);
+        let opt=parse_args_for_install(args("FindX.exe --live"),true).unwrap();
+        assert!(opt.official_product);
+        assert_eq!(opt.window_title(), isolation::OFFICIAL_WINDOW_TITLE);
         let opt=parse_args_for_install(args("FindX.exe --mock"),true).unwrap();
         assert!(!opt.live);assert!(opt.mock);assert_eq!(opt.pipe_name,DEFAULT_ISOLATED_PIPE);
+        assert!(!opt.official_product);
+        assert_eq!(opt.window_title(), isolation::ISOLATED_WINDOW_TITLE);
         let opt=parse_args_for_install(args("FindX.exe --pipe isolated-fixture"),true).unwrap();
         assert!(!opt.live);assert_eq!(opt.pipe_name,"isolated-fixture");
+        assert!(!opt.official_product);
+        assert_eq!(opt.window_title(), isolation::ISOLATED_WINDOW_TITLE);
     }
 
 }

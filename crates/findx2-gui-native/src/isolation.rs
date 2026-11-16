@@ -108,12 +108,27 @@ pub fn isolated_index_path() -> std::path::PathBuf {
     isolated_data_dir().join("index.bin")
 }
 
-pub fn window_title(live: bool) -> &'static str {
-    if live {
-        "FindX Native (live)"
+pub const OFFICIAL_WINDOW_TITLE: &str = "FindX";
+pub const LIVE_DEV_WINDOW_TITLE: &str = "FindX Native (live)";
+pub const ISOLATED_WINDOW_TITLE: &str = "FindX Native (isolated)";
+pub const OFFICIAL_APP_USER_MODEL_ID: &str = "FindX.FindX";
+
+/// Official installed product entry uses the product name only.
+/// Distinctive "Native (live/isolated)" titles are reserved for explicit
+/// development or fixture launches, not the shipped FindX.exe entry point.
+pub fn window_title(official_product: bool, live: bool) -> &'static str {
+    if official_product {
+        OFFICIAL_WINDOW_TITLE
+    } else if live {
+        LIVE_DEV_WINDOW_TITLE
     } else {
-        "FindX Native (isolated)"
+        ISOLATED_WINDOW_TITLE
     }
+}
+
+/// Main-window titles that office preview host may parent to.
+pub fn is_main_window_title(title: &str) -> bool {
+    title == OFFICIAL_WINDOW_TITLE || title.starts_with("FindX Native (")
 }
 
 #[cfg(test)]
@@ -141,6 +156,19 @@ mod tests {
         assert_eq!(endpoint, r"\\.\pipe\findx2");
         assert!(normalize_pipe_ex(r"\\.\pipe\findx2", true).is_ok());
         assert!(normalize_pipe_ex("findx2", false).is_err());
+    }
+
+    #[test]
+    fn official_product_title_is_findx_not_dev_label() {
+        assert_eq!(window_title(true, true), OFFICIAL_WINDOW_TITLE);
+        assert_eq!(window_title(true, false), OFFICIAL_WINDOW_TITLE);
+        assert_eq!(window_title(false, true), LIVE_DEV_WINDOW_TITLE);
+        assert_eq!(window_title(false, false), ISOLATED_WINDOW_TITLE);
+        assert!(is_main_window_title("FindX"));
+        assert!(is_main_window_title("FindX Native (live)"));
+        assert!(is_main_window_title("FindX Native (isolated)"));
+        assert!(!is_main_window_title("FindX 设置"));
+        assert!(!is_main_window_title("FindX 目录浏览"));
     }
 }
 

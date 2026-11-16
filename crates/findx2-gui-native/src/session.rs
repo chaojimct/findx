@@ -13,6 +13,7 @@ pub struct AppSession {
     pub endpoint: String,
     pub mock: bool,
     pub live: bool,
+    pub official_product: bool,
     pub preview_file: Option<String>,
     pub settings: FindxGuiSettings,
     pub prefs: LocalPrefs,
@@ -51,6 +52,7 @@ impl AppSession {
             endpoint: opts.endpoint.clone(),
             mock: opts.mock,
             live: opts.live,
+            official_product: opts.official_product,
             preview_file: opts.preview_file.clone(),
             settings,
             prefs,
@@ -104,7 +106,7 @@ impl AppSession {
     }
 
     pub fn window_title(&self) -> &'static str {
-        crate::isolation::window_title(self.live)
+        crate::isolation::window_title(self.official_product, self.live)
     }
 }
 
