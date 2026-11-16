@@ -29,15 +29,42 @@ jobs:
           set -eu
           mp=$(mktemp -d)
           trap 'hdiutil detach "$mp" || true; rmdir "$mp" || true' EXIT
+          (cd dist && shasum -a 256 -c *.sha256)
+          hdiutil verify dist/*.dmg
           hdiutil attach -nobrowse -readonly -mountpoint "$mp" dist/*.dmg
-          file "$mp/FindX.app/Contents/MacOS/FindX"
+          for binary in FindX findx2 fx findx2-service; do
+            file "$mp/FindX.app/Contents/MacOS/$binary"
+            lipo -verify_arch "$(uname -m)" "$mp/FindX.app/Contents/MacOS/$binary"
+            xcrun vtool -show-build "$mp/FindX.app/Contents/MacOS/$binary"
+          done
+          ls -lR "$mp/FindX.app"
+          test -f "$mp/FindX.app/Contents/MacOS/FindX.installed"
+          test "$(readlink "$mp/Applications")" = /Applications
           "$mp/FindX.app/Contents/MacOS/FindX" --version
           "$mp/FindX.app/Contents/MacOS/findx2" --version
           "$mp/FindX.app/Contents/MacOS/findx2-service" --version
           plutil -lint "$mp/FindX.app/Contents/Info.plist"
           plutil -lint "$mp/FindX.app/Contents/Resources/com.findx.findx2.plist"
+          plutil -p "$mp/FindX.app/Contents/Info.plist"
+          plutil -p "$mp/FindX.app/Contents/Resources/com.findx.findx2.plist"
+      - name: Tiny fixture only - native engine, GUI session IPC, FSEvents, graceful restart
+        run: |
+          set -eu
+          cargo build --release --locked -p findx2-gui-native --example unix_fixture_probe
+          mp=$(mktemp -d)
+          fixture=$(mktemp -d /tmp/findx-native-fixture-XXXXXX)
+          cleanup() {
+            test ! -f "$fixture/work/result.json" || cp "$fixture/work/result.json" dist/tiny-engine-fixture.json
+            test ! -f "$fixture/work/service.log" || cp "$fixture/work/service.log" dist/tiny-engine-fixture.log
+            hdiutil detach "$mp" || true
+            rmdir "$mp" || true
+          }
+          trap cleanup EXIT
+          hdiutil attach -nobrowse -readonly -mountpoint "$mp" dist/*.dmg
+          python3 scripts/test_unix_engine_fixture.py --service "$mp/FindX.app/Contents/MacOS/findx2-service" --gui-probe "$GITHUB_WORKSPACE/target/release/examples/unix_fixture_probe" --work "$fixture/work"
       # Actions-run validation artifacts; repository access rules apply. No Release/tag.
       - uses: actions/upload-artifact@v4
+        if: always() && !cancelled()
         with:
           name: native-${{ matrix.os }}-validation-only
           path: dist/*
