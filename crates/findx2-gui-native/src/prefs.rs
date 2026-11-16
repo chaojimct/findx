@@ -88,14 +88,18 @@ pub fn save_prefs(prefs: &LocalPrefs) -> Result<(), String> {
 
 pub fn load_settings(pipe_name: &str, default_index: String) -> FindxGuiSettings {
     let path = settings_path();
-    let default = FindxGuiSettings::isolated_default(pipe_name, default_index);
+    let default = FindxGuiSettings::isolated_default(pipe_name, default_index.clone());
     let Ok(text) = std::fs::read_to_string(&path) else {
         return default;
     };
     match serde_json::from_str::<FindxGuiSettings>(&text) {
         Ok(mut s) => {
             // 绝不把隔离客户端的管道名偷偷改回生产默认。
-            if crate::isolation::is_production_pipe(&s.pipe_name) {
+            if crate::isolation::official_storage() {
+                // Persisted GUI drafts never redirect an official GUI to dev storage.
+                s.pipe_name = "findx2".into();
+                s.index_path = default_index;
+            } else if crate::isolation::is_production_pipe(&s.pipe_name) {
                 s.pipe_name = pipe_name.to_string();
             }
             s
@@ -105,8 +109,13 @@ pub fn load_settings(pipe_name: &str, default_index: String) -> FindxGuiSettings
 }
 
 pub fn save_settings(settings: &FindxGuiSettings) -> Result<(), String> {
-    if crate::isolation::is_production_pipe(&settings.pipe_name) {
+    if crate::isolation::is_production_pipe(&settings.pipe_name)
+        && !crate::isolation::official_storage()
+    {
         return Err("拒绝把管道名保存为生产默认 findx2。请使用隔离管道名。".into());
+    }
+    if crate::isolation::official_storage() && settings.pipe_name != "findx2" {
+        return Err("正式 Unix GUI 的连接固定为 findx2；隔离运行请使用显式 --pipe。".into());
     }
     let path = settings_path();
     if let Some(parent) = path.parent() {

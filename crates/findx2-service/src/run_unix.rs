@@ -1,4 +1,22 @@
-//! Unix 前台：加载索引、Unix socket、平台增量监听、周期性落盘。
+use std::sync::atomic::{AtomicBool, Ordering};
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+extern "C" fn request_stop(_: libc::c_int) {
+    STOP_REQUESTED.store(true, Ordering::Relaxed);
+}
+fn install_stop_handler() -> anyhow::Result<()> {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = request_stop as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        if libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut()) != 0
+            || libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut()) != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+// Unix 前台：加载索引、Unix socket、平台增量监听、周期性落盘。
 
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -156,6 +174,7 @@ pub(crate) fn run_foreground(
             }
         })?;
 
+    install_stop_handler()?;
     let save_every = Duration::from_secs(save_interval_secs.max(5));
     let mut last_save = Instant::now();
     loop {
@@ -198,6 +217,16 @@ pub(crate) fn run_foreground(
                     }
                 }
             }
+        }
+        if STOP_REQUESTED.load(Ordering::Relaxed) {
+            let mut store = engine.index_store_mut();
+            while let Ok(event) = rx.try_recv() {
+                store.apply_change_event(&event)?;
+            }
+            drop(store);
+            persist(&engine, &index)?;
+            info!("Unix service stopped after final index save");
+            return Ok(());
         }
         if last_save.elapsed() >= save_every {
             persist(&engine, &index)?;

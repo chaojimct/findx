@@ -84,6 +84,38 @@ class UnixPackagingTests(unittest.TestCase):
             # A binary named findx2-gui-native is not what we install.
             self.assertFalse((dest / "opt" / "FindX" / "findx2-gui-native").exists())
 
+    def test_install_upgrade_remove_preserves_user_data(self):
+        with tempfile.TemporaryDirectory(prefix="findx-upgrade-") as tmp:
+            root = Path(tmp)
+            dest = root / "dest"
+            stage = root / "stage"; stage.mkdir()
+            user = root / "home"; user.mkdir()
+            data = user / ".local/share/FindX"; data.mkdir(parents=True)
+            (data / "index.bin").write_bytes(b"precious index")
+            (data / "index.bin.exclude.json").write_bytes(b"rules")
+            (data / "settings.json").write_bytes(b"preferences")
+            env = dict(os.environ, HOME=str(user), XDG_CONFIG_HOME=str(user / ".config"))
+            for version in ("old", "new"):
+                for name in ("FindX", "findx2", "fx", "findx2-service"):
+                    (stage / name).write_text("#!/bin/sh\necho " + version + "\n")
+                (stage / "version").write_text(version)
+                subprocess.run(["bash", str(INSTALL), "--destdir", str(dest), "--stage", str(stage)], env=env, check=True, capture_output=True)
+                self.assertIn(version, (dest / "opt/FindX/FindX").read_text())
+                self.assertEqual((data / "index.bin").read_bytes(), b"precious index")
+            # Unknown files under the prefix are not silently deleted either.
+            (dest / "opt/FindX/custom.txt").write_text("keep")
+            subprocess.run(["bash", str(ROOT / "installer/unix/uninstall.sh"), "--destdir", str(dest)], env=env, check=True, capture_output=True)
+            self.assertFalse((dest / "opt/FindX/FindX").exists())
+            self.assertTrue((dest / "opt/FindX/custom.txt").exists())
+            self.assertEqual((data / "index.bin").read_bytes(), b"precious index")
+            self.assertEqual((data / "index.bin.exclude.json").read_bytes(), b"rules")
+            self.assertEqual((data / "settings.json").read_bytes(), b"preferences")
+
+    def test_install_rejects_root_prefix(self):
+        r = subprocess.run(["bash", str(INSTALL), "--prefix", "/"], capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("unsafe prefix", r.stderr)
+
     def test_pack_linux_with_dummy_release_dir(self):
         if os.uname().sysname != "Linux":
             self.skipTest("linux pack script only runs on Linux")

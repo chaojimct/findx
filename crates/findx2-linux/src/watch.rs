@@ -278,6 +278,12 @@ fn watch_inotify(roots: &[String], tx: Sender<ChangeEvent>) -> Result<()> {
     for r in roots {
         let _ = watcher.watch(Path::new(r), RecursiveMode::Recursive);
     }
+    // Prime the same bounded catch-up cache after watch registration, so a
+    // pre-existing file's removal still has an inode after its path disappears.
+    // The existing 50k catch-up cap is reported via watch health, never hidden.
+    for root in roots {
+        catch_up_tree(Path::new(root), &tx, &cache);
+    }
     // 阻塞：把 watcher 钉在本线程直到通道断开。
     loop {
         std::thread::park();
@@ -346,17 +352,17 @@ fn notify_to_changes(path: &Path, kind: EventKind, cache: &PathInodeCache) -> Ve
             RenameMode::To | RenameMode::Both | RenameMode::Any,
         )) => {
             let mut out = Vec::new();
-            if let Some(ev) = meta_rename(path, name.clone()) {
-                if let ChangeEvent::Rename { file_id, .. } = &ev {
-                    cache_insert(cache, path, *file_id);
-                }
-                out.push(ev);
-            } else if let Some(ev) = meta_create_retry(path, name.clone()) {
-                // rename-to 时若尚未在索引中，按创建补齐（跨监视树移入）。
+            // notify may send From (Delete) before To/Both for the same inode.
+            // Rename cannot revive a tombstone or insert a move from outside the
+            // watched roots; CreatePending deliberately handles all three cases.
+            if let Some(ev) = meta_create_retry(path, name.clone()) {
                 if let ChangeEvent::CreatePending { file_id, .. } = &ev {
                     cache_insert(cache, path, *file_id);
                 }
                 out.push(ev);
+                if let Some(meta) = data_or_meta_with_backfill(path, name) {
+                    out.push(meta);
+                }
             }
             out
         }
@@ -486,20 +492,5 @@ fn meta_create(path: &Path, name: String) -> Option<ChangeEvent> {
         name,
         attrs: if meta.is_dir() { 0x10 } else { 0 },
         is_dir: meta.is_dir(),
-    })
-}
-
-fn meta_rename(path: &Path, name: String) -> Option<ChangeEvent> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    let parent = path
-        .parent()
-        .and_then(|p| std::fs::metadata(p).ok())
-        .map(|m| m.ino())
-        .unwrap_or(0);
-    Some(ChangeEvent::Rename {
-        file_id: meta.ino(),
-        new_parent_id: parent,
-        new_name: name,
     })
 }

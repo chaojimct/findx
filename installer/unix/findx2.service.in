@@ -5,7 +5,7 @@ ConditionPathExists=@PREFIX@/findx2-service
 
 [Service]
 Type=simple
-ExecStart=@PREFIX@/findx2-service --index %h/.local/share/FindX/index.bin --pipe findx2
+ExecStart=@PREFIX@/findx2-service --index %h/.local/share/FindX/index.bin --pipe findx2 --volume /
 Restart=on-failure
 RestartSec=3
 # Do not set a watchdog; the engine may be busy on first full-disk scan.

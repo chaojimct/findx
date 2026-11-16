@@ -38,6 +38,7 @@ fn set_official_app_user_model_id() {
 }
 
 pub fn start(opts: LaunchOptions) {
+    crate::isolation::configure_storage(opts.official_product);
     let title = opts.window_title().to_string();
     if opts.official_product {
         #[cfg(windows)]
@@ -101,7 +102,6 @@ pub fn start(opts: LaunchOptions) {
             .detach();
         });
 }
-
 
 fn schedule_official_auto_check(session: Entity<AppSession>, cx: &mut App) {
     cx.spawn(async move |cx| {

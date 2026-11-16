@@ -1,0 +1,43 @@
+name: Native Unix validation (no publish)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: unix-validation-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  macos:
+    if: github.ref == 'refs/heads/feat/native-gui-gpui'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Native tests (Darwin, not cross-compiled)
+        run: cargo test --locked -p findx2-gui-native --lib && cargo test --locked -p findx2-service
+      - name: Build native app and DMG (no signing credentials)
+        run: bash installer/macos/pack-macos.sh --version 2.5.2 --out "$GITHUB_WORKSPACE/dist"
+      - name: Verify real DMG and app binaries
+        run: |
+          set -eu
+          mp=$(mktemp -d)
+          trap 'hdiutil detach "$mp" || true; rmdir "$mp" || true' EXIT
+          hdiutil attach -nobrowse -readonly -mountpoint "$mp" dist/*.dmg
+          file "$mp/FindX.app/Contents/MacOS/FindX"
+          "$mp/FindX.app/Contents/MacOS/FindX" --version
+          "$mp/FindX.app/Contents/MacOS/findx2" --version
+          "$mp/FindX.app/Contents/MacOS/findx2-service" --version
+          plutil -lint "$mp/FindX.app/Contents/Info.plist"
+          plutil -lint "$mp/FindX.app/Contents/Resources/com.findx.findx2.plist"
+      # Actions-run validation artifacts; repository access rules apply. No Release/tag.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.os }}-validation-only
+          path: dist/*
+          retention-days: 7

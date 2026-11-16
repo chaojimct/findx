@@ -52,10 +52,14 @@ jobs:
           workspaces: ". -> target"
 
       - name: 工作区测试（不含已退役的 Tauri GUI crate）
-        run: cargo test --workspace --locked --exclude findx2-gui
+        run: cargo test --workspace --locked --exclude findx2-gui -- --test-threads=1
 
       - name: 原生 GUI 与更新检测测试
         run: cargo test --locked -p findx2-gui-native
+
+      - name: Linux fixture preferences transaction tests (simulated manager)
+        if: runner.os == 'Linux'
+        run: python3 scripts/test_unix_service_preferences.py
 
       - name: Linux packaging helper tests
         if: runner.os == 'Linux'

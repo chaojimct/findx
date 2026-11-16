@@ -1,53 +1,37 @@
 #!/usr/bin/env bash
-# Copy FindX.app into /Applications and install the per-user LaunchAgent.
-# Intended to run on macOS from the official .dmg (or a built .app).
+# Native macOS install. User data and an existing LaunchAgent's options survive upgrades.
 set -euo pipefail
-
-if [[ "$(uname -s)" != Darwin ]]; then
-  echo "install.sh must run on macOS" >&2
-  exit 1
-fi
-
+[[ "$(uname -s)" == Darwin ]] || { echo 'macOS required' >&2; exit 1; }
+[[ "$(id -u)" != 0 ]] || { echo 'Run as the login user; only the app copy requests administrator access.' >&2; exit 1; }
 HERE=$(cd "$(dirname "$0")" && pwd)
-APP=
-if [[ -d "$HERE/FindX.app" ]]; then
-  APP="$HERE/FindX.app"
-elif [[ -d "$HERE/../FindX.app" ]]; then
-  APP=$(cd "$HERE/.." && pwd)/FindX.app
-elif [[ "$(basename "$HERE")" == "MacOS" && -d "$HERE/../../.." ]]; then
-  APP=$(cd "$HERE/../../.." && pwd)
-  # When this script is not inside the bundle, skip; only used if copied.
+APP="$HERE/FindX.app"
+if [[ "${1:-}" == --app ]]; then APP="${2:?}"; fi
+[[ -x "$APP/Contents/MacOS/FindX" && -f "$APP/Contents/MacOS/FindX.installed" ]] || { echo 'Invalid FindX.app' >&2; exit 1; }
+quote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+# Stop/restart only this login user's loaded engine, never a process-name kill.
+was_running=0
+if launchctl print "gui/$(id -u)/com.findx.findx2" 2>/dev/null | grep -q 'state = running'; then
+  was_running=1
+  launchctl bootout "gui/$(id -u)/com.findx.findx2"
 fi
-
-if [[ -z "$APP" || ! -d "$APP/Contents/MacOS" ]]; then
-  # Allow --app
-  if [[ "${1:-}" == "--app" ]]; then
-    APP="${2:?}"
+restore_service() {
+  if [[ "$was_running" -eq 1 ]]; then
+    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.findx.findx2.plist"
+    launchctl kickstart "gui/$(id -u)/com.findx.findx2"
   fi
+}
+trap restore_service EXIT
+# Fixed, quoted paths; never delete the old app before a complete replacement exists.
+if [[ "$APP" != /Applications/FindX.app ]]; then
+  command="set -eu; stage=\$(mktemp -d /Applications/.FindX-stage-XXXXXX); ditto $(quote "$APP") \"\$stage/FindX.app\"; backup=/Applications/FindX.backup-\$(date +%s)-\$\$.app; if test -e /Applications/FindX.app; then mv /Applications/FindX.app \"\$backup\"; fi; if ! mv \"\$stage/FindX.app\" /Applications/FindX.app; then test ! -d \"\$backup\" || mv \"\$backup\" /Applications/FindX.app; exit 1; fi; rmdir \"\$stage\""
+  osascript -e 'on run argv' -e 'do shell script (item 1 of argv) with administrator privileges' -e 'end run' "$command"
 fi
-if [[ -z "$APP" || ! -x "$APP/Contents/MacOS/FindX" ]]; then
-  echo "cannot find official FindX.app next to this script" >&2
-  exit 1
+LAUNCH="$HOME/Library/LaunchAgents/com.findx.findx2.plist"
+mkdir -p "$(dirname "$LAUNCH")"
+if [[ ! -e "$LAUNCH" ]]; then
+  cp /Applications/FindX.app/Contents/Resources/com.findx.findx2.plist "$LAUNCH"
+  plutil -replace ProgramArguments.2 -string "$HOME/Library/Application Support/FindX/index.bin" "$LAUNCH"
 fi
-
-DEST=/Applications/FindX.app
-if [[ "$APP" != "$DEST" ]]; then
-  if [[ "$(id -u)" -eq 0 ]]; then
-    rm -rf "$DEST"
-    ditto "$APP" "$DEST"
-  else
-    osascript -e "do shell script \"rm -rf /Applications/FindX.app && ditto '$(printf %q "$APP")' /Applications/FindX.app\" with administrator privileges"
-  fi
-fi
-
-# LaunchAgent with this user's home (launchd does not expand $HOME in ProgramArguments).
-LAUNCH="$HOME/Library/LaunchAgents"
-mkdir -p "$LAUNCH"
-SRC="$DEST/Contents/Resources/com.findx.findx2.plist"
-if [[ -f "$SRC" ]]; then
-  sed -e "s|__HOME__|$HOME|g" "$SRC" > "$LAUNCH/com.findx.findx2.plist"
-  launchctl bootout "gui/$(id -u)/com.findx.findx2" >/dev/null 2>&1 || true
-  launchctl bootstrap "gui/$(id -u)" "$LAUNCH/com.findx.findx2.plist" || \
-    launchctl load "$LAUNCH/com.findx.findx2.plist" || true
-fi
-echo "Installed official FindX.app to $DEST (LaunchAgent enabled, not a signed/notarized package unless already signed)."
+# Do not bootstrap at install: that would start a first full-disk scan unexpectedly.
+echo 'Installed FindX. Open the app, then confirm Start service in Settings. User data/options preserved.'
+open /Applications/FindX.app

@@ -129,7 +129,10 @@ DESTDIR="$DEB_ROOT" "$STAGE/install.sh" --prefix /opt/FindX --stage "$STAGE" --d
 mkdir -p "$DEB_ROOT/DEBIAN"
 SIZE_KB=$(du -sk "$DEB_ROOT" | awk '{print $1}')
 # Runtime Depends are filled from ldd against the staged GUI after packaging tests
-# can refine them; keep a conservative Debian 13 / Ubuntu 24.04-friendly set.
+# can refine them. Derive the strong GLIBC symbol floor from the actual binaries.
+GLIBC_FLOOR=$(python3 "$REPO/scripts/linux_glibc_floor.py" "$STAGE/FindX" "$STAGE/findx2" "$STAGE/findx2-service")
+LIBC_DEP="libc6"
+if [[ -n "$GLIBC_FLOOR" ]]; then LIBC_DEP="libc6 (>= $GLIBC_FLOOR)"; fi
 cat > "$DEB_ROOT/DEBIAN/control" <<CTRL
 Package: findx
 Version: ${VERSION}
@@ -139,42 +142,26 @@ Architecture: amd64
 Maintainer: FindX maintainers <https://github.com/chaojimct/findx>
 Homepage: https://github.com/chaojimct/findx
 Installed-Size: ${SIZE_KB}
-Depends: libc6, libgcc-s1, libxcb1, libxcb-xkb1, libxkbcommon0, libxkbcommon-x11-0, libx11-6, libxcursor1, libxi6, libxrandr2, libwayland-client0, libvulkan1
+Depends: ${LIBC_DEP}, libgcc-s1, libxcb1, libxcb-xkb1, libxkbcommon0, libxkbcommon-x11-0, libx11-6, libxcursor1, libxi6, libxrandr2, libwayland-client0, libvulkan1, systemd
+Recommends: pkexec
 Description: FindX local file search (official native GUI)
  Official FindX native GPUI client, CLI, and user-session index service.
  This package does not ship the retired Tauri/WebView client.
 CTRL
+# Root package scripts must not guess which login user's index/service to touch.
+# GUI updates stop/restart only their own validated user service. Manual package
+# installs leave user state unchanged; no first scan is launched from apt/dpkg.
 cat > "$DEB_ROOT/DEBIAN/postinst" <<'POST'
 #!/bin/sh
 set -e
-target_user=${SUDO_USER:-}
-if [ -n "$target_user" ] && [ "$target_user" != root ]; then
-  uid=$(id -u "$target_user" 2>/dev/null || true)
-  runtime=/run/user/${uid:-}
-  if [ -n "$uid" ] && [ -d "$runtime" ] && command -v systemctl >/dev/null; then
-    # Enable but do not start: first start may begin a full-disk index.
-    sudo -u "$target_user" XDG_RUNTIME_DIR="$runtime" systemctl --user daemon-reload || true
-    sudo -u "$target_user" XDG_RUNTIME_DIR="$runtime" systemctl --user enable findx2.service || true
-  fi
-fi
-if command -v update-desktop-database >/dev/null; then
-  update-desktop-database -q /usr/share/applications || true
-fi
-if command -v gtk-update-icon-cache >/dev/null; then
-  gtk-update-icon-cache -q /usr/share/icons/hicolor || true
-fi
+if command -v update-desktop-database >/dev/null; then update-desktop-database -q /usr/share/applications || true; fi
+exit 0
 POST
 cat > "$DEB_ROOT/DEBIAN/prerm" <<'PRERM'
 #!/bin/sh
 set -e
-target_user=${SUDO_USER:-}
-if [ -n "$target_user" ] && [ "$target_user" != root ]; then
-  uid=$(id -u "$target_user" 2>/dev/null || true)
-  runtime=/run/user/${uid:-}
-  if [ -n "$uid" ] && [ -d "$runtime" ] && command -v systemctl >/dev/null; then
-    sudo -u "$target_user" XDG_RUNTIME_DIR="$runtime" systemctl --user disable --now findx2.service || true
-  fi
-fi
+# Never disable the user service on upgrade; never delete user data/config.
+exit 0
 PRERM
 chmod 0755 "$DEB_ROOT/DEBIAN/postinst" "$DEB_ROOT/DEBIAN/prerm"
 # Root-owned package metadata is expected; files inside can stay as the builder.

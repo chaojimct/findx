@@ -116,6 +116,11 @@ pub fn build_full_disk_index(
         } else {
             merge_index_stores(stores)?
         };
+        // Create the official first-run data directory before persisting rules.
+        // A missing/unwritable exclusion sidecar must never silently broaden a restart.
+        if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
         let excluded: Vec<String> = exclude_dir
             .iter()
             .filter_map(|s| normalize_excluded_dir(s))
@@ -123,10 +128,7 @@ pub fn build_full_disk_index(
         if !excluded.is_empty() {
             store.excluded_dirs = excluded.clone();
             store.mark_excluded_entries(&excluded);
-            let _ = save_exclude_sidecar(output, &excluded);
-        }
-        if let Some(parent) = output.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            save_exclude_sidecar(output, &excluded)?;
         }
         save_index_bin(output, &store)?;
         if let Err(e) = findx2_core::build_trigram_sidecar(&store, output) {

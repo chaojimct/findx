@@ -76,7 +76,7 @@ need fx
 need findx2-service
 
 STAGE=$(mktemp -d /tmp/findx-macos-stage-XXXXXX)
-cleanup() { rm -rf "$STAGE"; }
+cleanup() { if [[ -d "$STAGE/mount" ]]; then hdiutil detach "$STAGE/mount" >/dev/null 2>&1 || true; fi; rm -rf "$STAGE"; }
 trap cleanup EXIT
 
 APP="$STAGE/FindX.app"
@@ -102,7 +102,8 @@ if security find-identity -v -p codesigning 2>/dev/null | grep -q 'Developer ID 
   IDENTITY=$(security find-identity -v -p codesigning | awk -F'\"' '/Developer ID Application/ {print $2; exit}')
   if [[ -n "$IDENTITY" ]]; then
     codesign --force --sign "$IDENTITY" --timestamp --options runtime \
-      "$MACOS/FindX" "$MACOS/findx2" "$MACOS/fx" "$MACOS/findx2-service" "$APP" || true
+      "$MACOS/FindX" "$MACOS/findx2" "$MACOS/fx" "$MACOS/findx2-service" "$APP"
+    codesign --verify --deep --strict "$APP"
     SIGNED=1
   fi
 fi
@@ -116,14 +117,15 @@ DMG_SRC="$STAGE/dmgroot"
 mkdir -p "$DMG_SRC"
 cp -R "$APP" "$DMG_SRC/FindX.app"
 cp "$HERE/install.sh" "$DMG_SRC/install.sh"
+cp "$HERE/uninstall.sh" "$DMG_SRC/uninstall.sh"
 chmod 0755 "$DMG_SRC/install.sh"
 hdiutil create -volname "$VOL" -srcfolder "$DMG_SRC" -ov -format UDRW "$DMG_TMP" >/dev/null
 # Add an Applications shortcut for the standard drag-install UX.
-MOUNT=$(hdiutil attach -readwrite -noverify -nobrowse "$DMG_TMP" | awk '/\/Volumes\// {print $NF; exit}')
-if [[ -n "$MOUNT" ]]; then
-  ln -s /Applications "$MOUNT/Applications" || true
-  hdiutil detach "$MOUNT" >/dev/null
-fi
+MOUNT="$STAGE/mount"
+mkdir "$MOUNT"
+hdiutil attach -readwrite -noverify -nobrowse -mountpoint "$MOUNT" "$DMG_TMP" >/dev/null
+ln -s /Applications "$MOUNT/Applications"
+hdiutil detach "$MOUNT" >/dev/null
 hdiutil convert "$DMG_TMP" -format UDZO -imagekey zlib-level=9 -o "$DMG_PATH" >/dev/null
 
 # Guard: this job must never emit a Windows setup.exe

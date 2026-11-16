@@ -11,6 +11,8 @@
     <string>__HOME__/Library/Application Support/FindX/index.bin</string>
     <string>--pipe</string>
     <string>findx2</string>
+    <string>--volume</string>
+    <string>/</string>
   </array>
   <key>RunAtLoad</key>
   <true/>

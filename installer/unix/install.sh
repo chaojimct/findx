@@ -34,6 +34,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Never let a malformed prefix redirect writes to the filesystem root.
+[[ "$PREFIX" = /* && "$PREFIX" != / && "$PREFIX" != *..* && "$PREFIX" != *$'\n'* ]] || { echo "unsafe prefix" >&2; exit 2; }
+[[ -z "$DESTDIR" || ( "$DESTDIR" = /* && "$DESTDIR" != / ) ]] || { echo "unsafe destdir" >&2; exit 2; }
+
 if [[ -z "$STAGE" ]]; then
   STAGE="$HERE"
 fi
@@ -56,7 +60,16 @@ install_file() {
   local target
   target=$(dest "$abs")
   mkdir -p "$(dirname "$target")"
-  install -m "$mode" "$src" "$target"
+  # Rename a complete sibling file: an executing GUI/service must never be
+  # truncated (ETXTBSY), and interrupted copies leave the old binary intact.
+  local pending
+  pending=$(mktemp "${target}.new-XXXXXX")
+  if install -m "$mode" "$src" "$pending"; then
+    mv -f "$pending" "$target"
+  else
+    rm -f "$pending"
+    return 1
+  fi
 }
 
 # Official layout
@@ -105,7 +118,7 @@ if [[ -f "$STAGE/version" ]]; then
 fi
 
 # Desktop entry and icon
-desktop_src="$STAGE/findx.desktop"
+desktop_src="$STAGE/findx.desktop.in"
 if [[ ! -f "$desktop_src" && -f "$STAGE/findx.desktop.in" ]]; then
   desktop_src=$(mktemp)
   sed -e "s|@PREFIX@|$PREFIX|g" -e "s|@VERSION@|$VERSION|g" \
@@ -140,7 +153,7 @@ if [[ $NO_SYMLINKS -eq 0 ]]; then
 fi
 
 if [[ $NO_SERVICE -eq 0 ]]; then
-  unit_src="$STAGE/findx2.service"
+  unit_src="$STAGE/findx2.service.in"
   if [[ ! -f "$unit_src" && -f "$STAGE/findx2.service.in" ]]; then
     unit_src=$(mktemp)
     sed -e "s|@PREFIX@|$PREFIX|g" "$STAGE/findx2.service.in" > "$unit_src"
@@ -155,29 +168,8 @@ if [[ $NO_SERVICE -eq 0 ]]; then
   fi
 fi
 
-# Enabling the user unit is a live-system action: skip when DESTDIR is set
-# (package build) and when we cannot see the target user's runtime dir.
-if [[ $NO_SERVICE -eq 0 && -z "$DESTDIR" ]]; then
-  target_user=${SUDO_USER:-${USER:-}}
-  if [[ -n "$target_user" && "$target_user" != root ]]; then
-    uid=$(id -u "$target_user" 2>/dev/null || true)
-    runtime=/run/user/${uid:-}
-    if [[ -n "$uid" && -d "$runtime" ]] && command -v systemctl >/dev/null; then
-      if [[ "$(id -u)" -eq 0 ]]; then
-        sudo -u "$target_user" XDG_RUNTIME_DIR="$runtime" systemctl --user daemon-reload || true
-        sudo -u "$target_user" XDG_RUNTIME_DIR="$runtime" systemctl --user enable findx2.service || true
-      else
-        systemctl --user daemon-reload || true
-        systemctl --user enable findx2.service || true
-      fi
-    fi
-  fi
-  if command -v update-desktop-database >/dev/null; then
-    update-desktop-database -q /usr/share/applications || true
-  fi
-  if command -v gtk-update-icon-cache >/dev/null; then
-    gtk-update-icon-cache -q /usr/share/icons/hicolor || true
-  fi
-fi
-
+# Installing files must not change the invoking/root user's service state.
+# In particular: no --now, no automatic first full-disk scan, no re-enable on upgrade.
+# The GUI manages only the current user's exact registered service after confirmation.
 echo "Installed official FindX into ${DESTDIR}${PREFIX}"
+echo "For this user: systemctl --user daemon-reload; systemctl --user start findx2.service"

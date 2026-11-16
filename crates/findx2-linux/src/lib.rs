@@ -124,6 +124,11 @@ pub fn build_full_disk_index(
         } else {
             merge_index_stores(stores)?
         };
+        // Create the official first-run data directory before persisting rules.
+        // A missing/unwritable exclusion sidecar must never silently broaden a restart.
+        if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
         let excluded: Vec<String> = exclude_dir
             .iter()
             .filter_map(|s| normalize_excluded_dir(s))
@@ -131,15 +136,30 @@ pub fn build_full_disk_index(
         if !excluded.is_empty() {
             store.excluded_dirs = excluded.clone();
             store.mark_excluded_entries(&excluded);
-            let _ = save_exclude_sidecar(output, &excluded);
-        }
-        if let Some(parent) = output.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            save_exclude_sidecar(output, &excluded)?;
         }
         save_index_bin(output, &store)?;
         if let Err(e) = findx2_core::build_trigram_sidecar(&store, output) {
             findx2_core::progress!("trigram 边车构建失败（搜索将回退全表扫描）: {e}");
         }
         Ok(store)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod first_install_tests {
+    #[test]
+    fn tiny_fixture_first_run_keeps_exclusions_in_new_data_directory() {
+        let root = std::env::temp_dir().join(format!("findx-first-run-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let volume = root.join("volume"); std::fs::create_dir(&volume).unwrap();
+        let excluded = volume.join("private"); std::fs::create_dir(&excluded).unwrap();
+        std::fs::write(excluded.join("excluded.txt"), "fixture").unwrap();
+        let output = root.join("new-user-data/FindX/index.bin");
+        super::build_full_disk_index(&output, vec![volume.to_string_lossy().into_owned()], vec![excluded.to_string_lossy().into_owned()], true, 1).unwrap();
+        let store = findx2_core::load_index_bin(&output).unwrap();
+        assert!(!store.excluded_dirs.is_empty());
+        assert!(output.with_file_name("index.bin.exclude.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

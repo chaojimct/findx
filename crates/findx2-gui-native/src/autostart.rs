@@ -278,16 +278,14 @@ mod linux_imp {
             };
         }
         let text = std::fs::read_to_string(&path).unwrap_or_default();
-        let command = text.lines().find_map(|l| {
-            l.trim()
-                .strip_prefix("Exec=")
-                .map(|s| s.trim().to_string())
-        });
+        let command = text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Exec=").map(|s| s.trim().to_string()));
         let hidden = text.lines().any(|l| l.trim() == "Hidden=true");
         let enabled = !hidden
             && command
                 .as_deref()
-                .is_some_and(|c| c.contains(OFFICIAL_EXE) || c.contains("/FindX"));
+                .is_some_and(|c| c == OFFICIAL_EXE || c == format!("\"{OFFICIAL_EXE}\""));
         AutostartState {
             enabled,
             command,
@@ -302,14 +300,7 @@ mod linux_imp {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
             }
-            let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(OFFICIAL_EXE));
-            let target = if crate::isolation::is_official_gui_file_name(
-                &exe.file_name().unwrap_or_default().to_string_lossy(),
-            ) {
-                exe
-            } else {
-                PathBuf::from(OFFICIAL_EXE)
-            };
+            let target = PathBuf::from(OFFICIAL_EXE);
             let body = format!(
                 "[Desktop Entry]\nType=Application\nName=FindX\nExec={}\nHidden=false\nX-GNOME-Autostart-enabled=true\n",
                 official_command(&target)
