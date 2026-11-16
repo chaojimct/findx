@@ -69,9 +69,26 @@ fn main() {
 fn attach_cli_console() {
     #[cfg(windows)]
     unsafe {
+        use windows::Win32::Storage::FileSystem::{
+            FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType,
+        };
         use windows::Win32::System::Console::{
             ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole, GetConsoleWindow,
+            GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
         };
+
+        // If stdout/stderr are already pipes or files (cmd redirection, CI),
+        // print there and do not AllocConsole or freopen over the handles.
+        let redirected = [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].into_iter().any(|id| {
+            GetStdHandle(id).ok().is_some_and(|h| {
+                let kind = GetFileType(h);
+                kind == FILE_TYPE_DISK || kind == FILE_TYPE_PIPE
+            })
+        });
+        if redirected {
+            return;
+        }
+
         if GetConsoleWindow().0.is_null() {
             if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
                 let _ = AllocConsole();
