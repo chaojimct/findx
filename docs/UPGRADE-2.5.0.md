@@ -44,3 +44,5 @@ Additional drill: installed 2.4.10 CLI and candidate both read the same public v
 Stage C (隔离安装事务，见 docs/UPGRADE-T154-STAGE-C.md)：已在仓库内隔离树完成 exe + 全部夹具边车 + 配置 + 模拟 SCM/Run 的成功路径与失败回退到上一完整集合。正式安装目录、正式索引/配置、真实 SCM、真实 HKCU Run 均未改写。实验 C 库不能替代正式全卷索引。2.5.0 候选只在 checkout 内 staging，并带 SHA-256 manifest；因 UpgradeGatesApproved 未满足，不编译 Inno setup。发布门仍全部关闭。
 
 Stage t156（隔离打包 + 版本检测 + 打包升级覆盖，见 docs/UPGRADE-T156-PACKAGING.md）：已用独立 IsolatedFixturePackaging 模式打出 2.5.0 isolated-fixture setup，未使用 UpgradeGatesApproved，也未编译正式 FindX.iss。版本检测矩阵与隔离树上 2.4.10→2.5.0 打包升级（成功与回退）已验收。正式安装未替换。公开自动更新通道仍未实现，publish_ready 仍为 false。
+
+Stage t157（用户授权的试验发布，见 docs/UPGRADE-T157-TRIAL-PUBLISH.md）：已按正式 installer/FindX.iss 打出 FindX-2.5.0-setup.exe 并发布公开 v2.5.0，供已安装的 2.4.10 GUI 检测更新。这不等于 publish_ready=true，也不等于已验证正式目录升级或断电安全。发布者未运行安装包、未覆盖正式 2.4.10 安装。本次发布仅含 Windows 正式安装包，不含 macOS/Linux 官方包。
