@@ -59,6 +59,12 @@ fn output(mut c: Command) -> Result<String, String> {
     }
     Ok(text)
 }
+pub const LINUX_UNIT: &str = "findx2.service";
+pub const LINUX_SERVICE_NAME: &str = "findx2";
+pub const LINUX_SERVICE_EXE: &str = "/opt/FindX/findx2-service";
+pub const MACOS_LABEL: &str = "com.findx.findx2";
+pub const MACOS_SERVICE_EXE: &str = "/Applications/FindX.app/Contents/MacOS/findx2-service";
+
 pub fn snapshot() -> Result<Snapshot, String> {
     #[cfg(windows)]
     {
@@ -69,11 +75,148 @@ pub fn snapshot() -> Result<Snapshot, String> {
         validate(&s)?;
         Ok(s)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
-        Err("仅 Windows 支持 SCM 服务管理".into())
+        linux_snapshot()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_snapshot()
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        Err("当前平台暂不支持正式服务管理".into())
     }
 }
+
+pub fn parse_linux_systemctl_show(text: &str) -> Result<Snapshot, String> {
+    let mut map = std::collections::BTreeMap::<String, String>::new();
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            map.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    let load = map.get("LoadState").map(|s| s.as_str()).unwrap_or("");
+    if load == "not-found" {
+        return Err("未找到正式 findx2 用户服务（/usr/lib/systemd/user/findx2.service）".into());
+    }
+    let id = map.get("Id").cloned().unwrap_or_default();
+    if id != LINUX_UNIT && id != LINUX_SERVICE_NAME {
+        if id.is_empty() && load.is_empty() && !map.contains_key("ExecStart") {
+            return Err("systemctl 未返回正式 findx2 用户服务".into());
+        }
+        if !id.is_empty() && id != LINUX_UNIT {
+            return Err(format!("拒绝操作非官方单元：{id}"));
+        }
+    }
+    let active = map.get("ActiveState").map(|s| s.as_str()).unwrap_or("unknown");
+    let state = match active {
+        "active" | "activating" | "reloading" => "Running",
+        "inactive" | "failed" | "deactivating" => "Stopped",
+        other => other,
+    }
+    .to_string();
+    let start_mode = match map.get("UnitFileState").map(|s| s.as_str()).unwrap_or("") {
+        "enabled" | "enabled-runtime" => "Auto",
+        _ => "Manual",
+    }
+    .to_string();
+    let pid = map
+        .get("MainPID")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let path_name = map
+        .get("ExecStart")
+        .map(|s| extract_exec_argv(s))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| LINUX_SERVICE_EXE.to_string());
+    let s = Snapshot {
+        name: LINUX_SERVICE_NAME.into(),
+        state,
+        start_mode,
+        path_name,
+        process_id: pid,
+    };
+    validate_linux(&s)?;
+    Ok(s)
+}
+
+fn extract_exec_argv(exec_start: &str) -> String {
+    if let Some(rest) = exec_start.split("argv[]=").nth(1) {
+        let raw = rest.split(';').next().unwrap_or(rest).trim();
+        return raw.to_string();
+    }
+    if let Some(rest) = exec_start.split("path=").nth(1) {
+        return rest.split(';').next().unwrap_or(rest).trim().to_string();
+    }
+    exec_start.trim().to_string()
+}
+
+fn official_linux_command_line() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    format!(
+        "{LINUX_SERVICE_EXE} --index {home}/.local/share/FindX/index.bin --pipe findx2"
+    )
+}
+
+fn official_macos_command_line() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/var/root".into());
+    format!(
+        "{MACOS_SERVICE_EXE} --index {home}/Library/Application Support/FindX/index.bin --pipe findx2"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_snapshot() -> Result<Snapshot, String> {
+    let mut c = Command::new("systemctl");
+    c.args([
+        "--user",
+        "show",
+        LINUX_UNIT,
+        "--property=Id,LoadState,ActiveState,UnitFileState,ExecStart,MainPID",
+        "--no-page",
+    ]);
+    let text = output(c).map_err(|e| format!("未找到正式 findx2 用户服务：{e}"))?;
+    parse_linux_systemctl_show(&text)
+}
+
+pub fn parse_macos_launchctl_print(text: &str, path_name: &str, pid: u32) -> Result<Snapshot, String> {
+    let state = if text.contains("state = running") || text.contains("\"running\"") {
+        "Running"
+    } else {
+        "Stopped"
+    }
+    .to_string();
+    let start_mode = if text.contains("run at load = true") || text.contains("KeepAlive") {
+        "Auto"
+    } else {
+        "Manual"
+    }
+    .to_string();
+    let s = Snapshot {
+        name: MACOS_LABEL.into(),
+        state,
+        start_mode,
+        path_name: path_name.to_string(),
+        process_id: pid,
+    };
+    validate_macos(&s)?;
+    Ok(s)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_snapshot() -> Result<Snapshot, String> {
+    let uid = unsafe { libc::getuid() };
+    let mut c = Command::new("launchctl");
+    c.args(["print", &format!("gui/{uid}/{MACOS_LABEL}")]);
+    let text = output(c).unwrap_or_default();
+    if text.trim().is_empty() {
+        return Err("未找到正式 LaunchAgent com.findx.findx2".into());
+    }
+    let path_name = official_macos_command_line();
+    parse_macos_launchctl_print(&text, &path_name, 0)
+}
+
 #[cfg(windows)]
 pub fn split_command(s: &str) -> Vec<String> {
     use std::os::windows::ffi::OsStrExt;
@@ -121,6 +264,26 @@ pub fn split_command(s: &str) -> Vec<String> {
     out
 }
 pub fn validate(s: &Snapshot) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        validate_windows(s)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        validate_linux(s)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        validate_macos(s)
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = s;
+        Err("当前平台暂不支持正式服务管理".into())
+    }
+}
+
+pub fn validate_windows(s: &Snapshot) -> Result<(), String> {
     let args = split_command(&s.path_name);
     let expected =
         PathBuf::from(std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into()))
@@ -138,6 +301,32 @@ pub fn validate(s: &Snapshot) -> Result<(), String> {
     }
     Ok(())
 }
+
+pub fn validate_linux(s: &Snapshot) -> Result<(), String> {
+    let args = split_command(&s.path_name);
+    let exe = args.first().map(|s| s.as_str()).unwrap_or("");
+    let name_ok = s.name == LINUX_SERVICE_NAME || s.name == LINUX_UNIT;
+    if !name_ok
+        || exe != LINUX_SERVICE_EXE
+        || !args.windows(2).any(|a| a[0] == "--pipe" && a[1] == "findx2")
+    {
+        return Err("服务身份/安装路径/pipe 不匹配；拒绝操作任何其他服务".into());
+    }
+    Ok(())
+}
+
+pub fn validate_macos(s: &Snapshot) -> Result<(), String> {
+    let args = split_command(&s.path_name);
+    let exe = args.first().map(|s| s.as_str()).unwrap_or("");
+    if s.name != MACOS_LABEL
+        || exe != MACOS_SERVICE_EXE
+        || !args.windows(2).any(|a| a[0] == "--pipe" && a[1] == "findx2")
+    {
+        return Err("服务身份/安装路径/pipe 不匹配；拒绝操作任何其他服务".into());
+    }
+    Ok(())
+}
+
 fn arg(s: &Snapshot, key: &str) -> Result<String, String> {
     split_command(&s.path_name)
         .windows(2)
@@ -174,6 +363,17 @@ pub fn execute(
     {
         return Err("确认后服务状态已改变；请刷新重新确认".into());
     }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = &preferences;
+        return execute_linux(action, &current);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = &preferences;
+        return execute_macos(action, &current);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     match action {
         Action::Start => {
             if current.state != "Running" {
@@ -211,6 +411,98 @@ pub fn execute(
     }
     Ok(format!("{}完成；SCM/注册表已回读验证", action.label()))
 }
+
+fn execute_linux(action: Action, current: &Snapshot) -> Result<String, String> {
+    validate_linux(current)?;
+    match action {
+        Action::Start => {
+            if current.state != "Running" {
+                linux_systemctl(&["start", LINUX_UNIT])?;
+            }
+        }
+        Action::Stop => {
+            if current.state != "Stopped" {
+                linux_systemctl(&["stop", LINUX_UNIT])?;
+            }
+        }
+        Action::Auto => {
+            linux_systemctl(&["enable", LINUX_UNIT])?;
+        }
+        Action::Manual => {
+            linux_systemctl(&["disable", LINUX_UNIT])?;
+        }
+        Action::GuiAutoOn | Action::GuiAutoOff => {
+            let enabled = action == Action::GuiAutoOn;
+            let state = crate::autostart::apply(enabled)?;
+            if state.enabled != enabled {
+                return Err("正式 GUI 自启动回读不一致".into());
+            }
+        }
+        Action::ApplyPreferences | Action::Compact | Action::Rebuild => {
+            return Err(
+                "Linux 正式版暂不在设置页提供压缩/重建/改服务参数；请停止用户服务后使用命令行。".into(),
+            );
+        }
+    }
+    Ok(format!("{}完成；systemd 用户服务已回读验证", action.label()))
+}
+
+fn linux_systemctl(args: &[&str]) -> Result<String, String> {
+    let mut c = Command::new("systemctl");
+    let mut all = vec!["--user"];
+    all.extend_from_slice(args);
+    c.args(&all);
+    output(c)
+}
+
+fn execute_macos(action: Action, current: &Snapshot) -> Result<String, String> {
+    validate_macos(current)?;
+    match action {
+        Action::Start => {
+            macos_launchctl_kickstart()?;
+        }
+        Action::Stop => {
+            macos_launchctl_bootout()?;
+        }
+        Action::Auto | Action::Manual => {
+            return Err("macOS LaunchAgent 的开机启动请使用「正式 GUI 登录启动」或 install.sh 安装的 com.findx.findx2。".into());
+        }
+        Action::GuiAutoOn | Action::GuiAutoOff => {
+            let enabled = action == Action::GuiAutoOn;
+            let state = crate::autostart::apply(enabled)?;
+            if state.enabled != enabled {
+                return Err("正式 GUI 自启动回读不一致".into());
+            }
+        }
+        Action::ApplyPreferences | Action::Compact | Action::Rebuild => {
+            return Err(
+                "macOS 正式版暂不在设置页提供压缩/重建/改服务参数；请使用 LaunchAgent / 命令行。".into(),
+            );
+        }
+    }
+    Ok(format!("{}完成；LaunchAgent 已执行", action.label()))
+}
+
+fn macos_launchctl_kickstart() -> Result<(), String> {
+    let uid = std::env::var("UID").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let domain = format!("gui/{uid}/{MACOS_LABEL}");
+    let mut c = Command::new("launchctl");
+    c.args(["kickstart", "-k", &domain]);
+    output(c).map(|_| ())
+}
+
+fn macos_launchctl_bootout() -> Result<(), String> {
+    let uid = std::env::var("UID").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let domain = format!("gui/{uid}/{MACOS_LABEL}");
+    let mut c = Command::new("launchctl");
+    c.args(["bootout", &domain]);
+    match output(c) {
+        Ok(_) => Ok(()),
+        Err(e) if e.contains("No such") || e.contains("Could not") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
     let m = std::fs::symlink_metadata(src).map_err(|e| e.to_string())?;
     #[cfg(windows)]
@@ -395,11 +687,23 @@ fn maintenance(action: Action, s: &Snapshot) -> Result<String, String> {
 
 /// Preserve every unrelated CLI flag and official JSON field. Only these three
 /// runtime settings are owned by this operation; dev paths/UI prefs never migrate.
+pub fn validate_snapshot_identity(s: &Snapshot) -> Result<(), String> {
+    if s.name == "FindX2Search" {
+        validate_windows(s)
+    } else if s.name == LINUX_SERVICE_NAME || s.name == LINUX_UNIT {
+        validate_linux(s)
+    } else if s.name == MACOS_LABEL {
+        validate_macos(s)
+    } else {
+        Err("服务身份/安装路径/pipe 不匹配；拒绝操作任何其他服务".into())
+    }
+}
+
 pub fn runtime_arguments(
     s: &Snapshot,
     p: &crate::settings_logic::FindxGuiSettings,
 ) -> Result<Vec<String>, String> {
-    validate(s)?;
+    validate_snapshot_identity(s)?;
     let args = split_command(&s.path_name);
     let mut next = vec![];
     let mut i = 0;
@@ -426,7 +730,7 @@ pub fn runtime_arguments(
 
 /// Parse the official SCM command: interval, metadata backfill enabled, Everything IPC enabled.
 pub fn official_runtime_options(s: &Snapshot) -> Result<(u64, bool, bool), String> {
-    validate(s)?;
+    validate_snapshot_identity(s)?;
     let args = split_command(&s.path_name);
     let mut interval = 30u64;
     let mut i = 0;
@@ -697,5 +1001,58 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert_eq!(split_command(&command), v);
+    }
+
+    #[test]
+    fn linux_and_macos_official_service_identity() {
+        let linux = Snapshot {
+            name: LINUX_SERVICE_NAME.into(),
+            state: "Running".into(),
+            start_mode: "Auto".into(),
+            process_id: 9,
+            path_name: format!("{LINUX_SERVICE_EXE} --index /tmp/index.bin --pipe findx2"),
+        };
+        assert!(validate_linux(&linux).is_ok());
+        let evil = Snapshot {
+            name: LINUX_SERVICE_NAME.into(),
+            state: "Running".into(),
+            start_mode: "Auto".into(),
+            process_id: 9,
+            path_name: "/tmp/evil --pipe findx2".into(),
+        };
+        assert!(validate_linux(&evil).is_err());
+        let mac = Snapshot {
+            name: MACOS_LABEL.into(),
+            state: "Stopped".into(),
+            start_mode: "Auto".into(),
+            process_id: 0,
+            path_name: format!("{MACOS_SERVICE_EXE} --index /tmp/index.bin --pipe findx2"),
+        };
+        assert!(validate_macos(&mac).is_ok());
+        let show = concat!(
+            "Id=findx2.service
+",
+            "LoadState=loaded
+",
+            "ActiveState=active
+",
+            "UnitFileState=enabled
+",
+            "MainPID=4242
+",
+            "ExecStart={ path=/opt/FindX/findx2-service ; argv[]=/opt/FindX/findx2-service --index /tmp/index.bin --pipe findx2 ; ignore_errors=no }
+",
+        );
+        let parsed = parse_linux_systemctl_show(show).unwrap();
+        assert_eq!(parsed.name, LINUX_SERVICE_NAME);
+        assert_eq!(parsed.state, "Running");
+        assert_eq!(parsed.start_mode, "Auto");
+        assert_eq!(parsed.process_id, 4242);
+        assert!(parsed.path_name.contains(LINUX_SERVICE_EXE));
+        assert!(parsed.path_name.contains("--pipe"));
+        let missing = parse_linux_systemctl_show("LoadState=not-found
+Id=findx2.service
+");
+        assert!(missing.is_err());
     }
 }

@@ -123,13 +123,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: gui/package-lock.json
-
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -138,69 +131,18 @@ jobs:
         with:
           workspaces: ". -> target"
 
-      - name: Install frontend dependencies
-        working-directory: gui
-        run: npm ci
+      - name: Build official native macOS app and unsigned dmg
+        run: bash installer/macos/pack-macos.sh --version "${{ needs.meta.outputs.version }}" --out "$GITHUB_WORKSPACE/dist"
 
-      - name: 构建 Tauri（app + dmg，含 CLI/服务 sidecar）
-        working-directory: gui
-        run: npm run tauri build
-
-      - name: 校验 .app 内 sidecar 可执行且非占位
-        shell: bash
+      - name: Guard against Windows setup names
         run: |
           set -euo pipefail
-          APP=$(find target/release/bundle -name 'FindX.app' -type d | head -1)
-          if [ -z "$APP" ]; then
-            echo "未找到 FindX.app"
-            find target/release/bundle -maxdepth 5 -print || true
+          if compgen -G "$GITHUB_WORKSPACE/dist/FindX-*-setup.exe" > /dev/null; then
+            echo "macOS job must not emit FindX-*-setup.exe" >&2
+            ls -la "$GITHUB_WORKSPACE/dist"
             exit 1
           fi
-          echo "APP=$APP"
-          found=0
-          while IFS= read -r p; do
-            sz=$(stat -f%z "$p")
-            echo "sidecar $p size=$sz"
-            if [ "$sz" -lt 100000 ]; then
-              echo "sidecar 过小，仍是占位文件: $p"
-              exit 1
-            fi
-            chmod +x "$p" || true
-            found=$((found + 1))
-          done < <(find "$APP" \( -name findx2 -o -name fx -o -name findx2-service \) -type f)
-          if [ "$found" -lt 3 ]; then
-            echo "期望至少 3 个 sidecar，实际 $found。Contents 目录："
-            find "$APP/Contents" -type f | head -80
-            exit 1
-          fi
-          test -x "$APP/Contents/MacOS/FindX" || test -x "$APP/Contents/MacOS/findx2-gui" || {
-            echo "未找到主程序 MacOS/FindX"
-            ls -la "$APP/Contents/MacOS" || true
-            exit 1
-          }
-
-      - name: Collect artifacts
-        shell: bash
-        env:
-          VERSION: ${{ needs.meta.outputs.version }}
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          shopt -s nullglob
-          dmg=(target/release/bundle/dmg/*.dmg)
-          if [ ${#dmg[@]} -eq 0 ]; then
-            echo "未找到 dmg，bundle 目录："
-            find target/release/bundle -maxdepth 3 -type f -print || true
-            exit 1
-          fi
-          cp "${dmg[@]}" dist/
-          case "$(uname -m)" in
-            arm64|aarch64) ARCH=aarch64 ;;
-            x86_64) ARCH=x64 ;;
-            *) ARCH="$(uname -m)" ;;
-          esac
-          tar -C target/release -czf "dist/FindX-${VERSION}-macos-${ARCH}-cli.tar.gz" findx2 fx findx2-service
-          ls -la dist
+          test -n "$(ls "$GITHUB_WORKSPACE/dist"/FindX-*-macos-*.dmg 2>/dev/null)"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -215,25 +157,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Linux Tauri 系统依赖
+      - name: Linux native GUI 系统依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            libssl-dev \
-            libfuse2t64 \
-            file
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: gui/package-lock.json
+            clang cmake pkg-config fakeroot dpkg-dev file \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxcb-xkb-dev libxcb-keysyms1-dev libxcb-icccm4-dev libxcb-image0-dev \
+            libxcb-shm0-dev libxcb-randr0-dev libxcb-util-dev libxcb-cursor-dev \
+            libwayland-dev libvulkan-dev mesa-vulkan-drivers libssl-dev
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -243,36 +177,20 @@ jobs:
         with:
           workspaces: ". -> target"
 
-      - name: Install frontend dependencies
-        working-directory: gui
-        run: npm ci
+      - name: Build official native Linux deb and tarball
+        run: bash installer/unix/pack-linux.sh --version "${{ needs.meta.outputs.version }}" --out "$GITHUB_WORKSPACE/dist"
 
-      - name: 构建 Tauri（deb + AppImage，含 CLI/服务 sidecar）
-        working-directory: gui
-        env:
-          APPIMAGE_EXTRACT_AND_RUN: "1"
-        run: npm run tauri build
-
-      - name: Collect artifacts
-        shell: bash
-        env:
-          VERSION: ${{ needs.meta.outputs.version }}
+      - name: Guard against Windows setup names and Tauri leftovers
         run: |
           set -euo pipefail
-          mkdir -p dist
-          shopt -s nullglob
-          found=0
-          for f in target/release/bundle/deb/*.deb target/release/bundle/appimage/*.AppImage; do
-            cp "$f" dist/
-            found=1
-          done
-          if [ "$found" -eq 0 ]; then
-            echo "未找到 deb/AppImage，bundle 目录："
-            find target/release/bundle -maxdepth 4 -type f -print || true
+          if compgen -G "$GITHUB_WORKSPACE/dist/FindX-*-setup.exe" > /dev/null; then
+            echo "Linux job must not emit FindX-*-setup.exe" >&2
+            ls -la "$GITHUB_WORKSPACE/dist"
             exit 1
           fi
-          tar -C target/release -czf "dist/FindX-${VERSION}-linux-x64-cli.tar.gz" findx2 fx findx2-service
-          ls -la dist
+          test -f "$GITHUB_WORKSPACE/dist/FindX-${{ needs.meta.outputs.version }}-linux-x64.deb"
+          test -f "$GITHUB_WORKSPACE/dist/FindX-${{ needs.meta.outputs.version }}-linux-x64.tar.gz"
+          python3 scripts/test_unix_packaging.py
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -291,6 +209,9 @@ jobs:
           pattern: findx-*
           merge-multiple: true
           path: dist
+
+      - name: Validate official asset names (protect Windows native setup)
+        run: python3 scripts/check_release_assets.py --dist dist --expected-version "${{ needs.meta.outputs.version }}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

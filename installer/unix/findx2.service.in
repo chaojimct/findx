@@ -1,0 +1,14 @@
+[Unit]
+Description=FindX index service
+After=default.target
+ConditionPathExists=@PREFIX@/findx2-service
+
+[Service]
+Type=simple
+ExecStart=@PREFIX@/findx2-service --index %h/.local/share/FindX/index.bin --pipe findx2
+Restart=on-failure
+RestartSec=3
+# Do not set a watchdog; the engine may be busy on first full-disk scan.
+
+[Install]
+WantedBy=default.target

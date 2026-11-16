@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=@VERSION@
+Name=FindX
+Comment=FindX 本地文件搜索
+Exec=@PREFIX@/FindX
+Icon=findx
+Terminal=false
+Categories=Utility;FileTools;Filesystem;
+StartupNotify=true
+StartupWMClass=FindX
+Keywords=search;file;find;index;
