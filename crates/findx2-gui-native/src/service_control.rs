@@ -264,7 +264,7 @@ fn macos_snapshot() -> Result<Snapshot, String> {
     let mut c = Command::new("launchctl");
     c.args(["print", &format!("gui/{uid}/{MACOS_LABEL}")]);
     let text = output(c).unwrap_or_default();
-    let value = macos_plist_json(&macos_plist_path()?)?;
+    let value = macos_agent_configuration()?;
     let args = value
         .get("ProgramArguments")
         .and_then(|v| v.as_array())
@@ -291,7 +291,8 @@ fn macos_snapshot() -> Result<Snapshot, String> {
     let explicitly_disabled = disabled
         .lines()
         .any(|line| line.contains(&format!("\"{MACOS_LABEL}\"")) && line.contains("=> true"));
-    snapshot.start_mode = if !explicitly_disabled
+    snapshot.start_mode = if macos_plist_path()?.is_file()
+        && !explicitly_disabled
         && (value.get("RunAtLoad").and_then(|v| v.as_bool()) == Some(true)
             || value.get("KeepAlive").and_then(|v| v.as_bool()) == Some(true))
     {
@@ -588,16 +589,7 @@ fn execute_macos(
             macos_launchctl_bootout()?;
         }
         Action::Auto | Action::Manual => {
-            let mut c = Command::new("launchctl");
-            c.args([
-                if action == Action::Auto {
-                    "enable"
-                } else {
-                    "disable"
-                },
-                &format!("gui/{}/{MACOS_LABEL}", unix_uid()?),
-            ]);
-            output(c)?;
+            return macos_set_start_mode(current, action == Action::Auto);
         }
         Action::GuiAutoOn | Action::GuiAutoOff => {
             let enabled = action == Action::GuiAutoOn;
@@ -612,10 +604,75 @@ fn execute_macos(
     Ok(format!("{}完成；LaunchAgent 已执行", action.label()))
 }
 
+#[cfg(target_os = "macos")]
+fn macos_set_start_mode(current: &Snapshot, auto: bool) -> Result<String, String> {
+    ensure_macos_agent_file()?;
+    let path = macos_plist_path()?;
+    let old = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let mut value = macos_agent_configuration()?;
+    value["RunAtLoad"] = serde_json::json!(auto);
+    value["KeepAlive"] = serde_json::json!(auto);
+    let backup = path.with_extension(format!(
+        "backup-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(backup)
+        .and_then(|mut f| f.write_all(&old))
+        .map_err(|e| e.to_string())?;
+    let running = current.state == "Running";
+    if running {
+        set_running(false)?;
+    }
+    let result = (|| {
+        crate::prefs::write_atomic(
+            &path,
+            &serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?,
+        )?;
+        let mut c = Command::new("plutil");
+        c.args(["-convert", "xml1"]).arg(&path);
+        output(c)?;
+        // Manual mode is expressed in the plist, not a disabled label: a disabled
+        // job cannot be started on demand. Keep the label usable in both modes.
+        let mut c = Command::new("launchctl");
+        c.args(["enable", &format!("gui/{}/{MACOS_LABEL}", unix_uid()?)]);
+        output(c)?;
+        if running {
+            set_running(true)?;
+        }
+        let actual = snapshot()?;
+        if actual.start_mode != if auto { "Auto" } else { "Manual" } {
+            return Err("LaunchAgent 启动模式回读不一致".into());
+        }
+        Ok("LaunchAgent 启动模式已保存；原运行状态已恢复".into())
+    })();
+    if let Err(e) = result {
+        if running {
+            let _ = set_running(false);
+        }
+        crate::prefs::write_atomic(&path, &old)?;
+        if running {
+            set_running(true)?;
+        }
+        return Err(format!("启动模式应用失败，已恢复 plist: {e}"));
+    }
+    result
+}
+
 fn macos_launchctl_kickstart() -> Result<(), String> {
     let uid = unix_uid()?;
+    let mut enable = Command::new("launchctl");
+    enable.args(["enable", &format!("gui/{uid}/{MACOS_LABEL}")]);
+    output(enable)?;
     let domain = format!("gui/{uid}");
     let plist = macos_plist_path()?;
+    ensure_macos_agent_file()?;
     let mut c = Command::new("launchctl");
     c.args(["print", &format!("{domain}/{MACOS_LABEL}")]);
     if output(c).is_err() {
@@ -660,6 +717,75 @@ fn macos_plist_json(path: &Path) -> Result<serde_json::Value, String> {
     c.args(["-convert", "json", "-o", "-"]).arg(path);
     serde_json::from_str(&output(c)?).map_err(|e| e.to_string())
 }
+fn ensure_macos_agent_file() -> Result<(), String> {
+    let plist = macos_plist_path()?;
+    if !plist.exists() {
+        // A standard drag-install has no per-user agent yet. Create it only
+        // after the user explicitly confirms Start, never at GUI startup.
+        let value = macos_agent_configuration()?;
+        std::fs::create_dir_all(plist.parent().ok_or("LaunchAgent 无父目录")?)
+            .map_err(|e| e.to_string())?;
+        crate::prefs::write_atomic(
+            &plist,
+            &serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?,
+        )?;
+        let mut convert = Command::new("plutil");
+        convert.args(["-convert", "xml1"]).arg(&plist);
+        output(convert)?;
+    }
+    Ok(())
+}
+
+/// Load the user's existing agent verbatim, or prepare the shipped template
+/// for a first drag-install. Reading a snapshot must not create/start an agent.
+fn macos_agent_configuration() -> Result<serde_json::Value, String> {
+    let path = macos_plist_path()?;
+    let exists = path.exists();
+    let value = macos_plist_json(if exists {
+        &path
+    } else {
+        Path::new("/Applications/FindX.app/Contents/Resources/com.findx.findx2.plist")
+    })?;
+    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    prepare_macos_agent(value, &home, !exists)
+}
+pub fn prepare_macos_agent(
+    mut value: serde_json::Value,
+    home: &str,
+    from_template: bool,
+) -> Result<serde_json::Value, String> {
+    if value.get("Label").and_then(|v| v.as_str()) != Some(MACOS_LABEL) {
+        return Err("LaunchAgent Label 不匹配".into());
+    }
+    let args = value
+        .get_mut("ProgramArguments")
+        .and_then(|v| v.as_array_mut())
+        .ok_or("LaunchAgent 缺少 ProgramArguments")?;
+    if from_template {
+        for arg in args.iter_mut() {
+            if let Some(raw) = arg.as_str().and_then(|s| s.strip_prefix("__HOME__/")) {
+                *arg = serde_json::json!(format!("{home}/{raw}"));
+            }
+        }
+    }
+    let args = args
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .ok_or("LaunchAgent 参数不是字符串")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_macos(&Snapshot {
+        name: MACOS_LABEL.into(),
+        state: "Stopped".into(),
+        start_mode: "Manual".into(),
+        process_id: 0,
+        path_name: join_unix_args(&args)?,
+    })?;
+    Ok(value)
+}
+
 pub fn join_unix_args(args: &[String]) -> Result<String, String> {
     args.iter()
         .map(|s| {
@@ -1540,5 +1666,27 @@ mod unix_preferences_fixture {
         let stopped = snapshot().unwrap();
         execute(Action::ApplyPreferences, stopped, prefs).unwrap();
         assert_eq!(snapshot().unwrap().state, "Stopped");
+    }
+}
+
+#[cfg(test)]
+mod macos_first_install_tests {
+    use super::*;
+    #[test]
+    fn template_agent_preserves_home_spaces_and_existing_options() {
+        let template = serde_json::json!({"Label":MACOS_LABEL,"ProgramArguments":[MACOS_SERVICE_EXE,"--index","__HOME__/Library/Application Support/FindX/index.bin","--pipe","findx2","--volume","/"],"KeepAlive":true});
+        let ready = prepare_macos_agent(template, "/Users/fixture user", true).unwrap();
+        assert_eq!(
+            ready["ProgramArguments"][2],
+            "/Users/fixture user/Library/Application Support/FindX/index.bin"
+        );
+        assert_eq!(
+            prepare_macos_agent(ready.clone(), "/Users/another", false).unwrap(),
+            ready
+        );
+        let mut wrong = ready;
+        wrong["ProgramArguments"][2] =
+            serde_json::json!("/Users/fixture/FindX-native-dev/index.bin");
+        assert!(prepare_macos_agent(wrong, "/Users/fixture", false).is_err());
     }
 }

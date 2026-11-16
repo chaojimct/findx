@@ -116,3 +116,5 @@ macOS 使用明确挂载点挂载只读 DMG，`ditto` 到独立暂存目录，�
 - `scripts/test_unix_service_preferences.py` 使用 **模拟** systemd manager 验证配置写入/失败回滚与索引不变；不是实际 systemd 登录会话验收。
 - 构建宿主为 Debian 13 (trixie), glibc 2.41；当前强 GLIBC 符号 ABI 下限由 readelf 自动生成包依赖（当前 2.35）。需要对应 X11/xkbcommon/Wayland/Vulkan 运行库与可用图形驱动。未对 Ubuntu/Fedora/全部 Linux 做运行验收；tar 包不自带运行库。
 - 非发布工作流 `unix-validation.yml` 使用 `macos-15` arm64 与 `macos-15-intel` 原生测试/DMG 制包，仅保留 7 天 Actions 验证附件，无 release/tag 步骤。当前需授权推送后方可运行新修复。旧检查点的原生 Darwin 编译已在 CI 通过，但工作区测试因 core persist_tx 的并行环境故障注入竞态失败；CI 改为串行运行此类测试。
+
+macOS 标准拖放安装后，设置页会从随包模板展示“尚未启动”服务；仅在用户确认 Start 时创建自己的 LaunchAgent 并 bootstrap。不会因打开 GUI 自动开始全盘扫描；已有 LaunchAgent 的参数保持不变。
