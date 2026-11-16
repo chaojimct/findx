@@ -25,7 +25,7 @@
 #endif
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.5.1"
+  #define MyAppVersion "2.5.2"
 #endif
 #ifndef PublishDir
   #define PublishDir "stage"

@@ -85,6 +85,14 @@ pub fn start(opts: LaunchOptions) {
             })
             .expect("open FindX native window");
 
+            if std::env::var_os("FINDX_NATIVE_OPEN_ABOUT").is_some() {
+                open_settings_window(session.clone(), cx);
+            }
+
+            if opts.official_product {
+                schedule_official_auto_check(session.clone(), cx);
+            }
+
             cx.on_window_closed(|cx, _id| {
                 if cx.windows().is_empty() {
                     cx.quit();
@@ -92,6 +100,39 @@ pub fn start(opts: LaunchOptions) {
             })
             .detach();
         });
+}
+
+
+fn schedule_official_auto_check(session: Entity<AppSession>, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        cx.background_spawn(async {
+            std::thread::sleep(std::time::Duration::from_millis(3500));
+        })
+        .await;
+        let mut should = false;
+        let _ = session.update(cx, |session, _| {
+            should = crate::update_logic::should_auto_check(
+                session.official_product,
+                session.settings.auto_check_update,
+                session.prefs.last_official_update_check_unix,
+            );
+        });
+        if !should {
+            return;
+        }
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        let info = cx
+            .background_spawn(async move { crate::update_logic::check_latest_release(&current) })
+            .await;
+        let _ = session.update(cx, |session, cx| {
+            session.update_state.busy = false;
+            session.update_state.info = Some(info);
+            session.prefs.last_official_update_check_unix = crate::update_logic::now_unix();
+            crate::session::persist_prefs(session.prefs.clone(), cx);
+            cx.notify();
+        });
+    })
+    .detach();
 }
 
 pub fn open_settings_window(session: Entity<AppSession>, cx: &mut App) {

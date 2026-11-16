@@ -8,7 +8,7 @@ pub struct LaunchOptions {
     pub live: bool,
     pub diag: bool,
     pub preview_file: Option<String>,
-    /// Official installed FindX.exe + FindX.installed, production entry, not a fixture.
+    /// Official installed product (see isolation::detect_official_entry), not a fixture.
     pub official_product: bool,
 }
 
@@ -19,10 +19,9 @@ impl LaunchOptions {
 }
 
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOptions, String> {
-    let installed = std::env::current_exe().ok().is_some_and(|exe| {
-        exe.file_name().is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("FindX.exe"))
-            && exe.with_file_name("FindX.installed").is_file()
-    });
+    let installed = std::env::current_exe()
+        .ok()
+        .is_some_and(|exe| isolation::detect_official_entry(&exe));
     parse_args_for_install(args, installed)
 }
 
@@ -69,7 +68,8 @@ fn parse_args_for_install(args: impl IntoIterator<Item = String>, installed: boo
     if live && !pipe_set {
         pipe_name = PRODUCTION_PIPE.to_string();
     }
-    let official_product = installed && !mock && (live && (!pipe_set || isolation::is_production_pipe(&pipe_name)));
+    let official_product =
+        isolation::is_official_product_entry(installed, mock, live, pipe_set, &pipe_name);
     let endpoint = isolation::normalize_pipe_ex(&pipe_name, live)?;
     Ok(LaunchOptions {
         pipe_name,

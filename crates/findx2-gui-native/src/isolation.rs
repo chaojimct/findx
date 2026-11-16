@@ -131,6 +131,93 @@ pub fn is_main_window_title(title: &str) -> bool {
     title == OFFICIAL_WINDOW_TITLE || title.starts_with("FindX Native (")
 }
 
+fn path_key(path: &std::path::Path) -> String {
+    path.to_string_lossy()
+        .trim_end_matches(['\\', '/'])
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+/// Program Files roots used to recognize the official install directory.
+pub fn official_program_files_roots() -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for key in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+        if let Some(value) = std::env::var_os(key) {
+            let path = std::path::PathBuf::from(value);
+            if !path.as_os_str().is_empty()
+                && !roots.iter().any(|existing| path_key(existing) == path_key(&path))
+            {
+                roots.push(path);
+            }
+        }
+    }
+    roots
+}
+
+/// True when `exe` is `{ProgramFiles}\FindX\FindX.exe` (or the x86 equivalent).
+pub fn is_official_install_exe(exe: &std::path::Path) -> bool {
+    is_official_install_exe_with_roots(exe, &official_program_files_roots())
+}
+
+pub fn is_official_install_exe_with_roots(
+    exe: &std::path::Path,
+    roots: &[std::path::PathBuf],
+) -> bool {
+    let Some(name) = exe.file_name() else {
+        return false;
+    };
+    if !name.to_string_lossy().eq_ignore_ascii_case("FindX.exe") {
+        return false;
+    }
+    let Some(parent) = exe.parent() else {
+        return false;
+    };
+    if !parent
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("FindX"))
+    {
+        return false;
+    }
+    let Some(grand) = parent.parent() else {
+        return false;
+    };
+    let grand_key = path_key(grand);
+    roots.iter().any(|root| path_key(root) == grand_key)
+}
+
+/// Official product entry: enables the FindX title, AppUserModelID, and the
+/// real in-app updater. Isolated/dev/fixture launches must not match.
+///
+/// A process is official when it is not `--mock` and is not an explicit
+/// isolated pipe, and either:
+/// 1. the executable is named `FindX.exe` and a sibling `FindX.installed`
+///    marker is present (the shipped install layout), or
+/// 2. the executable is running from the official install directory
+///    (`%ProgramFiles%\FindX\FindX.exe` or `%ProgramFiles(x86)%\FindX\FindX.exe`).
+pub fn is_official_product_entry(
+    installed_or_official_dir: bool,
+    mock: bool,
+    live: bool,
+    pipe_set: bool,
+    pipe_name: &str,
+) -> bool {
+    installed_or_official_dir
+        && !mock
+        && live
+        && (!pipe_set || is_production_pipe(pipe_name))
+}
+
+/// Installed layout (FindX.exe + FindX.installed) or official Program Files path.
+pub fn detect_official_entry(exe: &std::path::Path) -> bool {
+    let is_findx = exe
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("FindX.exe"));
+    if !is_findx {
+        return false;
+    }
+    exe.with_file_name("FindX.installed").is_file() || is_official_install_exe(exe)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +256,39 @@ mod tests {
         assert!(is_main_window_title("FindX Native (isolated)"));
         assert!(!is_main_window_title("FindX 设置"));
         assert!(!is_main_window_title("FindX 目录浏览"));
+    }
+
+    #[test]
+    fn official_install_dir_and_product_entry() {
+        let pf = std::path::PathBuf::from(r"C:\Program Files");
+        let pf86 = std::path::PathBuf::from(r"C:\Program Files (x86)");
+        let roots = [pf.clone(), pf86.clone()];
+        assert!(is_official_install_exe_with_roots(
+            std::path::Path::new(r"C:\Program Files\FindX\FindX.exe"),
+            &roots
+        ));
+        assert!(is_official_install_exe_with_roots(
+            std::path::Path::new(r"C:\Program Files (x86)\FindX\FindX.exe"),
+            &roots
+        ));
+        assert!(!is_official_install_exe_with_roots(
+            std::path::Path::new(r"C:\Users\chaoj\dev\tools\findx\target\t159\FindX.exe"),
+            &roots
+        ));
+        assert!(!is_official_install_exe_with_roots(
+            std::path::Path::new(r"C:\Program Files\FindX\findx2-gui-native.exe"),
+            &roots
+        ));
+        assert!(is_official_product_entry(true, false, true, false, PRODUCTION_PIPE));
+        assert!(!is_official_product_entry(true, true, false, false, DEFAULT_ISOLATED_PIPE));
+        assert!(!is_official_product_entry(
+            true,
+            false,
+            false,
+            true,
+            DEFAULT_ISOLATED_PIPE
+        ));
+        assert!(!is_official_product_entry(false, false, true, false, PRODUCTION_PIPE));
     }
 }
 

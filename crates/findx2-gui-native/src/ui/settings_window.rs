@@ -18,7 +18,9 @@ use crate::settings_logic::{
 };
 use crate::theme::{FindxTokens, ThemeStyle};
 use crate::ui::update_card::{UpdateCardState, render_update_card};
-use crate::update_logic::UpdatePhase;
+use crate::update_logic::{
+    derive_update_phase, should_auto_check, start_silent_setup, UpdatePhase,
+};
 
 // Fixed-width content avoids Button's internal centered label changing each row's icon origin.
 fn settings_nav_content(icon: Icon, label: &'static str) -> impl IntoElement {
@@ -140,7 +142,11 @@ impl SettingsWindow {
             style,
             original_style: style,
             session,
-            tab: SettingsTab::Appearance,
+            tab: if std::env::var_os("FINDX_NATIVE_OPEN_ABOUT").is_some() {
+                SettingsTab::About
+            } else {
+                SettingsTab::Appearance
+            },
             original: settings.clone(),
             settings,
             theme,
@@ -931,35 +937,236 @@ impl SettingsWindow {
             .child({let e=cx.entity();Button::new("cancel-service").label("取消操作").on_click(move|_,_,cx|e.update(cx,|this,cx|{this.service_pending=None;cx.notify();}))})))
     }
 
+
+    fn persist_auto_check(&mut self, checked: bool, cx: &mut Context<Self>) {
+        self.update.auto_check = checked;
+        self.settings.auto_check_update = checked;
+        self.original.auto_check_update = checked;
+        self.session.update(cx, |session, cx| {
+            session.settings.auto_check_update = checked;
+            crate::session::persist_settings(session.settings.clone(), cx);
+        });
+        if checked {
+            let official = self.session.read(cx).official_product;
+            let last = self.session.read(cx).prefs.last_official_update_check_unix;
+            if should_auto_check(official, true, last) {
+                self.start_check(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn start_update_action(&mut self, cx: &mut Context<Self>) {
+        let official = self.session.read(cx).official_product;
+        if !official {
+            return;
+        }
+        let state = self.session.read(cx).update_state.clone();
+        let phase = derive_update_phase(
+            state.busy,
+            state.progress.as_ref(),
+            state.info.as_ref(),
+            state.downloaded_path.as_deref(),
+        );
+        match phase {
+            UpdatePhase::Available => self.start_download_install(cx),
+            UpdatePhase::Downloaded => self.start_install(cx),
+            UpdatePhase::Checking | UpdatePhase::Downloading => {}
+            UpdatePhase::Idle | UpdatePhase::Current | UpdatePhase::Error => self.start_check(cx),
+        }
+    }
+
+    fn start_check(&mut self, cx: &mut Context<Self>) {
+        if !self.session.read(cx).official_product {
+            return;
+        }
+        if self.session.read(cx).update_state.busy {
+            return;
+        }
+        self.session.update(cx, |session, cx| {
+            session.update_state.busy = true;
+            session.update_state.progress = None;
+            session.update_state.downloaded_path = None;
+            cx.notify();
+        });
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        cx.spawn(async move |this, cx| {
+            let info = cx
+                .background_spawn(async move { crate::update_logic::check_latest_release(&current) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.session.update(cx, |session, cx| {
+                    session.update_state.busy = false;
+                    session.update_state.info = Some(info);
+                    session.prefs.last_official_update_check_unix =
+                        crate::update_logic::now_unix();
+                    crate::session::persist_prefs(session.prefs.clone(), cx);
+                    cx.notify();
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_download_install(&mut self, cx: &mut Context<Self>) {
+        if !self.session.read(cx).official_product {
+            return;
+        }
+        if self.session.read(cx).update_state.busy {
+            return;
+        }
+        if self
+            .session
+            .read(cx)
+            .update_state
+            .downloaded_path
+            .is_some()
+        {
+            self.start_install(cx);
+            return;
+        }
+        let Some(url) = self
+            .session
+            .read(cx)
+            .update_state
+            .info
+            .as_ref()
+            .and_then(|i| i.download_url.clone())
+        else {
+            self.session.update(cx, |session, cx| {
+                if let Some(info) = session.update_state.info.as_mut() {
+                    info.ok = false;
+                    info.error = Some("没有可用的官方安装包下载地址。".into());
+                }
+                cx.notify();
+            });
+            return;
+        };
+        let expected = self
+            .session
+            .read(cx)
+            .update_state
+            .info
+            .as_ref()
+            .and_then(|i| i.asset_size);
+        self.session.update(cx, |session, cx| {
+            session.update_state.busy = true;
+            session.update_state.progress = Some(crate::update_logic::UpdateProgress {
+                downloaded: 0,
+                total: expected.unwrap_or(0),
+                percent: 0.0,
+            });
+            cx.notify();
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        cx.spawn(async move |this, cx| {
+            let worker = std::thread::spawn(move || {
+                crate::update_logic::download_official_setup(&url, expected, |progress| {
+                    let _ = tx.send(progress);
+                })
+            });
+            loop {
+                while let Ok(progress) = rx.try_recv() {
+                    let _ = this.update(cx, |this, cx| {
+                        this.session.update(cx, |session, cx| {
+                            session.update_state.progress = Some(progress);
+                            cx.notify();
+                        });
+                    });
+                }
+                if worker.is_finished() {
+                    break;
+                }
+                cx.background_spawn(async {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                })
+                .await;
+            }
+            let result = worker.join().unwrap_or_else(|_| Err("下载线程异常退出。".into()));
+            let _ = this.update(cx, |this, cx| {
+                this.session.update(cx, |session, cx| {
+                    session.update_state.busy = false;
+                    match &result {
+                        Ok(path) => {
+                            session.update_state.downloaded_path =
+                                Some(path.to_string_lossy().into_owned());
+                            session.update_state.progress = session.update_state.progress.take().map(|mut p| {
+                                p.percent = 100.0;
+                                p
+                            });
+                        }
+                        Err(e) => {
+                            if let Some(info) = session.update_state.info.as_mut() {
+                                info.ok = false;
+                                info.error = Some(e.clone());
+                            }
+                            session.update_state.progress = None;
+                        }
+                    }
+                    cx.notify();
+                });
+                if result.is_ok() {
+                    this.start_install(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_install(&mut self, cx: &mut Context<Self>) {
+        if !self.session.read(cx).official_product {
+            return;
+        }
+        let Some(path) = self.session.read(cx).update_state.downloaded_path.clone() else {
+            return;
+        };
+        match start_silent_setup(std::path::Path::new(&path)) {
+            Ok(()) => {
+                self.hint = "已启动安装程序。请在 UAC 提示中确认；安装完成后应用会由安装器拉起。".into();
+            }
+            Err(e) => {
+                self.hint = format!("未能启动安装：{e}").into();
+            }
+        }
+        cx.notify();
+    }
+
+
     fn render_advanced_tab(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
         let auto = self.update.auto_check;
         v_flex()
             .gap_4()
             .max_w(px(800.))
-            .child(render_update_card(
-                &self.update,
-                tokens,
-                {
-                    let entity = entity.clone();
-                    Rc::new(move |_, cx: &mut App, checked| {
-                        entity.update(cx, |this, cx| {
-                            this.update.auto_check = checked;
-                            this.settings.auto_check_update = checked;
-                            cx.notify();
-                        });
-                    })
-                },
-                {
-                    let entity = entity.clone();
-                    Rc::new(move |_, cx: &mut App, phase: UpdatePhase| {
-                        entity.update(cx, |this, cx| {
-                            this.update.set_demo(phase);
-                            cx.notify();
-                        });
-                    })
-                },
-            ))
+            .child({
+                let official = self.session.read(cx).official_product;
+                let runtime = self.session.read(cx).update_state.clone();
+                render_update_card(
+                    official,
+                    env!("CARGO_PKG_VERSION"),
+                    runtime,
+                    auto,
+                    tokens,
+                    {
+                        let entity = entity.clone();
+                        Rc::new(move |_, cx: &mut App, checked| {
+                            entity.update(cx, |this, cx| {
+                                this.persist_auto_check(checked, cx);
+                            });
+                        })
+                    },
+                    {
+                        let entity = entity.clone();
+                        Rc::new(move |_, cx: &mut App| {
+                            entity.update(cx, |this, cx| {
+                                this.start_update_action(cx);
+                            });
+                        })
+                    },
+                )
+            })
             .child(section_title("路径", tokens))
             .child(
                 v_flex()

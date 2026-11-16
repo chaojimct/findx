@@ -38,6 +38,8 @@ pub struct LocalPrefs {
     pub browser_fit_columns: bool,
     #[serde(default)]
     pub browser_column_widths: Option<[f32; 4]>,
+    #[serde(default)]
+    pub last_official_update_check_unix: i64,
 }
 
 fn default_true() -> bool {
@@ -62,6 +64,7 @@ impl Default for LocalPrefs {
             search_fit_columns: true,
             browser_fit_columns: true,
             browser_column_widths: None,
+            last_official_update_check_unix: 0,
         }
     }
 }

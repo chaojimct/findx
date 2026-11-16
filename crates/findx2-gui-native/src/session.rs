@@ -1,6 +1,7 @@
 use gpui_kit::*;
 
 use crate::cli::LaunchOptions;
+use crate::update_logic::OfficialUpdateState;
 use crate::ipc::IpcClient;
 use crate::prefs::{self, LocalPrefs};
 use crate::settings_logic::{EffectiveTheme, FindxGuiSettings, UiThemePref};
@@ -27,6 +28,7 @@ pub struct AppSession {
     pub system_dark: bool,
     pub preview_theme: Option<(theme::ThemeStyle, UiThemePref)>,
     pub settings_window: Option<AnyWindowHandle>,
+    pub update_state: OfficialUpdateState,
 }
 
 impl AppSession {
@@ -66,6 +68,7 @@ impl AppSession {
             system_dark,
             preview_theme: None,
             settings_window: None,
+            update_state: OfficialUpdateState::default(),
         }
     }
 

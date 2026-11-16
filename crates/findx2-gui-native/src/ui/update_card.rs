@@ -1,29 +1,70 @@
 use crate::theme::FindxTokens;
-use crate::update_logic::UpdatePhase;
+use crate::update_logic::{OfficialUpdateState, UpdateCardModel, update_card_model};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::{Disableable as _, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::rc::Rc;
+
 pub struct UpdateCardState {
     pub auto_check: bool,
 }
+
 impl UpdateCardState {
     pub fn new(auto_check: bool) -> Self {
         Self { auto_check }
     }
-    pub fn set_demo(&mut self, _: UpdatePhase) {}
 }
+
 pub fn render_update_card(
-    state: &UpdateCardState,
+    official_product: bool,
+    current_version: &str,
+    runtime: OfficialUpdateState,
+    auto_check: bool,
     tokens: FindxTokens,
     on_auto_check: Rc<dyn Fn(&mut Window, &mut App, bool)>,
-    _on_demo: Rc<dyn Fn(&mut Window, &mut App, UpdatePhase)>,
+    on_action: Rc<dyn Fn(&mut Window, &mut App)>,
 ) -> impl IntoElement {
-    v_flex().w_full().gap_2().p_3().bg(tokens.surface).border_1().border_color(tokens.border).rounded_md()
-    .child(div().child("应用更新 · 未连接安装协议"))
-    .child(div().text_sm().child(format!("当前 native-dev 版本 {}",env!("CARGO_PKG_VERSION"))))
-    .child(div().text_sm().child("此开发客户端不检查、下载或安装更新。更新请使用现有正式客户端；不展示虚构的新版本或下载进度。"))
-    .child(Button::new("update-protected").label("检查 / 安装更新（不可操作）").disabled(true))
-    .child(Checkbox::new("auto-check").checked(state.auto_check).label("自动检查偏好（只保存，本客户端不执行）").on_change(move|checked,w,cx|on_auto_check(w,cx,*checked)))
+    let model = update_card_model(official_product, current_version, &runtime, auto_check);
+    render_update_card_model(model, auto_check, tokens, on_auto_check, on_action)
+}
+
+fn render_update_card_model(
+    model: UpdateCardModel,
+    auto_check: bool,
+    tokens: FindxTokens,
+    on_auto_check: Rc<dyn Fn(&mut Window, &mut App, bool)>,
+    on_action: Rc<dyn Fn(&mut Window, &mut App)>,
+) -> impl IntoElement {
+    let button_enabled = model.button_enabled;
+    v_flex()
+        .w_full()
+        .gap_2()
+        .p_3()
+        .bg(tokens.surface)
+        .border_1()
+        .border_color(tokens.border)
+        .rounded_md()
+        .child(div().child(model.title))
+        .child(div().text_sm().child(model.version_line))
+        .child(div().text_sm().child(model.body))
+        .when_some(model.status, |v, status| v.child(div().text_sm().child(status)))
+        .when_some(model.progress_text, |v, text| v.child(div().text_sm().child(text)))
+        .child(
+            Button::new("update-action")
+                .label(model.button_label)
+                .disabled(!button_enabled)
+                .on_click(move |_, window, cx| {
+                    if button_enabled {
+                        on_action(window, cx);
+                    }
+                }),
+        )
+        .child(
+            Checkbox::new("auto-check")
+                .checked(auto_check)
+                .label(model.auto_check_label)
+                .on_change(move |checked, w, cx| on_auto_check(w, cx, *checked)),
+        )
 }
