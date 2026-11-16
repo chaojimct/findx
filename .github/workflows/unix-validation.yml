@@ -34,7 +34,7 @@ jobs:
           hdiutil attach -nobrowse -readonly -mountpoint "$mp" dist/*.dmg
           for binary in FindX findx2 fx findx2-service; do
             file "$mp/FindX.app/Contents/MacOS/$binary"
-            lipo -verify_arch "$(uname -m)" "$mp/FindX.app/Contents/MacOS/$binary"
+            lipo "$mp/FindX.app/Contents/MacOS/$binary" -verify_arch "$(uname -m)"
             xcrun vtool -show-build "$mp/FindX.app/Contents/MacOS/$binary"
           done
           ls -lR "$mp/FindX.app"
