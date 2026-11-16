@@ -1,6 +1,7 @@
 name: Native Unix validation (no publish)
 on:
   workflow_dispatch:
+  workflow_call:
 permissions:
   contents: read
 concurrency:
