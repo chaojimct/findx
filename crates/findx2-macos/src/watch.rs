@@ -14,6 +14,8 @@ use findx2_core::{ChangeEvent, ChangeWatcher, RawEntry, Result, WatchCursor};
 use libc::{lstat, stat, S_IFDIR, S_IFMT, S_IFREG};
 
 const FILE_EVENTS: u32 = 0x0000_0010;
+const USE_CF_TYPES: u32 = 0x0000_0001;
+const USE_EXTENDED_DATA: u32 = 0x0000_0040;
 const NO_DEFER: u32 = 0x0000_0002;
 const WATCH_ROOT: u32 = 0x0000_0004;
 const SINCE_NOW: u64 = u64::MAX;
@@ -99,6 +101,21 @@ extern "C" {
         callbacks: *const CFArrayCallBacks,
     ) -> CFArrayRef;
     fn CFRelease(cf: *const c_void);
+    fn CFGetTypeID(cf: *const c_void) -> usize;
+    fn CFArrayGetTypeID() -> usize;
+    fn CFArrayGetCount(array: CFArrayRef) -> isize;
+    fn CFArrayGetValueAtIndex(array: CFArrayRef, index: isize) -> *const c_void;
+    fn CFDictionaryGetTypeID() -> usize;
+    fn CFDictionaryGetValue(dictionary: *const c_void, key: *const c_void) -> *const c_void;
+    fn CFStringGetTypeID() -> usize;
+    fn CFStringGetCString(
+        string: CFStringRef,
+        buffer: *mut c_char,
+        size: isize,
+        encoding: u32,
+    ) -> u8;
+    fn CFNumberGetTypeID() -> usize;
+    fn CFNumberGetValue(number: *const c_void, number_type: isize, value: *mut c_void) -> u8;
     static kCFTypeArrayCallBacks: CFArrayCallBacks;
 }
 
@@ -193,7 +210,7 @@ pub fn watch_loop(root: &str, cursor: WatchCursor, tx: Sender<ChangeEvent>) -> R
             arr,
             since,
             0.5,
-            FILE_EVENTS | NO_DEFER | WATCH_ROOT,
+            FILE_EVENTS | NO_DEFER | WATCH_ROOT | USE_CF_TYPES | USE_EXTENDED_DATA,
         );
         CFRelease(arr as *const c_void);
         if stream.is_null() {
@@ -236,6 +253,74 @@ pub fn watch_loop(root: &str, cursor: WatchCursor, tx: Sender<ChangeEvent>) -> R
     })
 }
 
+// Extended-data keys are CFSTR macros in Apple's header, NOT exported symbols.
+// Create local equal CFStrings rather than trying to link nonexistent constants.
+struct OwnedCF(*const c_void);
+impl Drop for OwnedCF {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { CFRelease(self.0) };
+        }
+    }
+}
+fn stop_for_gap(state: &WatchState) {
+    state.gap.store(true, Ordering::SeqCst);
+    if let Ok(g) = state.runloop.lock() {
+        if let Some(rl) = *g {
+            unsafe { CFRunLoopStop(rl as CFRunLoopRef) };
+        }
+    }
+}
+
+// The stream uses UseCFTypes | UseExtendedData: a CFArray of dictionaries,
+// each with CFString "path" and optional CFNumber "fileID". No index-sized cache
+// or second filesystem walk is needed to identify a file after it was removed.
+unsafe fn extended_event(
+    paths: CFArrayRef,
+    index: isize,
+    path_key: *const c_void,
+    inode_key: *const c_void,
+) -> Option<(String, Option<u64>)> {
+    let dictionary = CFArrayGetValueAtIndex(paths, index);
+    if dictionary.is_null() || CFGetTypeID(dictionary) != CFDictionaryGetTypeID() {
+        return None;
+    }
+    let path = CFDictionaryGetValue(dictionary, path_key);
+    if path.is_null() || CFGetTypeID(path) != CFStringGetTypeID() {
+        return None;
+    }
+    // Darwin PATH_MAX is 1024 bytes; leave headroom and fail visibly on overflow.
+    let mut bytes = [0 as c_char; 4096];
+    if CFStringGetCString(
+        path,
+        bytes.as_mut_ptr(),
+        bytes.len() as isize,
+        KCF_STRING_ENCODING_UTF8,
+    ) == 0
+    {
+        return None;
+    }
+    let path = CStr::from_ptr(bytes.as_ptr())
+        .to_string_lossy()
+        .into_owned();
+    let number = CFDictionaryGetValue(dictionary, inode_key);
+    let mut inode = 0i64;
+    let inode = if !number.is_null()
+        && CFGetTypeID(number) == CFNumberGetTypeID()
+        && CFNumberGetValue(
+            number,
+            4, /* kCFNumberSInt64Type */
+            &mut inode as *mut _ as *mut c_void,
+        ) != 0
+        && inode != 0
+    {
+        Some(inode as u64)
+    } else {
+        None
+    };
+    Some((path, inode))
+}
+
 extern "C" fn fsevents_callback(
     _stream: FSEventStreamRef,
     info: *mut c_void,
@@ -244,48 +329,96 @@ extern "C" fn fsevents_callback(
     flags: *const c_uint,
     ids: *const u64,
 ) {
-    if info.is_null() {
+    if info.is_null() || num == 0 {
         return;
     }
     let state = unsafe { &*(info as *const WatchState) };
-    let paths = event_paths as *const *const c_char;
+    if event_paths.is_null()
+        || flags.is_null()
+        || ids.is_null()
+        || unsafe {
+            CFGetTypeID(event_paths) != CFArrayGetTypeID()
+                || CFArrayGetCount(event_paths) < 0
+                || (CFArrayGetCount(event_paths) as usize) < num
+        }
+    {
+        stop_for_gap(state);
+        return;
+    }
+    let path_key = OwnedCF(unsafe {
+        CFStringCreateWithCString(
+            ptr::null(),
+            b"path\0".as_ptr().cast(),
+            KCF_STRING_ENCODING_UTF8,
+        )
+    });
+    let inode_key = OwnedCF(unsafe {
+        CFStringCreateWithCString(
+            ptr::null(),
+            b"fileID\0".as_ptr().cast(),
+            KCF_STRING_ENCODING_UTF8,
+        )
+    });
+    if path_key.0.is_null() || inode_key.0.is_null() {
+        stop_for_gap(state);
+        return;
+    }
+    // Buffer only this delivered batch. Apply old-name removals before live-path
+    // upserts so a within-batch rename cannot finish as a tombstoned new name.
+    let mut events = Vec::new();
     for i in 0..num {
         let fl = unsafe { *flags.add(i) };
         let id = unsafe { *ids.add(i) };
         state.last_id.store(id, Ordering::SeqCst);
         if fl & (MUST_SCAN_SUBDIRS | USER_DROPPED | KERNEL_DROPPED | ROOT_CHANGED) != 0 {
-            state.gap.store(true, Ordering::SeqCst);
-            if let Ok(g) = state.runloop.lock() {
-                if let Some(rl) = *g {
-                    unsafe { CFRunLoopStop(rl as CFRunLoopRef) };
-                }
-            }
+            stop_for_gap(state);
             return;
         }
-        let p = unsafe { *paths.add(i) };
-        if p.is_null() {
-            continue;
+        let Some((path, inode)) =
+            (unsafe { extended_event(event_paths, i as isize, path_key.0, inode_key.0) })
+        else {
+            stop_for_gap(state);
+            return;
+        };
+        if let Some(event) = path_to_event(&path, fl, inode) {
+            events.push(event);
+        } else if fl & (ITEM_REMOVED | ITEM_RENAMED) != 0 && inode.is_none() {
+            // Never advertise healthy live deletion tracking after losing identity.
+            stop_for_gap(state);
+            return;
         }
-        let path = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
-        if let Some(ev) = path_to_event(&path, fl) {
-            let _ = state.tx.send(ev);
-        }
+    }
+    events.sort_by_key(|event| !matches!(event, ChangeEvent::Delete { .. }));
+    for event in events {
+        let _ = state.tx.send(event);
     }
 }
 
-fn path_to_event(path: &str, flags: u32) -> Option<ChangeEvent> {
+fn path_to_event(path: &str, flags: u32, event_inode: Option<u64>) -> Option<ChangeEvent> {
     if crate::scan::should_skip_name(Path::new(path).file_name()?.to_str()?) {
         return None;
     }
+    let current = lstat_ino(path);
     if flags & ITEM_REMOVED != 0 {
-        if let Some(st) = lstat_ino(path) {
-            return Some(ChangeEvent::Delete { file_id: st.0 });
+        if let Some(inode) = event_inode {
+            if current.as_ref().is_none_or(|st| st.0 != inode) {
+                return Some(ChangeEvent::Delete { file_id: inode });
+            }
         }
-        return None;
+        if current.is_none() {
+            return None;
+        }
+        // Coalesced remove/create of the same inode: the current live path wins.
     }
-    let st = lstat_ino(path)?;
+    let Some(st) = current else {
+        return if flags & ITEM_RENAMED != 0 {
+            event_inode.map(|file_id| ChangeEvent::Delete { file_id })
+        } else {
+            None
+        };
+    };
     let (ino, parent, name, size, mtime, ctime, is_dir) = st;
-    if flags & ITEM_CREATED != 0 {
+    if flags & (ITEM_CREATED | ITEM_RENAMED | ITEM_REMOVED) != 0 {
         return Some(ChangeEvent::CreatePending {
             file_id: ino,
             file_id_128: None,
@@ -293,13 +426,6 @@ fn path_to_event(path: &str, flags: u32) -> Option<ChangeEvent> {
             name,
             attrs: if is_dir { 0x10 } else { 0 },
             is_dir,
-        });
-    }
-    if flags & ITEM_RENAMED != 0 {
-        return Some(ChangeEvent::Rename {
-            file_id: ino,
-            new_parent_id: parent,
-            new_name: name,
         });
     }
     if flags & (ITEM_MODIFIED | ITEM_INODE_META) != 0 {
@@ -363,4 +489,55 @@ fn parent_ino(path: &str) -> Option<u64> {
         return None;
     }
     Some(st.st_ino)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removed_and_moved_out_paths_use_native_inode_after_unlink() {
+        let missing =
+            std::env::temp_dir().join(format!("findx-fsevents-missing-{}", std::process::id()));
+        assert!(!missing.exists());
+        let path = missing.to_str().unwrap();
+        assert!(matches!(
+            path_to_event(path, ITEM_REMOVED, Some(42)),
+            Some(ChangeEvent::Delete { file_id: 42 })
+        ));
+        assert!(matches!(
+            path_to_event(path, ITEM_RENAMED, Some(43)),
+            Some(ChangeEvent::Delete { file_id: 43 })
+        ));
+        assert!(path_to_event(path, ITEM_REMOVED, None).is_none());
+    }
+
+    #[test]
+    fn live_rename_and_coalesced_recreate_are_upserts_not_missing_row_renames() {
+        use std::os::unix::fs::MetadataExt;
+        let path = std::env::temp_dir().join(format!(
+            "findx-fsevents-live-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        for flags in [ITEM_RENAMED, ITEM_REMOVED | ITEM_CREATED] {
+            assert!(
+                matches!(path_to_event(path.to_str().unwrap(), flags, Some(inode)), Some(ChangeEvent::CreatePending { file_id, .. }) if file_id == inode)
+            );
+        }
+        // A stale removal must not delete a new file that now occupies the path.
+        assert!(
+            matches!(path_to_event(path.to_str().unwrap(), ITEM_REMOVED, Some(inode + 1)), Some(ChangeEvent::Delete { file_id }) if file_id == inode + 1)
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 }

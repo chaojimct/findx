@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import sys
 import shutil
 import subprocess
 import time
@@ -13,7 +14,11 @@ p=argparse.ArgumentParser();p.add_argument("--service", required=True);p.add_arg
 a=p.parse_args(); work=Path(a.work).resolve();work.mkdir(parents=True,exist_ok=False)
 volume=work/"volume";volume.mkdir();home=work/"home";home.mkdir();runtime=work/"runtime";runtime.mkdir(mode=0o700)
 (volume/"alpha-t162-fixture.txt").write_text("one")
-index=work/"index.bin";endpoint=runtime/"findx2.sock"
+index=work/"index.bin"
+# Match findx2_ipc::unix_socket_path: Darwin uses per-user Application Support,
+# Linux uses XDG_RUNTIME_DIR. A Linux-only expected path hides real Mac IPC.
+endpoint=(home/"Library/Application Support/FindX/findx2.sock") if sys.platform=="darwin" else (runtime/"findx2.sock")
+assert len(os.fsencode(endpoint)) < (104 if sys.platform=="darwin" else 108), f"fixture socket path too long: {endpoint}"
 env=dict(os.environ,HOME=str(home),XDG_RUNTIME_DIR=str(runtime),TMPDIR=str(work))
 command=[str(Path(a.service).resolve()),"--index",str(index),"--volume",str(volume),"--pipe","findx2","--no-backfill","--save-interval-secs","3600"]
 log=(work/"service.log").open("w"); proc=None

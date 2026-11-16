@@ -21,7 +21,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Native tests (Darwin, not cross-compiled)
-        run: cargo test --locked -p findx2-gui-native --lib && cargo test --locked -p findx2-service
+        run: cargo test --locked -p findx2-macos && cargo test --locked -p findx2-gui-native --lib && cargo test --locked -p findx2-service
       - name: Build native app and DMG (no signing credentials)
         run: bash installer/macos/pack-macos.sh --version 2.5.2 --out "$GITHUB_WORKSPACE/dist"
       - name: Verify real DMG and app binaries
