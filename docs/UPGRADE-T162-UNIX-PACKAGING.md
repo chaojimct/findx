@@ -76,7 +76,7 @@ bash installer/unix/pack-linux.sh --skip-build --out dist
 通道不变：`GET https://api.github.com/repos/chaojimct/findx/releases/latest`，比较 semver，再按平台挑选官方资产：
 
 - Windows：`FindX-*-setup.exe`（拒绝 isolated/fixture/drill）
-- Linux：若 `FindX.pkgformat=deb`（或未写明）优先 `.deb`，否则 `.tar.gz`
+- Linux：`FindX.pkgformat=deb` 只接受 `.deb`，`tar` 只接受 `.tar.gz`，不静默切换包管理权；未知格式优先 `.deb`
 - macOS：`FindX-*-macos-aarch64.dmg` 或 `FindX-*-macos-x64.dmg`
 
 Linux 安装使用固定 `/usr/bin/pkexec`，否则 `/usr/bin/sudo -n`（无图形提权器且 sudo 未授权时明确失败，不在无终端 GUI 中等密码），执行 `apt-get install` 或在普通用户私有目录中验证解包后执行官方 `install.sh`。tar 拒绝链接、越界、重复文件及未知布局。更新前停止当前用户已核对的服务，安装后恢复其原运行状态；不会启动原本停止的引擎。

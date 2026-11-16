@@ -437,8 +437,8 @@ pub fn pick_official_asset_name(
             .find(|n| n.to_ascii_lowercase().ends_with(".tar.gz"))
             .copied();
         return match linux_format {
-            LinuxPackageFormat::Deb => deb.or(tar),
-            LinuxPackageFormat::Tar => tar.or(deb),
+            LinuxPackageFormat::Deb => deb,
+            LinuxPackageFormat::Tar => tar,
             LinuxPackageFormat::Unknown => deb.or(tar),
         }
         .map(|s| s.to_string());
@@ -959,6 +959,15 @@ pub fn linux_install_plan(path: &Path) -> Result<InstallPlan, String> {
         vec![]
     };
     let lower = name.to_ascii_lowercase();
+    match current_linux_package_format() {
+        LinuxPackageFormat::Deb if !lower.ends_with(".deb") => {
+            return Err("deb 安装不得通过 tar 更新绕过包管理器".into());
+        }
+        LinuxPackageFormat::Tar if !lower.ends_with(".tar.gz") => {
+            return Err("tar 安装不得静默切换到 deb 包管理器".into());
+        }
+        _ => {}
+    }
     if lower.ends_with(".deb") {
         args.extend([
             "/usr/bin/env".into(),
@@ -1624,6 +1633,25 @@ mod unix_install_tests {
 #[cfg(test)]
 mod followup_safety_tests {
     use super::*;
+    #[test]
+    fn linux_update_never_switches_package_ownership() {
+        assert_eq!(
+            pick_official_asset_name(
+                &["FindX-2.5.3-linux-x64.tar.gz"],
+                UpdatePlatform::LinuxX64,
+                LinuxPackageFormat::Deb
+            ),
+            None
+        );
+        assert_eq!(
+            pick_official_asset_name(
+                &["FindX-2.5.3-linux-x64.deb"],
+                UpdatePlatform::LinuxX64,
+                LinuxPackageFormat::Tar
+            ),
+            None
+        );
+    }
     #[test]
     fn official_downloads_reject_foreign_hosts_and_busy_install_is_disabled() {
         assert!(
