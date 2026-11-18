@@ -94,6 +94,8 @@ jobs:
             ${{ runner.temp }}/FindXUpgradeTest_*/**/render-health.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/normal-exit.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/service-health.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/service-status-last.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/owned-volume.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/platform-applied.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/reason.code
             ${{ runner.temp }}/FindXUpgradeTest_*/**/service-uninitialized.flag

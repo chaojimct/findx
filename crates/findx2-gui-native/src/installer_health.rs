@@ -16,7 +16,7 @@ pub fn prepare(root: &str) -> Result<Vec<String>, String> {
         std::env::set_var("XDG_DATA_HOME",path.join("profile/data"));std::env::set_var("XDG_CONFIG_HOME",path.join("profile/config")); }
     ROOT.set(path).map_err(|_|"health already initialized")?;
     let previous=std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {if let Some(root)=ROOT.get(){let _=std::fs::write(root.join("panic.log"),format!("{info}\n{}",std::backtrace::Backtrace::force_capture()));} previous(info);}));
+    std::panic::set_hook(Box::new(move |info| {if let Some(root)=ROOT.get(){let _=std::fs::write(root.join("panic.log"),format!("{info}"));} previous(info);}));
     checkpoint("prepared");
     Ok(vec!["FindX".into(),"--mock".into(),"--pipe".into(),format!("findx-installer-health-{}",std::process::id())])
 }
@@ -32,9 +32,10 @@ pub fn rendered(window: &mut gpui_kit::Window, prefs: crate::prefs::LocalPrefs, 
                 let _=std::fs::write(root.join("render-health.json"),record.to_string()); }
             READY.store(ok,Ordering::SeqCst);
             cx.quit();
-        } else {window.request_animation_frame();}
+        } else {window.refresh();}
     });
-    window.request_animation_frame();
+    // on_next_frame schedules delivery. Its callback refreshes the window only
+    // after paint, without requiring GPUI current_view outside prepaint/paint.
 }
 pub fn finished() -> bool {
     let Some(root)=ROOT.get() else{return true};

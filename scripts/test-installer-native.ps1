@@ -9,6 +9,7 @@ $null=[IO.Directory]::CreateDirectory($base)
 $rows=[Collections.Generic.List[object]]::new()
 Import-Module (Join-Path $repo 'installer\transaction-files.psm1') -Force -Global
 Import-Module (Join-Path $repo 'installer\transaction-platform.psm1') -Force -Global
+Import-Module (Join-Path $PSScriptRoot 'test-owned-ntfs-volume.psm1') -Force
 Enable-FxTxFullSecurity
 function Journal([string]$root){return (Get-Content -LiteralPath (Join-Path $root 'journal.json') -Raw -Encoding UTF8 | ConvertFrom-Json)}
 function AssertGuiHealth([string]$root){
@@ -64,17 +65,29 @@ foreach($case in @('fresh-no-service','published252-stopped-service','backup-fai
  $id=[guid]::NewGuid().ToString('N');$service='FindXUpgradeTest_'+$id;$pipe='findx-upgrade-test-'+$id
  $root=Join-Path $base $case;$app=Join-Path $root 'app 中文 space';$data=Join-Path $root 'index state';$native=Join-Path $root 'native config';$legacy=Join-Path $root 'legacy config';$tx=Join-Path $root 'tx';$stage=Join-Path $root 'payload';$build=Join-Path $root 'build'
  foreach($p in @($root,$data,$native,$legacy,$stage,$build)){ $null=[IO.Directory]::CreateDirectory($p) }
- $created=$false;$originalServicePid=0;$ownedUninstall=''
+ $created=$false;$originalServicePid=0;$ownedUninstall='';$ownedVolumeImage='';$volume='C:'
  try{
+  Write-Output ('NATIVE_CASE_START='+$case)
   Copy-Item -Path (Join-Path $CandidatePayload '*') -Destination $stage -Recurse
   Assert ((Hash (Join-Path $stage 'FindX.exe')) -eq (Hash (Join-Path $CandidatePayload 'FindX.exe'))) 'Candidate copy changed'
   # Create a real small public index with the UNCHANGED published engine, no watch/backfill/host.
   $owned=Join-Path $root 'owned public fixture';$null=[IO.Directory]::CreateDirectory($owned);[IO.File]::WriteAllText((Join-Path $owned 'owned.txt'),'installer safety fixture')
+  if($case -in @('new-service-ipc','new-service-health-rollback')){
+   # --no-watch deliberately reports healthy=false in the published252engine.
+   # Positive readiness therefore uses real USN ONLY on a new guarded tiny VHD.
+   $ownedVolumeImage=Join-Path $root 'owned-health.vhd'
+   $privateVolume=New-FxOwnedTestVolume $ownedVolumeImage ('FXTX'+$id.Substring(0,8).ToUpperInvariant())
+   $volume=$privateVolume.Volume
+   [IO.File]::WriteAllText((Join-Path $privateVolume.Root 'owned-health.txt'),'own tiny real NTFS fixture')
+  }
   if($case -ne 'fresh-selected-no-index'){
   $stop=Join-Path $root 'foreground-stop.signal';[IO.File]::WriteAllText($stop,'stop')
   # PS5 promotes informational native stderr into terminating ErrorRecords under
   # ErrorActionPreference=Stop. Capture native streams, judge actual exit status.
-  $pi=[Diagnostics.ProcessStartInfo]::new((Join-Path $PublishedPayload 'findx2-service.exe'),('--fixture-root "'+$owned+'" --index "'+(Join-Path $data 'index.bin')+'" --volume C: --pipe '+$pipe+' --no-watch --no-backfill --no-everything-ipc --shutdown-file "'+$stop+'"'))
+  $indexExecutable=Join-Path $PublishedPayload 'findx2-service.exe'
+  $indexArguments='--fixture-root "'+$owned+'" --index "'+(Join-Path $data 'index.bin')+'" --volume C: --pipe '+$pipe+' --no-watch --no-backfill --no-everything-ipc --shutdown-file "'+$stop+'"'
+  if($ownedVolumeImage){$indexExecutable=Join-Path $PublishedPayload 'findx2.exe';$indexArguments='index --volume '+$volume+' --output "'+(Join-Path $data 'index.bin')+'"'}
+  $pi=[Diagnostics.ProcessStartInfo]::new($indexExecutable,$indexArguments)
   $pi.UseShellExecute=$false;$pi.CreateNoWindow=$true;$pi.RedirectStandardOutput=$true;$pi.RedirectStandardError=$true
   $child=[Diagnostics.Process]::Start($pi);$stdout=$child.StandardOutput.ReadToEndAsync();$stderr=$child.StandardError.ReadToEndAsync()
   Assert ($child.WaitForExit(30000)) 'Published engine fixture creation timed out; no force-stop'
@@ -101,6 +114,7 @@ foreach($case in @('fresh-no-service','published252-stopped-service','backup-fai
   $setup=Join-Path $build 'FindX-2.5.3-fixture-setup.exe';$fault=if($case -eq 'backup-failure'){'backup'}elseif($case -in @('health-rollback','new-service-health-rollback')){'health'}elseif($case -eq 'platform-rollback'){'post-platform'}elseif($case -eq 'stop-timeout'){'stop-timeout'}elseif($case -eq 'interrupted-recovery'){'interrupt-after-copy'}else{'none'}
   $args='/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOICONS /COMPONENTS="main,clicfg" /TASKS="" /DIR="'+$app+'" /TXROOT="'+$tx+'" /TXDATA="'+$data+'" /TXNATIVE="'+$native+'" /TXLEGACY="'+$legacy+'" /TXFAULT='+$fault+' /LOG="'+(Join-Path $root 'setup.log')+'"'
   $group=Join-Path $root 'shortcuts group';$desktop=Join-Path $root 'shortcuts desktop'
+  if($ownedVolumeImage){$args+=' /TXIMAGE="'+$ownedVolumeImage+'"'}
   $args+=' /TXGROUP="'+$group+'" /TXDESKTOP="'+$desktop+'"'
   if($case -in @('new-service-ipc','new-service-health-rollback','fresh-selected-no-index')){$args=$args.Replace('/COMPONENTS="main,clicfg"','/COMPONENTS="main,servicec,clicfg"')}
   $pathBefore=[Environment]::GetEnvironmentVariable('Path','Machine');$shortcutsBefore=@()
@@ -116,10 +130,13 @@ foreach($case in @('fresh-no-service','published252-stopped-service','backup-fai
    foreach($link in @((Join-Path $group 'FindX.lnk'),(Join-Path $group '卸载 FindX.lnk'),(Join-Path $desktop 'FindX.lnk'))){
     $comStep='create shortcut';try{
      $sc=$ws.CreateShortcut([string]$link)
-     $comStep='set target';$sc.TargetPath=[string](Join-Path $app 'FindX.exe')
+     $target=(Resolve-Path -LiteralPath (Join-Path $app 'FindX.exe')).ProviderPath
+     Assert ([IO.File]::Exists($target) -and $target.Length -lt 260 -and $target -notmatch '["\r\n]') 'Invalid real COM fixture target'
+     [IO.File]::WriteAllText((Join-Path $root 'shortcut-target.log'),($target+"`nlength="+$target.Length))
+     $comStep='set canonical quoted target';$sc.TargetPath='"'+$target+'"'
      $comStep='set arguments';$sc.Arguments=[string]'--help'
      $comStep='set description';$sc.Description=[string]'old owned fixture'
-     $comStep='save';$sc.Save();$shortcutsBefore+=@{path=$link;hash=(Hash $link)}
+     $comStep='save';$sc.Save();Assert (($ws.CreateShortcut([string]$link)).TargetPath -ieq $target) 'Real COM shortcut target did not round-trip';$shortcutsBefore+=@{path=$link;hash=(Hash $link)}
     }catch{throw ('Owned shortcut COM fixture failed at '+$comStep+' ['+$link+']: '+$_.Exception.ToString())}
    }
    $args=$args.Replace('/NOICONS ','').Replace('/TASKS=""','/TASKS="addpath,desktopicon"')
@@ -128,7 +145,7 @@ foreach($case in @('fresh-no-service','published252-stopped-service','backup-fai
   $expectedSuccess=$case -in @('fresh-no-service','published252-stopped-service','reentry-refusal','new-service-ipc','fresh-selected-no-index')
   if($expectedSuccess){Assert ($process.ExitCode -eq 0) ('Expected success, got '+$process.ExitCode);Assert ((Get-Content -LiteralPath (Join-Path $tx 'journal.json') -Raw -Encoding UTF8 | ConvertFrom-Json).state -eq 'committed') 'No commit record'}else{Assert ($process.ExitCode -ne 0) 'Fault did not refuse package'}
   Assert ((Hash (Join-Path $native 'prefs.json')) -eq $oldConfig) 'Config changed'
-  if($oldIndex){Assert ((Hash (Join-Path $data 'index.bin')) -eq $oldIndex) 'Index not restored exactly'}else{Assert (-not (Test-Path -LiteralPath (Join-Path $data 'index.bin'))) 'Installer fabricated an index'}
+  if($oldIndex){$verifyOld=if($case -eq 'new-service-ipc'){Join-Path $tx 'backup\data\index.bin'}else{Join-Path $data 'index.bin'};Assert ((Hash $verifyOld) -eq $oldIndex) 'Original persisted index not preserved exactly'}else{Assert (-not (Test-Path -LiteralPath (Join-Path $data 'index.bin'))) 'Installer fabricated an index'}
   if($case -in @('backup-failure','health-rollback','legacy-running-refusal','stop-timeout')){Assert ((Hash (Join-Path $app 'FindX.exe')) -eq $oldGui) 'Old GUI binary changed on refusal/rollback'}
   if($case -in @('health-rollback','new-service-health-rollback')){
    $j=Journal $tx
@@ -210,10 +227,18 @@ foreach($case in @('fresh-no-service','published252-stopped-service','backup-fai
     & "$env:SystemRoot\System32\sc.exe" delete $service | Out-Null
     if($LASTEXITCODE){throw 'Owned service deletion failed'}
    }finally{$controller.Dispose()}}
+   if($ownedVolumeImage -and (Test-Path -LiteralPath $ownedVolumeImage)){
+    $until=[DateTime]::UtcNow.AddSeconds(10)
+    do{$writers=@(Get-CimInstance Win32_Process -Filter "Name='findx2-service.exe'" | Where-Object {$_.ExecutablePath -ieq (Join-Path $app 'findx2-service.exe')});if(-not $writers.Count){break};Start-Sleep -Milliseconds 100}while([DateTime]::UtcNow -lt $until)
+    if($writers.Count){throw 'Owned engine still alive; volume retained, never detached underneath it'}
+    $image=Get-DiskImage -ImagePath $ownedVolumeImage -ErrorAction Stop
+    if($image.Attached){Dismount-DiskImage -ImagePath $ownedVolumeImage -ErrorAction Stop}
+   }
   }catch{
    $rows[$rows.Count-1]['passed']=$false;$rows[$rows.Count-1]['cleanupError']=$_.Exception.ToString()
   }
   Write-NativeResults
+  Write-Output ('NATIVE_CASE_END='+$case+' passed='+$rows[$rows.Count-1]['passed'])
  }
 }
 Write-NativeResults

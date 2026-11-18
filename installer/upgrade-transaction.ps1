@@ -6,6 +6,7 @@ param(
  [string]$InstallRoot,[string]$DataRoot,[string]$NativeConfigRoot,[string]$LegacyConfigRoot,
  [string]$ServiceName='FindX2Search',[string]$PipeName='findx2',[string]$ExpectedVersion,
  [int]$InstallService=0,[int]$TimeoutSeconds=12,[int]$AddPath=0,[string]$UninstallKey,[string]$GroupRoot,[string]$DesktopRoot,[int]$CreateGroup=0,
+ [string]$TestVolumeImage='',
  [switch]$TestBuild,[ValidateSet('none','backup','health','stop-timeout','interrupt-after-copy','post-platform')][string]$Fault='none'
 )
 Set-StrictMode -Version Latest
@@ -193,10 +194,11 @@ function Wait-NewServiceReady {
   if($svc -and $svc.State -eq 'Running' -and $svc.ProcessId){
    try {
     $status=Read-FxTxServiceStatus $script:s.pipeName ([int]$svc.ProcessId)
+    [IO.File]::WriteAllText((Join-Path $TransactionRoot 'service-status-last.json'),(@{scmPid=$svc.ProcessId;scmState=$svc.State;status=$status} | ConvertTo-Json -Depth 8))
     if(-not $status.loading -and $status.healthy){
      [IO.File]::WriteAllText((Join-Path $TransactionRoot 'service-health.json'),($status | ConvertTo-Json -Depth 8));return
     }
-    $last='Index loading or health failure'
+    $last='Index loading or health failure: '+($status | ConvertTo-Json -Depth 8 -Compress)
    }catch{$last=$_.Exception.Message}
   }else{$last='Service is not running'}
   Start-Sleep -Milliseconds 100
@@ -244,8 +246,21 @@ try{
   if(Test-Path -LiteralPath (Join-Path $TransactionRoot 'journal.json')){throw 'Unfinished/existing transaction requires recovery, not overwrite'}
   if(Test-Path -LiteralPath $TransactionRoot){throw 'Transaction root must be new; prior evidence retained'}
   Set-FxTxPrivateDirectory $TransactionRoot
-  $script:s=[pscustomobject]@{schema=2;installerOwner=$null;state='created';roots=[pscustomobject]$roots;serviceName=$ServiceName;pipeName=$PipeName;expectedVersion=$ExpectedVersion;installService=($InstallService -eq 1);timeoutSeconds=$TimeoutSeconds;testBuild=[bool]$TestBuild;fault=$Fault;platform=$null;backupVerified=$false;createdService=$false;original=[pscustomobject]@{serviceExists=$false;serviceRunning=$false;guiRunning=$false;guiStopped=$false;guiExitRequested=$false;serviceCommand='';serviceStartMode=''};error=''}
+  $script:s=[pscustomobject]@{schema=2;installerOwner=$null;state='created';roots=[pscustomobject]$roots;serviceName=$ServiceName;pipeName=$PipeName;expectedVersion=$ExpectedVersion;installService=($InstallService -eq 1);timeoutSeconds=$TimeoutSeconds;testVolume='C:';ownedTestVolume=$false;testBuild=[bool]$TestBuild;fault=$Fault;platform=$null;backupVerified=$false;createdService=$false;original=[pscustomobject]@{serviceExists=$false;serviceRunning=$false;guiRunning=$false;guiStopped=$false;guiExitRequested=$false;serviceCommand='';serviceStartMode=''};error=''}
   $script:lock=[IO.File]::Open((Join-Path $TransactionRoot 'phase.lock'),'OpenOrCreate','ReadWrite','None')
+  if($TestVolumeImage){
+   if(-not $TestBuild){throw 'Test volume is forbidden in production'}
+   $image=Get-FxTxPath $TestVolumeImage
+   if($image -ine (Join-Path ([IO.Path]::GetDirectoryName($TransactionRoot)) 'owned-health.vhd')){throw 'Test image must be the exact owned case image'}
+   $diskImage=Get-DiskImage -ImagePath $image -ErrorAction Stop
+   $disk=$diskImage | Get-Disk -ErrorAction Stop
+   if(-not $diskImage.Attached -or $disk.IsBoot -or $disk.IsSystem -or $disk.Size -ne 67108864 -or [int]$disk.BusType -ne 15){throw 'Only the owned 64MiB virtual disk is permitted'}
+   $parts=@($disk | Get-Partition | Where-Object {$_.DriveLetter})
+   if($parts.Count -ne 1){throw 'Owned test volume must have one letter'}
+   $vol=$parts[0] | Get-Volume
+   if($vol.FileSystem -ne 'NTFS' -or $vol.FileSystemLabel -notmatch '^FXTX[0-9A-F]{8}$'){throw 'Owned NTFS label mismatch'}
+   $script:s.testVolume=([string]$parts[0].DriveLetter)+':';$script:s.ownedTestVolume=$true
+  }
   Save-State;Enter-InstallerLease
   $svc=Get-ExactService
   if($svc){$script:s.original.serviceExists=$true;$script:s.original.serviceRunning=($svc.State -eq 'Running');$script:s.original.serviceCommand=$svc.PathName;$script:s.original.serviceStartMode=$svc.StartMode;if($svc.State -notin @('Running','Stopped')){throw 'Service in transition; unchanged'}}
@@ -292,8 +307,8 @@ try{
    if($script:s.installService -and -not $script:s.original.serviceExists){
     # Registration is exact-name and happens ONLY after verified backup/file copy.
     $exe=Join-Path $script:s.roots.app 'findx2-service.exe'
-    $cmd='"'+$exe+'" --service --index "'+(Join-Path $script:s.roots.data 'index.bin')+'" --volume C: --pipe '+$script:s.pipeName
-    if($script:s.testBuild){$cmd+=' --no-watch --no-backfill --no-everything-ipc'}
+    $cmd='"'+$exe+'" --service --index "'+(Join-Path $script:s.roots.data 'index.bin')+'" --volume '+$script:s.testVolume+' --pipe '+$script:s.pipeName
+    if($script:s.testBuild){$cmd+=' --no-backfill --no-everything-ipc';if(-not $script:s.ownedTestVolume){$cmd+=' --no-watch'}}
     # Persist ownership only AFTER successful creation; never delete a concurrently
     # created service merely because our New-Service call failed.
     $index=Join-Path $script:s.roots.data 'index.bin'

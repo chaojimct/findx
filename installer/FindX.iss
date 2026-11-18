@@ -1,4 +1,4 @@
-﻿; FindX native Windows Inno Setup (publication blocked until upgrade gates pass)
+; FindX native Windows Inno Setup (publication blocked until upgrade gates pass)
 ; 构建: 1) 在仓库根/ gui 中完成 tauri build --no-bundle
 ;       2) powershell -File installer\stage-inno.ps1
 ;       3) iscc /DMyAppVersion=x.y.z installer\FindX.iss
@@ -265,7 +265,10 @@ begin
     if WizardNoIcons then Args := Args + '0' else Args := Args + '1';
 #ifdef TxTestBuild
     Fault := ExpandConstant('{param:TXFAULT|none}');
-    Args := Args + ' -TestBuild -TimeoutSeconds 3 -Fault ' + TxQuote(Fault);
+    Args := Args + ' -TestBuild -Fault ' + TxQuote(Fault);
+    if ExpandConstant('{param:TXIMAGE|}') <> '' then
+      Args := Args + ' -TestVolumeImage ' + TxQuote(ExpandConstant('{param:TXIMAGE|}')) + ' -TimeoutSeconds 20'
+    else Args := Args + ' -TimeoutSeconds 3';
 #endif
   end;
   Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Args, '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0);
