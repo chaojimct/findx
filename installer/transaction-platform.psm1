@@ -51,11 +51,14 @@ function Restore-FxTxRegistryTree($Spec,$Tree) {
   $key=$base.OpenSubKey($Spec.path,$true)
   if(-not $key){throw 'Original registration key disappeared; refusing to fabricate its unknown audit security'}
   try{
+   # Inno never changes an existing registration ACL. Do not convert a legacy
+   # ACL inheritance model merely to restore values; preserve its audit ACL too.
+   if($key.GetAccessControl().GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All) -cne $Tree.sddl){throw 'Existing registry security changed externally; no unsafe ACL rewrite'}
    foreach($name in @($key.GetValueNames())){if($name -notin @($Tree.values | ForEach-Object {$_.name})){$key.DeleteValue($name,$false)}}
    foreach($v in $Tree.values){Set-FxTxRegistryValue $key $v}
    foreach($name in @($key.GetSubKeyNames())){if($name -notin @($Tree.children | ForEach-Object {$_.name})){$key.DeleteSubKeyTree($name,$false)}}
    foreach($child in $Tree.children){Restore-FxTxRegistryTree ([pscustomobject]@{hive=$Spec.hive;path=$Spec.path+'\'+$child.name}) $child.tree}
-   $acl=[Security.AccessControl.RegistrySecurity]::new();$acl.SetSecurityDescriptorSddlForm($Tree.sddl,([Security.AccessControl.AccessControlSections]::Access -bor [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group));$key.SetAccessControl($acl);$key.Flush()
+   $key.Flush()
   }finally{$key.Dispose()}
  }finally{$base.Dispose()}
 }

@@ -121,6 +121,14 @@ Case 'locked destination rollback fails without deleting source or backup' {
     Assert ([IO.File]::Exists((Join-Path $x.Root 'failed-new\restore.complete.json'))) 'Interrupted recovery did not resume'
     $null=Restore-FxTxVerifiedBackup $x.Backup (Join-Path $x.Root 'failed-new')
 }
+Case 'legacy DACL inheritance model restored exactly, not normalized away' {
+    $x=Fixture 'legacy-dacl';$p=(Get-ChildItem -LiteralPath $x.App -File | Select-Object -First 1).FullName
+    $sd=(Get-Acl -LiteralPath $p).Sddl.Replace('D:AI','D:')
+    [FxTxNativeStreams]::RestoreLegacyDacl($p,$sd)
+    $before=(Get-Acl -LiteralPath $p).Sddl;$null=New-FxTxVerifiedBackup $x.Roots $x.Backup
+    $null=Restore-FxTxVerifiedBackup $x.Backup (Join-Path $x.Root 'failed-new')
+    Assert ((Get-Acl -LiteralPath $p).Sddl -ceq $before) 'Exact legacy DACL model changed'
+}
 Case 'unowned pre-existing recovery folder is not reused' {
     $x=Fixture 'foreign-recovery';$null=New-FxTxVerifiedBackup $x.Roots $x.Backup;$e=Join-Path $x.Root 'foreign';$null=[IO.Directory]::CreateDirectory($e)
     MustThrow {Restore-FxTxVerifiedBackup $x.Backup $e} 'Unknown recovery directory reused'

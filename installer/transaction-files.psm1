@@ -38,6 +38,17 @@ public static class FxTxNativeStreams {
  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr FindFirstStreamW(string path,int level,out StreamData data,int flags);
  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool FindNextStreamW(IntPtr handle,out StreamData data);
  [DllImport("kernel32.dll")] static extern bool FindClose(IntPtr handle);
+ [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool SetFileSecurityW(string path,uint information,byte[] descriptor);
+ public static void RestoreLegacyDacl(string path,string sddl) {
+  var sd=new System.Security.AccessControl.RawSecurityDescriptor(sddl);
+  // Set-Acl/SetNamedSecurityInfo converts legacy ACLs to the modern automatic
+  // inheritance model. Preserve the original model instead of ignoring AI in
+  // readback. DACL-only SetFileSecurity deliberately does not propagate to children.
+  if((sd.ControlFlags & System.Security.AccessControl.ControlFlags.DiscretionaryAclAutoInherited)!=0)return;
+  if((sd.ControlFlags & System.Security.AccessControl.ControlFlags.DiscretionaryAclAutoInheritRequired)!=0)throw new InvalidOperationException("Unstable requested inheritance transition; retained backup");
+  byte[] raw=new byte[sd.BinaryLength];sd.GetBinaryForm(raw,0);
+  if(!SetFileSecurityW(path,4,raw))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Cannot restore exact legacy DACL model");
+ }
  public static void RequireUnnamedOnly(string path) {
   StreamData data; IntPtr h=FindFirstStreamW(path,0,out data,0);
   if(h==new IntPtr(-1)){int e=Marshal.GetLastWin32Error();if(e==38)return;throw new System.ComponentModel.Win32Exception(e,"Cannot verify NTFS streams; refusing incomplete backup");}
@@ -214,6 +225,9 @@ function Set-FxTxComponentMetadata($Record,$Component,[string]$Path) {
  foreach($f in @($Record.files | Where-Object {$_.component -eq $Component.name})){Set-FxTxMetadata (Join-Path $Path $f.relative) $f $false}
  foreach($d in @($Record.directories | Where-Object {$_.component -eq $Component.name} | Sort-Object {$_.relative.Length} -Descending)){Set-FxTxMetadata (Join-Path $Path $d.relative) $d.metadata $true}
  Set-FxTxMetadata $Path $Component.metadata $true
+ foreach($f in @($Record.files | Where-Object {$_.component -eq $Component.name})){[FxTxNativeStreams]::RestoreLegacyDacl((Join-Path $Path $f.relative),$f.sddl)}
+ foreach($d in @($Record.directories | Where-Object {$_.component -eq $Component.name})){[FxTxNativeStreams]::RestoreLegacyDacl((Join-Path $Path $d.relative),$d.metadata.sddl)}
+ [FxTxNativeStreams]::RestoreLegacyDacl($Path,$Component.metadata.sddl)
 }
 function Restore-FxTxVerifiedBackup([string]$BackupRoot,[string]$EvidenceRoot) {
  # A create-new, flushed per-component plan distinguishes our partial recovery from
