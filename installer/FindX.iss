@@ -293,7 +293,13 @@ begin
   TxPrepared := TxCall('Prepare');
   if not TxPrepared then begin
     Result := 'Safe upgrade preparation failed. Nothing was force-stopped. Evidence: ' + TxRoot;
-    if FileExists(TxRoot + '\reason.code') then Result := '请先正常退出 FindX、停止旧服务后重试。旧版无保存回执，本次未改动。日志: ' + TxRoot;
+    if FileExists(TxRoot + '\reason.code') then begin
+      Result := '请先正常退出 FindX、停止旧服务后重试。旧版无保存回执，本次未改动。日志: ' + TxRoot;
+#ifndef TxTestBuild
+      { The old updater starts /VERYSILENT. Do not silently lose the required retry explanation. }
+      if WizardSilent then MsgBox('请先正常退出 FindX、停止旧服务后重试。旧版无保存回执，本次未改动。', mbError, MB_OK);
+#endif
+    end;
   end;
 end;
 

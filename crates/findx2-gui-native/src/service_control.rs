@@ -1411,6 +1411,7 @@ mod tests {
     }
     #[cfg(windows)]
     #[test]
+    #[ignore = "opt-in read-only installed-service identity probe; normal unit/CI tests must not require a production FindX2Search service"]
     fn official_identity_is_installed_findx2search() {
         let s = snapshot().expect("读取正式 FindX2Search 快照");
         validate(&s).expect("正式服务身份校验");

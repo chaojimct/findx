@@ -43,6 +43,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: gui-only-253
+          cache-on-failure: true
       - name: Build and test final 2.5.3 GUI, never rebuild or import experimental engine
         shell: powershell
         run: |
