@@ -10,6 +10,7 @@ $rows=[Collections.Generic.List[object]]::new()
 Import-Module (Join-Path $repo 'installer\transaction-files.psm1') -Force -Global
 Import-Module (Join-Path $repo 'installer\transaction-platform.psm1') -Force -Global
 Import-Module (Join-Path $PSScriptRoot 'test-owned-ntfs-volume.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'native-shortcut-fixture.psm1') -Force
 Enable-FxTxFullSecurity
 function Journal([string]$root){return (Get-Content -LiteralPath (Join-Path $root 'journal.json') -Raw -Encoding UTF8 | ConvertFrom-Json)}
 function AssertGuiHealth([string]$root){
@@ -126,18 +127,11 @@ foreach($case in @('fresh-no-service','published252-stopped-service','backup-fai
    $null=New-Item -Path ($ownedUninstall+'\OwnedUnknownChild')
    $null=New-ItemProperty -LiteralPath ($ownedUninstall+'\OwnedUnknownChild') -Name 'OwnedFixtureValue' -Value '%TEMP%\preserve unknown' -PropertyType ExpandString
    foreach($dir in @($group,$desktop)){$null=[IO.Directory]::CreateDirectory($dir)}
-   $ws=New-Object -ComObject WScript.Shell
+   $target=(Resolve-Path -LiteralPath (Join-Path $app 'FindX.exe')).ProviderPath
+   Test-FxWshShortcutSupport $root $target (Join-Path $root 'shortcut-com-diagnostic.json')
    foreach($link in @((Join-Path $group 'FindX.lnk'),(Join-Path $group '卸载 FindX.lnk'),(Join-Path $desktop 'FindX.lnk'))){
-    $comStep='create shortcut';try{
-     $sc=$ws.CreateShortcut([string]$link)
-     $target=(Resolve-Path -LiteralPath (Join-Path $app 'FindX.exe')).ProviderPath
-     Assert ([IO.File]::Exists($target) -and $target.Length -lt 260 -and $target -notmatch '["\r\n]') 'Invalid real COM fixture target'
-     [IO.File]::WriteAllText((Join-Path $root 'shortcut-target.log'),($target+"`nlength="+$target.Length))
-     $comStep='set canonical quoted target';$sc.TargetPath='"'+$target+'"'
-     $comStep='set arguments';$sc.Arguments=[string]'--help'
-     $comStep='set description';$sc.Description=[string]'old owned fixture'
-     $comStep='save';$sc.Save();Assert (($ws.CreateShortcut([string]$link)).TargetPath -ieq $target) 'Real COM shortcut target did not round-trip';$shortcutsBefore+=@{path=$link;hash=(Hash $link)}
-    }catch{throw ('Owned shortcut COM fixture failed at '+$comStep+' ['+$link+']: '+$_.Exception.ToString())}
+    New-FxNativeShortcutFixture $root $target $link
+    $shortcutsBefore+=@{path=$link;hash=(Hash $link)}
    }
    $args=$args.Replace('/NOICONS ','').Replace('/TASKS=""','/TASKS="addpath,desktopicon"')
   }

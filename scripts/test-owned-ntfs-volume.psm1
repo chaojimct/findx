@@ -14,7 +14,11 @@ function New-FxOwnedTestVolume([string]$Image,[string]$Label){
  if(-not $p.WaitForExit(60000) -or $p.ExitCode -ne 0){throw 'Owned VHD creation timed out/failed; no force-stop'}
  $diskImage=Get-DiskImage -ImagePath $image -ErrorAction Stop
  $disk=$diskImage | Get-Disk -ErrorAction Stop
- if(-not $diskImage.Attached -or $disk.IsBoot -or $disk.IsSystem -or $disk.Size -ne 67108864 -or [int]$disk.BusType -ne 15 -or $disk.PartitionStyle -ne 'RAW'){throw 'Refusing anything except this new raw 64MiB file-backed disk'}
+ $rawDisks=@(Get-CimInstance -Namespace 'root/Microsoft/Windows/Storage' -ClassName MSFT_Disk -Filter ("Number="+[uint32]$disk.Number) -ErrorAction Stop)
+ if($rawDisks.Count -ne 1){throw 'Exact image disk did not resolve to one raw CIM disk'}
+ $rawDisk=$rawDisks[0];$bus=$rawDisk.CimInstanceProperties['BusType']
+ if($bus.CimType.ToString() -ne 'UInt16' -or $bus.Value -isnot [uint16] -or $bus.Value -ne 15 -or $rawDisk.CimInstanceProperties['UniqueId'].Value -cne $disk.UniqueId -or $rawDisk.CimInstanceProperties['Number'].Value -ne $disk.Number){throw 'Raw CIM disk identity/type mismatch; no host disk fallback'}
+ if(-not $diskImage.Attached -or $disk.IsBoot -or $disk.IsSystem -or $disk.Size -ne 67108864 -or $bus.Value -ne 15 -or $disk.PartitionStyle -ne 'RAW'){throw 'Refusing anything except this new raw 64MiB file-backed disk'}
  # Number is obtained ONLY from the exact just-created image, never a host selector.
  $null=Initialize-Disk -Number $disk.Number -PartitionStyle MBR -PassThru
  $partition=New-Partition -DiskNumber $disk.Number -UseMaximumSize -DriveLetter $letter
@@ -25,7 +29,7 @@ function New-FxOwnedTestVolume([string]$Image,[string]$Label){
  $p=Start-Process -FilePath "$env:SystemRoot\System32\fsutil.exe" -ArgumentList ('usn createjournal m=16777216 a=1048576 '+$letter+':') -PassThru -NoNewWindow -RedirectStandardOutput ($commands+'.journal.log') -RedirectStandardError ($commands+'.journal.stderr.log')
  $processHandle=$p.Handle
  if(-not $p.WaitForExit(30000) -or $p.ExitCode -ne 0){throw 'Private NTFS journal creation failed; no host fallback'}
- [ordered]@{image=$image;diskNumber=$disk.Number;busType=[int]$disk.BusType;bytes=$disk.Size;letter=$letter;label=$Label;hostDiskTouched=$false} | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path ([IO.Path]::GetDirectoryName($image)) 'owned-volume.json')
+ [ordered]@{image=$image;diskNumber=$disk.Number;busType=$bus.Value;busCimType=$bus.CimType.ToString();displayBusType=[string]$disk.BusType;uniqueId=$disk.UniqueId;bytes=$disk.Size;letter=$letter;label=$Label;hostDiskTouched=$false} | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path ([IO.Path]::GetDirectoryName($image)) 'owned-volume.json')
  return [pscustomobject]@{Image=$image;Root=($letter+':\');Volume=($letter+':')}
 }
 Export-ModuleMember -Function New-FxOwnedTestVolume

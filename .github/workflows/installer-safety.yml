@@ -6,7 +6,40 @@ on:
 permissions:
   contents: read
 jobs:
+  fixture-preflight:
+    runs-on: windows-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Obtain hash-pinned published payload without running old installer
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path $env:RUNNER_TEMP 'findx-published252-input'
+          New-Item -ItemType Directory -Path $root | Out-Null
+          $setup=Join-Path $root 'published-setup.exe'
+          Invoke-WebRequest -UseBasicParsing https://github.com/chaojimct/findx/releases/download/v2.5.2/FindX-2.5.2-setup.exe -OutFile $setup
+          if((Get-FileHash $setup -Algorithm SHA256).Hash -ne '5766a666f0edcb947f21a9001b5eff0b701686956f65e8a7881a47bd29a9aef1'){throw 'Published setup digest mismatch'}
+          $zip=Join-Path $root 'innounp.zip'
+          Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/jrathlev/InnoUnpacker-Windows-GUI/refs/heads/master/innounp-2/bin/innounp-2.zip -OutFile $zip
+          if((Get-FileHash $zip -Algorithm SHA256).Hash -ne 'f8e45c9676bebc7d7570108ab572673b541fcf7a7d3d24a04319ac6b5315b4e8'){throw 'Pinned public unpacker digest changed; do not run'}
+          Expand-Archive $zip -DestinationPath (Join-Path $root 'unpacker')
+          & (Join-Path $root 'unpacker/innounp.exe') -x -y ('-d'+(Join-Path $root 'extracted')) $setup
+          if($LASTEXITCODE){throw 'Read-only setup extraction failed'}
+      - name: Isolated native COM and raw typed CIM fixture selfcheck
+        shell: powershell
+        run: ./scripts/test-installer-fixtures.ps1 -PublishedGui (Join-Path $env:RUNNER_TEMP 'findx-published252-input/extracted/{app}/FindX.exe')
+      - name: Retain minimal preflight diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-fixture-preflight
+          path: |
+            ${{ runner.temp }}/FindXUpgradeTest_fixture-preflight_*/**/*.json
+            ${{ runner.temp }}/FindXUpgradeTest_fixture-preflight_*/**/*.log
+          retention-days: 7
   native-package:
+    needs: fixture-preflight
     runs-on: windows-latest
     timeout-minutes: 55
     env:
@@ -96,6 +129,7 @@ jobs:
             ${{ runner.temp }}/FindXUpgradeTest_*/**/service-health.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/service-status-last.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/owned-volume.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/shortcut-com-diagnostic.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/platform-applied.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/reason.code
             ${{ runner.temp }}/FindXUpgradeTest_*/**/service-uninitialized.flag

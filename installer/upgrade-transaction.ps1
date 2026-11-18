@@ -254,7 +254,11 @@ try{
    if($image -ine (Join-Path ([IO.Path]::GetDirectoryName($TransactionRoot)) 'owned-health.vhd')){throw 'Test image must be the exact owned case image'}
    $diskImage=Get-DiskImage -ImagePath $image -ErrorAction Stop
    $disk=$diskImage | Get-Disk -ErrorAction Stop
-   if(-not $diskImage.Attached -or $disk.IsBoot -or $disk.IsSystem -or $disk.Size -ne 67108864 -or [int]$disk.BusType -ne 15){throw 'Only the owned 64MiB virtual disk is permitted'}
+   $rawDisks=@(Get-CimInstance -Namespace 'root/Microsoft/Windows/Storage' -ClassName MSFT_Disk -Filter ("Number="+[uint32]$disk.Number) -ErrorAction Stop)
+   if($rawDisks.Count -ne 1){throw 'Exact image disk did not resolve to one raw CIM disk'}
+   $rawDisk=$rawDisks[0];$bus=$rawDisk.CimInstanceProperties['BusType']
+   if($bus.CimType.ToString() -ne 'UInt16' -or $bus.Value -isnot [uint16] -or $bus.Value -ne 15 -or $rawDisk.CimInstanceProperties['UniqueId'].Value -cne $disk.UniqueId -or $rawDisk.CimInstanceProperties['Number'].Value -ne $disk.Number){throw 'Raw CIM disk identity/type mismatch; no host disk fallback'}
+   if(-not $diskImage.Attached -or $disk.IsBoot -or $disk.IsSystem -or $disk.Size -ne 67108864 -or $bus.Value -ne 15){throw 'Only the owned 64MiB virtual disk is permitted'}
    $parts=@($disk | Get-Partition | Where-Object {$_.DriveLetter})
    if($parts.Count -ne 1){throw 'Owned test volume must have one letter'}
    $vol=$parts[0] | Get-Volume
