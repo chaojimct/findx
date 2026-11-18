@@ -31,3 +31,6 @@ $result=[ordered]@{scope='sealed packaging tests only, no installer execution';c
 $save=if($env:GITHUB_ACTIONS -eq 'true'){Join-Path $env:RUNNER_TEMP 'sealed-test-results.json'}else{Join-Path $ScratchRoot 'results.json'}
 $result | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 $save
 Write-Output ('SEALED_NEGATIVE_REGRESSIONS_PASSED='+$rows.Count)
+
+# Every negative native exit above was explicitly asserted; do not leak it to the Actions wrapper.
+$global:LASTEXITCODE=0
