@@ -17,7 +17,17 @@ jobs:
           fetch-depth: 0
       - name: Native file primitives
         shell: powershell
-        run: ./scripts/test-transaction-files.ps1
+        run: |
+          try { ./scripts/test-transaction-files.ps1 }
+          finally {
+            # Never recurse through the deliberate junction adversarial fixture.
+            # Copy just this fresh runner's result JSON before Rust cache restore.
+            $proof=Join-Path $env:RUNNER_TEMP 'FindXUpgradeTest_file-results'
+            foreach($fixture in @(Get-ChildItem target -Directory -Filter 'tx-file-tests-*' -ErrorAction SilentlyContinue)){
+              $result=Join-Path $fixture.FullName 'results.json'
+              if(Test-Path -LiteralPath $result){$out=Join-Path $proof $fixture.Name;$null=New-Item -ItemType Directory -Path $out -Force;Copy-Item -LiteralPath $result -Destination (Join-Path $out 'results.json')}
+            }
+          }
       - name: Native protected storage and registry regressions
         shell: powershell
         run: ./scripts/test-transaction-platform.ps1
@@ -87,7 +97,5 @@ jobs:
             ${{ runner.temp }}/FindXUpgradeTest_*/**/platform-applied.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/reason.code
             ${{ runner.temp }}/FindXUpgradeTest_*/**/service-uninitialized.flag
-            target/tx-file-tests-*/results.json
-            target/tx-file-tests-*/**/restore-diff-*.json
           if-no-files-found: warn
           retention-days: 7

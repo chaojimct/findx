@@ -39,6 +39,9 @@ function AssertPlatformRestored($snapshot){
 }
 function Assert($condition,[string]$reason){if(-not $condition){throw $reason}}
 function Hash([string]$p){return (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash}
+function Write-NativeResults {
+ [ordered]@{scope='actual official ISS with isolated test AppId/paths, final2.5.3 GUI + unchanged published2.5.2 engine, same exact payload digests; synthetic native service only for adverse running/timeout cases';cases=@($rows.ToArray());passed=@($rows | Where-Object{$_.passed}).Count;failed=@($rows | Where-Object{-not $_.passed}).Count;candidateGUIIntegrated=$true;candidateGuiSha256=(Hash (Join-Path $CandidatePayload 'FindX.exe'));productionTouched=$false} | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 (Join-Path $base 'results.json')
+}
 $hostSource=@'
 using System;
 using System.IO;
@@ -197,9 +200,22 @@ foreach($case in @('fresh-no-service','published252-stopped-service','backup-fai
   $hold=Join-Path $data 'index.bin.hold-stop';if(Test-Path -LiteralPath $hold){[IO.File]::Delete($hold)}
   if(Get-Service $service -ErrorAction SilentlyContinue){$created=$true}
   if($ownedUninstall){Remove-Item -LiteralPath $ownedUninstall -Recurse -Force}
-  if($created){$controller=[ServiceProcess.ServiceController]::new($service);try{if($controller.Status -ne 'Stopped'){$controller.Stop();$controller.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Stopped,[TimeSpan]::FromSeconds(20))}; & "$env:SystemRoot\System32\sc.exe" delete $service | Out-Null}finally{$controller.Dispose()}}
+  try{
+   if($created){$controller=[ServiceProcess.ServiceController]::new($service);try{
+    $controller.Refresh()
+    if($controller.Status -ne [ServiceProcess.ServiceControllerStatus]::Stopped){
+     if($controller.Status -ne [ServiceProcess.ServiceControllerStatus]::StopPending){$controller.Stop()}
+     $controller.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Stopped,[TimeSpan]::FromSeconds(20))
+    }
+    & "$env:SystemRoot\System32\sc.exe" delete $service | Out-Null
+    if($LASTEXITCODE){throw 'Owned service deletion failed'}
+   }finally{$controller.Dispose()}}
+  }catch{
+   $rows[$rows.Count-1]['passed']=$false;$rows[$rows.Count-1]['cleanupError']=$_.Exception.ToString()
+  }
+  Write-NativeResults
  }
 }
-[ordered]@{scope='actual official ISS with isolated test AppId/paths, final2.5.3 GUI + unchanged published2.5.2 engine, same exact payload digests; synthetic native service only for adverse running/timeout cases';cases=@($rows.ToArray());passed=@($rows | Where-Object{$_.passed}).Count;failed=@($rows | Where-Object{-not $_.passed}).Count;candidateGUIIntegrated=$true;candidateGuiSha256=(Hash (Join-Path $CandidatePayload 'FindX.exe'));productionTouched=$false} | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 (Join-Path $base 'results.json')
+Write-NativeResults
 Write-Output ('NATIVE_INSTALLER_EVIDENCE='+$base)
 if(@($rows | Where-Object{-not $_.passed}).Count){throw 'Native package integration matrix failed; see retained evidence'}
