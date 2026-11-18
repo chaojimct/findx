@@ -192,7 +192,10 @@ function Assert-FxTxRestoredComponent($Record,$Component,[string]$Path) {
  $actual.components[0].path=$Component.path
  $files=@($Record.files | Where-Object {$_.component -eq $Component.name});[decimal]$total=0;foreach($f in $files){$total+=$f.length}
  $expected=[ordered]@{schema=1;components=@($Component);directories=@($Record.directories | Where-Object {$_.component -eq $Component.name});files=$files;bytes=$total}
- if(($actual | ConvertTo-Json -Depth 15 -Compress) -cne ($expected | ConvertTo-Json -Depth 15 -Compress)){throw ('Restored complete bytes/ACL/metadata set differs: '+$Component.name)}
+ if(($actual | ConvertTo-Json -Depth 15 -Compress) -cne ($expected | ConvertTo-Json -Depth 15 -Compress)){
+  if($script:restoreDiagnosticRoot){$tag=[guid]::NewGuid().ToString('N');Write-FxTxNewJson (Join-Path $script:restoreDiagnosticRoot ('restore-diff-'+$tag+'-actual.json')) $actual;Write-FxTxNewJson (Join-Path $script:restoreDiagnosticRoot ('restore-diff-'+$tag+'-expected.json')) $expected}
+  throw ('Restored complete bytes/ACL/metadata set differs: '+$Component.name)
+ }
 }
 function Assert-FxTxRestoredContent($Record,$Component,[string]$Path) {
  $roots=[ordered]@{};$roots[$Component.name]=$Path;$actual=Get-FxTxInventory $roots
@@ -215,7 +218,7 @@ function Set-FxTxComponentMetadata($Record,$Component,[string]$Path) {
 function Restore-FxTxVerifiedBackup([string]$BackupRoot,[string]$EvidenceRoot) {
  # A create-new, flushed per-component plan distinguishes our partial recovery from
  # unknown pre-existing data. Re-entry never re-quarantines a partly restored tree.
- $record=Read-FxTxVerifiedBackup $BackupRoot;$evidence=Get-FxTxPath $EvidenceRoot
+ $record=Read-FxTxVerifiedBackup $BackupRoot;$evidence=Get-FxTxPath $EvidenceRoot;$script:restoreDiagnosticRoot=$evidence
  foreach($c in $record.components){if((Test-FxTxWithin $evidence $c.path) -or (Test-FxTxWithin $c.path $evidence)){throw 'Restore evidence overlaps original component'}}
  $digest=Get-FxTxFileHash (Join-Path $BackupRoot 'backup.complete.json');$plan=Join-Path $evidence '.restore-plan.json'
  if(Test-Path -LiteralPath $evidence){

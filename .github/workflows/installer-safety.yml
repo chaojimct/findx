@@ -52,5 +52,6 @@ jobs:
             ${{ runner.temp }}/FindXUpgradeTest_*/**/journal*.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/failure.txt
             target/tx-file-tests-*/results.json
+            target/tx-file-tests-*/**/restore-diff-*.json
           if-no-files-found: warn
           retention-days: 7
