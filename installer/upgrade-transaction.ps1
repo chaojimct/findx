@@ -6,7 +6,7 @@ param(
  [string]$InstallRoot,[string]$DataRoot,[string]$NativeConfigRoot,[string]$LegacyConfigRoot,
  [string]$ServiceName='FindX2Search',[string]$PipeName='findx2',[string]$ExpectedVersion,
  [int]$InstallService=0,[int]$TimeoutSeconds=12,
- [switch]$TestBuild,[ValidateSet('none','backup','health')][string]$Fault='none'
+ [switch]$TestBuild,[ValidateSet('none','backup','health','stop-timeout')][string]$Fault='none'
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
@@ -55,13 +55,14 @@ function Restore-OriginalRuntime {
   $controller=[ServiceProcess.ServiceController]::new($script:s.serviceName)
   try{$controller.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running,[TimeSpan]::FromSeconds($script:s.timeoutSeconds))}finally{$controller.Dispose()}
  }
+ $v=Get-ExactService
  if($script:s.original.serviceRunning -and $v -and $v.State -ne 'Running'){throw 'Original service is still transitioning; runtime recovery not confirmed'}
  # Existing stopped services are deliberately NOT started.
- if($script:s.original.guiRunning){[IO.File]::WriteAllText((Join-Path $TransactionRoot 'restart-original-user-gui.flag'),'1')}
+ if($script:s.original.guiRunning -and $script:s.original.guiStopped -and (Get-InstalledGui).Count -eq 0){[IO.File]::WriteAllText((Join-Path $TransactionRoot 'restart-original-user-gui.flag'),'1')}
 }
 function Get-InstalledGui {
  $path=Join-Path $script:s.roots.app 'FindX.exe'
- return @(Get-CimInstance Win32_Process -Filter "Name='FindX.exe'" | Where-Object {$_.ExecutablePath -and $_.ExecutablePath.Equals($path,[StringComparison]::OrdinalIgnoreCase)})
+ return ,@(Get-CimInstance Win32_Process -Filter "Name='FindX.exe'" | Where-Object {$_.ExecutablePath -and $_.ExecutablePath.Equals($path,[StringComparison]::OrdinalIgnoreCase)})
 }
 function Request-NormalGuiExit {
  $targets=Get-InstalledGui
@@ -86,6 +87,7 @@ function Request-NormalGuiExit {
   $until=[DateTime]::UtcNow.AddSeconds($script:s.timeoutSeconds)
   while((Get-Process -Id $target.ProcessId -ErrorAction SilentlyContinue) -and [DateTime]::UtcNow -lt $until){Start-Sleep -Milliseconds 100}
   if(Get-Process -Id $target.ProcessId -ErrorAction SilentlyContinue){throw 'GUI did not exit normally; no close/hide/force fallback'}
+  $script:s.original.guiStopped=$true;Save-State
  }
 }
 function Verify-PayloadAndIndex {
@@ -138,18 +140,20 @@ try{
   }elseif($ServiceName -ne 'FindX2Search' -or $PipeName -ne 'findx2' -or $Fault -ne 'none'){throw 'Production endpoints/fault policy cannot be overridden'}
   if(Test-Path -LiteralPath (Join-Path $TransactionRoot 'journal.json')){throw 'Unfinished/existing transaction requires recovery, not overwrite'}
   $null=[IO.Directory]::CreateDirectory($TransactionRoot)
-  $script:s=[pscustomobject]@{schema=1;state='created';roots=[pscustomobject]$roots;serviceName=$ServiceName;pipeName=$PipeName;expectedVersion=$ExpectedVersion;installService=($InstallService -eq 1);timeoutSeconds=$TimeoutSeconds;testBuild=[bool]$TestBuild;fault=$Fault;backupVerified=$false;createdService=$false;original=[pscustomobject]@{serviceExists=$false;serviceRunning=$false;guiRunning=$false;serviceCommand='';serviceStartMode=''};error=''}
+  $script:s=[pscustomobject]@{schema=1;state='created';roots=[pscustomobject]$roots;serviceName=$ServiceName;pipeName=$PipeName;expectedVersion=$ExpectedVersion;installService=($InstallService -eq 1);timeoutSeconds=$TimeoutSeconds;testBuild=[bool]$TestBuild;fault=$Fault;backupVerified=$false;createdService=$false;original=[pscustomobject]@{serviceExists=$false;serviceRunning=$false;guiRunning=$false;guiStopped=$false;serviceCommand='';serviceStartMode=''};error=''}
   $script:lock=[IO.File]::Open((Join-Path $TransactionRoot 'phase.lock'),'OpenOrCreate','ReadWrite','None')
   $svc=Get-ExactService
   if($svc){$script:s.original.serviceExists=$true;$script:s.original.serviceRunning=($svc.State -eq 'Running');$script:s.original.serviceCommand=$svc.PathName;$script:s.original.serviceStartMode=$svc.StartMode;if($svc.State -notin @('Running','Stopped')){throw 'Service in transition; unchanged'}}
   $script:s.original.guiRunning=((Get-InstalledGui).Count -gt 0); Save-State
-  Request-NormalGuiExit
   if($script:s.original.serviceRunning){
    # Published 2.5.2 has no durable-save ACK. A stop/exit0 or old valid checksum
    # cannot prove metadata-only dirty state was committed. Never pretend it does.
-   Stop-ExactService
-   throw 'Legacy running service has no verifiable final-save acknowledgment; refusing replacement. Original runtime will be restored.'
+   # Production refuses BEFORE stopping a legacy writer or closing its GUI.
+   # Only the explicit isolated-CI adversarial fixture exercises the bounded stop.
+   if($script:s.testBuild -and $script:s.fault -eq 'stop-timeout'){Stop-ExactService}
+   throw 'Legacy running service has no verifiable final-save acknowledgment; refusing before replacement. No production stop was requested.'
   }
+  Request-NormalGuiExit
   Set-State 'quiesced'
   if($script:s.fault -eq 'backup'){throw 'Injected CI backup failure before any replacement'}
   $map=[ordered]@{};foreach($prop in $script:s.roots.PSObject.Properties){$map[$prop.Name]=[string]$prop.Value}
@@ -182,7 +186,7 @@ try{
    Set-State 'health_verified'
   }elseif($Phase -eq 'Commit'){
    if($script:s.state -ne 'health_verified'){throw 'Cannot commit without verified health'}
-   Set-State 'committed';if($script:s.original.guiRunning){[IO.File]::WriteAllText((Join-Path $TransactionRoot 'restart-original-user-gui.flag'),'1')}
+   Set-State 'committed';if($script:s.original.guiRunning -and $script:s.original.guiStopped -and (Get-InstalledGui).Count -eq 0){[IO.File]::WriteAllText((Join-Path $TransactionRoot 'restart-original-user-gui.flag'),'1')}
   }else{Invoke-Rollback}
  }
  exit 0

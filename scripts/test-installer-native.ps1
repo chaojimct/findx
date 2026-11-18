@@ -60,7 +60,7 @@ foreach($case in @('fresh-no-service','published252-stopped-service','backup-fai
   }
   & $Iscc '/DTxTestBuild=1' (('/DMyServiceName=')+$service) (('/DTxPipeName=')+$pipe) ('/DPublishDir='+$stage) ('/O'+$build) (Join-Path $repo 'installer\FindX.iss') *> (Join-Path $root 'compile.log')
   Assert ($LASTEXITCODE -eq 0) 'Official ISS test-mode compilation failed'
-  $setup=Join-Path $build 'FindX-2.5.2-fixture-setup.exe';$fault=if($case -eq 'backup-failure'){'backup'}elseif($case -eq 'health-rollback'){'health'}else{'none'}
+  $setup=Join-Path $build 'FindX-2.5.2-fixture-setup.exe';$fault=if($case -eq 'backup-failure'){'backup'}elseif($case -eq 'health-rollback'){'health'}elseif($case -eq 'stop-timeout'){'stop-timeout'}else{'none'}
   $args='/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOICONS /COMPONENTS="main,clicfg" /TASKS="" /DIR="'+$app+'" /TXROOT="'+$tx+'" /TXDATA="'+$data+'" /TXNATIVE="'+$native+'" /TXLEGACY="'+$legacy+'" /TXFAULT='+$fault+' /LOG="'+(Join-Path $root 'setup.log')+'"'
   $process=Start-Process -FilePath $setup -ArgumentList $args -PassThru -Wait
   $expectedSuccess=$case -in @('fresh-no-service','published252-stopped-service','reentry-refusal')
