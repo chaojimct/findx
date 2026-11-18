@@ -28,6 +28,44 @@ function Get-FxTxFileHash([string]$Path) {
     $f = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try { $sha = [Security.Cryptography.SHA256]::Create(); try { return [BitConverter]::ToString($sha.ComputeHash($f)).Replace('-','').ToLowerInvariant() } finally { $sha.Dispose() } } finally { $f.Dispose() }
 }
+if(-not ('FxTxNativeStreams' -as [type])) {
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class FxTxNativeStreams {
+ [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+ struct StreamData { public long Size; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=296)] public string Name; }
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr FindFirstStreamW(string path,int level,out StreamData data,int flags);
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool FindNextStreamW(IntPtr handle,out StreamData data);
+ [DllImport("kernel32.dll")] static extern bool FindClose(IntPtr handle);
+ public static void RequireUnnamedOnly(string path) {
+  StreamData data; IntPtr h=FindFirstStreamW(path,0,out data,0);
+  if(h==new IntPtr(-1)){int e=Marshal.GetLastWin32Error();if(e==38)return;throw new System.ComponentModel.Win32Exception(e,"Cannot verify NTFS streams; refusing incomplete backup");}
+  try { int count=0; do { if(++count>1024 || data.Name!="::$DATA") throw new InvalidOperationException("Named NTFS data stream; refusing non-preserving backup"); } while(FindNextStreamW(h,out data));
+   int e=Marshal.GetLastWin32Error();if(e!=38)throw new System.ComponentModel.Win32Exception(e);
+  } finally {FindClose(h);}
+ }
+}
+'@
+}
+$script:RequireAuditSecurity=$false
+function Enable-FxTxFullSecurity { $script:RequireAuditSecurity=$true }
+function Get-FxTxMetadata([string]$Path) {
+    $item=Get-Item -LiteralPath $Path -Force
+    # These cannot be reproduced by an ordinary byte-copy transaction. Refuse,
+    # never silently strip encryption, sparse/compression semantics or named data.
+    if(($item.Attributes -band ([IO.FileAttributes]::Encrypted -bor [IO.FileAttributes]::Compressed -bor [IO.FileAttributes]::SparseFile -bor [IO.FileAttributes]::Offline)) -ne 0){throw 'Unsupported encrypted/compressed/sparse/offline object; unchanged'}
+    [FxTxNativeStreams]::RequireUnnamedOnly($Path)
+    $security=if($script:RequireAuditSecurity){Get-Acl -LiteralPath $Path -Audit}else{Get-Acl -LiteralPath $Path}
+    return [ordered]@{sddl=$security.Sddl;attributes=[int]$item.Attributes;lastWriteUtcTicks=$item.LastWriteTimeUtc.Ticks;creationUtcTicks=$item.CreationTimeUtc.Ticks}
+}
+function Set-FxTxMetadata([string]$Path,$Metadata,[bool]$Directory) {
+    if($Directory){$acl=[Security.AccessControl.DirectorySecurity]::new()}else{$acl=[Security.AccessControl.FileSecurity]::new()}
+    $acl.SetSecurityDescriptorSddlForm($Metadata.sddl);Set-Acl -LiteralPath $Path -AclObject $acl
+    [IO.File]::SetAttributes($Path,[IO.FileAttributes]$Metadata.attributes)
+    if($Directory){[IO.Directory]::SetCreationTimeUtc($Path,[datetime]::new([long]$Metadata.creationUtcTicks,[DateTimeKind]::Utc));[IO.Directory]::SetLastWriteTimeUtc($Path,[datetime]::new([long]$Metadata.lastWriteUtcTicks,[DateTimeKind]::Utc))}
+    else{[IO.File]::SetCreationTimeUtc($Path,[datetime]::new([long]$Metadata.creationUtcTicks,[DateTimeKind]::Utc));[IO.File]::SetLastWriteTimeUtc($Path,[datetime]::new([long]$Metadata.lastWriteUtcTicks,[DateTimeKind]::Utc))}
+}
 function Get-FxTxInventory([System.Collections.IDictionary]$Roots) {
     $components = @(); $files = @(); $directories = @(); [decimal]$bytes = 0
     foreach ($name in @($Roots.Keys | Sort-Object)) {
@@ -38,7 +76,7 @@ function Get-FxTxInventory([System.Collections.IDictionary]$Roots) {
         }
         if ([IO.File]::Exists($root)) { throw 'Component root must be a directory or absent' }
         $exists = [IO.Directory]::Exists($root)
-        $components += [ordered]@{ name = $name; path = $root; exists = $exists }
+        $components += [ordered]@{ name = $name; path = $root; exists = $exists; metadata = $(if($exists){Get-FxTxMetadata $root}else{$null}) }
         if (-not $exists) { continue }
         # Walk explicitly. Get-ChildItem -Recurse may follow provider-specific links.
         $queue = [Collections.Generic.Queue[string]]::new(); $queue.Enqueue($root)
@@ -47,11 +85,12 @@ function Get-FxTxInventory([System.Collections.IDictionary]$Roots) {
             foreach ($item in @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop | Sort-Object FullName)) {
                 if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Reparse point refused' }
                 $relative = $item.FullName.Substring($root.Length + 1); Assert-FxTxRelative $relative
-                if ($item.PSIsContainer) { $directories += [ordered]@{ component = $name; relative = $relative }; $queue.Enqueue($item.FullName); continue }
+                if($files.Count+$directories.Count -ge 100000){throw 'Inventory object bound exceeded'}
+                if ($item.PSIsContainer) { $directories += [ordered]@{ component = $name; relative = $relative; metadata=(Get-FxTxMetadata $item.FullName) }; $queue.Enqueue($item.FullName); continue }
                 if ($files.Count -ge 100000) { throw 'Inventory bound exceeded; no partial acceptance' }
                 $len = $item.Length; $hash = Get-FxTxFileHash $item.FullName
-                $acl = (Get-Acl -LiteralPath $item.FullName).Sddl
-                $files += [ordered]@{ component = $name; relative = $relative; length = $len; sha256 = $hash; attributes = [int]$item.Attributes; lastWriteUtcTicks = $item.LastWriteTimeUtc.Ticks; sddl = $acl }
+                $metadata=Get-FxTxMetadata $item.FullName
+                $files += [ordered]@{ component = $name; relative = $relative; length = $len; sha256 = $hash; attributes = [int]$item.Attributes; lastWriteUtcTicks = $item.LastWriteTimeUtc.Ticks; sddl = $metadata.sddl; creationUtcTicks=$metadata.creationUtcTicks }
                 $bytes += $len
             }
         }
@@ -91,7 +130,7 @@ function Test-FxTxBackup([string]$BackupRoot, $Manifest) {
     }
     return $true
 }
-function New-FxTxVerifiedBackup([System.Collections.IDictionary]$Roots, [string]$BackupRoot, [decimal]$CandidateBytes = 0, [decimal]$ReserveBytes = 33554432) {
+function New-FxTxVerifiedBackup([System.Collections.IDictionary]$Roots, [string]$BackupRoot, [decimal]$CandidateBytes = 0, [decimal]$ReserveBytes = 33554432, [switch]$AdministratorsOnly) {
     if ($CandidateBytes -lt 0 -or $ReserveBytes -lt 0) { throw 'Negative capacity budget' }
     $backup = Get-FxTxPath $BackupRoot
     if (Test-Path -LiteralPath $backup) { throw 'Backup must be create-new; retain prior evidence' }
@@ -99,6 +138,7 @@ function New-FxTxVerifiedBackup([System.Collections.IDictionary]$Roots, [string]
     foreach ($c in $inventory.components) {
         if ((Test-FxTxWithin $backup $c.path) -or (Test-FxTxWithin $c.path $backup)) { throw 'Backup overlaps a component' }
     }
+    if([Text.Encoding]::UTF8.GetByteCount(($inventory | ConvertTo-Json -Depth 15 -Compress)) -gt 67108864){throw 'Backup metadata bound exceeded'}
     $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($backup))
     $required = $inventory.bytes + $CandidateBytes + $ReserveBytes
     if ($required -gt $drive.AvailableFreeSpace) { throw 'Insufficient backup/staging capacity; unchanged' }
@@ -106,7 +146,9 @@ function New-FxTxVerifiedBackup([System.Collections.IDictionary]$Roots, [string]
     # The backup contains private configuration/index bytes: do not inherit broad access.
     $acl = [Security.AccessControl.DirectorySecurity]::new(); $acl.SetAccessRuleProtection($true, $false)
     $owner = [Security.Principal.WindowsIdentity]::GetCurrent().User
-    foreach ($sid in @($owner, [Security.Principal.SecurityIdentifier]::new('S-1-5-18'), [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))) {
+    $principals=@([Security.Principal.SecurityIdentifier]::new('S-1-5-18'),[Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
+    if($AdministratorsOnly){$acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))}else{$principals+=@($owner)}
+    foreach ($sid in $principals) {
         $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
     }
     Set-Acl -LiteralPath $backup -AclObject $acl
@@ -141,39 +183,80 @@ function Read-FxTxVerifiedBackup([string]$BackupRoot) {
     $null = Test-FxTxBackup $BackupRoot $record
     return $record
 }
-function Restore-FxTxVerifiedBackup([string]$BackupRoot, [string]$EvidenceRoot) {
-    # Caller must have stopped and verified all candidate writers BEFORE entry.
-    $record = Read-FxTxVerifiedBackup $BackupRoot
-    $evidence = Get-FxTxPath $EvidenceRoot
-    if (Test-Path -LiteralPath $evidence) { throw 'Restore evidence must be create-new' }
-    foreach ($c in $record.components) {
-        $target = Get-FxTxPath $c.path
-        if ((Test-FxTxWithin $evidence $target) -or (Test-FxTxWithin $target $evidence)) { throw 'Restore evidence overlaps live data' }
-    }
-    $null = [IO.Directory]::CreateDirectory($evidence)
-    foreach ($c in $record.components) {
-        $target = Get-FxTxPath $c.path
-        # Preserve ALL failed/new bytes, including unknown files. No recursive deletion.
-        if ([IO.Directory]::Exists($target)) { [IO.Directory]::Move($target, (Join-Path $evidence $c.name)) }
-        if (-not $c.exists) { continue }
-        $null = [IO.Directory]::CreateDirectory($target)
-        foreach ($d in $record.directories | Where-Object { $_.component -eq $c.name }) { $null=[IO.Directory]::CreateDirectory((Join-Path $target $d.relative)) }
-        foreach ($f in $record.files | Where-Object { $_.component -eq $c.name }) {
-            $source = Join-Path $BackupRoot ($c.name + '\' + $f.relative); $dest = Join-Path $target $f.relative
-            $null = [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($dest))
-            $input = [IO.File]::Open($source,'Open','Read','Read')
-            try { $output=[IO.File]::Open($dest,'CreateNew','Write','None'); try { $input.CopyTo($output); $output.Flush($true) } finally { $output.Dispose() } } finally { $input.Dispose() }
-            if ((Get-FxTxFileHash $dest) -ne $f.sha256) { throw 'Restored bytes differ; retained backup/evidence, no runtime restart' }
-            [IO.File]::SetLastWriteTimeUtc($dest, [datetime]::new([long]$f.lastWriteUtcTicks, [DateTimeKind]::Utc))
-            $acl=[Security.AccessControl.FileSecurity]::new(); $acl.SetSecurityDescriptorSddlForm($f.sddl); Set-Acl -LiteralPath $dest -AclObject $acl
-            [IO.File]::SetAttributes($dest, [IO.FileAttributes]$f.attributes)
-        }
-    }
-    foreach ($c in $record.components) {
-        if (-not $c.exists) { if (Test-Path -LiteralPath $c.path) { throw 'Absent root was fabricated by rollback' }; continue }
-        foreach ($f in $record.files | Where-Object { $_.component -eq $c.name }) { if ((Get-FxTxFileHash (Join-Path $c.path $f.relative)) -ne $f.sha256) { throw 'Restore readback failed' } }
-    }
-    Write-FxTxNewJson (Join-Path $evidence 'restore.complete.json') ([ordered]@{schema=1;restored=$true;backup=$BackupRoot})
-    return $true
+function Write-FxTxUpdateJson([string]$Path,$Value) {
+ $tmp=$Path+'.'+[guid]::NewGuid().ToString('N')+'.tmp';Write-FxTxNewJson $tmp $Value
+ if([IO.File]::Exists($Path)){[IO.File]::Replace($tmp,$Path,($Path+'.previous.'+[guid]::NewGuid().ToString('N')))}else{[IO.File]::Move($tmp,$Path)}
 }
-Export-ModuleMember -Function Restore-FxTxVerifiedBackup, Read-FxTxVerifiedBackup, Get-FxTxInventory,New-FxTxVerifiedBackup,Test-FxTxBackup,Get-FxTxFileHash,Get-FxTxPath,Assert-FxTxRelative
+function Assert-FxTxRestoredComponent($Record,$Component,[string]$Path) {
+ $roots=[ordered]@{};$roots[$Component.name]=$Path;$actual=Get-FxTxInventory $roots
+ $actual.components[0].path=$Component.path
+ $files=@($Record.files | Where-Object {$_.component -eq $Component.name});[decimal]$total=0;foreach($f in $files){$total+=$f.length}
+ $expected=[ordered]@{schema=1;components=@($Component);directories=@($Record.directories | Where-Object {$_.component -eq $Component.name});files=$files;bytes=$total}
+ if(($actual | ConvertTo-Json -Depth 15 -Compress) -cne ($expected | ConvertTo-Json -Depth 15 -Compress)){throw ('Restored complete bytes/ACL/metadata set differs: '+$Component.name)}
+}
+function Assert-FxTxRestoredContent($Record,$Component,[string]$Path) {
+ $roots=[ordered]@{};$roots[$Component.name]=$Path;$actual=Get-FxTxInventory $roots
+ $a=@($actual.files | ForEach-Object {[ordered]@{relative=$_.relative;length=$_.length;sha256=$_.sha256}})
+ $e=@($Record.files | Where-Object {$_.component -eq $Component.name} | ForEach-Object {[ordered]@{relative=$_.relative;length=$_.length;sha256=$_.sha256}})
+ if(($a | ConvertTo-Json -Depth 8 -Compress) -cne ($e | ConvertTo-Json -Depth 8 -Compress)){throw 'Recovery content set differs'}
+ $a=@($actual.directories | ForEach-Object {$_.relative});$e=@($Record.directories | Where-Object {$_.component -eq $Component.name} | ForEach-Object {$_.relative})
+ if(($a | ConvertTo-Json -Compress) -cne ($e | ConvertTo-Json -Compress)){throw 'Recovery directory set differs'}
+}
+function Set-FxTxComponentMetadata($Record,$Component,[string]$Path) {
+ # Apply inherited permissions only AFTER atomic publication under the ORIGINAL
+ # parent. Setting them while staged under a different ACL would re-inherit the
+ # recovery store's ACL rather than the original parent's ACL.
+ Set-FxTxMetadata $Path $Component.metadata $true
+ foreach($d in @($Record.directories | Where-Object {$_.component -eq $Component.name} | Sort-Object {$_.relative.Length})){Set-FxTxMetadata (Join-Path $Path $d.relative) $d.metadata $true}
+ foreach($f in @($Record.files | Where-Object {$_.component -eq $Component.name})){Set-FxTxMetadata (Join-Path $Path $f.relative) $f $false}
+ foreach($d in @($Record.directories | Where-Object {$_.component -eq $Component.name} | Sort-Object {$_.relative.Length} -Descending)){Set-FxTxMetadata (Join-Path $Path $d.relative) $d.metadata $true}
+ Set-FxTxMetadata $Path $Component.metadata $true
+}
+function Restore-FxTxVerifiedBackup([string]$BackupRoot,[string]$EvidenceRoot) {
+ # A create-new, flushed per-component plan distinguishes our partial recovery from
+ # unknown pre-existing data. Re-entry never re-quarantines a partly restored tree.
+ $record=Read-FxTxVerifiedBackup $BackupRoot;$evidence=Get-FxTxPath $EvidenceRoot
+ foreach($c in $record.components){if((Test-FxTxWithin $evidence $c.path) -or (Test-FxTxWithin $c.path $evidence)){throw 'Restore evidence overlaps original component'}}
+ $digest=Get-FxTxFileHash (Join-Path $BackupRoot 'backup.complete.json');$plan=Join-Path $evidence '.restore-plan.json'
+ if(Test-Path -LiteralPath $evidence){
+  if(-not [IO.File]::Exists($plan)){throw 'Unowned restore evidence; unchanged'}
+  $owned=Get-Content -LiteralPath $plan -Raw -Encoding UTF8 | ConvertFrom-Json
+  if($owned.schema -ne 1 -or $owned.backupHash -cne $digest -or $owned.backup -cne (Get-FxTxPath $BackupRoot)){throw 'Restore plan does not match verified backup'}
+ }else{$null=[IO.Directory]::CreateDirectory($evidence);Write-FxTxNewJson $plan ([ordered]@{schema=1;backup=(Get-FxTxPath $BackupRoot);backupHash=$digest})}
+ foreach($c in $record.components){
+  $target=Get-FxTxPath $c.path;$quarantine=Join-Path $evidence $c.name;$stage=Join-Path $evidence ('.staging\'+$c.name);$marker=Join-Path $evidence ('.component-'+$c.name+'.json')
+  if([IO.File]::Exists($marker)){$progress=Get-Content -LiteralPath $marker -Raw -Encoding UTF8 | ConvertFrom-Json;if($progress.backupHash -cne $digest){throw 'Component plan mismatch'}}
+  else{$progress=[pscustomobject]@{backupHash=$digest;phase='quarantine_intent'};Write-FxTxNewJson $marker $progress}
+  if($progress.phase -eq 'quarantine_intent'){
+   if([IO.Directory]::Exists($quarantine)){if(Test-Path -LiteralPath $target){throw 'Ambiguous concurrent destination; retained all data'}}
+   elseif([IO.Directory]::Exists($target)){[IO.Directory]::Move($target,$quarantine)}
+   elseif([IO.File]::Exists($target)){throw 'Component root changed type; unchanged'}
+   $progress.phase='building';Write-FxTxUpdateJson $marker $progress
+  }
+  if(-not $c.exists){if(Test-Path -LiteralPath $target){throw 'Absent original root was fabricated'};$progress.phase='complete';Write-FxTxUpdateJson $marker $progress;continue}
+  if($progress.phase -eq 'building'){
+   if(Test-Path -LiteralPath $target){throw 'Concurrent destination while building; unchanged'}
+   $null=[IO.Directory]::CreateDirectory($stage)
+   foreach($d in @($record.directories | Where-Object {$_.component -eq $c.name})){$null=[IO.Directory]::CreateDirectory((Join-Path $stage $d.relative))}
+   foreach($f in @($record.files | Where-Object {$_.component -eq $c.name})){
+    $source=Join-Path $BackupRoot ($c.name+'\'+$f.relative);$dest=Join-Path $stage $f.relative
+    if([IO.File]::Exists($dest)){if((Get-FxTxFileHash $dest) -cne $f.sha256){throw 'Partial staging bytes differ; retained for manual recovery'}}
+    else{$null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($dest));$input=[IO.File]::Open($source,'Open','Read','Read');try{$output=[IO.File]::Open($dest,'CreateNew','Write','None');try{$input.CopyTo($output);$output.Flush($true)}finally{$output.Dispose()}}finally{$input.Dispose()}}
+   }
+   Assert-FxTxRestoredContent $record $c $stage
+   $progress.phase='publish_intent';Write-FxTxUpdateJson $marker $progress
+  }
+  if($progress.phase -eq 'publish_intent'){
+   if(Test-Path -LiteralPath $target){if(Test-Path -LiteralPath $stage){throw 'Concurrent restored destination; unchanged'};Assert-FxTxRestoredContent $record $c $target}
+   else{[IO.Directory]::Move($stage,$target)}
+   Set-FxTxComponentMetadata $record $c $target;Assert-FxTxRestoredComponent $record $c $target
+   $progress.phase='complete';Write-FxTxUpdateJson $marker $progress
+  }
+  if($progress.phase -ne 'complete'){throw 'Unknown component recovery phase'}
+  Assert-FxTxRestoredComponent $record $c $target
+ }
+ $complete=Join-Path $evidence 'restore.complete.json'
+ if(-not [IO.File]::Exists($complete)){Write-FxTxNewJson $complete ([ordered]@{schema=1;restored=$true;backupHash=$digest})}
+ return $true
+}
+Export-ModuleMember -Function Enable-FxTxFullSecurity,Write-FxTxUpdateJson,Get-FxTxMetadata,Set-FxTxMetadata,Write-FxTxNewJson,Restore-FxTxVerifiedBackup, Read-FxTxVerifiedBackup, Get-FxTxInventory,New-FxTxVerifiedBackup,Test-FxTxBackup,Get-FxTxFileHash,Get-FxTxPath,Assert-FxTxRelative

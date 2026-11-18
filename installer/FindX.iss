@@ -38,9 +38,11 @@
 [Setup]
 #ifdef TxTestBuild
 AppId=FindXUpgradeTest-{#MyServiceName}
+SetupMutex=Global\FindXUpgradeTest-{#MyServiceName}
 PrivilegesRequiredOverridesAllowed=dialog
 #else
 AppId={{7E8A9B0C-1D2E-3F4A-5B6C-7D8E9F0A1B2C}
+SetupMutex=Global\FindX.ProductUpgrade
 #endif
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
@@ -98,6 +100,7 @@ Name: "postlaunch";   Description: "安装完成后启动 FindX";               
 Source: "{#PublishDir}\FindX.installed"; DestDir: "{app}"; Flags: ignoreversion; Components: main
 Source: "{#PublishDir}\stage-manifest.json"; DestDir: "{app}"; DestName: "payload-manifest.json"; Flags: ignoreversion; Components: main
 Source: "transaction-files.psm1"; Flags: dontcopy
+Source: "transaction-platform.psm1"; Flags: dontcopy
 Source: "upgrade-transaction.ps1"; Flags: dontcopy
 
 ; stage 由 stage-inno.ps1 生成。勿用单条 "{#PublishDir}\*"：Inno 编译器要求根目录至少有一个能匹配 * 的文件；
@@ -123,6 +126,10 @@ Filename: "{sys}\sc.exe"; Parameters: "stop {#MyServiceName}"; Flags: runhidden;
 Filename: "{sys}\sc.exe"; Parameters: "delete {#MyServiceName}"; Flags: runhidden; RunOnceId: "ScDelete"
 
 [Code]
+#ifdef TxTestBuild
+// Fault injection terminates ONLY this isolated test installer itself, never another process.
+procedure TxTestExitProcess(Code: LongWord); external 'ExitProcess@kernel32.dll stdcall';
+#endif
 // ── 系统 PATH（与 v1 风格一致，HKLM）──
 procedure AddToPath(const Dir: String);
 var
@@ -220,6 +227,15 @@ begin
       ' -LegacyConfigRoot ' + TxQuote(TxLegacyConfig) + ' -ServiceName {#MyServiceName}' +
       ' -PipeName {#TxPipeName} -ExpectedVersion {#MyAppVersion} -InstallService ';
     if WizardIsComponentSelected('servicec') then Args := Args + '1' else Args := Args + '0';
+    Args := Args + ' -AddPath ';
+    if WizardIsTaskSelected('addpath') then Args := Args + '1' else Args := Args + '0';
+#ifdef TxTestBuild
+    Args := Args + ' -UninstallKey ' + TxQuote('FindXUpgradeTest-{#MyServiceName}_is1');
+#else
+    Args := Args + ' -UninstallKey ' + TxQuote('{7E8A9B0C-1D2E-3F4A-5B6C-7D8E9F0A1B2C}_is1');
+    Args := Args + ' -GroupRoot ' + TxQuote(ExpandConstant('{group}')) + ' -DesktopRoot ' + TxQuote(ExpandConstant('{autodesktop}')) + ' -CreateGroup ';
+    if WizardNoIcons then Args := Args + '0' else Args := Args + '1';
+#endif
 #ifdef TxTestBuild
     Fault := ExpandConstant('{param:TXFAULT|none}');
     Args := Args + ' -TestBuild -TimeoutSeconds 3 -Fault ' + TxQuote(Fault);
@@ -244,10 +260,14 @@ begin
   TxRoot := ExpandConstant('{commonappdata}\FindX-upgrades\') + GetDateTimeString('yyyymmddhhnnsszzz', '', '') ;
 #endif
   ExtractTemporaryFile('transaction-files.psm1');
+  ExtractTemporaryFile('transaction-platform.psm1');
   ExtractTemporaryFile('upgrade-transaction.ps1');
   TxStarted := True;
   TxPrepared := TxCall('Prepare');
-  if not TxPrepared then Result := 'Safe upgrade preparation failed. No forced shutdown. Evidence: ' + TxRoot;
+  if not TxPrepared then begin
+    Result := 'Safe upgrade preparation failed. Nothing was force-stopped. Evidence: ' + TxRoot;
+    if FileExists(TxRoot + '\reason.code') then Result := '旧版服务仍在运行，无法确认最终保存。未停止服务，未替换文件。保留当前版本。日志: ' + TxRoot;
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -255,10 +275,12 @@ var
   Code: Integer;
 begin
   if CurStep = ssPostInstall then begin
+#ifdef TxTestBuild
+    if ExpandConstant('{param:TXFAULT|none}') = 'interrupt-after-copy' then TxTestExitProcess(73);
+#endif
     if not TxCall('Verify') then RaiseException('Upgrade health failed; transaction rollback required. Evidence: ' + TxRoot);
     { PATH remains selected behavior, but runs before commit; registration/Run rollback
-      coverage remains a release gate until the full native matrix proves it. }
-    { PATH mutation is deferred until registry rollback coverage is implemented. }
+      values, types and security are captured before replacement. }
     if not TxCall('Commit') then RaiseException('Upgrade transaction commit failed. Evidence: ' + TxRoot);
     TxCommitted := True;
   end;
@@ -267,11 +289,24 @@ end;
 procedure DeinitializeSetup;
 var
   Code: Integer;
+  RestartBytes: AnsiString;
+  RestartPath: String;
 begin
   if TxPrepared and not TxCommitted then begin
     if not TxCall('Rollback') then Log('RECOVERY REQUIRED: retained backup at ' + TxRoot);
   end;
   { Only restart a previously-running GUI, in its original user context. }
-  if TxStarted and FileExists(TxRoot + '\restart-original-user-gui.flag') then
-    ExecAsOriginalUser(ExpandConstant('{app}\FindX.exe'), '', ExpandConstant('{app}'), SW_SHOWNORMAL, ewNoWait, Code);
+  if TxStarted and LoadStringFromFile(TxRoot + '\restart-original-user-gui.flag', RestartBytes) then begin
+    RestartPath := Utf8Decode(RestartBytes);
+    if (Pos('"', RestartPath) = 0) and FileExists(RestartPath) then
+      ExecAsOriginalUser(RestartPath, '', ExtractFileDir(RestartPath), SW_SHOWNORMAL, ewNoWait, Code);
+  end;
+end;
+
+// CurStepChanged exceptions alone do NOT make Inno's exit code nonzero.
+// Never let an updater interpret a rolled-back installation as successful.
+function GetCustomSetupExitCode: Integer;
+begin
+  Result := 0;
+  if TxStarted and not TxCommitted then Result := 80;
 end;

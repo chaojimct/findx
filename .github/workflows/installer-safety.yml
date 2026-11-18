@@ -14,6 +14,9 @@ jobs:
       - name: Native file primitives
         shell: powershell
         run: ./scripts/test-transaction-files.ps1
+      - name: Native protected storage and registry regressions
+        shell: powershell
+        run: ./scripts/test-transaction-platform.ps1
       - name: Obtain hash-pinned published payload without running old installer
         shell: powershell
         run: |

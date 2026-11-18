@@ -117,6 +117,13 @@ Case 'locked destination rollback fails without deleting source or backup' {
     Assert ([IO.File]::Exists((Join-Path $x.Data 'index.bin'))) 'Locked original disappeared'
     $null=Read-FxTxVerifiedBackup $x.Backup
     Assert (-not [IO.File]::Exists((Join-Path $x.Root 'failed-new\restore.complete.json'))) 'Incomplete restore marked complete'
+    $null=Restore-FxTxVerifiedBackup $x.Backup (Join-Path $x.Root 'failed-new')
+    Assert ([IO.File]::Exists((Join-Path $x.Root 'failed-new\restore.complete.json'))) 'Interrupted recovery did not resume'
+    $null=Restore-FxTxVerifiedBackup $x.Backup (Join-Path $x.Root 'failed-new')
+}
+Case 'unowned pre-existing recovery folder is not reused' {
+    $x=Fixture 'foreign-recovery';$null=New-FxTxVerifiedBackup $x.Roots $x.Backup;$e=Join-Path $x.Root 'foreign';$null=[IO.Directory]::CreateDirectory($e)
+    MustThrow {Restore-FxTxVerifiedBackup $x.Backup $e} 'Unknown recovery directory reused'
 }
 $summary=[ordered]@{ at=(Get-Date -Format o); fixtureRoot=$base; passed=@($results | Where-Object {$_.passed}).Count; failed=@($results | Where-Object {-not $_.passed}).Count; cases=@($results.ToArray()); officialTouched=$false; processOrScmCalls=$false; installerIntegrated=$false; note='File-only primitives. NOT a proof of writer shutdown, save acknowledgment, or official installer integration; restore tests cover ordinary owned fixture files only.' }
 $summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $base 'results.json') -Encoding UTF8

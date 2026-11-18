@@ -27,7 +27,7 @@ class FixtureService:ServiceBase{
 '@
 $fixtureHost=Join-Path $base 'service-fixture.exe'
 Add-Type -TypeDefinition $hostSource -OutputAssembly $fixtureHost -OutputType WindowsApplication -ReferencedAssemblies System.ServiceProcess
-foreach($case in @('fresh-no-service','published252-stopped-service','backup-failure','health-rollback','legacy-running-refusal','stop-timeout','reentry-refusal')){
+foreach($case in @('fresh-no-service','published252-stopped-service','backup-failure','health-rollback','legacy-running-refusal','stop-timeout','reentry-refusal','interrupted-recovery')){
  $id=[guid]::NewGuid().ToString('N');$service='FindXUpgradeTest_'+$id;$pipe='findx-upgrade-test-'+$id
  $root=Join-Path $base $case;$app=Join-Path $root 'app 中文 space';$data=Join-Path $root 'index state';$native=Join-Path $root 'native config';$legacy=Join-Path $root 'legacy config';$tx=Join-Path $root 'tx';$stage=Join-Path $root 'payload';$build=Join-Path $root 'build'
  foreach($p in @($root,$data,$native,$legacy,$stage,$build)){ $null=[IO.Directory]::CreateDirectory($p) }
@@ -66,7 +66,7 @@ foreach($case in @('fresh-no-service','published252-stopped-service','backup-fai
   }
   & $Iscc '/DTxTestBuild=1' (('/DMyServiceName=')+$service) (('/DTxPipeName=')+$pipe) ('/DPublishDir='+$stage) ('/O'+$build) (Join-Path $repo 'installer\FindX.iss') *> (Join-Path $root 'compile.log')
   Assert ($LASTEXITCODE -eq 0) 'Official ISS test-mode compilation failed'
-  $setup=Join-Path $build 'FindX-2.5.2-fixture-setup.exe';$fault=if($case -eq 'backup-failure'){'backup'}elseif($case -eq 'health-rollback'){'health'}elseif($case -eq 'stop-timeout'){'stop-timeout'}else{'none'}
+  $setup=Join-Path $build 'FindX-2.5.2-fixture-setup.exe';$fault=if($case -eq 'backup-failure'){'backup'}elseif($case -eq 'health-rollback'){'health'}elseif($case -eq 'stop-timeout'){'stop-timeout'}elseif($case -eq 'interrupted-recovery'){'interrupt-after-copy'}else{'none'}
   $args='/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOICONS /COMPONENTS="main,clicfg" /TASKS="" /DIR="'+$app+'" /TXROOT="'+$tx+'" /TXDATA="'+$data+'" /TXNATIVE="'+$native+'" /TXLEGACY="'+$legacy+'" /TXFAULT='+$fault+' /LOG="'+(Join-Path $root 'setup.log')+'"'
   $process=Start-Process -FilePath $setup -ArgumentList $args -PassThru -Wait
   $expectedSuccess=$case -in @('fresh-no-service','published252-stopped-service','reentry-refusal')
@@ -74,10 +74,22 @@ foreach($case in @('fresh-no-service','published252-stopped-service','backup-fai
   Assert ((Hash (Join-Path $native 'prefs.json')) -eq $oldConfig) 'Config changed'
   Assert ((Hash (Join-Path $data 'index.bin')) -eq $oldIndex) 'Index not restored exactly'
   if($case -in @('backup-failure','health-rollback','legacy-running-refusal','stop-timeout')){Assert ((Hash (Join-Path $app 'FindX.exe')) -eq $oldGui) 'Old GUI binary changed on refusal/rollback'}
-  if($case -eq 'health-rollback'){Assert ((Get-Content -LiteralPath (Join-Path $tx 'journal.json') -Raw -Encoding UTF8 | ConvertFrom-Json).state -eq 'rolled_back') 'Rollback not confirmed';Assert (-not (Test-Path -LiteralPath (Join-Path $app 'resources\transaction-added.txt'))) 'Candidate addition left active';Assert (Test-Path -LiteralPath (Join-Path $tx 'failed-new\app\resources\transaction-added.txt')) 'Failed new evidence discarded'}
+  if($case -eq 'health-rollback'){Assert (-not (Test-Path -LiteralPath ('Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\FindXUpgradeTest-'+$service+'_is1'))) 'Failed install left uninstall registration';Assert ((Get-Content -LiteralPath (Join-Path $tx 'journal.json') -Raw -Encoding UTF8 | ConvertFrom-Json).state -eq 'rolled_back') 'Rollback not confirmed';Assert (-not (Test-Path -LiteralPath (Join-Path $app 'resources\transaction-added.txt'))) 'Candidate addition left active';Assert (Test-Path -LiteralPath (Join-Path $tx 'failed-new\app\resources\transaction-added.txt')) 'Failed new evidence discarded'}
   if($case -eq 'published252-stopped-service'){Assert ((Get-Service $service).Status -eq 'Stopped') 'Previously stopped service was started'}
   if($case -eq 'legacy-running-refusal'){Assert ((Get-Service $service).Status -eq 'Running') 'Old running service not restored'}
   if($case -eq 'reentry-refusal'){$again=Start-Process -FilePath $setup -ArgumentList $args -PassThru -Wait;Assert ($again.ExitCode -ne 0) 'Committed transaction reused implicitly'}
+  if($case -eq 'interrupted-recovery'){
+   $recovery=Join-Path $root 'tx-recovery';$resumeArgs=$args.Replace(('/TXROOT="'+$tx+'"'),('/TXROOT="'+$recovery+'"')).Replace('/TXFAULT=interrupt-after-copy','/TXFAULT=none')
+   $resumed=Start-Process -FilePath $setup -ArgumentList $resumeArgs -PassThru -Wait
+   Assert ($resumed.ExitCode -ne 0) 'Recovery must not claim a new installation'
+   Assert ((Get-Content -LiteralPath (Join-Path $tx 'journal.json') -Raw -Encoding UTF8 | ConvertFrom-Json).state -eq 'rolled_back') 'Interrupted actual installer was not recovered'
+   Assert ((Hash (Join-Path $app 'FindX.exe')) -eq $oldGui) 'Interrupted binary set not restored'
+   Assert (-not (Test-Path -LiteralPath (Join-Path $app 'resources\transaction-added.txt'))) 'Interrupted candidate addition remained active'
+   Assert ((Hash (Join-Path $data 'index.bin')) -eq $oldIndex) 'Interrupted index not restored'
+   $finalArgs=$resumeArgs.Replace(('/TXROOT="'+$recovery+'"'),('/TXROOT="'+(Join-Path $root 'tx-final')+'"'))
+   $final=Start-Process -FilePath $setup -ArgumentList $finalArgs -PassThru -Wait
+   Assert ($final.ExitCode -eq 0) 'Healthy retry after verified recovery failed'
+  }
   $rows.Add([ordered]@{case=$case;passed=$true;exit=$process.ExitCode;root=$root})
  }catch{$rows.Add([ordered]@{case=$case;passed=$false;error=$_.Exception.ToString();root=$root})}
  finally{
