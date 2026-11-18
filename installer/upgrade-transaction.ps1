@@ -10,6 +10,7 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
+Add-Type -AssemblyName System.ServiceProcess
 Import-Module (Join-Path $PSScriptRoot 'transaction-files.psm1') -Force -Global
 Import-Module (Join-Path $PSScriptRoot 'transaction-platform.psm1') -Force -Global
 $script:s=$null; $script:lock=$null
@@ -171,9 +172,16 @@ function Verify-GuiHealth {
  $null=[IO.Directory]::CreateDirectory($root)
  $exe=Join-Path $script:s.roots.app 'FindX.exe'
  $info=[Diagnostics.ProcessStartInfo]::new($exe,('--installer-health "'+$root+'"'));$info.UseShellExecute=$false
+ $info.CreateNoWindow=$true;$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
+ $started=[DateTime]::UtcNow
  $child=[Diagnostics.Process]::Start($info)
+ $out=$child.StandardOutput.ReadToEndAsync();$err=$child.StandardError.ReadToEndAsync()
  if(-not $child.WaitForExit(30000)){throw 'Candidate GUI health timed out; no force exit; backup retained until normal exit'}
- if($child.ExitCode -ne 0){throw ('Candidate GUI startup/normal exit failed: '+$child.ExitCode)}
+ [IO.File]::WriteAllText((Join-Path $root 'stdout.log'),$out.Result);[IO.File]::WriteAllText((Join-Path $root 'stderr.log'),$err.Result)
+ if($child.ExitCode -ne 0){
+  try{$events=Get-WinEvent -FilterHashtable @{LogName='Application';StartTime=$started.ToLocalTime()} -MaxEvents 50 -ErrorAction Stop | Where-Object {$_.Message -match 'FindX.exe'} | Select-Object TimeCreated,Id,ProviderName,Message;[IO.File]::WriteAllText((Join-Path $root 'windows-events.log'),($events | Format-List | Out-String))}catch{[IO.File]::WriteAllText((Join-Path $root 'windows-events.log'),('Own GUI event diagnostic unavailable: '+$_.Exception.Message))}
+  throw ('Candidate GUI startup/normal exit failed: '+$child.ExitCode)
+ }
  $render=Get-Content -LiteralPath (Join-Path $root 'render-health.json') -Raw -Encoding UTF8 | ConvertFrom-Json
  $exit=Get-Content -LiteralPath (Join-Path $root 'normal-exit.json') -Raw -Encoding UTF8 | ConvertFrom-Json
  if($render.version -ne $script:s.expectedVersion -or $render.frames -lt 3 -or -not $render.storage_ok -or -not $render.normal_quit_requested -or -not $render.isolated -or -not $exit.normal_event_loop_return -or -not $exit.passed){throw 'GUI did not confirm real frame/persistence/normal-exit health'}
@@ -306,7 +314,15 @@ try{
    Verify-GuiHealth
    if($script:s.fault -eq 'health'){if($script:s.testBuild){[IO.File]::WriteAllText((Join-Path $script:s.roots.data 'index.bin'),'deliberately damaged CI fixture only')};throw 'Injected CI post-copy health failure'}
    Apply-FxTxPlatformPath $script:s.platform
-   if($script:s.fault -eq 'post-platform'){throw 'Injected CI failure after actual PATH and shortcut changes'}
+   if($script:s.fault -eq 'post-platform'){
+    if($script:s.testBuild){
+     $observed=@();foreach($link in $script:s.platform.shortcuts){$exists=[IO.File]::Exists($link.path);$observed+=@{path=$link.path;exists=$exists;bytes=$(if($exists){[Convert]::ToBase64String([IO.File]::ReadAllBytes($link.path))}else{''})}}
+     $envkey=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\CurrentControlSet\Control\Session Manager\Environment')
+     try{$appliedPath=$envkey.GetValue('Path',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)}finally{$envkey.Dispose()}
+     [IO.File]::WriteAllText((Join-Path $TransactionRoot 'platform-applied.json'),(@{path=$appliedPath;shortcuts=$observed} | ConvertTo-Json -Depth 8))
+    }
+    throw 'Injected CI failure after actual PATH and shortcut changes'
+   }
    Set-State 'health_verified'
   }elseif($Phase -eq 'Commit'){
    if($script:s.state -ne 'health_verified'){throw 'Cannot commit without verified health'}

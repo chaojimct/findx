@@ -84,6 +84,8 @@ jobs:
             ${{ runner.temp }}/FindXUpgradeTest_*/**/render-health.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/normal-exit.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/service-health.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/platform-applied.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/reason.code
             ${{ runner.temp }}/FindXUpgradeTest_*/**/service-uninitialized.flag
             target/tx-file-tests-*/results.json
             target/tx-file-tests-*/**/restore-diff-*.json

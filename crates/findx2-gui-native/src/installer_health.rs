@@ -15,6 +15,9 @@ pub fn prepare(root: &str) -> Result<Vec<String>, String> {
         std::env::set_var("USERPROFILE",path.join("profile"));std::env::set_var("HOME",path.join("profile"));
         std::env::set_var("XDG_DATA_HOME",path.join("profile/data"));std::env::set_var("XDG_CONFIG_HOME",path.join("profile/config")); }
     ROOT.set(path).map_err(|_|"health already initialized")?;
+    let previous=std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {if let Some(root)=ROOT.get(){let _=std::fs::write(root.join("panic.log"),format!("{info}\n{}",std::backtrace::Backtrace::force_capture()));} previous(info);}));
+    checkpoint("prepared");
     Ok(vec!["FindX".into(),"--mock".into(),"--pipe".into(),format!("findx-installer-health-{}",std::process::id())])
 }
 pub fn rendered(window: &mut gpui_kit::Window, prefs: crate::prefs::LocalPrefs, settings: crate::settings_logic::FindxGuiSettings) {
@@ -38,4 +41,10 @@ pub fn finished() -> bool {
     let ok=READY.load(Ordering::SeqCst) && FRAMES.load(Ordering::SeqCst)>=3;
     let record=serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"normal_event_loop_return":true,"passed":ok});
     ok && std::fs::write(root.join("normal-exit.json"),record.to_string()).is_ok()
+}
+
+/// Only the explicit isolated diagnostic writes startup evidence. Normal GUI is silent.
+pub fn checkpoint(stage: &str) {
+    use std::io::Write;
+    if let Some(root)=ROOT.get(){if let Ok(mut file)=std::fs::OpenOptions::new().create(true).append(true).open(root.join("startup.log")){let _=writeln!(file,"{stage}");}}
 }

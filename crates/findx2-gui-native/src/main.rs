@@ -67,7 +67,9 @@ fn main() {
         std::thread::sleep(Duration::from_millis(120));
     }
 
+    findx2_gui_native::installer_health::checkpoint("enter-ui-start");
     ui::start(opts);
+    findx2_gui_native::installer_health::checkpoint("event-loop-returned");
     if !findx2_gui_native::installer_health::finished() {std::process::exit(82);}
 }
 

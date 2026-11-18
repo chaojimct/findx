@@ -46,9 +46,11 @@ pub fn start(opts: LaunchOptions) {
         #[cfg(windows)]
         set_official_app_user_model_id();
     }
+    crate::installer_health::checkpoint("create-platform");
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
+            crate::installer_health::checkpoint("application-run-entered");
             gpui_kit::init(cx);
             let dark = matches!(
                 cx.window_appearance(),
@@ -87,6 +89,7 @@ pub fn start(opts: LaunchOptions) {
                 cx.new(|cx| MainWindow::new(session_for_window, window, cx))
             })
             .expect("open FindX native window");
+            crate::installer_health::checkpoint("native-window-created");
 
             if crate::isolation::development_var_os("FINDX_NATIVE_OPEN_ABOUT").is_some() {
                 open_settings_window(session.clone(), cx);
