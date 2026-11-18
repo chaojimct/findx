@@ -1,0 +1,53 @@
+name: Installer safety native matrix
+on:
+  push:
+    branches: [release/v2.5.3-installer-safety]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-package:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native file primitives
+        shell: powershell
+        run: ./scripts/test-transaction-files.ps1
+      - name: Obtain hash-pinned published payload without running old installer
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path $env:RUNNER_TEMP 'findx-published252-input'
+          New-Item -ItemType Directory -Path $root | Out-Null
+          $setup=Join-Path $root 'published-setup.exe'
+          Invoke-WebRequest -UseBasicParsing https://github.com/chaojimct/findx/releases/download/v2.5.2/FindX-2.5.2-setup.exe -OutFile $setup
+          if((Get-FileHash $setup -Algorithm SHA256).Hash -ne '5766a666f0edcb947f21a9001b5eff0b701686956f65e8a7881a47bd29a9aef1'){throw 'Published setup digest mismatch'}
+          $zip=Join-Path $root 'innounp.zip'
+          Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/jrathlev/InnoUnpacker-Windows-GUI/refs/heads/master/innounp-2/bin/innounp-2.zip -OutFile $zip
+          if((Get-FileHash $zip -Algorithm SHA256).Hash -ne 'f8e45c9676bebc7d7570108ab572673b541fcf7a7d3d24a04319ac6b5315b4e8'){throw 'Pinned public unpacker digest changed; do not run'}
+          Expand-Archive $zip -DestinationPath (Join-Path $root 'unpacker')
+          & (Join-Path $root 'unpacker/innounp.exe') -x -y ('-d'+(Join-Path $root 'extracted')) $setup
+          if($LASTEXITCODE){throw 'Read-only setup extraction failed'}
+      - name: Install compiler if absent
+        shell: powershell
+        run: |
+          if(-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")){choco install innosetup -y --no-progress}
+      - name: Real official-ISS isolated package and native SCM matrix
+        shell: powershell
+        run: |
+          $root=Join-Path $env:RUNNER_TEMP 'findx-published252-input'
+          ./scripts/test-installer-native.ps1 -PublishedPayload (Join-Path $root 'extracted/{app}') -Iscc "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+      - name: Retain only test-owned evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-safety-test-evidence
+          path: |
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/*.log
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/results.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/journal*.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/failure.txt
+            target/tx-file-tests-*/results.json
+          if-no-files-found: warn
+          retention-days: 7

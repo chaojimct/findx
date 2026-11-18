@@ -1,4 +1,4 @@
-; FindX native Windows Inno Setup (publication blocked until upgrade gates pass)
+﻿; FindX native Windows Inno Setup (publication blocked until upgrade gates pass)
 ; 构建: 1) 在仓库根/ gui 中完成 tauri build --no-bundle
 ;       2) powershell -File installer\stage-inno.ps1
 ;       3) iscc /DMyAppVersion=x.y.z installer\FindX.iss
@@ -7,7 +7,9 @@
 ; 与 v1 的 FindX.iss 类似：多任务（服务注册、PATH、桌面快捷方式、安装后启动），无 .NET 检测。
 
 #ifndef UpgradeGatesApproved
+ #ifndef TxTestBuild
   #error "Upgrade gates are not approved. Run scripts/check_release.py --require-ready before enabling installer compilation."
+ #endif
 #endif
 
 #ifndef MyAppVersion
@@ -21,7 +23,12 @@
 #ifndef PublishDir
 #define PublishDir "stage"
 #endif
+#ifndef MyServiceName
 #define MyServiceName  "FindX2Search"
+#endif
+#ifndef TxPipeName
+#define TxPipeName "findx2"
+#endif
 ; 与 GUI 内约定一致：存在该文件时首启用 ProgramData 索引 + 服务模式
 #define MyInstalledMarker "FindX.installed"
 ; 「随系统启动」在 HKCU\...\Run 下的值名。改这里必须同步改 gui/src-tauri/src/autostart.rs
@@ -29,7 +36,12 @@
 #define MyRunValueName "FindX"
 
 [Setup]
+#ifdef TxTestBuild
+AppId=FindXUpgradeTest-{#MyServiceName}
+PrivilegesRequiredOverridesAllowed=dialog
+#else
 AppId={{7E8A9B0C-1D2E-3F4A-5B6C-7D8E9F0A1B2C}
+#endif
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
@@ -39,7 +51,11 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 OutputDir=..\dist
+#ifdef TxTestBuild
+OutputBaseFilename=FindX-{#MyAppVersion}-fixture-setup
+#else
 OutputBaseFilename=FindX-{#MyAppVersion}-setup
+#endif
 Compression=lzma2/ultra64
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible
@@ -47,6 +63,8 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 WizardStyle=modern
 SetupLogging=yes
+CloseApplications=no
+RestartApplications=no
 UninstallDisplayName={#MyAppName}
 ; 本脚本相对路径以 installer/ 为基准
 SetupIconFile=..\gui\src-tauri\icons\icon.ico
@@ -77,6 +95,11 @@ Name: "desktopicon";  Description: "创建桌面快捷方式";                  
 Name: "postlaunch";   Description: "安装完成后启动 FindX";                        GroupDescription: "安装结束:"; Components: main;   Flags: checkedonce
 
 [Files]
+Source: "{#PublishDir}\FindX.installed"; DestDir: "{app}"; Flags: ignoreversion; Components: main
+Source: "{#PublishDir}\stage-manifest.json"; DestDir: "{app}"; DestName: "payload-manifest.json"; Flags: ignoreversion; Components: main
+Source: "transaction-files.psm1"; Flags: dontcopy
+Source: "upgrade-transaction.ps1"; Flags: dontcopy
+
 ; stage 由 stage-inno.ps1 生成。勿用单条 "{#PublishDir}\*"：Inno 编译器要求根目录至少有一个能匹配 * 的文件；
 ; 若仅有子目录（如 resources）而无根层文件，会报 No files found matching ...\stage\*。
 Source: "{#PublishDir}\FindX.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: main
@@ -92,22 +115,12 @@ Name: "{group}\{#MyAppName}";           Filename: "{app}\{#MyAppExeName}"; Compo
 Name: "{group}\卸载 {#MyAppName}";     Filename: "{uninstallexe}";    Components: main
 Name: "{autodesktop}\{#MyAppName}";   Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; Components: main
 
-[Run]
-; Interactive installs keep the postlaunch checkbox (checkedonce).
-Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent shellexec; Tasks: postlaunch; Components: main
-; Silent / very-silent upgrades (including in-app /VERYSILENT) always start the
-; official GUI, independent of leftover checkedonce postlaunch task state.
-Filename: "{app}\{#MyAppExeName}"; Flags: nowait postinstall skipifnotsilent; Components: main
+; GUI restart is transaction-owned and only follows commit/restoration.
 
 [UninstallRun]
-; 先停服务再杀进程、最后 uninstall（卸载器仍应能找到 {app}\findx2-service.exe）
-Filename: "{sys}\sc.exe";            Parameters: "stop {#MyServiceName}";  Flags: runhidden; RunOnceId: "ScStop"
-Filename: "{sys}\taskkill.exe";     Parameters: "/F /IM findx2-service.exe"; Flags: runhidden; RunOnceId: "KillSvc"
-Filename: "{sys}\taskkill.exe";     Parameters: "/F /IM {#MyAppExeName}"; Flags: runhidden; RunOnceId: "KillGui"
-Filename: "{app}\findx2-service.exe"; Parameters: "uninstall";      Flags: runhidden; RunOnceId: "SvcUninstall"
-
-[UninstallDelete]
-Type: filesandordirs; Name: "{app}"
+; No process-name force kill or hardcoded engine uninstall command.
+Filename: "{sys}\sc.exe"; Parameters: "stop {#MyServiceName}"; Flags: runhidden; RunOnceId: "ScStop"
+Filename: "{sys}\sc.exe"; Parameters: "delete {#MyServiceName}"; Flags: runhidden; RunOnceId: "ScDelete"
 
 [Code]
 // ── 系统 PATH（与 v1 风格一致，HKLM）──
@@ -144,96 +157,6 @@ begin
   RegWriteStringValue(HKLM, 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment', 'Path', Path);
 end;
 
-function QuerySearchServiceCode: Integer;
-begin
-  if not Exec(ExpandConstant('{sys}\sc.exe'), 'query {#MyServiceName}', '', SW_HIDE, ewWaitUntilTerminated, Result) then
-    Result := -1;
-end;
-
-function WaitSearchServiceGone(TimeoutMs: Integer): Boolean;
-var
-  Elapsed: Integer;
-begin
-  Elapsed := 0;
-  while Elapsed < TimeoutMs do
-  begin
-    if QuerySearchServiceCode() <> 0 then
-    begin
-      Result := True;
-      Exit;
-    end;
-    Sleep(200);
-    Elapsed := Elapsed + 200;
-  end;
-  Result := QuerySearchServiceCode() <> 0;
-end;
-
-function InstallSearchService: Boolean;
-var
-  R, Attempt: Integer;
-  IndexPath, AppDir, Params: String;
-begin
-  Result := False;
-  AppDir := ExpandConstant('{app}');
-  IndexPath := ExpandConstant('{commonappdata}') + '\FindX\index.bin';
-  ForceDirectories(ExpandConstant('{commonappdata}') + '\FindX');
-
-  Exec(AppDir + '\findx2-service.exe', 'uninstall', '', SW_HIDE, ewWaitUntilTerminated, R);
-  Log('FindX uninstall service exit=' + IntToStr(R));
-  if not WaitSearchServiceGone(8000) then
-  begin
-    Exec(ExpandConstant('{sys}\sc.exe'), 'stop {#MyServiceName}', '', SW_HIDE, ewWaitUntilTerminated, R);
-    Exec(ExpandConstant('{sys}\sc.exe'), 'delete {#MyServiceName}', '', SW_HIDE, ewWaitUntilTerminated, R);
-    WaitSearchServiceGone(8000);
-  end;
-
-  { 参数必须能被 clap 吃到：旧写法 `install --index` 在未设 global 时直接 exit 2 }
-  Params := '--index ' + #34 + IndexPath + #34 + ' install';
-  for Attempt := 1 to 15 do
-  begin
-    if Exec(AppDir + '\findx2-service.exe', Params, '', SW_HIDE, ewWaitUntilTerminated, R) and (R = 0) then
-    begin
-      Result := True;
-      Break;
-    end;
-    Log('FindX install service attempt=' + IntToStr(Attempt) + ' exit=' + IntToStr(R));
-    Sleep(400);
-  end;
-
-  if not Result then
-  begin
-    MsgBox('注册 Windows 服务 {#MyServiceName} 失败。' + #13#10 +
-      'USN 增量监听需要该服务以 SYSTEM 运行，否则状态栏会报「打开卷失败: 拒绝访问」。' + #13#10 + #13#10 +
-      '请卸载后以管理员重装，或手动执行：' + #13#10 +
-      AppDir + '\findx2-service.exe --index "' + IndexPath + '" install' + #13#10 +
-      'sc start {#MyServiceName}', mbError, MB_OK);
-    Exit;
-  end;
-
-  Exec(ExpandConstant('{sys}\sc.exe'), 'start {#MyServiceName}', '', SW_HIDE, ewWaitUntilTerminated, R);
-  Log('FindX sc start exit=' + IntToStr(R));
-end;
-
-// ── 安装结束：服务 + 标记 + PATH ──
-procedure CurStepChanged(CurStep: TSetupStep);
-var
-  AppDir, Marker: String;
-begin
-  if CurStep = ssPostInstall then
-  begin
-    AppDir := ExpandConstant('{app}');
-    if WizardIsTaskSelected('addpath') then
-      AddToPath(AppDir);
-
-    if WizardIsComponentSelected('servicec') then
-    begin
-      InstallSearchService;
-      Marker := AppDir + '\{#MyInstalledMarker}';
-      SaveStringToFile(Marker, '1' + #13#10, False);
-    end;
-  end;
-end;
-
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then begin
@@ -245,12 +168,110 @@ begin
   end;
 end;
 
-// 与 v1 一样：有旧版本占用时强杀
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+
 var
-  ResultCode: Integer;
+  TxRoot: String;
+  TxStarted, TxPrepared, TxCommitted: Boolean;
+
+function TxQuote(const Value: String): String;
 begin
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#MyAppExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM findx2-service.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if Pos('"', Value) > 0 then RaiseException('Invalid transaction argument');
+  Result := '"' + Value + '"';
+end;
+
+function TxDataRoot: String;
+begin
+#ifdef TxTestBuild
+  Result := ExpandConstant('{param:TXDATA|}');
+#else
+  Result := ExpandConstant('{commonappdata}\FindX');
+#endif
+end;
+
+function TxNativeConfig: String;
+begin
+#ifdef TxTestBuild
+  Result := ExpandConstant('{param:TXNATIVE|}');
+#else
+  Result := ExpandConstant('{localappdata}\FindX-native-dev');
+#endif
+end;
+
+function TxLegacyConfig: String;
+begin
+#ifdef TxTestBuild
+  Result := ExpandConstant('{param:TXLEGACY|}');
+#else
+  Result := ExpandConstant('{userappdata}\tools.findx.gui');
+#endif
+end;
+
+function TxCall(const Phase: String): Boolean;
+var
+  Args, Fault: String;
+  ErrorText: AnsiString;
+  Code: Integer;
+begin
+  Args := '-NoProfile -NonInteractive -File ' + TxQuote(ExpandConstant('{tmp}\upgrade-transaction.ps1')) +
+    ' -Phase ' + Phase + ' -TransactionRoot ' + TxQuote(TxRoot);
+  if Phase = 'Prepare' then begin
+    Args := Args + ' -InstallRoot ' + TxQuote(ExpandConstant('{app}')) +
+      ' -DataRoot ' + TxQuote(TxDataRoot) + ' -NativeConfigRoot ' + TxQuote(TxNativeConfig) +
+      ' -LegacyConfigRoot ' + TxQuote(TxLegacyConfig) + ' -ServiceName {#MyServiceName}' +
+      ' -PipeName {#TxPipeName} -ExpectedVersion {#MyAppVersion} -InstallService ';
+    if WizardIsComponentSelected('servicec') then Args := Args + '1' else Args := Args + '0';
+#ifdef TxTestBuild
+    Fault := ExpandConstant('{param:TXFAULT|none}');
+    Args := Args + ' -TestBuild -TimeoutSeconds 3 -Fault ' + TxQuote(Fault);
+#endif
+  end;
+  Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Args, '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0);
+  if not Result then begin
+    ErrorText := '';
+    LoadStringFromFile(TxRoot + '\failure.txt', ErrorText);
+    Log('FindX transaction ' + Phase + ' failed: ' + String(ErrorText));
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
   Result := '';
+  if TxStarted then begin Result := 'Upgrade transaction already attempted; see retained evidence.'; Exit; end;
+#ifdef TxTestBuild
+  if GetEnv('GITHUB_ACTIONS') <> 'true' then begin Result := 'Test build runs only on the isolated CI runner.'; Exit; end;
+  TxRoot := ExpandConstant('{param:TXROOT|}');
+#else
+  TxRoot := ExpandConstant('{commonappdata}\FindX-upgrades\') + GetDateTimeString('yyyymmddhhnnsszzz', '', '') ;
+#endif
+  ExtractTemporaryFile('transaction-files.psm1');
+  ExtractTemporaryFile('upgrade-transaction.ps1');
+  TxStarted := True;
+  TxPrepared := TxCall('Prepare');
+  if not TxPrepared then Result := 'Safe upgrade preparation failed. No forced shutdown. Evidence: ' + TxRoot;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Code: Integer;
+begin
+  if CurStep = ssPostInstall then begin
+    if not TxCall('Verify') then RaiseException('Upgrade health failed; transaction rollback required. Evidence: ' + TxRoot);
+    { PATH remains selected behavior, but runs before commit; registration/Run rollback
+      coverage remains a release gate until the full native matrix proves it. }
+    { PATH mutation is deferred until registry rollback coverage is implemented. }
+    if not TxCall('Commit') then RaiseException('Upgrade transaction commit failed. Evidence: ' + TxRoot);
+    TxCommitted := True;
+  end;
+end;
+
+procedure DeinitializeSetup;
+var
+  Code: Integer;
+begin
+  if TxPrepared and not TxCommitted then begin
+    if not TxCall('Rollback') then Log('RECOVERY REQUIRED: retained backup at ' + TxRoot);
+  end;
+  { Only restart a previously-running GUI, in its original user context. }
+  if TxStarted and FileExists(TxRoot + '\restart-original-user-gui.flag') then
+    ExecAsOriginalUser(ExpandConstant('{app}\FindX.exe'), '', ExpandConstant('{app}'), SW_SHOWNORMAL, ewNoWait, Code);
 end;
