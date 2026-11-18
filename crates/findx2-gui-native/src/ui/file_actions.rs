@@ -111,6 +111,7 @@ impl MainWindow {
         }
     }
     pub(crate) fn selected_file_hits(&self) -> Vec<SearchHitDto> {
+        if !self.file_scope_current() { return Vec::new(); }
         if self.workspace.mode == ViewMode::Usage {
             return self.active_workspace_hit().into_iter().collect();
         }
@@ -149,6 +150,7 @@ impl MainWindow {
         modifiers: Modifiers,
         cx: &mut Context<Self>,
     ) {
+        if !self.file_rows_current(search) { return; }
         let key = self.selection_table_key(search);
         let previous = if search {
             self.selected
@@ -224,6 +226,7 @@ impl MainWindow {
         row: usize,
         cx: &mut Context<Self>,
     ) {
+        if !self.file_rows_current(search) { return; }
         if self.file_actions.pointer_event.take() == Some((search, row)) {
             cx.notify();
             return;
@@ -235,6 +238,7 @@ impl MainWindow {
         }
     }
     pub(crate) fn prepare_context_row(&mut self, search: bool, row: usize, cx: &mut Context<Self>) {
+        if !self.file_rows_current(search) { return; }
         let set = if search {
             &mut self.search_selection
         } else {
@@ -254,6 +258,7 @@ impl MainWindow {
         cx.notify();
     }
     fn paste_directory(&self) -> Option<PathBuf> {
+        if !self.file_scope_current() { return None; }
         if self.workspace.mode == ViewMode::Directory {
             Some(self.workspace.location.clone())
         } else {
@@ -496,7 +501,7 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.settings_page.is_some() {
+        if self.text_edit_active(window, cx) || !self.file_scope_current() {
             return;
         }
         let blank = std::mem::take(&mut self.file_actions.context_blank);

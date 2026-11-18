@@ -179,7 +179,7 @@ mod tests {
     }
     #[test]
     fn child_delay() {
-        if std::env::var_os("FINDX_PREVIEW_DELAY_TEST").is_some() {
+        if crate::isolation::development_var_os("FINDX_PREVIEW_DELAY_TEST").is_some() {
             std::thread::sleep(Duration::from_secs(30));
         }
     }

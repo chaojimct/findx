@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub struct LocalPrefs {
     #[serde(default)]
     pub usage_reduce_motion: bool,
+    #[serde(default = "default_usage_depth")]
+    pub usage_preferred_depth: usize,
     #[serde(default)]
     pub browser_favorites: Vec<String>,
     #[serde(default)]
@@ -42,6 +44,8 @@ pub struct LocalPrefs {
     pub last_official_update_check_unix: i64,
 }
 
+fn default_usage_depth()->usize{3}
+
 fn default_true() -> bool {
     true
 }
@@ -50,6 +54,7 @@ impl Default for LocalPrefs {
     fn default() -> Self {
         Self {
             usage_reduce_motion: false,
+            usage_preferred_depth: 3,
             browser_favorites: Vec::new(),
             browser_recent: Vec::new(),
             browser_show_hidden: false,
@@ -88,14 +93,18 @@ pub fn save_prefs(prefs: &LocalPrefs) -> Result<(), String> {
 
 pub fn load_settings(pipe_name: &str, default_index: String) -> FindxGuiSettings {
     let path = settings_path();
-    let default = FindxGuiSettings::isolated_default(pipe_name, default_index);
+    let default = FindxGuiSettings::isolated_default(pipe_name, default_index.clone());
     let Ok(text) = std::fs::read_to_string(&path) else {
         return default;
     };
     match serde_json::from_str::<FindxGuiSettings>(&text) {
         Ok(mut s) => {
             // 绝不把隔离客户端的管道名偷偷改回生产默认。
-            if crate::isolation::is_production_pipe(&s.pipe_name) {
+            if crate::isolation::official_storage() {
+                // Persisted GUI drafts never redirect an official GUI to dev storage.
+                s.pipe_name = "findx2".into();
+                s.index_path = default_index;
+            } else if crate::isolation::is_production_pipe(&s.pipe_name) {
                 s.pipe_name = pipe_name.to_string();
             }
             s
@@ -105,8 +114,13 @@ pub fn load_settings(pipe_name: &str, default_index: String) -> FindxGuiSettings
 }
 
 pub fn save_settings(settings: &FindxGuiSettings) -> Result<(), String> {
-    if crate::isolation::is_production_pipe(&settings.pipe_name) {
+    if crate::isolation::is_production_pipe(&settings.pipe_name)
+        && !crate::isolation::official_storage()
+    {
         return Err("拒绝把管道名保存为生产默认 findx2。请使用隔离管道名。".into());
+    }
+    if crate::isolation::official_storage() && settings.pipe_name != "findx2" {
+        return Err("正式安装版的连接固定为 findx2；隔离运行请使用显式 --pipe。".into());
     }
     let path = settings_path();
     if let Some(parent) = path.parent() {
@@ -210,3 +224,5 @@ mod storage_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]mod usage_depth_preference_tests{#[test]fn default_is_three_and_manual_two_roundtrips_without_available_depth(){let p=super::LocalPrefs::default();assert_eq!(p.usage_preferred_depth,3);let mut p=p;p.usage_preferred_depth=2;let q:super::LocalPrefs=serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();assert_eq!(q.usage_preferred_depth,2);let q:super::LocalPrefs=serde_json::from_str("{}").unwrap();assert_eq!(q.usage_preferred_depth,3);}}

@@ -16,15 +16,12 @@ pub fn is_production_pipe(name: &str) -> bool {
 
 pub fn pipe_bare_name(name: &str) -> String {
     let t = name.trim();
-    #[cfg(windows)]
+    let normalized = t.replace('/', "\\");
+    if let Some(rest) = normalized
+        .strip_prefix(r"\\.\pipe\")
+        .or_else(|| normalized.strip_prefix(r"\\?\pipe\"))
     {
-        let lower = t.replace('/', r"\");
-        if let Some(rest) = lower
-            .strip_prefix(r"\\.\pipe\")
-            .or_else(|| lower.strip_prefix(r"\\?\pipe\"))
-        {
-            return rest.to_string();
-        }
+        return rest.to_string();
     }
     t.trim_end_matches(".sock").to_string()
 }
@@ -96,12 +93,42 @@ pub fn isolated_data_dir() -> std::path::PathBuf {
     }
 }
 
+// Set once at process launch, before preferences are loaded. Tests use the pure
+// path helpers below instead of changing process-global HOME/XDG variables.
+static OFFICIAL_STORAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn configure_storage(official: bool) {
+    OFFICIAL_STORAGE.store(official, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn official_storage() -> bool {
+    OFFICIAL_STORAGE.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub fn official_data_dir() -> std::path::PathBuf {
+    // Keep the existing Windows GUI preference location; no settings migration.
+    #[cfg(windows)] { return isolated_data_dir(); }
+    #[cfg(not(windows))] {
+    let home =
+        std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME is required for FindX"));
+    if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/FindX")
+    } else {
+        home.join(".local/share/FindX")
+    }
+}
+}
+pub fn user_data_dir() -> std::path::PathBuf {
+    if official_storage() {
+        official_data_dir()
+    } else {
+        isolated_data_dir()
+    }
+}
+
 pub fn settings_path() -> std::path::PathBuf {
-    isolated_data_dir().join("settings.json")
+    user_data_dir().join("settings.json")
 }
 
 pub fn prefs_path() -> std::path::PathBuf {
-    isolated_data_dir().join("prefs.json")
+    user_data_dir().join("prefs.json")
 }
 
 pub fn isolated_index_path() -> std::path::PathBuf {
@@ -138,6 +165,73 @@ fn path_key(path: &std::path::Path) -> String {
         .to_ascii_lowercase()
 }
 
+/// Official shipped GUI file name: `FindX.exe` on Windows, `FindX` on Unix.
+pub fn official_gui_file_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "FindX.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "FindX"
+    }
+}
+
+/// True when `name` is the official shipped GUI file name for this platform.
+pub fn is_official_gui_file_name(name: &str) -> bool {
+    #[cfg(windows)]
+    {
+        name.eq_ignore_ascii_case("FindX.exe")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        name.eq_ignore_ascii_case("FindX")
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        name == "FindX"
+    }
+}
+
+/// Official Linux install path is `/opt/FindX/FindX` (not a random `.../opt/FindX/FindX`).
+pub fn is_official_linux_install_path(exe: &std::path::Path) -> bool {
+    let Some(name) = exe.file_name() else {
+        return false;
+    };
+    if name.to_string_lossy() != "FindX" {
+        return false;
+    }
+    let Some(parent) = exe.parent() else {
+        return false;
+    };
+    if parent.file_name().is_none_or(|n| n != "FindX") {
+        return false;
+    }
+    let Some(grand) = parent.parent() else {
+        return false;
+    };
+    if grand.file_name().is_none_or(|n| n != "opt") {
+        return false;
+    }
+    matches!(
+        grand.parent().and_then(|p| p.as_os_str().to_str()),
+        Some("") | Some("/")
+    ) || grand
+        .parent()
+        .is_some_and(|p| p == std::path::Path::new("/"))
+        || grand == std::path::Path::new("/opt")
+}
+
+/// Official macOS install path is `/Applications/FindX.app/Contents/MacOS/FindX`.
+pub fn is_official_macos_install_path(exe: &std::path::Path) -> bool {
+    // This is a Unix install-layout policy, including when tested on Windows.
+    // Host Path::iter represents RootDir as "\\" on Windows, not "/".
+    // Match the exact absolute Unix spelling; never accept a Windows drive,
+    // a relative bundle, or a lookalike Applications directory elsewhere.
+    exe.to_str().is_some_and(|path| path.eq_ignore_ascii_case(
+        "/Applications/FindX.app/Contents/MacOS/FindX"))
+}
+
 /// Program Files roots used to recognize the official install directory.
 pub fn official_program_files_roots() -> Vec<std::path::PathBuf> {
     let mut roots: Vec<std::path::PathBuf> = Vec::new();
@@ -145,7 +239,9 @@ pub fn official_program_files_roots() -> Vec<std::path::PathBuf> {
         if let Some(value) = std::env::var_os(key) {
             let path = std::path::PathBuf::from(value);
             if !path.as_os_str().is_empty()
-                && !roots.iter().any(|existing| path_key(existing) == path_key(&path))
+                && !roots
+                    .iter()
+                    .any(|existing| path_key(existing) == path_key(&path))
             {
                 roots.push(path);
             }
@@ -154,9 +250,25 @@ pub fn official_program_files_roots() -> Vec<std::path::PathBuf> {
     roots
 }
 
-/// True when `exe` is `{ProgramFiles}\FindX\FindX.exe` (or the x86 equivalent).
+/// True when `exe` is the official install path on this platform.
 pub fn is_official_install_exe(exe: &std::path::Path) -> bool {
-    is_official_install_exe_with_roots(exe, &official_program_files_roots())
+    #[cfg(windows)]
+    {
+        is_official_install_exe_with_roots(exe, &official_program_files_roots())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        is_official_linux_install_path(exe)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        is_official_macos_install_path(exe)
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = exe;
+        false
+    }
 }
 
 pub fn is_official_install_exe_with_roots(
@@ -190,10 +302,13 @@ pub fn is_official_install_exe_with_roots(
 ///
 /// A process is official when it is not `--mock` and is not an explicit
 /// isolated pipe, and either:
-/// 1. the executable is named `FindX.exe` and a sibling `FindX.installed`
-///    marker is present (the shipped install layout), or
-/// 2. the executable is running from the official install directory
-///    (`%ProgramFiles%\FindX\FindX.exe` or `%ProgramFiles(x86)%\FindX\FindX.exe`).
+/// 1. the executable is named `FindX.exe` (Windows) or `FindX` (Unix) and a
+///    sibling `FindX.installed` marker is present (the shipped install layout,
+///    including official-mode fixtures), or
+/// 2. the executable is running from the official install directory:
+///    `%ProgramFiles%\FindX\FindX.exe` (or x86) on Windows,
+///    `/opt/FindX/FindX` on Linux,
+///    `/Applications/FindX.app/Contents/MacOS/FindX` on macOS.
 pub fn is_official_product_entry(
     installed_or_official_dir: bool,
     mock: bool,
@@ -201,17 +316,14 @@ pub fn is_official_product_entry(
     pipe_set: bool,
     pipe_name: &str,
 ) -> bool {
-    installed_or_official_dir
-        && !mock
-        && live
-        && (!pipe_set || is_production_pipe(pipe_name))
+    installed_or_official_dir && !mock && live && (!pipe_set || is_production_pipe(pipe_name))
 }
 
-/// Installed layout (FindX.exe + FindX.installed) or official Program Files path.
+/// Installed layout (`FindX`/`FindX.exe` + `FindX.installed`) or official dir.
 pub fn detect_official_entry(exe: &std::path::Path) -> bool {
     let is_findx = exe
         .file_name()
-        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("FindX.exe"));
+        .is_some_and(|n| is_official_gui_file_name(&n.to_string_lossy()));
     if !is_findx {
         return false;
     }
@@ -260,27 +372,42 @@ mod tests {
 
     #[test]
     fn official_install_dir_and_product_entry() {
-        let pf = std::path::PathBuf::from(r"C:\Program Files");
-        let pf86 = std::path::PathBuf::from(r"C:\Program Files (x86)");
-        let roots = [pf.clone(), pf86.clone()];
-        assert!(is_official_install_exe_with_roots(
-            std::path::Path::new(r"C:\Program Files\FindX\FindX.exe"),
-            &roots
+        #[cfg(windows)]
+        {
+            let pf = std::path::PathBuf::from(r"C:\Program Files");
+            let pf86 = std::path::PathBuf::from(r"C:\Program Files (x86)");
+            let roots = [pf.clone(), pf86.clone()];
+            assert!(is_official_install_exe_with_roots(
+                std::path::Path::new(r"C:\Program Files\FindX\FindX.exe"),
+                &roots
+            ));
+            assert!(is_official_install_exe_with_roots(
+                std::path::Path::new(r"C:\Program Files (x86)\FindX\FindX.exe"),
+                &roots
+            ));
+            assert!(!is_official_install_exe_with_roots(
+                std::path::Path::new(r"C:\FindX-example\project\target\t159\FindX.exe"),
+                &roots
+            ));
+            assert!(!is_official_install_exe_with_roots(
+                std::path::Path::new(r"C:\Program Files\FindX\findx2-gui-native.exe"),
+                &roots
+            ));
+        }
+        assert!(is_official_product_entry(
+            true,
+            false,
+            true,
+            false,
+            PRODUCTION_PIPE
         ));
-        assert!(is_official_install_exe_with_roots(
-            std::path::Path::new(r"C:\Program Files (x86)\FindX\FindX.exe"),
-            &roots
+        assert!(!is_official_product_entry(
+            true,
+            true,
+            false,
+            false,
+            DEFAULT_ISOLATED_PIPE
         ));
-        assert!(!is_official_install_exe_with_roots(
-            std::path::Path::new(r"C:\Users\chaoj\dev\tools\findx\target\t159\FindX.exe"),
-            &roots
-        ));
-        assert!(!is_official_install_exe_with_roots(
-            std::path::Path::new(r"C:\Program Files\FindX\findx2-gui-native.exe"),
-            &roots
-        ));
-        assert!(is_official_product_entry(true, false, true, false, PRODUCTION_PIPE));
-        assert!(!is_official_product_entry(true, true, false, false, DEFAULT_ISOLATED_PIPE));
         assert!(!is_official_product_entry(
             true,
             false,
@@ -288,7 +415,63 @@ mod tests {
             true,
             DEFAULT_ISOLATED_PIPE
         ));
-        assert!(!is_official_product_entry(false, false, true, false, PRODUCTION_PIPE));
+        assert!(!is_official_product_entry(
+            false,
+            false,
+            true,
+            false,
+            PRODUCTION_PIPE
+        ));
+    }
+
+    #[test]
+    fn official_unix_install_paths_and_names() {
+        assert!(is_official_linux_install_path(std::path::Path::new(
+            "/opt/FindX/FindX"
+        )));
+        assert!(!is_official_linux_install_path(std::path::Path::new(
+            "/home/user/opt/FindX/FindX"
+        )));
+        assert!(!is_official_linux_install_path(std::path::Path::new(
+            "/opt/FindX/findx2-gui-native"
+        )));
+        assert!(!is_official_linux_install_path(std::path::Path::new(
+            "/usr/bin/FindX"
+        )));
+        assert!(is_official_macos_install_path(std::path::Path::new(
+            "/Applications/FindX.app/Contents/MacOS/FindX"
+        )));
+        assert!(!is_official_macos_install_path(std::path::Path::new(
+            "/Users/me/Applications/FindX.app/Contents/MacOS/FindX"
+        )));
+        assert!(!is_official_macos_install_path(std::path::Path::new(
+            "/Applications/FindX.app/Contents/MacOS/findx2-gui-native"
+        )));
+        #[cfg(target_os = "linux")]
+        {
+            assert!(is_official_gui_file_name("FindX"));
+            assert!(!is_official_gui_file_name("FindX.exe"));
+            assert!(!is_official_gui_file_name("findx"));
+            assert!(!is_official_gui_file_name("findx2-gui-native"));
+            assert!(is_official_install_exe(std::path::Path::new(
+                "/opt/FindX/FindX"
+            )));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(is_official_gui_file_name("FindX"));
+            assert!(is_official_gui_file_name("findx"));
+            assert!(!is_official_gui_file_name("FindX.exe"));
+            assert!(is_official_install_exe(std::path::Path::new(
+                "/Applications/FindX.app/Contents/MacOS/FindX"
+            )));
+        }
+        #[cfg(windows)]
+        {
+            assert!(is_official_gui_file_name("FindX.exe"));
+            assert!(is_official_gui_file_name("findx.exe"));
+            assert!(!is_official_gui_file_name("FindX"));
+        }
     }
 }
 
@@ -349,4 +532,17 @@ mod usage_open_tests {
         assert!(isolated_usage_open_path(false, Some(&dir.join("missing"))).is_none());
         let _ = fs::remove_dir_all(&dir);
     }
+}
+
+// Development automation cannot steer installed release binaries through inherited environment.
+pub fn development_var_os(key: &str) -> Option<std::ffi::OsString> {
+    if cfg!(any(debug_assertions, test)) { std::env::var_os(key) } else { None }
+}
+pub fn development_var(key: &str) -> Result<String, std::env::VarError> {
+    if cfg!(any(debug_assertions, test)) { std::env::var(key) } else { Err(std::env::VarError::NotPresent) }
+}
+
+pub fn official_index_path() -> std::path::PathBuf {
+    #[cfg(windows)] { return std::path::PathBuf::from(std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into())).join("FindX").join("index.bin"); }
+    #[cfg(not(windows))] { official_data_dir().join("index.bin") }
 }

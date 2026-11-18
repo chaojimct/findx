@@ -1,6 +1,47 @@
 ﻿# Exact installer-owned registry/shortcut scope. No arbitrary tree or credential export.
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
+if(-not ('FxTxProcessNative' -as [type])) {Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class FxTxProcessNative {
+ [DllImport("shell32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CommandLineToArgvW(string command, out int count);
+ [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr p);
+ [DllImport("kernel32.dll",SetLastError=true)] public static extern bool GetNamedPipeServerProcessId(IntPtr h,out uint pid);
+ public static string[] Args(string command) {int n;IntPtr p=CommandLineToArgvW(command,out n);if(p==IntPtr.Zero)throw new System.ComponentModel.Win32Exception();try{if(n>64)throw new InvalidOperationException("Service argument bound");var a=new string[n];for(int i=0;i<n;i++)a[i]=Marshal.PtrToStringUni(Marshal.ReadIntPtr(p,i*IntPtr.Size));return a;}finally{LocalFree(p);}}
+}
+'@}
+function Assert-FxTxServiceScope([string]$Command,[string]$Image,[string]$Index,[string]$PipeName) {
+ $args=[FxTxProcessNative]::Args($Command)
+ if($args.Count -lt 2 -or $args[0] -ine $Image){throw 'Unexpected service executable; unchanged'}
+ $seen=@{}
+ for($i=1;$i -lt $args.Count;$i++){
+  $key=$args[$i]
+  if($seen.ContainsKey($key)){throw 'Duplicate service argument; unchanged'}
+  if($key -in @('--service','--no-watch','--no-backfill','--no-everything-ipc')){$seen[$key]=$true;continue}
+  if($key -notin @('--index','--pipe','--volume','--save-interval-secs') -or $i+1 -ge $args.Count){throw 'Unsupported service arguments; unchanged'}
+  $i++;$seen[$key]=$args[$i]
+ }
+ if(-not $seen.ContainsKey('--service') -or -not $seen.ContainsKey('--index') -or -not $seen.ContainsKey('--pipe')){throw 'Service index/pipe is not explicit; unchanged'}
+ if((Get-FxTxPath $seen['--index']) -ine (Get-FxTxPath $Index) -or $seen['--pipe'] -cne $PipeName){throw 'Service index/pipe lies outside the verified backup scope; unchanged'}
+ if($seen.ContainsKey('--volume') -and $seen['--volume'] -notmatch '^[A-Za-z]:$'){throw 'Unsupported volume scope; unchanged'}
+ if($seen.ContainsKey('--save-interval-secs') -and $seen['--save-interval-secs'] -notmatch '^[0-9]{1,7}$'){throw 'Unsupported save interval; unchanged'}
+}
+function Read-FxTxServiceStatus([string]$PipeName,[int]$ExpectedPid,[int]$TimeoutMs=1000) {
+ $pipe=[IO.Pipes.NamedPipeClientStream]::new('.',$PipeName,[IO.Pipes.PipeDirection]::InOut,[IO.Pipes.PipeOptions]::Asynchronous)
+ $reader=$null
+ try {
+  $pipe.Connect($TimeoutMs);[uint32]$server=0
+  if(-not [FxTxProcessNative]::GetNamedPipeServerProcessId($pipe.SafePipeHandle.DangerousGetHandle(),[ref]$server) -or $server -ne $ExpectedPid){throw 'Health pipe is not owned by the exact service process'}
+  $bytes=[Text.Encoding]::UTF8.GetBytes('{"type":"status"}'+"`n");$pipe.Write($bytes,0,$bytes.Length);$pipe.Flush()
+  $reader=[IO.StreamReader]::new($pipe,[Text.Encoding]::UTF8,$false,4096,$true)
+  $task=$reader.ReadLineAsync();if(-not $task.Wait($TimeoutMs)){throw 'Status response timeout'}
+  $line=$task.Result;if(-not $line -or $line.Length -gt 65536){throw 'Invalid bounded status response'}
+  $status=$line | ConvertFrom-Json
+  if($status.type -ne 'status_result'){throw 'Unexpected IPC status response'}
+  return $status
+ }finally{if($reader){$reader.Dispose()};$pipe.Dispose()}
+}
 function Set-FxTxPrivateDirectory([string]$Path) {
  $path=Get-FxTxPath $Path
  if(Test-Path -LiteralPath $path){Assert-FxTxPrivateDirectory $path;return}
@@ -65,6 +106,10 @@ function Restore-FxTxRegistryTree($Spec,$Tree) {
 function Assert-FxTxSame($Actual,$Expected,[string]$Context) {
  if(($Actual | ConvertTo-Json -Depth 40 -Compress) -cne ($Expected | ConvertTo-Json -Depth 40 -Compress)){throw ($Context+' changed or did not restore exactly')}
 }
+function Get-FxTxAppendedPath([string]$Current,[string]$InstallRoot,[bool]$AddPath) {
+ if(-not $AddPath -or @($Current.Split(';') | Where-Object {$_.Trim().Trim('"').TrimEnd('\').Equals($InstallRoot.TrimEnd('\'),[StringComparison]::OrdinalIgnoreCase)}).Count){return $Current}
+ if($Current.Length){return $Current+';'+$InstallRoot};return $InstallRoot
+}
 function Get-FxTxPlatformSnapshot([string]$UninstallKey,[string]$ServiceName,[string[]]$ShortcutPaths,[string]$InstallRoot,[bool]$AddPath) {
  if($UninstallKey -notmatch '^(\{7E8A9B0C-1D2E-3F4A-5B6C-7D8E9F0A1B2C\}|FindXUpgradeTest-FindXUpgradeTest_[a-f0-9]{32})_is1$'){throw 'Unrecognized exact uninstall registration'}
  $uninstall=[pscustomobject]@{hive='LocalMachine';path='SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\'+$UninstallKey}
@@ -79,8 +124,7 @@ function Get-FxTxPlatformSnapshot([string]$UninstallKey,[string]$ServiceName,[st
   if($present){if((Get-Item -LiteralPath $p).Length -gt 2097152){throw 'Shortcut exceeds bound'};$entry.metadata=Get-FxTxMetadata $p;$entry.bytes=[Convert]::ToBase64String([IO.File]::ReadAllBytes($p))};$shortcuts+=$entry
  }
  if($path.exists -and $path.kind -notin @('String','ExpandString')){throw 'Unexpected PATH type; unchanged'}
- $newPath=[string]$path.value
- if($AddPath -and -not @($newPath.Split(';') | Where-Object {$_.TrimEnd('\').Equals($InstallRoot.TrimEnd('\'),[StringComparison]::OrdinalIgnoreCase)}).Count){$newPath=$newPath.TrimEnd(';')+';'+$InstallRoot;$newPath=$newPath.TrimStart(';')}
+ $newPath=Get-FxTxAppendedPath ([string]$path.value) $InstallRoot $AddPath
  return [ordered]@{schema=1;uninstallSpec=$uninstall;uninstall=(Read-FxTxRegistryTree $uninstall);serviceSpec=$service;service=(Read-FxTxRegistryTree $service);environmentSpec=$envspec;path=$path;addPath=$AddPath;newPath=$newPath;runSpec=$runspec;run=$run;shortcuts=@($shortcuts)}
 }
 function Apply-FxTxPlatformPath($Snapshot) {
@@ -112,12 +156,31 @@ function Restore-FxTxPlatform($Snapshot,[string]$EvidenceRoot) {
  $key=Open-FxTxRegistry $Snapshot.runSpec
  try{Assert-FxTxSame (Read-FxTxRegistryValue $key 'FindX') $Snapshot.run 'User autostart (installer does not mutate it)'}finally{if($key){$key.Dispose()}}
  $n=0;foreach($item in $Snapshot.shortcuts){
+  $identity=$n;$n++ # Stable leaf identity, even when an earlier leaf is already restored.
+  $null=Get-FxTxPath $item.path
   $same=([IO.File]::Exists($item.path) -eq [bool]$item.exists)
   if($same -and $item.exists){$same=([Convert]::ToBase64String([IO.File]::ReadAllBytes($item.path)) -ceq $item.bytes)}
-  if($same){continue}
-  if([IO.File]::Exists($item.path)){$null=[IO.Directory]::CreateDirectory($EvidenceRoot);[IO.File]::Move($item.path,(Join-Path $EvidenceRoot (([string]$n)+'.lnk')))}
-  if($item.exists){$null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($item.path));$f=[IO.File]::Open($item.path,'CreateNew','Write','None');try{$b=[Convert]::FromBase64String($item.bytes);$f.Write($b,0,$b.Length);$f.Flush($true)}finally{$f.Dispose()};Set-FxTxMetadata $item.path $item.metadata $false}
-  $n++
+  if(-not $same){
+   if([IO.File]::Exists($item.path)){
+    $null=[IO.Directory]::CreateDirectory($EvidenceRoot)
+    if([IO.Directory]::GetFiles($EvidenceRoot).Count -ge 128){throw 'Shortcut recovery evidence bound reached; originals retained'}
+    $dest=Join-Path $EvidenceRoot (([string]$identity)+'.lnk')
+    if([IO.File]::Exists($dest)){$dest=Join-Path $EvidenceRoot (([string]$identity)+'.interrupted-'+[guid]::NewGuid().ToString('N')+'.lnk')}
+    [IO.File]::Move($item.path,$dest)
+   }
+   if($item.exists){
+    $null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($item.path))
+    $f=[IO.File]::Open($item.path,'CreateNew','Write','None')
+    try{$b=[Convert]::FromBase64String($item.bytes);$f.Write($b,0,$b.Length);$f.Flush($true)}finally{$f.Dispose()}
+   }
+  }
+  if($item.exists){
+   # Bytes may already match after interruption BEFORE security/timestamps restored.
+   Set-FxTxMetadata $item.path $item.metadata $false
+   [FxTxNativeStreams]::RestoreLegacyDacl($item.path,$item.metadata.sddl)
+   Assert-FxTxSame (Get-FxTxMetadata $item.path) $item.metadata 'Shortcut metadata'
+   if([Convert]::ToBase64String([IO.File]::ReadAllBytes($item.path)) -cne $item.bytes){throw 'Shortcut byte restoration failed'}
+  }elseif([IO.File]::Exists($item.path)){throw 'New shortcut still active after rollback'}
  }
 }
-Export-ModuleMember -Function Set-FxTxPrivateDirectory,Assert-FxTxPrivateDirectory,Read-FxTxRegistryTree,Restore-FxTxRegistryTree,Assert-FxTxSame,Get-FxTxPlatformSnapshot,Apply-FxTxPlatformPath,Restore-FxTxPlatform
+Export-ModuleMember -Function Get-FxTxAppendedPath,Assert-FxTxServiceScope,Read-FxTxServiceStatus,Set-FxTxPrivateDirectory,Assert-FxTxPrivateDirectory,Read-FxTxRegistryTree,Restore-FxTxRegistryTree,Assert-FxTxSame,Get-FxTxPlatformSnapshot,Apply-FxTxPlatformPath,Restore-FxTxPlatform

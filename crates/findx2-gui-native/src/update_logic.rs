@@ -2,9 +2,14 @@
 //!
 //! Channel matches the 2.4.10 Tauri client (`gui/src-tauri/src/app_update.rs`):
 //! `GET https://api.github.com/repos/chaojimct/findx/releases/latest`
-//! (non-draft, non-prerelease), compare tag semver, pick `FindX-*-setup.exe`,
-//! download with progress, then `ShellExecute` `runas` with
-//! `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`.
+//! (non-draft, non-prerelease), compare tag semver, then pick the official
+//! asset for the running platform:
+//! - Windows: `FindX-*-setup.exe`, installed with `ShellExecute` `runas`
+//!   `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`
+//! - Linux: `FindX-*-linux-x64.deb` (preferred when the current install is a
+//!   `.deb`) or `FindX-*-linux-x64.tar.gz`, installed with `pkexec`/`sudo`
+//! - macOS: `FindX-*-macos-aarch64.dmg` or `FindX-*-macos-x64.dmg`, copied
+//!   into `/Applications` with an administrator prompt
 //!
 //! Isolated / native-dev / fixture clients must not check, download, or install.
 
@@ -24,6 +29,77 @@ const NOTES_LIMIT: usize = 600;
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(200);
 const MIN_SETUP_BYTES: u64 = 1024 * 1024;
 
+/// Official update asset platform. Tests pass this explicitly so Linux CI can
+/// still assert Windows asset picking, and vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdatePlatform {
+    Windows,
+    LinuxX64,
+    MacosX64,
+    MacosAarch64,
+}
+
+impl UpdatePlatform {
+    pub fn current() -> Self {
+        #[cfg(windows)]
+        {
+            Self::Windows
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            Self::LinuxX64
+        }
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        {
+            Self::MacosX64
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            Self::MacosAarch64
+        }
+        #[cfg(not(any(
+            windows,
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64")
+        )))]
+        {
+            // Unsupported official pack targets (e.g. Linux aarch64) still
+            // need a stable value so checks can report a missing asset.
+            #[cfg(target_os = "linux")]
+            {
+                return Self::LinuxX64;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                return Self::MacosAarch64;
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                Self::Windows
+            }
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Windows => "Windows",
+            Self::LinuxX64 => "Linux x64",
+            Self::MacosX64 => "macOS x64",
+            Self::MacosAarch64 => "macOS aarch64",
+        }
+    }
+}
+
+/// How the current official Linux install was laid down. Unknown prefers the
+/// `.deb` (the primary official Linux package) and falls back to the tarball.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxPackageFormat {
+    Deb,
+    Tar,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdatePhase {
     Idle,
@@ -31,6 +107,7 @@ pub enum UpdatePhase {
     Available,
     Downloading,
     Downloaded,
+    Installing,
     Current,
     Error,
 }
@@ -42,6 +119,7 @@ impl UpdatePhase {
             Self::Checking => Some("检查中"),
             Self::Downloading => Some("下载中"),
             Self::Downloaded => Some("已下载，可安装"),
+            Self::Installing => Some("正在安装"),
             Self::Current => Some("已是最新"),
             Self::Available => Some("有新版本"),
             Self::Error => Some("检查失败"),
@@ -118,6 +196,9 @@ pub fn derive_update_phase(
     info: Option<&UpdateInfo>,
     downloaded_path: Option<&str>,
 ) -> UpdatePhase {
+    if busy && downloaded_path.is_some() {
+        return UpdatePhase::Installing;
+    }
     if busy && progress.is_some() {
         return UpdatePhase::Downloading;
     }
@@ -188,7 +269,8 @@ pub fn update_card_model(
         state.info.as_ref(),
         state.downloaded_path.as_deref(),
     );
-    let mut body = "从 GitHub Releases 检查正式版本，下载 FindX 安装包后以管理员权限静默安装。".to_string();
+    let mut body =
+        "从 GitHub Releases 检查正式版本，下载 FindX 安装包后以管理员权限静默安装。".to_string();
     let mut status = phase.label().map(|s| s.to_string());
     if let Some(info) = state.info.as_ref() {
         if let Some(err) = info.error.as_ref() {
@@ -204,6 +286,13 @@ pub fn update_card_model(
             if let Some(notes) = info.release_notes.as_ref() {
                 body = notes.clone();
             }
+            if info.download_url.is_none() {
+                if let Some(err) = info.error.as_ref() {
+                    status = Some(err.clone());
+                } else {
+                    status = Some("发现新版本，但此发行没有当前平台的官方安装包".into());
+                }
+            }
         } else if info.ok {
             if let Some(latest) = info.latest_version.as_ref() {
                 status = Some(format!("已是最新（{latest}）"));
@@ -218,9 +307,16 @@ pub fn update_card_model(
             p.percent
         )
     });
+    let missing_platform_asset = matches!(phase, UpdatePhase::Available)
+        && state
+            .info
+            .as_ref()
+            .is_some_and(|info| info.download_url.is_none());
     let (button_label, button_enabled) = match phase {
         UpdatePhase::Checking => ("检查中…".into(), false),
+        UpdatePhase::Installing => ("安装中…".into(), false),
         UpdatePhase::Downloading => ("下载中…".into(), false),
+        UpdatePhase::Available if missing_platform_asset => ("暂无本平台安装包".into(), false),
         UpdatePhase::Available => ("下载并安装".into(), true),
         UpdatePhase::Downloaded => ("安装更新".into(), true),
         UpdatePhase::Idle | UpdatePhase::Current | UpdatePhase::Error => ("检查更新".into(), true),
@@ -273,26 +369,123 @@ struct GhAsset {
     size: u64,
 }
 
-pub fn is_official_setup_asset_name(name: &str) -> bool {
+pub fn is_forbidden_asset_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    if n.contains("isolated") || n.contains("fixture") || n.contains("drill") {
+    n.contains("isolated")
+        || n.contains("fixture")
+        || n.contains("drill")
+        || n.contains("tauri")
+        || n.contains("webview")
+}
+
+/// Windows official Inno setup. Kept as a named helper for existing tests.
+pub fn is_official_setup_asset_name(name: &str) -> bool {
+    is_official_asset_name(name, UpdatePlatform::Windows)
+}
+
+pub fn is_official_asset_name(name: &str, platform: UpdatePlatform) -> bool {
+    let n = name.to_ascii_lowercase();
+    if is_forbidden_asset_name(&n) {
         return false;
     }
-    n.starts_with("findx-") && n.ends_with("-setup.exe")
+    if !n.starts_with("findx-") {
+        return false;
+    }
+    // CLI-only sidecars are never the official GUI installer.
+    if n.contains("-cli.") || n.ends_with("-cli.tar.gz") {
+        return false;
+    }
+    let suffixes: &[&str] = match platform {
+        UpdatePlatform::Windows => &["-setup.exe"],
+        UpdatePlatform::LinuxX64 => &["-linux-x64.deb", "-linux-x64.tar.gz"],
+        UpdatePlatform::MacosX64 => &["-macos-x64.dmg"],
+        UpdatePlatform::MacosAarch64 => &["-macos-aarch64.dmg"],
+    };
+    suffixes.iter().any(|suffix| {
+        n.strip_prefix("findx-")
+            .and_then(|s| s.strip_suffix(suffix))
+            .is_some_and(|v| {
+                semver::Version::parse(v).is_ok_and(|v| v.pre.is_empty() && v.build.is_empty())
+            })
+    })
 }
 
 pub fn pick_windows_setup_asset_name(names: &[&str]) -> Option<String> {
-    names
-        .iter()
-        .find(|n| is_official_setup_asset_name(n))
-        .map(|n| (*n).to_string())
+    pick_official_asset_name(names, UpdatePlatform::Windows, LinuxPackageFormat::Unknown)
 }
 
-fn pick_windows_setup_asset(assets: &[GhAsset]) -> Option<&GhAsset> {
-    if !cfg!(windows) {
+pub fn pick_official_asset_name(
+    names: &[&str],
+    platform: UpdatePlatform,
+    linux_format: LinuxPackageFormat,
+) -> Option<String> {
+    let matches: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| is_official_asset_name(n, platform))
+        .collect();
+    if matches.is_empty() {
         return None;
     }
-    assets.iter().find(|a| is_official_setup_asset_name(&a.name))
+    if platform == UpdatePlatform::LinuxX64 {
+        let deb = matches
+            .iter()
+            .find(|n| n.to_ascii_lowercase().ends_with(".deb"))
+            .copied();
+        let tar = matches
+            .iter()
+            .find(|n| n.to_ascii_lowercase().ends_with(".tar.gz"))
+            .copied();
+        return match linux_format {
+            LinuxPackageFormat::Deb => deb,
+            LinuxPackageFormat::Tar => tar,
+            LinuxPackageFormat::Unknown => deb.or(tar),
+        }
+        .map(|s| s.to_string());
+    }
+    matches.first().map(|s| (*s).to_string())
+}
+
+fn pick_official_asset<'a>(
+    assets: &'a [GhAsset],
+    platform: UpdatePlatform,
+    linux_format: LinuxPackageFormat,
+    version: &semver::Version,
+) -> Option<&'a GhAsset> {
+    let prefix = format!("findx-{version}-");
+    let names: Vec<&str> = assets
+        .iter()
+        .filter(|a| {
+            a.name.to_ascii_lowercase().starts_with(&prefix)
+                && validate_official_asset_url(&a.browser_download_url, platform)
+                    .ok()
+                    .as_deref()
+                    == Some(a.name.as_str())
+        })
+        .map(|a| a.name.as_str())
+        .collect();
+    let chosen = pick_official_asset_name(&names, platform, linux_format)?;
+    assets.iter().find(|a| a.name == chosen)
+}
+
+/// Read a sibling `FindX.pkgformat` (`deb` or `tar`) next to the running exe.
+pub fn detect_linux_package_format(exe: &Path) -> LinuxPackageFormat {
+    let path = exe.with_file_name("FindX.pkgformat");
+    match std::fs::read_to_string(path) {
+        Ok(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "deb" => LinuxPackageFormat::Deb,
+            "tar" | "tar.gz" | "tarball" => LinuxPackageFormat::Tar,
+            _ => LinuxPackageFormat::Unknown,
+        },
+        Err(_) => LinuxPackageFormat::Unknown,
+    }
+}
+
+pub fn current_linux_package_format() -> LinuxPackageFormat {
+    std::env::current_exe()
+        .ok()
+        .map(|exe| detect_linux_package_format(&exe))
+        .unwrap_or(LinuxPackageFormat::Unknown)
 }
 
 pub fn version_from_release_tag(tag: &str) -> Option<semver::Version> {
@@ -353,9 +546,27 @@ fn error_info(current_version: &str, error: String) -> UpdateInfo {
     }
 }
 
-/// Evaluate a GitHub /releases/latest JSON body against the running version.
-/// Used by the live client and by tests with mocked payloads.
+/// Evaluate a GitHub /releases/latest JSON body against the running version
+/// on the current platform.
 pub fn evaluate_latest_release(current_version: &str, status: u16, body: &str) -> UpdateInfo {
+    evaluate_latest_release_for(
+        current_version,
+        status,
+        body,
+        UpdatePlatform::current(),
+        current_linux_package_format(),
+    )
+}
+
+/// Evaluate a GitHub /releases/latest JSON body for an explicit platform.
+/// Used by the live client (via [`evaluate_latest_release`]) and by tests.
+pub fn evaluate_latest_release_for(
+    current_version: &str,
+    status: u16,
+    body: &str,
+    platform: UpdatePlatform,
+    linux_format: LinuxPackageFormat,
+) -> UpdateInfo {
     let current = match semver::Version::parse(current_version.trim().trim_start_matches('v')) {
         Ok(v) => v,
         Err(e) => {
@@ -399,10 +610,7 @@ pub fn evaluate_latest_release(current_version: &str, status: u16, body: &str) -
         Err(e) => return error_info(current_version, format!("解析 GitHub 响应失败：{e}")),
     };
     if gh.draft || gh.prerelease {
-        return error_info(
-            current_version,
-            "最新发行不是正式版本，已忽略。".into(),
-        );
+        return error_info(current_version, "最新发行不是正式版本，已忽略。".into());
     }
     let tag_display = gh.tag_name.clone();
     let latest = match version_from_release_tag(&gh.tag_name) {
@@ -424,10 +632,19 @@ pub fn evaluate_latest_release(current_version: &str, status: u16, body: &str) -
         }
     };
     let has_update = latest > current;
-    let setup = pick_windows_setup_asset(&gh.assets);
+    let setup = pick_official_asset(&gh.assets, platform, linux_format, &latest);
+    let missing = has_update && setup.is_none();
+    let error = if missing {
+        Some(format!(
+            "发现新版本 {tag_display}，但此发行没有当前平台（{}）的官方安装包。",
+            platform.label()
+        ))
+    } else {
+        None
+    };
     UpdateInfo {
         ok: true,
-        error: None,
+        error,
         current_version: current_version.to_string(),
         latest_version: Some(tag_display),
         has_update,
@@ -465,19 +682,42 @@ fn fetch_latest_release() -> Result<(u16, String), String> {
 }
 
 pub fn validate_setup_download_url(url: &str) -> Result<String, String> {
+    validate_official_asset_url(url, UpdatePlatform::current())
+}
+
+pub fn validate_official_asset_url(url: &str, platform: UpdatePlatform) -> Result<String, String> {
     let url = url.trim();
     if !url.starts_with("https://") {
         return Err("下载地址不是 https 链接，已拒绝。".into());
     }
-    let asset_name = url.rsplit('/').next().unwrap_or("").to_string();
-    if !is_official_setup_asset_name(&asset_name) {
+    let release_path = url
+        .strip_prefix("https://github.com/chaojimct/findx/releases/download/")
+        .ok_or("下载地址不属于官方 FindX 发行仓库")?;
+    let (tag, file) = release_path.split_once('/').ok_or("发行资产路径无效")?;
+    if tag.is_empty()
+        || file.contains('/')
+        || semver::Version::parse(tag.trim_start_matches('v')).is_err()
+    {
+        return Err("发行标签/资产路径无效".into());
+    }
+    let asset_name = file.to_string();
+    if !is_official_asset_name(&asset_name, platform) {
         return Err(format!("拒绝非官方安装包资产：{asset_name}"));
     }
     Ok(asset_name)
 }
 
 pub fn download_dest_path(asset_name: &str) -> PathBuf {
-    std::env::temp_dir().join("FindX-update").join(asset_name)
+    std::env::temp_dir()
+        .join(format!(
+            "FindX-download-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+        .join(asset_name)
 }
 
 pub fn download_official_setup(
@@ -488,8 +728,14 @@ pub fn download_official_setup(
     let asset_name = validate_setup_download_url(url)?;
     let dest = download_dest_path(&asset_name);
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建临时目录失败（{}）：{e}", parent.display()))?;
+        std::fs::create_dir(parent)
+            .map_err(|e| format!("创建独占临时目录失败（{}）：{e}", parent.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| e.to_string())?;
+        }
     }
     let resp = ureq::get(url)
         .set("User-Agent", USER_AGENT_DOWNLOAD)
@@ -514,7 +760,10 @@ pub fn download_official_setup(
         }
     }
     let mut reader = resp.into_reader();
-    let mut file = std::fs::File::create(&dest)
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&dest)
         .map_err(|e| format!("创建临时文件失败（{}）：{e}", dest.display()))?;
     let mut buf = [0u8; 64 * 1024];
     let mut downloaded: u64 = 0;
@@ -538,6 +787,7 @@ pub fn download_official_setup(
             });
         }
     }
+    file.sync_all().map_err(|e| e.to_string())?;
     drop(file);
     if downloaded != total {
         let _ = std::fs::remove_file(&dest);
@@ -553,15 +803,341 @@ pub fn download_official_setup(
     Ok(dest)
 }
 
+/// Privilege helper and argument vector used to apply a downloaded official
+/// package. Tests assert this plan without launching pkexec/osascript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallPlan {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+pub fn privileged_wrapper() -> Option<String> {
+    // Do not run a PATH-supplied privilege helper. sudo is non-interactive:
+    // a GUI without a terminal must never hang waiting for a password on stdin.
+    for candidate in ["/usr/bin/pkexec", "/usr/bin/sudo"] {
+        if Path::new(candidate).is_file() {
+            return Some(candidate.into());
+        }
+    }
+    None
+}
+
+fn which(name: &str) -> Option<PathBuf> {
+    if let Ok(paths) = std::env::var("PATH") {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        for dir in paths.split(sep) {
+            if dir.is_empty() {
+                continue;
+            }
+            let p = PathBuf::from(dir).join(name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Extract as the unprivileged user. Reject links, traversal, duplicate paths,
+/// unexpected layout and decompression bombs before invoking any root helper.
+pub fn unpack_linux_update(path: &Path) -> Result<PathBuf, String> {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("安装包名称无效")?;
+    if !is_official_asset_name(name, UpdatePlatform::LinuxX64) || !name.ends_with(".tar.gz") {
+        return Err("非官方 tar 包".into());
+    }
+    let root = name.trim_end_matches(".tar.gz");
+    let dir = std::env::temp_dir().join(format!(
+        "FindX-update-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+    }
+    let result = (|| {
+        let input = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(input));
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0u64;
+        for entry in archive.entries().map_err(|e| e.to_string())? {
+            let mut entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path().map_err(|e| e.to_string())?.into_owned();
+            if path
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                return Err("tar 路径越界".into());
+            }
+            let relative = path.strip_prefix(root).map_err(|_| "tar 根目录不匹配")?;
+            let kind = entry.header().entry_type();
+            if kind.is_dir() && (relative.as_os_str().is_empty() || relative == Path::new("icons"))
+            {
+                continue;
+            }
+            let allowed = [
+                "FindX",
+                "findx2",
+                "fx",
+                "findx2-service",
+                "FindX.installed",
+                "FindX.pkgformat",
+                "version",
+                "install.sh",
+                "uninstall.sh",
+                "findx.desktop",
+                "findx.desktop.in",
+                "findx2.service",
+                "findx2.service.in",
+                "findx.png",
+                "icons/findx.png",
+            ];
+            if !kind.is_file()
+                || !allowed.iter().any(|v| relative == Path::new(v))
+                || !seen.insert(relative.to_path_buf())
+            {
+                return Err("tar 含链接/重复/未知文件".into());
+            }
+            total = total.checked_add(entry.size()).ok_or("tar 大小溢出")?;
+            if total > 1024 * 1024 * 1024 {
+                return Err("tar 解压大小超过 1GiB".into());
+            }
+            entry.unpack_in(&dir).map_err(|e| e.to_string())?;
+        }
+        let stage = dir.join(root);
+        for file in [
+            "FindX",
+            "findx2",
+            "fx",
+            "findx2-service",
+            "FindX.installed",
+            "install.sh",
+        ] {
+            if !stage.join(file).is_file() {
+                return Err(format!("tar 缺少 {file}"));
+            }
+        }
+        Ok(stage)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    result
+}
+
+pub fn linux_install_plan(path: &Path) -> Result<InstallPlan, String> {
+    let p = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !p.exists() {
+        return Err(format!("安装包不存在：{}", p.display()));
+    }
+    let size = std::fs::metadata(&p).map_err(|e| e.to_string())?.len();
+    if size < MIN_SETUP_BYTES {
+        return Err(format!("安装包大小异常（{size} B），拒绝执行。"));
+    }
+    let name = p
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !is_official_asset_name(&name, UpdatePlatform::LinuxX64) {
+        return Err(format!("拒绝非官方 Linux 安装包：{name}"));
+    }
+    let helper = privileged_wrapper().ok_or_else(|| {
+        "未找到 pkexec 或 sudo，无法提权安装。请使用官方 .deb/.tar.gz 手动安装。".to_string()
+    })?;
+    let mut args = if helper.ends_with("/sudo") {
+        vec!["-n".to_string()]
+    } else {
+        vec![]
+    };
+    let lower = name.to_ascii_lowercase();
+    match current_linux_package_format() {
+        LinuxPackageFormat::Deb if !lower.ends_with(".deb") => {
+            return Err("deb 安装不得通过 tar 更新绕过包管理器".into());
+        }
+        LinuxPackageFormat::Tar if !lower.ends_with(".tar.gz") => {
+            return Err("tar 安装不得静默切换到 deb 包管理器".into());
+        }
+        _ => {}
+    }
+    if lower.ends_with(".deb") {
+        args.extend([
+            "/usr/bin/env".into(),
+            "DEBIAN_FRONTEND=noninteractive".into(),
+            "/usr/bin/apt-get".into(),
+            "install".into(),
+            "-y".into(),
+            p.to_string_lossy().into_owned(),
+        ]);
+        return Ok(InstallPlan {
+            program: helper,
+            args,
+        });
+    }
+    let stage = unpack_linux_update(&p)?;
+    args.extend([
+        "/bin/bash".into(),
+        stage.join("install.sh").to_string_lossy().into_owned(),
+        "--stage".into(),
+        stage.to_string_lossy().into_owned(),
+        "--prefix".into(),
+        "/opt/FindX".into(),
+    ]);
+    Ok(InstallPlan {
+        program: helper,
+        args,
+    })
+}
+
+pub fn macos_install_plan(path: &Path) -> Result<InstallPlan, String> {
+    let p = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !p.exists() {
+        return Err(format!("安装包不存在：{}", p.display()));
+    }
+    let size = std::fs::metadata(&p).map_err(|e| e.to_string())?.len();
+    if size < MIN_SETUP_BYTES {
+        return Err(format!("安装包大小异常（{size} B），拒绝执行。"));
+    }
+    let name = p
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !(is_official_asset_name(&name, UpdatePlatform::MacosAarch64)
+        || is_official_asset_name(&name, UpdatePlatform::MacosX64))
+    {
+        return Err(format!("拒绝非官方 macOS 安装包：{name}"));
+    }
+    let dmg = p.to_string_lossy().replace('\'', r"'\''");
+    // Explicit mountpoint: never parse hdiutil's whitespace-delimited output.
+    // Stage first, keep the previous app, and rollback on a failed rename.
+    let inner = format!(
+        "set -eu; mp=$(mktemp -d /tmp/FindX-mount-XXXXXX); stage=$(mktemp -d /Applications/.FindX-stage-XXXXXX); trap 'hdiutil detach \"$mp\" >/dev/null 2>&1 || true; rmdir \"$mp\" 2>/dev/null || true; rmdir \"$stage\" 2>/dev/null || true' EXIT; hdiutil attach -nobrowse -readonly -mountpoint \"$mp\" '{dmg}' >/dev/null; test -x \"$mp/FindX.app/Contents/MacOS/FindX\"; test -f \"$mp/FindX.app/Contents/MacOS/FindX.installed\"; ditto \"$mp/FindX.app\" \"$stage/FindX.app\"; backup=/Applications/FindX.backup-$(date +%s)-$$.app; if test -e /Applications/FindX.app; then mv /Applications/FindX.app \"$backup\"; fi; if ! mv \"$stage/FindX.app\" /Applications/FindX.app; then test ! -d \"$backup\" || mv \"$backup\" /Applications/FindX.app; exit 1; fi"
+    );
+    let escaped = inner.replace('\\', "\\\\").replace('"', "\\\"");
+    Ok(InstallPlan {
+        program: "osascript".into(),
+        args: vec![
+            "-e".into(),
+            format!("do shell script \"{escaped}\" with administrator privileges"),
+        ],
+    })
+}
+
 pub fn start_silent_setup(path: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
         start_silent_setup_windows(path)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        start_silent_setup_linux(path)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        start_silent_setup_macos(path)
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         let _ = path;
-        Err("自动安装当前仅支持 Windows，请到发行页手动下载更新。".into())
+        Err("自动安装不支持当前平台，请到发行页手动下载更新。".into())
+    }
+}
+
+#[cfg(unix)]
+fn run_unix_install_plan(plan: &InstallPlan) -> Result<std::process::ExitStatus, String> {
+    // Refuse an unknown or redirected service before any privileged replacement.
+    // A missing user manager is acceptable for manual-launch installs; an installed
+    // but invalid unit is not. Query only when the official unit/plist is installed.
+    let registered = if cfg!(target_os = "linux") {
+        Path::new("/usr/lib/systemd/user/findx2.service").exists()
+    } else {
+        std::env::var_os("HOME").is_some_and(|h| {
+            PathBuf::from(h)
+                .join("Library/LaunchAgents/com.findx.findx2.plist")
+                .exists()
+        })
+    };
+    let service = if registered {
+        Some(crate::service_control::snapshot()?)
+    } else {
+        None
+    };
+    let running = service.as_ref().is_some_and(|s| s.state == "Running");
+    if running {
+        crate::service_control::set_running_for_update(false)?;
+    }
+    let result = std::process::Command::new(&plan.program)
+        .args(&plan.args)
+        .status()
+        .map_err(|e| e.to_string());
+    let mut reload_failed = false;
+    #[cfg(target_os = "linux")]
+    if registered {
+        let reload = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
+        reload_failed = !reload.is_ok_and(|s| s.success());
+    }
+    let restore = if running {
+        crate::service_control::set_running_for_update(true)
+    } else {
+        Ok(())
+    };
+    if let Some(i) = plan.args.iter().position(|a| a == "--stage") {
+        if let Some(stage) = plan.args.get(i + 1).map(PathBuf::from) {
+            if let Some(parent) = stage.parent().filter(|p| {
+                p.parent() == Some(std::env::temp_dir().as_path())
+                    && p.file_name()
+                        .is_some_and(|s| s.to_string_lossy().starts_with("FindX-update-"))
+            }) {
+                let _ = std::fs::remove_dir_all(parent);
+            }
+        }
+    }
+    restore.map_err(|e| {
+        format!("安装结果 {result:?}；用户服务恢复失败: {e}；daemon-reload 失败={reload_failed}")
+    })?;
+    if reload_failed {
+        return Err(format!(
+            "安装结果 {result:?}；已尝试恢复原用户服务，但 daemon-reload 失败，请检查用户会话"
+        ));
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn start_silent_setup_linux(path: &Path) -> Result<(), String> {
+    let plan = linux_install_plan(path)?;
+    let status = run_unix_install_plan(&plan)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "安装程序退出码 {:?}。若取消了提权提示，则未开始安装。",
+            status.code()
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn start_silent_setup_macos(path: &Path) -> Result<(), String> {
+    let plan = macos_install_plan(path)?;
+    let status = run_unix_install_plan(&plan)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "安装程序退出码 {:?}。若取消了管理员授权，则未开始安装。",
+            status.code()
+        ))
     }
 }
 
@@ -589,16 +1165,7 @@ fn start_silent_setup_windows(path: &Path) -> Result<(), String> {
     let file = HSTRING::from(p.as_os_str());
     let params = HSTRING::from(SILENT_SETUP_ARGS);
     let dir = HSTRING::from(cwd.as_os_str());
-    let rc = unsafe {
-        ShellExecuteW(
-            None,
-            w!("runas"),
-            &file,
-            &params,
-            &dir,
-            SW_SHOWNORMAL,
-        )
-    };
+    let rc = unsafe { ShellExecuteW(None, w!("runas"), &file, &params, &dir, SW_SHOWNORMAL) };
     // ShellExecute returns a HINSTANCE value; >32 means success.
     if rc.0 as usize <= 32 {
         return Err(format!(
@@ -617,9 +1184,7 @@ mod tests {
         let assets_json: Vec<String> = assets
             .iter()
             .map(|(name, url, size)| {
-                format!(
-                    r#"{{"name":"{name}","browser_download_url":"{url}","size":{size}}}"#
-                )
+                format!(r#"{{"name":"{name}","browser_download_url":"{url}","size":{size}}}"#)
             })
             .collect();
         format!(
@@ -630,7 +1195,8 @@ mod tests {
 
     #[test]
     fn version_compare_and_asset_pick() {
-        let official = "https://github.com/chaojimct/findx/releases/download/v2.5.2/FindX-2.5.2-setup.exe";
+        let official =
+            "https://github.com/chaojimct/findx/releases/download/v2.5.2/FindX-2.5.2-setup.exe";
         let fixture = "https://example.com/FindX-2.5.2-isolated-fixture-setup.exe";
         let body = sample_release(
             "v2.5.2",
@@ -641,18 +1207,33 @@ mod tests {
             false,
             false,
         );
-        let newer = evaluate_latest_release("2.5.1", 200, &body);
+        let ev = |cur: &str| {
+            evaluate_latest_release_for(
+                cur,
+                200,
+                &body,
+                UpdatePlatform::Windows,
+                LinuxPackageFormat::Unknown,
+            )
+        };
+        let newer = ev("2.5.1");
         assert!(newer.ok && newer.has_update);
         assert_eq!(newer.latest_version.as_deref(), Some("v2.5.2"));
         assert_eq!(newer.download_url.as_deref(), Some(official));
         assert_eq!(newer.asset_size, Some(10_940_635));
-        assert!(!newer.release_notes.as_deref().unwrap_or("").contains("占位"));
+        assert!(
+            !newer
+                .release_notes
+                .as_deref()
+                .unwrap_or("")
+                .contains("占位")
+        );
 
-        let current = evaluate_latest_release("2.5.2", 200, &body);
+        let current = ev("2.5.2");
         assert!(current.ok && !current.has_update);
         assert_eq!(current.download_url, None);
 
-        let older_tag = evaluate_latest_release("2.5.3", 200, &body);
+        let older_tag = ev("2.5.3");
         assert!(older_tag.ok && !older_tag.has_update);
 
         assert_eq!(
@@ -663,7 +1244,10 @@ mod tests {
             .as_deref(),
             Some("FindX-2.5.2-setup.exe")
         );
-        assert_eq!(version_from_release_tag("v2.5.2").unwrap().to_string(), "2.5.2");
+        assert_eq!(
+            version_from_release_tag("v2.5.2").unwrap().to_string(),
+            "2.5.2"
+        );
         assert_eq!(
             version_from_release_tag("gui-2.0.2").unwrap().to_string(),
             "2.0.2"
@@ -712,7 +1296,7 @@ mod tests {
         assert!(!official.version_line.contains("native-dev"));
 
         let mut available = OfficialUpdateState::default();
-        available.info = Some(evaluate_latest_release(
+        available.info = Some(evaluate_latest_release_for(
             "2.5.2",
             200,
             &sample_release(
@@ -725,6 +1309,8 @@ mod tests {
                 false,
                 false,
             ),
+            UpdatePlatform::Windows,
+            LinuxPackageFormat::Unknown,
         ));
         let model = update_card_model(true, "2.5.2", &available, true);
         assert_eq!(model.button_label, "下载并安装");
@@ -799,11 +1385,302 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            validate_setup_download_url(
-                "https://github.com/chaojimct/findx/releases/download/v2.5.2/FindX-2.5.2-setup.exe"
+            validate_official_asset_url(
+                "https://github.com/chaojimct/findx/releases/download/v2.5.2/FindX-2.5.2-setup.exe",
+                UpdatePlatform::Windows,
             )
             .unwrap(),
             "FindX-2.5.2-setup.exe"
         );
+        assert_eq!(
+            validate_official_asset_url(
+                "https://github.com/chaojimct/findx/releases/download/v2.5.3/FindX-2.5.3-linux-x64.deb",
+                UpdatePlatform::LinuxX64,
+            )
+            .unwrap(),
+            "FindX-2.5.3-linux-x64.deb"
+        );
+        assert!(
+            validate_official_asset_url(
+                "https://github.com/chaojimct/findx/releases/download/v2.5.3/FindX-2.5.3-setup.exe",
+                UpdatePlatform::LinuxX64,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_official_asset_url(
+                "https://github.com/chaojimct/findx/releases/download/v2.5.3/FindX-2.5.3-linux-x64-cli.tar.gz",
+                UpdatePlatform::LinuxX64,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unix_assets_are_picked_per_platform_and_package_format() {
+        let win =
+            "https://github.com/chaojimct/findx/releases/download/v2.5.3/FindX-2.5.3-setup.exe";
+        let deb =
+            "https://github.com/chaojimct/findx/releases/download/v2.5.3/FindX-2.5.3-linux-x64.deb";
+        let tar = "https://github.com/chaojimct/findx/releases/download/v2.5.3/FindX-2.5.3-linux-x64.tar.gz";
+        let dmg_arm = "https://github.com/chaojimct/findx/releases/download/v2.5.3/FindX-2.5.3-macos-aarch64.dmg";
+        let dmg_x64 =
+            "https://github.com/chaojimct/findx/releases/download/v2.5.3/FindX-2.5.3-macos-x64.dmg";
+        let body = sample_release(
+            "v2.5.3",
+            &[
+                ("FindX-2.5.3-setup.exe", win, 11_000_000),
+                ("FindX-2.5.3-linux-x64.tar.gz", tar, 12_000_000),
+                ("FindX-2.5.3-linux-x64.deb", deb, 12_100_000),
+                (
+                    "FindX-2.5.3-linux-x64-cli.tar.gz",
+                    "https://example.invalid/cli.tar.gz",
+                    1_000_000,
+                ),
+                ("FindX-2.5.3-macos-aarch64.dmg", dmg_arm, 13_000_000),
+                ("FindX-2.5.3-macos-x64.dmg", dmg_x64, 13_100_000),
+                (
+                    "FindX-2.5.3-isolated-fixture-setup.exe",
+                    "https://example.invalid/fx.exe",
+                    100,
+                ),
+            ],
+            false,
+            false,
+        );
+        let linux_deb = evaluate_latest_release_for(
+            "2.5.2",
+            200,
+            &body,
+            UpdatePlatform::LinuxX64,
+            LinuxPackageFormat::Deb,
+        );
+        assert!(linux_deb.ok && linux_deb.has_update);
+        assert_eq!(linux_deb.download_url.as_deref(), Some(deb));
+        let linux_tar = evaluate_latest_release_for(
+            "2.5.2",
+            200,
+            &body,
+            UpdatePlatform::LinuxX64,
+            LinuxPackageFormat::Tar,
+        );
+        assert_eq!(linux_tar.download_url.as_deref(), Some(tar));
+        let linux_default = evaluate_latest_release_for(
+            "2.5.2",
+            200,
+            &body,
+            UpdatePlatform::LinuxX64,
+            LinuxPackageFormat::Unknown,
+        );
+        assert_eq!(linux_default.download_url.as_deref(), Some(deb));
+        let mac = evaluate_latest_release_for(
+            "2.5.2",
+            200,
+            &body,
+            UpdatePlatform::MacosAarch64,
+            LinuxPackageFormat::Unknown,
+        );
+        assert_eq!(mac.download_url.as_deref(), Some(dmg_arm));
+        let mac_x64 = evaluate_latest_release_for(
+            "2.5.2",
+            200,
+            &body,
+            UpdatePlatform::MacosX64,
+            LinuxPackageFormat::Unknown,
+        );
+        assert_eq!(mac_x64.download_url.as_deref(), Some(dmg_x64));
+
+        // Windows-only release on Linux: update exists but cannot be installed here.
+        let windows_only = sample_release(
+            "v2.5.3",
+            &[("FindX-2.5.3-setup.exe", win, 11_000_000)],
+            false,
+            false,
+        );
+        let missing = evaluate_latest_release_for(
+            "2.5.2",
+            200,
+            &windows_only,
+            UpdatePlatform::LinuxX64,
+            LinuxPackageFormat::Unknown,
+        );
+        assert!(missing.ok && missing.has_update);
+        assert_eq!(missing.download_url, None);
+        assert!(
+            missing
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("没有当前平台")
+        );
+        let mut state = OfficialUpdateState::default();
+        state.info = Some(missing);
+        let model = update_card_model(true, "2.5.2", &state, true);
+        assert!(!model.button_enabled);
+        assert_eq!(model.button_label, "暂无本平台安装包");
+        assert!(!official_card_uses_placeholder(&model));
+
+        assert_eq!(
+            pick_official_asset_name(
+                &[
+                    "FindX-2.5.3-linux-x64-cli.tar.gz",
+                    "FindX-2.5.3-linux-x64.tar.gz",
+                    "FindX-2.5.3-linux-x64.deb"
+                ],
+                UpdatePlatform::LinuxX64,
+                LinuxPackageFormat::Unknown
+            )
+            .as_deref(),
+            Some("FindX-2.5.3-linux-x64.deb")
+        );
+    }
+
+    #[test]
+    fn linux_pkgformat_file_is_read_from_sibling_marker() {
+        let dir = std::env::temp_dir().join(format!("findx-pkgformat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("FindX");
+        std::fs::write(&exe, b"exe").unwrap();
+        assert_eq!(
+            detect_linux_package_format(&exe),
+            LinuxPackageFormat::Unknown
+        );
+        std::fs::write(dir.join("FindX.pkgformat"), b"deb\n").unwrap();
+        assert_eq!(detect_linux_package_format(&exe), LinuxPackageFormat::Deb);
+        std::fs::write(dir.join("FindX.pkgformat"), b"tar\n").unwrap();
+        assert_eq!(detect_linux_package_format(&exe), LinuxPackageFormat::Tar);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod unix_install_tests {
+    use super::*;
+    fn archive(path: &Path, symlink: bool) {
+        let gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(path).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut tar = tar::Builder::new(gz);
+        let root = "FindX-2.5.2-linux-x64";
+        for file in [
+            "FindX",
+            "findx2",
+            "fx",
+            "findx2-service",
+            "FindX.installed",
+            "install.sh",
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o755);
+            header.set_cksum();
+            tar.append_data(&mut header, format!("{root}/{file}"), &b"x"[..])
+                .unwrap();
+        }
+        if symlink {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_link_name("/etc/passwd").unwrap();
+            header.set_cksum();
+            tar.append_data(&mut header, format!("{root}/version"), &b""[..])
+                .unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+    #[test]
+    fn tar_update_rejects_links_and_requires_exact_layout() {
+        let dir = std::env::temp_dir().join(format!(
+            "findx-tar-test-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("FindX-2.5.2-linux-x64.tar.gz");
+        archive(&path, false);
+        let stage = unpack_linux_update(&path).unwrap();
+        assert!(stage.join("FindX").is_file());
+        std::fs::remove_dir_all(stage.parent().unwrap()).unwrap();
+        archive(&path, true);
+        assert!(unpack_linux_update(&path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn macos_mount_and_replacement_plan_is_fail_closed() {
+        let dir = std::env::temp_dir().join(format!("findx-dmg-test-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("FindX-2.5.2-macos-aarch64.dmg");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MIN_SETUP_BYTES)
+            .unwrap();
+        let plan = macos_install_plan(&path).unwrap();
+        assert_eq!(plan.program, "osascript");
+        let script = plan.args.join(" ");
+        assert!(script.contains("-mountpoint"));
+        assert!(script.contains("FindX.backup-"));
+        assert!(script.contains("trap "));
+        assert!(!script.contains("awk"));
+        assert!(!script.contains("rm -rf /Applications/FindX.app"));
+        assert!(!script.contains("pipefail")); // do shell script uses /bin/sh
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod followup_safety_tests {
+    use super::*;
+    #[test]
+    fn linux_update_never_switches_package_ownership() {
+        assert_eq!(
+            pick_official_asset_name(
+                &["FindX-2.5.3-linux-x64.tar.gz"],
+                UpdatePlatform::LinuxX64,
+                LinuxPackageFormat::Deb
+            ),
+            None
+        );
+        assert_eq!(
+            pick_official_asset_name(
+                &["FindX-2.5.3-linux-x64.deb"],
+                UpdatePlatform::LinuxX64,
+                LinuxPackageFormat::Tar
+            ),
+            None
+        );
+    }
+    #[test]
+    fn official_downloads_reject_foreign_hosts_and_busy_install_is_disabled() {
+        assert!(
+            validate_official_asset_url(
+                "https://evil.example/FindX-2.5.3-linux-x64.deb",
+                UpdatePlatform::LinuxX64
+            )
+            .is_err()
+        );
+        assert!(
+            validate_official_asset_url(
+                "https://github.com/other/findx/releases/download/v2.5.3/FindX-2.5.3-linux-x64.deb",
+                UpdatePlatform::LinuxX64
+            )
+            .is_err()
+        );
+        assert_ne!(
+            download_dest_path("FindX-2.5.3-linux-x64.deb"),
+            download_dest_path("FindX-2.5.3-linux-x64.deb")
+        );
+        let state = OfficialUpdateState {
+            busy: true,
+            downloaded_path: Some("/fixture/package".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_update_phase(true, None, None, state.downloaded_path.as_deref()),
+            UpdatePhase::Installing
+        );
+        assert!(!update_card_model(true, "2.5.2", &state, true).button_enabled);
     }
 }

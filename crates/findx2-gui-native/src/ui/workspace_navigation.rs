@@ -104,6 +104,7 @@ impl MainWindow {
         self.workspace
             .address_menu_cancel
             .store(true, Ordering::Release);
+        self.workspace.address_menu_header=None;
         if self.workspace.address_menu.take().is_some() {
             self.workspace.address_menu_subscription = None;
             if let Some(token) = self.workspace.address_menu_token.take() {
@@ -115,20 +116,22 @@ impl MainWindow {
     fn sibling_menu_items(
         menu: PopupMenu,
         items: Siblings,
+        parent_total: Option<u64>,
         current: &Path,
         owner: WeakEntity<Self>,
         mode: ViewMode,
         cx: &App,
     ) -> PopupMenu {
         let tokens = Self::tokens(cx);
-        let max = items
+        let max = parent_total.unwrap_or_else(|| items
             .entries
             .iter()
             .filter_map(|e| e.bytes)
             .max()
-            .unwrap_or(1)
-            .max(1);
-        let mut menu = menu.scrollable(true).max_h(px(340.));
+            .unwrap_or(1)).max(1);
+        let empty=items.entries.is_empty();
+        let mut menu = menu.scrollable(true).min_w(px(372.)).max_w(px(372.)).max_h(px(312.));
+        if empty {menu=menu.item(PopupMenuItem::label("没有可显示的同级项目"));}
         for item in items.entries {
             let selected = key(&item.path) == key(current);
             let path = item.path;
@@ -136,12 +139,17 @@ impl MainWindow {
             let name = item.name;
             let bytes = item.bytes;
             let uncertain = item.uncertain;
-            let ratio = bytes.unwrap_or(0) as f32 / max as f32;
+            let ratio = (bytes.unwrap_or(0) as f32 / max as f32).clamp(0.,1.);
             let owner = owner.clone();
             menu = menu.item(
                 PopupMenuItem::element(move |_, _| {
                     h_flex()
+                        .id(SharedString::from(format!("usage-sibling-{name}")))
                         .w(px(340.))
+                        .role(gpui::Role::MenuItem)
+                        .aria_label(format!("{}{}",name,if selected {"，当前项目"} else {""}))
+                        .child(div().w(px(14.)).flex_shrink_0().when(selected,|tick|tick.child(Icon::new(IconName::Check).size_3())))
+                        .when(selected,|row|row.bg(tokens.row_selected).rounded_sm())
                         .gap_2()
                         .text_size(px(12.))
                         .child(
@@ -165,14 +173,14 @@ impl MainWindow {
                         .when_some(bytes, |row, bytes| {
                             row.child(
                                 div()
-                                    .w(px(44.))
+                                    .w(px(44.)).flex_shrink_0()
                                     .h(px(3.))
                                     .bg(tokens.border)
                                     .child(div().w(px(44. * ratio)).h_full().bg(tokens.accent)),
                             )
                             .child(
                                 div()
-                                    .w(px(82.))
+                                    .w(px(98.)).min_w(px(98.)).flex_shrink_0().whitespace_nowrap()
                                     .text_right()
                                     .text_color(tokens.text_secondary)
                                     .child(format!(
@@ -183,7 +191,6 @@ impl MainWindow {
                             )
                         })
                 })
-                .checked(selected)
                 .on_click(move |_, _, cx| {
                     owner
                         .update(cx, |this, cx| {
@@ -203,11 +210,6 @@ impl MainWindow {
                         .ok();
                 }),
             );
-        }
-        if items.partial {
-            menu = menu.item(PopupMenuItem::label(
-                "仅显示部分同级项目；未知大小不补零，其他项目可进入父目录查看",
-            ));
         }
         menu
     }
@@ -254,12 +256,50 @@ impl MainWindow {
         let owner = cx.weak_entity();
         let mode = self.workspace.mode;
         let current = path.clone();
+        if mode == ViewMode::Usage && self.workspace.engine_usage {
+            // Usage siblings belong to path.parent(), never to the selected child.
+            // A re-rooted scene need not contain that parent. Read one indexed
+            // directory, not the filesystem and not unbounded descendants.
+            let header=format!("同级  {}",display_path(&parent));
+            let menu=PopupMenu::build(window,cx,|menu,_,_|menu
+                .item(PopupMenuItem::label("正在读取索引…"))
+                .scrollable(true).min_w(px(372.)).max_w(px(372.)).max_h(px(312.)));
+            self.workspace.address_menu_header=Some(header.clone());
+            self.install_address_menu(menu.clone(),position,window,cx);
+            let generation=self.workspace.address_menu_generation;
+            self.workspace.address_menu_cancel=Arc::new(AtomicBool::new(false));
+            let cancel=self.workspace.address_menu_cancel.clone();
+            let expected=self.workspace.engine_generation;
+            let cache=self.workspace.usage_page_cache.clone();
+            let session=self.session.read(cx);let ipc=session.ipc.clone();let endpoint=session.endpoint.clone();
+            cx.spawn(async move|this,cx|{
+                let result=crate::indexed_siblings::load(parent.clone(),expected,cache,cancel.clone(),|after,stamp|{
+                    let ipc=ipc.clone();let endpoint=endpoint.clone();let cancel=cancel.clone();let path=display_path(&parent);
+                    async move{match ipc.request_cancellable(endpoint,findx2_ipc::IpcRequest::UsageChildren{path,expected:stamp,after,max_bytes:48*1024},cancel).await.map_err(|_|"读取已取消".to_string())??{
+                        findx2_ipc::IpcResponse::UsageChildrenResult{page}=>Ok(page),
+                        findx2_ipc::IpcResponse::Error{message}=>Err(message),
+                        _=>Err("索引响应不兼容".into()),
+                    }}
+                }).await;
+                this.update(cx,|this,cx|{
+                    if generation!=this.workspace.address_menu_generation||this.workspace.address_menu.is_none()||cancel.load(Ordering::Acquire)||this.workspace.mode!=ViewMode::Usage||!this.workspace.engine_usage{return}
+                    let result=result.and_then(|r|if this.workspace.engine_generation.is_some_and(|g|g!=r.stamp){Err("索引已变化，请重新打开".into())}else{Ok(r)});
+                    let _=this.workspace.window.update(cx,|_,window,cx|{
+                        menu.update(cx,|menu,cx|menu.rebuild(window,cx,|menu,_,cx|{
+                            let menu=menu.scrollable(true).min_w(px(372.)).max_w(px(372.)).max_h(px(312.));
+                            match result{
+                                Ok(list)=>Self::sibling_menu_items(menu,list.items,Some(list.total),&current,owner,mode,cx),
+                                Err(message)=>menu.item(PopupMenuItem::label(format!("读取失败：{message}"))),
+                            }
+                        }));
+                    });
+                }).ok();
+            }).detach();
+            return;
+        }
         if mode == ViewMode::Usage {
-            let entries = self
-                .workspace
-                .scan_lookup
-                .get(&key(&parent))
-                .and_then(|&i| self.workspace.scan.as_ref().map(|s| (i, s)))
+            let entries = self.usage_render_scan()
+                .and_then(|scan|scan.nodes.iter().position(|n|key(&n.path)==key(&parent)).map(|i|(i,scan)))
                 .map(|(i, scan)| {
                     let p = &scan.nodes[i];
                     Siblings {
@@ -287,11 +327,11 @@ impl MainWindow {
                 });
             let menu = PopupMenu::build(window, cx, |menu, _, cx| {
                 let menu = menu.item(PopupMenuItem::label(format!(
-                    "同级 · {}",
+                    "同级  {}",
                     display_path(&parent)
                 )));
                 match entries {
-                    Some(items) => Self::sibling_menu_items(menu, items, &current, owner, mode, cx),
+                    Some(items) => Self::sibling_menu_items(menu, items, None, &current, owner, mode, cx),
                     None => menu.item(PopupMenuItem::label("尚未扫描此层；打开菜单不会启动扫描")),
                 }
             });
@@ -319,7 +359,7 @@ impl MainWindow {
                     menu.update(cx, |menu, cx| {
                         menu.rebuild(window, cx, |menu, _, cx| match result {
                             Ok(items) => {
-                                Self::sibling_menu_items(menu, items, &current, owner, mode, cx)
+                                Self::sibling_menu_items(menu, items, None, &current, owner, mode, cx)
                             }
                             Err(_) => menu.item(PopupMenuItem::label(
                                 "无法读取同级项目；请检查权限或磁盘连接",
@@ -753,3 +793,5 @@ impl MainWindow {
             .into_any_element()
     }
 }
+
+#[cfg(test)]mod sibling_stability_tests{#[test]fn heading_is_outside_scroll_and_selection_never_arms_delayed_auto_scroll(){let nav=include_str!("workspace_navigation.rs");let body=nav.split("fn sibling_menu_items(").nth(1).unwrap().split("fn install_address_menu(").next().unwrap();assert!(!body.contains(".checked(selected)"));assert!(!body.contains("items.partial"));assert!(!body.contains("完整记录请进入父目录"));let ui=include_str!("main_window.rs");assert!(ui.contains("address_menu_header.clone()"));assert!(ui.contains(".h(px(340.))"));assert!(nav.contains("address_menu_header=None"));}}

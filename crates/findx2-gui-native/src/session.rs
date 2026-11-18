@@ -1,12 +1,12 @@
 use gpui_kit::*;
 
 use crate::cli::LaunchOptions;
-use crate::update_logic::OfficialUpdateState;
 use crate::ipc::IpcClient;
 use crate::prefs::{self, LocalPrefs};
 use crate::settings_logic::{EffectiveTheme, FindxGuiSettings, UiThemePref};
 use crate::status_logic::{self, IndexStatusView};
 use crate::theme;
+use crate::update_logic::OfficialUpdateState;
 
 pub struct AppSession {
     pub ipc: IpcClient,
@@ -38,10 +38,18 @@ impl AppSession {
             prefs.diag_enabled = true;
         }
         let settings = prefs::load_settings(
-            "findx2-native-dev",
-            crate::isolation::isolated_index_path()
-                .to_string_lossy()
-                .into_owned(),
+            if opts.official_product {
+                "findx2"
+            } else {
+                "findx2-native-dev"
+            },
+            (if opts.official_product {
+                crate::isolation::official_index_path()
+            } else {
+                crate::isolation::isolated_index_path()
+            })
+            .to_string_lossy()
+            .into_owned(),
         );
         let initial_status = if opts.live {
             status_logic::disconnected_status("尚未查询生产服务")

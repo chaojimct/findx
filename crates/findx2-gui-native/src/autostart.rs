@@ -8,9 +8,12 @@
 //!   那条路径解耦。用户级自启也符合「这是个人搜索工具」的定位。
 //! - **幂等**：重复开启即覆盖同名值；关闭时只在值存在时才删（不存在 = 已经是关的）。
 //!
-//! Unix 侧暂不实现（macOS 的 `LaunchAgent` / Linux 的 `~/.config/autostart` 需要在
-//! `Info.plist` 与 desktop entry 层面配合，属于 M6 macOS 迭代范围）。Unix 上这两个命令
-//! 显式返回「暂不支持」，而不是静默假装成功。
+//! Unix official installs use a user-level autostart only:
+//! - Linux: `~/.config/autostart/findx.desktop` pointing at `/opt/FindX/FindX`
+//! - macOS: `~/Library/LaunchAgents/com.findx.gui.plist` pointing at
+//!   `/Applications/FindX.app/Contents/MacOS/FindX`
+//! Neither path is a system-wide policy; isolated/dev clients should not call
+//! these helpers (the settings UI only offers the switch in official mode).
 
 use serde::Serialize;
 
@@ -240,26 +243,197 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod linux_imp {
+    use super::AutostartState;
+    use std::path::{Path, PathBuf};
+
+    pub const DESKTOP_NAME: &str = "findx.desktop";
+    pub const OFFICIAL_EXE: &str = "/opt/FindX/FindX";
+
+    pub fn autostart_file() -> PathBuf {
+        let base = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+                PathBuf::from(home).join(".config")
+            });
+        base.join("autostart").join(DESKTOP_NAME)
+    }
+
+    fn official_command(exe: &Path) -> String {
+        format!("\"{}\"", exe.display())
+    }
+
+    pub fn read() -> AutostartState {
+        let path = autostart_file();
+        if !path.is_file() {
+            return AutostartState {
+                enabled: false,
+                command: None,
+                supported: true,
+                unsupported_reason: None,
+            };
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let command = text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Exec=").map(|s| s.trim().to_string()));
+        let hidden = text.lines().any(|l| l.trim() == "Hidden=true");
+        let enabled = !hidden
+            && command
+                .as_deref()
+                .is_some_and(|c| c == OFFICIAL_EXE || c == format!("\"{OFFICIAL_EXE}\""));
+        AutostartState {
+            enabled,
+            command,
+            supported: true,
+            unsupported_reason: None,
+        }
+    }
+
+    pub fn apply(enable: bool) -> Result<AutostartState, String> {
+        let path = autostart_file();
+        if enable {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            let target = PathBuf::from(OFFICIAL_EXE);
+            let body = format!(
+                "[Desktop Entry]\nType=Application\nName=FindX\nExec={}\nHidden=false\nX-GNOME-Autostart-enabled=true\n",
+                official_command(&target)
+            );
+            std::fs::write(&path, body).map_err(|e| e.to_string())?;
+        } else if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+        }
+        Ok(read())
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos_imp {
+    use super::AutostartState;
+    use std::path::PathBuf;
+
+    pub const LABEL: &str = "com.findx.gui";
+    pub const OFFICIAL_EXE: &str = "/Applications/FindX.app/Contents/MacOS/FindX";
+
+    pub fn plist_path() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        PathBuf::from(home)
+            .join("Library/LaunchAgents")
+            .join(format!("{LABEL}.plist"))
+    }
+
+    fn plist_body(exe: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exe}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
+"#
+        )
+    }
+
+    pub fn read() -> AutostartState {
+        let path = plist_path();
+        if !path.is_file() {
+            return AutostartState {
+                enabled: false,
+                command: None,
+                supported: true,
+                unsupported_reason: None,
+            };
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let enabled = text.contains(OFFICIAL_EXE) || text.contains("FindX.app");
+        AutostartState {
+            enabled,
+            command: enabled.then(|| OFFICIAL_EXE.to_string()),
+            supported: true,
+            unsupported_reason: None,
+        }
+    }
+
+    pub fn apply(enable: bool) -> Result<AutostartState, String> {
+        let path = plist_path();
+        if enable {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(&path, plist_body(OFFICIAL_EXE)).map_err(|e| e.to_string())?;
+        } else if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+        }
+        Ok(read())
+    }
+}
+
 #[cfg(windows)]
 pub use imp::{apply, read};
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub use linux_imp::{apply, read};
+
+#[cfg(target_os = "macos")]
+pub use macos_imp::{apply, read};
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub fn read() -> AutostartState {
     AutostartState {
         enabled: false,
         command: None,
         supported: false,
-        unsupported_reason: Some(
-            "当前平台暂不支持由 FindX 管理开机启动（macOS 的 LaunchAgent / Linux 的 autostart 将在后续版本接入）"
-                .into(),
-        ),
+        unsupported_reason: Some("当前平台暂不支持由 FindX 管理开机启动".into()),
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub fn apply(_enable: bool) -> Result<AutostartState, String> {
-    Err(
-        "当前平台暂不支持由 FindX 管理开机启动（macOS 的 LaunchAgent / Linux 的 autostart 将在后续版本接入）"
-            .into(),
-    )
+    Err("当前平台暂不支持由 FindX 管理开机启动".into())
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_autostart_file_roundtrip_in_xdg_config() {
+        let base = std::env::temp_dir().join(format!("findx-autostart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // SAFETY: test-only, restored below; cargo test is single-threaded for this file's env.
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
+        let _ = super::apply(false);
+        let off = super::read();
+        assert!(off.supported);
+        assert!(!off.enabled);
+        let on = super::apply(true).unwrap();
+        assert!(on.enabled);
+        let path = base.join("autostart/findx.desktop");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("Exec="));
+        assert!(body.contains("FindX"));
+        let off = super::apply(false).unwrap();
+        assert!(!off.enabled);
+        assert!(!path.exists());
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

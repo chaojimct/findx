@@ -510,6 +510,8 @@ pub fn scan(
         elapsed: Duration::ZERO,
         entry_limit_reached: false,
         time_limit_reached: false,
+        memory_limit_reached: false,
+        alloc_failed: false,
         limits,
         volume: volume_space(&root).ok(),
     };
@@ -967,8 +969,9 @@ mod accounting_tests {
         );
         assert_eq!(full.nodes[0].files, 1);
         assert_eq!(full.nodes[0].directories, 8);
-        assert_eq!(full.nodes[0].category, 2);
         assert_eq!(full.nodes[0].entries, 9);
+        #[cfg(windows)]
+        assert_eq!(full.nodes[0].category, 2);
         std::fs::remove_dir_all(p).unwrap();
     }
     #[test]

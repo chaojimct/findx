@@ -154,7 +154,7 @@ impl Repository {
         GLOBAL
             .get_or_init(|| {
                 Arc::new(Self::new(
-                    if std::env::var_os("FINDX_NATIVE_USAGE_OPEN").is_some()
+                    if crate::isolation::development_var_os("FINDX_NATIVE_USAGE_OPEN").is_some()
                         && !std::env::args().any(|arg| arg == "--live")
                     {
                         std::env::temp_dir()
@@ -225,6 +225,24 @@ impl Repository {
     }
     /// Interactive cache reads preserve resource refusal reasons; never rewrite a snapshot.
     pub fn lookup_reported(&self, root: &Path) -> Result<Option<Cached>, String> {
+        // Unix scans canonicalize parent aliases (Darwin /var -> /private/var).
+        // Compare coverage using the same spelling, without allowing a symlink
+        // at the scan root itself, which the measured provider refuses to follow.
+        #[cfg(unix)]
+        let canonical_root = {
+            if std::fs::symlink_metadata(root)
+                .ok()
+                .is_none_or(|m| m.file_type().is_symlink())
+            {
+                return Ok(None);
+            }
+            let Ok(path) = std::fs::canonicalize(root) else {
+                return Ok(None);
+            };
+            path
+        };
+        #[cfg(unix)]
+        let root = canonical_root.as_path();
         let Some(root_key) = key(root) else {
             return Ok(None);
         };
@@ -769,6 +787,10 @@ mod tests {
             std::fs::create_dir_all(p.join("data/child")).unwrap();
             std::fs::write(p.join("data/one"), vec![1u8; 8192]).unwrap();
             std::fs::write(p.join("data/child/two"), vec![2u8; 4096]).unwrap();
+            // Darwin temp_dir may contain /var -> /private/var. Scans return
+            // canonical paths, so fixture assertions must use that same spelling.
+            #[cfg(unix)]
+            let p = std::fs::canonicalize(p).unwrap();
             Self(p)
         }
     }
@@ -790,6 +812,35 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
             disk_usage::scan(root, c, p, l)
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_parent_reuses_cache_but_symlink_root_is_still_refused() {
+        let f = Fixture::new("canonical-parent");
+        let provider = Arc::new(Counted(AtomicU64::new(0)));
+        let directory = f.0.join("cache");
+        let root = f.0.join("data/child");
+        let alias = f.0.join("parent-alias");
+        std::os::unix::fs::symlink(f.0.join("data"), &alias).unwrap();
+        let alias_root = alias.join("child");
+        let repo = Repository::new(directory.clone(), provider.clone());
+        repo.run(&repo.request(&root, true, Limits::default()))
+            .unwrap();
+        assert_eq!(repo.lookup(&alias_root).unwrap().source, Source::Memory);
+        let restarted = Repository::new(directory, provider.clone());
+        assert_eq!(
+            restarted.lookup(&alias_root).unwrap().source,
+            Source::Snapshot
+        );
+        let leaf_alias = f.0.join("root-alias");
+        std::os::unix::fs::symlink(&root, &leaf_alias).unwrap();
+        assert!(repo.lookup(&leaf_alias).is_none());
+        assert!(
+            repo.run(&repo.request(&leaf_alias, true, Limits::default()))
+                .is_err()
+        );
+        assert_eq!(provider.0.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -940,12 +991,12 @@ mod tests {
     }
     #[test]
     fn separate_process_snapshot_reader() {
-        let Some(root) = std::env::var_os("FINDX_USAGE_FIXTURE_ROOT") else {
+        let Some(root) = crate::isolation::development_var_os("FINDX_USAGE_FIXTURE_ROOT") else {
             return;
         };
         let root = PathBuf::from(root);
         let directory = PathBuf::from(
-            std::env::var_os("FINDX_USAGE_FIXTURE_CACHE").expect("owned fixture cache"),
+            crate::isolation::development_var_os("FINDX_USAGE_FIXTURE_CACHE").expect("owned fixture cache"),
         );
         assert!(
             root.parent()

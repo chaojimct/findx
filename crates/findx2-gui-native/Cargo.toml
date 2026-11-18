@@ -3,7 +3,7 @@ name = "findx2-gui-native"
 version.workspace = true
 edition = "2024"
 license.workspace = true
-description = "FindX2 native GPUI client. Isolated runtime by default; --live talks to the official FindX2Search service over existing IPC and can manage that named service after explicit confirmation. Does not replace the WebView GUI."
+description = "FindX2 native GPUI client. Isolated runtime by default; --live talks to the official FindX2Search service over existing IPC and can manage that named service after explicit confirmation. Official installed native GUI on Windows, Linux and macOS."
 publish = false
 
 [lib]
@@ -24,6 +24,8 @@ encoding_rs = "0.8"
 raw-window-handle = "0.6"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 quick-xml = "0.32"
+tar = "0.4"
+flate2 = "1"
 findx2-ipc = { path = "../findx2-ipc" }
 gpui-kit = "=0.9.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "webp"] }
@@ -36,7 +38,7 @@ rustc-hash = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61.3", features = ["Data_Pdf", "Storage", "Storage_Streams", "Foundation", "Win32_Foundation", "Win32_System_IO", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Com", "Win32_System_Console", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_UI_HiDpi"] }
+windows = { version = "0.61.3", features = ["Data_Pdf", "Storage", "Storage_Streams", "Foundation", "Win32_Foundation", "Win32_System_IO", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Com", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_UI_HiDpi"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

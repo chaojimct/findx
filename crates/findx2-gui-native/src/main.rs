@@ -7,7 +7,11 @@ use findx2_gui_native::mock_backend;
 use findx2_gui_native::ui;
 
 fn main() {
-    let raw: Vec<String> = std::env::args().collect();
+    let mut raw: Vec<String> = std::env::args().collect();
+    if raw.get(1).is_some_and(|s|s=="--installer-health") {
+        if raw.len()!=3 { std::process::exit(2); }
+        raw=match findx2_gui_native::installer_health::prepare(&raw[2]) {Ok(v)=>v,Err(_)=>std::process::exit(2)};
+    }
     #[cfg(windows)]
     if raw.get(1).is_some_and(|s| s == "--office-preview-host") {
         findx2_gui_native::office_host::host_main(&raw);
@@ -64,6 +68,7 @@ fn main() {
     }
 
     ui::start(opts);
+    if !findx2_gui_native::installer_health::finished() {std::process::exit(82);}
 }
 
 fn attach_cli_console() {

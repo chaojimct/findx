@@ -1,7 +1,9 @@
+mod async_publication;
 mod browser_table;
 pub(super) mod chrome;
 mod file_icon;
 pub mod main_window;
+mod native_focus;
 mod result_table;
 pub mod settings_window;
 pub mod update_card;
@@ -14,7 +16,7 @@ use crate::ui::main_window::MainWindow;
 use crate::ui::settings_window::SettingsWindow;
 
 fn launch_window_size() -> Size<Pixels> {
-    if let Ok(raw) = std::env::var("FINDX_NATIVE_WINDOW_SIZE") {
+    if let Ok(raw) = crate::isolation::development_var("FINDX_NATIVE_WINDOW_SIZE") {
         let lowered = raw.to_ascii_lowercase();
         let mut parts = lowered.split('x');
         if let (Some(w), Some(h)) = (parts.next(), parts.next()) {
@@ -38,6 +40,7 @@ fn set_official_app_user_model_id() {
 }
 
 pub fn start(opts: LaunchOptions) {
+    crate::isolation::configure_storage(opts.official_product);
     let title = opts.window_title().to_string();
     if opts.official_product {
         #[cfg(windows)]
@@ -72,7 +75,7 @@ pub fn start(opts: LaunchOptions) {
             let bounds = Bounds::centered(None, window_size, cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                focus: std::env::var_os("FINDX_NATIVE_USAGE_OPEN").is_none(),
+                focus: !crate::installer_health::active() && crate::isolation::development_var_os("FINDX_NATIVE_USAGE_OPEN").is_none(),
                 window_min_size: Some(size(px(560.), px(400.))),
                 ..gpui_kit::component::TitleBar::window_options()
             };
@@ -85,7 +88,7 @@ pub fn start(opts: LaunchOptions) {
             })
             .expect("open FindX native window");
 
-            if std::env::var_os("FINDX_NATIVE_OPEN_ABOUT").is_some() {
+            if crate::isolation::development_var_os("FINDX_NATIVE_OPEN_ABOUT").is_some() {
                 open_settings_window(session.clone(), cx);
             }
 
@@ -101,7 +104,6 @@ pub fn start(opts: LaunchOptions) {
             .detach();
         });
 }
-
 
 fn schedule_official_auto_check(session: Entity<AppSession>, cx: &mut App) {
     cx.spawn(async move |cx| {
@@ -176,3 +178,6 @@ pub fn open_settings_window(session: Entity<AppSession>, cx: &mut App) {
         Err(err) => eprintln!("findx2-gui-native: failed to open settings: {err:?}"),
     }
 }
+
+#[cfg(test)]
+mod async_chrome_tests;

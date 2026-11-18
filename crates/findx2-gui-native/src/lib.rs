@@ -48,3 +48,17 @@ pub mod indexed_usage;
 pub mod footer_status;
 
 pub mod directory_filter;
+
+#[cfg(windows)]
+pub mod native_tray;
+
+pub mod indexed_depth;
+pub mod indexed_siblings;
+pub mod usage_inspector;
+
+pub mod usage_volume;
+pub mod usage_presentation;
+
+pub mod usage_motion;
+
+pub mod installer_health;

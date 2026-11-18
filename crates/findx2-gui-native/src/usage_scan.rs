@@ -205,10 +205,10 @@ fn dispatch_one<'s>(
         return;
     }
     #[cfg(debug_assertions)]
-    if std::env::var_os("FINDX_NATIVE_FIXTURE_LOCK").is_some()
-        && std::env::var_os("FINDX_NATIVE_SCAN_FIXTURE_DELAY_MS").is_some()
+    if crate::isolation::development_var_os("FINDX_NATIVE_FIXTURE_LOCK").is_some()
+        && crate::isolation::development_var_os("FINDX_NATIVE_SCAN_FIXTURE_DELAY_MS").is_some()
     {
-        let ms = std::env::var("FINDX_NATIVE_SCAN_FIXTURE_DELAY_MS")
+        let ms = crate::isolation::development_var("FINDX_NATIVE_SCAN_FIXTURE_DELAY_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0)

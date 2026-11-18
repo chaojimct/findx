@@ -154,7 +154,7 @@ mod structure_tests {
         findx2_ipc::UsagePageDto{epoch:9,generation,root:item("dev",logical,unknown),children:vec![item(child_name,child_logical,0)],next:None,resident_bytes:0,state:"ok".into(),watch_error:None,metadata_error:None}
     }
     #[test]fn generation_and_unknown_ticks_keep_structure(){
-        let requested=PathBuf::from(r"C:\Users\chaoj\dev");
+        let requested=PathBuf::from(r"C:\Users\example\dev");
         let first=page(7,1,100,"tools",80);
         let mut scan=scan_from_page(&first,requested.clone());
         let later=page(12,4,100,"tools",80);

@@ -8,6 +8,7 @@ pub(super) struct SearchSnapshot {
     selected_rows: std::collections::BTreeSet<usize>,
     selected: Option<usize>,
     total: u32,
+    keyboard_ready: bool,
     status: SharedString,
     type_filter: TypeFilter,
     time_filter: TimeFilter,
@@ -16,6 +17,89 @@ pub(super) struct SearchSnapshot {
     size_max: String,
 }
 impl MainWindow {
+    pub(super) fn query_key_allowed(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.settings_page.is_none()
+            && self.workspace.mode == ViewMode::Search
+            && self.search.read(cx).focus_handle(cx).is_focused(window)
+            && self
+                .search
+                .update(cx, |i, cx| i.marked_text_range(window, cx).is_none())
+    }
+    pub(super) fn request_search_key(
+        &mut self,
+        intent: crate::interaction_logic::SearchKeyIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if crate::isolation::development_var_os("FINDX_NATIVE_KEY_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "[query-key] intent={intent:?} generation={} published={} loading={} rows={}",
+                self.search_gen,
+                self.search_keyboard.ready(self.search_gen),
+                self.loading,
+                self.hits.len()
+            );
+        }
+        if self.search_keyboard.ready(self.search_gen) && !self.loading {
+            self.apply_search_key(intent, window, cx);
+        } else if !self.current_query(cx).trim().is_empty() {
+            self.search_keyboard
+                .queue(self.search_gen, intent, self.current_query(cx));
+            if !self.loading {
+                self.run_search(cx);
+            }
+        }
+    }
+    pub(super) fn apply_search_key(
+        &mut self,
+        intent: crate::interaction_logic::SearchKeyIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::interaction_logic::SearchKeyIntent;
+        // A queued Enter must not steal focus from settings, another page or
+        // an IME composition begun while the IPC request was in flight.
+        if !self.query_key_allowed(window, cx) { return; }
+        if self.workspace.mode != ViewMode::Search
+            || !self.search_keyboard.ready(self.search_gen)
+            || self.hits.is_empty()
+        {
+            return;
+        }
+        let index = match intent {
+            SearchKeyIntent::Next => {
+                move_result_selection(self.selected, ResultNavKey::ArrowDown, self.hits.len())
+            }
+            SearchKeyIntent::Previous => {
+                move_result_selection(self.selected, ResultNavKey::ArrowUp, self.hits.len())
+            }
+            SearchKeyIntent::Open => {
+                Some(self.selected.filter(|i| *i < self.hits.len()).unwrap_or(0))
+            }
+        }
+        .unwrap();
+        self.set_selected(Some(index), cx);
+        let focus = self.table.read(cx).focus_handle(cx);
+        self.table.update(cx, |table, cx| {
+            table.set_selected_row(index, cx);
+            table.scroll_to_row(index, cx);
+        });
+        focus.focus(window, cx);
+        if crate::isolation::development_var_os("FINDX_NATIVE_KEY_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "[query-key] selected={index} table_focus={} intent={intent:?}",
+                focus.is_focused(window)
+            );
+        }
+        if intent == SearchKeyIntent::Open {
+            self.open_selected(cx);
+        }
+        cx.notify();
+    }
     pub(super) fn begin_scoped_search(
         &mut self,
         path: PathBuf,
@@ -30,6 +114,7 @@ impl MainWindow {
                 selected_rows: self.search_selection.clone(),
                 selected: self.selected,
                 total: self.match_total,
+                keyboard_ready: self.search_keyboard.ready(self.search_gen),
                 status: if self.loading {
                     "原查询已暂停；可按 F5 刷新".into()
                 } else {
@@ -43,6 +128,7 @@ impl MainWindow {
             });
         }
         self.search_gen = self.search_gen.wrapping_add(1);
+        self.search_keyboard.invalidate();
         self._search_task = None;
         self._page_task = None;
         self.search_scope = Some(path.clone());
@@ -94,6 +180,7 @@ impl MainWindow {
             return;
         };
         self.search_gen = self.search_gen.wrapping_add(1);
+        self.search_keyboard.invalidate();
         self._search_task = None;
         self._page_task = None;
         self.search_scope = None;
@@ -103,6 +190,9 @@ impl MainWindow {
         self.search_selection = saved.selected_rows;
         self.selected = saved.selected;
         self.match_total = saved.total;
+        if saved.keyboard_ready {
+            self.search_keyboard.publish(self.search_gen);
+        }
         self.search_status = saved.status;
         self.type_filter = saved.type_filter;
         self.time_filter = saved.time_filter;

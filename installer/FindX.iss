@@ -13,7 +13,7 @@
 #endif
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.5.2"
+  #define MyAppVersion "2.5.3"
 #endif
 
 #define MyAppName      "FindX"
@@ -87,7 +87,7 @@ Name: "custom"; Description: "自定义"; Flags: iscustom
 ; 与 v1 一样保留「主程序 / 服务 / CLI 路径」三段的语义，实际文件同一目录一次拷入
 Name: "main";     Description: "FindX 程序、资源与 findx2 / fx 命令行工具"; Types: full custom; Flags: fixed
 ; 官方标志为 disablenouninstallwarning，勿写 disablenouninstall（旧版 ISCC 报 unknown flag）
-Name: "servicec"; Description: "注册并启动 Windows 服务 {#MyServiceName}（推荐；索引在 ProgramData\FindX）"; Types: full custom; Flags: disablenouninstallwarning
+Name: "servicec"; Description: "注册 Windows 服务（有索引时启动，无索引保持停止）"; Types: full custom; Flags: disablenouninstallwarning
 Name: "clicfg";  Description: "为命令行工具配置 PATH/快捷方式等"; Types: full custom; Flags: fixed
 
 [Tasks]
@@ -114,9 +114,15 @@ Source: "{#PublishDir}\findx2-service.exe"; DestDir: "{app}"; Flags: ignoreversi
 Source: "{#PublishDir}\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: main
 
 [Icons]
-Name: "{group}\{#MyAppName}";           Filename: "{app}\{#MyAppExeName}"; Components: main
-Name: "{group}\卸载 {#MyAppName}";     Filename: "{uninstallexe}";    Components: main
-Name: "{autodesktop}\{#MyAppName}";   Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; Components: main
+#ifdef TxTestBuild
+Name: "{code:TxGroupRoot}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Components: main; Check: TxCreateGroup
+Name: "{code:TxGroupRoot}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"; Components: main; Check: TxCreateGroup
+Name: "{code:TxDesktopRoot}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; Components: main
+#else
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Components: main
+Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"; Components: main
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; Components: main
+#endif
 
 ; GUI restart is transaction-owned and only follows commit/restoration.
 
@@ -213,6 +219,27 @@ begin
 #endif
 end;
 
+function TxCreateGroup: Boolean;
+begin
+  Result := not WizardNoIcons;
+end;
+function TxGroupRoot(Param: String): String;
+begin
+#ifdef TxTestBuild
+  Result := ExpandConstant('{param:TXGROUP|}');
+#else
+  Result := ExpandConstant('{group}');
+#endif
+end;
+function TxDesktopRoot(Param: String): String;
+begin
+#ifdef TxTestBuild
+  Result := ExpandConstant('{param:TXDESKTOP|}');
+#else
+  Result := ExpandConstant('{autodesktop}');
+#endif
+end;
+
 function TxCall(const Phase: String): Boolean;
 var
   Args, Fault: String;
@@ -233,9 +260,9 @@ begin
     Args := Args + ' -UninstallKey ' + TxQuote('FindXUpgradeTest-{#MyServiceName}_is1');
 #else
     Args := Args + ' -UninstallKey ' + TxQuote('{7E8A9B0C-1D2E-3F4A-5B6C-7D8E9F0A1B2C}_is1');
-    Args := Args + ' -GroupRoot ' + TxQuote(ExpandConstant('{group}')) + ' -DesktopRoot ' + TxQuote(ExpandConstant('{autodesktop}')) + ' -CreateGroup ';
-    if WizardNoIcons then Args := Args + '0' else Args := Args + '1';
 #endif
+    Args := Args + ' -GroupRoot ' + TxQuote(TxGroupRoot('')) + ' -DesktopRoot ' + TxQuote(TxDesktopRoot('')) + ' -CreateGroup ';
+    if WizardNoIcons then Args := Args + '0' else Args := Args + '1';
 #ifdef TxTestBuild
     Fault := ExpandConstant('{param:TXFAULT|none}');
     Args := Args + ' -TestBuild -TimeoutSeconds 3 -Fault ' + TxQuote(Fault);
@@ -266,7 +293,7 @@ begin
   TxPrepared := TxCall('Prepare');
   if not TxPrepared then begin
     Result := 'Safe upgrade preparation failed. Nothing was force-stopped. Evidence: ' + TxRoot;
-    if FileExists(TxRoot + '\reason.code') then Result := '旧版服务仍在运行，无法确认最终保存。未停止服务，未替换文件。保留当前版本。日志: ' + TxRoot;
+    if FileExists(TxRoot + '\reason.code') then Result := '请先正常退出 FindX、停止旧服务后重试。旧版无保存回执，本次未改动。日志: ' + TxRoot;
   end;
 end;
 
@@ -309,4 +336,11 @@ function GetCustomSetupExitCode: Integer;
 begin
   Result := 0;
   if TxStarted and not TxCommitted then Result := 80;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = wpFinished) and TxCommitted and FileExists(TxRoot + '\service-uninitialized.flag') then
+    WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10 +
+      '尚无索引，服务已注册并保持停止。请在 FindX 设置中初始化索引后启动。';
 end;

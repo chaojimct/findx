@@ -8,9 +8,13 @@ permissions:
 jobs:
   native-package:
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 55
+    env:
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Native file primitives
         shell: powershell
         run: ./scripts/test-transaction-files.ps1
@@ -36,11 +40,35 @@ jobs:
         shell: powershell
         run: |
           if(-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")){choco install innosetup -y --no-progress}
-      - name: Real official-ISS isolated package and native SCM matrix
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gui-only-253
+      - name: Build and test final 2.5.3 GUI, never rebuild or import experimental engine
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $backend=git diff v2.5.2 -- crates/findx2-core crates/findx2-service crates/findx2-windows crates/findx2-ipc crates/findx2-cli
+          if($backend){throw 'Backend source differs from published 2.5.2'}
+          # Explicit Process avoids PS5 treating native warning stderr as a failure.
+          foreach($verb in @('test','build')){
+            $arg=if($verb -eq 'test'){'test -p findx2-gui-native --lib --release --locked'}else{'build -p findx2-gui-native --release --locked'}
+            $p=Start-Process cargo -ArgumentList $arg -PassThru -NoNewWindow -RedirectStandardOutput "$env:RUNNER_TEMP/FindXUpgradeTest_gui-$verb.stdout.log" -RedirectStandardError "$env:RUNNER_TEMP/FindXUpgradeTest_gui-$verb.stderr.log"
+            $handle=$p.Handle;$p.WaitForExit();if($p.ExitCode -ne 0){throw ('GUI '+$verb+' failed: '+$p.ExitCode)}
+          }
+          $root=Join-Path $env:RUNNER_TEMP 'findx-published252-input'
+          ./scripts/stage-gui-only-release.ps1 -PublishedPayload (Join-Path $root 'extracted/{app}') -Gui target/release/findx2-gui-native.exe -Destination (Join-Path $env:RUNNER_TEMP 'findx-candidate253-payload')
+      - name: Real official-ISS isolated final-payload package and native SCM matrix
         shell: powershell
         run: |
           $root=Join-Path $env:RUNNER_TEMP 'findx-published252-input'
-          ./scripts/test-installer-native.ps1 -PublishedPayload (Join-Path $root 'extracted/{app}') -Iscc "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          ./scripts/test-installer-native.ps1 -PublishedPayload (Join-Path $root 'extracted/{app}') -CandidatePayload (Join-Path $env:RUNNER_TEMP 'findx-candidate253-payload') -Iscc "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+      - name: Retain immutable exact candidate payload (not a release approval)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: findx-253-immutable-candidate-payload
+          path: ${{ runner.temp }}/findx-candidate253-payload/
+          retention-days: 7
       - name: Retain only test-owned evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -51,6 +79,11 @@ jobs:
             ${{ runner.temp }}/FindXUpgradeTest_*/**/results.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/journal*.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/failure.txt
+            ${{ runner.temp }}/FindXUpgradeTest_gui-*.log
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/render-health.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/normal-exit.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/service-health.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/service-uninitialized.flag
             target/tx-file-tests-*/results.json
             target/tx-file-tests-*/**/restore-diff-*.json
           if-no-files-found: warn

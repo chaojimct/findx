@@ -37,6 +37,13 @@ try {
  Case 'complete root/directory/file security and timestamps survive restore' {
   Enable-FxTxFullSecurity
   $d=Join-Path $root 'metadata';$app=Join-Path $d 'app';$null=[IO.Directory]::CreateDirectory((Join-Path $app 'empty 中文'));[IO.File]::WriteAllText((Join-Path $app 'prefs.json'),'old')
+  # Exercise NONEMPTY explicit SACLs, not merely a descriptor with no audit entries.
+  foreach($target in @($app,(Join-Path $app 'empty 中文'),(Join-Path $app 'prefs.json'))){
+   $acl=Get-Acl -LiteralPath $target -Audit
+   $acl.AddAuditRule([Security.AccessControl.FileSystemAuditRule]::new([Security.Principal.WindowsIdentity]::GetCurrent().User,[Security.AccessControl.FileSystemRights]::ReadAndExecute,[Security.AccessControl.AuditFlags]::Success))
+   Set-Acl -LiteralPath $target -AclObject $acl
+   Assert ((Get-Acl -LiteralPath $target -Audit).Audit.Count -gt 0) 'No positive audit rule present'
+  }
   $map=[ordered]@{app=$app};$old=Get-FxTxInventory $map;$backup=Join-Path $d 'backup';$null=New-FxTxVerifiedBackup $map $backup -AdministratorsOnly
   [IO.File]::WriteAllText((Join-Path $app 'prefs.json'),'new');$null=Restore-FxTxVerifiedBackup $backup (Join-Path $d 'failed-new')
   Assert-FxTxSame (Get-FxTxInventory $map) $old 'Full file metadata'
@@ -49,6 +56,55 @@ try {
   $dir=Join-Path $root 'directory stream';$null=[IO.Directory]::CreateDirectory($dir);[FxTxOwnedFixtureStream]::Write(($dir+':owned-stream'),'directory bytes')
   $refused=$false;try{$null=Get-FxTxInventory ([ordered]@{app=$dir})}catch{$refused=$true};Assert $refused 'Named directory stream silently dropped'
   Assert ([FxTxOwnedFixtureStream]::Read(($dir+':owned-stream')) -eq 'directory bytes') 'Directory stream changed'
+ }
+ function Open-FixtureEnvironment($Snapshot) {return $base.OpenSubKey($Snapshot.environmentSpec.path,$true)}
+ function New-PrivatePlatform([string]$Suffix,[string]$Original,[string[]]$Links) {
+  $prefix=$regPath+'\'+$Suffix
+  $environment=[pscustomobject]@{hive='CurrentUser';path=$prefix+'\Environment'}
+  $key=$base.CreateSubKey($environment.path);try{$key.SetValue('Path',$Original,[Microsoft.Win32.RegistryValueKind]::ExpandString)}finally{$key.Dispose()}
+  $app=Join-Path $root ('app '+$Suffix)
+  $snap=Get-FxTxPlatformSnapshot ('FindXUpgradeTest-FindXUpgradeTest_'+$id+'_is1') ('FindXUpgradeTest_'+$id) $Links $app $true
+  $snap.environmentSpec=$environment;$snap.path=[ordered]@{name='Path';exists=$true;kind='ExpandString';value=$Original};$snap.newPath=Get-FxTxAppendedPath $Original $app $true
+  foreach($name in @('service','uninstall')){$spec=[pscustomobject]@{hive='CurrentUser';path=$prefix+'\'+$name};$snap[($name+'Spec')]=$spec;$snap[$name]=Read-FxTxRegistryTree $spec}
+  $snap.runSpec=[pscustomobject]@{hive='CurrentUser';path=$prefix+'\Run'};$snap.run=[ordered]@{name='FindX';exists=$false;kind='';value=$null}
+  return $snap
+ }
+ Case 'PATH preserves every preexisting byte and type, duplicate append and conflict fail closed' {
+  $original=';C:\Existing;;%SystemRoot%;'
+  $snap=New-PrivatePlatform 'path' $original @()
+  Assert ($snap.newPath.StartsWith($original,[StringComparison]::Ordinal)) 'Original PATH empties/bytes rewritten'
+  Assert ((Get-FxTxAppendedPath $snap.newPath (Join-Path $root 'app path') $true) -ceq $snap.newPath) 'Duplicate append'
+  Apply-FxTxPlatformPath $snap;Restore-FxTxPlatform $snap (Join-Path $root 'path-evidence')
+  $key=Open-FixtureEnvironment $snap
+  try{Assert ($key.GetValue('Path',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) -ceq $original) 'PATH not exactly restored';Assert ($key.GetValueKind('Path') -eq 'ExpandString') 'PATH type lost'}finally{$key.Dispose()}
+  Apply-FxTxPlatformPath $snap;$key=Open-FixtureEnvironment $snap
+  try{$key.SetValue('Path','external-edit',[Microsoft.Win32.RegistryValueKind]::ExpandString)}finally{$key.Dispose()}
+  $refused=$false;try{Restore-FxTxPlatform $snap (Join-Path $root 'path-evidence')}catch{$refused=$true};Assert $refused 'Concurrent PATH edit overwritten'
+  $key=Open-FixtureEnvironment $snap;try{Assert ($key.GetValue('Path') -ceq 'external-edit') 'External PATH edit lost'}finally{$key.Dispose()}
+ }
+ Case 'shortcut recovery resumes stable leaf identities and metadata, retains partial evidence and is idempotent' {
+  $dir=Join-Path $root 'shortcut fixtures';$null=[IO.Directory]::CreateDirectory($dir)
+  $links=@((Join-Path $dir 'first.lnk'),(Join-Path $dir 'second.lnk'))
+  foreach($link in $links){[IO.File]::WriteAllText($link,'original '+$link)}
+  $snap=New-PrivatePlatform 'links' 'unchanged-path' $links
+  $evidence=Join-Path $root 'shortcut evidence';$null=[IO.Directory]::CreateDirectory($evidence)
+  [IO.File]::WriteAllText((Join-Path $evidence '0.lnk'),'first failed bytes');[IO.File]::WriteAllText((Join-Path $evidence '1.lnk'),'second failed bytes')
+  [IO.File]::SetLastWriteTimeUtc($links[0],[datetime]::UtcNow.AddDays(-2))
+  [IO.File]::WriteAllText($links[1],'partial old restoration')
+  Restore-FxTxPlatform $snap $evidence
+  foreach($entry in $snap.shortcuts){Assert-FxTxSame (Get-FxTxMetadata $entry.path) $entry.metadata 'Shortcut exact metadata';Assert ([Convert]::ToBase64String([IO.File]::ReadAllBytes($entry.path)) -ceq $entry.bytes) 'Shortcut bytes mismatch'}
+  Assert ([IO.File]::ReadAllText((Join-Path $evidence '0.lnk')) -ceq 'first failed bytes') 'First failed bytes overwritten'
+  Assert ([IO.File]::ReadAllText((Join-Path $evidence '1.lnk')) -ceq 'second failed bytes') 'Second failed bytes overwritten'
+  $count=[IO.Directory]::GetFiles($evidence).Count;Assert ($count -eq 3) 'Partial failed restore bytes not quarantined'
+  Restore-FxTxPlatform $snap $evidence;Assert ([IO.Directory]::GetFiles($evidence).Count -eq $count) 'Idempotent restore grew evidence'
+ }
+ Case 'service command exact index and endpoint scope, no arbitrary extra writes or duplicate args' {
+  $exe=Join-Path $root 'app 中文 space\findx2-service.exe';$index=Join-Path $root 'data\index.bin';$pipe='findx-upgrade-test-'+$id
+  $good='"'+$exe+'" --service --index "'+$index+'" --volume C: --pipe '+$pipe+' --save-interval-secs 30'
+  Assert-FxTxServiceScope $good $exe $index $pipe
+  foreach($bad in @($good.Replace($index,(Join-Path $root 'outside\index.bin')),($good+' --index "'+$index+'"'),($good+' --shutdown-file unexpected'),$good.Replace($pipe,'another-pipe'))){
+   $refused=$false;try{Assert-FxTxServiceScope $bad $exe $index $pipe}catch{$refused=$true};Assert $refused 'Unexpected service argument scope accepted'
+  }
  }
 }finally{$base.DeleteSubKeyTree($regPath,$false);$base.Dispose()}
 [ordered]@{cases=@($rows.ToArray());passed=@($rows | Where-Object {$_.passed}).Count;failed=@($rows | Where-Object {-not $_.passed}).Count;scope='owned CI registry and NTFS fixtures only; not full installer acceptance'} | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 (Join-Path $root 'results.json')

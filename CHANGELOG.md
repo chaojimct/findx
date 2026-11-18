@@ -1,3 +1,11 @@
+## 2.5.3 (candidate, publication gates still closed)
+
+- Integrate the tested native Usage refinements: stable depth preference, click-selected absolute-path Inspector and bounded children, compact details, indexed sibling menus with fixed heading, toolbar icons, consistent classification, responsive resize/hit geometry and interruptible spatial navigation.
+- Official installer transaction: verified complete backup, bounded normal shutdown/refusal, original-state recovery, exact registration/PATH/shortcut handling, real GUI render/normal-exit health and PID-owned service Status readiness.
+- Ship unchanged published 2.5.2 engine/CLI bytes; no index-format migration, development snapshot configuration or AI cleanup feature.
+- A running legacy engine has no final-save receipt: it is refused unchanged; normally exit FindX and stop the service before retrying. No-index new installs register a stopped manual service and require explicit initialization; no automatic volume scan.
+- Lower-MFT/realtime coverage and inherited broader engine safety gates are not declared repaired. This candidate is not a publication approval.
+
 # Changelog
 
 本文档记�?**FindX 2.x**（Rust / Tauri / Windows）面向用户的显著变更。版本号�?GUI 安装包、Git 标签 `v*` 对齐�?

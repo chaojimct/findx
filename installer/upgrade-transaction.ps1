@@ -6,7 +6,7 @@ param(
  [string]$InstallRoot,[string]$DataRoot,[string]$NativeConfigRoot,[string]$LegacyConfigRoot,
  [string]$ServiceName='FindX2Search',[string]$PipeName='findx2',[string]$ExpectedVersion,
  [int]$InstallService=0,[int]$TimeoutSeconds=12,[int]$AddPath=0,[string]$UninstallKey,[string]$GroupRoot,[string]$DesktopRoot,[int]$CreateGroup=0,
- [switch]$TestBuild,[ValidateSet('none','backup','health','stop-timeout','interrupt-after-copy')][string]$Fault='none'
+ [switch]$TestBuild,[ValidateSet('none','backup','health','stop-timeout','interrupt-after-copy','post-platform')][string]$Fault='none'
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
@@ -77,6 +77,7 @@ function Get-ExactService {
   $expected=Join-Path $script:s.roots.app 'findx2-service.exe'
   if(-not $svc.PathName.StartsWith('"'+$expected+'" ',[StringComparison]::OrdinalIgnoreCase)){throw 'Unexpected service image/arguments: refusing to change it'}
   if($svc.ServiceType -ne 'Own Process'){throw 'Shared-process service is unsupported'}
+  Assert-FxTxServiceScope $svc.PathName $expected (Join-Path $script:s.roots.data 'index.bin') $script:s.pipeName
  }
  return $svc
 }
@@ -94,7 +95,7 @@ function Stop-ExactService {
  $v=Get-ExactService
  if($v -and $v.State -ne 'Stopped'){
   $controller=[ServiceProcess.ServiceController]::new($script:s.serviceName)
-  try{$controller.Stop()}finally{$controller.Dispose()}
+  try{if($v.State -ne 'Stop Pending'){$controller.Stop()}}finally{$controller.Dispose()}
   Wait-ServiceStopped ([int]$v.ProcessId)
  }
 }
@@ -165,17 +166,53 @@ function Verify-PayloadAndIndex {
  }}
  $null=Read-FxTxVerifiedBackup (Join-Path $TransactionRoot 'backup')
 }
+function Verify-GuiHealth {
+ $root=Join-Path $TransactionRoot 'gui-health'
+ $null=[IO.Directory]::CreateDirectory($root)
+ $exe=Join-Path $script:s.roots.app 'FindX.exe'
+ $info=[Diagnostics.ProcessStartInfo]::new($exe,('--installer-health "'+$root+'"'));$info.UseShellExecute=$false
+ $child=[Diagnostics.Process]::Start($info)
+ if(-not $child.WaitForExit(30000)){throw 'Candidate GUI health timed out; no force exit; backup retained until normal exit'}
+ if($child.ExitCode -ne 0){throw ('Candidate GUI startup/normal exit failed: '+$child.ExitCode)}
+ $render=Get-Content -LiteralPath (Join-Path $root 'render-health.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+ $exit=Get-Content -LiteralPath (Join-Path $root 'normal-exit.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+ if($render.version -ne $script:s.expectedVersion -or $render.frames -lt 3 -or -not $render.storage_ok -or -not $render.normal_quit_requested -or -not $render.isolated -or -not $exit.normal_event_loop_return -or -not $exit.passed){throw 'GUI did not confirm real frame/persistence/normal-exit health'}
+}
+function Wait-NewServiceReady {
+ $until=[DateTime]::UtcNow.AddSeconds($script:s.timeoutSeconds);$last='not ready'
+ do {
+  $svc=Get-ExactService
+  if($svc -and $svc.State -eq 'Running' -and $svc.ProcessId){
+   try {
+    $status=Read-FxTxServiceStatus $script:s.pipeName ([int]$svc.ProcessId)
+    if(-not $status.loading -and $status.healthy){
+     [IO.File]::WriteAllText((Join-Path $TransactionRoot 'service-health.json'),($status | ConvertTo-Json -Depth 8));return
+    }
+    $last='Index loading or health failure'
+   }catch{$last=$_.Exception.Message}
+  }else{$last='Service is not running'}
+  Start-Sleep -Milliseconds 100
+ }while([DateTime]::UtcNow -lt $until)
+ throw ('Real service IPC readiness failed: '+$last)
+}
 function Invoke-Rollback {
  if($script:s.state -eq 'committed' -or $script:s.state -eq 'rolled_back'){return}
  if($script:s.backupVerified){
   # Each installer phase is a NEW PS process. Audit-aware verification must be
   # re-enabled during rollback/recovery, not just during initial backup.
   Enable-FxTxFullSecurity
-  Set-State 'rollback_requested'; Stop-ExactService
+  Set-State 'rollback_requested'
+  if($script:s.createdService){Stop-ExactService}else{
+   $original=Get-ExactService
+   if($original -and -not $script:s.original.serviceRunning -and $original.State -ne 'Stopped'){throw 'Previously stopped service changed externally; not stopped by rollback'}
+  }
   if((Get-InstalledGui).Count){throw 'Candidate GUI still active; retained backup, refusing unsafe restore'}
   if($script:s.createdService){
    $v=Get-ExactService
    if($v){& "$env:SystemRoot\System32\sc.exe" delete $script:s.serviceName | Out-Null;if($LASTEXITCODE){throw 'Cannot remove this transaction service'}}
+   $until=[DateTime]::UtcNow.AddSeconds($script:s.timeoutSeconds)
+   while((Get-CimInstance Win32_Service -Filter ("Name='"+$script:s.serviceName+"'")) -and [DateTime]::UtcNow -lt $until){Start-Sleep -Milliseconds 100}
+   if(Get-CimInstance Win32_Service -Filter ("Name='"+$script:s.serviceName+"'")){throw 'Transaction service deletion not confirmed'}
   }
   Set-State 'restoring'
   $null=Restore-FxTxVerifiedBackup (Join-Path $TransactionRoot 'backup') (Join-Path $TransactionRoot 'failed-new')
@@ -249,14 +286,27 @@ try{
     $exe=Join-Path $script:s.roots.app 'findx2-service.exe'
     $cmd='"'+$exe+'" --service --index "'+(Join-Path $script:s.roots.data 'index.bin')+'" --volume C: --pipe '+$script:s.pipeName
     if($script:s.testBuild){$cmd+=' --no-watch --no-backfill --no-everything-ipc'}
+    # Persist ownership only AFTER successful creation; never delete a concurrently
+    # created service merely because our New-Service call failed.
+    $index=Join-Path $script:s.roots.data 'index.bin'
+    $hasIndex=[IO.File]::Exists($index) -or [IO.Directory]::Exists($index+'.v6')
+    $startMode=if($hasIndex){'Automatic'}else{'Manual'}
+    $null=New-Service -Name $script:s.serviceName -BinaryPathName $cmd -StartupType $startMode
     $script:s.createdService=$true;Save-State
-    $null=New-Service -Name $script:s.serviceName -BinaryPathName $cmd -StartupType Automatic
-    # Fresh explicit service selection may start it; stopped old service never starts.
-    Start-Service -Name $script:s.serviceName
-    $c=[ServiceProcess.ServiceController]::new($script:s.serviceName);try{$c.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running,[TimeSpan]::FromSeconds($script:s.timeoutSeconds))}finally{$c.Dispose()}
+    $index=Join-Path $script:s.roots.data 'index.bin'
+    if($hasIndex){
+     Start-Service -Name $script:s.serviceName
+     Wait-NewServiceReady
+    }else{
+     # Unchanged252engine cannot start without an index. Do not fabricate data or
+     # initiate a full-volume scan. Explicitly registered but NOT initialized/running.
+     [IO.File]::WriteAllText((Join-Path $TransactionRoot 'service-uninitialized.flag'),'RegisteredStopped: no index; initialize explicitly in FindX settings')
+    }
    }
+   Verify-GuiHealth
    if($script:s.fault -eq 'health'){if($script:s.testBuild){[IO.File]::WriteAllText((Join-Path $script:s.roots.data 'index.bin'),'deliberately damaged CI fixture only')};throw 'Injected CI post-copy health failure'}
    Apply-FxTxPlatformPath $script:s.platform
+   if($script:s.fault -eq 'post-platform'){throw 'Injected CI failure after actual PATH and shortcut changes'}
    Set-State 'health_verified'
   }elseif($Phase -eq 'Commit'){
    if($script:s.state -ne 'health_verified'){throw 'Cannot commit without verified health'}

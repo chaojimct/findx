@@ -30,10 +30,12 @@ use windows::{
 struct Position {
     rect: [i32; 4],
     visible: bool,
+    interactive: bool,
 }
 pub struct Surface {
     position: Mutex<Position>,
     suppressed: AtomicBool,
+    interactive: AtomicBool,
     cancel: Cancel,
     alive: AtomicBool,
 }
@@ -55,8 +57,13 @@ impl Surface {
                     (bounds.size.height.as_f32() * scale).round() as i32,
                 ],
                 visible: true,
+                interactive: self.interactive.load(Ordering::Acquire),
             };
         }
+    }
+    pub fn set_interactive(&self, interactive: bool) {
+        self.interactive.store(interactive, Ordering::Release);
+        if let Ok(mut p) = self.position.lock() { p.interactive = interactive; }
     }
     pub fn set_suppressed(&self, suppressed: bool) {
         self.suppressed.store(suppressed, Ordering::Release);
@@ -138,7 +145,8 @@ pub fn start(path: &str, cancel: Cancel) -> Result<NativeClient, String> {
     let surface = Arc::new(Surface {
         position: Mutex::new(Position::default()),
         suppressed: AtomicBool::new(false),
-        cancel,
+        interactive: AtomicBool::new(false),
+        cancel: Arc::new(AtomicBool::new(false)),
         alive: AtomicBool::new(true),
     });
     let state = surface.clone();
@@ -188,7 +196,9 @@ fn find_owner() -> usize {
                 let mut title = [0u16; 128];
                 let n = GetWindowTextW(h, &mut title);
                 if n > 0
-                    && crate::isolation::is_main_window_title(&String::from_utf16_lossy(&title[..n as usize]))
+                    && crate::isolation::is_main_window_title(&String::from_utf16_lossy(
+                        &title[..n as usize],
+                    ))
                 {
                     *(data.0 as *mut usize) = h.0 as usize;
                     return false.into();
@@ -464,6 +474,7 @@ unsafe fn host_setup(args: &[String]) -> Result<(), String> {
                 let _ = ShowWindow(host, if visible { SW_SHOW } else { SW_HIDE });
                 shown = visible;
             }
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(host, p.interactive);
             let mut msg = MSG::default();
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 if msg.message == WM_QUIT {
@@ -487,6 +498,7 @@ mod surface_visibility_tests {
         Surface {
             position: Mutex::new(Position::default()),
             suppressed: AtomicBool::new(false),
+            interactive: AtomicBool::new(false),
             cancel: Arc::new(AtomicBool::new(false)),
             alive: AtomicBool::new(true),
         }

@@ -88,8 +88,8 @@ impl FindxTokens {
             Git => (0.955, 1.0),
             Media => (0.745, 1.0),
             Cache => (0.125, 0.95),
-            Documents => (0.6, 0.18),
-            Other => (0.6, 0.08),
+            Documents => (0.10, 0.65),
+            Other => (0.10, 0.04),
         }
     }
     pub fn usage_fill(&self, class: crate::disktree::classify::Category, depth: usize) -> Hsla {
@@ -97,9 +97,9 @@ impl FindxTokens {
         let step = depth.min(4) as f32;
         let dark = self.bg.l < 0.4;
         let (s, l) = if dark {
-            (0.26 * chroma, step.mul_add(0.028, 0.215))
+            (0.30 * chroma, step.mul_add(0.026, 0.205))
         } else {
-            (0.30 * chroma, step.mul_add(-0.03, 0.84))
+            (0.34 * chroma, step.mul_add(-0.026, 0.91))
         };
         self.mix_toward_surface(Hsla { h, s, l, a: 1.0 }, 0.12)
     }
@@ -116,7 +116,7 @@ impl FindxTokens {
     fn mix_toward_surface(&self, color: Hsla, amount: f32) -> Hsla {
         let t = amount.clamp(0., 1.);
         Hsla {
-            h: color.h + (self.surface.h - color.h) * t,
+            h: color.h, // preserve category hue: legend and tiles must not drift toward different hues
             s: color.s + (self.surface.s - color.s) * t,
             l: color.l + (self.surface.l - color.l) * t,
             a: 1.0,
@@ -133,7 +133,7 @@ impl FindxTokens {
             Media => "媒体",
             Documents => "文档",
             Cache => "缓存",
-            Other => "其他",
+            Other => "未分类",
         }
     }
 
@@ -380,4 +380,17 @@ mod tests {
             assert_ne!(light.bg, dark.bg);
         }
     }
+    #[test]fn usage_category_hues_match_legend_and_all_depths_keep_readable_labels(){
+        use crate::disktree::classify::Category;
+        for (style,_) in ThemeStyle::ALL{for appearance in [EffectiveTheme::Light,EffectiveTheme::Dark]{
+            let t=FindxTokens::for_style(style,appearance);
+            for c in Category::LEGEND.into_iter().chain(std::iter::once(Category::Other)){for depth in 1..=6{
+                let fill=t.usage_fill(c,depth);assert_eq!(fill.h,t.usage_accent(c).h);
+                assert!(contrast(t.text_primary,fill)>=4.5);
+                let mut header=fill;header.l=(header.l-0.035).clamp(0.,1.);
+                assert!(contrast(t.text_primary,header)>=4.5,"header contrast {:?} {:?} depth{}: {}",style,c,depth,contrast(t.text_primary,header));
+            }}
+        }}
+    }
+
 }

@@ -1,4 +1,4 @@
-﻿param([Parameter(Mandatory=$true)][string]$PublishedPayload,[Parameter(Mandatory=$true)][string]$Iscc)
+﻿param([Parameter(Mandatory=$true)][string]$PublishedPayload,[Parameter(Mandatory=$true)][string]$CandidatePayload,[Parameter(Mandatory=$true)][string]$Iscc)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 if($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows'){throw 'Only disposable Windows CI runner allowed'}
@@ -27,19 +27,17 @@ class FixtureService:ServiceBase{
 '@
 $fixtureHost=Join-Path $base 'service-fixture.exe'
 Add-Type -TypeDefinition $hostSource -OutputAssembly $fixtureHost -OutputType WindowsApplication -ReferencedAssemblies System.ServiceProcess
-foreach($case in @('fresh-no-service','published252-stopped-service','backup-failure','health-rollback','legacy-running-refusal','stop-timeout','reentry-refusal','interrupted-recovery')){
+foreach($case in @('fresh-no-service','published252-stopped-service','backup-failure','health-rollback','legacy-running-refusal','stop-timeout','reentry-refusal','interrupted-recovery','new-service-ipc','new-service-health-rollback','fresh-selected-no-index','platform-rollback')){
  $id=[guid]::NewGuid().ToString('N');$service='FindXUpgradeTest_'+$id;$pipe='findx-upgrade-test-'+$id
  $root=Join-Path $base $case;$app=Join-Path $root 'app 中文 space';$data=Join-Path $root 'index state';$native=Join-Path $root 'native config';$legacy=Join-Path $root 'legacy config';$tx=Join-Path $root 'tx';$stage=Join-Path $root 'payload';$build=Join-Path $root 'build'
  foreach($p in @($root,$data,$native,$legacy,$stage,$build)){ $null=[IO.Directory]::CreateDirectory($p) }
  $created=$false
  try{
-  foreach($name in @('FindX.exe','findx2.exe','fx.exe','findx2-service.exe')){Copy-Item -LiteralPath (Join-Path $PublishedPayload $name) -Destination (Join-Path $stage $name)}
-  [IO.File]::WriteAllBytes((Join-Path $stage 'FindX.installed'),[byte[]](0x31,13,10))
-  $null=[IO.Directory]::CreateDirectory((Join-Path $stage 'resources'));[IO.File]::WriteAllText((Join-Path $stage 'resources\transaction-added.txt'),'candidate-owned addition')
-  $files=@(Get-ChildItem -LiteralPath $stage -Recurse -File | ForEach-Object{[ordered]@{name=$_.FullName.Substring($stage.Length+1);length=$_.Length;sha256=(Hash $_.FullName).ToLowerInvariant()}})
-  [ordered]@{version='2.5.2';gui='native';files=$files} | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 (Join-Path $stage 'stage-manifest.json')
+  Copy-Item -Path (Join-Path $CandidatePayload '*') -Destination $stage -Recurse
+  Assert ((Hash (Join-Path $stage 'FindX.exe')) -eq (Hash (Join-Path $CandidatePayload 'FindX.exe'))) 'Candidate copy changed'
   # Create a real small public index with the UNCHANGED published engine, no watch/backfill/host.
   $owned=Join-Path $root 'owned public fixture';$null=[IO.Directory]::CreateDirectory($owned);[IO.File]::WriteAllText((Join-Path $owned 'owned.txt'),'installer safety fixture')
+  if($case -ne 'fresh-selected-no-index'){
   $stop=Join-Path $root 'foreground-stop.signal';[IO.File]::WriteAllText($stop,'stop')
   # PS5 promotes informational native stderr into terminating ErrorRecords under
   # ErrorActionPreference=Stop. Capture native streams, judge actual exit status.
@@ -49,11 +47,12 @@ foreach($case in @('fresh-no-service','published252-stopped-service','backup-fai
   Assert ($child.WaitForExit(30000)) 'Published engine fixture creation timed out; no force-stop'
   [IO.File]::WriteAllText((Join-Path $root 'fixture-build.log'),($stdout.Result+"`n"+$stderr.Result))
   Assert ($child.ExitCode -eq 0) 'Published engine fixture creation failed'
+  }
   [IO.File]::WriteAllText((Join-Path $native 'prefs.json'),'{"theme":"dark","unknown":"preserve"}')
   [IO.File]::WriteAllText((Join-Path $legacy 'old-settings.json'),'{"unknown":"preserve legacy"}')
-  $oldIndex=Hash (Join-Path $data 'index.bin');$oldConfig=Hash (Join-Path $native 'prefs.json')
+  $oldIndex=if($case -eq 'fresh-selected-no-index'){''}else{Hash (Join-Path $data 'index.bin')};$oldConfig=Hash (Join-Path $native 'prefs.json')
   $oldGui=''
-  if($case -ne 'fresh-no-service'){
+  if($case -notin @('fresh-no-service','new-service-ipc','new-service-health-rollback','fresh-selected-no-index')){
    $null=[IO.Directory]::CreateDirectory($app)
    foreach($name in @('FindX.exe','findx2.exe','fx.exe','findx2-service.exe')){Copy-Item -LiteralPath (Join-Path $PublishedPayload $name) -Destination (Join-Path $app $name)}
    [IO.File]::WriteAllBytes((Join-Path $app 'FindX.installed'),[byte[]](0x31,13,10));$oldGui=Hash (Join-Path $app 'FindX.exe')
@@ -64,17 +63,37 @@ foreach($case in @('fresh-no-service','published252-stopped-service','backup-fai
    $null=New-Service -Name $service -BinaryPathName $command -StartupType Manual;$created=$true
    if($case -in @('legacy-running-refusal','stop-timeout')){if($case -eq 'stop-timeout'){[IO.File]::WriteAllText((Join-Path $data 'index.bin.hold-stop'),'hold')};Start-Service $service}
   }
-  & $Iscc '/DTxTestBuild=1' (('/DMyServiceName=')+$service) (('/DTxPipeName=')+$pipe) ('/DPublishDir='+$stage) ('/O'+$build) (Join-Path $repo 'installer\FindX.iss') *> (Join-Path $root 'compile.log')
+  & $Iscc '/DMyAppVersion=2.5.3' '/DTxTestBuild=1' (('/DMyServiceName=')+$service) (('/DTxPipeName=')+$pipe) ('/DPublishDir='+$stage) ('/O'+$build) (Join-Path $repo 'installer\FindX.iss') *> (Join-Path $root 'compile.log')
   Assert ($LASTEXITCODE -eq 0) 'Official ISS test-mode compilation failed'
-  $setup=Join-Path $build 'FindX-2.5.2-fixture-setup.exe';$fault=if($case -eq 'backup-failure'){'backup'}elseif($case -eq 'health-rollback'){'health'}elseif($case -eq 'stop-timeout'){'stop-timeout'}elseif($case -eq 'interrupted-recovery'){'interrupt-after-copy'}else{'none'}
+  $setup=Join-Path $build 'FindX-2.5.3-fixture-setup.exe';$fault=if($case -eq 'backup-failure'){'backup'}elseif($case -in @('health-rollback','new-service-health-rollback')){'health'}elseif($case -eq 'platform-rollback'){'post-platform'}elseif($case -eq 'stop-timeout'){'stop-timeout'}elseif($case -eq 'interrupted-recovery'){'interrupt-after-copy'}else{'none'}
   $args='/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOICONS /COMPONENTS="main,clicfg" /TASKS="" /DIR="'+$app+'" /TXROOT="'+$tx+'" /TXDATA="'+$data+'" /TXNATIVE="'+$native+'" /TXLEGACY="'+$legacy+'" /TXFAULT='+$fault+' /LOG="'+(Join-Path $root 'setup.log')+'"'
+  $group=Join-Path $root 'shortcuts group';$desktop=Join-Path $root 'shortcuts desktop'
+  $args+=' /TXGROUP="'+$group+'" /TXDESKTOP="'+$desktop+'"'
+  if($case -in @('new-service-ipc','new-service-health-rollback','fresh-selected-no-index')){$args=$args.Replace('/COMPONENTS="main,clicfg"','/COMPONENTS="main,servicec,clicfg"')}
+  $pathBefore=[Environment]::GetEnvironmentVariable('Path','Machine');$shortcutsBefore=@()
+  if($case -eq 'platform-rollback'){
+   foreach($dir in @($group,$desktop)){$null=[IO.Directory]::CreateDirectory($dir)}
+   $ws=New-Object -ComObject WScript.Shell
+   foreach($link in @((Join-Path $group 'FindX.lnk'),(Join-Path $group '卸载 FindX.lnk'),(Join-Path $desktop 'FindX.lnk'))){$sc=$ws.CreateShortcut($link);$sc.TargetPath=Join-Path $app 'FindX.exe';$sc.Arguments='--help';$sc.Description='old owned fixture';$sc.Save();$shortcutsBefore+=@{path=$link;hash=(Hash $link)}}
+   $args=$args.Replace('/NOICONS ','').Replace('/TASKS=""','/TASKS="addpath,desktopicon"')
+  }
   $process=Start-Process -FilePath $setup -ArgumentList $args -PassThru -Wait
-  $expectedSuccess=$case -in @('fresh-no-service','published252-stopped-service','reentry-refusal')
+  $expectedSuccess=$case -in @('fresh-no-service','published252-stopped-service','reentry-refusal','new-service-ipc','fresh-selected-no-index')
   if($expectedSuccess){Assert ($process.ExitCode -eq 0) ('Expected success, got '+$process.ExitCode);Assert ((Get-Content -LiteralPath (Join-Path $tx 'journal.json') -Raw -Encoding UTF8 | ConvertFrom-Json).state -eq 'committed') 'No commit record'}else{Assert ($process.ExitCode -ne 0) 'Fault did not refuse package'}
   Assert ((Hash (Join-Path $native 'prefs.json')) -eq $oldConfig) 'Config changed'
-  Assert ((Hash (Join-Path $data 'index.bin')) -eq $oldIndex) 'Index not restored exactly'
+  if($oldIndex){Assert ((Hash (Join-Path $data 'index.bin')) -eq $oldIndex) 'Index not restored exactly'}else{Assert (-not (Test-Path -LiteralPath (Join-Path $data 'index.bin'))) 'Installer fabricated an index'}
   if($case -in @('backup-failure','health-rollback','legacy-running-refusal','stop-timeout')){Assert ((Hash (Join-Path $app 'FindX.exe')) -eq $oldGui) 'Old GUI binary changed on refusal/rollback'}
-  if($case -eq 'health-rollback'){Assert (-not (Test-Path -LiteralPath ('Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\FindXUpgradeTest-'+$service+'_is1'))) 'Failed install left uninstall registration';Assert ((Get-Content -LiteralPath (Join-Path $tx 'journal.json') -Raw -Encoding UTF8 | ConvertFrom-Json).state -eq 'rolled_back') 'Rollback not confirmed';Assert (-not (Test-Path -LiteralPath (Join-Path $app 'resources\transaction-added.txt'))) 'Candidate addition left active';Assert (Test-Path -LiteralPath (Join-Path $tx 'failed-new\app\resources\transaction-added.txt')) 'Failed new evidence discarded'}
+  if($case -eq 'health-rollback'){Assert (-not (Test-Path -LiteralPath ('Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\FindXUpgradeTest-'+$service+'_is1'))) 'Failed install left uninstall registration';Assert ((Get-Content -LiteralPath (Join-Path $tx 'journal.json') -Raw -Encoding UTF8 | ConvertFrom-Json).state -eq 'rolled_back') 'Rollback not confirmed';Assert (-not (Test-Path -LiteralPath (Join-Path $app 'resources\component-manifest.json'))) 'Candidate addition left active';Assert (Test-Path -LiteralPath (Join-Path $tx 'failed-new\app\resources\component-manifest.json')) 'Failed new evidence discarded'}
+  if($expectedSuccess){Assert ((Hash (Join-Path $app 'FindX.exe')) -eq (Hash (Join-Path $CandidatePayload 'FindX.exe'))) 'Installed GUI not final candidate bytes';Assert (Test-Path -LiteralPath (Join-Path $tx 'gui-health\normal-exit.json')) 'No actual GUI exit health'}
+  if($case -eq 'new-service-ipc'){$created=$true;Assert ((Get-Service $service).Status -eq 'Running') 'Fresh real service not running';$health=Get-Content -LiteralPath (Join-Path $tx 'service-health.json') -Raw -Encoding UTF8 | ConvertFrom-Json;Assert ($health.healthy -and -not $health.loading -and $health.entry_count -gt 0) 'No real loaded IPC status'}
+  if($case -eq 'new-service-health-rollback'){Assert (-not (Get-Service $service -ErrorAction SilentlyContinue)) 'Created service remained after rollback';Assert ((Get-Content -LiteralPath (Join-Path $tx 'journal.json') -Raw -Encoding UTF8 | ConvertFrom-Json).state -eq 'rolled_back') 'Fresh service failure rollback incomplete'}
+  if($case -eq 'fresh-selected-no-index'){$created=$true;Assert ((Get-Service $service).Status -eq 'Stopped') 'Uninitialized service was started';Assert ((Get-CimInstance Win32_Service -Filter ("Name='"+$service+"'")).StartMode -eq 'Manual') 'Uninitialized service would autostart';Assert (Test-Path -LiteralPath (Join-Path $tx 'service-uninitialized.flag')) 'Uninitialized status hidden'}
+  if($case -eq 'platform-rollback'){
+   Assert ([Environment]::GetEnvironmentVariable('Path','Machine') -ceq $pathBefore) 'Machine PATH not exactly restored'
+   foreach($link in $shortcutsBefore){Assert ((Hash $link.path) -eq $link.hash) 'Old real shortcut not restored'}
+   Assert ((Get-Content -LiteralPath (Join-Path $tx 'journal.json') -Raw -Encoding UTF8 | ConvertFrom-Json).state -eq 'rolled_back') 'Platform rollback not confirmed'
+   Assert ((Get-Content -LiteralPath (Join-Path $tx 'journal.json') -Raw -Encoding UTF8 | ConvertFrom-Json).error -match 'after actual PATH') 'Never exercised post-PATH failure'
+  }
   if($case -eq 'published252-stopped-service'){Assert ((Get-Service $service).Status -eq 'Stopped') 'Previously stopped service was started'}
   if($case -eq 'legacy-running-refusal'){Assert ((Get-Service $service).Status -eq 'Running') 'Old running service not restored'}
   if($case -eq 'reentry-refusal'){$again=Start-Process -FilePath $setup -ArgumentList $args -PassThru -Wait;Assert ($again.ExitCode -ne 0) 'Committed transaction reused implicitly'}
@@ -84,7 +103,7 @@ foreach($case in @('fresh-no-service','published252-stopped-service','backup-fai
    Assert ($resumed.ExitCode -ne 0) 'Recovery must not claim a new installation'
    Assert ((Get-Content -LiteralPath (Join-Path $tx 'journal.json') -Raw -Encoding UTF8 | ConvertFrom-Json).state -eq 'rolled_back') 'Interrupted actual installer was not recovered'
    Assert ((Hash (Join-Path $app 'FindX.exe')) -eq $oldGui) 'Interrupted binary set not restored'
-   Assert (-not (Test-Path -LiteralPath (Join-Path $app 'resources\transaction-added.txt'))) 'Interrupted candidate addition remained active'
+   Assert (-not (Test-Path -LiteralPath (Join-Path $app 'resources\component-manifest.json'))) 'Interrupted candidate addition remained active'
    Assert ((Hash (Join-Path $data 'index.bin')) -eq $oldIndex) 'Interrupted index not restored'
    $finalArgs=$resumeArgs.Replace(('/TXROOT="'+$recovery+'"'),('/TXROOT="'+(Join-Path $root 'tx-final')+'"'))
    $final=Start-Process -FilePath $setup -ArgumentList $finalArgs -PassThru -Wait
@@ -95,9 +114,10 @@ foreach($case in @('fresh-no-service','published252-stopped-service','backup-fai
  finally{
   # Only test-owned unique resource cleanup; release a deliberate stall normally.
   $hold=Join-Path $data 'index.bin.hold-stop';if(Test-Path -LiteralPath $hold){[IO.File]::Delete($hold)}
+  if(Get-Service $service -ErrorAction SilentlyContinue){$created=$true}
   if($created){$controller=[ServiceProcess.ServiceController]::new($service);try{if($controller.Status -ne 'Stopped'){$controller.Stop();$controller.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Stopped,[TimeSpan]::FromSeconds(20))}; & "$env:SystemRoot\System32\sc.exe" delete $service | Out-Null}finally{$controller.Dispose()}}
  }
 }
-[ordered]@{scope='actual official ISS with isolated test AppId/paths, published2.5.2 payload; synthetic native service only for adverse running/timeout cases';cases=@($rows.ToArray());passed=@($rows | Where-Object{$_.passed}).Count;failed=@($rows | Where-Object{-not $_.passed}).Count;candidateGUIIntegrated=$false;productionTouched=$false} | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 (Join-Path $base 'results.json')
+[ordered]@{scope='actual official ISS with isolated test AppId/paths, final2.5.3 GUI + unchanged published2.5.2 engine, same exact payload digests; synthetic native service only for adverse running/timeout cases';cases=@($rows.ToArray());passed=@($rows | Where-Object{$_.passed}).Count;failed=@($rows | Where-Object{-not $_.passed}).Count;candidateGUIIntegrated=$true;candidateGuiSha256=(Hash (Join-Path $CandidatePayload 'FindX.exe'));productionTouched=$false} | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 (Join-Path $base 'results.json')
 Write-Output ('NATIVE_INSTALLER_EVIDENCE='+$base)
 if(@($rows | Where-Object{-not $_.passed}).Count){throw 'Native package integration matrix failed; see retained evidence'}

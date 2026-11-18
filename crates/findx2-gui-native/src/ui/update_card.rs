@@ -2,6 +2,7 @@ use crate::theme::FindxTokens;
 use crate::update_logic::{OfficialUpdateState, UpdateCardModel, update_card_model};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{Disableable as _, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -46,13 +47,16 @@ fn render_update_card_model(
         .border_1()
         .border_color(tokens.border)
         .rounded_md()
-        .child(div().child(model.title))
-        .child(div().text_sm().child(model.version_line))
-        .child(div().text_sm().child(model.body))
-        .when_some(model.status, |v, status| v.child(div().text_sm().child(status)))
-        .when_some(model.progress_text, |v, text| v.child(div().text_sm().child(text)))
+        .child(div().h(px(20.)).flex_shrink_0().text_ellipsis().child(model.title))
+        .child(div().h(px(20.)).flex_shrink_0().text_sm().text_ellipsis().child(model.version_line))
+        .child(div().id("update-body").h(px(64.)).flex_shrink_0().overflow_y_scrollbar().text_sm().child(model.body))
+        .child(div().id("update-status").h(px(20.)).flex_shrink_0().text_sm().text_ellipsis()
+            .child(model.status.unwrap_or_default()))
+        .child(div().id("update-progress").h(px(20.)).flex_shrink_0().text_sm().text_ellipsis()
+            .child(model.progress_text.unwrap_or_default()))
         .child(
             Button::new("update-action")
+                .w(px(192.)).flex_shrink_0()
                 .label(model.button_label)
                 .disabled(!button_enabled)
                 .on_click(move |_, window, cx| {

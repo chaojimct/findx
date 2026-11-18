@@ -13,7 +13,7 @@ fn sample_hits() -> Vec<SearchHitDto> {
     vec![
         hit(
             "README.md",
-            r"C:\Users\chaoj\dev\tools\findx\README.md",
+            r"C:\FindX-example\project\README.md",
             4200,
             1_699_000_000,
             false,
@@ -21,7 +21,7 @@ fn sample_hits() -> Vec<SearchHitDto> {
         ),
         hit(
             "测试文件.txt",
-            r"C:\Users\chaoj\dev\tools\findx\files_for_test\测试文件.txt",
+            r"C:\FindX-example\project\files_for_test\测试文件.txt",
             128,
             1_720_000_000,
             false,
@@ -29,7 +29,7 @@ fn sample_hits() -> Vec<SearchHitDto> {
         ),
         hit(
             "FindXSearchApp.tsx",
-            r"C:\Users\chaoj\dev\tools\findx\gui\src\findx\FindXSearchApp.tsx",
+            r"C:\FindX-example\project\gui\src\findx\FindXSearchApp.tsx",
             52_000,
             1_731_200_000,
             false,
@@ -37,7 +37,7 @@ fn sample_hits() -> Vec<SearchHitDto> {
         ),
         hit(
             "docs",
-            r"C:\Users\chaoj\dev\tools\findx\docs",
+            r"C:\FindX-example\project\docs",
             0,
             1_731_100_000,
             true,
@@ -45,7 +45,7 @@ fn sample_hits() -> Vec<SearchHitDto> {
         ),
         hit(
             "hit_batch_01.png",
-            r"C:\Users\chaoj\dev\tools\findx\files_for_test\hit_batch_01.png",
+            r"C:\FindX-example\project\files_for_test\hit_batch_01.png",
             48_000,
             1_731_050_000,
             false,
@@ -61,7 +61,7 @@ fn sample_hits() -> Vec<SearchHitDto> {
         ),
         hit(
             "settingsDraft.ts",
-            r"C:\Users\chaoj\dev\tools\findx\gui\src\findx\settingsDraft.ts",
+            r"C:\FindX-example\project\gui\src\findx\settingsDraft.ts",
             3_300,
             1_731_300_000,
             false,
@@ -69,7 +69,7 @@ fn sample_hits() -> Vec<SearchHitDto> {
         ),
         hit(
             "findx2-ipc",
-            r"C:\Users\chaoj\dev\tools\findx\crates\findx2-ipc",
+            r"C:\FindX-example\project\crates\findx2-ipc",
             0,
             1_731_000_000,
             true,
