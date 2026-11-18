@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,6 +39,7 @@ jobs:
         run: python scripts/check_release.py --expected-version "${{ steps.ver.outputs.VERSION }}" --require-ready
 
   build-windows:
+    if: needs.meta.outputs.version != '2.5.3'
     needs: meta
     runs-on: windows-latest
     steps:
@@ -117,6 +119,7 @@ jobs:
           path: dist/*
 
   build-macos:
+    if: needs.meta.outputs.version != '2.5.3'
     needs: meta
     runs-on: macos-latest
     steps:
@@ -209,6 +212,7 @@ jobs:
           path: dist/*
 
   build-linux:
+    if: needs.meta.outputs.version != '2.5.3'
     needs: meta
     runs-on: ubuntu-24.04
     steps:
@@ -280,21 +284,74 @@ jobs:
           name: findx-linux
           path: dist/*
 
+  sealed-windows:
+    needs: meta
+    if: needs.meta.outputs.version == '2.5.3'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Read fixed sealed input
+        id: lock
+        shell: powershell
+        run: |
+          $lock=Get-Content release/2.5.3-seal-lock.json -Raw | ConvertFrom-Json
+          "run=$($lock.testedRun)" >> $env:GITHUB_OUTPUT
+      - uses: actions/download-artifact@v4
+        with:
+          name: findx-253-immutable-candidate-payload
+          run-id: ${{ steps.lock.outputs.run }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/sealed-payload
+      - uses: actions/download-artifact@v4
+        with:
+          name: installer-safety-test-evidence
+          run-id: ${{ steps.lock.outputs.run }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/sealed-evidence
+      - name: Install packaging compiler only
+        shell: powershell
+        run: |
+          if(-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")){choco install innosetup -y --no-progress}
+      - name: Approved packaging from sealed bytes, never rebuild runtime
+        shell: powershell
+        run: ./scripts/pack-sealed-release.ps1 -PayloadRoot "$env:RUNNER_TEMP/sealed-payload" -EvidenceRoot "$env:RUNNER_TEMP/sealed-evidence" -OutputRoot "$env:RUNNER_TEMP/sealed-production-output" -Production -Iscc "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: findx-windows-sealed
+          path: ${{ runner.temp }}/sealed-production-output/official/*
+
   publish:
-    needs: [meta, build-windows, build-macos, build-linux]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [meta, build-windows, build-macos, build-linux, sealed-windows]
+    if: >-
+      always() && startsWith(github.ref, 'refs/tags/v') && needs.meta.result == 'success' &&
+      ((needs.meta.outputs.version == '2.5.3' && needs.sealed-windows.result == 'success') ||
+       (needs.meta.outputs.version != '2.5.3' && needs.build-windows.result == 'success' && needs.build-macos.result == 'success' && needs.build-linux.result == 'success'))
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: findx-*
+          pattern: ${{ needs.meta.outputs.version == '2.5.3' && 'findx-windows-sealed' || 'findx-*' }}
           merge-multiple: true
           path: dist
 
       - name: Create GitHub Release
+        if: needs.meta.outputs.version != '2.5.3'
         uses: softprops/action-gh-release@v2
         with:
           name: FindX ${{ needs.meta.outputs.version }}
           files: dist/*
           generate_release_notes: true
+
+      - name: Create new 2.5.3 Release without overwrite
+        if: needs.meta.outputs.version == '2.5.3'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_NAME" = "v2.5.3"
+          # gh release create fails when the Release exists; never upload --clobber.
+          gh release create v2.5.3 dist/FindX-2.5.3-setup.exe dist/SHA256SUMS.txt dist/seal.json --verify-tag --title "FindX 2.5.3" --notes "Native GUI and verified installer; exact sealed published 2.5.2 engine. See seal.json provenance."

@@ -1,0 +1,76 @@
+{
+  "version": "2.5.3",
+  "testedCommit": "aea0adc1a88e472457c14cf806a82950a87dc9cb",
+  "testedRun": 44334214875,
+  "artifactName": "findx-253-immutable-candidate-payload",
+  "stageManifestSha256": "70394f1087c1d90a626f8cb94ed0d78917252fadd6a7e6fdf9dbfc0feb1f4122",
+  "matrixSha256": "f01221c2e78824fae8154b69c6166a711d4359f584e153bd2511eb80c73b8a2b",
+  "engineBaseline": "v2.5.2",
+  "published252SetupSha256": "5766a666f0edcb947f21a9001b5eff0b701686956f65e8a7881a47bd29a9aef1",
+  "files": [
+    {
+      "name": "FindX.exe",
+      "length": 35040256,
+      "sha256": "8cdea0ad9639dcd00f9c08689fb69a6dab4d713c06b6287065796a607860900e"
+    },
+    {
+      "name": "FindX.installed",
+      "length": 3,
+      "sha256": "f1b2f662800122bed0ff255693df89c4487fbdcf453d3524a42d4ec20c3d9c04"
+    },
+    {
+      "name": "findx2-service.exe",
+      "length": 6636032,
+      "sha256": "981eadf760a0bf52f84e93a62718e18f2a194ab1c7096d3807606ca079d89cda"
+    },
+    {
+      "name": "findx2.exe",
+      "length": 6043136,
+      "sha256": "bf2e26674f7e719217b047bc55465278d355220e568521bc1f8fa9bbf59bc7ee"
+    },
+    {
+      "name": "fx.exe",
+      "length": 6043136,
+      "sha256": "0f45010b9f6c1f608551f32a6da8b1287d0ad9d25ea203e802fb5463d358b30c"
+    },
+    {
+      "name": "resources\\component-manifest.json",
+      "length": 1335,
+      "sha256": "462fdf08fa6e577ef7c4baacafa63ac3fc0439209dc8a65576ae3db9bfe134e4"
+    }
+  ],
+  "helpers": [
+    {
+      "gitBlob": "a7a261a2b1c538d3b76cdd815267f054c13df58d",
+      "path": "installer/FindX.iss"
+    },
+    {
+      "gitBlob": "4a0c17832bdcb16e2d7cdd1ebd1916053d11e6fc",
+      "path": "installer/transaction-files.psm1"
+    },
+    {
+      "gitBlob": "575d99604742fc92045a4a71a4a126e4088f4b0f",
+      "path": "installer/transaction-platform.psm1"
+    },
+    {
+      "gitBlob": "3041335eb875b9516e7b7fa8eda5753925f63e26",
+      "path": "installer/upgrade-transaction.ps1"
+    },
+    {
+      "gitBlob": "d6a11c4490de07dad443ade668289fc954dfa1ed",
+      "path": "installer/Languages/ChineseSimplified.isl"
+    },
+    {
+      "gitBlob": "8c2e7299c700784d4acbf910884c020ab2aa1187",
+      "path": "installer/Languages/Default.isl"
+    },
+    {
+      "gitBlob": "6b61c481dcb5b5b4dae0beccf182c6aae7a4f480",
+      "path": "gui/src-tauri/icons/icon.ico"
+    },
+    {
+      "gitBlob": "8280516e7d8c18be6b4e166c2f7bb25a279aedd1",
+      "path": "scripts/check_release.py"
+    }
+  ]
+}

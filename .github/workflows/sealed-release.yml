@@ -1,0 +1,77 @@
+name: Seal verified 2.5.3 without runtime rebuild
+on:
+  push:
+    branches: [release/v2.5.3-sealed-artifacts]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  seal:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Read fixed successful candidate source
+        id: lock
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $lock=Get-Content release/2.5.3-seal-lock.json -Raw | ConvertFrom-Json
+          $run=gh run view $lock.testedRun --repo chaojimct/findx --json conclusion,headSha,status | ConvertFrom-Json
+          if($LASTEXITCODE -or $run.status -ne 'completed' -or $run.conclusion -ne 'success' -or $run.headSha -ne $lock.testedCommit){throw 'Not the verified successful source run'}
+          $run | ConvertTo-Json | Set-Content "$env:RUNNER_TEMP/tested-run.json"
+          "run=$($lock.testedRun)" >> $env:GITHUB_OUTPUT
+      - uses: actions/download-artifact@v4
+        with:
+          name: findx-253-immutable-candidate-payload
+          run-id: ${{ steps.lock.outputs.run }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/sealed-input-payload
+      - uses: actions/download-artifact@v4
+        with:
+          name: installer-safety-test-evidence
+          run-id: ${{ steps.lock.outputs.run }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/sealed-input-evidence
+      - name: Install compiler only, never runtime compilation
+        shell: powershell
+        run: |
+          if(-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")){choco install innosetup -y --no-progress}
+      - name: Obtain pinned read-only unpacker
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $zip=Join-Path $env:RUNNER_TEMP 'sealed-innounp.zip'
+          Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/jrathlev/InnoUnpacker-Windows-GUI/refs/heads/master/innounp-2/bin/innounp-2.zip -OutFile $zip
+          if((Get-FileHash $zip -Algorithm SHA256).Hash -ne 'f8e45c9676bebc7d7570108ab572673b541fcf7a7d3d24a04319ac6b5315b4e8'){throw 'Unpacker digest mismatch'}
+          Expand-Archive $zip -DestinationPath "$env:RUNNER_TEMP/sealed-unpacker"
+      - name: Negative validation and unchanged policy regressions
+        shell: powershell
+        run: ./scripts/test-sealed-release.ps1 -PayloadRoot "$env:RUNNER_TEMP/sealed-input-payload" -EvidenceRoot "$env:RUNNER_TEMP/sealed-input-evidence"
+      - name: Seal candidate, compile ONLY isolated fixture and verify embedded bytes
+        shell: powershell
+        run: ./scripts/pack-sealed-release.ps1 -PayloadRoot "$env:RUNNER_TEMP/sealed-input-payload" -EvidenceRoot "$env:RUNNER_TEMP/sealed-input-evidence" -OutputRoot "$env:RUNNER_TEMP/sealed-output" -BuildFixture -Iscc "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" -Extractor "$env:RUNNER_TEMP/sealed-unpacker/innounp.exe"
+      - name: Retain sealed candidate, NOT official publication approval
+        uses: actions/upload-artifact@v4
+        with:
+          name: findx-253-sealed-candidate
+          path: |
+            ${{ runner.temp }}/sealed-output/FindX-2.5.3-sealed-candidate.zip
+            ${{ runner.temp }}/sealed-output/SHA256SUMS.txt
+            ${{ runner.temp }}/sealed-output/sealed/seal.json
+          retention-days: 30
+      - name: Retain precise packaging diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sealed-packaging-evidence
+          path: |
+            ${{ runner.temp }}/sealed-output/*.log
+            ${{ runner.temp }}/sealed-test-results.json
+            ${{ runner.temp }}/tested-run.json
+          if-no-files-found: warn
