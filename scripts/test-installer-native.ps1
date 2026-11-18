@@ -41,8 +41,14 @@ foreach($case in @('fresh-no-service','published252-stopped-service','backup-fai
   # Create a real small public index with the UNCHANGED published engine, no watch/backfill/host.
   $owned=Join-Path $root 'owned public fixture';$null=[IO.Directory]::CreateDirectory($owned);[IO.File]::WriteAllText((Join-Path $owned 'owned.txt'),'installer safety fixture')
   $stop=Join-Path $root 'foreground-stop.signal';[IO.File]::WriteAllText($stop,'stop')
-  & (Join-Path $PublishedPayload 'findx2-service.exe') --fixture-root $owned --index (Join-Path $data 'index.bin') --volume C: --pipe $pipe --no-watch --no-backfill --no-everything-ipc --shutdown-file $stop *> (Join-Path $root 'fixture-build.log')
-  Assert ($LASTEXITCODE -eq 0) 'Published engine fixture creation failed'
+  # PS5 promotes informational native stderr into terminating ErrorRecords under
+  # ErrorActionPreference=Stop. Capture native streams, judge actual exit status.
+  $pi=[Diagnostics.ProcessStartInfo]::new((Join-Path $PublishedPayload 'findx2-service.exe'),('--fixture-root "'+$owned+'" --index "'+(Join-Path $data 'index.bin')+'" --volume C: --pipe '+$pipe+' --no-watch --no-backfill --no-everything-ipc --shutdown-file "'+$stop+'"'))
+  $pi.UseShellExecute=$false;$pi.CreateNoWindow=$true;$pi.RedirectStandardOutput=$true;$pi.RedirectStandardError=$true
+  $child=[Diagnostics.Process]::Start($pi);$stdout=$child.StandardOutput.ReadToEndAsync();$stderr=$child.StandardError.ReadToEndAsync()
+  Assert ($child.WaitForExit(30000)) 'Published engine fixture creation timed out; no force-stop'
+  [IO.File]::WriteAllText((Join-Path $root 'fixture-build.log'),($stdout.Result+"`n"+$stderr.Result))
+  Assert ($child.ExitCode -eq 0) 'Published engine fixture creation failed'
   [IO.File]::WriteAllText((Join-Path $native 'prefs.json'),'{"theme":"dark","unknown":"preserve"}')
   [IO.File]::WriteAllText((Join-Path $legacy 'old-settings.json'),'{"unknown":"preserve legacy"}')
   $oldIndex=Hash (Join-Path $data 'index.bin');$oldConfig=Hash (Join-Path $native 'prefs.json')
