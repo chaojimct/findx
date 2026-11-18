@@ -27,6 +27,8 @@ pub struct Node {
 }
 #[derive(Default)]
 pub struct Progress {
+    #[cfg(test)]
+    test_pause: std::sync::Mutex<Option<(u64, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     pub entries: AtomicU64,
     pub allocated: AtomicU64,
     pub directories: AtomicU64,
@@ -35,6 +37,21 @@ pub struct Progress {
     pub active_workers: AtomicU64,
     pub peak_workers: AtomicU64,
     pub(crate) preview: std::sync::Mutex<crate::disktree::scan_preview::Builder>,
+}
+#[cfg(test)]
+impl Progress {
+    fn test_checkpoint(&self) {
+        let gate = {
+            let mut slot = self.test_pause.lock().unwrap();
+            if slot.as_ref().is_some_and(|(at, _, _)| self.entries.load(Ordering::Acquire) >= *at) {
+                slot.take()
+            } else { None }
+        };
+        if let Some((_, reached, proceed)) = gate {
+            let _ = reached.send(());
+            let _ = proceed.recv_timeout(Duration::from_secs(10));
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub struct Scan {
@@ -597,6 +614,8 @@ pub fn scan(
             Err(Admission::Accept { .. }) => unreachable!(),
         };
         progress.entries.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        progress.test_checkpoint();
         progress.allocated.fetch_add(allocated, Ordering::Relaxed);
         if m.is_dir() {
             progress.directories.fetch_add(1, Ordering::Relaxed);
@@ -832,14 +851,19 @@ mod tests {
         }
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(Progress::default());
+        // Synchronize with actual admission, not a scheduler race: on a busy CI
+        // CPU the old yield loop could resume only after all 1,000 files finished.
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        *progress.test_pause.lock().unwrap() = Some((8, reached_tx, proceed_rx));
         let (c, p, worker_root) = (cancel.clone(), progress.clone(), root.clone());
         let worker = std::thread::spawn(move || scan(&worker_root, c, p, Limits::default()));
-        while progress.entries.load(Ordering::Relaxed) < 8 && !worker.is_finished() {
-            std::thread::yield_now();
-        }
-        cancel.store(true, Ordering::Relaxed);
+        let reached = reached_rx.recv_timeout(Duration::from_secs(10));
+        cancel.store(true, Ordering::Release);
+        let _ = proceed_tx.send(());
         let result = worker.join().unwrap().unwrap();
         std::fs::remove_dir_all(root).unwrap();
+        assert!(reached.is_ok(), "scan never reached the actual in-flight admission boundary");
         assert!(result.cancelled && result.partial);
         assert!(result.nodes.len() > 1 && result.nodes.len() < 1001);
         assert!(result.nodes[0].allocated > 0);

@@ -366,6 +366,8 @@ fn dispatch_one<'s>(
             }
         };
         ctx.progress.entries.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        ctx.progress.test_checkpoint();
         ctx.progress
             .allocated
             .fetch_add(occupied, Ordering::Relaxed);
