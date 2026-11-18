@@ -5,6 +5,18 @@ if($env:GITHUB_ACTIONS -ne 'true'){throw 'Native registry/privileged-security te
 $repo=Split-Path $PSScriptRoot -Parent
 Import-Module (Join-Path $repo 'installer\transaction-files.psm1') -Force -Global
 Import-Module (Join-Path $repo 'installer\transaction-platform.psm1') -Force -Global
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class FxTxOwnedFixtureStream {
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern SafeFileHandle CreateFileW(string p,uint a,uint s,IntPtr x,uint d,uint f,IntPtr t);
+ public static void Write(string p,string value){using(var h=CreateFileW(p,0x40000000,0,IntPtr.Zero,2,0x02000000,IntPtr.Zero)){if(h.IsInvalid)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());using(var f=new FileStream(h,FileAccess.Write)){byte[] b=new UTF8Encoding(false).GetBytes(value);f.Write(b,0,b.Length);f.Flush(true);}}}
+ public static string Read(string p){using(var h=CreateFileW(p,0x80000000,1,IntPtr.Zero,3,0x02000000,IntPtr.Zero)){if(h.IsInvalid)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());using(var f=new FileStream(h,FileAccess.Read)){using(var r=new StreamReader(f,new UTF8Encoding(false))){return r.ReadToEnd();}}}}
+}
+'@
 $id=[guid]::NewGuid().ToString('N');$root=Join-Path $env:RUNNER_TEMP ('FindXUpgradeTest_platform_'+$id)
 $null=[IO.Directory]::CreateDirectory($root);$rows=[Collections.Generic.List[object]]::new()
 function Assert($Ok,[string]$Message){if(-not $Ok){throw $Message}}
@@ -31,12 +43,12 @@ try {
   $null=Restore-FxTxVerifiedBackup $backup (Join-Path $d 'failed-new')
  }
  Case 'named file and directory streams rejected before blessing a lossy backup' {
-  $d=Join-Path $root 'streams';$null=[IO.Directory]::CreateDirectory($d);[IO.File]::WriteAllText((Join-Path $d 'ordinary.txt'),'ordinary');[IO.File]::WriteAllText((Join-Path $d 'ordinary.txt:owned-stream'),'preserve')
+  $d=Join-Path $root 'streams';$null=[IO.Directory]::CreateDirectory($d);[IO.File]::WriteAllText((Join-Path $d 'ordinary.txt'),'ordinary');[FxTxOwnedFixtureStream]::Write((Join-Path $d 'ordinary.txt:owned-stream'),'preserve')
   $refused=$false;try{$null=Get-FxTxInventory ([ordered]@{app=$d})}catch{$refused=$true};Assert $refused 'Named file stream silently dropped'
-  Assert ([IO.File]::ReadAllText((Join-Path $d 'ordinary.txt:owned-stream')) -eq 'preserve') 'Original stream changed'
-  $dir=Join-Path $root 'directory stream';$null=[IO.Directory]::CreateDirectory($dir);[IO.File]::WriteAllText(($dir+':owned-stream'),'directory bytes')
+  Assert ([FxTxOwnedFixtureStream]::Read((Join-Path $d 'ordinary.txt:owned-stream')) -eq 'preserve') 'Original stream changed'
+  $dir=Join-Path $root 'directory stream';$null=[IO.Directory]::CreateDirectory($dir);[FxTxOwnedFixtureStream]::Write(($dir+':owned-stream'),'directory bytes')
   $refused=$false;try{$null=Get-FxTxInventory ([ordered]@{app=$dir})}catch{$refused=$true};Assert $refused 'Named directory stream silently dropped'
-  Assert ([IO.File]::ReadAllText(($dir+':owned-stream')) -eq 'directory bytes') 'Directory stream changed'
+  Assert ([FxTxOwnedFixtureStream]::Read(($dir+':owned-stream')) -eq 'directory bytes') 'Directory stream changed'
  }
 }finally{$base.DeleteSubKeyTree($regPath,$false);$base.Dispose()}
 [ordered]@{cases=@($rows.ToArray());passed=@($rows | Where-Object {$_.passed}).Count;failed=@($rows | Where-Object {-not $_.passed}).Count;scope='owned CI registry and NTFS fixtures only; not full installer acceptance'} | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 (Join-Path $root 'results.json')

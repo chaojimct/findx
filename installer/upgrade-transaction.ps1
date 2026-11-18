@@ -156,7 +156,7 @@ function Verify-PayloadAndIndex {
   # This verifies already-stopped index readability/integrity, NEVER latest save ACK.
   $cli=Join-Path $script:s.roots.app 'findx2.exe'
   $info=[Diagnostics.ProcessStartInfo]::new($cli,('status -i "'+$index+'"'));$info.UseShellExecute=$false;$info.CreateNoWindow=$true
-  $info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
+  $info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true;$info.StandardOutputEncoding=[Text.UTF8Encoding]::new($false);$info.StandardErrorEncoding=[Text.UTF8Encoding]::new($false)
   $child=[Diagnostics.Process]::Start($info)
   $out=$child.StandardOutput.ReadToEndAsync();$err=$child.StandardError.ReadToEndAsync()
   if(-not $child.WaitForExit(30000)){throw 'Read-only index verification timeout; no force-stop'}
@@ -168,6 +168,9 @@ function Verify-PayloadAndIndex {
 function Invoke-Rollback {
  if($script:s.state -eq 'committed' -or $script:s.state -eq 'rolled_back'){return}
  if($script:s.backupVerified){
+  # Each installer phase is a NEW PS process. Audit-aware verification must be
+  # re-enabled during rollback/recovery, not just during initial backup.
+  Enable-FxTxFullSecurity
   Set-State 'rollback_requested'; Stop-ExactService
   if((Get-InstalledGui).Count){throw 'Candidate GUI still active; retained backup, refusing unsafe restore'}
   if($script:s.createdService){
@@ -239,6 +242,8 @@ try{
    Set-State 'installed'
    $gui=Join-Path $script:s.roots.app 'FindX.exe'
    if(-not [IO.File]::Exists($gui) -or (Get-Item -LiteralPath $gui).VersionInfo.ProductVersion -ne $script:s.expectedVersion){throw 'Installed GUI version mismatch'}
+   # Never start a candidate writer before stored data and backup validate.
+   Verify-PayloadAndIndex
    if($script:s.installService -and -not $script:s.original.serviceExists){
     # Registration is exact-name and happens ONLY after verified backup/file copy.
     $exe=Join-Path $script:s.roots.app 'findx2-service.exe'
@@ -251,7 +256,6 @@ try{
     $c=[ServiceProcess.ServiceController]::new($script:s.serviceName);try{$c.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running,[TimeSpan]::FromSeconds($script:s.timeoutSeconds))}finally{$c.Dispose()}
    }
    if($script:s.fault -eq 'health'){if($script:s.testBuild){[IO.File]::WriteAllText((Join-Path $script:s.roots.data 'index.bin'),'deliberately damaged CI fixture only')};throw 'Injected CI post-copy health failure'}
-   Verify-PayloadAndIndex
    Apply-FxTxPlatformPath $script:s.platform
    Set-State 'health_verified'
   }elseif($Phase -eq 'Commit'){
