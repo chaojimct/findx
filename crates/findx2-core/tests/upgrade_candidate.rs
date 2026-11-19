@@ -153,19 +153,46 @@ fn transactional_save_copies_legacy_and_ignores_later_prefix_patches() {
     assert!(v6_load(&layout).is_err(), "corrupt published generation must not load mixed leftover bytes");
 }
 
-// Existing in both installed 2.4.10 CLI and candidate. Windows normalizes these
-// redundant separators, so this is a canonical-path/UX gate, not proven loss.
+// Read-compatible correction of the historical ignored D:\\public.txt case.
+// No loader or format migration is involved: old cached paths remain untouched.
 #[test]
-#[ignore = "P1 existing multi-volume root path contains redundant separators; release gate remains open"]
-fn known_legacy_second_volume_path_is_not_canonical() {
+fn legacy_second_volume_paths_are_canonical_without_rewriting_indexes() {
     let dir = fixture("canonical-path");
     let p = dir.join("legacy.bin");
     save_index_bin(&p, &store()).unwrap();
     let bytes = v5_bytes(&std::fs::read(&p).unwrap());
     let legacy = dir.join("legacy-v5.bin");
-    std::fs::write(&legacy, bytes).unwrap();
+    std::fs::write(&legacy, &bytes).unwrap();
+    let assert_paths = |loaded: &IndexStore| {
+        for (idx, expected) in [(0, r"C:\public.txt"), (2, r"D:\public.txt")] {
+            assert_eq!(loaded.entry_display_path(idx).unwrap(), expected);
+            assert_eq!(loaded.entry_full_path_lower(idx), expected.to_ascii_lowercase());
+        }
+        assert_eq!(loaded.entry_display_path(1).unwrap(), r"C:\");
+        assert_eq!(loaded.entry_display_path(3).unwrap(), r"D:\");
+        assert_eq!(loaded.volumes[0].last_usn, 10_000);
+        assert_eq!(loaded.volumes[1].last_usn, 20_000);
+    };
     let loaded = load_index_bin(&legacy).unwrap();
-    assert_eq!(loaded.entry_display_path(2).unwrap(), r"D:\public.txt");
+    assert_paths(&loaded);
+    assert_eq!(std::fs::read(&legacy).unwrap(), bytes, "read must not rewrite legacy v5");
+
+    let layout = V6Layout::for_index(&dir.join("canonical-v6.bin"));
+    v6_save_full(&layout, &loaded).unwrap();
+    let published = std::fs::read(published_path(&layout)).unwrap();
+    let ptr = read_published(&layout).unwrap().unwrap();
+    let gen = generation_dir(&layout, ptr.manifest.generation);
+    let names = ["entries.dat", "frns.dat", "dirs.dat", "ranges.dat", "names.dat", "dirpaths.dat", "manifest.json"];
+    let original: Vec<_> = names.iter().map(|name| std::fs::read(gen.join(name)).unwrap()).collect();
+    for _ in 0..2 {
+        let restarted = v6_load(&layout).unwrap();
+        assert_paths(&restarted);
+        for (name, before) in names.iter().zip(&original) {
+            assert_eq!(&std::fs::read(gen.join(name)).unwrap(), before, "read changed {name}");
+        }
+        assert_eq!(std::fs::read(published_path(&layout)).unwrap(), published);
+    }
+    assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
 }
 
 fn store_with_pinyin() -> IndexStore {
@@ -227,4 +254,60 @@ fn export_stage_c_legacy_fixtures_if_requested() {
         "pinyin probe entry must be present"
     );
     println!("exported_legacy_v5={}", dest.display());
+}
+
+#[test]
+fn second_volume_self_parent_root_and_nested_paths_match_cached_and_uncached() {
+    let mut stores = Vec::new();
+    for (letter, id) in [(b'C', 100u64), (b'D', 200)] {
+        let raw = |file_id, parent_id, name: &str, is_dir| RawEntry {
+            file_id, file_id_128: None, parent_id, name: name.into(),
+            size: 0, mtime: 0, ctime: 0, attrs: if is_dir { 0x10 } else { 0 }, is_dir,
+        };
+        stores.push(IndexBuilder::new(letter, id as u32, id, id).build_from_raw(
+            vec![raw(id+1,id,"root.txt",false),raw(id+3,id+2,"child.txt",false)],
+            vec![raw(id,0,"",true),raw(id+2,id,"nested",true)],true).unwrap());
+    }
+    let mut merged = merge_index_stores(stores).unwrap();
+    let check = |store: &IndexStore| {
+        let paths: Vec<_> = (0..store.entry_count()).map(|idx| {
+            let path = store.entry_display_path(idx).unwrap();
+            assert!(!path.contains(r"\\"), "noncanonical merged root: {path:?}");
+            assert_eq!(store.entry_full_path_lower(idx),path.to_ascii_lowercase());
+            path
+        }).collect();
+        for expected in [r"C:\root.txt",r"D:\root.txt",r"C:\nested\child.txt",r"D:\nested\child.txt",r"C:\nested",r"D:\nested",r"C:\",r"D:\"] {
+            assert!(paths.iter().any(|p|p==expected),"missing {expected:?} in {paths:?}");
+        }
+    };
+    check(&merged);
+    merged.rebuild_dir_paths();
+    check(&merged);
+    // A legacy root cache is interpreted canonically without being repaired in place.
+    let mut old_cache = merged.dir_paths_buf.clone();
+    old_cache.extend_from_slice(br"\\");
+    let offset=(old_cache.len()-2) as u32;
+    let root=merged.dir_root_idx(merged.entries.iter().enumerate().find(|(i,e)| !e.is_dir_entry() && merged.volume_letter_for_entry(*i)=='D').unwrap().1.dir_idx);
+    merged.dir_paths_buf=old_cache;
+    merged.dir_path_ranges[root as usize]=(offset,2);
+    let before=merged.dir_paths_buf.clone();
+    check(&merged);
+    assert_eq!(merged.dir_paths_buf,before,"read must not mutate old cached bytes");
+    let engine = findx2_core::SearchEngine::new(merged);
+    for (text, expected) in [
+        ("parent:C:/ file:",r"C:\root.txt"),
+        ("parent:D:/ file:",r"D:\root.txt"),
+        ("parent:C:/nested file:",r"C:\nested\child.txt"),
+        ("parent:D:/nested file:",r"D:\nested\child.txt"),
+        (r"path:D:\nested child.txt",r"D:\nested\child.txt"),
+    ] {
+        let query=findx2_core::QueryParser::parse(text).unwrap();
+        let options=findx2_core::SearchOptions::default();
+        let (hits,total)=engine.search(&query,&options).unwrap();
+        assert_eq!(total,1,"canonical direct query: {text}");
+        assert_eq!(hits[0].path,expected,"canonical direct query: {text}");
+        let (page,n)=engine.search_paged(text,&query,&options,0,10).unwrap();
+        assert_eq!(n,1,"canonical paged query: {text}");
+        assert_eq!(page[0].path,expected,"canonical paged query: {text}");
+    }
 }

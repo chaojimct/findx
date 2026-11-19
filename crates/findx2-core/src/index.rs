@@ -285,12 +285,15 @@ pub(crate) fn compose_volume_dir_path(vol: &VolumeState, dir_path: &[u8]) -> Str
         } else {
             (vol.volume_letter as char).to_ascii_uppercase()
         };
-        let mut s = String::with_capacity(2 + dir.len());
-        s.push(letter);
-        s.push(':');
-        s.push_str(&dir);
-        s
+        compose_windows_dir_path(letter, &dir)
     }
+}
+
+// Legacy merged-volume roots are self-parented, not necessarily index zero.
+// Older cached materializations can contain redundant root separators. Normalize
+// only the read-side drive/directory join; do not rewrite any persisted cache.
+fn compose_windows_dir_path(letter: char, dir: &str) -> String {
+    format!("{letter}:\\{}", dir.trim_matches('\\'))
 }
 
 pub(crate) fn join_unix_prefix(root_prefix: &str, rel: &str) -> String {
@@ -795,7 +798,7 @@ impl IndexStore {
                 .unwrap_or(&[]);
             let name_lc = String::from_utf8_lossy(name_bs).to_ascii_lowercase();
             parts.push(name_lc);
-            if d.parent_idx == 0 {
+            if d.parent_idx == 0 || d.parent_idx as usize == cur {
                 break;
             }
             cur = d.parent_idx as usize;
@@ -837,7 +840,7 @@ impl IndexStore {
                 .get(d.name_offset as usize..end)
                 .unwrap_or(&[]);
             parts.push(name_bs.to_vec());
-            if d.parent_idx == 0 {
+            if d.parent_idx == 0 || d.parent_idx as usize == cur {
                 break;
             }
             cur = d.parent_idx as usize;
@@ -876,7 +879,7 @@ impl IndexStore {
                 .get(d.name_offset as usize..d.name_offset as usize + d.name_len as usize)
                 .unwrap_or(&[]);
             let name_lc = String::from_utf8_lossy(name_bs).to_ascii_lowercase();
-            let path_str = if d.parent_idx == 0 {
+            let path_str = if d.parent_idx == 0 || d.parent_idx as usize == i {
                 if name_lc.is_empty() {
                     String::new()
                 } else {
@@ -2268,18 +2271,19 @@ impl IndexStore {
                 let pbytes = self.resolve_dir_path_lower(di);
                 if !pbytes.is_empty() {
                     let p = std::str::from_utf8(pbytes.as_ref())?;
-                    return Ok(format!("{}{}{}", letter, ':', p));
+                    return Ok(compose_windows_dir_path(letter, p));
                 }
             }
             Ok(format!("{}:\\{}", letter, name))
         } else {
             let pbytes = self.resolve_dir_path_lower(e.dir_idx);
-            if !pbytes.is_empty() {
-                let p = std::str::from_utf8(pbytes.as_ref())?;
-                Ok(format!("{}{}{}\\{}", letter, ':', p, name))
-            } else {
-                Ok(format!("{}:\\{}", letter, name))
+            let p = std::str::from_utf8(pbytes.as_ref())?;
+            let mut full = compose_windows_dir_path(letter, p);
+            if !full.ends_with('\\') {
+                full.push('\\');
             }
+            full.push_str(&name);
+            Ok(full)
         }
     }
 
