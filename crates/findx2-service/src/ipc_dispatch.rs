@@ -7,8 +7,16 @@ use findx2_ipc::{IpcRequest, IpcResponse};
 
 pub(crate) type EngineSlot = Arc<RwLock<Option<Arc<SearchEngine>>>>;
 
+fn checkpoint_error_snapshot() -> Option<String> {
+    #[cfg(windows)]
+    { crate::run::last_persistence_error() }
+    #[cfg(not(windows))]
+    { None } // No receipt capability on this platform either; None does not imply durable.
+}
+
 pub(crate) fn req_kind_label(r: &IpcRequest) -> &'static str {
     match r {
+        IpcRequest::UpgradeCapabilities { .. } => "UpgradeCapabilities",
         IpcRequest::UsageCapabilities => "UsageCapabilities",
         IpcRequest::UsageChildren { .. } => "UsageChildren",
         IpcRequest::Ping => "Ping",
@@ -20,6 +28,15 @@ pub(crate) fn req_kind_label(r: &IpcRequest) -> &'static str {
 pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse {
     let engine = slot.read().ok().and_then(|g| g.clone());
     match (req, engine) {
+        (IpcRequest::UpgradeCapabilities { protocol_version: 1 }, _) => IpcResponse::UpgradeCapabilitiesResult {
+            protocol_version: 1,
+            durable_prepare: false,
+            last_checkpoint_error: checkpoint_error_snapshot(),
+            reason: "producer admission/drain and generation-bound final receipt are not implemented; refuse before service stop".into(),
+        },
+        (IpcRequest::UpgradeCapabilities { .. }, _) => IpcResponse::Error {
+            message: "unsupported durable-upgrade protocol version; refuse before service stop".into(),
+        },
         (IpcRequest::UsageCapabilities, Some(eng)) if eng.usage_available() => {
             IpcResponse::UsageCapabilitiesResult { logical_tree: 1, allocated: false }
         }
@@ -383,5 +400,16 @@ mod usage_tests {
         let (hits,_,_)=super::search_ipc(&engine,"public",false,50,0).unwrap();
         assert!(hits.iter().any(|h| h.name=="public-folder" && h.is_directory));
         assert!(hits.iter().any(|h| h.name=="public-file.txt" && !h.is_directory));
+    }
+}
+
+#[cfg(test)]
+mod upgrade_negotiation_tests {
+    use super::*;
+    #[test]
+    fn upgrade_capabilities_never_claim_unimplemented_receipt_even_during_load() {
+        let slot: EngineSlot = Arc::new(RwLock::new(None));
+        assert!(matches!(process_request(&slot, IpcRequest::UpgradeCapabilities { protocol_version: 1 }), IpcResponse::UpgradeCapabilitiesResult { protocol_version: 1, durable_prepare: false, .. }));
+        assert!(matches!(process_request(&slot, IpcRequest::UpgradeCapabilities { protocol_version: 252 }), IpcResponse::Error { .. }));
     }
 }

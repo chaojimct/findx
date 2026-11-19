@@ -55,6 +55,8 @@ pub enum IpcRequest {
         #[serde(default)]
         offset: usize,
     },
+    /// Negotiation only. Missing/unknown versions must never imply prepare support.
+    UpgradeCapabilities { protocol_version: u32 },
     UsageCapabilities,
     UsageChildren {
         path: String,
@@ -145,6 +147,13 @@ pub enum IpcResponse {
         /// 阈值约定见 `IndexStore::should_compact`（≥10 万条目且墓碑比 >25%）。
         #[serde(default)]
         tombstone_count: Option<u64>,
+    },
+    UpgradeCapabilitiesResult {
+        protocol_version: u32,
+        durable_prepare: bool,
+        #[serde(default)]
+        last_checkpoint_error: Option<String>,
+        reason: String,
     },
     UsageCapabilitiesResult {
         logical_tree: u32,
@@ -248,5 +257,15 @@ mod usage_health_tests {
         let page: super::UsagePageDto=serde_json::from_value(serde_json::json!({"epoch":1,"generation":2,"root":{"id":0,"name":"fixture","directory":true,"logical":0,"files":0,"directories":1,"unknown":0},"children":[],"next":null,"resident_bytes":0,"state":"metadata freshness not established"})).unwrap();
         assert!(page.watch_error.is_none());
         assert!(page.metadata_error.is_none());
+    }
+}
+
+#[cfg(test)]
+mod upgrade_protocol_tests {
+    #[test]
+    fn upgrade_negotiation_requires_explicit_version_and_has_no_implicit_prepare() {
+        assert!(serde_json::from_str::<super::IpcRequest>(r#"{"type":"upgrade_capabilities"}"#).is_err());
+        assert!(serde_json::from_str::<super::IpcRequest>(r#"{"type":"prepare_upgrade","protocol_version":1}"#).is_err());
+        assert!(matches!(serde_json::from_str::<super::IpcRequest>(r#"{"type":"upgrade_capabilities","protocol_version":1}"#).unwrap(), super::IpcRequest::UpgradeCapabilities { protocol_version: 1 }));
     }
 }

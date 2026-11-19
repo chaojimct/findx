@@ -1,0 +1,41 @@
+# t215 bounded engine repair checkpoint (in progress)
+2026-11-19 08:37 Asia/Shanghai. User 08:31 scope expansion applies; necessary engine changes are authorized. No publication until all eight gates have independent genuine evidence.
+
+## Verified starting state
+Preparation tree `C:\Users\chaoj\dev\tools\findx\target\t208-release-src`, local/remote branch `release/v2.5.3-sealed-artifacts` at `20f3e8055b2fbcca264f7bc834333c5d6cab57cc`, clean at 08:32. No v2.5.3 tag/release. Prior source archive preserved as `/workspace/t215-evidence-source.zip`. No new CI triggered yet.
+
+## Concrete gaps / implementation order
+1. Partial-metadata durability: historical t153 batch retention/consistency exists; full-volume bounded IO/cost acceptance missing. Reuse regressions, add actual producer-fenced final capture.
+2. Transactional persistence/error propagation: t154 immutable generations and pre/post publish fault matrix exist. ACTUAL run.rs swallows shutdown persistence error/busy/panic/unfinished workers; win_service discards runner Result, reports SCM exit 0 and forcibly exits 0 after 10s. Repair these paths first. Still need writer admission/drain, coherent RAM mutation sequence + published generation receipt, failure/cancellation/concurrency proofs and versioned IPC.
+3. Installer/rollback: old-engine actual ISS 12/12 is valid only for old payload. New engine + complete final payload require fresh build/hash/native ISS matrix, live negotiated prepare/save/stop/backup/replacement/rollback.
+4. Full-volume/USN: t118 real 4,473,119-entry scan had 808 unverified metadata entries and pending parents; NOT accepted. t119 leaves unknown identity failures/missing parents unresolved. Read lower-MFT/uncorroborated lower-record evidence, reproduce/fix exact parent identity/cursor atomicity/cross-generation/backfill semantics on disposable NTFS VHD, real watch/backfill enabled and metadata_ready true.
+5. Service identity/IPC/generation/singleinstance: strict PID/path/pipe/index assertions exist; no final durable receipt or complete live GUI/session handoff. Add fail-closed protocol negotiation; do not advertise prepare support until all writers fenced/drained. Old 2.5.2 must reject before stop.
+6. Preferences/startup resume: file/registry restore exists; complete legacy WebView/session migration needs distinct real evidence, not fixture relabeling.
+7. Deep-parent performance: small cases exist; historic large/deep acceptance still missing; isolate benchmark with bounds and resource evidence.
+8. Canonical multivolume roots: historical equality/migration acceptance unresolved; reproduce/fix preserving reversible/read-compatible indexes.
+
+Sequence: A1 real shutdown error propagation + non-forcing SCM wait + negative negotiation + focused tests; A2 shared producer admission/drain + consistent generation/nonce/identity final receipt and real injected failures; A3 installer receipt validation and stop/rollback integration; B real VHD/full-volume regressions; C remaining independent gates/live GUI/preferences/performance/roots; D NEW full payload and hashes, native matrix, sealed provenance update, all-ready check, normal new tag/release only then.
+No index-format change planned. Any unavoidable irreversible/incompatible migration goes to parent first.
+
+## Preserved evidence / restrictions
+Old archival fixture ONLY: `/workspace/t214-evidence/FindX-2.5.3-sealed-candidate.zip`, SHA256 d0803d4c36800af6793f479931eea9e78554dc90559af7c4ca1faaddbdf1528c (31,002,426 bytes); not official setup. Old ISS 12/12: https://github.com/chaojimct/findx/actions/runs/44334214875 . Packaging-only CI44340109159 success; not new-engine proof.
+MZ original 29 dirty files, GUI42816, snapshot65168, actual service/ProgramData/user indexes untouched. No UAC, installation, service control, process forcing, history force or hook skipping. Code only in clean preparation tree; local tests own temporary fixtures; native SCM/VHD only disposable CI.
+
+## Next
+Implement A1 now, record exact tests/commit/CI and remaining real safety limitations before ending bounded batch.
+
+## A1 exact implementation and evidence limits
+- `run_foreground` now preserves watcher Results and panics as errors, joins rather than deadline-detaching active writers, and propagates final checkpoint IO/busy/newer-mutation failures instead of logging success and returning Ok.
+- SCM wrapper retains `JoinHandle<Result>`, emits nonzero service-specific failure/panic codes, updates nonzero StopPending progress and removes the 10-second `process::exit(0)` fallback. Real SCM transitions have NOT yet been exercised in this batch; result classification is unit-tested without touching SCM/ProgramData.
+- Explicit versioned capability negotiation returns durable_prepare=false, including loading state. Missing/unsupported version and unimplemented prepare are rejected. The current installer remains fail-closed; no final receipt is fabricated from exit 0, checksums, or an empty dirty bitmap.
+- The real v6 writer is exercised through six existing injected boundaries (quota/disk-full simulation, short-write simulation, access, after-data-sync, before-publish interruption simulation, rename). Tests require each exact stage/cause, identical prior published pointer and old loaded data, retained dirty state, actual cause exposed to IPC, and successful full retry/readback. These are injected protocol/IO-hook proofs, NOT physical disk-full/power-loss or native SCM proofs.
+- A real mutation injected after snapshot IO is rejected as newer RAM rather than acknowledged. It remains possible for another producer to mutate after a clean observation; therefore this observation is explicitly NOT a final RAM receipt.
+
+## A2 precise inventory / minimal next implementation
+`spawn_stat_worker` currently discards its JoinHandle; `spawn_backfill` and `spawn_final_persist_for_epoch` detach producer/persister threads. Trigram rebuild is also detached. Joining watch workers alone is NOT whole-engine quiescence. Track/close admission/drain ALL these paths, including namespace batches, metadata tickets/observations, store replacement, unrestricted index_store_mut, compaction and sidecar publication. Final failure currently reaches SCM honestly but does not yet keep all RAM available for a negotiated retry; implement the pre-STOP prepare state machine before permitting installer STOP.
+Bind accepted RAM mutation sequence and published generation under coherent capture; serialize trigram publication with checkpoint publication; retain the actual writer-returned generation (currently discarded) rather than infer from checksum/current disk pointer. Bind process instance, exact index/pipe identity, caller nonce and protocol version. Prepared state must forbid subsequent mutation until normal STOP or explicit authenticated abort. Failure, busy, cancellation, timeout, panic and any generation mismatch cannot produce ACK. No index format migration is needed for this protocol plan.
+Also found a concrete gate5 gap: `pipe_server::create_first_pipe_server` falls back from first_pipe_instance(true) to false after failure. Real duplicate-owner rejection must be fixed/tested in isolated CI, not claimed from current PID/path checks.
+Read historical lower-MFT detailed raw evidence before changing its recovery policy; the archived docs only establish t118/t119 incomplete metadata/pending-parent facts, not the exact lower-record classifications. No full-volume proof is claimed.
+
+## Bounded local checkpoint (2026-11-19 08:44 Asia/Shanghai)
+Initial A1 regression: IPC3 + service33 + integration1 PASS. Final refined A1: shutdown8 PASS (including six actual-writer injected boundary subcases), real newer-RAM-during-IO1 PASS, IPC3 PASS. These are not full final-payload or native SCM/installer acceptance. Refined-r4 GUI/CLI additive-schema compile check running separately. New engine branch `release/v2.5.3-engine-durability` starts from20f3e80; preserve the old sealed-artifacts branch/source for archival provenance rather than rerun its obsolete fixed252payload packager. One new Windows lifecycle CI runs automatically on normal engine-branch push; all eight gates remain pending their actual independent final evidence.

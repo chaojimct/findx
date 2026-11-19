@@ -517,20 +517,21 @@ pub(crate) fn run_foreground(
             }
         }
     }
-    let mut usn_handles: Vec<JoinHandle<()>> = Vec::new();
+    let mut usn_handles: Vec<JoinHandle<anyhow::Result<()>>> = Vec::new();
     for (vol_path, letter) in volumes_watch {
         let index_for_watch = index.clone();
         let engine_watch = engine.clone();
         let stop_watch = stop.clone();
         usn_handles.push(std::thread::spawn(move || {
-            if let Err(e) = usn_watch_loop(
+            let result = usn_watch_loop(
                 engine_watch,
                 vol_path,
                 letter,
                 index_for_watch,
                 save_iv,
                 stop_watch,
-            ) {
+            );
+            if let Err(e) = &result {
                 crate::watch_health::set_watch_error(
                     letter as char,
                     Some(format!(
@@ -539,6 +540,7 @@ pub(crate) fn run_foreground(
                 );
                 error!("USN 监听线程退出 ({letter}): {e}");
             }
+            result
         }));
     }
 
@@ -548,33 +550,26 @@ pub(crate) fn run_foreground(
     while !shutdown_requested(&stop, flags.shutdown_file.as_deref()) {
         std::thread::sleep(Duration::from_millis(50));
     }
-    info!("Shutdown requested; shared STOP published, waiting for watch flush (shared 10s grace)");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut unfinished = 0usize;
+    info!("Shutdown requested; waiting for watch workers without forced termination");
+    let mut worker_errors = Vec::new();
     for h in usn_handles {
-        while !h.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        if h.is_finished() {
-            if h.join().is_err() { tracing::warn!("watch worker panicked during shutdown"); }
-        } else {
-            unfinished += 1;
+        // Do not detach unfinished writers on a deadline. SCM renews StopPending;
+        // the installer must time out/refuse replacement, never kill this process.
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => worker_errors.push(format!("watch worker failed: {e:#}")),
+            Err(_) => worker_errors.push("watch worker panicked during shutdown".into()),
         }
     }
-    if unfinished == 0 {
-        info!("All watch workers finished normal shutdown");
-        // Namespace workers are quiescent. Persist their cursor even if metadata
-        // coverage is incomplete; keep metadata_ready=false and fold the bounded
-        // overlay pages into the base first, never advance a cursor alone.
-        match persist_shutdown_checkpoint(&engine, &index) {
-            Ok(true) => info!("Normal shutdown checkpoint committed (metadata readiness preserved)"),
-            Ok(false) => tracing::warn!("Shutdown checkpoint deferred by another persister; durable cursor requires replay"),
-            Err(e) => error!("Shutdown checkpoint failed; retained durable cursor requires replay: {e:#}"),
-        }
-        info!(counts=?findx2_windows::metadata_terminal_counts(), "metadata terminal buckets: missing/access/sharing/invalid_id/not_found/other/success");
-    } else {
-        tracing::warn!(unfinished, "Shutdown grace expired; do not claim all workers flushed; retained durable cursor requires replay");
+    if !worker_errors.is_empty() {
+        anyhow::bail!("shutdown not confirmed: {}", worker_errors.join("; "));
     }
+    // A successful IO observation is NOT an upgrade receipt: metadata/backfill/
+    // stat producers still need a shared admission fence and drain in the next step.
+    let result = persist_shutdown_checkpoint(&engine, &index);
+    crate::shutdown::require_checkpoint_result(result, || engine.has_pending_persistence())?;
+    info!("Shutdown checkpoint IO complete; NOT a producer-fenced final RAM durability receipt");
+    info!(counts=?findx2_windows::metadata_terminal_counts(), "metadata terminal buckets: missing/access/sharing/invalid_id/not_found/other/success");
     Ok(())
 }
 
@@ -739,7 +734,7 @@ fn usn_watch_loop(
             match persist_index(&engine, &index_path) {
                 Ok(true) => info!("Volume {letter} shutdown checkpoint generation published (protocol durable, not physical power-loss certified)"),
                 Ok(false) => info!("Volume {letter} shutdown checkpoint deferred to active writer"),
-                Err(e) => error!("Volume {letter} shutdown checkpoint failed; journal retained: {e}"),
+                Err(e) => return Err(e.context(format!("Volume {letter} shutdown checkpoint failed; no final receipt"))),
             }
             info!("卷 {letter} USN 监听线程停机退出");
             return Ok(());
@@ -1200,6 +1195,10 @@ fn persistence_io_health() -> &'static std::sync::Mutex<PersistenceIoHealth> {
     HEALTH.get_or_init(Default::default)
 }
 
+pub(crate) fn last_persistence_error() -> Option<String> {
+    persistence_io_health().lock().unwrap_or_else(|e| e.into_inner()).last_error.clone()
+}
+
 // Retain a drained batch on error AND unwinding. Recover the writer mutex after
 // poison so a panic cannot silently disable all future persistence attempts.
 struct UnacknowledgedBatch<'a> {
@@ -1360,6 +1359,45 @@ mod tests {
     }
 
 
+
+    #[test]
+    fn shutdown_actual_writer_faults_reach_expected_stage_and_ipc_without_ack() {
+        use findx2_core::PersistFault;
+        for (label, fault, expected) in [
+            ("quota", PersistFault::DiskFull { max_bytes: 0 }, "disk full (injected quota"),
+            ("short", PersistFault::ShortWrite { file: "entries.dat".into(), max_bytes: 0 }, "injected short write: entries.dat"),
+            ("access", PersistFault::AccessDenied { file: "entries.dat".into() }, "injected access failure: entries.dat"),
+            ("synced", PersistFault::AfterDataSync, "injected failure after data sync"),
+            ("before-publish", PersistFault::BeforePublish, "injected failure before publish"),
+            ("rename", PersistFault::RenameFail, "injected rename failure"),
+        ] {
+            let (path, engine) = checkpoint_fixture(label);
+            let layout=findx2_core::V6Layout::for_index(&path);
+            let pointer=layout.dir.join("published.json");
+            let before=std::fs::read(&pointer).unwrap();
+            checkpoint_patch(&engine,456);
+            findx2_core::set_persist_fault(fault);
+            let io=super::persist_shutdown_checkpoint(&engine,&path);
+            findx2_core::clear_persist_fault();
+            let error=format!("{:#}",io.as_ref().expect_err("fault must reach actual writer"));
+            assert!(error.contains(expected),"{label} reached wrong failure stage: {error}");
+            assert!(matches!(crate::shutdown::require_checkpoint_result(io, || engine.has_pending_persistence()), Err(crate::shutdown::CheckpointFailure::Writer(_))));
+            assert!(engine.has_pending_persistence());
+            assert_eq!(std::fs::read(&pointer).unwrap(),before,"failure must not replace published pointer");
+            assert_eq!(restored_size(&path),10,"failed save must retain prior complete generation");
+            let slot=std::sync::Arc::new(std::sync::RwLock::new(Some(engine.clone())));
+            match crate::ipc_dispatch::process_request(&slot,findx2_ipc::IpcRequest::UpgradeCapabilities { protocol_version: 1 }) {
+                findx2_ipc::IpcResponse::UpgradeCapabilitiesResult { durable_prepare:false, last_checkpoint_error:Some(e), .. } => assert!(e.contains(expected),"IPC lost actual cause: {e}"),
+                response=>panic!("missing failure or falsely enabled prepare: {response:?}"),
+            }
+            assert!(super::persist_shutdown_checkpoint(&engine,&path).unwrap());
+            assert!(!engine.has_pending_persistence());
+            assert_eq!(restored_size(&path),456);
+            assert!(super::last_persistence_error().is_none());
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
     fn checkpoint_fixture(label: &str) -> (std::path::PathBuf, std::sync::Arc<findx2_core::SearchEngine>) {
         let dir = std::env::temp_dir().join(format!("findx-t153-{label}-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1467,12 +1505,14 @@ mod tests {
     fn checkpoint_success_does_not_acknowledge_metadata_arriving_during_io() {
         let (path,engine)=checkpoint_fixture("late-after-snapshot");
         checkpoint_patch(&engine,456);
-        assert!(super::persist_index_with(&engine,&path,|layout,batch| {
+        let io = super::persist_index_with(&engine,&path,|layout,batch| {
             let result=findx2_core::v6_try_commit(layout,batch).map_err(|e|anyhow::anyhow!("{e:#}"))?;
             let writer=engine.clone();
             std::thread::spawn(move||checkpoint_patch(&writer,789)).join().unwrap();
             Ok(result)
-        }).unwrap());
+        });
+        assert_eq!(crate::shutdown::require_checkpoint_result(io, || engine.has_pending_persistence()),
+            Err(crate::shutdown::CheckpointFailure::NewerMutations));
         assert_eq!(restored_size(&path),456);
         assert!(engine.has_pending_persistence(),"newer accepted metadata cannot be acknowledged by an older batch");
         assert!(super::persist_index(&engine,&path).unwrap());

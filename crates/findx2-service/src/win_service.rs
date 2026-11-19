@@ -1,7 +1,8 @@
 //! Windows 服务安装、卸载与入口调度。
 //!
 //! 停止协议（2.4.5 起）：STOP 控制码 → 置 `stop` 标志 → 上报 StopPending（wait_hint 10s）
-//! → 等 run_foreground 线程收尾落盘（USN pending flush + persist，最多 10s）→ 上报 STOPPED。
+//! → 持续更新 StopPending checkpoint，等待 run_foreground 的真实 Result → 上报相应 STOPPED。
+//! 不再按 10s 硬退；IO 卡住时安装器必须超时拒绝替换，而不是强杀工作线程。
 //! 之前直接 `process::exit(0)`：工作线程被腰斩（最多丢一个落盘间隔的内存增量，靠 journal
 //! 重放兜底），且 exit 若卡在 C runtime flush 就表现为「STOP 30s 无响应」。
 //! 关键节点全部落 `service-win.log`（ProgramData\FindX），为历史上无证据的 ExitCode 1067
@@ -12,7 +13,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tracing::error;
 use windows_service::{
@@ -33,6 +34,14 @@ pub const SERVICE_NAME: &str = "FindX2Search";
 
 /// 分发层日志：service_main 各关键节点 append 一行，退出/崩溃时最后几行即现场。
 fn svc_log(msg: &str) {
+    #[cfg(test)]
+    { let _ = msg; return; }
+    #[cfg(not(test))]
+    svc_log_production(msg);
+}
+
+#[cfg(not(test))]
+fn svc_log_production(msg: &str) {
     let dir = match std::env::var_os("ProgramData") {
         Some(pd) => PathBuf::from(pd).join("FindX"),
         None => return,
@@ -55,12 +64,20 @@ fn set_status(
     wait_hint: Duration,
     exit_code: ServiceExitCode,
 ) {
+    set_status_checkpoint(handle, state, controls, wait_hint, exit_code, 0);
+}
+
+fn set_status_checkpoint(
+    handle: &windows_service::service_control_handler::ServiceStatusHandle,
+    state: ServiceState, controls: ServiceControlAccept, wait_hint: Duration,
+    exit_code: ServiceExitCode, checkpoint: u32,
+) {
     let r = handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: state,
         controls_accepted: controls,
         exit_code,
-        checkpoint: 0,
+        checkpoint,
         wait_hint,
         process_id: None,
     });
@@ -139,7 +156,7 @@ fn service_main_impl(_arguments: Vec<OsString>) {
     let runner = {
         let stop_runner = stop.clone();
         std::thread::spawn(move || {
-            if let Err(e) = crate::run::run_foreground(
+            let result = crate::run::run_foreground(
                 idx,
                 vol,
                 pipe,
@@ -148,11 +165,13 @@ fn service_main_impl(_arguments: Vec<OsString>) {
                 max_scan_threads,
                 flags,
                 stop_runner,
-            ) {
+            );
+            if let Err(e) = &result {
                 svc_log(&format!("run_foreground 失败: {e:#}"));
                 error!("run_foreground: {e}");
             }
             svc_log("run_foreground 线程返回");
+            result
         })
     };
     svc_log("run_foreground 线程已启动");
@@ -166,43 +185,54 @@ fn service_main_impl(_arguments: Vec<OsString>) {
                 ServiceState::Stopped,
                 ServiceControlAccept::empty(),
                 Duration::default(),
-                ServiceExitCode::Win32(0),
+                runner_exit_code(runner.join()),
             );
             return;
         }
         std::thread::sleep(Duration::from_millis(300));
     }
 
-    // 收到 STOP：告知 SCM 我们在收尾（落盘最多 ~10s），避免 30s 无响应被误判。
-    set_status(
-        &status_handle,
-        ServiceState::StopPending,
-        ServiceControlAccept::empty(),
-        Duration::from_secs(10),
-        ServiceExitCode::Win32(0),
-    );
-    svc_log("状态=StopPending 已上报，等待工作线程收尾（最多 10s）");
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !runner.is_finished() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    if runner.is_finished() {
-        svc_log("工作线程收尾完成——上报 STOPPED，正常退出");
-        set_status(
-            &status_handle,
-            ServiceState::Stopped,
-            ServiceControlAccept::empty(),
-            Duration::default(),
-            ServiceExitCode::Win32(0),
+    // STOP is a request to finish, not permission to force termination or claim
+    // durability. Renew SCM progress while retaining the real worker JoinHandle.
+    let mut checkpoint = 1u32;
+    loop {
+        set_status_checkpoint(
+            &status_handle, ServiceState::StopPending, ServiceControlAccept::empty(),
+            Duration::from_secs(10), ServiceExitCode::Win32(0), checkpoint,
         );
-        // 正常 return：dispatcher 结束 → main 返回 → 进程退出。
-        // pipe/tokio 等 detached 线程由 OS 收割（命名管道句柄随进程关闭）。
-    } else {
-        // 兜底：落盘卡住（磁盘满/杀毒扫描）也不能让 SCM 干等——硬退，journal 重放兜底。
-        svc_log("等待工作线程超时（10s）——强制退出（journal 重放兜底）");
-        std::process::exit(0);
+        if runner.is_finished() { break; }
+        checkpoint = checkpoint.saturating_add(1);
+        std::thread::sleep(Duration::from_secs(1));
     }
+    let exit_code = runner_exit_code(runner.join());
+    set_status(&status_handle, ServiceState::Stopped, ServiceControlAccept::empty(),
+        Duration::default(), exit_code);
+}
+
+fn runner_exit_code(result: std::thread::Result<anyhow::Result<()>>) -> ServiceExitCode {
+    match result {
+        Ok(Ok(())) => ServiceExitCode::Win32(0),
+        Ok(Err(e)) => {
+            svc_log(&format!("worker failed; SCM service-specific exit=1; NO durable receipt: {e:#}"));
+            ServiceExitCode::ServiceSpecific(1)
+        }
+        Err(_) => {
+            svc_log("worker panicked; SCM service-specific exit=2; NO durable receipt");
+            ServiceExitCode::ServiceSpecific(2)
+        }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    #[test]
+    fn shutdown_runner_result_maps_only_real_success_to_zero() {
+        assert!(matches!(runner_exit_code(Ok(Ok(()))), ServiceExitCode::Win32(0)));
+        assert!(matches!(runner_exit_code(Ok(Err(anyhow::anyhow!("owned fixture write error")))), ServiceExitCode::ServiceSpecific(1)));
+        assert!(matches!(runner_exit_code(Err(Box::new("owned fixture panic"))), ServiceExitCode::ServiceSpecific(2)));
+    }
+
 }
 
 pub fn install(

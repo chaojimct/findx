@@ -1,3 +1,5 @@
+> Historical unchanged-engine applicability below is superseded by the user's 2026-11-19 08:31 Asia/Shanghai authorization. Necessary engine/IPC/installer repair is now in scope; ALL eight gates remain required, with no N/A or approval override. See [current staged engine plan](RELEASE-2.5.3-ENGINE-PLAN.md). Old fixture 12/12 is NOT proof for a rebuilt engine.
+
 # 2.5.3 applicability decision — evidence, not a gate override
 
 Exact baseline: successful installer run44334214875, source aea0adc1a88e472457c14cf806a82950a87dc9cb, final GUI SHA2568cdea0ad9639dcd00f9c08689fb69a6dab4d713c06b6287065796a607860900e, exact published252engine binaries. All12 intended installer cases passed. Original required flags/publish_ready and check_release.py are not changed.

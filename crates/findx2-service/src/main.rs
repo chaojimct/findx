@@ -4,6 +4,7 @@ mod cli;
 mod ipc_dispatch;
 mod load_state;
 mod startup_compact;
+mod shutdown;
 mod usage_fixture;
 mod watch_health;
 

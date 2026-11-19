@@ -1,0 +1,38 @@
+name: Engine lifecycle safety
+on:
+  push:
+    branches: [release/v2.5.3-engine-durability]
+    paths:
+      - 'crates/findx2-service/**'
+      - 'crates/findx2-ipc/**'
+      - '.github/workflows/engine-lifecycle.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-lifecycle:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: IPC and actual service shutdown regressions (temporary file fixtures only)
+        shell: pwsh
+        run: |
+          cargo test --locked -p findx2-ipc -p findx2-service -- --test-threads=1 2>&1 | Tee-Object engine-lifecycle-tests.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: No force-exit fallback and protocol remains fail-closed
+        shell: pwsh
+        run: |
+          $source = Get-Content crates/findx2-service/src/win_service.rs -Raw
+          if ($source -match 'std::process::exit') { throw 'SCM must never force-exit its worker' }
+          $dispatch = Get-Content crates/findx2-service/src/ipc_dispatch.rs -Raw
+          if ($dispatch -match 'durable_prepare:\s*true') { throw 'Receipt cannot be enabled before producer fencing' }
+      - name: Archive bounded A1 test log, not release approval
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-lifecycle-A1-evidence
+          path: engine-lifecycle-tests.log
+          retention-days: 30
