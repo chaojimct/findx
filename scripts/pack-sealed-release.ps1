@@ -1,8 +1,9 @@
 # No cargo/npm/build of runtime binaries. No installer execution.
-param([Parameter(Mandatory=$true)][string]$PayloadRoot,[Parameter(Mandatory=$true)][string]$EvidenceRoot,[Parameter(Mandatory=$true)][string]$OutputRoot,[switch]$ValidateOnly,[switch]$BuildFixture,[switch]$Production,[string]$Iscc='',[string]$Extractor='')
+param([Parameter(Mandatory=$true)][string]$PayloadRoot,[Parameter(Mandatory=$true)][string]$EvidenceRoot,[Parameter(Mandatory=$true)][string]$OutputRoot,[switch]$ValidateOnly,[switch]$BuildFixture,[switch]$Production,[string]$Iscc='',[string]$Extractor='',[string]$SourceRoot='',[switch]$TaggedSourceRepack)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
-$repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$repo=[IO.Path]::GetFullPath($(if($SourceRoot){$SourceRoot}else{Join-Path $PSScriptRoot '..'}))
+if($SourceRoot -and -not $TaggedSourceRepack){throw 'Explicit source root only for pinned tagged-source recovery'}
 $lock=Get-Content -LiteralPath (Join-Path $repo 'release/2.5.3-seal-lock.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 function Require($ok,[string]$why){if(-not $ok){throw $why}}
 function Hash([string]$p){(Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()}
@@ -81,8 +82,17 @@ if($ValidateOnly){Write-Output 'SEALED_INPUT_VALIDATED_6_HASHES_AND_EXPLICIT_COM
 Require (-not (Invoke-SealGit -arguments @('status','--porcelain'))) 'Only a clean committed packaging source may be sealed'
 if($Production){
  Require ($rebuilt) 'Production 2.5.3 now requires the new-engine final lock, not the historical252 fixture'
- Require ($env:GITHUB_ACTIONS -eq 'true' -and $env:GITHUB_REPOSITORY -eq 'chaojimct/findx' -and $env:GITHUB_REF -eq 'refs/tags/v2.5.3') 'Official compilation only in the approved tag workflow'
- Require ((Invoke-SealGit -arguments @('rev-parse','v2.5.3^{commit}')) -eq $head) 'Official source tag differs from checked-out source'
+ Require ($env:GITHUB_ACTIONS -eq 'true' -and $env:GITHUB_REPOSITORY -eq 'chaojimct/findx') 'Official compilation only in approved repository Actions'
+ if($TaggedSourceRepack){
+  # Explicitly authorized packaging recovery, NOT a different product source,
+  # manifest, proof hash, gate plan, replacement tag or permission to overwrite.
+  Require ($env:GITHUB_EVENT_NAME -ceq 'push' -and $env:GITHUB_REF -ceq 'refs/heads/release/v2.5.3-engine-durability' -and $env:GITHUB_WORKFLOW_REF -ceq 'chaojimct/findx/.github/workflows/repack-253.yml@refs/heads/release/v2.5.3-engine-durability') 'Wrong controlled packaging-recovery workflow'
+  Require ($head -ceq 'f3235307221fc2dd807d0d6c7d1b0d767f0bd987' -and $repo -ceq [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'tagged-source'))) 'Recovery must consume original immutable tagged checkout'
+  $consumer=Join-Path $env:GITHUB_WORKSPACE 'packaging'
+  $consumerHead=& git -C $consumer rev-parse HEAD;Require ($LASTEXITCODE -eq 0 -and $consumerHead -ceq $env:GITHUB_SHA) 'Packaging consumer source differs from triggering commit'
+  $changes=@(& git -C $consumer diff --name-only $head $consumerHead);Require ($LASTEXITCODE -eq 0 -and $changes.Count -eq 2 -and @($changes|Where-Object {$_ -cnotin @('scripts/pack-sealed-release.ps1','.github/workflows/repack-253.yml')}).Count -eq 0) 'Recovery changed product, manifest, gates or other tagged sources'
+ }else{Require ($env:GITHUB_REF -ceq 'refs/tags/v2.5.3') 'Official compilation only in approved tag workflow'}
+ Require ((Invoke-SealGit -arguments @('rev-parse','v2.5.3^{commit}')) -ceq $head) 'Official source tag differs from checked-out source'
  & python (Join-Path $repo 'scripts/check_release.py') --expected-version 2.5.3 --require-ready
  Require ($LASTEXITCODE -eq 0) 'Publication policy is not approved; production compilation forbidden'
 }
@@ -96,7 +106,7 @@ Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $bundle 'source
 $null=New-Item -ItemType Directory (Join-Path $bundle 'proofs');foreach($id in $proofFiles.Keys){Copy-Item -LiteralPath $proofFiles[$id] -Destination (Join-Path $bundle ('proofs/'+$id+'.'+[IO.Path]::GetExtension($proofFiles[$id]).TrimStart('.')))}
 Copy-Item -LiteralPath (Join-Path $repo 'release/2.5.3-seal-lock.json') -Destination (Join-Path $bundle 'seal-lock.json')
 Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $bundle 'pack-sealed-release.ps1')
-$receipt=[ordered]@{version='2.5.3';runtimeSourceCommit=$lock.testedCommit;packagingSourceCommit=$head;testedRun=$lock.testedRun;acceptanceRun=$lock.acceptanceRun;acceptanceCommit=$lock.acceptanceCommit;engineBaseline=$(if($rebuilt){'v2.5.2 source plus authorized engine durability/identity fixes'}else{'historical published v2.5.2 binaries'});guiSha256=($lock.files | Where-Object name -eq 'FindX.exe').sha256;matrixCoverage='18 distinct cases across explicitly component-scoped runs, NOT one identical-payload 18-case run';installerCases=$lock.installerCases;proofProvenance=$lock.proofs;independentGates=$lock.gates;officialApproval=[bool]$Production;fixtureOnly=[bool]$BuildFixture;helperGitBlobs=$lock.helpers;files=@()}
+$receipt=[ordered]@{version='2.5.3';runtimeSourceCommit=$lock.testedCommit;packagingSourceCommit=$head;testedRun=$lock.testedRun;packagingConsumerCommit=$(if($TaggedSourceRepack){$env:GITHUB_SHA}else{$head});taggedSourceRecovery=[bool]$TaggedSourceRepack;acceptanceRun=$lock.acceptanceRun;acceptanceCommit=$lock.acceptanceCommit;engineBaseline=$(if($rebuilt){'v2.5.2 source plus authorized engine durability/identity fixes'}else{'historical published v2.5.2 binaries'});guiSha256=($lock.files | Where-Object name -eq 'FindX.exe').sha256;matrixCoverage='18 distinct cases across explicitly component-scoped runs, NOT one identical-payload 18-case run';installerCases=$lock.installerCases;proofProvenance=$lock.proofs;independentGates=$lock.gates;officialApproval=[bool]$Production;fixtureOnly=[bool]$BuildFixture;helperGitBlobs=$lock.helpers;files=@()}
 if($Production -or $BuildFixture){
  Require ([IO.File]::Exists($Iscc)) 'Explicit Inno compiler missing'
  $compile=Join-Path $out $(if($Production){'official'}else{'fixture'});$null=New-Item -ItemType Directory -Path $compile

@@ -1,0 +1,95 @@
+name: Controlled canonical-byte 2.5.3 packaging recovery
+on:
+  push:
+    branches: [release/v2.5.3-engine-durability]
+    paths: ['.github/workflows/repack-253.yml', 'scripts/pack-sealed-release.ps1']
+permissions:
+  contents: write
+  actions: read
+jobs:
+  package-tagged-source:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: chaojimct/findx
+    steps:
+      - name: Disable checkout text conversion on disposable runner only
+        shell: powershell
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          path: packaging
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          ref: v2.5.3
+          path: tagged-source
+          fetch-depth: 0
+      - name: Verify immutable original tag and absent public Release
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path $env:GITHUB_WORKSPACE 'tagged-source'
+          if((git -C $root rev-parse HEAD) -cne 'f3235307221fc2dd807d0d6c7d1b0d767f0bd987' -or (git -C $root rev-parse 'v2.5.3^{commit}') -cne 'f3235307221fc2dd807d0d6c7d1b0d767f0bd987'){throw 'Original tag moved; refuse'}
+          $remote=git -C $root ls-remote --tags origin refs/tags/v2.5.3
+          if($LASTEXITCODE -or ($remote -split '\s+')[0] -cne (git -C $root rev-parse v2.5.3)){throw 'Remote annotated tag differs'}
+          $releases=gh release list --repo chaojimct/findx --limit 100 --json tagName|ConvertFrom-Json
+          if($LASTEXITCODE -or @($releases|Where-Object tagName -ceq 'v2.5.3').Count){throw 'Release exists or query uncertain; no overwrite'}
+          python "$root/scripts/check_release.py" --expected-version 2.5.3 --require-ready
+          if($LASTEXITCODE){throw 'Tagged release readiness failed'}
+      - name: Fetch same six bytes and pinned independent proofs; canonical tagged blobs only
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $repo=Join-Path $env:GITHUB_WORKSPACE 'tagged-source'
+          $lock=Get-Content "$repo/release/2.5.3-seal-lock.json" -Raw|ConvertFrom-Json
+          gh run download $lock.testedRun --repo chaojimct/findx --name $lock.payloadArtifact --dir "$env:RUNNER_TEMP/sealed-payload"
+          if($LASTEXITCODE){throw 'Exact payload download failed'}
+          $py=Join-Path $env:RUNNER_TEMP 'canonical-proof.py'
+          $code=@'
+          import subprocess,hashlib,pathlib,sys
+          b=subprocess.check_output(['git','-C',sys.argv[1],'cat-file','blob','f3235307221fc2dd807d0d6c7d1b0d767f0bd987:'+sys.argv[2]])
+          assert hashlib.sha256(b).hexdigest()==sys.argv[4], 'canonical tagged proof hash mismatch'
+          pathlib.Path(sys.argv[3]).write_bytes(b)
+          '@
+          [IO.File]::WriteAllText($py,$code,[Text.UTF8Encoding]::new($false))
+          $done=@{}
+          foreach($p in $lock.proofs){
+            $key=[string]$p.run+':'+$p.artifact;if($done.ContainsKey($key)){continue};$done[$key]=$true
+            $dir=Join-Path "$env:RUNNER_TEMP/sealed-evidence" ([string]$done.Count)
+            if($p.artifact -ceq 'repository-evidence'){
+              if($p.sourcePath -cnotmatch '^release/evidence/[A-Za-z0-9_.-]+$'){throw 'Invalid tagged evidence path'}
+              $null=New-Item -ItemType Directory $dir
+              # Native subprocess bytes, no PowerShell decoding/newline/BOM conversion.
+              python $py $repo $p.sourcePath (Join-Path $dir $p.fileName) $p.sha256
+              if($LASTEXITCODE){throw 'Canonical tagged proof failed'}
+            }else{
+              gh run download $p.run --repo chaojimct/findx --name $p.artifact --dir $dir
+              if($LASTEXITCODE){throw 'Pinned proof download failed'}
+            }
+          }
+      - name: Packaging tools only, no runtime compilation or tests
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          if(-not(Test-Path "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe")){choco install innosetup -y --no-progress;if($LASTEXITCODE){throw 'ISCC missing'}}
+          $zip=Join-Path $env:RUNNER_TEMP 'innounp.zip'
+          Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/jrathlev/InnoUnpacker-Windows-GUI/refs/heads/master/innounp-2/bin/innounp-2.zip -OutFile $zip
+          if((Get-FileHash $zip).Hash -ine 'f8e45c9676bebc7d7570108ab572673b541fcf7a7d3d24a04319ac6b5315b4e8'){throw 'Extractor hash mismatch'}
+          Expand-Archive $zip -DestinationPath "$env:RUNNER_TEMP/innounp"
+      - name: Official setup from original tag source; verify embedded six bytes and helpers
+        shell: powershell
+        run: |
+          & "$env:GITHUB_WORKSPACE/packaging/scripts/pack-sealed-release.ps1" -SourceRoot "$env:GITHUB_WORKSPACE/tagged-source" -TaggedSourceRepack -Production -PayloadRoot "$env:RUNNER_TEMP/sealed-payload" -EvidenceRoot "$env:RUNNER_TEMP/sealed-evidence" -OutputRoot "$env:RUNNER_TEMP/sealed-official-output" -Iscc "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe" -Extractor "$env:RUNNER_TEMP/innounp/innounp.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: findx-253-official-tagged-setup
+          path: ${{ runner.temp }}/sealed-official-output/official/*
+      - name: Create only absent v2.5.3 Release; no tag or asset overwrite
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $dir=Join-Path $env:RUNNER_TEMP 'sealed-official-output/official'
+          gh release create v2.5.3 "$dir/FindX-2.5.3-setup.exe" "$dir/SHA256SUMS.txt" "$dir/seal.json" --repo chaojimct/findx --verify-tag --title 'FindX 2.5.3' --notes 'Native GUI and durability-safe engine. Exact six sealed files and independently scoped acceptance in seal.json. Packaging consumes original immutable v2.5.3 tag; no runtime rebuild. Running legacy 2.5.2 without protocol2 is refused before STOP. Install manually; no forced shutdown or automatic installation.'
+          if($LASTEXITCODE){throw 'Release creation refused; do not overwrite assets'}
