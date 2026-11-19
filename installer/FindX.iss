@@ -300,11 +300,12 @@ begin
     Result := 'Safe upgrade preparation failed. Nothing was force-stopped. Evidence: ' + TxRoot;
     if FileExists(TxRoot + '\reason.code') then begin
       Result := '请先正常退出 FindX、停止旧服务后重试。旧版无保存回执，本次未改动。日志: ' + TxRoot;
-#ifndef TxTestBuild
-      { The old updater starts /VERYSILENT. Do not silently lose the required retry explanation. }
-      if WizardSilent then MsgBox('请先正常退出 FindX、停止旧服务后重试。旧版无保存回执，本次未改动。', mbError, MB_OK);
-#endif
     end;
+#ifndef TxTestBuild
+    { MsgBox, unlike SuppressibleMsgBox, remains visible with /SUPPRESSMSGBOXES.
+      Every preparation refusal must be visible, not only legacy-service ACK refusal. }
+    if WizardSilent then MsgBox(Result + #13#10 + '请正常关闭旧版所有 FindX 窗口后重试。不会强制退出或停止无保存回执的旧服务。', mbError, MB_OK);
+#endif
   end;
 end;
 

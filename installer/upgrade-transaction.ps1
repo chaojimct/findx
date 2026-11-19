@@ -121,6 +121,37 @@ function Get-InstalledGui {
  $path=Join-Path $script:s.roots.app 'FindX.exe'
  return ,@(Get-CimInstance Win32_Process -Filter "Name='FindX.exe'" | Where-Object {$_.ExecutablePath -and $_.ExecutablePath.Equals($path,[StringComparison]::OrdinalIgnoreCase)})
 }
+function Request-Legacy252NormalClose($Target) {
+ # The shipped 2.5.2 native GUI has no tray/Quit menu. Its last normal window
+ # close calls cx.quit (v2.5.2 ui/mod.rs96-101). Never apply this to newer GUIs
+ # whose Close button may only hide to tray. Exact published-build allowlist.
+ $image=Join-Path $script:s.roots.app 'FindX.exe'
+ if((Get-Item -LiteralPath $image).VersionInfo.ProductVersion -cne '2.5.2' -or
+    (Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash -ine '392cea03063d4b1ac57e62d5edcba45291ffe36e16c49bad472298d2b51c9a02'){return $false}
+ $process=Get-Process -Id $Target.ProcessId -ErrorAction Stop
+ $null=$process.Handle # retain this instance; do not confuse PID reuse with exit
+ $until=[DateTime]::UtcNow.AddSeconds($script:s.timeoutSeconds)
+ $sent=@{}
+ while(-not $process.HasExited -and [DateTime]::UtcNow -lt $until){
+  $fresh=Get-CimInstance Win32_Process -Filter ('ProcessId='+$Target.ProcessId)
+  if(-not $fresh){break}
+  if($fresh.CreationDate -ne $Target.CreationDate -or $fresh.SessionId -ne $Target.SessionId -or
+     -not $fresh.ExecutablePath -or -not $fresh.ExecutablePath.Equals($image,[StringComparison]::OrdinalIgnoreCase)){
+   throw 'Legacy GUI instance/session/path changed; refusing normal-close request'
+  }
+  $process.Refresh()
+  $window=$process.MainWindowHandle.ToInt64()
+  if($window -ne 0 -and -not $sent.ContainsKey($window)){
+   $script:s.original.guiExitRequested=$true;Save-State
+   if(-not $process.CloseMainWindow()){throw 'Legacy GUI did not accept normal window close; close its windows manually'}
+   $sent[$window]=$true
+  }
+  Start-Sleep -Milliseconds 100
+ }
+ if(-not $process.WaitForExit(100)){throw 'Legacy GUI normal-close timeout; no force/hide/process-name fallback'}
+ if($process.ExitCode -ne 0){throw ('Legacy GUI crashed during normal close; installation unchanged, exit='+$process.ExitCode)}
+ return $true
+}
 function Request-NormalGuiExit {
  $targets=Get-InstalledGui
  if(-not $targets.Count){return}
@@ -140,7 +171,15 @@ function Request-NormalGuiExit {
    }
    if($invoked){break}
   }
-  if(-not $invoked){throw 'Installed GUI has no supported normal Quit entry available; installation unchanged'}
+  if(-not $invoked){
+   # The original target may have exited while UIA was enumerating; don't use a
+   # stale PID, claim a requested quit, or close a replacement process.
+   $current=@(Get-InstalledGui | Where-Object {$_.ProcessId -eq $target.ProcessId})
+   if(-not $current.Count){continue}
+   if($current.Count -ne 1 -or $current[0].CreationDate -ne $target.CreationDate -or $current[0].SessionId -ne $target.SessionId){throw 'GUI instance changed during quit discovery; installation unchanged'}
+   $invoked=Request-Legacy252NormalClose $target
+  }
+  if(-not $invoked){throw 'Installed GUI has no supported normal Quit entry available; close all its windows normally and retry; installation unchanged'}
   $until=[DateTime]::UtcNow.AddSeconds($script:s.timeoutSeconds)
   while((Get-Process -Id $target.ProcessId -ErrorAction SilentlyContinue) -and [DateTime]::UtcNow -lt $until){Start-Sleep -Milliseconds 100}
   if(Get-Process -Id $target.ProcessId -ErrorAction SilentlyContinue){throw 'GUI did not exit normally; no close/hide/force fallback'}
