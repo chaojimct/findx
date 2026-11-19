@@ -236,7 +236,29 @@ foreach($case in $cases){
    if($case -eq 'running253-save-refusal'){
     Assert (-not $j.backupVerified -and $j.error -match 'Real prepare refused:.*checkpoint writer:.*(denied|Access|os error 5)') 'Save refusal did not reach actual OS writer failure'
     $svc=Get-CimInstance Win32_Service -Filter ("Name='"+$service+"'");Assert ($svc.State -eq 'Running' -and $svc.ProcessId -eq $originalServicePid) 'Failed prepare destroyed/restarted original RAM owner'
+    # Permission repair is not a durability result: the real periodic writer
+    # deliberately backs off five seconds on IO failure. Do not feed a new event
+    # or bypass its retained error. Observe same-instance, fresh disk recovery.
+    $repairImage=Join-Path $app 'findx2-service.exe';$repairIndex=Join-Path $data 'index.bin'
+    $repairOwner=Assert-FxTxReceiptService $service $pipe $repairImage $repairIndex $originalServicePid
+    $repairIdentity=Invoke-FxTxManagement $service $pipe $repairImage $repairIndex $repairOwner @{type='checkpoint_identity';protocol_version=2} 2000
+    $beforeRepair=(Get-Content (Join-Path $saveV6 'published.json') -Raw|ConvertFrom-Json).manifest.generation
     Set-Acl $saveV6 $saveAcl;$saveAcl=$null
+    $repairTimer=[Diagnostics.Stopwatch]::StartNew();$recovered=$false;$repairLast='';$repairGeneration=$beforeRepair
+    while($repairTimer.Elapsed.TotalSeconds -lt 10){
+     try{
+      $repairCap=Invoke-FxTxManagement $service $pipe $repairImage $repairIndex $repairOwner @{type='upgrade_capabilities';protocol_version=2} 2000
+      $repairNow=Invoke-FxTxManagement $service $pipe $repairImage $repairIndex $repairOwner @{type='checkpoint_identity';protocol_version=2} 2000
+      Assert ($repairNow.engine_instance -ceq $repairIdentity.engine_instance -and $repairNow.service_pid -eq $originalServicePid) 'RAM owner changed during actual IO repair'
+      $repairGeneration=(Get-Content (Join-Path $saveV6 'published.json') -Raw|ConvertFrom-Json).manifest.generation
+      if($null -eq $repairCap.runtime_error -and $null -eq $repairCap.last_checkpoint_error -and $repairGeneration -gt $beforeRepair){Assert-FxTxUpgradeCapabilities $repairCap;$recovered=$true;break}
+      $repairLast=$repairCap|ConvertTo-Json -Compress -Depth 10
+     }catch{$repairLast=$_.Exception.Message}
+     [Threading.Thread]::Sleep(200)
+    }
+    $observation=@{passed=$recovered;beforeGeneration=$beforeRepair;afterGeneration=$repairGeneration;engineInstance=$repairIdentity.engine_instance;owner=$repairOwner;seconds=$repairTimer.Elapsed.TotalSeconds;last=$repairLast;extraEvents=$false}
+    $observation|ConvertTo-Json -Depth 12|Set-Content (Join-Path $root 'save-repair-observed.json')
+    Assert $recovered ('Actual idle writer did not repair retained same-instance failure within bounded10s: '+$repairLast)
     $retryTx=Join-Path $root 'tx-save-retry';$retryArgs=$args.Replace(('/TXROOT="'+$tx+'"'),('/TXROOT="'+$retryTx+'"'))
     $savedRetry=Start-Process -FilePath $setup -ArgumentList $retryArgs -PassThru -Wait
     $rj=Journal $retryTx

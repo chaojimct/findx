@@ -51,7 +51,9 @@ jobs:
         if: ${{ !cancelled() && steps.stage.outcome == 'success' }}
         shell: pwsh
         run: |
-          cargo build --locked --release -p findx2-core --example verify_persisted_file --example namespace_index_copy --target-dir target --jobs 2
+          cargo build --locked --release -p findx2-core --example verify_persisted_file --target-dir target --jobs 2
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          cargo build --locked --release -p findx2-windows --example namespace_index_copy --target-dir target --jobs 2
           if($LASTEXITCODE){exit $LASTEXITCODE}
           $null=New-Item -ItemType Directory scripts/gui-compat-tests/examples -Force
           Copy-Item scripts/final-legacy-export.rs scripts/gui-compat-tests/examples/final-legacy-export.rs
@@ -114,4 +116,5 @@ jobs:
             ${{ runner.temp }}/FindXUpgradeTest_*/**/service-health.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/service-status-last.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/*receipt*.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/save-repair-observed.json
           retention-days: 30
