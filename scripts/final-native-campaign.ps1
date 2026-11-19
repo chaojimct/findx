@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$Payload)
+﻿param([Parameter(Mandatory=$true)][string]$Payload)
 Set-StrictMode -Version Latest;$ErrorActionPreference='Stop'
 if($env:GITHUB_ACTIONS-ne'true'-or$env:RUNNER_OS-ne'Windows'-or$env:COMPUTERNAME-eq'MZ'-or$env:USERPROFILE-eq'C:\Users\chaoj'){throw 'Disposable existing-admin Windows CI only'}
 if(-not([Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'No UAC; existing runner rights required'}

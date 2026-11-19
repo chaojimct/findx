@@ -31,18 +31,7 @@ jobs:
       - name: One necessary current engine build; NEVER rebuild attested GUI
         shell: pwsh
         run: |
-          cargo build --locked --release -p findx2-cli -p findx2-service -p findx2-core --bins --example verify_persisted_file --example path_page_latency --jobs 2
-          if($LASTEXITCODE){exit $LASTEXITCODE}
-          $deps=Join-Path $pwd 'target/release/deps'
-          $lib=Get-ChildItem $deps -Filter 'librusty_leveldb-*.rlib'|Select-Object -First 1
-          if(-not $lib){
-            $env:CARGO_TARGET_DIR=Join-Path $pwd 'target'
-            cargo test --locked --release --manifest-path scripts/gui-compat-tests/Cargo.toml -- --test-threads=1
-            if($LASTEXITCODE){exit $LASTEXITCODE}
-            $lib=Get-ChildItem $deps -Filter 'librusty_leveldb-*.rlib'|Select-Object -First 1
-          }
-          if(-not $lib){throw 'Actual legacy data generator dependency missing'}
-          rustc --edition=2024 scripts/final-legacy-export.rs -L "dependency=$deps" --extern "rusty_leveldb=$($lib.FullName)" -o target/release/final-legacy-export.exe
+          cargo build --locked --release -p findx2-cli -p findx2-service -p findx2-core --bins --example verify_persisted_file --example path_page_latency --target-dir target --jobs 2
           if($LASTEXITCODE){exit $LASTEXITCODE}
       - name: Pin exact six files and separate GUI engine provenance
         id: stage
@@ -54,6 +43,16 @@ jobs:
           name: findx-253-final-engine-E10D-gui-payload
           path: ${{ runner.temp }}/findx-final253-payload/**
           retention-days: 30
+      - name: Build existing data-only legacy generator after preserving runtime artifacts
+        id: generator
+        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $null=New-Item -ItemType Directory scripts/gui-compat-tests/examples -Force
+          Copy-Item scripts/final-legacy-export.rs scripts/gui-compat-tests/examples/final-legacy-export.rs
+          cargo build --locked --release --manifest-path scripts/gui-compat-tests/Cargo.toml --example final-legacy-export --target-dir target --jobs 2
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          Copy-Item target/release/examples/final-legacy-export.exe target/release/final-legacy-export.exe
       - name: Existing documented 50k-overlay deep parent page benchmark
         id: perf
         shell: pwsh
@@ -62,7 +61,7 @@ jobs:
           if($LASTEXITCODE){exit $LASTEXITCODE}
       - name: Combined real two-volume backfill durability USN owner and official GUI campaign
         id: native
-        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.stage.outcome == 'success' && steps.generator.outcome == 'success' }}
         shell: powershell
         run: ./scripts/final-native-campaign.ps1 -Payload "$env:RUNNER_TEMP/findx-final253-payload"
       - name: Reuse native parent journal epoch recovery harness on exact newly built engine bytes
