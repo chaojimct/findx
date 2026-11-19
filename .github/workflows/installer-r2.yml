@@ -1,0 +1,142 @@
+name: Canonical installer-only 2.5.3-r2 release
+on:
+  push:
+    branches: [fix/legacy252-installer-handoff]
+    paths: ['.github/workflows/installer-r2.yml']
+permissions:
+  contents: write
+  actions: read
+jobs:
+  canonical-r2:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: chaojimct/findx
+    steps:
+      - name: Canonical checkout bytes on disposable runner
+        shell: powershell
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Receive successful real252 proof and original canonical runtime contract
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$d=New-Item -ItemType Directory "$env:RUNNER_TEMP/installer-r2"
+          if((git rev-parse 'v2.5.3^{commit}') -cne 'f3235307221fc2dd807d0d6c7d1b0d767f0bd987'){throw 'Original tag differs'}
+          $j=gh api repos/chaojimct/findx/actions/jobs/135504307288|ConvertFrom-Json
+          if($LASTEXITCODE -or $j.head_sha -cne '1d17682a27439433e316e7381a8a69f68b49a1f2' -or $j.conclusion -cne 'success'){throw 'Actual252 canonical producer not successful'}
+          git diff --exit-code 1d17682a27439433e316e7381a8a69f68b49a1f2 HEAD -- installer gui/src-tauri/icons
+          if($LASTEXITCODE){throw 'Installer differs from actual252 tested producer'}
+          gh run download 44507932907 --name actual252-normal-close-upgrade --dir $d
+          if($LASTEXITCODE){throw 'Tested exact setup fetch failed'}
+          $r=Get-Content "$d/result.json" -Raw|ConvertFrom-Json
+          if($r.legacyGuiSha256 -cne '392cea03063d4b1ac57e62d5edcba45291ffe36e16c49bad472298d2b51c9a02' -or $r.oldGuiExit -ne 0 -or $r.installerExit -ne 0 -or $r.fixtureOnly -or $r.mock -or $r.runtimeRebuilt){throw 'Actual original252 exit/upgrade proof mismatch'}
+          Invoke-WebRequest -UseBasicParsing https://github.com/chaojimct/findx/releases/download/v2.5.3/seal.json -OutFile "$d/original-seal.json"
+          if((Get-FileHash "$d/original-seal.json").Hash -ine 'e32eeb0979be0d2fe67325e1eff720409660d184c861d0e1e83bf704529b0a2c'){throw 'Inherited original seal changed'}
+          $seal=Get-Content "$d/original-seal.json" -Raw|ConvertFrom-Json
+          if(-not $seal.officialApproval -or $seal.fixtureOnly -or @($seal.independentGates|Where-Object{-not $_.passed}).Count -or @($seal.independentGates).Count -ne 8){throw 'Prior product gates not approved'}
+          $py=@'
+          import subprocess,pathlib,hashlib,json,os
+          d=pathlib.Path(os.environ['RUNNER_TEMP'])/'installer-r2'
+          seal=json.loads((d/'original-seal.json').read_text(encoding='utf-8-sig'))
+          for f in seal['files']:
+            if not f['name'].startswith('source\\'): continue
+            rel=f['name'][7:].replace('\\','/')
+            if rel in ['installer/FindX.iss','installer/upgrade-transaction.ps1']: continue
+            assert hashlib.sha256(pathlib.Path(rel).read_bytes()).hexdigest()==f['sha256'],rel+' changed unexpectedly'
+          for f in seal['helperGitBlobs']:
+            rel=f['path']
+            canonical=subprocess.check_output(['git','cat-file','blob','1d17682a27439433e316e7381a8a69f68b49a1f2:'+rel])
+            assert canonical==pathlib.Path(rel).read_bytes(),rel+' is not canonical producer bytes'
+          '@
+          [IO.File]::WriteAllText("$d/canonical.py",$py,[Text.UTF8Encoding]::new($false));python "$d/canonical.py"
+          if($LASTEXITCODE){throw 'Canonical source byte check failed'}
+      - name: Read-only extract exact tested official setup; verify all six files and revised canonical helpers
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$d=Join-Path $env:RUNNER_TEMP 'installer-r2';$setup=Join-Path $d 'output/FindX-2.5.3-setup.exe'
+          Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/jrathlev/InnoUnpacker-Windows-GUI/refs/heads/master/innounp-2/bin/innounp-2.zip -OutFile "$d/unpacker.zip"
+          if((Get-FileHash "$d/unpacker.zip").Hash -ine 'f8e45c9676bebc7d7570108ab572673b541fcf7a7d3d24a04319ac6b5315b4e8'){throw 'Extractor differs'}
+          Expand-Archive "$d/unpacker.zip" "$d/extractor"
+          & "$d/extractor/innounp.exe" -x -y ("-d"+"$d/unpacked") $setup > "$d/unpack.log"
+          if($LASTEXITCODE){throw 'Read-only unpack failed'}
+          $lock=Get-Content release/2.5.3-seal-lock.json -Raw|ConvertFrom-Json
+          foreach($f in $lock.files){$p=Join-Path "$d/unpacked/{app}" $f.name;if((Get-FileHash -LiteralPath $p).Hash -ine $f.sha256 -or (Get-Item -LiteralPath $p).Length -ne $f.length){throw ('Embedded sealed file differs '+$f.name)}}
+          if((Get-FileHash "$d/unpacked/{app}/payload-manifest.json").Hash -ine $lock.stageManifestSha256){throw 'Embedded payload manifest differs'}
+          if((Get-Item "$d/unpacked/{app}/FindX.exe").VersionInfo.ProductVersion -cne '2.5.3'){throw 'GUI falsely relabeled'}
+          $helpers=@()
+          foreach($name in @('transaction-files.psm1','transaction-platform.psm1','transaction-receipt.psm1','upgrade-transaction.ps1')){
+            $found=@(Get-ChildItem "$d/unpacked" -Recurse -File -Filter $name);$expected=(Get-FileHash "installer/$name").Hash
+            if($found.Count -ne 1 -or (Get-FileHash $found[0].FullName).Hash -cne $expected){throw ('Embedded helper differs '+$name)}
+            $helpers+=@{path="installer/$name";sha256=$expected.ToLowerInvariant();gitBlob=(git rev-parse ("HEAD:installer/"+$name))}
+          }
+          $old=Get-Content "$d/original-seal.json" -Raw|ConvertFrom-Json
+          $receipt=[ordered]@{releaseTag='v2.5.3-r2';installerRevision='r2';productVersion='2.5.3';preferredAssetName='FindX-2.5.3-setup.exe';fixtureOnly=$false;runtimeRebuilt=$false;releaseCommit=$env:GITHUB_SHA;installerProducerCommit='1d17682a27439433e316e7381a8a69f68b49a1f2';actual252UpgradeRun=44507932907;actual252UpgradeJob=135504307288;legacyGuiSha256='392cea03063d4b1ac57e62d5edcba45291ffe36e16c49bad472298d2b51c9a02';legacyGuiExit=0;formalInstallerExit=0;originalSealSha256='e32eeb0979be0d2fe67325e1eff720409660d184c861d0e1e83bf704529b0a2c';runtimeSourceCommit=$old.runtimeSourceCommit;guiSha256=$old.guiSha256;payload=$lock.files;stageManifestSha256=$lock.stageManifestSha256;canonicalHelpers=$helpers;installerScriptSha256=(Get-FileHash installer/FindX.iss).Hash.ToLowerInvariant();embeddedPayloadAndHelpersVerified=$true;inheritedGates=$old.independentGates;setupSha256=(Get-FileHash $setup).Hash.ToLowerInvariant();limitations='MZ not installed/tested; old252 synchronous UAC crash cause not symbolized; running legacy service without protocol2 remains refused before STOP. Launch independently, not from old GUI updater.'}
+          $receipt|ConvertTo-Json -Depth 12|Set-Content -Encoding UTF8 "$d/output/seal-r2.json"
+          @(((Get-FileHash $setup).Hash.ToLowerInvariant()+'  FindX-2.5.3-setup.exe'),((Get-FileHash "$d/output/seal-r2.json").Hash.ToLowerInvariant()+'  seal-r2.json'))|Set-Content -Encoding ASCII "$d/output/SHA256SUMS-r2.txt"
+      - name: Execute actual old and shipped GUI updater version/asset functions without building either GUI
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$d=Join-Path $env:RUNNER_TEMP 'installer-r2'
+          $py=@'
+          import pathlib,subprocess,re,tomllib
+          root=pathlib.Path(__import__('os').environ['RUNNER_TEMP'])/'installer-r2'/'version-contract'
+          (root/'src').mkdir(parents=True)
+          lock=tomllib.loads(pathlib.Path('Cargo.lock').read_text())
+          version=next(x['version'] for x in lock['package'] if x['name']=='semver')
+          (root/'Cargo.toml').write_text('[package]\nname="updater-contract"\nversion="0.0.0"\nedition="2021"\n[dependencies]\nsemver="='+version+'"\n')
+          modules=[]
+          for name,ref in [('old','v2.5.2'),('shipped','b72219bc844de5eb141bb99a708494c956f53073')]:
+            src=subprocess.check_output(['git','show',ref+':crates/findx2-gui-native/src/update_logic.rs']).decode('utf-8')
+            names=['version_from_release_tag','is_official_setup_asset_name']
+            if name=='shipped':
+              names+=['is_official_asset_name','is_forbidden_asset_name']
+            funcs=[re.search(r'(?ms)^(?:pub )?fn '+f+r'\b.*?^}',src).group() for f in names]
+            if name=='shipped': funcs.insert(0,re.search(r'(?ms)^pub enum UpdatePlatform\b.*?^}',src).group())
+            modules.append('mod '+name+'{'+ '\n'.join(funcs)+'}')
+          main='fn main(){for v in [old::version_from_release_tag("v2.5.3-r2"),shipped::version_from_release_tag("v2.5.3-r2")]{let v=v.unwrap();assert!(v>semver::Version::parse("2.5.2").unwrap());assert!(v<semver::Version::parse("2.5.3").unwrap());}assert!(old::is_official_setup_asset_name("FindX-2.5.3-setup.exe"));assert!(shipped::is_official_setup_asset_name("FindX-2.5.3-setup.exe"));println!("old252 updates to r2; installed253 does not loop; exact shipped asset functions accept only candidate name");}'
+          (root/'src'/'main.rs').write_text('\n'.join(modules)+main)
+          '@
+          [IO.File]::WriteAllText("$d/updater-contract.py",$py,[Text.UTF8Encoding]::new($false));python "$d/updater-contract.py"
+          if($LASTEXITCODE){throw 'Exact updater source extraction failed'}
+          cargo run --quiet --manifest-path "$d/version-contract/Cargo.toml"
+          if($LASTEXITCODE){throw 'Actual updater version/asset contract failed'}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: findx-253-r2-canonical-official
+          path: |
+            ${{ runner.temp }}/installer-r2/output/*
+            ${{ runner.temp }}/installer-r2/canonical-production.log
+      - name: Publish only absent revision tag/release, select as latest, never overwrite 2.5.3
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$d=Join-Path $env:RUNNER_TEMP 'installer-r2';$tag='v2.5.3-r2'
+          $releases=gh release list --limit 100 --json tagName|ConvertFrom-Json
+          if($LASTEXITCODE -or @($releases|Where-Object tagName -ceq $tag).Count){throw 'Revision exists or uncertain; no overwrite'}
+          $remote=git ls-remote --tags origin "refs/tags/$tag"
+          if($LASTEXITCODE -or $remote){throw 'Revision tag exists or uncertain; no overwrite'}
+          git config user.name 'github-actions[bot]';git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a $tag $env:GITHUB_SHA -m 'Installer-only r2: exact legacy252 normal-close and visible preparation refusal; sealed runtime remains2.5.3'
+          if($LASTEXITCODE){throw 'New tag failed'}
+          git push origin "refs/tags/$tag"
+          if($LASTEXITCODE){throw 'New tag push failed'}
+          $notes=@'
+          Installer-only revision r2. GUI, CLI and engine are the exact accepted 2.5.3 six-file payload, NOT product 2.5.4. Prior tags/assets remain unchanged.
+          Fixes normal exit compatibility with the genuine published 2.5.2 native GUI (exact hash/version/path/session/instance): its last normal window close quits, unlike newer tray GUIs. Bounded normal close requires exit0; no kill/hide fallback. All silent preparation refusals now display an explicit message.
+          Verified original2.5.2 GUI normal exit0 -> real non-fixture formal installer upgrade exit0 on isolated Windows (44507932907). Canonical revised helpers and all embedded payload files verified without rebuilding runtime.
+          IMPORTANT for the affected user: download this setup and launch it independently; DO NOT let the old 2.5.2 GUI updater launch it. This bypasses the old synchronous GPUI/UAC launch code, whose exact crash stack is still unconfirmed. MZ has NOT been installed/tested or repaired by the agent. No new UAC/process cleanup/service action was performed there.
+          A running old service without protocol2 still refuses BEFORE STOP. Normal GUI exit does not establish engine durability. Never force-stop it; preserve the existing safety refusal and backups. Existing installed2.5.3 does not need runtime replacement solely for this installer revision.
+          '@
+          [IO.File]::WriteAllText("$d/notes.txt",$notes,[Text.UTF8Encoding]::new($false))
+          gh release create $tag "$d/output/FindX-2.5.3-setup.exe" "$d/output/SHA256SUMS-r2.txt" "$d/output/seal-r2.json" --verify-tag --latest --prerelease=false --title 'FindX 2.5.3 — installer revision r2' --notes-file "$d/notes.txt"
+          if($LASTEXITCODE){throw 'Release failed; no overwrite retry'}
+          $latest=gh api repos/chaojimct/findx/releases/latest|ConvertFrom-Json
+          if($LASTEXITCODE -or $latest.tag_name -cne $tag -or $latest.draft -or $latest.prerelease){throw 'Latest contract differs'}
+          $assets=@($latest.assets|Where-Object{$_.name.ToLowerInvariant().StartsWith('findx-') -and $_.name.ToLowerInvariant().EndsWith('-setup.exe')})
+          if($assets.Count -ne 1 -or $assets[0].name -cne 'FindX-2.5.3-setup.exe'){throw 'Updater ambiguous setup selection'}
+          $latest|ConvertTo-Json -Depth 12|Set-Content "$d/latest.json"
+          Invoke-WebRequest -UseBasicParsing $assets[0].browser_download_url -OutFile "$d/external-download.exe"
+          if((Get-FileHash "$d/external-download.exe").Hash -cne (Get-FileHash "$d/output/FindX-2.5.3-setup.exe").Hash){throw 'Public download differs'}
