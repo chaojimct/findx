@@ -66,10 +66,12 @@ $requiredNative=@('real-full-two-volume-backfill','actual-partial-periodic-disk-
 foreach($id in $requiredNative){Require ($nativeCovered.ContainsKey($id)) ('Missing independent native acceptance: '+$id)}
 Require (@($lock.gates).Count -eq 8 -and @($lock.gates|Where-Object {$_.required -ne $true -or $_.passed -ne $true}).Count -eq 0) 'Eight independently satisfied existing gates required'
 foreach($g in $lock.gates){Require ($g.applicability.Length -gt 0 -and @($g.proofIds).Count -gt 0) 'Gate applicability/proof required';foreach($id in $g.proofIds){Require ($proofFiles.ContainsKey($id)) 'Gate references missing raw proof'}}
-$current=gh run view $lock.testedRun --repo chaojimct/findx --json headSha,status,conclusion|ConvertFrom-Json
-Require ($LASTEXITCODE -eq 0 -and $current.headSha -ceq $lock.testedCommit -and $current.status -ceq 'completed' -and $current.conclusion -ceq 'success') 'Final current-payload acceptance must truly succeed'
+$current=gh run view $lock.acceptanceRun --repo chaojimct/findx --json headSha,status,conclusion|ConvertFrom-Json
+Require ($LASTEXITCODE -eq 0 -and $current.headSha -ceq $lock.acceptanceCommit -and $current.status -ceq 'completed' -and $current.conclusion -ceq 'success') 'Final fixture-only acceptance must truly succeed; failed raw rows are never selected'
 $caseCount=18
 
+Require ($lock.acceptanceCommit -match '^[0-9a-f]{40}$') 'Explicit final acceptance source required'
+foreach($path in @('crates','gui','installer','Cargo.toml','Cargo.lock','scripts/check_release.py')){Require ((Invoke-SealGit -arguments @('rev-parse',($lock.acceptanceCommit+':'+$path))) -ceq (Invoke-SealGit -arguments @('rev-parse',($lock.testedCommit+':'+$path)))) 'Final fixture acceptance runtime source differs from payload'}
 $head=Invoke-SealGit -arguments @('rev-parse','HEAD')
 foreach($path in @('crates','gui','installer','Cargo.toml','Cargo.lock','scripts/check_release.py')){Require ((Invoke-SealGit -arguments @('rev-parse',('HEAD:'+$path))) -eq (Invoke-SealGit -arguments @('rev-parse',($lock.testedCommit+':'+$path)))) ('Untested runtime/installer/checker source change: '+$path)}
 $helperPaths=@('installer/FindX.iss','installer/transaction-files.psm1','installer/transaction-platform.psm1','installer/transaction-receipt.psm1','installer/upgrade-transaction.ps1','installer/Languages/ChineseSimplified.isl','installer/Languages/Default.isl','gui/src-tauri/icons/icon.ico','scripts/check_release.py')
@@ -94,7 +96,7 @@ Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $bundle 'source
 $null=New-Item -ItemType Directory (Join-Path $bundle 'proofs');foreach($id in $proofFiles.Keys){Copy-Item -LiteralPath $proofFiles[$id] -Destination (Join-Path $bundle ('proofs/'+$id+'.'+[IO.Path]::GetExtension($proofFiles[$id]).TrimStart('.')))}
 Copy-Item -LiteralPath (Join-Path $repo 'release/2.5.3-seal-lock.json') -Destination (Join-Path $bundle 'seal-lock.json')
 Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $bundle 'pack-sealed-release.ps1')
-$receipt=[ordered]@{version='2.5.3';runtimeSourceCommit=$lock.testedCommit;packagingSourceCommit=$head;testedRun=$lock.testedRun;engineBaseline=$(if($rebuilt){'v2.5.2 source plus authorized engine durability/identity fixes'}else{'historical published v2.5.2 binaries'});guiSha256=($lock.files | Where-Object name -eq 'FindX.exe').sha256;matrixCoverage='18 distinct cases across explicitly component-scoped runs, NOT one identical-payload 18-case run';installerCases=$lock.installerCases;proofProvenance=$lock.proofs;independentGates=$lock.gates;officialApproval=[bool]$Production;fixtureOnly=[bool]$BuildFixture;helperGitBlobs=$lock.helpers;files=@()}
+$receipt=[ordered]@{version='2.5.3';runtimeSourceCommit=$lock.testedCommit;packagingSourceCommit=$head;testedRun=$lock.testedRun;acceptanceRun=$lock.acceptanceRun;acceptanceCommit=$lock.acceptanceCommit;engineBaseline=$(if($rebuilt){'v2.5.2 source plus authorized engine durability/identity fixes'}else{'historical published v2.5.2 binaries'});guiSha256=($lock.files | Where-Object name -eq 'FindX.exe').sha256;matrixCoverage='18 distinct cases across explicitly component-scoped runs, NOT one identical-payload 18-case run';installerCases=$lock.installerCases;proofProvenance=$lock.proofs;independentGates=$lock.gates;officialApproval=[bool]$Production;fixtureOnly=[bool]$BuildFixture;helperGitBlobs=$lock.helpers;files=@()}
 if($Production -or $BuildFixture){
  Require ([IO.File]::Exists($Iscc)) 'Explicit Inno compiler missing'
  $compile=Join-Path $out $(if($Production){'official'}else{'fixture'});$null=New-Item -ItemType Directory -Path $compile

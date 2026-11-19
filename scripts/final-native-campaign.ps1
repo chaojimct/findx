@@ -1,4 +1,4 @@
-﻿param([Parameter(Mandatory=$true)][string]$Payload,[switch]$OnlyRemaining)
+﻿param([Parameter(Mandatory=$true)][string]$Payload,[switch]$OnlyRemaining,[switch]$OnlyGuiRebind)
 Set-StrictMode -Version Latest;$ErrorActionPreference='Stop'
 if($env:GITHUB_ACTIONS-ne'true'-or$env:RUNNER_OS-ne'Windows'-or$env:COMPUTERNAME-eq'MZ'-or$env:USERPROFILE-eq'C:\Users\chaoj'){throw 'Disposable existing-admin Windows CI only'}
 if(-not([Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'No UAC; existing runner rights required'}
@@ -70,22 +70,23 @@ using System;using System.Text;using System.Runtime.InteropServices;using Access
 function Close-Gui($p){if(-not$p.HasExited){$p.Refresh();[FinalGuiExit]::Exit([uint32]$p.Id,$p.MainWindowHandle);Assert ($p.WaitForExit(15000)) 'Own GUI did not exit normally; no force'} }
 function Invoke-Gui($p,$label){$p.Refresh();$a=[Windows.Automation.AutomationElement]::FromHandle($p.MainWindowHandle);$c=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,$label);$script:foundControl=$null;Wait-Condition {$script:foundControl=$a.FindFirst([Windows.Automation.TreeScope]::Descendants,$c);return $null-ne$script:foundControl} 15 ('Actual GUI control did not render: '+$label);$e=$script:foundControl;Assert ($null-ne$e) ('Missing actual GUI control '+$label);([Windows.Automation.InvokePattern]$e.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern)).Invoke()}
 function Save-GuiTree($root,$label){
- $nodes=@($root.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.Condition]::TrueCondition)|ForEach-Object { [pscustomobject]@{name=$_.Current.Name;type=$_.Current.ControlType.ProgrammaticName;id=$_.Current.AutomationId;offscreen=$_.Current.IsOffscreen} })
+ $nodes=@($root.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.Condition]::TrueCondition)|ForEach-Object { [pscustomobject]@{name=$_.Current.Name;type=$_.Current.ControlType.ProgrammaticName;id=$_.Current.AutomationId;offscreen=$_.Current.IsOffscreen;enabled=$_.Current.IsEnabled;valuePattern=$_.GetCurrentPropertyValue([Windows.Automation.AutomationElement]::IsValuePatternAvailableProperty)} })
  $nodes|ConvertTo-Json -Depth 5|Set-Content (Join-Path $artifact ($label+'-uia.json')) -Encoding UTF8
 }
 try{
  Stage 'one-shared-real-two-volume-dataset'
  foreach($v in 0..1){$dir=Join-Path $base ('v'+$v);$null=New-Item -ItemType Directory $dir;$vol=New-FxOwnedTestVolume (Join-Path $dir 'owned-health.vhd') ('FXTX'+[guid]::NewGuid().ToString('N').Substring(0,8).ToUpperInvariant()) -SizeMiB 256;$volumes.Add($vol)
-  $body='native233body';for($i=0;$i-lt24000;$i++){$parent=Join-Path $vol.Root ('p'+$i.ToString('D6'));$null=[IO.Directory]::CreateDirectory($parent);[IO.File]::WriteAllText((Join-Path $parent ('fx233-v'+$v+'-'+$i.ToString('D6')+'.bin')),$body,[Text.Encoding]::ASCII)}
+  $body='native233body';for($i=0;$i-lt$(if($OnlyGuiRebind){16}else{24000});$i++){$parent=Join-Path $vol.Root ('p'+$i.ToString('D6'));$null=[IO.Directory]::CreateDirectory($parent);[IO.File]::WriteAllText((Join-Path $parent ('fx233-v'+$v+'-'+$i.ToString('D6')+'.bin')),$body,[Text.Encoding]::ASCII)}
   $deep=$vol.Root;for($d=0;$d-lt128;$d++){$deep+="d\";$null=[IO.Directory]::CreateDirectory(('\\?\'+$deep))};[IO.File]::WriteAllText(('\\?\'+$deep+'fx233-deep-v'+$v+'.txt'),'deep',[Text.Encoding]::ASCII)
  }
  $owned=$volumes[0];$null=New-Item -ItemType Directory (Join-Path $base 'programdata/FindX');$index=Join-Path $base 'programdata/FindX/index.bin'
  $scan=Start-Process $cli -ArgumentList ('index --volumes '+($volumes.Volume-join',')+' --output "'+$index+'" --max-scan-threads 1') -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $artifact 'initial-index.log') -RedirectStandardError (Join-Path $artifact 'initial-index.err');$null=$scan.Handle;Assert ($scan.WaitForExit(120000)-and$scan.ExitCode-eq0) 'Real two-volume native scan failed/timed out; no force'
- $seed=Inspect;Assert (-not$seed.metadata_ready-and$seed.volumes.Count-eq2-and$seed.entries-ge48002) 'Actual partial native scan scope incorrect'
+ $seed=Inspect;Assert (-not$seed.metadata_ready-and$seed.volumes.Count-eq2-and$seed.entries-ge$(if($OnlyGuiRebind){34}else{48002})) 'Actual partial native scan scope incorrect'
  Stage 'native-full-volume-backfill-and-partial-periodic-commit'
  $command='"'+$ServiceExe+'" --service --index "'+$index+'" --volume '+$owned.Volume+' --pipe findx2 --no-everything-ipc --usage-memory-mib 64 --save-interval-secs 1'
  $null=New-Service -Name $name -BinaryPathName $command -StartupType Manual;$created=$true
  $null=New-ItemProperty ('HKLM:\SYSTEM\CurrentControlSet\Services\'+$name) -Name Environment -PropertyType MultiString -Value @('ProgramData='+(Join-Path $base 'programdata'))
+ if(-not $OnlyGuiRebind){
  $partialDir=Join-Path $owned.Root 'p000000';$partialAcl=Get-Acl $partialDir;$denied=Get-Acl $partialDir
  $deny=[Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-18'),[Security.AccessControl.FileSystemRights]'ReadAndExecute',[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Deny)
  $denied.AddAccessRule($deny);Set-Acl $partialDir $denied
@@ -102,7 +103,12 @@ try{
  $fullTimer=[Diagnostics.Stopwatch]::StartNew();Start-Service $name;Wait-Condition {Ready} 90 'Repaired native partial generation did not reach actual full coverage'
  $rows.Add(@{test='real-full-two-volume-backfill';passed=$true;knownFiles=48002;maxDepth=128;seconds=$fullTimer.Elapsed.TotalSeconds})
  $rows.Add(@{test='actual-partial-periodic-disk-generation';passed=$true;partial=$partial})
- if(-not $OnlyRemaining){
+ }else{
+  Start-Service $name;$mutation=Join-Path $owned.Root 'periodic-live-mutation.txt';[IO.File]::WriteAllText($mutation,'during-backfill',[Text.Encoding]::ASCII)
+  Wait-Condition {Ready} 90 'Actual rebind fixture did not reach full metadata/watch health'
+  Wait-Condition {Has-File 'periodic-live-mutation.txt' 15} 30 'Actual rebind marker was not indexed'
+ }
+ if(-not $OnlyRemaining -and -not $OnlyGuiRebind){
  Stage 'all-known-records-canonical-metadata-and-deep-parent-proof'
  $count=0;$seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
  do{$r=Rpc @{type='search';query='fx233-v';pinyin=$false;limit=1000;offset=$count};$hits=@($r.hits);foreach($hit in $hits){Assert ($hit.size-eq13) 'Full metadata size not actually backfilled';Assert ($seen.Add($hit.path)) 'Duplicate/cross-volume full path';Assert (@($volumes|Where-Object {$hit.path.StartsWith($_.Root,[StringComparison]::OrdinalIgnoreCase)}).Count-eq1) 'Wrong volume identity'};$count+=$hits.Count;Assert ($count-le48000) 'Unexpected indexed fixture count'}while($hits.Count-gt0)
@@ -129,7 +135,7 @@ try{
  # Gate5 is the existing SERVICE/IPC owner and live GUI generation handoff,
  # not a newly imposed GUI-process singleton feature. Keep this real GUI alive across SCM restart.
  $current=Get-Content $nativePrefs -Raw|ConvertFrom-Json;Assert ($current.workspaceResume.tabs.Count-eq$saved.workspaceResume.tabs.Count-and$current.legacyWebView.findx2_search_history-eq$saved.legacyWebView.findx2_search_history) 'Actual restart lost session/legacy data'
- $rows.Add(@{test='official-auto-import-and-normal-session-restart';passed=$true;tabs=$saved.workspaceResume.tabs.Count})
+ if(-not $OnlyGuiRebind){$rows.Add(@{test='official-auto-import-and-normal-session-restart';passed=$true;tabs=$saved.workspaceResume.tabs.Count})}
  Stage 'actual-stop-and-offline-final-generation-before-any-replay'
  $null=Stop-Owned;$pub=Get-Content ($index+'.v6/published.json') -Raw|ConvertFrom-Json
  & $verify $index $mutation 15 $pub.manifest.generation|Set-Content (Join-Path $artifact 'offline-final-mutation.json');Assert ($LASTEXITCODE-eq0) 'Latest accepted mutation not actually durable'
@@ -138,9 +144,16 @@ try{
  $freshName='fx253-rebind-'+[guid]::NewGuid().ToString('N')+'.txt';$freshPath=Join-Path $owned.Root $freshName;$freshBody='live-rebind-proof';[IO.File]::WriteAllText($freshPath,$freshBody,[Text.Encoding]::ASCII)
  Wait-Condition {Has-File $freshName $freshBody.Length} 30 'New instance did not index actual post-restart file'
  Invoke-Gui $gui '搜索';$gui.Refresh();$a=[Windows.Automation.AutomationElement]::FromHandle($gui.MainWindowHandle)
- $edits=@($a.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::Edit))|Where-Object {-not $_.Current.IsOffscreen -and $_.Current.IsEnabled})
- Save-GuiTree $a 'before-live-query';Assert ($edits.Count-eq1) 'Expected one actual visible search editor, never choose arbitrary hidden input'
- ([Windows.Automation.ValuePattern]$edits[0].GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)).SetValue($freshName)
+ # InvokePattern returns before the GPUI workspace switch has rendered. The
+ # previous one-shot query saw the old pane; its immediately subsequent saved
+ # tree already contained the single real search editor. Wait for THAT exact
+ # accessible target, never arbitrary first input or another process/window.
+ $script:searchEditor=$null
+ try{Wait-Condition {
+  $edits=@($a.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::Edit))|Where-Object {$_.Current.Name -ceq '搜索文件…' -and -not $_.Current.IsOffscreen -and $_.Current.IsEnabled})
+  if($edits.Count-ne1){return $false};$script:searchEditor=$edits[0];return $true
+ } 10 'Expected one rendered visible enabled exact search editor'}finally{Save-GuiTree $a 'before-live-query'}
+ ([Windows.Automation.ValuePattern]$script:searchEditor.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)).SetValue($freshName)
  try{Wait-Condition {
   # ResultsTable::cell_label(col1) is the FULL PATH. A row's own Name need not
   # aggregate its cells; matching Edit.Value or a historical query is NOT proof.
@@ -163,4 +176,4 @@ try{
  foreach($v in $volumes){try{Dismount-DiskImage -ImagePath $v.Image -ErrorAction Stop}catch{Write-Host 'Do not force detach active volume'}}
  $rows.ToArray()|ConvertTo-Json -Depth 20|Set-Content (Join-Path $artifact 'results.json')
 }
-Assert (@($rows|Where-Object {-not$_.passed}).Count-eq0-and$rows.Count-ge$(if($OnlyRemaining){5}else{8})) 'At least one independent acceptance missing/failed; never publication-ready'
+Assert (@($rows|Where-Object {-not$_.passed}).Count-eq0-and$rows.Count-ge$(if($OnlyGuiRebind){2}elseif($OnlyRemaining){5}else{8})) 'At least one independent acceptance missing/failed; never publication-ready'
