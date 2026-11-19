@@ -78,7 +78,7 @@ function Deny-Parent([string]$Path){
  $rule=[Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-18'),[Security.AccessControl.FileSystemRights]::ReadAttributes,[Security.AccessControl.InheritanceFlags]::None,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Deny)
  $deny.AddAccessRule($rule);Set-Acl -LiteralPath $Path -AclObject $deny;return $acl
 }
-function Cursor { $text=& $verify --inspect-index $index;Assert ($LASTEXITCODE -eq 0) 'Cannot read persisted private index';return ($text|ConvertFrom-Json).volumes[0] }
+function Cursor { $text=& $verify --inspect-index $index;Assert ($LASTEXITCODE -eq 0) 'Cannot read persisted private index';$view=$text|ConvertFrom-Json;Assert ($view.source -eq 'segmented-v6') 'Cursor proof must read canonical v6, not stale anchor';return $view.volumes[0] }
 function Epoch { $r=Rpc @{type='usage_children';path=$owned.Root;expected=$null;after=$null;max_bytes=4096};Assert ($r.type -eq 'usage_children_result') 'Actual usage epoch unavailable';return $r.page.epoch }
 function Waiting-Parent {
  $s=Rpc @{type='status'};$s|ConvertTo-Json -Depth 12|Set-Content -Encoding UTF8 (Join-Path $artifact 'retry-status.json')
@@ -146,8 +146,13 @@ try{
  # the old JournalGap must remain visible until an accepted native read proves it.
  Wait-Condition {(Epoch) -ne $beforeSwap} 120 'Actual RAM index generation was not replaced'
  Assert ((Assert-OwnedService).ProcessId -eq $samePid) 'Journal replacement must exercise live process rebuild, not service restart'
+ $rebuiltEpoch=Epoch
+ Wait-Condition {(Has-File 'blocked-two.txt' 11) -and (Has-File 'later-two.txt' 9) -and (Has-File 'blocked.txt' 11)} 30 'Rebuild lost pre-probe files; sentinel must not hide missing events'
+ Stage 'idle-new-journal-health-before-any-probe'
+ Wait-Condition {Ready} 120 'Idle native reader must recover without extra filesystem writes'
  [IO.File]::WriteAllText((Join-Path $d 'post-rebuild.txt'),'post-rebuild')
  Wait-Condition {Has-File 'post-rebuild.txt' 12} 30 'New-generation actual USN listener did not resume'
+ Assert ((Epoch) -eq $rebuiltEpoch) 'Post-rebuild event must not trigger another rescan to hide lost events'
  Wait-Condition {Ready} 120 'Same-volume native journal rebuild/replay never recovered'
  Wait-Condition {(Has-File 'blocked-two.txt' 11) -and (Has-File 'later-two.txt' 9) -and (Has-File 'blocked.txt' 11)} 30 'Lost old accepted or failed-prefix filesystem data during generation replacement'
  Stage 'final-terminal-stop-offline-cursor-and-restart'

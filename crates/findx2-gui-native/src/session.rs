@@ -122,10 +122,8 @@ impl AppSession {
 }
 
 pub fn persist_prefs(prefs: LocalPrefs, cx: &mut App) {
-    cx.background_spawn(async move {
-        let _ = prefs::save_prefs(&prefs);
-    })
-    .detach();
+    let _=cx; // Queue admission occurs in caller order, not background scheduling order.
+    prefs::enqueue_prefs(prefs);
 }
 
 pub fn persist_settings(settings: FindxGuiSettings, cx: &mut App) {

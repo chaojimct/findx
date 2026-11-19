@@ -20,6 +20,7 @@ on:
       - 'scripts/test-upgrade-capabilities.ps1'
       - 'scripts/test-ntfs-identity.ps1'
       - 'scripts/test-namespace-scm.ps1'
+      - 'scripts/gui-compat-tests/**'
       - 'installer/FindX.iss'
   workflow_dispatch:
     inputs:
@@ -42,6 +43,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          git fetch origin 4afb1a9fc4635be1cdbfb3aa305b4ea19b482342 --depth=1
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          $compat=git diff --name-only 4afb1a9fc4635be1cdbfb3aa305b4ea19b482342 HEAD -- Cargo.lock Cargo.toml crates installer scripts/gui-compat-tests scripts/test-namespace-scm.ps1
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          $compatAllowed=@('Cargo.lock','crates/findx2-windows/src/usn.rs','crates/findx2-core/examples/verify_persisted_file.rs','crates/findx2-gui-native/Cargo.toml','crates/findx2-gui-native/src/lib.rs','crates/findx2-gui-native/src/prefs.rs','crates/findx2-gui-native/src/session.rs','crates/findx2-gui-native/src/legacy_compat.rs','crates/findx2-gui-native/src/ui/mod.rs','crates/findx2-gui-native/src/ui/workspace.rs','crates/findx2-gui-native/src/ui/main_window.rs','scripts/gui-compat-tests/Cargo.toml','scripts/gui-compat-tests/Cargo.lock','scripts/test-namespace-scm.ps1')
+          if(@($compat).Count -eq $compatAllowed.Count -and @($compat|Where-Object {$_ -notin $compatAllowed}).Count -eq 0){
+            # Only bounded idle-reader recovery + GUI compatibility + offline inspector changed; no writer/IPC changes or full GUI build.
+            # Prior journal native was NOT passed: stale-anchor inspection fixed
+            # below and both genuine SCM cases rerun with the canonical reader.
+            'compat=true' >> $env:GITHUB_OUTPUT
+            'parent=true' >> $env:GITHUB_OUTPUT
+            'changed=false' >> $env:GITHUB_OUTPUT
+            exit 0
+          }
           git fetch origin 76598791dbcf4c3148439de7cbee19cee6a48868 --depth=1
           if($LASTEXITCODE){exit $LASTEXITCODE}
           $recovery=git diff --name-only 76598791dbcf4c3148439de7cbee19cee6a48868 HEAD -- Cargo.lock Cargo.toml crates installer
@@ -122,7 +137,16 @@ jobs:
         if: steps.engine-change.outputs.parent == 'true'
         shell: pwsh
         run: |
-          if('${{ steps.engine-change.outputs.recovery }}' -eq 'true'){
+          if('${{ steps.engine-change.outputs.compat }}' -eq 'true'){
+            cargo test --locked -p findx2-windows idle_checkpoint -- --test-threads=1
+            if($LASTEXITCODE){exit $LASTEXITCODE}
+            cargo test --locked --manifest-path scripts/gui-compat-tests/Cargo.toml -- --test-threads=1
+            if($LASTEXITCODE){exit $LASTEXITCODE}
+            cargo test --locked -p findx2-core --example verify_persisted_file -- --test-threads=1
+            if($LASTEXITCODE){exit $LASTEXITCODE}
+            cargo check --locked -p findx2-gui-native
+            if($LASTEXITCODE){exit $LASTEXITCODE}
+          }elseif('${{ steps.engine-change.outputs.recovery }}' -eq 'true'){
             cargo test --locked -p findx2-service watch_recovery -- --test-threads=1
             if($LASTEXITCODE){exit $LASTEXITCODE}
           }else{

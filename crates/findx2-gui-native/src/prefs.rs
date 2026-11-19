@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct LocalPrefs {
     #[serde(default)]
+    pub workspace_resume: crate::legacy_compat::Resume,
+    #[serde(flatten)]
+    pub compatibility_extra: std::collections::BTreeMap<String,serde_json::Value>,
+    #[serde(default)]
     pub usage_reduce_motion: bool,
     #[serde(default = "default_usage_depth")]
     pub usage_preferred_depth: usize,
@@ -53,6 +57,8 @@ fn default_true() -> bool {
 impl Default for LocalPrefs {
     fn default() -> Self {
         Self {
+            workspace_resume: Default::default(),
+            compatibility_extra: Default::default(),
             usage_reduce_motion: false,
             usage_preferred_depth: 3,
             browser_favorites: Vec::new(),
@@ -87,7 +93,10 @@ pub fn save_prefs(prefs: &LocalPrefs) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let text = serde_json::to_string_pretty(prefs).map_err(|e| e.to_string())?;
+    let mut value=if path.exists(){let bytes=std::fs::read(&path).map_err(|e|e.to_string())?;let _:LocalPrefs=serde_json::from_slice(&bytes).map_err(|e|format!("existing preferences unsupported; preserved: {e}"))?;serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e|e.to_string())?}else{serde_json::json!({})};
+    let object=value.as_object_mut().ok_or("existing preferences are not an object; preserved")?;
+    object.extend(serde_json::to_value(prefs).map_err(|e|e.to_string())?.as_object().ok_or("preferences serialization")?.clone());
+    let text=serde_json::to_string_pretty(&value).map_err(|e|e.to_string())?;
     write_atomic(&path, text.as_bytes())
 }
 
@@ -126,7 +135,9 @@ pub fn save_settings(settings: &FindxGuiSettings) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let text = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
+    let mut value=if path.exists(){let bytes=std::fs::read(&path).map_err(|e|e.to_string())?;let _:FindxGuiSettings=serde_json::from_slice(&bytes).map_err(|e|format!("existing settings unsupported; preserved: {e}"))?;serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e|e.to_string())?}else{serde_json::json!({})};
+    value.as_object_mut().ok_or("existing settings are not an object; preserved")?.extend(serde_json::to_value(settings).map_err(|e|e.to_string())?.as_object().ok_or("settings serialization")?.clone());
+    let text=serde_json::to_string_pretty(&value).map_err(|e|e.to_string())?;
     write_atomic(&path, text.as_bytes())
 }
 
@@ -226,3 +237,30 @@ mod storage_tests {
 }
 
 #[cfg(test)]mod usage_depth_preference_tests{#[test]fn default_is_three_and_manual_two_roundtrips_without_available_depth(){let p=super::LocalPrefs::default();assert_eq!(p.usage_preferred_depth,3);let mut p=p;p.usage_preferred_depth=2;let q:super::LocalPrefs=serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();assert_eq!(q.usage_preferred_depth,2);let q:super::LocalPrefs=serde_json::from_str("{}").unwrap();assert_eq!(q.usage_preferred_depth,3);}}
+
+/// Runs before platform/window creation, never in drawing/input callbacks.
+pub fn migrate_legacy()->Result<(),String>{
+ if !crate::isolation::official_storage(){return Ok(());}
+ #[cfg(windows)]{
+  let config=std::path::PathBuf::from(std::env::var_os("APPDATA").ok_or("APPDATA unavailable")?).join("tools.findx.gui").join("findx2-gui-settings.json");
+  if !settings_path().exists()&&config.exists(){
+   // Validate typed settings BEFORE installing, but retain the complete raw JSON
+   // (including unknown keys) and leave the source immutable.
+   let _:FindxGuiSettings=serde_json::from_slice(&std::fs::read(&config).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+   crate::legacy_compat::import_settings(&config,&settings_path(),true,"findx2",&crate::isolation::official_index_path().to_string_lossy())?;
+  }
+  if !prefs_path().exists(){
+   let profile=std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA unavailable")?).join("tools.findx.gui/EBWebView/Default/Local Storage/leveldb");
+   let values=crate::legacy_compat::webview_values(&profile)?;
+   if !values.is_empty(){let value=crate::legacy_compat::map_prefs(&values)?;let _:LocalPrefs=serde_json::from_value(value.clone()).map_err(|e|e.to_string())?;crate::legacy_compat::install_new(&prefs_path(),&value)?;}
+  }
+ }
+ Ok(())
+}
+enum PrefWrite{Save(LocalPrefs),Barrier(std::sync::mpsc::SyncSender<()>)}
+fn writer()->&'static std::sync::mpsc::Sender<PrefWrite>{
+ static Q:std::sync::OnceLock<std::sync::mpsc::Sender<PrefWrite>>=std::sync::OnceLock::new();Q.get_or_init(||{let(tx,rx)=std::sync::mpsc::channel();std::thread::spawn(move||{for item in rx{match item{PrefWrite::Save(p)=>{if let Err(e)=save_prefs(&p){eprintln!("FindX preferences save failed: {e}");}},PrefWrite::Barrier(tx)=>{let _=tx.send(());}}}});tx})
+}
+pub fn enqueue_prefs(prefs:LocalPrefs){let _=writer().send(PrefWrite::Save(prefs));}
+/// Called only AFTER the application event loop returns; no render-thread disk IO.
+pub fn flush_queued_prefs(){let(tx,rx)=std::sync::mpsc::sync_channel(1);if writer().send(PrefWrite::Barrier(tx)).is_ok(){let _=rx.recv_timeout(std::time::Duration::from_secs(5));}}

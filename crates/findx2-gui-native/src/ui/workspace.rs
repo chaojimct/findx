@@ -175,6 +175,7 @@ pub(super) fn preview_stamp(path: &str, size: u64, mtime: u64) -> (String, u64, 
 }
 
 pub(super) struct Workspace {
+    resume_restored: bool,
     pub(super) show_hidden: bool,
     locations: Vec<(&'static str, &'static str, PathBuf)>,
     sidebar_source: Option<(&'static str, String)>,
@@ -333,6 +334,7 @@ impl Workspace {
             .col_selectable(false)
         });
         let mut this = Self {
+            resume_restored: false,
             show_hidden: false,
             locations: Vec::new(),
             sidebar_source: None,
@@ -576,6 +578,7 @@ impl MainWindow {
                     .await;
                 if this
                     .update(cx, |this, cx| {
+                        this.persist_workspace_resume(cx);
                         if this.workspace.scanning {
                             cx.notify();
                         }
@@ -666,6 +669,29 @@ impl MainWindow {
                     _ => {}
                 }
             }));
+    }
+
+    pub(super) fn persist_workspace_resume(&mut self,cx:&mut Context<Self>){
+        if !self.workspace.resume_restored{return;}
+        let previous=&self.session.read(cx).prefs.workspace_resume;
+        if previous.validate().is_err(){return;} // Unknown future data is not overwritten.
+        let mut state=crate::legacy_compat::Resume{tabs:self.workspace.tabs.iter().map(|p|p.location.to_string_lossy().into_owned()).collect(),active:self.workspace.active_tab,directory:self.workspace.mode==ViewMode::Directory,extra:previous.extra.clone(),..Default::default()};
+        if state.directory&&!state.tabs.is_empty(){state.tabs[state.active]=self.workspace.location.to_string_lossy().into_owned();}
+        if state.validate().is_err()||*previous==state{return;}
+        self.session.update(cx,|s,cx|{s.prefs.workspace_resume=state;crate::session::persist_prefs(s.prefs.clone(),cx);});
+    }
+    pub(super) fn restore_workspace_resume(&mut self,window:&mut Window,cx:&mut Context<Self>){
+        self.workspace.resume_restored=true;
+        let state=self.session.read(cx).prefs.workspace_resume.clone();
+        if state.validate().is_err()||state.tabs.is_empty(){return;}
+        let widths=self.workspace.table.read(cx).delegate().widths;let mut tabs=Vec::new();
+        for path in &state.tabs{
+            let owner=cx.weak_entity();let table=cx.new(|cx|TableState::new(BrowserTable{owner,hits:vec![],widths,more:false,allocated:false},window,cx).col_movable(false).col_resizable(true).row_selectable(true).col_selectable(false));
+            self.subscribe_workspace_table(table.clone(),cx);
+            let mut page=self.workspace.tabs[0].clone();page.table=table;page.location=PathBuf::from(path);page.rows.clear();page.all_rows=Arc::new(vec![]);page.selected_rows.clear();page.selected=None;page.filter.clear();page.history=History::default();page.needs_load=true;tabs.push(page);
+        }
+        self.workspace.tabs=tabs;self.workspace.active_tab=state.active;
+        if state.directory{self.workspace.mode=ViewMode::Directory;let page=self.workspace.tabs[state.active].clone();self.restore_page_context(page,cx);self.workspace_navigate(PathBuf::from(&state.tabs[state.active]),ViewMode::Directory,None,false,cx);}
     }
 
     fn save_page_context(&mut self) {

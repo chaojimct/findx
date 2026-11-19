@@ -186,6 +186,17 @@ pub fn query_journal_state(volume_path: &str) -> Result<(u64, i64, i64)> {
 ///   至多 `Timeout` 秒。相比 sleep 轮询：延迟 500ms→~实时，空闲零 syscall。
 /// - 同一批 READ 内同 FRN 多记录合并（reason 按位或、取最新 name/parent），bulk 场景下
 ///   `OpenFileById` 次数从 N 降到 1；且 watch 线程本身永不 stat（见 `StatRefresh`）。
+fn idle_checkpoint_cursor(expected:u64,cursor:i64,actual:u64,first:i64,next:i64)->Result<u64>{
+ if actual!=expected||cursor<0||cursor<first||cursor>next{return Err(findx2_core::Error::JournalGap("idle native read journal/cursor changed; no acknowledgement".into()));}
+ // Probe tail may contain unread events. A heartbeat NEVER acknowledges it.
+ Ok(cursor as u64)
+}
+#[cfg(test)]mod idle_checkpoint_tests{
+ #[test]fn idle_checkpoint_preserves_unread_tail_and_rejects_epoch_or_range_change(){
+  assert_eq!(super::idle_checkpoint_cursor(7,10,7,0,99).unwrap(),10);
+  for args in [(7,10,8,0,99),(7,10,7,11,99),(7,100,7,0,99),(7,-1,7,0,99)]{assert!(super::idle_checkpoint_cursor(args.0,args.1,args.2,args.3,args.4).is_err());}
+ }
+}
 pub fn usn_watch_forever(
     volume_path: &str,
     resume: Option<UsnResume>,
@@ -265,7 +276,17 @@ pub fn usn_watch_forever(
             )));
         }
 
-        if returned >= 8 {
+        if returned == 0 {
+            // A successful zero-byte native timeout is still a real reader
+            // observation. Verify the SAME open volume handle/journal and retain
+            // the last consumed cursor; never synthesize events or adopt the tail.
+            let actual=match unsafe{query_usn_journal(h)}{Ok(v)=>v,Err(e)=>{let _=unsafe{CloseHandle(h)};return Err(e);}};
+            let cursor=match idle_checkpoint_cursor(journal_id,next_cursor,actual.UsnJournalID,actual.FirstUsn,actual.NextUsn){Ok(v)=>v,Err(e)=>{let _=unsafe{CloseHandle(h)};return Err(e);}};
+            if let Err(e)=publish_watch_batch(Vec::new(),journal_id,cursor,&tx){let _=unsafe{CloseHandle(h)};return Err(e);}
+        } else if returned < 8 {
+            let _=unsafe{CloseHandle(h)};
+            return Err(findx2_core::Error::Platform("truncated native journal cursor; not acknowledged".into()));
+        } else {
             diagnostic_batch = diagnostic_batch.wrapping_add(1);
             let slice = &out[..returned as usize];
             next_cursor = i64::from_le_bytes(slice[0..8].try_into().unwrap());

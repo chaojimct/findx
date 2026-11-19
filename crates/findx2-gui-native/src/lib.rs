@@ -62,3 +62,5 @@ pub mod usage_presentation;
 pub mod usage_motion;
 
 pub mod installer_health;
+
+pub mod legacy_compat;

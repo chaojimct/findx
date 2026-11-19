@@ -419,6 +419,7 @@ impl MainWindow {
         let closing = cx.entity();
         window.on_window_should_close(cx, move |window, cx| {
             closing.update(cx, |this, cx| {
+                this.persist_workspace_resume(cx);
                 // Hiding is not shutdown: retain active work and unsaved settings.
                 #[cfg(windows)]
                 if let Some(tray) = this.tray.as_ref().filter(|t| t.ready()) {
@@ -475,6 +476,7 @@ impl MainWindow {
             }
         }
         this.init_workspace(window, cx);
+        cx.defer_in(window,|this,window,cx|this.restore_workspace_resume(window,cx));
         if let Some(path) = crate::isolation::isolated_usage_open_path(
             this.session.read(cx).live,
             crate::isolation::development_var_os("FINDX_NATIVE_USAGE_OPEN")

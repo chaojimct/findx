@@ -27,9 +27,11 @@ fn main()->Result<(),Box<dyn std::error::Error>>{
 }
 
 fn inspect_index(path:&Path)->Result<serde_json::Value,Box<dyn std::error::Error>>{
- let store=findx2_core::load_index_bin(path)?;
+ let layout=findx2_core::V6Layout::for_index(path);
+ let segmented=layout.manifest_exists();
+ let store=if segmented{findx2_core::v6_load(&layout)?}else{findx2_core::load_index_bin(path)?};
  let volumes:Vec<_>=store.volumes.iter().map(|v|serde_json::json!({"letter":(v.volume_letter as char).to_string(),"root_prefix":v.root_prefix,"serial":v.volume_serial,"journal_id":v.usn_journal_id,"last_usn":v.last_usn})).collect();
- Ok(serde_json::json!({"offline":true,"watch":false,"replay":false,"entries":store.entry_count(),"metadata_ready":store.metadata_ready,"volumes":volumes}))
+ Ok(serde_json::json!({"source":if segmented{"segmented-v6"}else{"legacy-anchor"},"offline":true,"watch":false,"replay":false,"entries":store.entry_count(),"metadata_ready":store.metadata_ready,"volumes":volumes}))
 }
 #[cfg(test)]mod tests{
  use super::*;
@@ -40,4 +42,10 @@ fn inspect_index(path:&Path)->Result<serde_json::Value,Box<dyn std::error::Error
   let store=IndexBuilder::new(b'F',123,456,789).build_from_raw(vec![raw(2,false)],vec![raw(1,true)],false).unwrap();findx2_core::save_index_bin(&path,&store).unwrap();
   let v=inspect_index(&path).unwrap();assert_eq!(v["metadata_ready"],false);assert_eq!(v["volumes"][0]["letter"],"F");assert_eq!(v["volumes"][0]["serial"],123);assert_eq!(v["volumes"][0]["journal_id"],456);assert_eq!(v["volumes"][0]["last_usn"],789);assert_eq!(v["watch"],false);assert_eq!(v["replay"],false);assert!(v["entries"].as_u64().unwrap()>0);std::fs::remove_dir_all(root).unwrap();
  }
+ #[test]fn inspection_prefers_actual_segmented_generation_over_stale_anchor_and_never_falls_back_on_corruption(){
+  use findx2_core::{IndexBuilder,RawEntry};let root=std::env::temp_dir().join(format!("findx-inspect-latest-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));std::fs::create_dir(&root).unwrap();let path=root.join("index.bin");
+  let d=RawEntry{file_id:1,file_id_128:None,parent_id:0,name:"".into(),size:0,mtime:0,ctime:0,attrs:16,is_dir:true};let mut s=IndexBuilder::new(b'F',123,456,789).build_from_raw(vec![],vec![d],true).unwrap();findx2_core::save_index_bin(&path,&s).unwrap();let anchor=std::fs::read(&path).unwrap();s.volumes[0].usn_journal_id=999;s.volumes[0].last_usn=1234;let layout=findx2_core::V6Layout::for_index(&path);findx2_core::v6_save_full(&layout,&s).unwrap();let v=inspect_index(&path).unwrap();assert_eq!(v["source"],"segmented-v6");assert_eq!(v["volumes"][0]["journal_id"],999);assert_eq!(v["volumes"][0]["last_usn"],1234);assert_eq!(std::fs::read(&path).unwrap(),anchor);
+  std::fs::remove_dir_all(&layout.dir).unwrap();std::fs::create_dir(&layout.dir).unwrap();std::fs::write(layout.dir.join("manifest.json"),b"broken").unwrap();assert!(layout.manifest_exists());assert!(inspect_index(&path).is_err());std::fs::remove_dir_all(root).unwrap();
+ }
+
 }
