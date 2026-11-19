@@ -1,4 +1,4 @@
-﻿param([Parameter(Mandatory=$true)][string]$Payload)
+﻿param([Parameter(Mandatory=$true)][string]$Payload,[switch]$OnlyRemaining)
 Set-StrictMode -Version Latest;$ErrorActionPreference='Stop'
 if($env:GITHUB_ACTIONS-ne'true'-or$env:RUNNER_OS-ne'Windows'-or$env:COMPUTERNAME-eq'MZ'-or$env:USERPROFILE-eq'C:\Users\chaoj'){throw 'Disposable existing-admin Windows CI only'}
 if(-not([Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'No UAC; existing runner rights required'}
@@ -7,7 +7,7 @@ if(Get-Service $name -ErrorAction SilentlyContinue){throw 'Never touch pre-exist
 Import-Module (Join-Path $PSScriptRoot 'test-owned-ntfs-volume.psm1') -Force
 foreach($n in @('transaction-platform.psm1','transaction-files.psm1','transaction-receipt.psm1')){Import-Module (Join-Path $repo ('installer/'+$n)) -Force}
 $base=Join-Path $env:RUNNER_TEMP ('FindXUpgradeTest_final_'+[guid]::NewGuid().ToString('N'));$artifact=Join-Path $repo 'final-native-evidence';$null=New-Item -ItemType Directory $base,$artifact
-$ServiceExe=Join-Path $Payload 'findx2-service.exe';$cli=Join-Path $Payload 'findx2.exe';$verify=Join-Path $repo 'target/release/examples/verify_persisted_file.exe';$volumes=[Collections.Generic.List[object]]::new();$created=$false;$guis=[Collections.Generic.List[object]]::new();$rows=[Collections.Generic.List[object]]::new();$script:pipeName='findx2';$owned=$null
+$ServiceExe=Join-Path $Payload 'findx2-service.exe';$cli=Join-Path $Payload 'findx2.exe';$verify=Join-Path $repo 'target/release/examples/verify_persisted_file.exe';$volumes=[Collections.Generic.List[object]]::new();$created=$false;$guis=[Collections.Generic.List[object]]::new();$rows=[Collections.Generic.List[object]]::new();$script:pipeName='findx2';$owned=$null;$partialAcl=$null;$partialDir=$null
 function Stage($n){Write-Host ('FINAL NATIVE STAGE: '+$n);@{stage=$n;time=(Get-Date -Format o)}|ConvertTo-Json|Set-Content (Join-Path $artifact 'stage.json')}
 function Assert($ok,[string]$why){if(-not $ok){throw $why}}
 function Wait-Condition([scriptblock]$Test,[int]$Seconds,[string]$Why){
@@ -69,6 +69,10 @@ using System;using System.Text;using System.Runtime.InteropServices;using Access
 '@
 function Close-Gui($p){if(-not$p.HasExited){$p.Refresh();[FinalGuiExit]::Exit([uint32]$p.Id,$p.MainWindowHandle);Assert ($p.WaitForExit(15000)) 'Own GUI did not exit normally; no force'} }
 function Invoke-Gui($p,$label){$p.Refresh();$a=[Windows.Automation.AutomationElement]::FromHandle($p.MainWindowHandle);$c=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,$label);$script:foundControl=$null;Wait-Condition {$script:foundControl=$a.FindFirst([Windows.Automation.TreeScope]::Descendants,$c);return $null-ne$script:foundControl} 15 ('Actual GUI control did not render: '+$label);$e=$script:foundControl;Assert ($null-ne$e) ('Missing actual GUI control '+$label);([Windows.Automation.InvokePattern]$e.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern)).Invoke()}
+function Save-GuiTree($root,$label){
+ $nodes=@($root.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.Condition]::TrueCondition)|ForEach-Object { [pscustomobject]@{name=$_.Current.Name;type=$_.Current.ControlType.ProgrammaticName;id=$_.Current.AutomationId;offscreen=$_.Current.IsOffscreen} })
+ $nodes|ConvertTo-Json -Depth 5|Set-Content (Join-Path $artifact ($label+'-uia.json')) -Encoding UTF8
+}
 try{
  Stage 'one-shared-real-two-volume-dataset'
  foreach($v in 0..1){$dir=Join-Path $base ('v'+$v);$null=New-Item -ItemType Directory $dir;$vol=New-FxOwnedTestVolume (Join-Path $dir 'owned-health.vhd') ('FXTX'+[guid]::NewGuid().ToString('N').Substring(0,8).ToUpperInvariant()) -SizeMiB 256;$volumes.Add($vol)
@@ -82,12 +86,23 @@ try{
  $command='"'+$ServiceExe+'" --service --index "'+$index+'" --volume '+$owned.Volume+' --pipe findx2 --no-everything-ipc --usage-memory-mib 64 --save-interval-secs 1'
  $null=New-Service -Name $name -BinaryPathName $command -StartupType Manual;$created=$true
  $null=New-ItemProperty ('HKLM:\SYSTEM\CurrentControlSet\Services\'+$name) -Name Environment -PropertyType MultiString -Value @('ProgramData='+(Join-Path $base 'programdata'))
+ $partialDir=Join-Path $owned.Root 'p000000';$partialAcl=Get-Acl $partialDir;$denied=Get-Acl $partialDir
+ $deny=[Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-18'),[Security.AccessControl.FileSystemRights]'ReadAndExecute',[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Deny)
+ $denied.AddAccessRule($deny);Set-Acl $partialDir $denied
  Start-Service $name;$timer=[Diagnostics.Stopwatch]::StartNew();$partial=$null;$peak=0L;$mutation=Join-Path $owned.Root 'periodic-live-mutation.txt';[IO.File]::WriteAllText($mutation,'during-backfill',[Text.Encoding]::ASCII)
- while($timer.Elapsed.TotalSeconds-lt180){try{$s=Assert-OwnedService;if($s.ProcessId){$peak=[Math]::Max($peak,(Get-Process -Id $s.ProcessId).WorkingSet64)};if(Test-Path ($index+'.v6/published.json')){$before=Get-Content ($index+'.v6/published.json') -Raw|ConvertFrom-Json;$disk=Inspect;$after=Get-Content ($index+'.v6/published.json') -Raw|ConvertFrom-Json;if($before.manifest.generation-eq$after.manifest.generation-and-not$disk.metadata_ready){$proof=& $verify $index $mutation 15 $after.manifest.generation;if($LASTEXITCODE-eq0){$partial=@{generation=$after.manifest.generation;disk=$disk;actualMutationProof=($proof|ConvertFrom-Json)};$partial|ConvertTo-Json -Depth 12|Set-Content (Join-Path $artifact 'actual-partial-periodic.json')}}};if(Ready){break}}catch{Write-Host $_.Exception.Message};[Threading.Thread]::Sleep(100)}
- Assert (Ready) 'Actual native backfill/watch never became fully healthy';$rows.Add(@{test='real-full-two-volume-backfill';passed=$true;knownFiles=48002;maxDepth=128;peakWorkingSetBytes=$peak;seconds=$timer.Elapsed.TotalSeconds})
- # Independent partial durability result: if the real partial window was missed,
- # record unverified/fail; never manufacture false metadata or use no-backfill.
- $rows.Add(@{test='actual-partial-periodic-disk-generation';passed=($null-ne$partial);partial=$partial})
+ while($timer.Elapsed.TotalSeconds-lt180){try{$s=Assert-OwnedService;if($s.ProcessId){$peak=[Math]::Max($peak,(Get-Process -Id $s.ProcessId).WorkingSet64)};if(Test-Path ($index+'.v6/published.json')){$before=Get-Content ($index+'.v6/published.json') -Raw|ConvertFrom-Json;$disk=Inspect;$after=Get-Content ($index+'.v6/published.json') -Raw|ConvertFrom-Json;if($before.manifest.generation-eq$after.manifest.generation-and-not$disk.metadata_ready){$proof=& $verify $index $mutation 15 $after.manifest.generation;if($LASTEXITCODE-eq0){$partial=@{generation=$after.manifest.generation;disk=$disk;actualMutationProof=($proof|ConvertFrom-Json)};$partial|ConvertTo-Json -Depth 12|Set-Content (Join-Path $artifact 'actual-partial-periodic.json')}}};if($partial){break};if(Ready){break}}catch{Write-Host $_.Exception.Message};[Threading.Thread]::Sleep(100)}
+ Assert ($null-ne$partial) 'No actual incomplete-metadata disk generation containing the concurrent mutation; not publication-ready'
+ $partial['scope']='real SYSTEM read-denial, real backfill/USN/periodic writer; NOT complete metadata coverage'
+ $partial['liveBeforeRepair']=Rpc @{type='status'}
+ Set-Acl $partialDir $partialAcl;$partialAcl=$null
+ $partialStop=Stop-Owned;$partial['gracefulStoppedState']=$partialStop.State
+ $partial|ConvertTo-Json -Depth 15|Set-Content (Join-Path $artifact 'actual-partial-periodic.json')
+ # Reopen the same actual partial disk snapshot with the real permission repaired;
+ # full coverage is a separate positive requirement, never inferred from partial IO.
+ $fullTimer=[Diagnostics.Stopwatch]::StartNew();Start-Service $name;Wait-Condition {Ready} 90 'Repaired native partial generation did not reach actual full coverage'
+ $rows.Add(@{test='real-full-two-volume-backfill';passed=$true;knownFiles=48002;maxDepth=128;seconds=$fullTimer.Elapsed.TotalSeconds})
+ $rows.Add(@{test='actual-partial-periodic-disk-generation';passed=$true;partial=$partial})
+ if(-not $OnlyRemaining){
  Stage 'all-known-records-canonical-metadata-and-deep-parent-proof'
  $count=0;$seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
  do{$r=Rpc @{type='search';query='fx233-v';pinyin=$false;limit=1000;offset=$count};$hits=@($r.hits);foreach($hit in $hits){Assert ($hit.size-eq13) 'Full metadata size not actually backfilled';Assert ($seen.Add($hit.path)) 'Duplicate/cross-volume full path';Assert (@($volumes|Where-Object {$hit.path.StartsWith($_.Root,[StringComparison]::OrdinalIgnoreCase)}).Count-eq1) 'Wrong volume identity'};$count+=$hits.Count;Assert ($count-le48000) 'Unexpected indexed fixture count'}while($hits.Count-gt0)
@@ -100,6 +115,7 @@ try{
  Stage 'real-competing-service-owner-rejection'
  $dup=Start-Process $ServiceExe -ArgumentList ('--index "'+$index+'" --volume '+$owned.Volume+' --pipe findx2 --no-everything-ipc --shutdown-file "'+(Join-Path $base 'duplicate.stop')+'"') -PassThru -NoNewWindow -RedirectStandardError (Join-Path $artifact 'duplicate.err') -RedirectStandardOutput (Join-Path $artifact 'duplicate.out');$null=$dup.Handle
  $rejected=$dup.WaitForExit(10000);if(-not$rejected){[IO.File]::WriteAllText((Join-Path $base 'duplicate.stop'),'stop');$null=$dup.WaitForExit(30000)};Assert ($rejected-and$dup.ExitCode-ne0) 'Actual duplicate owner was not rejected';Assert (Ready) 'Competing process disturbed actual owner';$rows.Add(@{test='real-service-single-owner';passed=$true})
+ }
  Stage 'exact-final-gui-official-automatic-import-and-live-session'
  foreach($dir in @('gui/local','gui/roaming/tools.findx.gui')){$null=New-Item -ItemType Directory (Join-Path $base $dir)}
  & (Join-Path $repo 'target/release/final-legacy-export.exe') (Join-Path $base 'gui/local');Assert ($LASTEXITCODE-eq0) 'Legacy closed-source generator failed'
@@ -118,14 +134,33 @@ try{
  $null=Stop-Owned;$pub=Get-Content ($index+'.v6/published.json') -Raw|ConvertFrom-Json
  & $verify $index $mutation 15 $pub.manifest.generation|Set-Content (Join-Path $artifact 'offline-final-mutation.json');Assert ($LASTEXITCODE-eq0) 'Latest accepted mutation not actually durable'
  Start-Service $name;Wait-Condition {Ready} 90 'Actual full state did not recover after SCM restart'
- Invoke-Gui $gui '搜索';$gui.Refresh();$a=[Windows.Automation.AutomationElement]::FromHandle($gui.MainWindowHandle);$edit=$a.FindFirst([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::Edit));Assert ($null-ne$edit) 'Actual live GUI search input absent';([Windows.Automation.ValuePattern]$edit.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)).SetValue('fx233-v0-000000.bin')
- Wait-Condition {$items=$a.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.Condition]::TrueCondition);return @($items|Where-Object {$_.Current.Name-like'*fx233-v0-000000.bin*'-and$_.Current.ControlType-eq[Windows.Automation.ControlType]::DataItem}).Count-gt0} 30 'Actual GUI did not display new-owner live search result after SCM restart'
+ # Prove fresh data from the NEW already-healthy SCM instance, not a cached old row.
+ $freshName='fx253-rebind-'+[guid]::NewGuid().ToString('N')+'.txt';$freshPath=Join-Path $owned.Root $freshName;$freshBody='live-rebind-proof';[IO.File]::WriteAllText($freshPath,$freshBody,[Text.Encoding]::ASCII)
+ Wait-Condition {Has-File $freshName $freshBody.Length} 30 'New instance did not index actual post-restart file'
+ Invoke-Gui $gui '搜索';$gui.Refresh();$a=[Windows.Automation.AutomationElement]::FromHandle($gui.MainWindowHandle)
+ $edits=@($a.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::Edit))|Where-Object {-not $_.Current.IsOffscreen -and $_.Current.IsEnabled})
+ Save-GuiTree $a 'before-live-query';Assert ($edits.Count-eq1) 'Expected one actual visible search editor, never choose arbitrary hidden input'
+ ([Windows.Automation.ValuePattern]$edits[0].GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)).SetValue($freshName)
+ try{Wait-Condition {
+  # ResultsTable::cell_label(col1) is the FULL PATH. A row's own Name need not
+  # aggregate its cells; matching Edit.Value or a historical query is NOT proof.
+  $matches=$a.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,$freshPath))
+  foreach($cell in $matches){
+   if($cell.Current.ControlType-eq[Windows.Automation.ControlType]::Edit){continue}
+   $parent=$cell
+   for($n=0;$n-lt12-and$null-ne$parent;$n++){
+    if($parent.Current.ControlType-eq[Windows.Automation.ControlType]::Table-or$parent.Current.ControlType-eq[Windows.Automation.ControlType]::DataGrid){return $true}
+    $parent=[Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($parent)
+   }
+  };return $false
+ } 30 'Actual GUI did not display exact fresh full-path table cell from new SCM instance'}finally{Save-GuiTree $a 'after-live-query'}
  Close-Gui $gui;$rows.Add(@{test='real-live-gui-rebind-new-scm-instance';passed=$true});$null=Stop-Owned
  $rows.Add(@{test='current-engine-stop-offline-and-restart';passed=$true;generation=$pub.manifest.generation})
 }finally{
+ if($partialAcl){try{Set-Acl $partialDir $partialAcl}catch{Write-Host 'Owned test ACL restore failed; no host target fallback'}}
  foreach($g in $guis){try{Close-Gui $g}catch{Write-Host ('Owned GUI cleanup incomplete, no force: '+$_.Exception.Message)}}
  if($created){try{$null=Stop-Owned;sc.exe delete $name|Out-Null}catch{Write-Host ('Owned SCM cleanup incomplete, no force: '+$_.Exception.Message)}}
  foreach($v in $volumes){try{Dismount-DiskImage -ImagePath $v.Image -ErrorAction Stop}catch{Write-Host 'Do not force detach active volume'}}
  $rows.ToArray()|ConvertTo-Json -Depth 20|Set-Content (Join-Path $artifact 'results.json')
 }
-Assert (@($rows|Where-Object {-not$_.passed}).Count-eq0-and$rows.Count-ge6) 'At least one independent acceptance missing/failed; never publication-ready'
+Assert (@($rows|Where-Object {-not$_.passed}).Count-eq0-and$rows.Count-ge$(if($OnlyRemaining){5}else{8})) 'At least one independent acceptance missing/failed; never publication-ready'
