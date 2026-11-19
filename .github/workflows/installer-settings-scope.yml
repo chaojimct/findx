@@ -17,6 +17,8 @@ jobs:
       - shell: powershell
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Owned preference rollback, interruption reentry, sparse exclusion and strict required-file refusal
         shell: powershell
         run: ./scripts/test-installer-settings-scope.ps1
@@ -34,21 +36,15 @@ jobs:
           & "$d/extractor/innounp.exe" -x -y ("-d"+"$d/old") "$d/old-setup.exe" > "$d/unpack.log"
           if($LASTEXITCODE){throw 'Legacy read-only unpack failed'}
           if((Get-FileHash "$d/old/{app}/FindX.exe").Hash -ine '392cea03063d4b1ac57e62d5edcba45291ffe36e16c49bad472298d2b51c9a02'){throw 'Published252 GUI does NOT match actual MZ old GUI; stop, no substituted fixture'}
-          $lock=Get-Content release/2.5.3-seal-lock.json -Raw|ConvertFrom-Json
-          gh run download $lock.testedRun --name $lock.payloadArtifact --dir "$d/new"
-          if($LASTEXITCODE){throw 'Payload fetch failed'}
-          $m=@(Get-ChildItem "$d/new" -Recurse -Filter stage-manifest.json);if($m.Count -ne 1){throw 'Payload ambiguous'}
-          $stage=$m[0].DirectoryName
-          foreach($f in $lock.files){if((Get-FileHash (Join-Path $stage $f.name)).Hash -ine $f.sha256){throw 'Sealed runtime changed'}}
-          $stage|Set-Content "$d/stage.txt"
-      - name: Compile only actual production installer with normal-close fix
-        shell: powershell
-        run: |
-          $ErrorActionPreference='Stop';$d=Join-Path $env:RUNNER_TEMP 'legacy252';$stage=(Get-Content "$d/stage.txt" -Raw).Trim()
-          $iscc="${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe"
-          if(-not(Test-Path $iscc)){choco install innosetup -y --no-progress;if($LASTEXITCODE){throw 'No compiler'}}
-          & $iscc /DUpgradeGatesApproved=1 /DMyAppVersion=2.5.3 "/DPublishDir=$stage" "/O$d/output" installer/FindX.iss
-          if($LASTEXITCODE){throw 'Production compile failed'}
+          $j=gh api repos/chaojimct/findx/actions/jobs/135520142366|ConvertFrom-Json
+          if($LASTEXITCODE -or $j.head_sha -cne '51fd7e1efe7401735ccfcc628f54a9a29852f02b'){throw 'Prior source differs'}
+          foreach($n in @('Owned preference rollback, interruption reentry, sparse exclusion and strict required-file refusal','Compile only actual production installer with normal-close fix','Actual original252 GUI two real windows -> normal close -> formal upgrade, no fixture or mock')){if(@($j.steps|Where-Object{$_.name -ceq $n -and $_.conclusion -ceq 'success'}).Count -ne 1){throw 'Prior installer producer proof missing'}}
+          git diff --exit-code 51fd7e1efe7401735ccfcc628f54a9a29852f02b HEAD -- installer gui/src-tauri/icons
+          if($LASTEXITCODE){throw 'Installer source changed; cannot reuse setup'}
+          gh run download 44512531863 --name installer-settings-scope-production --dir "$d/reuse"
+          if($LASTEXITCODE){throw 'Exact previously compiled setup fetch failed'}
+          Copy-Item "$d/reuse/legacy252/output" "$d/output" -Recurse
+          if(-not(Test-Path "$d/output/FindX-2.5.3-setup.exe")){throw 'Reused exact setup missing'}
       - name: Actual original252 GUI two real windows -> normal close -> formal upgrade, no fixture or mock
         shell: powershell
         run: |

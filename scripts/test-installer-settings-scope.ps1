@@ -23,7 +23,8 @@ if($Mode -eq 'SeedFormal'){
  return
 }
 if($Mode -eq 'VerifyFormal'){
- foreach($f in @(Get-Content "$env:RUNNER_TEMP/formal-settings-extras.json" -Raw|ConvertFrom-Json)){Assert-Snapshot $f.path $f.before}
+ $saved=Get-Content "$env:RUNNER_TEMP/formal-settings-extras.json" -Raw|ConvertFrom-Json
+ foreach($f in $saved){Assert-Snapshot $f.path $f.before}
  'FORMAL_NON_FIXTURE_SPARSE_AND_UNKNOWN_UNCHANGED'|Set-Content "$env:RUNNER_TEMP/formal-settings-result.txt"
  return
 }
