@@ -21,6 +21,7 @@ pub fn log_now_local_short() -> impl std::fmt::Display {
     chrono::Local::now().format("%H:%M:%S%.3f")
 }
 
+pub mod checkpoint_fence;
 pub mod error;
 pub mod index;
 pub mod meta_overlay;

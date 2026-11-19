@@ -3,6 +3,8 @@ on:
   push:
     branches: [release/v2.5.3-engine-durability]
     paths:
+      - 'crates/findx2-core/**'
+      - 'Cargo.lock'
       - 'crates/findx2-service/**'
       - 'crates/findx2-ipc/**'
       - 'crates/findx2-gui-native/**'
@@ -18,13 +20,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Core authoritative admission and actual-writer checkpoint evidence (not runtime ACK)
+        shell: pwsh
+        run: |
+          cargo test --locked -p findx2-core --lib -- --test-threads=1 2>&1 | Tee-Object core-checkpoint-fence-tests.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: IPC and actual service shutdown regressions (temporary file fixtures only)
         shell: pwsh
         run: |
           cargo test --locked -p findx2-ipc -p findx2-service -- --test-threads=1 2>&1 | Tee-Object engine-lifecycle-tests.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: GUI and CLI compile against actual shared IPC contract
-        run: cargo check --locked -p findx2-cli -p findx2-gui-native
+        shell: pwsh
+        run: |
+          cargo check --locked -p findx2-cli -p findx2-gui-native 2>&1 | Tee-Object client-compile.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: No force-exit fallback and protocol remains fail-closed
         shell: pwsh
         run: |
@@ -37,5 +47,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: engine-lifecycle-A1-evidence
-          path: engine-lifecycle-tests.log
+          path: |
+            core-checkpoint-fence-tests.log
+            engine-lifecycle-tests.log
+            client-compile.log
           retention-days: 30

@@ -2219,6 +2219,7 @@ dependencies = [
  "crc32fast",
  "dashmap",
  "fxhash",
+ "getrandom 0.4.3",
  "glob",
  "ib-matcher",
  "libc",

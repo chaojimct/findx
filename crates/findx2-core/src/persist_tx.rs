@@ -166,7 +166,26 @@ fn digest_file(path: &Path) -> Result<FileDigest> {
     Ok(FileDigest { size, crc32: hasher.finalize() })
 }
 
+static PUBLICATION: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+/// An in-process publication lease; NOT interprocess/index-owner exclusion.
+/// Holding it pins the actual published generation for frozen evidence lifetime.
+pub(crate) struct PublicationLease { _guard: parking_lot::MutexGuard<'static, ()> }
+impl PublicationLease {
+    pub(crate) fn acquire(deadline:std::time::Instant,cancel:&std::sync::atomic::AtomicBool)->std::result::Result<Self,String> {
+        loop {
+            if cancel.load(std::sync::atomic::Ordering::Acquire)||std::time::Instant::now()>=deadline{return Err("publication wait cancelled/timed out; no ACK".into());}
+            if let Some(g)=PUBLICATION.try_lock_for(std::time::Duration::from_millis(5)){return Ok(Self{_guard:g});}
+        }
+    }
+    pub(crate) fn save_full(&self,layout:&V6Layout,store:&IndexStore)->Result<u64>{save_full_generation_inner(layout,store)}
+}
+
 pub fn save_full_generation(layout: &V6Layout, store: &IndexStore) -> Result<u64> {
+    let _publication=PUBLICATION.lock();
+    save_full_generation_inner(layout,store)
+}
+
+fn save_full_generation_inner(layout: &V6Layout, store: &IndexStore) -> Result<u64> {
     fs::create_dir_all(&layout.dir).map_err(|e| io_err(e, "create v6 dir"))?;
     *WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = 0;
     let gen = next_generation(layout);
@@ -204,6 +223,7 @@ pub fn save_full_generation(layout: &V6Layout, store: &IndexStore) -> Result<u64
 }
 
 pub fn try_commit_generation(layout: &V6Layout, batch: &CommitBatch) -> Result<CommitOutcome> {
+    let _publication=PUBLICATION.lock();
     if batch.mutations.iter().any(|m| matches!(m, Mutation::FullResync)) {
         return Ok(CommitOutcome::NeedFull { reason: "batch contains FullResync".into() });
     }
@@ -515,6 +535,7 @@ fn publish_generation(
 pub fn publish_trigram_snapshot(
     layout: &V6Layout, tri_path: &Path, pending: &roaring::RoaringBitmap, tri_snap: u32,
 ) -> Result<u64> {
+    let _publication=PUBLICATION.lock();
     let Some(base) = resolve_base(layout)? else {
         return Err(persist_err("cannot publish trigram without a committed generation"));
     };

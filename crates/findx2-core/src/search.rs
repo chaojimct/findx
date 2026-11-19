@@ -10,7 +10,6 @@ use std::sync::Arc;
 // - parking_lot 默认 reader 不会被排队中的 writer 卡住（writer 之间公平排队，
 //   reader 路径快速通过），更适合"99% 读 + 后台少量写"的本场景；
 // - 同时去掉 poison 处理：parking_lot::RwLock 没有 poisoning 概念，API 更清爽。
-use parking_lot::RwLock;
 
 use memchr::memmem;
 use rayon::prelude::*;
@@ -120,7 +119,8 @@ impl Default for BackfillProgress {
 }
 
 pub struct SearchEngine {
-    pub(crate) store: RwLock<IndexStore>,
+    pub(crate) store: crate::checkpoint_fence::AdmissionStore<IndexStore>,
+    pub(crate) checkpoint_instance: Option<[u8;16]>,
     pub(crate) usage: parking_lot::Mutex<crate::usage::UsageRuntime>,
     pub(crate) orphans: parking_lot::Mutex<crate::usage::OrphanQueue>,
     backfill: Arc<BackfillProgress>,
@@ -175,7 +175,8 @@ impl SearchEngine {
     pub fn new(store: IndexStore) -> Self {
         let entry_count = store.entries.len();
         Self {
-            store: RwLock::new(store),
+            store: crate::checkpoint_fence::AdmissionStore::new(store),
+            checkpoint_instance: { let mut id=[0u8;16]; getrandom::fill(&mut id).ok().map(|()|id) },
             usage: parking_lot::Mutex::new(Default::default()),
             orphans: parking_lot::Mutex::new(Default::default()),
             backfill: Arc::new(BackfillProgress::default()),
@@ -1269,7 +1270,7 @@ impl SearchEngine {
         g.mutation_log = Some(batch.mutations);
     }
 
-    pub fn index_store_mut(&self) -> parking_lot::RwLockWriteGuard<'_, IndexStore> {
+    pub fn index_store_mut(&self) -> crate::checkpoint_fence::TrackedWriteGuard<'_, IndexStore> {
         let guard = self.store.write();
         // An unrestricted external writer cannot promise to maintain child links.
         self.usage.lock().invalidate_parent_search(false);
