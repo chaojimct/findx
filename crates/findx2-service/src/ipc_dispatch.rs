@@ -16,6 +16,7 @@ fn checkpoint_error_snapshot() -> Option<String> {
 
 pub(crate) fn req_kind_label(r: &IpcRequest) -> &'static str {
     match r {
+        IpcRequest::PrepareStop{..}|IpcRequest::CommitStop{..}|IpcRequest::CancelStop{..}|IpcRequest::CheckpointIdentity{..}=>"StopManagement",
         IpcRequest::UpgradeCapabilities { .. } => "UpgradeCapabilities",
         IpcRequest::UsageCapabilities => "UsageCapabilities",
         IpcRequest::UsageChildren { .. } => "UsageChildren",
@@ -28,12 +29,13 @@ pub(crate) fn req_kind_label(r: &IpcRequest) -> &'static str {
 pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse {
     let engine = slot.read().ok().and_then(|g| g.clone());
     match (req, engine) {
+        (IpcRequest::PrepareStop{..}|IpcRequest::CommitStop{..}|IpcRequest::CancelStop{..}|IpcRequest::CheckpointIdentity{..},_)=>IpcResponse::Error{message:"requires authenticated elevated Windows pipe transport".into()},
         (IpcRequest::UpgradeCapabilities { protocol_version: 1 }, engine) => IpcResponse::UpgradeCapabilitiesResult {
             protocol_version: 1,
             durable_prepare: false,
             runtime_error: engine.as_deref().and_then(crate::runtime_lifecycle::error_snapshot),
             last_checkpoint_error: checkpoint_error_snapshot(),
-            reason: "managed fencing is internal only; native lifecycle acceptance and final IPC/installer receipt are not complete; refuse before service stop".into(),
+            reason: "protocol2 terminal candidate requires native acceptance; protocol1 never authorizes service stop; installer integration remains incomplete".into(),
         },
         (IpcRequest::UpgradeCapabilities { .. }, _) => IpcResponse::Error {
             message: "unsupported durable-upgrade protocol version; refuse before service stop".into(),

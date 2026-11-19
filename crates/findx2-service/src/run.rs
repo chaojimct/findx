@@ -279,6 +279,14 @@ fn shutdown_requested(stop: &AtomicBool, marker: Option<&Path>) -> bool {
     false
 }
 
+fn acquire_index_owner(index:&Path)->anyhow::Result<std::fs::File>{
+    use std::os::windows::fs::OpenOptionsExt;
+    let parent=index.parent().ok_or_else(||anyhow::anyhow!("index parent unavailable"))?.canonicalize()?;
+    let name=index.file_name().ok_or_else(||anyhow::anyhow!("index filename missing"))?;
+    let path=parent.join(format!("{}.runtime-owner",name.to_string_lossy()));
+    std::fs::OpenOptions::new().read(true).write(true).create(true).share_mode(0).open(path).map_err(|e|anyhow::anyhow!("exclusive index runtime owner refused: {e}"))
+}
+
 pub(crate) fn run_foreground(
     index: PathBuf,
     _volume: String,
@@ -303,6 +311,10 @@ pub(crate) fn run_foreground(
             index.display(),
         ));
     }
+
+    // Exclusive OS handle spans load, all publishers, prepared STOP and teardown.
+    // Different pipe names cannot open the same index in another new-engine process.
+    let _index_owner=acquire_index_owner(&index)?;
 
     // 关键：管道在 load_index_bin 之前就开起来。
     // 大索引（千万级）反序列化要十几秒甚至几十秒，旧顺序下 GUI / IPC 会一直撞「管道超时」。
@@ -573,6 +585,11 @@ pub(crate) fn run_foreground(
             Ok(Err(e)) => worker_errors.push(format!("watch worker failed: {e:#}")),
             Err(_) => worker_errors.push("watch worker panicked during shutdown".into()),
         }
+    }
+    if let Some(receipt)=lifecycle.prepared_stop().map_err(anyhow::Error::msg)? {
+        if !worker_errors.is_empty(){anyhow::bail!("sealed checkpoint saved but watcher stop failed: {}",worker_errors.join("; "));}
+        info!(?receipt,"exact sealed terminal checkpoint retained through normal STOP; process_stopped remains externally observed");
+        return Ok(());
     }
     let _stop_work=loop {
         match lifecycle.drain_stop(Instant::now()+Duration::from_secs(10)) {
@@ -1671,4 +1688,11 @@ mod tests {
         );
         assert_eq!(resume_usn_after_rebuild(fresh, 1, fresh, 9, first), fresh);
     }
+}
+
+#[cfg(test)]mod index_owner_tests{
+ use super::*;
+ #[test]fn actual_os_owner_handle_excludes_same_index_until_dropped(){
+  let d=std::env::temp_dir().join(format!("findx-owner-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));std::fs::create_dir(&d).unwrap();let p=d.join("index.bin");let a=acquire_index_owner(&p).unwrap();assert!(acquire_index_owner(&p).is_err());drop(a);assert!(acquire_index_owner(&p).is_ok());std::fs::remove_dir_all(d).unwrap();
+ }
 }

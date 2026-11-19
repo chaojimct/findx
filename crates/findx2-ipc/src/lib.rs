@@ -40,6 +40,27 @@ pub fn unix_socket_path(name: &str) -> PathBuf {
     }
 }
 
+/// Protocol 2 terminal handoff identity. Equality is exact; no field has a default.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StopToken {
+    pub protocol_version: u32,
+    pub engine_instance: String,
+    pub service_pid: u32,
+    pub request_nonce: String,
+    pub index_identity: String,
+    pub mutation_sequence: u64,
+    pub published_generation: u64,
+    pub outcome_epoch: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DurableStopReceipt {
+    pub token: StopToken,
+    pub state: String,
+    pub process_stopped: bool,
+}
+
 /// 客户端 → 服务端的请求。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -57,6 +78,10 @@ pub enum IpcRequest {
     },
     /// Negotiation only. Missing/unknown versions must never imply prepare support.
     UpgradeCapabilities { protocol_version: u32 },
+    PrepareStop { protocol_version: u32, expected_instance: String, request_nonce: String, index_identity: String, timeout_ms: u64 },
+    CommitStop { token: StopToken },
+    CancelStop { token: StopToken },
+    CheckpointIdentity { protocol_version: u32 },
     UsageCapabilities,
     UsageChildren {
         path: String,
@@ -158,6 +183,10 @@ pub enum IpcResponse {
         last_checkpoint_error: Option<String>,
         reason: String,
     },
+    CheckpointIdentityResult { protocol_version: u32, engine_instance: String, service_pid: u32, index_identity: String },
+    StopPrepared { token: StopToken },
+    StopCommitted { receipt: DurableStopReceipt, receipt_path: String },
+    StopCancelled,
     UsageCapabilitiesResult {
         logical_tree: u32,
         allocated: bool,

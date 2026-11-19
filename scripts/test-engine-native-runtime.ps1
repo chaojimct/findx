@@ -36,17 +36,18 @@ function Assert-OwnedService {
  Assert ($s -and $s.PathName.Contains($base) -and $s.PathName.Contains($ServiceExe)) 'Service identity no longer owned by this fixture'
  return $s
 }
-function Rpc($request){
+function Rpc($request,[Security.Principal.TokenImpersonationLevel]$Level=[Security.Principal.TokenImpersonationLevel]::Impersonation){
  $s=Assert-OwnedService
  Assert ($s.ProcessId -gt 0) 'No actual SCM process'
- $pipe=[IO.Pipes.NamedPipeClientStream]::new('.',$script:pipeName,[IO.Pipes.PipeDirection]::InOut,[IO.Pipes.PipeOptions]::Asynchronous)
+ $pipe=[IO.Pipes.NamedPipeClientStream]::new('.',$script:pipeName,[IO.Pipes.PipeDirection]::InOut,[IO.Pipes.PipeOptions]::Asynchronous,$Level)
  $reader=$null
  try{
   $pipe.Connect(1000);[uint32]$server=0
   Assert ([FxTxProcessNative]::GetNamedPipeServerProcessId($pipe.SafePipeHandle.DangerousGetHandle(),[ref]$server) -and $server -eq $s.ProcessId) 'RPC not owned by current SCM process'
   $bytes=[Text.Encoding]::UTF8.GetBytes(($request|ConvertTo-Json -Compress -Depth 10)+"`n");$pipe.Write($bytes,0,$bytes.Length);$pipe.Flush()
   $reader=[IO.StreamReader]::new($pipe,[Text.Encoding]::UTF8,$false,4096,$true);$task=$reader.ReadLineAsync()
-  Assert ($task.Wait(1500)) 'RPC bounded timeout';$line=$task.Result
+  $rpcMs=if($request.type -eq 'prepare_stop'){[int]$request.timeout_ms+5000}elseif($request.type -eq 'commit_stop'){10000}else{1500}
+  Assert ($task.Wait($rpcMs)) 'RPC bounded timeout';$line=$task.Result
   Assert ($line -and $line.Length -lt 1048576) 'Invalid bounded IPC line'
   return $line|ConvertFrom-Json
  }finally{if($reader){$reader.Dispose()};$pipe.Dispose()}
@@ -144,6 +145,62 @@ try{
  $restarted=Assert-OwnedService
  Assert ($restarted.ProcessId -ne $identity.ProcessId) 'Did not actually restart a service instance'
  $rows.Add(@{test='actual-os-write-failure-stop-pending-retry-native-recovery';passed=$true;beforeGeneration=$before.manifest.generation;afterGeneration=$after.manifest.generation;oldPid=$identity.ProcessId;newPid=$restarted.ProcessId;expectedBytes=$body.Length;upgradeAck=$false})
+ Stage 'protocol2-actual-writer-prepare-failure'
+ Assert ((Rpc @{type='checkpoint_identity';protocol_version=2} ([Security.Principal.TokenImpersonationLevel]::Anonymous)).type -eq 'error') 'Anonymous pipe frame obtained elevated management'
+ $id=Rpc @{type='checkpoint_identity';protocol_version=2}
+ Assert ($id.type -eq 'checkpoint_identity_result' -and $id.service_pid -eq (Service-State).ProcessId) 'No authenticated current-instance identity'
+ function Prepare([string]$Nonce,[int]$Ms=30000){return Rpc @{type='prepare_stop';protocol_version=2;expected_instance=$id.engine_instance;request_nonce=$Nonce;index_identity=$id.index_identity;timeout_ms=$Ms}}
+ # No new mutation/persister is needed: freeze always invokes the actual full writer.
+ $originalAcl=Get-Acl -LiteralPath $v6;$denied=Get-Acl -LiteralPath $v6;$denied.AddAccessRule($deny);Set-Acl -LiteralPath $v6 -AclObject $denied
+ $failure=Prepare ([guid]::NewGuid().ToString('N'))
+ $failure|ConvertTo-Json -Depth 20|Set-Content (Join-Path $artifact 'prepare-actual-writer-failure.json')
+ Assert ($failure.type -eq 'error' -and $failure.message -match 'checkpoint writer:.*(denied|拒绝|os error 5|Access)') 'Prepare failure was not the actual writer stage'
+ Set-Acl -LiteralPath $v6 -AclObject $originalAcl;$originalAcl=$null
+ Assert (Has-File $file $body.Length) 'Failed prepare lost accepted RAM'
+ $rows.Add(@{test='protocol2-native-prepare-actual-os-write-failure-retains-ram';passed=$true;failure=$failure.message})
+ Stage 'protocol2-native-cancel-expire-retry'
+ $nonce=[guid]::NewGuid().ToString('N');$cancelled=Prepare $nonce
+ Assert ($cancelled.type -eq 'stop_prepared') 'Cancel test never reached real frozen preparation'
+ $c=Rpc @{type='cancel_stop';token=$cancelled.token};Assert ($c.type -eq 'stop_cancelled') 'Exact cancellation failed'
+ $stale=Rpc @{type='commit_stop';token=$cancelled.token};Assert ($stale.type -eq 'error') 'Cancelled token revived'
+ $replay=Prepare $nonce;Assert ($replay.type -eq 'error') 'Cancelled nonce replay accepted'
+ Assert (Has-File $file $body.Length) 'Cancellation did not release RAM admission'
+ $expiring=Prepare ([guid]::NewGuid().ToString('N')) 2000
+ Assert ($expiring.type -eq 'stop_prepared') 'Expiry test never reached actual frozen preparation'
+ [Threading.Thread]::Sleep(2300)
+ $expired=Rpc @{type='commit_stop';token=$expiring.token};Assert ($expired.type -eq 'error') 'Expired preparation was committed'
+ Assert (Has-File $file $body.Length) 'Expired prepare lost or blocked RAM'
+ $rows.Add(@{test='protocol2-native-cancel-timeout-nonce-replay-and-retry';passed=$true;cancelledNonce=$nonce})
+ Stage 'protocol2-positive-freeze-commit-stop-offline-before-restart'
+ $prepared=Prepare ([guid]::NewGuid().ToString('N'))
+ Assert ($prepared.type -eq 'stop_prepared') 'Positive chain did not reach real writer freeze'
+ $prepared|ConvertTo-Json -Depth 20|Set-Content (Join-Path $artifact 'actual-stop-prepared.json')
+ $badToken=$prepared.token|ConvertTo-Json -Depth 20|ConvertFrom-Json;$badToken.index_identity+='-wrong-index'
+ Assert ((Rpc @{type='commit_stop';token=$badToken}).type -eq 'error') 'Wrong-index token committed'
+ $badToken=$prepared.token|ConvertTo-Json -Depth 20|ConvertFrom-Json;$badToken.published_generation++
+ Assert ((Rpc @{type='commit_stop';token=$badToken}).type -eq 'error') 'Wrong-disk-generation token committed'
+ # A real OS write occurs AFTER RAM was sealed; it must not enter the sealed disk snapshot.
+ $lateFile='after-sealed-boundary.txt';$lateBody='journal-only-after-seal'
+ [IO.File]::WriteAllText((Join-Path $owned.Root ('native-runtime\'+$lateFile)),$lateBody,[Text.Encoding]::ASCII)
+ $committed=Rpc @{type='commit_stop';token=$prepared.token}
+ Assert ($committed.type -eq 'stop_committed' -and $committed.receipt.state -eq 'saved_stop_pending' -and -not $committed.receipt.process_stopped) 'SCM or observation was substituted for a durable receipt'
+ $receipt=Get-Content -LiteralPath $committed.receipt_path -Raw|ConvertFrom-Json
+ foreach($field in @('protocol_version','engine_instance','service_pid','request_nonce','index_identity','mutation_sequence','published_generation','outcome_epoch')){Assert ($receipt.token.$field -ceq $prepared.token.$field) ('Receipt binding mismatch: '+$field)}
+ Assert ((Rpc @{type='commit_stop';token=$prepared.token}).type -eq 'stop_committed') 'Same-instance exact commit retry was not idempotent'
+ Assert ((Rpc @{type='cancel_stop';token=$prepared.token}).type -eq 'error') 'Committed safe seal was reopened by cancellation'
+ $committed|ConvertTo-Json -Depth 20|Set-Content (Join-Path $artifact 'actual-durable-stop-receipt.json')
+ $terminalPid=(Service-State).ProcessId;$terminal=Stop-Owned
+ Assert ($terminal.State -eq 'Stopped' -and $terminal.ProcessId -eq 0 -and $terminal.ExitCode -eq 0 -and $terminal.ServiceSpecificExitCode -eq 0) 'Receipt alone did not ensure normal exact-service successful STOP'
+ & $verify $index (Join-Path $owned.Root ('native-runtime\'+$file)) $body.Length $prepared.token.published_generation (Join-Path $owned.Root ('native-runtime\'+$lateFile)) |Set-Content (Join-Path $artifact 'prepared-stop-offline-before-replay.json')
+ Assert ($LASTEXITCODE -eq 0) 'Sealed receipt generation/data/boundary did not match actual disk BEFORE restart'
+ Start-Service $name
+ Wait-Condition {Ready} 45 'Native service restart after sealed stop failed'
+ $newId=Rpc @{type='checkpoint_identity';protocol_version=2}
+ Assert ($newId.engine_instance -cne $id.engine_instance -and $newId.service_pid -ne $terminalPid) 'Restart did not change actual instance/PID'
+ Assert ((Rpc @{type='commit_stop';token=$prepared.token}).type -eq 'error') 'Previous-instance ACK accepted after restart'
+ Wait-Condition {Has-File $file $body.Length} 30 'Sealed accepted RAM missing after restart'
+ Wait-Condition {Has-File $lateFile $lateBody.Length} 30 'After-seal OS mutation was not resumed from retained USN cursor'
+ $rows.Add(@{test='protocol2-native-freeze-durable-commit-normal-stop-offline-restart-concurrent-boundary';passed=$true;token=$prepared.token;processStoppedExternally=$true;offlineBeforeReplay=$true;lateMutationExcludedBeforeReplay=$true;newInstance=$newId.engine_instance;productionCapability=$false})
  $null=Stop-Owned
  Stage 'actual-corrupt-index-load-error-scm'
  # Actual SCM error propagation, explicitly a corrupt-index LOAD failure, not a fake save-failure claim.

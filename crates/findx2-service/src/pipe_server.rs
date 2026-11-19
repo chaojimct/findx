@@ -5,7 +5,7 @@
 
 use findx2_ipc::{IpcRequest, IpcResponse};
 use tokio::io::{split, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::ipc_dispatch::{process_request, req_kind_label, EngineSlot};
 
@@ -20,7 +20,7 @@ const PIPE_BUF_SIZE: u32 = 64 * 1024;
 const PIPE_MAX_INSTANCES: u32 = 254;
 
 fn configure_opts(opts: &mut tokio::net::windows::named_pipe::ServerOptions) {
-    opts.in_buffer_size(PIPE_BUF_SIZE)
+    opts.reject_remote_clients(true).in_buffer_size(PIPE_BUF_SIZE)
         .out_buffer_size(PIPE_BUF_SIZE)
         .max_instances(PIPE_MAX_INSTANCES as usize);
 }
@@ -69,28 +69,9 @@ fn create_first_pipe_server(
     opts.first_pipe_instance(true);
     // 创建后要改 DACL，必须带 WRITE_DAC。
     opts.write_dac(true);
-    match opts.create(pipe_path) {
-        Ok(s) => {
-            apply_local_client_acl(&s)?;
-            info!("命名管道 ACL 已放宽：本机已登录用户可连接（管理员服务 + 普通 GUI）");
-            Ok(s)
-        }
-        Err(e) => {
-            // 残留实例或异常状态下一度会失败；再试非首实例，避免服务直接起不来、GUI 永远连不上管道。
-            warn!("命名管道 first_pipe_instance(true) 失败: {e}，尝试非首实例…");
-            let mut opts2 = tokio::net::windows::named_pipe::ServerOptions::new();
-            configure_opts(&mut opts2);
-            opts2.first_pipe_instance(false);
-            opts2.write_dac(true);
-            let s = opts2
-                .create(pipe_path)
-                .map_err(|e2| anyhow::anyhow!("创建命名管道失败: {e}；重试: {e2}"))?;
-            if let Err(acl_e) = apply_local_client_acl(&s) {
-                warn!("非首实例写入管道 ACL 失败: {acl_e}");
-            }
-            Ok(s)
-        }
-    }
+    let server=opts.create(pipe_path).map_err(|e|anyhow::anyhow!("exclusive first pipe ownership refused: {e}"))?;
+    apply_local_client_acl(&server)?;
+    Ok(server)
 }
 
 fn create_next_pipe_server(
@@ -150,6 +131,8 @@ async fn handle_client(
     let sid = SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     debug!(sid, "pipe 会话开始");
 
+    use std::os::windows::io::AsRawHandle;
+    let pipe_handle=server.as_raw_handle() as usize;
     let (r, mut w) = split(server);
     let mut reader = BufReader::new(r);
     loop {
@@ -177,12 +160,21 @@ async fn handle_client(
                 // process_request 里 engine.search() 是 CPU-bound 重活（最长可达 100ms+），
                 // 直接在 tokio worker 上跑会把 worker 池打满，新管道连接 connect 失败 →
                 // 用户看到 ERROR_PIPE_BUSY (231)。挪到 blocking pool 隔离。
+                let management=matches!(&req,IpcRequest::PrepareStop{..}|IpcRequest::CommitStop{..}|IpcRequest::CancelStop{..}|IpcRequest::CheckpointIdentity{..});
+                let authorized=if management {management_authorized(pipe_handle)}else{false};
                 let slot_cloned = slot.clone();
                 let req_kind = req_kind_label(&req);
                 debug!(sid, kind = req_kind, "spawn_blocking 派发");
                 let blocking_started = std::time::Instant::now();
                 let result =
-                    tokio::task::spawn_blocking(move || process_request(&slot_cloned, req)).await;
+                    tokio::task::spawn_blocking(move || {
+                        if management&&authorized {
+                            match slot_cloned.read().ok().and_then(|s|s.clone()){
+                                Some(e)=>crate::runtime_lifecycle::management(&e,req),
+                                None=>IpcResponse::Error{message:"engine not loaded".into()}
+                            }
+                        }else{process_request(&slot_cloned, req)}
+                    }).await;
                 let blocking_ms = blocking_started.elapsed().as_millis();
                 if blocking_ms > 200 {
                     info!(sid, kind = req_kind, blocking_ms, "请求处理偏慢");
@@ -259,4 +251,23 @@ mod frame_tests {
         let mut r = BufReader::new(bytes.as_slice());
         assert!(read_bounded_frame(&mut r).await.is_err());
     }
+}
+
+// Impersonate only after this exact frame was read, never trust a caller PID/string.
+// A dedicated OS thread cannot leak an impersonation token into Tokio's pool even
+// if RevertToSelf fails: thread termination discards its thread-owned token.
+fn management_authorized(handle:usize)->bool{
+    std::thread::spawn(move||unsafe{
+        #[link(name="advapi32")]
+        unsafe extern "system" {
+            fn ImpersonateNamedPipeClient(pipe:*mut std::ffi::c_void)->i32;
+            fn RevertToSelf()->i32;
+            fn CreateWellKnownSid(kind:i32,domain:*const std::ffi::c_void,sid:*mut std::ffi::c_void,size:*mut u32)->i32;
+            fn CheckTokenMembership(token:*mut std::ffi::c_void,sid:*const std::ffi::c_void,member:*mut i32)->i32;
+        }
+        if ImpersonateNamedPipeClient(handle as *mut _) ==0{return false;}
+        let mut sid=[0u64;9];let mut size=72u32;let mut member=0;
+        let allowed=CreateWellKnownSid(26,std::ptr::null(),sid.as_mut_ptr().cast(),&mut size)!=0&&CheckTokenMembership(std::ptr::null_mut(),sid.as_ptr().cast(),&mut member)!=0&&member!=0;
+        let reverted=RevertToSelf()!=0;allowed&&reverted
+    }).join().unwrap_or(false)
 }

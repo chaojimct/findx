@@ -1,4 +1,5 @@
 //! Real runtime work ownership. Internal prepared observations remain NON-ACK.
+use findx2_ipc::{StopToken, DurableStopReceipt};
 use findx2_core::{checkpoint_fence::FreezeRequest, SearchEngine};
 use std::{
     cell::RefCell,
@@ -25,6 +26,8 @@ struct Work {
 }
 pub(crate) struct State {
     key: usize,
+    control: Mutex<Option<mpsc::Sender<Command>>>,
+    index_identity: String,
     work: Mutex<Work>,
     changed: Condvar,
 }
@@ -305,6 +308,9 @@ pub(crate) fn error_snapshot(e: &SearchEngine) -> Option<String> {
 }
 
 enum Command {
+    Commit { token: StopToken, reply: mpsc::Sender<Result<(DurableStopReceipt,String),String>> },
+    Cancel { token: StopToken, reply: mpsc::Sender<Result<(),String>> },
+    PreparedStop { reply: mpsc::Sender<Result<Option<DurableStopReceipt>,String>> },
     Prepare {
         request: FreezeRequest,
         until: Instant,
@@ -335,8 +341,11 @@ impl Owner {
         stop: Arc<AtomicBool>,
     ) -> Result<Self, String> {
         let key = Arc::as_ptr(&engine) as usize;
+        let identity = index.parent().ok_or("index parent missing")?.canonicalize().map_err(|e|e.to_string())?.join(index.file_name().ok_or("index filename missing")?);
         let state = Arc::new(State {
             key,
+            control: Mutex::new(None),
+            index_identity: identity.to_string_lossy().into_owned(),
             work: Mutex::new(Work::default()),
             changed: Condvar::new(),
         });
@@ -348,13 +357,15 @@ impl Owner {
             t.insert(key, Arc::downgrade(&state));
         }
         let (tx, rx) = mpsc::channel();
+        *state.control.lock().unwrap()=Some(tx.clone());
         let s = state.clone();
         let thread=std::thread::Builder::new().name("findx2-prepare-actor".into()).spawn(move||{
+   let mut prepared_token:Option<StopToken>=None;let mut committed:Option<(DurableStopReceipt,String)>=None;
    let mut frame=None;let mut binding:Option<(String,String,Instant,u64,Arc<AtomicBool>)>=None;let mut consumed=HashSet::new();
    loop{
-    if stop.load(Ordering::Acquire){frame.take();binding.take();s.stop_ingress();}
-    if binding.is_some()&&{let w=s.work.lock().unwrap();w.failed.is_some()||!w.errors.is_empty()}{frame.take();binding.take();s.reopen();}
-    if binding.as_ref().is_some_and(|b|Instant::now()>=b.2||b.4.load(Ordering::Acquire)){frame.take();binding.take();s.reopen();}
+    if stop.load(Ordering::Acquire){if committed.is_none(){frame.take();binding.take();prepared_token.take();}s.stop_ingress();}
+    if committed.is_none()&&binding.is_some()&&{let w=s.work.lock().unwrap();w.failed.is_some()||!w.errors.is_empty()}{frame.take();binding.take();s.reopen();}
+    if committed.is_none()&&binding.as_ref().is_some_and(|b|Instant::now()>=b.2||b.4.load(Ordering::Acquire)){frame.take();binding.take();s.reopen();}
     match rx.recv_timeout(Duration::from_millis(20)){
      Ok(Command::Prepare{request,until,cancel,reply})=>{
       if binding.is_some()||stop.load(Ordering::Acquire){let _=reply.send(Err("already prepared or stopping; no ACK".into()));continue;}
@@ -364,7 +375,9 @@ impl Owner {
       match result{
        Ok((epoch,f)) if !stop.load(Ordering::Acquire)&&!cancel.load(Ordering::Acquire)&&Instant::now()<until=>{
         let observation=serde_json::json!({"upgrade_ack":false,"managed_work_drained":true,"outcome_epoch":epoch,"process_stopped":false,"core":f.evidence()});
-        let generation=observation["core"]["published_generation"].as_u64().expect("serialized u64 generation");let token=cancel.clone();frame=Some(f);binding=Some((instance,nonce,until,generation,cancel));
+        let generation=observation["core"]["published_generation"].as_u64().expect("serialized u64 generation");let core=&observation["core"];
+        prepared_token=Some(StopToken{protocol_version:2,engine_instance:instance.clone(),service_pid:std::process::id(),request_nonce:nonce.clone(),index_identity:core["index_identity"].as_str().unwrap().into(),mutation_sequence:core["mutation_sequence"].as_u64().unwrap(),published_generation:generation,outcome_epoch:epoch});
+        let token=cancel.clone();frame=Some(f);binding=Some((instance,nonce,until,generation,cancel));
         match s.publish_if_current(epoch,||!stop.load(Ordering::Acquire)&&!token.load(Ordering::Acquire)&&Instant::now()<until,||reply.send(Ok(observation))){
          Ok(Ok(()))=>{},
          Ok(Err(_))=>{frame.take();binding.take();s.reopen();},
@@ -375,10 +388,29 @@ impl Owner {
        Err(e)=>{s.reopen();let _=reply.send(Err(e));}
       }
      }
+     Ok(Command::Commit{token,reply})=>{
+      if let Some((receipt,path))=&committed {let _=reply.send(if receipt.token==token{Ok((receipt.clone(),path.clone()))}else{Err("different committed request".into())});continue;}
+      let valid=prepared_token.as_ref()==Some(&token)&&frame.as_ref().is_some_and(|f|serde_json::to_value(f.evidence()).ok().is_some_and(|v|v["metadata_ready"]==true))&&binding.as_ref().is_some_and(|b|Instant::now()<b.2&&!b.4.load(Ordering::Acquire))&&!stop.load(Ordering::Acquire);
+      if !valid {let _=reply.send(Err("wrong/expired instance nonce index sequence generation or epoch; no receipt".into()));continue;}
+      let until=binding.as_ref().unwrap().2;
+      let result=s.publish_if_current(token.outcome_epoch,||Instant::now()<until&&!stop.load(Ordering::Acquire),||write_terminal_receipt(&index,&token,until)).and_then(|v|v);
+      match result {Ok(v)=>{committed=Some(v.clone());let _=reply.send(Ok(v));},Err(e)=>{frame.take();binding.take();prepared_token.take();s.reopen();let _=reply.send(Err(e));}}
+     }
+     Ok(Command::Cancel{token,reply})=>{
+      if committed.is_some(){let _=reply.send(Err("already durably committed; sealed safe state, request normal SCM STOP".into()));}
+      else if prepared_token.as_ref()==Some(&token)&&frame.is_some(){frame.take();binding.take();prepared_token.take();s.reopen();let _=reply.send(Ok(()));}
+      else{let _=reply.send(Err("no current exact preparation; no cancellation".into()));}
+     }
+     Ok(Command::PreparedStop{reply})=>{
+      let w=s.work.lock().unwrap();
+      let result=if let Some((receipt,_))=&committed {if frame.is_some()&&w.active==0&&w.errors.is_empty()&&w.failed.is_none()&&w.outcome_epoch==receipt.token.outcome_epoch{Ok(Some(receipt.clone()))}else{Err("committed frame/outcome changed; keep RAM sealed, no successful STOP".into())}}else{Ok(None)};
+      let _=reply.send(result);
+     }
      Ok(Command::Abort{instance,nonce,generation,reply})=>{
-      if binding.as_ref().is_some_and(|b|b.0==instance&&b.1==nonce&&b.3==generation){frame.take();binding.take();s.reopen();let _=reply.send(Ok(()));}else{let _=reply.send(Err("stale instance/nonce or expired prepare".into()));}
+      if committed.is_none()&&binding.as_ref().is_some_and(|b|b.0==instance&&b.1==nonce&&b.3==generation){frame.take();binding.take();s.reopen();let _=reply.send(Ok(()));}else{let _=reply.send(Err("stale instance/nonce or expired prepare".into()));}
      }
      Ok(Command::DrainStop{until,reply})=>{
+      if committed.is_some(){let _=reply.send(Err("terminal checkpoint retained; use prepared_stop, never reopen and resave".into()));continue;}
       frame.take();binding.take();s.stop_ingress();
       let result=s.close_drain(until,&AtomicBool::new(false),None).map(|_|{let mut w=s.work.lock().unwrap();w.active+=1;*w.sources.entry("stop-final-save").or_default()+=1;Reservation{state:s.clone(),source:"stop-final-save",admitted_epoch:w.outcome_epoch,failure:None,required:false,completed:false,recover:false}});
       let _=reply.send(result);
@@ -393,6 +425,9 @@ impl Owner {
             tx,
             thread: Some(thread),
         })
+    }
+    pub(crate) fn prepared_stop(&self)->Result<Option<DurableStopReceipt>,String>{
+        let(tx,rx)=mpsc::channel();self.tx.send(Command::PreparedStop{reply:tx}).map_err(|e|e.to_string())?;rx.recv().map_err(|e|e.to_string())?
     }
     pub(crate) fn retained_errors(&self) -> Vec<String> {
         let w = self.state.work.lock().unwrap();
@@ -455,6 +490,50 @@ impl Drop for Owner {
         }
         table().lock().unwrap().remove(&self.state.key);
     }
+}
+
+// The real save_full writer has already synced/published the exact bound generation,
+// and its FrozenCheckpoint still owns namespace AND publication exclusion here.
+fn write_terminal_receipt(index:&std::path::Path, token:&StopToken, until:Instant)->Result<(DurableStopReceipt,String),String>{
+    use std::io::Write;
+    let path=findx2_core::V6Layout::for_index(index).dir.join(format!("stop-{}-{}.json",token.engine_instance,token.request_nonce));
+    let tmp=path.with_extension("tmp");
+    let receipt=DurableStopReceipt{token:token.clone(),state:"saved_stop_pending".into(),process_stopped:false};
+    let result=(||{
+        if Instant::now()>=until{return Err("commit deadline before receipt IO".to_string());}
+        let mut file=std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(|e|format!("receipt create: {e}"))?;
+        file.write_all(&serde_json::to_vec(&receipt).map_err(|e|e.to_string())?).map_err(|e|format!("receipt write: {e}"))?;
+        file.sync_all().map_err(|e|format!("receipt sync: {e}"))?;drop(file);
+        if Instant::now()>=until{return Err("commit deadline after receipt IO; no ACK".into());}
+        findx2_core::persist_tx::atomic_rename_replace(&tmp,&path).map_err(|e|format!("receipt publish: {e}"))?;
+        if Instant::now()>=until{let _=std::fs::remove_file(&path);return Err("late receipt publish; no ACK".into());}
+        Ok((receipt,path.to_string_lossy().into_owned()))
+    })();if result.is_err(){let _=std::fs::remove_file(tmp);}result
+}
+
+/// Only the Windows pipe transport with a verified elevated client calls this.
+pub(crate) fn management(e:&SearchEngine, req:findx2_ipc::IpcRequest)->findx2_ipc::IpcResponse{
+    use findx2_ipc::{IpcRequest as Q,IpcResponse as R};
+    let result=(||->Result<R,String>{
+        let s=lookup(e).ok_or("runtime lifecycle unavailable")?;
+        let tx=s.control.lock().unwrap().clone().ok_or("actor unavailable")?;
+        match req{
+            Q::CheckpointIdentity{protocol_version:2}=>Ok(R::CheckpointIdentityResult{protocol_version:2,engine_instance:e.checkpoint_instance()?,service_pid:std::process::id(),index_identity:s.index_identity.clone()}),
+            Q::PrepareStop{protocol_version:2,expected_instance,request_nonce,index_identity,timeout_ms}=>{
+                if index_identity!=s.index_identity||!(50..=120000).contains(&timeout_ms){return Err("wrong index or timeout bound".into());}
+                if crate::watch_health::watch_error_summary().is_some()||e.backfill_error_snapshot().is_some(){return Err("native watch/backfill unhealthy; no prepare".into());}
+                let until=Instant::now()+Duration::from_millis(timeout_ms);let cancel=Arc::new(AtomicBool::new(false));let(a,b)=mpsc::channel();
+                tx.send(Command::Prepare{request:FreezeRequest{protocol_version:1,expected_instance,nonce:request_nonce},until,cancel:cancel.clone(),reply:a}).map_err(|e|e.to_string())?;
+                let observed=match b.recv_timeout(Duration::from_millis(timeout_ms)){Ok(v)=>v?,Err(_)=>{cancel.store(true,Ordering::Release);return Err("prepare timeout; RAM retained, no receipt".into())}};
+                let c=&observed["core"];
+                if c["metadata_ready"]!=true {let(a,_)=mpsc::channel();let _=tx.send(Command::Abort{instance:c["engine_instance"].as_str().unwrap().into(),nonce:c["request_nonce"].as_str().unwrap().into(),generation:c["published_generation"].as_u64().unwrap(),reply:a});return Err("metadata not ready; preparation aborted".into());}
+                Ok(R::StopPrepared{token:StopToken{protocol_version:2,engine_instance:c["engine_instance"].as_str().unwrap().into(),service_pid:std::process::id(),request_nonce:c["request_nonce"].as_str().unwrap().into(),index_identity:c["index_identity"].as_str().unwrap().into(),mutation_sequence:c["mutation_sequence"].as_u64().unwrap(),published_generation:c["published_generation"].as_u64().unwrap(),outcome_epoch:observed["outcome_epoch"].as_u64().unwrap()}})
+            },
+            Q::CommitStop{token}=>{let(a,b)=mpsc::channel();tx.send(Command::Commit{token,reply:a}).map_err(|e|e.to_string())?;let(receipt,receipt_path)=b.recv().map_err(|e|e.to_string())??;Ok(R::StopCommitted{receipt,receipt_path})},
+            Q::CancelStop{token}=>{let(a,b)=mpsc::channel();tx.send(Command::Cancel{token,reply:a}).map_err(|e|e.to_string())?;b.recv().map_err(|e|e.to_string())??;Ok(R::StopCancelled)},
+            _=>Err("unsupported management protocol; refuse before STOP".into())
+        }
+    })();result.unwrap_or_else(|message|R::Error{message})
 }
 
 #[cfg(all(test, windows))]
@@ -916,5 +995,47 @@ mod tests {
         assert!(!published);
         drop(o);
         std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+    fn token(v:&serde_json::Value)->StopToken{
+        let c=&v["core"];StopToken{protocol_version:2,engine_instance:c["engine_instance"].as_str().unwrap().into(),service_pid:std::process::id(),request_nonce:c["request_nonce"].as_str().unwrap().into(),index_identity:c["index_identity"].as_str().unwrap().into(),mutation_sequence:c["mutation_sequence"].as_u64().unwrap(),published_generation:c["published_generation"].as_u64().unwrap(),outcome_epoch:v["outcome_epoch"].as_u64().unwrap()}
+    }
+    fn commit(o:&Owner,t:StopToken)->Result<(DurableStopReceipt,String),String>{let(a,b)=mpsc::channel();o.tx.send(Command::Commit{token:t,reply:a}).unwrap();b.recv_timeout(Duration::from_secs(3)).unwrap()}
+    #[test]
+    fn terminal_real_writer_generation_and_seals_survive_stop_no_resave(){
+        let(p,e,o,stop)=fixture("terminal-success");e.index_store_mut().metadata_ready=true;
+        let i=idx(&e);e.patch_entry_metadata(i,981,0,0).unwrap();
+        let v=o.prepare(req(&e,'T'),until(),Arc::new(AtomicBool::new(false))).unwrap();let t=token(&v);
+        for field in 0..8{let mut bad=t.clone();match field{0=>bad.protocol_version=1,1=>bad.engine_instance.push('x'),2=>bad.service_pid+=1,3=>bad.request_nonce.push('x'),4=>bad.index_identity.push('x'),5=>bad.mutation_sequence+=1,6=>bad.published_generation+=1,_=>bad.outcome_epoch+=1};assert!(commit(&o,bad).is_err());}
+        let(saved,path)=commit(&o,t.clone()).unwrap();assert!(!saved.process_stopped);assert_eq!(saved.state,"saved_stop_pending");assert_eq!(serde_json::from_slice::<DurableStopReceipt>(&std::fs::read(path).unwrap()).unwrap(),saved);
+        let(read_tx,read_rx)=mpsc::channel();let worker=e.clone();let blocked=std::thread::spawn(move||{worker.patch_entry_metadata(i,999,0,0).unwrap();read_tx.send(()).unwrap();});
+        assert!(read_rx.recv_timeout(Duration::from_millis(30)).is_err());
+        stop.store(true,Ordering::Release);assert_eq!(o.prepared_stop().unwrap(),Some(saved.clone()));assert_eq!(commit(&o,t).unwrap().0,saved);assert!(o.drain_stop(until()).is_err());
+        assert_eq!(size(&p),981);assert!(read_rx.recv_timeout(Duration::from_millis(30)).is_err(),"STOP reopened actual namespace fence");
+        drop(o);blocked.join().unwrap();std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn terminal_real_receipt_io_failure_releases_for_retry_without_clearing_ram(){
+        let(p,e,o,_)=fixture("terminal-receipt-failure");e.index_store_mut().metadata_ready=true;let i=idx(&e);e.patch_entry_metadata(i,1234,0,0).unwrap();
+        let v=o.prepare(req(&e,'R'),until(),Arc::new(AtomicBool::new(false))).unwrap();let t=token(&v);
+        let path=findx2_core::V6Layout::for_index(&p).dir.join(format!("stop-{}-{}.json",t.engine_instance,t.request_nonce));std::fs::create_dir(path.with_extension("tmp")).unwrap();
+        assert!(commit(&o,t.clone()).unwrap_err().contains("receipt create"));assert!(!path.exists());assert!(o.prepared_stop().unwrap().is_none());assert!(commit(&o,t).is_err());
+        assert_eq!(e.index_store().entries[i].size,1234);e.patch_entry_metadata(i,4321,0,0).unwrap();
+        let v=o.prepare(req(&e,'S'),until(),Arc::new(AtomicBool::new(false))).unwrap();let t=token(&v);assert!(commit(&o,t).is_ok());assert_eq!(size(&p),4321);drop(o);std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn terminal_metadata_not_ready_never_receipts_even_with_guessed_complete_token(){
+        let(p,e,o,_)=fixture("terminal-metadata-incomplete");let v=o.prepare(req(&e,'M'),until(),Arc::new(AtomicBool::new(false))).unwrap();assert!(commit(&o,token(&v)).is_err());drop(o);std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+}
+
+#[cfg(all(test,windows))]
+mod terminal_tests {
+    use super::*;
+    #[test]
+    fn terminal_token_has_no_default_identity_or_generation_and_public_dispatch_refuses(){
+        assert!(serde_json::from_str::<StopToken>(r#"{"protocol_version":2}"#).is_err());
+        let slot=Arc::new(std::sync::RwLock::new(None));
+        assert!(matches!(crate::ipc_dispatch::process_request(&slot,findx2_ipc::IpcRequest::CheckpointIdentity{protocol_version:2}),findx2_ipc::IpcResponse::Error{..}));
     }
 }
