@@ -249,7 +249,7 @@ try{
  $null=New-ItemProperty -Path ('HKLM:\SYSTEM\CurrentControlSet\Services\'+$name) -Name Environment -PropertyType MultiString -Value @('ProgramData='+(Join-Path $base 'programdata'))
  Start-Service $name;Wait-Condition {Ready} 60 'Exact installer-source engine did not reach real native readiness'
  $appHash=(Get-FileHash $ServiceExe).Hash;$tx=Join-Path $case 'transaction-backup-failure'
- $helper=Join-Path $repo 'installer\upgrade-transaction.ps1';$uninstall='Software\Microsoft\Windows\CurrentVersion\Uninstall\'+$name
+ $helper=Join-Path $repo 'installer\upgrade-transaction.ps1';$uninstall='FindXUpgradeTest-'+$name+'_is1'
  $args=@('-NoProfile','-NonInteractive','-File',$helper,'-Phase','Prepare','-TransactionRoot',$tx,'-InstallRoot',$app,'-DataRoot',$data,'-NativeConfigRoot',$nativeConfig,'-LegacyConfigRoot',$legacyConfig,'-ServiceName',$name,'-PipeName',$script:pipeName,'-ExpectedVersion','2.5.3','-TimeoutSeconds','20','-UninstallKey',$uninstall,'-TestBuild','-Fault','backup')
  & powershell.exe @args *> (Join-Path $artifact 'official-installer-prepare-backup-failure.log');$helperExit=$LASTEXITCODE
  Assert ($helperExit -ne 0) 'Expected real official backup-stage failure did not happen'
