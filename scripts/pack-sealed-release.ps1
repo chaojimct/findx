@@ -30,7 +30,7 @@ $matrix=Get-Content -LiteralPath $proofs[0].FullName -Raw -Encoding UTF8 | Conve
 Require ($matrix.passed -eq 12 -and $matrix.failed -eq 0 -and @($matrix.cases).Count -eq 12 -and @($matrix.cases | Where-Object {-not $_.passed}).Count -eq 0 -and $matrix.candidateGuiSha256 -ieq ($lock.files | Where-Object name -eq 'FindX.exe').sha256) 'Actual final12 matrix mismatch'
 $head=Invoke-SealGit -arguments @('rev-parse','HEAD')
 foreach($path in @('crates','gui','installer','Cargo.toml','Cargo.lock','scripts/check_release.py')){Require ((Invoke-SealGit -arguments @('rev-parse',('HEAD:'+$path))) -eq (Invoke-SealGit -arguments @('rev-parse',($lock.testedCommit+':'+$path)))) ('Untested runtime/installer/checker source change: '+$path)}
-$helperPaths=@('installer/FindX.iss','installer/transaction-files.psm1','installer/transaction-platform.psm1','installer/upgrade-transaction.ps1','installer/Languages/ChineseSimplified.isl','installer/Languages/Default.isl','gui/src-tauri/icons/icon.ico','scripts/check_release.py')
+$helperPaths=@('installer/FindX.iss','installer/transaction-files.psm1','installer/transaction-platform.psm1','installer/transaction-receipt.psm1','installer/upgrade-transaction.ps1','installer/Languages/ChineseSimplified.isl','installer/Languages/Default.isl','gui/src-tauri/icons/icon.ico','scripts/check_release.py')
 Require (@($lock.helpers).Count -eq $helperPaths.Count) 'Helper lock incomplete'
 foreach($h in $lock.helpers){Require ($h.path -cin $helperPaths -and (Invoke-SealGit -arguments @('rev-parse',($lock.testedCommit+':'+$h.path))) -eq $h.gitBlob) 'Exact tested helper Git blob mismatch'}
 if($ValidateOnly){Write-Output 'SEALED_INPUT_VALIDATED_6_HASHES_TESTED_SOURCE_AND_12_CASES';return}
@@ -64,7 +64,7 @@ if($Production -or $BuildFixture){
   & $Extractor '-x' '-y' ('-d'+$unpacked) $fixture *> (Join-Path $out 'fixture-unpack.log');Require ($LASTEXITCODE -eq 0) 'Fixture read-only extraction failed'
   CheckFiles (Join-Path $unpacked '{app}')
   Require ((Hash (Join-Path $unpacked '{app}/payload-manifest.json')) -eq $lock.stageManifestSha256) 'Embedded stage manifest changed'
-  foreach($name in @('transaction-files.psm1','transaction-platform.psm1','upgrade-transaction.ps1')){$found=@(Get-ChildItem -LiteralPath $unpacked -Recurse -File -Filter $name);Require ($found.Count -eq 1 -and (Hash $found[0].FullName) -eq (Hash (Join-Path $bundle ('source/installer/'+$name)))) ('Embedded helper differs: '+$name)}
+  foreach($name in @('transaction-files.psm1','transaction-platform.psm1','transaction-receipt.psm1','upgrade-transaction.ps1')){$found=@(Get-ChildItem -LiteralPath $unpacked -Recurse -File -Filter $name);Require ($found.Count -eq 1 -and (Hash $found[0].FullName) -eq (Hash (Join-Path $bundle ('source/installer/'+$name)))) ('Embedded helper differs: '+$name)}
   Copy-Item -LiteralPath $fixture -Destination (Join-Path $bundle 'FindX-2.5.3-fixture-setup.exe')
   $receipt['fixtureSha256']=Hash $fixture
  }

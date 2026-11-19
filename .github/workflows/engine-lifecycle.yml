@@ -10,6 +10,8 @@ on:
       - 'crates/findx2-gui-native/**'
       - '.github/workflows/engine-lifecycle.yml'
       - 'scripts/test-engine-native-runtime.ps1'
+      - 'installer/transaction-*.psm1'
+      - 'installer/upgrade-transaction.ps1'
       - 'scripts/test-owned-ntfs-volume.psm1'
   workflow_dispatch:
 permissions:

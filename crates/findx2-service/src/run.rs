@@ -586,8 +586,12 @@ pub(crate) fn run_foreground(
             Err(_) => worker_errors.push("watch worker panicked during shutdown".into()),
         }
     }
-    if let Some(receipt)=lifecycle.prepared_stop().map_err(anyhow::Error::msg)? {
-        if !worker_errors.is_empty(){anyhow::bail!("sealed checkpoint saved but watcher stop failed: {}",worker_errors.join("; "));}
+    // An uncertain committed outcome MUST NOT unwind Owner/drop its RAM/fences.
+    // A real joined worker failure is permanent until explicit operator recovery;
+    // transient receipt/pointer IO is retried while the same sealed RAM lives.
+    if !worker_errors.is_empty(){lifecycle.retain_terminal_failure(format!("watch worker shutdown failed: {}",worker_errors.join("; ")));}
+    let prepared=loop{match lifecycle.prepared_stop(){Ok(v)=>break v,Err(e)=>{error!("STOP PENDING: terminal receipt verification failed; sealed RAM retained, no ACK: {e}");std::thread::sleep(Duration::from_secs(1));}}};
+    if let Some(receipt)=prepared {
         info!(?receipt,"exact sealed terminal checkpoint retained through normal STOP; process_stopped remains externally observed");
         return Ok(());
     }

@@ -101,6 +101,7 @@ Source: "{#PublishDir}\FindX.installed"; DestDir: "{app}"; Flags: ignoreversion;
 Source: "{#PublishDir}\stage-manifest.json"; DestDir: "{app}"; DestName: "payload-manifest.json"; Flags: ignoreversion; Components: main
 Source: "transaction-files.psm1"; Flags: dontcopy
 Source: "transaction-platform.psm1"; Flags: dontcopy
+Source: "transaction-receipt.psm1"; Flags: dontcopy
 Source: "upgrade-transaction.ps1"; Flags: dontcopy
 
 ; stage 由 stage-inno.ps1 生成。勿用单条 "{#PublishDir}\*"：Inno 编译器要求根目录至少有一个能匹配 * 的文件；
@@ -291,6 +292,7 @@ begin
 #endif
   ExtractTemporaryFile('transaction-files.psm1');
   ExtractTemporaryFile('transaction-platform.psm1');
+  ExtractTemporaryFile('transaction-receipt.psm1');
   ExtractTemporaryFile('upgrade-transaction.ps1');
   TxStarted := True;
   TxPrepared := TxCall('Prepare');

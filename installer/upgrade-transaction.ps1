@@ -14,6 +14,7 @@ $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.ServiceProcess
 Import-Module (Join-Path $PSScriptRoot 'transaction-files.psm1') -Force -Global
 Import-Module (Join-Path $PSScriptRoot 'transaction-platform.psm1') -Force -Global
+Import-Module (Join-Path $PSScriptRoot 'transaction-receipt.psm1') -Force -Global
 $script:s=$null; $script:lock=$null
 function Save-State {
  $temp=Join-Path $TransactionRoot ('journal.'+[guid]::NewGuid().ToString('N')+'.tmp')
@@ -103,6 +104,7 @@ function Stop-ExactService {
 }
 function Restore-OriginalRuntime {
  $v=Get-ExactService
+ if($script:s.PSObject.Properties.Name -contains 'terminalHandoff' -and $script:s.terminalHandoff -and $script:s.terminalHandoff.stage -notin @('stopped','cancelled')){throw 'Terminal handoff remains uncertain/committed and sealed; RAM retained, runtime restoration NOT claimed'}
  if($script:s.original.serviceRunning -and $v -and $v.State -eq 'Stopped'){
   Start-Service -Name $script:s.serviceName
   $controller=[ServiceProcess.ServiceController]::new($script:s.serviceName)
@@ -246,7 +248,7 @@ try{
   if(Test-Path -LiteralPath (Join-Path $TransactionRoot 'journal.json')){throw 'Unfinished/existing transaction requires recovery, not overwrite'}
   if(Test-Path -LiteralPath $TransactionRoot){throw 'Transaction root must be new; prior evidence retained'}
   Set-FxTxPrivateDirectory $TransactionRoot
-  $script:s=[pscustomobject]@{schema=2;installerOwner=$null;state='created';roots=[pscustomobject]$roots;serviceName=$ServiceName;pipeName=$PipeName;expectedVersion=$ExpectedVersion;installService=($InstallService -eq 1);timeoutSeconds=$TimeoutSeconds;testVolume='C:';ownedTestVolume=$false;testBuild=[bool]$TestBuild;fault=$Fault;platform=$null;backupVerified=$false;createdService=$false;original=[pscustomobject]@{serviceExists=$false;serviceRunning=$false;guiRunning=$false;guiStopped=$false;guiExitRequested=$false;serviceCommand='';serviceStartMode=''};error=''}
+  $script:s=[pscustomobject]@{schema=2;installerOwner=$null;state='created';roots=[pscustomobject]$roots;serviceName=$ServiceName;pipeName=$PipeName;expectedVersion=$ExpectedVersion;installService=($InstallService -eq 1);timeoutSeconds=$TimeoutSeconds;testVolume='C:';ownedTestVolume=$false;testBuild=[bool]$TestBuild;fault=$Fault;platform=$null;backupVerified=$false;createdService=$false;terminalHandoff=$null;original=[pscustomobject]@{serviceExists=$false;serviceRunning=$false;guiRunning=$false;guiStopped=$false;guiExitRequested=$false;serviceCommand='';serviceStartMode=''};error=''}
   $script:lock=[IO.File]::Open((Join-Path $TransactionRoot 'phase.lock'),'OpenOrCreate','ReadWrite','None')
   if($TestVolumeImage){
    if(-not $TestBuild){throw 'Test volume is forbidden in production'}
@@ -269,20 +271,19 @@ try{
   $svc=Get-ExactService
   if($svc){$script:s.original.serviceExists=$true;$script:s.original.serviceRunning=($svc.State -eq 'Running');$script:s.original.serviceCommand=$svc.PathName;$script:s.original.serviceStartMode=$svc.StartMode;if($svc.State -notin @('Running','Stopped')){throw 'Service in transition; unchanged'}}
   $script:s.original.guiRunning=((Get-InstalledGui).Count -gt 0); Save-State
-  if($script:s.original.serviceRunning){
-   # Published 2.5.2 has no durable-save ACK. A stop/exit0 or old valid checksum
-   # cannot prove metadata-only dirty state was committed. Never pretend it does.
-   # Production refuses BEFORE stopping a legacy writer or closing its GUI.
-   # Only the explicit isolated-CI adversarial fixture exercises the bounded stop.
-   if($script:s.testBuild -and $script:s.fault -eq 'stop-timeout'){Stop-ExactService}
-   throw 'Legacy running service has no verifiable final-save acknowledgment; refusing before replacement. No production stop was requested.'
-  }
   if(-not $script:s.testBuild){
    $me=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;$session=(Get-Process -Id $PID).SessionId
    $owners=@(Get-CimInstance Win32_Process -Filter "Name='explorer.exe' AND SessionId=$session" | ForEach-Object {(Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid).Sid} | Sort-Object -Unique)
    if($owners.Count -ne 1 -or $owners[0] -ne $me){throw 'Original user profile cannot be verified in this session; no profile or running application changed'}
   }
   foreach($p in $roots.Values){if([IO.Path]::GetPathRoot($p) -ine [IO.Path]::GetPathRoot($TransactionRoot)){throw 'Cross-volume atomic recovery is unsupported; refused before replacement'}}
+  if($script:s.original.serviceRunning){
+   # Old252 still fails version/typed protocol BEFORE stop. New engine must
+   # provide an authenticated exact terminal receipt plus real offline validation.
+   if($script:s.testBuild -and $script:s.fault -eq 'stop-timeout'){Stop-ExactService;throw 'Expected isolated stop-timeout fixture did not time out'}
+   $null=Invoke-FxTxPreparedServiceStop -ServiceName $ServiceName -PipeName $PipeName -Image (Join-Path $roots.app 'findx2-service.exe') -Index (Join-Path $roots.data 'index.bin') -Cli (Join-Path $roots.app 'findx2.exe') -ExpectedVersion $ExpectedVersion -Evidence $TransactionRoot -TimeoutSeconds $TimeoutSeconds -OnState {param($Handoff) $script:s.terminalHandoff=$Handoff;Save-State}
+
+  }
   Request-NormalGuiExit
   Enable-FxTxFullSecurity
   Set-State 'quiesced'

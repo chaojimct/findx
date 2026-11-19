@@ -10,12 +10,14 @@ $name='FindX2Search'
 if(Get-Service -Name $name -ErrorAction SilentlyContinue){throw 'Service already exists; refuse to touch any pre-existing registration'}
 Import-Module (Join-Path $PSScriptRoot 'test-owned-ntfs-volume.psm1') -Force
 Import-Module (Join-Path $repo 'installer\transaction-platform.psm1') -Force
+Import-Module (Join-Path $repo 'installer\transaction-files.psm1') -Force
+Import-Module (Join-Path $repo 'installer\transaction-receipt.psm1') -Force
 $base=Join-Path $env:RUNNER_TEMP ('FindXUpgradeTest_'+[guid]::NewGuid().ToString('N'))
 $null=[IO.Directory]::CreateDirectory($base)
 $artifact=Join-Path $repo 'native-runtime-evidence'
 $null=[IO.Directory]::CreateDirectory($artifact)
 $rows=[Collections.Generic.List[object]]::new()
-$owned=$null;$created=$false;$originalAcl=$null;$v6=$null;$script:stage='initializing'
+$owned=$null;$created=$false;$originalAcl=$null;$v6=$null;$receiptAcl=$null;$receiptFile=$null;$script:stage='initializing'
 function Stage([string]$Name){$script:stage=$Name;[ordered]@{stage=$Name;time=(Get-Date -Format o)}|ConvertTo-Json|Set-Content -Encoding UTF8 (Join-Path $artifact 'stage.json');Write-Host ('NATIVE STAGE: '+$Name)}
 function Capture-NativeDiagnostics {
  if($created){try{Service-State|Select-Object Name,State,ProcessId,ExitCode,ServiceSpecificExitCode,PathName,StartName|ConvertTo-Json|Set-Content -Encoding UTF8 (Join-Path $artifact 'last-owned-scm-state.json')}catch{}}
@@ -182,6 +184,11 @@ try{
  # A real OS write occurs AFTER RAM was sealed; it must not enter the sealed disk snapshot.
  $lateFile='after-sealed-boundary.txt';$lateBody='journal-only-after-seal'
  [IO.File]::WriteAllText((Join-Path $owned.Root ('native-runtime\'+$lateFile)),$lateBody,[Text.Encoding]::ASCII)
+ Stage 'durable-commit-client-reply-not-consumed-exact-retry'
+ $receiptFile=Join-Path $v6 ('stop-'+$prepared.token.engine_instance+'-'+$prepared.token.request_nonce+'.json')
+ $lost=[IO.Pipes.NamedPipeClientStream]::new('.',$script:pipeName,[IO.Pipes.PipeDirection]::InOut,[IO.Pipes.PipeOptions]::Asynchronous,[Security.Principal.TokenImpersonationLevel]::Impersonation)
+ try{$lost.Connect(1000);[uint32]$lostServer=0;Assert ([FxTxProcessNative]::GetNamedPipeServerProcessId($lost.SafePipeHandle.DangerousGetHandle(),[ref]$lostServer) -and $lostServer -eq $prepared.token.service_pid) 'Lost reply pipe owner mismatch';$bytes=[Text.Encoding]::UTF8.GetBytes((@{type='commit_stop';token=$prepared.token}|ConvertTo-Json -Depth 10 -Compress)+"`n");$lost.Write($bytes,0,$bytes.Length);$lost.Flush();Wait-Condition {[IO.File]::Exists($receiptFile)} 5 'Did not really reach durable commit before dropping unread client reply'}finally{$lost.Dispose()}
+ @{responseConsumed=$false;durableFileObserved=$true;requestNonce=$prepared.token.request_nonce;note='consumer loss, not claiming a forced server-side socket write failure'}|ConvertTo-Json|Set-Content (Join-Path $artifact 'actual-unconsumed-commit-response.json')
  $committed=Rpc @{type='commit_stop';token=$prepared.token}
  Assert ($committed.type -eq 'stop_committed' -and $committed.receipt.state -eq 'saved_stop_pending' -and -not $committed.receipt.process_stopped) 'SCM or observation was substituted for a durable receipt'
  $receipt=Get-Content -LiteralPath $committed.receipt_path -Raw|ConvertFrom-Json
@@ -189,7 +196,21 @@ try{
  Assert ((Rpc @{type='commit_stop';token=$prepared.token}).type -eq 'stop_committed') 'Same-instance exact commit retry was not idempotent'
  Assert ((Rpc @{type='cancel_stop';token=$prepared.token}).type -eq 'error') 'Committed safe seal was reopened by cancellation'
  $committed|ConvertTo-Json -Depth 20|Set-Content (Join-Path $artifact 'actual-durable-stop-receipt.json')
- $terminalPid=(Service-State).ProcessId;$terminal=Stop-Owned
+ Stage 'postcommit-real-receipt-read-denial-stop-pending-retains-seal'
+ $receiptAcl=Get-Acl -LiteralPath $receiptFile;$blocked=Get-Acl -LiteralPath $receiptFile
+ $readDeny=[Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-18'),[Security.AccessControl.FileSystemRights]::ReadData,[Security.AccessControl.AccessControlType]::Deny)
+ $blocked.AddAccessRule($readDeny);Set-Acl -LiteralPath $receiptFile -AclObject $blocked
+ $late=Rpc @{type='commit_stop';token=$prepared.token};$late|ConvertTo-Json -Depth 12|Set-Content (Join-Path $artifact 'actual-postcommit-late-io-error.json')
+ Assert ($late.type -eq 'error' -and $late.message -match 'terminal receipt (read|metadata):.*(denied|拒绝|os error 5|Access)') 'Postcommit failure did not reach actual receipt-read OS fault'
+ $lateCap=Rpc @{type='upgrade_capabilities';protocol_version=1};Assert ($lateCap.runtime_error -match 'terminal receipt') 'Late IO failure hidden from capability diagnostics'
+ $terminalPid=(Service-State).ProcessId;$controller=Get-Service $name;$controller.Stop()
+ Wait-Condition {(Service-State).State -eq 'Stop Pending'} 8 'Late committed failure did not preserve StopPending'
+ [Threading.Thread]::Sleep(1300);$held=Service-State
+ Assert ($held.State -eq 'Stop Pending' -and $held.ProcessId -eq $terminalPid) 'Committed failure unwound Owner/destroyed RAM or exited success'
+ $held|Select-Object State,ProcessId,ExitCode,ServiceSpecificExitCode|ConvertTo-Json|Set-Content (Join-Path $artifact 'actual-postcommit-same-pid-stop-pending.json')
+ Set-Acl -LiteralPath $receiptFile -AclObject $receiptAcl;$receiptAcl=$null
+ $terminal=Stop-Owned
+ $rows.Add(@{test='actual-postcommit-late-os-read-failure-refuses-ack-retains-seal-and-retries';passed=$true;heldPid=$terminalPid;fault=$late.message;responseConsumedBeforeRetry=$false})
  Assert ($terminal.State -eq 'Stopped' -and $terminal.ProcessId -eq 0 -and $terminal.ExitCode -eq 0 -and $terminal.ServiceSpecificExitCode -eq 0) 'Receipt alone did not ensure normal exact-service successful STOP'
  & $verify $index (Join-Path $owned.Root ('native-runtime\'+$file)) $body.Length $prepared.token.published_generation (Join-Path $owned.Root ('native-runtime\'+$lateFile)) |Set-Content (Join-Path $artifact 'prepared-stop-offline-before-replay.json')
  Assert ($LASTEXITCODE -eq 0) 'Sealed receipt generation/data/boundary did not match actual disk BEFORE restart'
@@ -213,11 +234,42 @@ try{
  $failed=Assert-OwnedService
  $failed|Select-Object Name,State,ProcessId,ExitCode,ServiceSpecificExitCode|ConvertTo-Json|Set-Content (Join-Path $artifact 'actual-scm-load-error.json')
  $rows.Add(@{test='actual-corrupt-index-load-error-to-scm';passed=$true;win32=$failed.ExitCode;serviceSpecific=$failed.ServiceSpecificExitCode;scope='load failure, NOT successful final RAM save or save-failure exit'})
+ Stage 'official-installer-real-new-engine-receipt-stop-backup-failure-rollback'
+ # Separate private registration/app/data; run the ACTUAL official Prepare helper.
+ & sc.exe delete $name|Out-File (Join-Path $artifact 'delete-first-native-service.log');Assert ($LASTEXITCODE -eq 0) 'Cannot retire owned first registration';$created=$false
+ $case=Join-Path $base 'installer-native';$app=Join-Path $case 'app';$data=Join-Path $case 'data';$nativeConfig=Join-Path $case 'native-config';$legacyConfig=Join-Path $case 'legacy-config'
+ foreach($dir in @($app,$data,$nativeConfig,$legacyConfig)){$null=[IO.Directory]::CreateDirectory($dir)}
+ $builtImage=$ServiceExe;$builtCli=$cli;$ServiceExe=Join-Path $app 'findx2-service.exe';$cli=Join-Path $app 'findx2.exe'
+ Copy-Item -LiteralPath $builtImage -Destination $ServiceExe;Copy-Item -LiteralPath $builtCli -Destination $cli
+ Assert ((Get-FileHash $builtImage).Hash -ceq (Get-FileHash $ServiceExe).Hash) 'Installer engine is not exact tested source build'
+ Copy-Item -LiteralPath $index -Destination (Join-Path $data 'index.bin');Copy-Item -LiteralPath $v6 -Destination (Join-Path $data 'index.bin.v6') -Recurse
+ $index=Join-Path $data 'index.bin';$v6=$index+'.v6';$name='FindXUpgradeTest_'+[guid]::NewGuid().ToString('N');$script:pipeName='findx-upgrade-test-'+[guid]::NewGuid().ToString('N')
+ $command='"'+$ServiceExe+'" --service --index "'+$index+'" --volume '+$owned.Volume+' --pipe '+$script:pipeName+' --no-everything-ipc --save-interval-secs 1'
+ $null=New-Service -Name $name -BinaryPathName $command -StartupType Manual;$created=$true
+ $null=New-ItemProperty -Path ('HKLM:\SYSTEM\CurrentControlSet\Services\'+$name) -Name Environment -PropertyType MultiString -Value @('ProgramData='+(Join-Path $base 'programdata'))
+ Start-Service $name;Wait-Condition {Ready} 60 'Exact installer-source engine did not reach real native readiness'
+ $appHash=(Get-FileHash $ServiceExe).Hash;$tx=Join-Path $case 'transaction-backup-failure'
+ $helper=Join-Path $repo 'installer\upgrade-transaction.ps1';$uninstall='Software\Microsoft\Windows\CurrentVersion\Uninstall\'+$name
+ $args=@('-NoProfile','-NonInteractive','-File',$helper,'-Phase','Prepare','-TransactionRoot',$tx,'-InstallRoot',$app,'-DataRoot',$data,'-NativeConfigRoot',$nativeConfig,'-LegacyConfigRoot',$legacyConfig,'-ServiceName',$name,'-PipeName',$script:pipeName,'-ExpectedVersion','2.5.3','-TimeoutSeconds','20','-UninstallKey',$uninstall,'-TestBuild','-Fault','backup')
+ & powershell.exe @args *> (Join-Path $artifact 'official-installer-prepare-backup-failure.log');$helperExit=$LASTEXITCODE
+ Assert ($helperExit -ne 0) 'Expected real official backup-stage failure did not happen'
+ $journal=Get-Content -LiteralPath (Join-Path $tx 'journal.json') -Raw|ConvertFrom-Json
+ Copy-Item -LiteralPath (Join-Path $tx 'journal.json') -Destination (Join-Path $artifact 'official-installer-rollback-journal.json')
+ $failureText=Get-Content -LiteralPath (Join-Path $tx 'failure.txt') -Raw
+ Assert ($failureText -match 'Injected CI backup failure before any replacement' -and $journal.terminalHandoff.stage -eq 'stopped' -and $journal.terminalHandoff.offlineBeforeReplay -and $journal.state -eq 'rolled_back') 'Failure occurred before actual receipt/STOP/offline/backup stage or rollback not complete'
+ Wait-Condition {Ready} 45 'Official rollback did not restore originally running native service'
+ Assert ((Get-FileHash $ServiceExe).Hash -ceq $appHash -and (Service-State).StartMode -eq 'Manual') 'Backup failure changed actual app/service start policy'
+ Wait-Condition {Has-File $file $body.Length} 30 'Official rollback lost accepted original data'
+ Copy-Item -LiteralPath (Join-Path $tx 'installer-terminal-receipt.json') -Destination (Join-Path $artifact 'official-installer-terminal-receipt.json')
+ Copy-Item -LiteralPath (Join-Path $tx 'terminal-offline-index.log') -Destination (Join-Path $artifact 'official-installer-offline-index.log')
+ $rows.Add(@{test='official-installer-new-engine-prepare-stop-offline-backup-failure-runtime-rollback';passed=$true;targetStage='backup';helperExit=$helperExit;terminal=$journal.terminalHandoff;rollback=$journal.state;realNativeWatch=$true;engineUnchanged=$true})
+
 }catch{
  $rows.Add(@{test='native-runtime-current-stage';stage=$script:stage;passed=$false;error=$_.Exception.Message})
  Capture-NativeDiagnostics
  throw
 }finally{
+ if($receiptAcl -and $receiptFile){Set-Acl -LiteralPath $receiptFile -AclObject $receiptAcl}
  if($originalAcl -and $v6){Set-Acl -LiteralPath $v6 -AclObject $originalAcl}
  $safeDetach=$true
  if($created){

@@ -20,6 +20,7 @@ struct Work {
     stopping: bool,
     active: usize,
     failed: Option<String>,
+    terminal_error: Option<String>,
     sources: HashMap<&'static str, usize>,
     outcome_epoch: u64,
     errors: HashMap<&'static str, (u64, String)>,
@@ -300,9 +301,8 @@ pub(crate) fn error_snapshot(e: &SearchEngine) -> Option<String> {
             .iter()
             .map(|(source, (_, error))| format!("{source}: {error}"))
             .collect();
-        if let Some(e) = &w.failed {
-            errors.push(e.clone());
-        }
+        if let Some(e) = &w.failed { errors.push(e.clone()); }
+        if let Some(e) = &w.terminal_error { errors.push(e.clone()); }
         (!errors.is_empty()).then(|| errors.join("; "))
     })
 }
@@ -389,7 +389,7 @@ impl Owner {
       }
      }
      Ok(Command::Commit{token,reply})=>{
-      if let Some((receipt,path))=&committed {let _=reply.send(if receipt.token==token{Ok((receipt.clone(),path.clone()))}else{Err("different committed request".into())});continue;}
+      if let Some((receipt,path))=&committed {let result=if receipt.token==token{validate_committed(&s,&index,receipt,path,frame.is_some()).map(|_|(receipt.clone(),path.clone()))}else{Err("different committed request".into())};let _=reply.send(result);continue;}
       let valid=prepared_token.as_ref()==Some(&token)&&frame.as_ref().is_some_and(|f|serde_json::to_value(f.evidence()).ok().is_some_and(|v|v["metadata_ready"]==true))&&binding.as_ref().is_some_and(|b|Instant::now()<b.2&&!b.4.load(Ordering::Acquire))&&!stop.load(Ordering::Acquire);
       if !valid {let _=reply.send(Err("wrong/expired instance nonce index sequence generation or epoch; no receipt".into()));continue;}
       let until=binding.as_ref().unwrap().2;
@@ -402,8 +402,7 @@ impl Owner {
       else{let _=reply.send(Err("no current exact preparation; no cancellation".into()));}
      }
      Ok(Command::PreparedStop{reply})=>{
-      let w=s.work.lock().unwrap();
-      let result=if let Some((receipt,_))=&committed {if frame.is_some()&&w.active==0&&w.errors.is_empty()&&w.failed.is_none()&&w.outcome_epoch==receipt.token.outcome_epoch{Ok(Some(receipt.clone()))}else{Err("committed frame/outcome changed; keep RAM sealed, no successful STOP".into())}}else{Ok(None)};
+      let result=if let Some((receipt,path))=&committed {validate_committed(&s,&index,receipt,path,frame.is_some()).map(|_|Some(receipt.clone()))}else{Ok(None)};
       let _=reply.send(result);
      }
      Ok(Command::Abort{instance,nonce,generation,reply})=>{
@@ -426,6 +425,11 @@ impl Owner {
             thread: Some(thread),
         })
     }
+    pub(crate) fn retain_terminal_failure(&self,error:String){
+        let mut w=self.state.work.lock().unwrap();
+        if w.failed.is_none(){w.outcome_epoch=w.outcome_epoch.saturating_add(1);w.failed=Some(error);}
+        w.closed=true;w.stopping=true;self.state.changed.notify_all();
+    }
     pub(crate) fn prepared_stop(&self)->Result<Option<DurableStopReceipt>,String>{
         let(tx,rx)=mpsc::channel();self.tx.send(Command::PreparedStop{reply:tx}).map_err(|e|e.to_string())?;rx.recv().map_err(|e|e.to_string())?
     }
@@ -436,9 +440,8 @@ impl Owner {
             .iter()
             .map(|(source, (_, error))| format!("{source}: {error}"))
             .collect();
-        if let Some(e) = &w.failed {
-            errors.push(e.clone());
-        }
+        if let Some(e) = &w.failed { errors.push(e.clone()); }
+        if let Some(e) = &w.terminal_error { errors.push(e.clone()); }
         errors
     }
     pub(crate) fn drain_stop(&self, until: Instant) -> Result<Activity, String> {
@@ -490,6 +493,26 @@ impl Drop for Owner {
         }
         table().lock().unwrap().remove(&self.state.key);
     }
+}
+
+// Revalidate EVERY committed retry and STOP: neither an old in-memory success nor
+// a lost response may hide later producer errors or actual receipt/pointer IO failure.
+fn validate_committed(state:&State,index:&std::path::Path,receipt:&DurableStopReceipt,path:&str,has_frame:bool)->Result<(),String>{
+    let mut w=state.work.lock().unwrap();
+    let result=(||{
+        if !has_frame||!w.closed||w.active!=0||!w.errors.is_empty()||w.failed.is_some()||w.outcome_epoch!=receipt.token.outcome_epoch{return Err("committed frame/outcome failed; RAM retained sealed, no ACK or successful STOP".to_string());}
+        let meta=std::fs::metadata(path).map_err(|e|format!("terminal receipt metadata: {e}"))?;
+        if meta.len()>16384{return Err("terminal receipt exceeds bound".into());}
+        let bytes=std::fs::read(path).map_err(|e|format!("terminal receipt read: {e}"))?;
+        let disk:DurableStopReceipt=serde_json::from_slice(&bytes).map_err(|e|format!("terminal receipt decode: {e}"))?;
+        if disk!=*receipt{return Err("terminal durable receipt no longer equals committed token".into());}
+        let pointer=findx2_core::persist_tx::read_published(&findx2_core::V6Layout::for_index(index)).map_err(|e|format!("terminal published pointer: {e}"))?.ok_or("terminal published pointer missing")?;
+        if pointer.manifest.generation!=receipt.token.published_generation{return Err("terminal actual disk generation changed; no ACK".into());}
+        Ok(())
+    })();
+    // This diagnostic is NOT a producer mutation epoch. Only a successful actual
+    // receipt+pointer read clears its own transient IO failure; never source errors.
+    w.terminal_error=result.as_ref().err().cloned();result
 }
 
 // The real save_full writer has already synced/published the exact bound generation,
@@ -1025,6 +1048,32 @@ mod tests {
     #[test]
     fn terminal_metadata_not_ready_never_receipts_even_with_guessed_complete_token(){
         let(p,e,o,_)=fixture("terminal-metadata-incomplete");let v=o.prepare(req(&e,'M'),until(),Arc::new(AtomicBool::new(false))).unwrap();assert!(commit(&o,token(&v)).is_err());drop(o);std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn terminal_lost_reply_and_expired_original_deadline_keep_committed_seal_and_retry_identity(){
+        let(p,e,o,stop)=fixture("terminal-lost-reply");e.index_store_mut().metadata_ready=true;
+        let v=o.prepare(req(&e,'L'),Instant::now()+Duration::from_millis(300),Arc::new(AtomicBool::new(false))).unwrap();let t=token(&v);
+        let(a,b)=mpsc::channel();drop(b);o.tx.send(Command::Commit{token:t.clone(),reply:a}).unwrap();
+        let receipt=o.prepared_stop().unwrap().unwrap();assert_eq!(receipt.token,t);
+        std::thread::sleep(Duration::from_millis(330));assert_eq!(commit(&o,t.clone()).unwrap().0,receipt);
+        let(a,b)=mpsc::channel();o.tx.send(Command::Cancel{token:t.clone(),reply:a}).unwrap();assert!(b.recv().unwrap().is_err());
+        stop.store(true,Ordering::Release);assert_eq!(o.prepared_stop().unwrap(),Some(receipt));drop(o);
+        let fresh=Owner::attach(e.clone(),p.clone(),Arc::new(AtomicBool::new(false))).unwrap();assert!(commit(&fresh,t).is_err());drop(fresh);std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn terminal_actual_late_receipt_io_failure_is_not_hidden_and_only_real_repair_allows_retry(){
+        let(p,e,o,stop)=fixture("terminal-late-io");e.index_store_mut().metadata_ready=true;let i=idx(&e);e.patch_entry_metadata(i,2468,0,0).unwrap();
+        let v=o.prepare(req(&e,'I'),until(),Arc::new(AtomicBool::new(false))).unwrap();let t=token(&v);let(saved,path)=commit(&o,t.clone()).unwrap();let bytes=std::fs::read(&path).unwrap();std::fs::remove_file(&path).unwrap();
+        assert!(commit(&o,t.clone()).unwrap_err().contains("terminal receipt"));assert!(error_snapshot(&e).unwrap().contains("terminal receipt"));stop.store(true,Ordering::Release);assert!(o.prepared_stop().is_err());assert_eq!(size(&p),2468);
+        std::fs::write(&path,bytes).unwrap();assert_eq!(o.prepared_stop().unwrap(),Some(saved));assert!(error_snapshot(&e).is_none());assert!(commit(&o,t).is_ok());drop(o);std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn terminal_late_worker_failure_rejects_old_ack_and_retains_actual_fence(){
+        let(p,e,o,stop)=fixture("terminal-late-worker");e.index_store_mut().metadata_ready=true;let v=o.prepare(req(&e,'W'),until(),Arc::new(AtomicBool::new(false))).unwrap();let t=token(&v);commit(&o,t.clone()).unwrap();
+        // This is the exact publication invoked by run.rs AFTER an actual worker join failure.
+        o.retain_terminal_failure("joined native watch worker returned failure".into());stop.store(true,Ordering::Release);
+        assert!(o.prepared_stop().is_err());assert!(commit(&o,t).is_err());assert!(error_snapshot(&e).unwrap().contains("joined native"));assert!(e.try_index_store().is_none(),"failed STOP dropped the authoritative RAM fence");drop(o);std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
     }
 
 }
