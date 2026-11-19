@@ -44,6 +44,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          git fetch origin 200ca19e736f9f0b28c40089f44cd4efb3b2afb4 --depth=1
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          $product=git diff --name-only 200ca19e736f9f0b28c40089f44cd4efb3b2afb4 HEAD -- Cargo.lock Cargo.toml crates installer
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          if(@($product).Count -eq 0){
+            $proof=gh run view 44466141726 --repo chaojimct/findx --json headSha,jobs|ConvertFrom-Json
+            if($LASTEXITCODE -or $proof.headSha -cne '200ca19e736f9f0b28c40089f44cd4efb3b2afb4'){throw 'Exact native module origin unavailable'}
+            if(@($proof.jobs|ForEach-Object {$_.steps}|Where-Object {$_.name -eq 'Preserve exact native test modules for subsequent no-rebuild reuse' -and $_.conclusion -eq 'success'}).Count -ne 1){throw 'Native module archive not established'}
+            'reuse-native=true' >> $env:GITHUB_OUTPUT
+            'parent=true' >> $env:GITHUB_OUTPUT
+            'changed=false' >> $env:GITHUB_OUTPUT
+            exit 0
+          }
           git fetch origin 4afb1a9fc4635be1cdbfb3aa305b4ea19b482342 --depth=1
           if($LASTEXITCODE){exit $LASTEXITCODE}
           $compat=git diff --name-only 4afb1a9fc4635be1cdbfb3aa305b4ea19b482342 HEAD -- Cargo.lock Cargo.toml crates installer scripts/gui-compat-tests scripts/test-namespace-scm.ps1
@@ -141,11 +154,11 @@ jobs:
             'Reuse unchanged ACK/IPC/service lifecycle evidence44446796510; any isolated root-path change receives targeted core tests, not a full-payload claim.'
           }
       - uses: dtolnay/rust-toolchain@stable
-        if: steps.engine-change.outputs.changed == 'true' || steps.engine-change.outputs.focused == 'true' || steps.engine-change.outputs.namespace == 'true' || steps.engine-change.outputs.parent == 'true'
+        if: (steps.engine-change.outputs.changed == 'true' || steps.engine-change.outputs.focused == 'true' || steps.engine-change.outputs.namespace == 'true' || steps.engine-change.outputs.parent == 'true') && steps.engine-change.outputs.reuse-native != 'true'
       - uses: Swatinem/rust-cache@v2
-        if: steps.engine-change.outputs.changed == 'true' || steps.engine-change.outputs.focused == 'true' || steps.engine-change.outputs.namespace == 'true' || steps.engine-change.outputs.parent == 'true'
+        if: (steps.engine-change.outputs.changed == 'true' || steps.engine-change.outputs.focused == 'true' || steps.engine-change.outputs.namespace == 'true' || steps.engine-change.outputs.parent == 'true') && steps.engine-change.outputs.reuse-native != 'true'
       - name: Affected parent recovery and real replacement binding tests
-        if: steps.engine-change.outputs.parent == 'true'
+        if: steps.engine-change.outputs.parent == 'true' && steps.engine-change.outputs.reuse-native != 'true'
         shell: pwsh
         run: |
           if('${{ steps.engine-change.outputs.compat }}' -eq 'true'){
@@ -174,20 +187,44 @@ jobs:
           if($LASTEXITCODE){exit $LASTEXITCODE}
           cargo build --locked -p findx2-windows --example namespace_index_copy
           if($LASTEXITCODE){exit $LASTEXITCODE}
+      - uses: actions/download-artifact@v4
+        if: steps.engine-change.outputs.reuse-native == 'true'
+        with:
+          name: engine-lifecycle-A1-evidence
+          run-id: 44466141726
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/native-exact-reuse
+      - name: Restore only exact hash-verified native modules; no Rust or GUI build
+        if: steps.engine-change.outputs.reuse-native == 'true'
+        shell: pwsh
+        run: |
+          $manifests=@(Get-ChildItem (Join-Path $env:RUNNER_TEMP 'native-exact-reuse') -Filter source-hashes.json -File -Recurse|Where-Object {$_.Directory.Name -ceq 'native-reuse-binaries'})
+          if($manifests.Count -ne 1){throw 'Expected one immutable native source manifest'}
+          $m=Get-Content $manifests[0].FullName -Raw|ConvertFrom-Json
+          $expected=@('findx2-service.exe','findx2.exe','verify_persisted_file.exe','namespace_index_copy.exe')
+          if($m.sourceCommit -cne '200ca19e736f9f0b28c40089f44cd4efb3b2afb4' -or $m.profile -cne 'debug-native-tests-NOT-release' -or @($m.files).Count -ne 4 -or @($m.files.name|Select-Object -Unique).Count -ne 4 -or @($m.files|Where-Object {$_.name -notin $expected}).Count){throw 'Wrong exact native module provenance'}
+          New-Item -ItemType Directory -Force target/debug/examples|Out-Null
+          foreach($f in $m.files){
+            $p=Join-Path $manifests[0].Directory.FullName $f.name
+            if((Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash -cne $f.sha256){throw 'Native module digest mismatch'}
+            $dest=if($f.name -in @('verify_persisted_file.exe','namespace_index_copy.exe')){'target/debug/examples'}else{'target/debug'}
+            Copy-Item -LiteralPath $p -Destination $dest
+          }
       - name: Preserve exact native test modules for subsequent no-rebuild reuse
+        id: native-modules
         if: steps.engine-change.outputs.parent == 'true'
         shell: pwsh
         run: |
           $root='native-reuse-binaries';New-Item -ItemType Directory $root|Out-Null
           foreach($p in @('target/debug/findx2-service.exe','target/debug/findx2.exe','target/debug/examples/verify_persisted_file.exe','target/debug/examples/namespace_index_copy.exe')){Copy-Item $p $root}
           $files=@(Get-ChildItem $root -File|ForEach-Object {@{name=$_.Name;sha256=(Get-FileHash $_.FullName -Algorithm SHA256).Hash}})
-          @{sourceCommit=$env:GITHUB_SHA;profile='debug-native-tests-NOT-release';files=$files}|ConvertTo-Json -Depth 5|Set-Content (Join-Path $root 'source-hashes.json')
+          @{sourceCommit=$(if('${{ steps.engine-change.outputs.reuse-native }}' -eq 'true'){'200ca19e736f9f0b28c40089f44cd4efb3b2afb4'}else{$env:GITHUB_SHA});testCommit=$env:GITHUB_SHA;profile='debug-native-tests-NOT-release';files=$files}|ConvertTo-Json -Depth 5|Set-Content (Join-Path $root 'source-hashes.json')
       - name: Actual owned two-volume canonical root read-only compatibility
         if: steps.engine-change.outputs.parent == 'true'
         shell: powershell
         run: ./scripts/test-combined-roots.ps1
       - name: Actual SCM parent permission retry and live journal/index replacement
-        if: steps.engine-change.outputs.parent == 'true'
+        if: ${{ !cancelled() && steps.native-modules.outcome == 'success' }}
         shell: powershell
         run: ./scripts/test-namespace-scm.ps1 -ServiceExe ./target/debug/findx2-service.exe
       - name: Changed namespace proof and atomic cursor/prefix regressions only

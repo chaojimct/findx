@@ -9,6 +9,14 @@ $base=Join-Path $env:RUNNER_TEMP ('FindXUpgradeTest_roots_'+[guid]::NewGuid().To
 $artifact=Join-Path $repo 'native-combined-evidence';$null=New-Item -ItemType Directory $base,$artifact
 $volumes=[Collections.Generic.List[object]]::new()
 function Assert($ok,$why){if(-not $ok){throw $why}}
+function Native([string]$Exe,[string[]]$NativeArgs,[string]$Label){
+ $quoted=@($NativeArgs|ForEach-Object {if($_ -match '["\r\n]'){throw 'Invalid private native argument'};'"'+$_+'"'}) -join ' '
+ $out=Join-Path $artifact ($Label+'.out');$err=Join-Path $artifact ($Label+'.err')
+ $p=Start-Process -FilePath $Exe -ArgumentList $quoted -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err;$h=$p.Handle
+ Assert ($p.WaitForExit(90000)) 'Native private command timed out; no force'
+ if($p.ExitCode -ne 0){Write-Host ([IO.File]::ReadAllText($err));throw ('Private native command failed: '+$Label+' exit='+$p.ExitCode)}
+ return [IO.File]::ReadAllText($out)
+}
 function Fingerprint($directory){return (@(Get-ChildItem -LiteralPath $directory -Recurse -File|Sort-Object FullName|ForEach-Object {$_.FullName+':'+(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash}) -join "`n")}
 try{
  foreach($i in 1..2){
@@ -19,8 +27,8 @@ try{
  }
  Assert ($volumes[0].Volume -ne $volumes[1].Volume) 'Two distinct attested volumes required'
  $indexRoot=Join-Path $base 'indexes';$null=New-Item -ItemType Directory $indexRoot;$index=Join-Path $indexRoot 'combined.bin';$cli=Join-Path $repo 'target\debug\findx2.exe';$verify=Join-Path $repo 'target\debug\examples\verify_persisted_file.exe'
- & $cli index --volumes ($volumes.Volume -join ',') --output $index --max-scan-threads 1 *> (Join-Path $artifact 'native-two-volume-build.log');Assert ($LASTEXITCODE -eq 0) 'Explicit owned two-volume scan failed'
- $view=& $verify --inspect-index $index;Assert ($LASTEXITCODE -eq 0) 'Canonical combined index read failed'
+ $null=Native $cli @('index','--volumes',($volumes.Volume -join ','),'--output',$index,'--max-scan-threads','1') 'native-two-volume-build'
+ $view=Native $verify @('--inspect-index',$index) 'canonical-two-volume-inspection'
  $view|Set-Content (Join-Path $artifact 'canonical-two-volume.json');$state=$view|ConvertFrom-Json
  Assert ($state.source -eq 'segmented-v6' -and @($state.volumes).Count -eq 2) 'Actual canonical two-volume source required'
  foreach($v in $volumes){Assert (@($state.volumes|Where-Object {$_.root_prefix -ceq $v.Root -and $_.letter -ceq $v.Volume.Substring(0,1)}).Count -eq 1) 'Wrong canonical root/letter'}
@@ -29,7 +37,7 @@ try{
  $before=Fingerprint $indexRoot
  foreach($inputIndex in @($index,$legacy)){
   foreach($restart in 1..2){
-   $json=& $cli search --index $inputIndex root-proof.txt --json;Assert ($LASTEXITCODE -eq 0) 'Offline fresh-process search failed'
+   $json=Native $cli @('search','--index',$inputIndex,'root-proof.txt','--json') (([IO.Path]::GetFileName($inputIndex))+'-reload'+$restart)
    $response=$json|ConvertFrom-Json;$hits=@($response.hits)
    foreach($v in $volumes){Assert (@($hits|Where-Object {$_.path -ceq (Join-Path $v.Root 'root-proof.txt')}).Count -eq 1) 'Cross-volume root collision or missing exact file'}
   }
