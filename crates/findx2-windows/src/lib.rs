@@ -38,3 +38,6 @@ mod ntfs_namespace;
 
 #[cfg(windows)]
 pub use ntfs_namespace::NtfsUnlinkResolver;
+
+#[cfg(windows)] mod ntfs_identity;
+#[cfg(windows)] pub use ntfs_namespace::NamespaceResolveError;

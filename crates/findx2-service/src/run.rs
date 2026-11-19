@@ -770,6 +770,8 @@ fn usn_watch_loop(
     // restart/rebuild is required and resumes from the retained durable watermark.
     let mut namespace_gate = crate::watch_health::NamespaceGate::default();
     let mut unlink_resolver:Option<findx2_windows::NtfsUnlinkResolver>=None;
+    let mut namespace_retry=crate::watch_health::NamespaceRetry::default();
+    let mut namespace_retry_delay=Duration::from_millis(100);
     loop {
         // 停机检查：recv_timeout 只有 50ms 粒度，这里最多 50ms 响应一次。
         // 退出前 flush 内存 pending（游标停在最后 Checkpoint，journal 重放覆盖剩余变更）
@@ -796,7 +798,13 @@ fn usn_watch_loop(
             lifecycle.success();
             continue;
         }
-        match rx.recv_timeout(flush_every) {
+        let (received,retry_binding)=match namespace_retry.take(){
+            Some((events,journal_id,next_usn,binding))=>{
+                std::thread::sleep(namespace_retry_delay);
+                (Ok(findx2_windows::UsnWatchMsg::NamespaceBatch{events,journal_id,next_usn}),Some(binding))
+            },None=>(rx.recv_timeout(flush_every),None)
+        };
+        match received {
             Ok(msg) => match msg {
                 findx2_windows::UsnWatchMsg::NamespaceBatch {
                     events,
@@ -804,7 +812,9 @@ fn usn_watch_loop(
                     next_usn,
                 } => {
                     dirty_count += flush_pending(&mut pending)?;
-                    let prepared=(||->Result<Vec<findx2_core::ChangeEvent>,String>{
+                    let binding=retry_binding.unwrap_or_else(||{let g=engine.index_store();(engine.metadata_epoch(),g.volumes.iter().find(|v|v.volume_letter==volume_letter).map(|v|v.volume_serial).unwrap_or(0))});
+                    let prepared=(||->Result<Vec<findx2_core::ChangeEvent>,findx2_windows::NamespaceResolveError>{
+                        if engine.metadata_epoch()!=binding.0{return Err("retained namespace batch belongs to replaced index generation".into());}
                         let (missing,parked)=engine.namespace_recovery_inputs(volume_letter,&events);
                         if missing.is_empty() && unlink_resolver.is_none(){return Ok(events.clone());}
                         if unlink_resolver.is_none(){
@@ -813,8 +823,12 @@ fn usn_watch_loop(
                         }
                         unlink_resolver.as_mut().unwrap().rewrite(&events,&parked,&missing,journal_id,|p|engine.namespace_parent_resolvable(volume_letter,p,&events),|id|engine.namespace_identity_live(volume_letter,id))
                     })();
-                    let events=match prepared{Ok(e)=>e,Err(e)=>{set_watch_error(letter,Some(format!("internal namespace resolution failed; cursor retained: {e}")));namespace_gate.blocked=true;lifecycle.error(e);continue;}};
-                    match namespace_gate.apply(&engine, volume_letter, &events, journal_id, next_usn) {
+                    let events=match prepared{Ok(e)=>{namespace_retry_delay=Duration::from_millis(100);e},Err(e)=>{
+                        set_watch_error(letter,Some(format!("namespace resolution failed; exact prefix/cursor retained: {e}")));
+                        if e.retryable(){namespace_retry.hold((events,journal_id,next_usn,binding)).map_err(anyhow::Error::msg)?;namespace_retry_delay=(namespace_retry_delay*2).min(Duration::from_secs(1));}else{namespace_gate.blocked=true;}
+                        lifecycle.error(e.to_string());continue;
+                    }};
+                    match namespace_gate.apply_bound(&engine, volume_letter, &events, journal_id, next_usn,Some(binding)) {
                         Ok(()) => {
                             set_watch_error(letter, engine.has_pending_namespace(volume_letter).then(||
                                 format!("missing-parent namespace events pending; durable cursor pinned for restart replay; {}", engine.pending_namespace_diagnostics(volume_letter))));

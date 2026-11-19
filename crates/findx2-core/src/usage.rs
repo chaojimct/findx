@@ -782,18 +782,26 @@ impl SearchEngine {
         r.invalidate_ticket(idx);
     }
     pub fn apply_volume_change(&self, volume: u8, ev: &ChangeEvent) -> Result<(), String> {
-        self.apply_volume_events(volume, std::slice::from_ref(ev), None).map(|_| ())
+        self.apply_volume_events(volume, std::slice::from_ref(ev), None, None).map(|_| ())
     }
     /// Namespace cursor advances only after every event is applied, excluded, or parked.
     /// Fatal failures roll the batch back and leave the watermark unchanged.
     pub fn apply_volume_batch(&self, volume: u8, events: &[ChangeEvent], journal_id: u64, next_usn: u64) -> Result<(), String> {
-        self.apply_volume_events(volume, events, Some((journal_id, next_usn))).map(|_| ())
+        self.apply_volume_events(volume, events, Some((journal_id, next_usn)), None).map(|_| ())
     }
-    fn apply_volume_events(&self, volume: u8, events: &[ChangeEvent], cursor: Option<(u64, u64)>) -> Result<bool, String> {
+    /// A resolved/retried native batch must still belong to this exact RAM index
+    /// generation and volume when acquiring the authoritative store write lock.
+    pub fn apply_volume_batch_bound(&self,volume:u8,events:&[ChangeEvent],journal_id:u64,next_usn:u64,epoch:u64,serial:u32)->Result<(),String>{
+        self.apply_volume_events(volume,events,Some((journal_id,next_usn)),Some((epoch,serial))).map(|_|())
+    }
+    fn apply_volume_events(&self, volume: u8, events: &[ChangeEvent], cursor: Option<(u64, u64)>, binding:Option<(u64,u32)>) -> Result<bool, String> {
         let lock_started = std::time::Instant::now();
         let mut g = self.store.write();
         let write_wait = lock_started.elapsed();
         let apply_started = std::time::Instant::now();
+        if let Some((epoch,serial))=binding {
+            if self.usage.lock().epoch!=epoch || !g.volumes.iter().any(|v|v.volume_letter==volume&&v.volume_serial==serial){return Err("resolved namespace index generation/volume changed; cursor retained".into());}
+        }
         if let Some((journal_id, next_usn)) = cursor {
             let v = g.volumes.iter().find(|v| v.volume_letter == volume).ok_or("batch volume unavailable")?;
             if v.usn_journal_id != 0 && v.usn_journal_id != journal_id {
@@ -2184,4 +2192,19 @@ mod parent_direct_capability_tests {
  #[test]fn parked_namespace_disables_links_until_attachment(){let e=engine();let q=QueryParser::parse("parent:C:/").unwrap();e.apply_volume_batch(b'C',&[ChangeEvent::Create{entry:raw(44,999,"parked",false)}],2,4).unwrap();assert!(e.direct_parent_candidates(&e.store.read(),&q).is_none());e.apply_volume_batch(b'C',&[ChangeEvent::Create{entry:raw(999,10,"attached",true)}],2,5).unwrap();assert!(e.direct_parent_candidates(&e.store.read(),&q).is_some());let q=QueryParser::parse("parent:C:/attached").unwrap();assert_eq!(e.direct_parent_candidates(&e.store.read(),&q).unwrap().len(),1);}
  #[test]fn checkpoint_drain_preserves_graph_and_atomic_cursor(){let e=engine();e.apply_volume_batch(b'C',&[ChangeEvent::Create{entry:raw(32,20,"new",false)}],2,4).unwrap();let batch=e.take_persistence_batch().expect("mutation checkpoint");assert!(!batch.mutations.is_empty());let g=e.index_store();assert_eq!(batch.entry_count,g.entries.len());assert_eq!(batch.dir_count,g.dirs.len());assert_eq!(batch.volumes[0].last_usn,g.volumes[0].last_usn);assert_eq!(batch.volumes[0].last_usn,4);drop(g);let q=QueryParser::parse("parent:C:/dev").unwrap();let ids=e.direct_parent_candidates(&e.store.read(),&q).expect("checkpoint is not a namespace mutation");assert_eq!(ids.len(),2);assert!(e.take_persistence_batch().is_none());}
  #[test]fn uncertain_graph_and_predicates_fall_back(){let e=engine();for text in ["parent:dev","parent:C:/missing","parent:C:/dev size:>0","parent:C:/dev ext:log"]{let q=QueryParser::parse(text).unwrap();assert!(e.direct_parent_candidates(&e.store.read(),&q).is_none(),"{text}");}e.apply_volume_change(b'C',&ChangeEvent::Delete{file_id:20}).unwrap();let q=QueryParser::parse("parent:C:/dev").unwrap();assert!(e.direct_parent_candidates(&e.store.read(),&q).is_none());let q=QueryParser::parse("parent:C:/").unwrap();assert!(e.direct_parent_candidates(&e.store.read(),&q).is_some());drop(e.index_store_mut());assert!(e.direct_parent_candidates(&e.store.read(),&q).is_none());}
+}
+
+#[cfg(test)] mod namespace_binding_tests {
+ use super::*;
+ fn engine()->SearchEngine{
+  let raw=|id,parent,name:&str,dir|crate::RawEntry{file_id:id,file_id_128:None,parent_id:parent,name:name.into(),size:if dir{0}else{7},mtime:0,ctime:0,attrs:if dir{16}else{0},is_dir:dir};
+  let store=crate::IndexBuilder::new(b'F',123,7,10).build_from_raw(vec![raw(2,1,"keep.txt",false)],vec![raw(1,0,"root",true)],true).unwrap();SearchEngine::new(store)
+ }
+ #[test]fn namespace_binding_wrong_epoch_serial_or_journal_never_mutates_or_advances(){
+  let e=engine();let epoch=e.metadata_epoch();let events=[crate::ChangeEvent::Delete{file_id:2}];
+  for (ep,serial,journal) in [(epoch.wrapping_add(1),123,7),(epoch,124,7),(epoch,123,8)]{
+   assert!(e.apply_volume_batch_bound(b'F',&events,journal,20,ep,serial).is_err());let g=e.index_store();assert_eq!(g.volumes[0].last_usn,10);assert!(!g.entries[g.entry_on_volume(b'F',2).unwrap() as usize].is_deleted());
+  }
+  e.apply_volume_batch_bound(b'F',&events,7,20,epoch,123).unwrap();assert_eq!(e.index_store().volumes[0].last_usn,20);
+ }
 }
