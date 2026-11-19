@@ -311,3 +311,23 @@ fn second_volume_self_parent_root_and_nested_paths_match_cached_and_uncached() {
         assert_eq!(page[0].path,expected,"canonical paged query: {text}");
     }
 }
+
+#[test]
+fn identical_full_frns_across_volumes_never_cross_parent_or_root_after_reload() {
+    let raw=|file_id,parent_id,name:&str,is_dir| RawEntry {file_id,file_id_128:None,parent_id,name:name.into(),size:7,mtime:0,ctime:0,attrs:if is_dir{0x10}else{0},is_dir};
+    let root=0x5000000000005u64;
+    let mut stores=Vec::new();
+    for letter in [b'Z',b'Y'] {
+        stores.push(IndexBuilder::new(letter,letter as u32,letter as u64,100).build_from_raw(
+            vec![raw(0x1000000000040,root,"root-proof.txt",false),raw(0x1000000000041,0x100000000000c,"child.txt",false)],
+            vec![raw(root,0,"",true),raw(0x100000000000c,root,"nested",true)],true).unwrap());
+    }
+    let s=merge_index_stores(stores).unwrap();
+    let check=|s:IndexStore| {
+        let paths:Vec<_>=(0..s.entry_count()).map(|i|s.entry_display_path(i).unwrap()).collect();
+        for p in [r"Z:\root-proof.txt",r"Y:\root-proof.txt",r"Z:\nested\child.txt",r"Y:\nested\child.txt",r"Z:\nested",r"Y:\nested"] {assert!(paths.iter().any(|v|v==p),"missing {p:?}; actual={paths:?}");}
+        for letter in [b'Z',b'Y'] {let d=s.dir_on_volume(letter,root).expect("full root identity on own volume");assert_eq!(s.volume_letter_u8_for_dir(d),Some(letter));}
+    };
+    let dir=std::env::temp_dir().join(format!("findx-same-frn-{}",std::process::id()));std::fs::create_dir_all(&dir).unwrap();let p=dir.join("index.bin");
+    save_index_bin(&p,&s).unwrap();let layout=V6Layout::for_index(&dir.join("segmented.bin"));v6_save_full(&layout,&s).unwrap();check(s);check(load_index_bin(&p).unwrap());check(v6_load(&layout).unwrap());std::fs::remove_dir_all(dir).unwrap();
+}

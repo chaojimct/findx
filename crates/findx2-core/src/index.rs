@@ -1670,22 +1670,8 @@ impl IndexStore {
         }
         di
     }
-    pub fn volume_letter_u8_for_dir(&self, dir_idx: u32) -> Option<u8> {
-        if self.volumes.len() == 1 {
-            return self.volumes.first().map(|v| v.volume_letter);
-        }
-        let root = self.dir_root_idx(dir_idx);
-        let roots: Vec<u32> = self
-            .dirs
-            .iter()
-            .enumerate()
-            .filter(|(i, d)| d.parent_idx as usize == *i)
-            .map(|(i, _)| i as u32)
-            .collect();
-        roots
-            .iter()
-            .position(|r| *r == root)
-            .and_then(|i| self.volumes.get(i).map(|v| v.volume_letter))
+    pub fn volume_letter_u8_for_dir(&self, dir_idx:u32)->Option<u8>{
+        self.volume_for_dir_idx(dir_idx).map(|v|v.volume_letter)
     }
     pub fn entry_on_volume(&self, letter: u8, frn: u64) -> Option<u32> {
         let slot = self.volume_slot_of(letter)?;
@@ -2079,9 +2065,10 @@ impl IndexStore {
     ///
     /// 增量 Create/CreatePending 追加的条目会超出原始 first_entry_idx 范围，
     /// `volume_for_entry` 会错误地选择最后一个卷。此方法通过父目录的所属卷来推导。
-    fn directory_for_display(&self, frn: u64) -> Option<u32> {
-        if self.volumes.len() == 1 { self.dir_index.get_scoped(frn, 0) }
-        else { self.dir_index.get(&frn).copied() }
+    fn directory_for_display(&self, frn:u64, parent:u32)->Option<u32>{
+        let volume=self.volume_for_dir_idx(parent)?;
+        let slot=self.volume_slot_of(volume.volume_letter)?;
+        self.dir_index.get_scoped(frn,slot)
     }
 
     fn volume_for_entry_by_parent(&self, idx: usize) -> Option<&VolumeState> {
@@ -2090,7 +2077,7 @@ impl IndexStore {
         // 对于目录条目，从 frn 查找 dir_idx
         if e.is_dir_entry() {
             let fr = self.frns.get(idx).copied().unwrap_or(0);
-            if let Some(di) = self.directory_for_display(fr) {
+            if let Some(di) = self.directory_for_display(fr, e.dir_idx) {
                 // 递归查找该目录的祖先，直到找到根目录
                 return self.volume_for_dir_idx(di);
             }
@@ -2101,45 +2088,43 @@ impl IndexStore {
     }
 
     /// 从目录 idx 查找所属的卷（递归向上直到找到根目录或匹配的卷）
-    fn volume_for_dir_idx(&self, mut dir_idx: u32) -> Option<&VolumeState> {
-        if self.volumes.len() == 1 {
-            self.dirs.get(dir_idx as usize)?;
-            return self.volumes.first();
-        }
-        if self.volumes.is_empty() {
-            return None;
-        }
+    fn volume_for_dir_idx(&self, dir_idx:u32)->Option<&VolumeState>{
+        let root=self.dir_root_idx(dir_idx);
+        let d=self.dirs.get(root as usize)?;
+        if d.parent_idx!=root{return None;}
+        if self.volumes.len()==1{return self.volumes.first();}
+        self.volumes.iter().enumerate().find_map(|(slot,v)|{
+            (self.dir_index.get_scoped(d.frn,slot as u32)==Some(root)).then_some(v)
+        })
+    }
 
-        // 沿父链向上：只接受落在「本卷起点 → 下一卷起点」半开区间内的目录。
-        // 最后一卷之后追加的增量条目（含新建子目录）若用旧逻辑会被当成最后一卷，
-        // 导致 /home/box 下新建目录路径变成 /workspace/... 。
-        let mut visited = 0usize;
-        let safety_limit = self.dirs.len() + 1;
-
-        loop {
-            visited += 1;
-            if visited > safety_limit {
-                return self.volume_for_entry(dir_idx as usize);
+    /// Rebuild ephemeral identity maps, never persisted bytes. FRNs are only
+    /// unique inside a volume; parent topology (not a global FRN hit) owns scope.
+    pub(crate) fn rebuild_scoped_identity_maps(&mut self)->crate::Result<()> {
+        if self.volumes.len()<=1{return Ok(());}
+        let roots:Vec<_>=self.dirs.iter().enumerate().filter(|(i,d)|d.parent_idx as usize==*i).map(|(i,_)|i).collect();
+        if roots.len()!=self.volumes.len(){return Err(crate::Error::Persist("ambiguous multi-volume root topology".into()));}
+        let mut scopes=vec![u32::MAX;self.dirs.len()];
+        for (slot,&root) in roots.iter().enumerate(){scopes[root]=slot as u32;}
+        for start in 0..self.dirs.len(){
+            let mut at=start;let mut trail=Vec::new();
+            while scopes.get(at).copied()==Some(u32::MAX){
+                if trail.len()>=self.dirs.len(){return Err(crate::Error::Persist("cyclic multi-volume parent identity".into()));}
+                trail.push(at);at=self.dirs[at].parent_idx as usize;
             }
-
-            let d = self.dirs.get(dir_idx as usize)?;
-
-            if let Some(&entry_idx) = self.frn_to_entry.get(&d.frn) {
-                if let Some(v) = self.volume_for_entry_in_scan_segment(entry_idx) {
-                    return Some(v);
-                }
-            }
-
-            // 到达卷根：根目录本身是建库时的条目，volume_for_entry 可靠。
-            if d.parent_idx == 0 || d.parent_idx == dir_idx {
-                if let Some(&entry_idx) = self.frn_to_entry.get(&d.frn) {
-                    return self.volume_for_entry(entry_idx as usize);
-                }
-                return self.volumes.first();
-            }
-
-            dir_idx = d.parent_idx;
+            let slot=*scopes.get(at).ok_or_else(||crate::Error::Persist("multi-volume parent outside directory table".into()))?;
+            for i in trail{scopes[i]=slot;}
         }
+        let mut dirs=FrnIdxMap::with_capacity(self.dirs.len());
+        for(i,d)in self.dirs.iter().enumerate(){dirs.push_unsorted_on(d.frn,i as u32,scopes[i]);}
+        dirs.finalize_build();
+        let mut entries=FrnIdxMap::with_capacity(self.frns.len());
+        for(i,&frn)in self.frns.iter().enumerate(){if frn==0{continue;}
+            let e=self.entries.get(i).ok_or_else(||crate::Error::Persist("FRN outside entry table".into()))?;
+            let slot=*scopes.get(e.dir_idx as usize).ok_or_else(||crate::Error::Persist("entry parent outside directory table".into()))?;
+            entries.push_unsorted_on(frn,i as u32,slot);
+        }
+        entries.finalize_build();self.dir_index=dirs;self.frn_to_entry=entries;Ok(())
     }
 
     /// 仅当 `entry_idx` 落在某卷的扫描段 `[first, next_first)` 时返回该卷。
@@ -2198,7 +2183,7 @@ impl IndexStore {
             .to_ascii_lowercase();
         if e.is_dir_entry() {
             let fr = self.frns.get(idx).copied().unwrap_or(0);
-            if let Some(&di) = self.dir_index.get(&fr) {
+            if let Some(di) = self.directory_for_display(fr, e.dir_idx) {
                 let dir = self.resolve_dir_path_lower(di);
                 return compose_volume_dir_path(vol, dir.as_ref()).to_ascii_lowercase();
             }
@@ -2238,7 +2223,7 @@ impl IndexStore {
             let prefix = vol.map(|v| v.root_prefix.as_str()).unwrap_or("/");
             if e.is_dir_entry() {
                 let fr = self.frns.get(idx).copied().unwrap_or(0);
-                if let Some(di) = self.directory_for_display(fr) {
+                if let Some(di) = self.directory_for_display(fr, e.dir_idx) {
                     // Unix 使用保留原始大小写的路径
                     let pbytes = self.build_dir_path_original_case(di);
                     if !pbytes.is_empty() {
@@ -2267,7 +2252,7 @@ impl IndexStore {
             // 1000 个目录 hits × 100 万 dirs ≈ 10 亿次比较 ≈ 600ms（实测「android」就被这个挡住）。
             // dir_index 已是 FRN→dirs 下标的 FxHashMap，直接 O(1) 查询即可。
             let fr = self.frns.get(idx).copied().unwrap_or(0);
-            if let Some(di) = self.directory_for_display(fr) {
+            if let Some(di) = self.directory_for_display(fr, e.dir_idx) {
                 let pbytes = self.resolve_dir_path_lower(di);
                 if !pbytes.is_empty() {
                     let p = std::str::from_utf8(pbytes.as_ref())?;

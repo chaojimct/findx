@@ -750,6 +750,7 @@ pub fn load_index_bin_with_progress(
     };
     // 拼音候选剪枝位图：并行扫一遍名字（1.15M 条目 ~10ms，8.5M ~100ms），之后 USN 增量维护。
     on_phase(LoadPhase::CjkBitmap);
+    store.rebuild_scoped_identity_maps()?;
     store.rebuild_cjk_bitmap();
 
     if hdr.version < FORMAT_VERSION_V2 {

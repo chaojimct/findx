@@ -44,6 +44,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          git fetch origin b72219bc844de5eb141bb99a708494c956f53073 --depth=1
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          $roots=git diff --name-only b72219bc844de5eb141bb99a708494c956f53073 HEAD -- Cargo.lock Cargo.toml crates installer
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          $allowed=@('crates/findx2-core/src/index.rs','crates/findx2-core/src/persist.rs','crates/findx2-core/src/persist_v6.rs','crates/findx2-core/tests/upgrade_candidate.rs')
+          if(@($roots).Count -eq 4 -and @($roots|Where-Object {$_ -notin $allowed}).Count -eq 0){
+            'root-native=true' >> $env:GITHUB_OUTPUT
+            'changed=false' >> $env:GITHUB_OUTPUT
+            exit 0
+          }
           git fetch origin 200ca19e736f9f0b28c40089f44cd4efb3b2afb4 --depth=1
           if($LASTEXITCODE){exit $LASTEXITCODE}
           $product=git diff --name-only 200ca19e736f9f0b28c40089f44cd4efb3b2afb4 HEAD -- Cargo.lock Cargo.toml crates installer
@@ -154,9 +164,9 @@ jobs:
             'Reuse unchanged ACK/IPC/service lifecycle evidence44446796510; any isolated root-path change receives targeted core tests, not a full-payload claim.'
           }
       - uses: dtolnay/rust-toolchain@stable
-        if: (steps.engine-change.outputs.changed == 'true' || steps.engine-change.outputs.focused == 'true' || steps.engine-change.outputs.namespace == 'true' || steps.engine-change.outputs.parent == 'true') && steps.engine-change.outputs.reuse-native != 'true'
+        if: (steps.engine-change.outputs.changed == 'true' || steps.engine-change.outputs.focused == 'true' || steps.engine-change.outputs.namespace == 'true' || steps.engine-change.outputs.parent == 'true' || steps.engine-change.outputs.root-native == 'true') && steps.engine-change.outputs.reuse-native != 'true'
       - uses: Swatinem/rust-cache@v2
-        if: (steps.engine-change.outputs.changed == 'true' || steps.engine-change.outputs.focused == 'true' || steps.engine-change.outputs.namespace == 'true' || steps.engine-change.outputs.parent == 'true') && steps.engine-change.outputs.reuse-native != 'true'
+        if: (steps.engine-change.outputs.changed == 'true' || steps.engine-change.outputs.focused == 'true' || steps.engine-change.outputs.namespace == 'true' || steps.engine-change.outputs.parent == 'true' || steps.engine-change.outputs.root-native == 'true') && steps.engine-change.outputs.reuse-native != 'true'
       - name: Affected parent recovery and real replacement binding tests
         if: steps.engine-change.outputs.parent == 'true' && steps.engine-change.outputs.reuse-native != 'true'
         shell: pwsh
@@ -219,8 +229,18 @@ jobs:
           foreach($p in @('target/debug/findx2-service.exe','target/debug/findx2.exe','target/debug/examples/verify_persisted_file.exe','target/debug/examples/namespace_index_copy.exe')){Copy-Item $p $root}
           $files=@(Get-ChildItem $root -File|ForEach-Object {@{name=$_.Name;sha256=(Get-FileHash $_.FullName -Algorithm SHA256).Hash}})
           @{sourceCommit=$(if('${{ steps.engine-change.outputs.reuse-native }}' -eq 'true'){'200ca19e736f9f0b28c40089f44cd4efb3b2afb4'}else{$env:GITHUB_SHA});testCommit=$env:GITHUB_SHA;profile='debug-native-tests-NOT-release';files=$files}|ConvertTo-Json -Depth 5|Set-Content (Join-Path $root 'source-hashes.json')
+      - name: Affected same-full-FRN monolithic and v6 root tests; CLI only
+        if: steps.engine-change.outputs.root-native == 'true'
+        shell: pwsh
+        run: |
+          cargo test --locked -p findx2-core --test upgrade_candidate -- --test-threads=1
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          cargo build --locked -p findx2-cli
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          cargo build --locked -p findx2-core --example verify_persisted_file
+          if($LASTEXITCODE){exit $LASTEXITCODE}
       - name: Actual owned two-volume canonical root read-only compatibility
-        if: steps.engine-change.outputs.parent == 'true'
+        if: steps.engine-change.outputs.parent == 'true' || steps.engine-change.outputs.root-native == 'true'
         shell: powershell
         run: ./scripts/test-combined-roots.ps1
       - name: Actual SCM parent permission retry and live journal/index replacement
