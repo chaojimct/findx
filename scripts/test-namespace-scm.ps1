@@ -100,7 +100,7 @@ try{
  $cli=Join-Path $repo 'target\debug\findx2.exe';$verify=Join-Path $repo 'target\debug\examples\verify_persisted_file.exe';$copy=Join-Path $repo 'target\debug\examples\namespace_index_copy.exe'
  $source=Join-Path $base 'source.bin';$index=Join-Path $base 'incomplete-copy.bin'
  Native-Tool $cli ('index --volume '+$owned.Volume+' --output "'+$source+'" --max-scan-threads 1')
- Native-Tool $copy ('"'+$source+'" "'+$index+'" "'+$owned.Root+'"')
+ Native-Tool $copy ('"'+$source+'" "'+$index+'" '+$owned.Root)
  $script:pipeName='findx253ns'+[guid]::NewGuid().ToString('N')
  $command='"'+$ServiceExe+'" --service --index "'+$index+'" --volume '+$owned.Volume+' --pipe '+$pipeName+' --no-everything-ipc --save-interval-secs 1'
  Assert ($command -notmatch '--no-watch|--no-backfill|--fixture-root|--fixture-events') 'Real runtime cannot use fixture bypass'
