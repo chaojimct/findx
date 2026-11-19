@@ -83,7 +83,7 @@ fn spawn_stat_worker(
             loop {
                 match rx.recv_timeout(std::time::Duration::from_millis(1000)) {
                     Ok((frn, id128, work)) => {
-                        pending.insert(frn, (id128,work));
+                        if let Some((_,Some(mut superseded)))=pending.insert(frn, (id128,work)){superseded.success();} // Coalesced into a newer owned item, not silently failed.
                         // 攒够一批就刷（5000 条或 1 秒超时，取先到者）。
                         if pending.len() >= 5000 {
                             drain_stat_batch(
@@ -139,7 +139,7 @@ fn drain_stat_batch(
     if pending.is_empty() {
         return;
     }
-    let accepted=std::mem::take(pending); // Keep work reservations through IO AND commits.
+    let mut accepted=std::mem::take(pending); // Keep work reservations through IO AND commits.
     // 注：重建冻结期无需特殊处理——合并后旧条目下标不变（新条目追加在后），
     // patch 到墓碑/旧条目无害；新文件的 StatRefresh 在旧布局查不到会被跳过，
     // journal 重放会重新排队。见 rebuild_volume 设计注释。
@@ -157,6 +157,9 @@ fn drain_stat_batch(
         .iter()
         .map(|&f| engine.metadata_ticket_by_id(volume, f))
         .collect();
+    struct StatTicketLease<'a>{engine:&'a SearchEngine,tickets:&'a [Option<findx2_core::usage::MetadataTicket>]}
+    impl Drop for StatTicketLease<'_>{fn drop(&mut self){for ticket in self.tickets.iter().flatten(){self.engine.release_metadata_ticket(*ticket);}}}
+    let _tickets=StatTicketLease{engine,tickets:&tickets}; // Includes partial IO, missing results and unwind.
     let updates = findx2_windows::fill_metadata_by_id_pooled(
         volume_device_path,
         &frns,
@@ -178,8 +181,10 @@ fn drain_stat_batch(
     }
     for (local, size, mtime, ctime) in updates {
         if let Some(Some(ticket)) = tickets.get(local) {
-            if let Err(e) = engine.commit_metadata(*ticket, size, mtime, ctime) {
-                tracing::warn!("stat commit: {e}");
+            match engine.commit_metadata(*ticket,size,mtime,ctime){
+                Ok(true)=>{if let Some((_,Some(work)))=accepted.get_mut(&frns[local]){work.success();}}
+                Ok(false)=>{if let Some((_,Some(work)))=accepted.get_mut(&frns[local]){work.error("stat result stale or rejected; no current metadata coverage proof".into());}}
+                Err(e)=>{if let Some((_,Some(work)))=accepted.get_mut(&frns[local]){work.error(e.to_string());}tracing::warn!("stat commit: {e}");}
             }
         }
     }
@@ -225,15 +230,17 @@ fn spawn_trigram_rebuild(engine: Arc<SearchEngine>, index: PathBuf, reason: &'st
     let Some(guard) = TrigramRebuildGuard::acquire() else {
         return;
     };
-    let lifecycle=match crate::runtime_lifecycle::reserve(&engine,"trigram-publisher") {Ok(v)=>v,Err(_)=>return};
+    let lifecycle=match crate::runtime_lifecycle::reserve(&engine,"trigram-publisher") {Ok(v)=>v.map(|p|p.require_result()),Err(_)=>return};
     let spawned = std::thread::Builder::new()
         .name("findx2-trigram-rebuild".into())
         .spawn(move || {
-            let _lifecycle=lifecycle.map(|p|p.activate());
+            let mut lifecycle=lifecycle.map(|p|p.activate());
             let _guard = guard;
             info!("trigram：后台重建开始（{reason}）");
             let t0 = Instant::now();
-            match engine.rebuild_trigram_sidecar(&index) {
+            let result=engine.rebuild_trigram_sidecar(&index);
+            match &result{Ok(())=>crate::runtime_lifecycle::success_optional(&mut lifecycle),Err(e)=>crate::runtime_lifecycle::error_optional(&mut lifecycle,e.to_string())}
+            match result {
                 Ok(()) => info!(
                     "trigram：后台重建完成，耗时 {:.1}s",
                     t0.elapsed().as_secs_f64()
@@ -582,6 +589,8 @@ pub(crate) fn run_foreground(
             Err(e)=>{error!("STOP PENDING: save failed, RAM/IPC retained; retrying, NO ACK: {e}");std::thread::sleep(Duration::from_secs(5));}
         }
     }
+    let runtime_errors=lifecycle.retained_errors();
+    if !runtime_errors.is_empty(){anyhow::bail!("saved RAM but runtime source failure remains: {}",runtime_errors.join("; "));}
     if !worker_errors.is_empty(){anyhow::bail!("saved accepted RAM, but watch shutdown failed: {}",worker_errors.join("; "));}
     info!("Shutdown checkpoint IO complete; NOT a producer-fenced final RAM durability receipt");
     info!(counts=?findx2_windows::metadata_terminal_counts(), "metadata terminal buckets: missing/access/sharing/invalid_id/not_found/other/success");
@@ -750,10 +759,11 @@ fn usn_watch_loop(
             info!("卷 {letter} USN 监听线程停机退出");
             return Ok(());
         }
-        let _lifecycle=match crate::runtime_lifecycle::enter(&engine,"watch-batch") {Ok(p)=>p,Err(_)=>return Ok(())};
+        let mut lifecycle=match crate::runtime_lifecycle::enter(&engine,"watch-batch") {Ok(p)=>p.require_result(),Err(_)=>return Ok(())};
         if namespace_gate.blocked {
             let _ = rx.recv_timeout(Duration::from_millis(100));
             std::thread::sleep(Duration::from_millis(100));
+            lifecycle.success();
             continue;
         }
         // 重建冻结期（本卷）：排空丢弃，不 apply 不推进游标；journal 重放会补回。
@@ -762,6 +772,7 @@ fn usn_watch_loop(
             pending.clear();
             while rx.try_recv().is_ok() {}
             std::thread::sleep(Duration::from_millis(100));
+            lifecycle.success();
             continue;
         }
         match rx.recv_timeout(flush_every) {
@@ -781,7 +792,7 @@ fn usn_watch_loop(
                         }
                         unlink_resolver.as_mut().unwrap().rewrite(&events,&parked,&missing,journal_id,|p|engine.namespace_parent_resolvable(volume_letter,p,&events),|id|engine.namespace_identity_live(volume_letter,id))
                     })();
-                    let events=match prepared{Ok(e)=>e,Err(e)=>{set_watch_error(letter,Some(format!("internal namespace resolution failed; cursor retained: {e}")));namespace_gate.blocked=true;continue;}};
+                    let events=match prepared{Ok(e)=>e,Err(e)=>{set_watch_error(letter,Some(format!("internal namespace resolution failed; cursor retained: {e}")));namespace_gate.blocked=true;lifecycle.error(e);continue;}};
                     match namespace_gate.apply(&engine, volume_letter, &events, journal_id, next_usn) {
                         Ok(()) => {
                             set_watch_error(letter, engine.has_pending_namespace(volume_letter).then(||
@@ -795,6 +806,7 @@ fn usn_watch_loop(
                             );
                             error!("USN batch not committed ({letter}); namespace fenced until restart/rebuild: {e}");
                             namespace_gate.blocked = true;
+                            lifecycle.error(e);
                         }
                     }
                 }
@@ -818,7 +830,7 @@ fn usn_watch_loop(
                         anyhow::bail!("full 128-bit stat binding unresolved; refusing low64 alias");
                     }
                     engine.mark_metadata_dirty(volume_letter, file_id);
-                    stat_tx.send((file_id, file_id_128, crate::runtime_lifecycle::reserve(&engine,"queued-stat").map_err(anyhow::Error::msg)?)).map_err(|_| {
+                    stat_tx.send((file_id, file_id_128, crate::runtime_lifecycle::reserve(&engine,"queued-stat").map_err(anyhow::Error::msg)?.map(|p|p.require_result()))).map_err(|_| {
                         anyhow::anyhow!("stat worker unavailable; metadata remains unknown")
                     })?;
                 }
@@ -830,10 +842,12 @@ fn usn_watch_loop(
                     if let Err(e) = namespace_gate.apply(&engine, volume_letter, &[], journal_id, next_usn) {
                         set_watch_error(letter, Some(format!("checkpoint rejected; namespace fenced: {e}")));
                         namespace_gate.blocked = true;
+                        lifecycle.error(e);
                         continue;
                     }
                     if engine.has_pending_namespace(volume_letter) {
                         set_watch_error(letter, Some(format!("missing-parent namespace events pending; durable cursor pinned for restart replay; {}", engine.pending_namespace_diagnostics(volume_letter))));
+                        lifecycle.error("unresolved namespace parents; cursor retained".into());
                         continue;
                     }
                     // 存活确认：收到 journal 心跳即视为健康，复位退避/重建计数。
@@ -866,6 +880,7 @@ fn usn_watch_loop(
                     Ok(Err(e)) => format!("{e}"),
                     Err(_) => "watch 线程 panic".to_string(),
                 };
+                lifecycle.error(reason.clone());
                 let is_gap = matches!(&exit, Ok(Err(findx2_core::Error::JournalGap(_))));
                 if is_gap && gap_rebuilds < 3 {
                     gap_rebuilds += 1;
@@ -928,6 +943,7 @@ fn usn_watch_loop(
             dirty_count += flush_pending(&mut pending)?;
         }
         dirty_count += flush_pending(&mut pending)?; // No accepted legacy batch crosses the prepare barrier.
+        lifecycle.success();
     }
 }
 
@@ -1234,7 +1250,13 @@ pub(crate) fn persist_index_with(
     engine: &SearchEngine, path: &Path,
     writer: impl FnOnce(&V6Layout, &findx2_core::CommitBatch) -> anyhow::Result<CommitOutcome>,
 ) -> anyhow::Result<bool> {
-    let _lifecycle=crate::runtime_lifecycle::enter(engine,"persister").map_err(anyhow::Error::msg)?;
+    let lifecycle=crate::runtime_lifecycle::enter(engine,"persister").map_err(anyhow::Error::msg)?.require_result();
+    lifecycle.finish_persistence(persist_index_with_inner(engine,path,writer))
+}
+fn persist_index_with_inner(
+    engine:&SearchEngine,path:&Path,
+    writer:impl FnOnce(&V6Layout,&findx2_core::CommitBatch)->anyhow::Result<CommitOutcome>,
+)->anyhow::Result<bool>{
     let _guard = match persist_lock().try_lock() {
         Ok(g) => g,
         Err(std::sync::TryLockError::Poisoned(e)) => {

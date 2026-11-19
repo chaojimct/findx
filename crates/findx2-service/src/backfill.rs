@@ -67,14 +67,15 @@ pub(crate) fn spawn_backfill(engine: Arc<SearchEngine>, index_path: std::path::P
         return;
     }
     let engine_err = engine.clone();
-    let lifecycle=match crate::runtime_lifecycle::reserve(&engine,"backfill") {Ok(v)=>v,Err(_)=>{BACKFILL_RUNNING.store(false,Ordering::SeqCst);return}};
+    let lifecycle=match crate::runtime_lifecycle::reserve(&engine,"backfill") {Ok(v)=>v.map(|p|p.require_result()),Err(_)=>{BACKFILL_RUNNING.store(false,Ordering::SeqCst);return}};
     if let Err(e) = std::thread::Builder::new()
         .name("findx2-backfill".into())
         .spawn(move || {
-            let _lifecycle=lifecycle.map(|p|p.activate());
+            let mut lifecycle=lifecycle.map(|p|p.activate());
             let _guard = BackfillRunningGuard;
-            if let Err(e) = backfill_loop(engine.clone(), index_path) {
-                crate::runtime_lifecycle::fail(&engine,format!("backfill failed: {e}"));
+            let result=backfill_loop(engine.clone(),index_path);
+            match &result{Ok(())=>crate::runtime_lifecycle::success_optional(&mut lifecycle),Err(e)=>crate::runtime_lifecycle::error_optional(&mut lifecycle,e.to_string())}
+            if let Err(e)=result {
                 error!("元数据回填线程退出: {e}");
                 engine.set_backfill_error(Some(format!("元数据回填异常：{e}")));
             }
@@ -95,11 +96,11 @@ fn spawn_final_persist(engine: Arc<SearchEngine>, path: std::path::PathBuf) {
     spawn_final_persist_for_epoch(engine,path,None)
 }
 fn spawn_final_persist_for_epoch(engine:Arc<SearchEngine>,path:std::path::PathBuf,epoch:Option<u64>) {
-    let lifecycle=match crate::runtime_lifecycle::reserve(&engine,"metadata-finalizer") {Ok(v)=>v,Err(_)=>return};
+    let lifecycle=match crate::runtime_lifecycle::reserve(&engine,"metadata-finalizer") {Ok(v)=>v.map(|p|p.require_result()),Err(_)=>return};
     std::thread::Builder::new()
         .name("findx2-final-persist".into())
         .spawn(move || {
-            let _lifecycle=lifecycle.map(|p|p.activate());
+            let mut lifecycle=lifecycle.map(|p|p.activate());
             let t0 = Instant::now();
             // 1) flush overlay 进主索引（写锁 ~2-5s @ 8.5M 全填）。
             //    这步发生时回填线程已退出，不会再有新 put；search 会被这次写锁阻塞数秒。
@@ -113,6 +114,7 @@ fn spawn_final_persist_for_epoch(engine:Arc<SearchEngine>,path:std::path::PathBu
                     t0.elapsed()
                 ),
                 Err(e) => {
+                    crate::runtime_lifecycle::error_optional(&mut lifecycle,e.to_string());
                     error!("终态落盘：set_metadata_ready 失败: {e}");
                     engine.set_backfill_error(Some(format!("元数据已补全但写入索引失败：{e}")));
                     return;
@@ -123,6 +125,7 @@ fn spawn_final_persist_for_epoch(engine:Arc<SearchEngine>,path:std::path::PathBu
             //    非 Windows（Unix 回填桩）走旧 v5 直写。
             let t1 = Instant::now();
             if epoch.is_some_and(|e| engine.metadata_epoch() != e) {
+                crate::runtime_lifecycle::error_optional(&mut lifecycle,"obsolete metadata finalizer cannot prove current coverage".into());
                 info!("obsolete metadata finalizer skipped");
                 return;
             }
@@ -130,10 +133,12 @@ fn spawn_final_persist_for_epoch(engine:Arc<SearchEngine>,path:std::path::PathBu
             match crate::run::persist_index(&engine, &path) {
                 Ok(true) => {},
                 Ok(false) => {
+                    crate::runtime_lifecycle::error_optional(&mut lifecycle,"terminal persistence deferred: no real commit".into());
                     engine.set_backfill_error(Some("metadata covered; terminal persistence deferred by concurrent commit; regular persistence will retry".into()));
                     return;
                 },
                 Err(e) => {
+                    crate::runtime_lifecycle::error_optional(&mut lifecycle,format!("{e:#}"));
                     error!("terminal metadata persistence failed: {e:#}");
                     engine.set_backfill_error(Some(format!("metadata covered but terminal persistence failed: {e:#}")));
                     return;
@@ -143,6 +148,7 @@ fn spawn_final_persist_for_epoch(engine:Arc<SearchEngine>,path:std::path::PathBu
             {
                 let store = engine.index_store();
                 if let Err(e) = findx2_core::save_index_bin(&path, &store) {
+                    crate::runtime_lifecycle::error_optional(&mut lifecycle,e.to_string());
                     error!("终态落盘：save_index_bin 失败: {e}");
                     return;
                 }
@@ -150,6 +156,7 @@ fn spawn_final_persist_for_epoch(engine:Arc<SearchEngine>,path:std::path::PathBu
             // 终态已落盘：断点边车使命完成，删除（下次回填从头也不怕，因为 ready=true 不会再回填）。
             if epoch.is_some_and(|e| engine.metadata_epoch() != e) { return; }
             delete_overlay_sidecar(&path);
+            crate::runtime_lifecycle::success_optional(&mut lifecycle);
             info!(
                 "终态落盘：v6 已写盘（写盘耗时 {:?}，全程 {:?}）",
                 t1.elapsed(),

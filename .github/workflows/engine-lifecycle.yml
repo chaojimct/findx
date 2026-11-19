@@ -9,6 +9,8 @@ on:
       - 'crates/findx2-ipc/**'
       - 'crates/findx2-gui-native/**'
       - '.github/workflows/engine-lifecycle.yml'
+      - 'scripts/test-engine-native-runtime.ps1'
+      - 'scripts/test-owned-ntfs-volume.psm1'
   workflow_dispatch:
 permissions:
   contents: read
@@ -35,6 +37,16 @@ jobs:
         run: |
           cargo check --locked -p findx2-cli -p findx2-gui-native 2>&1 | Tee-Object client-compile.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build actual service for isolated native SCM/VHD acceptance
+        shell: pwsh
+        run: |
+          cargo build --locked -p findx2-service
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked -p findx2-core --example verify_persisted_file
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Real native SCM VHD USN backfill and OS writer-failure recovery (no fixture bypass)
+        shell: pwsh
+        run: ./scripts/test-engine-native-runtime.ps1 -ServiceExe ./target/debug/findx2-service.exe
       - name: No force-exit fallback and protocol remains fail-closed
         shell: pwsh
         run: |
@@ -51,4 +63,5 @@ jobs:
             core-checkpoint-fence-tests.log
             engine-lifecycle-tests.log
             client-compile.log
+            native-runtime-evidence/**
           retention-days: 30

@@ -151,6 +151,9 @@ pub enum IpcResponse {
     UpgradeCapabilitiesResult {
         protocol_version: u32,
         durable_prepare: bool,
+        /// Atomic managed-runtime source outcome; None is not a durability receipt.
+        #[serde(default)]
+        runtime_error: Option<String>,
         #[serde(default)]
         last_checkpoint_error: Option<String>,
         reason: String,
@@ -267,5 +270,11 @@ mod upgrade_protocol_tests {
         assert!(serde_json::from_str::<super::IpcRequest>(r#"{"type":"upgrade_capabilities"}"#).is_err());
         assert!(serde_json::from_str::<super::IpcRequest>(r#"{"type":"prepare_upgrade","protocol_version":1}"#).is_err());
         assert!(matches!(serde_json::from_str::<super::IpcRequest>(r#"{"type":"upgrade_capabilities","protocol_version":1}"#).unwrap(), super::IpcRequest::UpgradeCapabilities { protocol_version: 1 }));
+    }
+
+    #[test]
+    fn older_negative_capabilities_without_runtime_error_remain_compatible(){
+        let response:super::IpcResponse=serde_json::from_str(r#"{"type":"upgrade_capabilities_result","protocol_version":1,"durable_prepare":false,"reason":"old negative response"}"#).unwrap();
+        assert!(matches!(response,super::IpcResponse::UpgradeCapabilitiesResult{durable_prepare:false,runtime_error:None,..}));
     }
 }

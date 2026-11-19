@@ -28,11 +28,12 @@ pub(crate) fn req_kind_label(r: &IpcRequest) -> &'static str {
 pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse {
     let engine = slot.read().ok().and_then(|g| g.clone());
     match (req, engine) {
-        (IpcRequest::UpgradeCapabilities { protocol_version: 1 }, _) => IpcResponse::UpgradeCapabilitiesResult {
+        (IpcRequest::UpgradeCapabilities { protocol_version: 1 }, engine) => IpcResponse::UpgradeCapabilitiesResult {
             protocol_version: 1,
             durable_prepare: false,
+            runtime_error: engine.as_deref().and_then(crate::runtime_lifecycle::error_snapshot),
             last_checkpoint_error: checkpoint_error_snapshot(),
-            reason: "producer admission/drain and generation-bound final receipt are not implemented; refuse before service stop".into(),
+            reason: "managed fencing is internal only; native lifecycle acceptance and final IPC/installer receipt are not complete; refuse before service stop".into(),
         },
         (IpcRequest::UpgradeCapabilities { .. }, _) => IpcResponse::Error {
             message: "unsupported durable-upgrade protocol version; refuse before service stop".into(),

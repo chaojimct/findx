@@ -20,6 +20,8 @@ struct Work {
     active: usize,
     failed: Option<String>,
     sources: HashMap<&'static str, usize>,
+    outcome_epoch: u64,
+    errors: HashMap<&'static str, (u64, String)>,
 }
 pub(crate) struct State {
     key: usize,
@@ -43,10 +45,39 @@ fn nested(key: usize) -> bool {
 pub(crate) struct Reservation {
     state: Arc<State>,
     source: &'static str,
+    admitted_epoch: u64,
+    failure: Option<String>,
+    required: bool,
+    completed: bool,
+    recover: bool,
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
         let mut w = self.state.work.lock().unwrap();
+        // Outcome publication and the last active decrement share ONE mutex.
+        // A waiter can never see active==0 without seeing this operation's error.
+        let failure = self.failure.take().or_else(|| {
+            (self.required && !self.completed).then(|| {
+                format!(
+                    "{} exited without completing its real operation",
+                    self.source
+                )
+            })
+        });
+        if let Some(error) = failure {
+            match w.outcome_epoch.checked_add(1) {
+                Some(v) => w.outcome_epoch = v,
+                None => w.failed = Some("runtime outcome epoch exhausted".into()),
+            }
+            let epoch = w.outcome_epoch;
+            w.errors.insert(self.source, (epoch, error));
+        } else if self.recover
+            && w.errors
+                .get(self.source)
+                .is_some_and(|(epoch, _)| *epoch <= self.admitted_epoch)
+        {
+            w.errors.remove(self.source);
+        }
         w.active -= 1;
         if let Some(n) = w.sources.get_mut(self.source) {
             *n -= 1;
@@ -58,6 +89,17 @@ impl Drop for Reservation {
     }
 }
 impl Reservation {
+    pub(crate) fn require_result(mut self) -> Self {
+        self.required = true;
+        self
+    }
+    pub(crate) fn success(&mut self) {
+        self.completed = true;
+    }
+    pub(crate) fn error(&mut self, error: String) {
+        self.completed = true;
+        self.failure = Some(error);
+    }
     pub(crate) fn activate(self) -> Activity {
         let key = self.state.key;
         DEPTH.with(|d| *d.borrow_mut().entry(key).or_default() += 1);
@@ -72,6 +114,52 @@ pub(crate) struct Activity {
     key: Option<usize>,
     _owned: Option<Reservation>,
     _not_send: PhantomData<Rc<()>>,
+}
+impl Activity {
+    pub(crate) fn require_result(mut self) -> Self {
+        if let Some(p) = &mut self._owned {
+            p.required = true;
+        }
+        self
+    }
+    pub(crate) fn success(&mut self) {
+        if let Some(p) = &mut self._owned {
+            p.success();
+        }
+    }
+    pub(crate) fn error(&mut self, error: String) {
+        if let Some(p) = &mut self._owned {
+            p.error(error);
+        }
+    }
+    pub(crate) fn finish<T, E: std::fmt::Display>(mut self, result: Result<T, E>) -> Result<T, E> {
+        match &result {
+            Ok(_) => self.success(),
+            Err(e) => self.error(e.to_string()),
+        };
+        result
+    }
+    pub(crate) fn finish_persistence(
+        mut self,
+        result: anyhow::Result<bool>,
+    ) -> anyhow::Result<bool> {
+        if matches!(&result, Ok(true)) {
+            if let Some(p) = &mut self._owned {
+                p.recover = true;
+            }
+        }
+        self.finish(result)
+    }
+}
+pub(crate) fn error_optional(activity: &mut Option<Activity>, error: String) {
+    if let Some(a) = activity {
+        a.error(error);
+    }
+}
+pub(crate) fn success_optional(activity: &mut Option<Activity>) {
+    if let Some(a) = activity {
+        a.success();
+    }
 }
 impl Drop for Activity {
     fn drop(&mut self) {
@@ -109,6 +197,11 @@ impl State {
         Ok(Reservation {
             state: self.clone(),
             source,
+            admitted_epoch: w.outcome_epoch,
+            failure: None,
+            required: false,
+            completed: false,
+            recover: false,
         })
     }
     fn reopen(&self) {
@@ -129,7 +222,7 @@ impl State {
         until: Instant,
         cancel: &AtomicBool,
         stop: Option<&AtomicBool>,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         let mut w = self.work.lock().unwrap();
         w.closed = true;
         self.changed.notify_all();
@@ -147,7 +240,13 @@ impl State {
                 ));
             }
             if w.active == 0 {
-                return Ok(());
+                if !w.stopping && !w.errors.is_empty() {
+                    return Err(format!(
+                        "runtime source errors retained; no ACK: {:?}",
+                        w.errors
+                    ));
+                }
+                return Ok(w.outcome_epoch);
             }
             w = self
                 .changed
@@ -155,6 +254,25 @@ impl State {
                 .unwrap()
                 .0;
         }
+    }
+    fn publish_if_current<T>(
+        &self,
+        epoch: u64,
+        valid: impl FnOnce() -> bool,
+        publish: impl FnOnce() -> T,
+    ) -> Result<T, String> {
+        let w = self.work.lock().unwrap();
+        if !w.closed
+            || w.stopping
+            || w.active != 0
+            || w.failed.is_some()
+            || !w.errors.is_empty()
+            || w.outcome_epoch != epoch
+            || !valid()
+        {
+            return Err("runtime changed/failed before observation publication; no ACK".into());
+        }
+        Ok(publish())
     }
 }
 pub(crate) fn reserve(
@@ -167,24 +285,25 @@ pub(crate) fn reserve(
 }
 pub(crate) fn enter(e: &SearchEngine, source: &'static str) -> Result<Activity, String> {
     if let Some(s) = lookup(e) {
-        if nested(s.key) {
-            DEPTH.with(|d| *d.borrow_mut().entry(s.key).or_default() += 1);
-            return Ok(Activity {
-                key: Some(s.key),
-                _owned: None,
-                _not_send: PhantomData,
-            });
-        }
         return s.reserve(source).map(Reservation::activate);
     }
     Ok(empty())
 }
-pub(crate) fn fail(e: &SearchEngine, error: String) {
-    if let Some(s) = lookup(e) {
-        s.work.lock().unwrap().failed = Some(error);
-        s.changed.notify_all();
-    }
+pub(crate) fn error_snapshot(e: &SearchEngine) -> Option<String> {
+    lookup(e).and_then(|s| {
+        let w = s.work.lock().unwrap();
+        let mut errors: Vec<_> = w
+            .errors
+            .iter()
+            .map(|(source, (_, error))| format!("{source}: {error}"))
+            .collect();
+        if let Some(e) = &w.failed {
+            errors.push(e.clone());
+        }
+        (!errors.is_empty()).then(|| errors.join("; "))
+    })
 }
+
 enum Command {
     Prepare {
         request: FreezeRequest,
@@ -234,19 +353,25 @@ impl Owner {
    let mut frame=None;let mut binding:Option<(String,String,Instant,u64,Arc<AtomicBool>)>=None;let mut consumed=HashSet::new();
    loop{
     if stop.load(Ordering::Acquire){frame.take();binding.take();s.stop_ingress();}
+    if binding.is_some()&&{let w=s.work.lock().unwrap();w.failed.is_some()||!w.errors.is_empty()}{frame.take();binding.take();s.reopen();}
     if binding.as_ref().is_some_and(|b|Instant::now()>=b.2||b.4.load(Ordering::Acquire)){frame.take();binding.take();s.reopen();}
     match rx.recv_timeout(Duration::from_millis(20)){
      Ok(Command::Prepare{request,until,cancel,reply})=>{
       if binding.is_some()||stop.load(Ordering::Acquire){let _=reply.send(Err("already prepared or stopping; no ACK".into()));continue;}
       let instance=request.expected_instance.clone();let nonce=request.nonce.clone();
       if consumed.len()>=4096||!consumed.insert(nonce.clone()){let _=reply.send(Err("request nonce replay or bounded ledger exhausted; no ACK".into()));continue;}
-      let result=s.close_drain(until,&cancel,Some(&stop)).and_then(|()|engine.freeze_checkpoint(&index,request,until,&cancel));
+      let result=s.close_drain(until,&cancel,Some(&stop)).and_then(|epoch|engine.freeze_checkpoint(&index,request,until,&cancel).map(|f|(epoch,f)));
       match result{
-       Ok(f) if !stop.load(Ordering::Acquire)&&!cancel.load(Ordering::Acquire)&&Instant::now()<until=>{
-        let observation=serde_json::json!({"upgrade_ack":false,"managed_work_drained":true,"process_stopped":false,"core":f.evidence()});
-        let generation=observation["core"]["published_generation"].as_u64().expect("serialized u64 generation");frame=Some(f);binding=Some((instance,nonce,until,generation,cancel));if reply.send(Ok(observation)).is_err(){frame.take();binding.take();s.reopen();}
+       Ok((epoch,f)) if !stop.load(Ordering::Acquire)&&!cancel.load(Ordering::Acquire)&&Instant::now()<until=>{
+        let observation=serde_json::json!({"upgrade_ack":false,"managed_work_drained":true,"outcome_epoch":epoch,"process_stopped":false,"core":f.evidence()});
+        let generation=observation["core"]["published_generation"].as_u64().expect("serialized u64 generation");let token=cancel.clone();frame=Some(f);binding=Some((instance,nonce,until,generation,cancel));
+        match s.publish_if_current(epoch,||!stop.load(Ordering::Acquire)&&!token.load(Ordering::Acquire)&&Instant::now()<until,||reply.send(Ok(observation))){
+         Ok(Ok(()))=>{},
+         Ok(Err(_))=>{frame.take();binding.take();s.reopen();},
+         Err(e)=>{frame.take();binding.take();s.reopen();let _=reply.send(Err(e));}
+        }
        }
-       Ok(f)=>{drop(f);s.reopen();let _=reply.send(Err("late/cancelled/stop completion; no ACK".into()));}
+       Ok((_,f))=>{drop(f);s.reopen();let _=reply.send(Err("late/cancelled/stop completion; no ACK".into()));}
        Err(e)=>{s.reopen();let _=reply.send(Err(e));}
       }
      }
@@ -255,7 +380,7 @@ impl Owner {
      }
      Ok(Command::DrainStop{until,reply})=>{
       frame.take();binding.take();s.stop_ingress();
-      let result=s.close_drain(until,&AtomicBool::new(false),None).map(|()|{let mut w=s.work.lock().unwrap();w.active+=1;*w.sources.entry("stop-final-save").or_default()+=1;Reservation{state:s.clone(),source:"stop-final-save"}});
+      let result=s.close_drain(until,&AtomicBool::new(false),None).map(|_|{let mut w=s.work.lock().unwrap();w.active+=1;*w.sources.entry("stop-final-save").or_default()+=1;Reservation{state:s.clone(),source:"stop-final-save",admitted_epoch:w.outcome_epoch,failure:None,required:false,completed:false,recover:false}});
       let _=reply.send(result);
      }
      Ok(Command::Shutdown)|Err(mpsc::RecvTimeoutError::Disconnected)=>{frame.take();s.stop_ingress();break;}
@@ -268,6 +393,18 @@ impl Owner {
             tx,
             thread: Some(thread),
         })
+    }
+    pub(crate) fn retained_errors(&self) -> Vec<String> {
+        let w = self.state.work.lock().unwrap();
+        let mut errors: Vec<_> = w
+            .errors
+            .iter()
+            .map(|(source, (_, error))| format!("{source}: {error}"))
+            .collect();
+        if let Some(e) = &w.failed {
+            errors.push(e.clone());
+        }
+        errors
     }
     pub(crate) fn drain_stop(&self, until: Instant) -> Result<Activity, String> {
         let (tx, rx) = mpsc::channel();
@@ -652,5 +789,132 @@ mod tests {
             drop(o);
             std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    fn runtime_actual_failed_persister_publishes_error_before_last_permit_and_retry_clears_only_own_error(
+    ) {
+        let (p, e, o, _) = fixture("atomic-result");
+        e.patch_entry_metadata(idx(&e), 900, 0, 0).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (go, gone) = mpsc::channel();
+        let worker = e.clone();
+        let path = p.clone();
+        let t = std::thread::spawn(move || {
+            crate::run::persist_index_with(&worker, &path, |layout, batch| {
+                tx.send(()).unwrap();
+                gone.recv().unwrap();
+                findx2_core::set_persist_fault(findx2_core::PersistFault::AfterDataSync);
+                let result = findx2_core::v6_try_commit(layout, batch).map_err(anyhow::Error::from);
+                findx2_core::clear_persist_fault();
+                result
+            })
+        });
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let prepared = prepare_async(&o, req(&e, '3'));
+        assert!(prepared.recv_timeout(Duration::from_millis(10)).is_err());
+        go.send(()).unwrap();
+        let error = t.join().unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("after data sync"));
+        let refusal = prepared
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            refusal.contains("after data sync"),
+            "must observe actual writer error before active becomes zero: {refusal}"
+        );
+        assert!(!o.retained_errors().is_empty());
+        assert!(e.has_pending_persistence());
+        assert!(crate::run::persist_index(&e, &p).unwrap());
+        assert!(o.retained_errors().is_empty());
+        let v = o
+            .prepare(req(&e, '4'), until(), Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        assert_eq!(size(&p), 900);
+        o.abort(
+            e.checkpoint_instance().unwrap(),
+            "4".repeat(32),
+            generation(&v),
+        )
+        .unwrap();
+        drop(o);
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn runtime_real_metadata_error_stays_visible_after_persist_and_old_instance_is_rejected_after_restart(
+    ) {
+        let (p, e, o, _) = fixture("metadata-result");
+        let error = crate::metadata_pipeline::ticket_pass(
+            &e,
+            e.metadata_epoch(),
+            &AtomicBool::new(false),
+            crate::metadata_pipeline::Limits::default(),
+            |_, _| Err("actual pipeline fetch failure".into()),
+        )
+        .unwrap_err();
+        assert!(error.contains("actual pipeline fetch failure"));
+        let slot = Arc::new(std::sync::RwLock::new(Some(e.clone())));
+        assert!(
+            matches!(crate::ipc_dispatch::process_request(&slot,findx2_ipc::IpcRequest::UpgradeCapabilities{protocol_version:1}),findx2_ipc::IpcResponse::UpgradeCapabilitiesResult{durable_prepare:false,runtime_error:Some(ref error),..} if error.contains("actual pipeline fetch failure"))
+        );
+        assert!(o
+            .prepare(req(&e, '5'), until(), Arc::new(AtomicBool::new(false)))
+            .unwrap_err()
+            .contains("actual pipeline fetch failure"));
+        e.patch_entry_metadata(idx(&e), 901, 0, 0).unwrap();
+        crate::run::persist_index(&e, &p).unwrap();
+        assert!(
+            !o.retained_errors().is_empty(),
+            "unrelated successful disk IO cannot repair source failure"
+        );
+        let stale = req(&e, '6');
+        drop(o);
+        let restarted = Arc::new(SearchEngine::new(
+            findx2_core::v6_load(&findx2_core::V6Layout::for_index(&p)).unwrap(),
+        ));
+        restarted.enable_usage(16 * 1024 * 1024).unwrap();
+        let owner = Owner::attach(
+            restarted.clone(),
+            p.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_ne!(
+            restarted.checkpoint_instance().unwrap(),
+            stale.expected_instance
+        );
+        assert!(owner
+            .prepare(stale, until(), Arc::new(AtomicBool::new(false)))
+            .unwrap_err()
+            .contains("instance"));
+        assert_eq!(size(&p), 901);
+        drop(owner);
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn runtime_missing_normal_outcome_and_late_error_cannot_publish_clean_observation() {
+        let (p, e, o, _) = fixture("late-outcome");
+        let permit = enter(&e, "unreported-source").unwrap().require_result();
+        let prepared = prepare_async(&o, req(&e, '7'));
+        drop(permit);
+        assert!(prepared
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err()
+            .contains("without completing"));
+        let epoch = {
+            let mut w = o.state.work.lock().unwrap();
+            w.closed = true;
+            w.outcome_epoch
+        };
+        let mut published = false;
+        assert!(o
+            .state
+            .publish_if_current(epoch, || true, || published = true)
+            .is_err());
+        assert!(!published);
+        drop(o);
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
     }
 }
