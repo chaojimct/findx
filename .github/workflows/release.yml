@@ -292,31 +292,34 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Read fixed sealed input
-        id: lock
+      - name: Fetch explicitly pinned runtime and independent raw proofs, no rebuild
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $lock=Get-Content release/2.5.3-seal-lock.json -Raw|ConvertFrom-Json
+          if($lock.schema -cne 'rebuilt-engine-composite-v2'){throw 'New final composite proof lock required'}
+          gh run download $lock.testedRun --repo chaojimct/findx --name $lock.payloadArtifact --dir "$env:RUNNER_TEMP/sealed-payload"
+          if($LASTEXITCODE){throw 'Exact tested payload download failed'}
+          $done=@{}
+          foreach($p in $lock.proofs){$key=[string]$p.run+':'+$p.artifact;if($done.ContainsKey($key)){continue};$done[$key]=$true
+            gh run download $p.run --repo chaojimct/findx --name $p.artifact --dir (Join-Path "$env:RUNNER_TEMP/sealed-evidence" ([string]$done.Count))
+            if($LASTEXITCODE){throw 'Pinned independent raw proof download failed'}
+          }
+      - name: Install packaging compiler and hash-pinned read-only extractor only
         shell: powershell
         run: |
-          $lock=Get-Content release/2.5.3-seal-lock.json -Raw | ConvertFrom-Json
-          "run=$($lock.testedRun)" >> $env:GITHUB_OUTPUT
-      - uses: actions/download-artifact@v4
-        with:
-          name: findx-253-immutable-candidate-payload
-          run-id: ${{ steps.lock.outputs.run }}
-          github-token: ${{ github.token }}
-          path: ${{ runner.temp }}/sealed-payload
-      - uses: actions/download-artifact@v4
-        with:
-          name: installer-safety-test-evidence
-          run-id: ${{ steps.lock.outputs.run }}
-          github-token: ${{ github.token }}
-          path: ${{ runner.temp }}/sealed-evidence
-      - name: Install packaging compiler only
+          if(-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")){choco install innosetup -y --no-progress;if($LASTEXITCODE){throw 'ISCC installation failed'}}
+          $zip=Join-Path $env:RUNNER_TEMP 'innounp.zip'
+          Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/jrathlev/InnoUnpacker-Windows-GUI/refs/heads/master/innounp-2/bin/innounp-2.zip -OutFile $zip
+          if((Get-FileHash $zip).Hash -ine 'f8e45c9676bebc7d7570108ab572673b541fcf7a7d3d24a04319ac6b5315b4e8'){throw 'Read-only extractor digest changed'}
+          Expand-Archive $zip -DestinationPath "$env:RUNNER_TEMP/innounp"
+      - name: Approved official setup from sealed bytes; extract and verify every embedded hash
         shell: powershell
-        run: |
-          if(-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")){choco install innosetup -y --no-progress}
-      - name: Approved packaging from sealed bytes, never rebuild runtime
-        shell: powershell
-        run: ./scripts/pack-sealed-release.ps1 -PayloadRoot "$env:RUNNER_TEMP/sealed-payload" -EvidenceRoot "$env:RUNNER_TEMP/sealed-evidence" -OutputRoot "$env:RUNNER_TEMP/sealed-production-output" -Production -Iscc "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/pack-sealed-release.ps1 -PayloadRoot "$env:RUNNER_TEMP/sealed-payload" -EvidenceRoot "$env:RUNNER_TEMP/sealed-evidence" -OutputRoot "$env:RUNNER_TEMP/sealed-production-output" -Production -Iscc "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" -Extractor "$env:RUNNER_TEMP/innounp/innounp.exe"
       - uses: actions/upload-artifact@v4
         with:
           name: findx-windows-sealed
@@ -354,4 +357,4 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF_NAME" = "v2.5.3"
           # gh release create fails when the Release exists; never upload --clobber.
-          gh release create v2.5.3 dist/FindX-2.5.3-setup.exe dist/SHA256SUMS.txt dist/seal.json --verify-tag --title "FindX 2.5.3" --notes "Native GUI and verified installer; exact sealed published 2.5.2 engine. See seal.json provenance."
+          gh release create v2.5.3 dist/FindX-2.5.3-setup.exe dist/SHA256SUMS.txt dist/seal.json --verify-tag --title "FindX 2.5.3" --notes "Native GUI and rebuilt durability-safe engine; exact sealed payload with component-scoped acceptance provenance in seal.json. Running legacy 2.5.2 without protocol2 is refused before STOP; no forced shutdown. Install manually; no automatic installation."

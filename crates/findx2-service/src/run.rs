@@ -1625,11 +1625,16 @@ mod tests {
         begin.recv_timeout(Duration::from_secs(5)).unwrap();e.enable_usage(16*1024*1024).unwrap();drop(guard);
         assert!(!job.join().unwrap().unwrap());
         checkpoint_patch(&e,789);assert!(e.complete_metadata_if_covered(e.metadata_epoch()).unwrap());let epoch=e.metadata_epoch();
+        let replacement=std::cell::Cell::new(None);
         assert!(!super::persist_metadata_final_with(&e,&path,Some(epoch),|layout,batch|{
             let outcome=findx2_core::v6_try_commit(layout,batch).map_err(|e|anyhow::anyhow!("{e:#}"))?;
-            e.enable_usage(16*1024*1024).unwrap();Ok(outcome)
+            e.enable_usage(16*1024*1024).unwrap();replacement.set(Some((e.metadata_epoch(),e.metadata_ready())));Ok(outcome)
         }).unwrap());
-        assert_ne!(epoch,e.metadata_epoch());assert!(!e.metadata_ready());
+        assert_ne!(epoch,e.metadata_epoch());
+        // Re-enabling tracking over already complete metadata need not make the
+        // new store incomplete. The old finalizer must leave its actual state
+        // unchanged and still MUST return obsolete, not a completion receipt.
+        assert_eq!(Some((e.metadata_epoch(),e.metadata_ready())),replacement.get());
         drop(owner);std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
     #[test]

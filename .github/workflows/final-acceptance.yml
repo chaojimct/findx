@@ -34,7 +34,7 @@ jobs:
           run-id: 44468255654
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/final-gui-input
-      - name: One incremental service-only build and finalizer lifetime regressions
+      - name: One incremental service-only build and finalizer ownership epoch regressions
         shell: pwsh
         run: |
           $root="$env:RUNNER_TEMP/findx-final253-payload"
