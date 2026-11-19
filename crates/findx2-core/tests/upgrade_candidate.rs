@@ -320,7 +320,7 @@ fn identical_full_frns_across_volumes_never_cross_parent_or_root_after_reload() 
     for letter in [b'Z',b'Y'] {
         stores.push(IndexBuilder::new(letter,letter as u32,letter as u64,100).build_from_raw(
             vec![raw(0x1000000000040,root,"root-proof.txt",false),raw(0x1000000000041,0x100000000000c,"child.txt",false)],
-            vec![raw(root,0,"",true),raw(0x100000000000c,root,"nested",true)],true).unwrap());
+            vec![raw(0x100000000001c,0,"$RmMetadata",true),raw(root,0,"",true),raw(0x100000000000c,root,"nested",true)],true).unwrap());
     }
     let s=merge_index_stores(stores).unwrap();
     let check=|s:IndexStore| {

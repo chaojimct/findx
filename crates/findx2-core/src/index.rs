@@ -765,6 +765,9 @@ impl IndexStore {
     /// 按需解析目录路径（与物化进 `dir_paths_buf` 的字节语义一致）。
     pub(crate) fn resolve_dir_path_lower(&self, dir_idx: u32) -> Cow<'_, [u8]> {
         let d = dir_idx as usize;
+        if self.dirs.get(d).is_some_and(|entry| entry.name_len == 0) { return Cow::Borrowed(&[]); }
+        let root=self.dir_root_idx(dir_idx);
+        if self.dirs.get(root as usize).is_some_and(|entry| entry.name_len==0 && entry.parent_idx!=root) { return Cow::Owned(self.build_dir_path_lower_owned(dir_idx)); }
         if d < self.dir_path_ranges.len() {
             let (o, len) = self.dir_path_ranges[d];
             if len > 0 {
@@ -791,6 +794,7 @@ impl IndexStore {
         while safety > 0 {
             safety -= 1;
             let d = &self.dirs[cur];
+            if d.name_len == 0 { break; } // Empty native root is not a child of an earlier detached metadata record.
             let end = d.name_offset as usize + d.name_len as usize;
             let name_bs = self
                 .names_buf
@@ -834,6 +838,7 @@ impl IndexStore {
         while safety > 0 {
             safety -= 1;
             let d = &self.dirs[cur];
+            if d.name_len == 0 { break; } // Empty native root is not a child of an earlier detached metadata record.
             let end = d.name_offset as usize + d.name_len as usize;
             let name_bs = self
                 .names_buf
@@ -1663,7 +1668,7 @@ impl IndexStore {
         let mut guard = 0usize;
         while (di as usize) < self.dirs.len() {
             let p = self.dirs[di as usize].parent_idx;
-            if p == di { return di; }
+            if p == di || self.dirs[di as usize].name_len == 0 { return di; }
             di = p;
             guard += 1;
             if guard > self.dirs.len() { break; }
@@ -2091,7 +2096,7 @@ impl IndexStore {
     fn volume_for_dir_idx(&self, dir_idx:u32)->Option<&VolumeState>{
         let root=self.dir_root_idx(dir_idx);
         let d=self.dirs.get(root as usize)?;
-        if d.parent_idx!=root{return None;}
+        if d.parent_idx!=root && d.name_len!=0{return None;}
         if self.volumes.len()==1{return self.volumes.first();}
         self.volumes.iter().enumerate().find_map(|(slot,v)|{
             (self.dir_index.get_scoped(d.frn,slot as u32)==Some(root)).then_some(v)
@@ -2461,6 +2466,8 @@ impl IndexBuilder {
                 children.entry(d.parent_id).or_default().push(d);
             }
         }
+        // Enumeration order is not identity: detached metadata may precede the volume root.
+        roots.sort_by_key(|d| !d.name.is_empty());
         let mut queue: VecDeque<RawEntry> = VecDeque::from_iter(roots);
         let mut topo_done: u64 = 0;
         while let Some(d) = queue.pop_front() {
