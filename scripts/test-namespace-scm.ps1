@@ -88,7 +88,7 @@ function Native-Tool([string]$Tool,[string]$Arguments){
  $id=[guid]::NewGuid().ToString('N');$p=Start-Process $Tool -ArgumentList $Arguments -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $artifact ($id+'.log')) -RedirectStandardError (Join-Path $artifact ($id+'.err'));$h=$p.Handle
  Assert ($p.WaitForExit(60000) -and $p.ExitCode -eq 0) 'Owned native command failed/timed out; no force'
 }
-$aclB=$null;$aclD=$null
+$aclB=$null;$aclD=$null;$index=$null
 try{
  Stage 'create-attested-owned-vhd-and-native-seed'
  $owned=New-FxOwnedTestVolume (Join-Path $base 'owned-health.vhd') ('FXTX'+[guid]::NewGuid().ToString('N').Substring(0,8).ToUpperInvariant())
@@ -100,6 +100,9 @@ try{
  $cli=Join-Path $repo 'target\debug\findx2.exe';$verify=Join-Path $repo 'target\debug\examples\verify_persisted_file.exe';$copy=Join-Path $repo 'target\debug\examples\namespace_index_copy.exe'
  $source=Join-Path $base 'source.bin';$index=Join-Path $base 'incomplete-copy.bin'
  Native-Tool $cli ('index --volume '+$owned.Volume+' --output "'+$source+'" --max-scan-threads 1')
+ $initial=& $verify --inspect-index $source;Assert ($LASTEXITCODE -eq 0) 'Cannot inspect canonical native provision'
+ $initial|Set-Content (Join-Path $artifact 'canonical-initial-index-state.json');$initialView=$initial|ConvertFrom-Json
+ Assert ($initialView.source -eq 'segmented-v6' -and -not $initialView.metadata_ready -and @($initialView.volumes).Count -eq 1 -and $initialView.volumes[0].root_prefix -ceq $owned.Root) 'Canonical initial native scope/partial metadata wrong'
  Native-Tool $copy ('"'+$source+'" "'+$index+'" '+$owned.Root)
  $script:pipeName='findx253ns'+[guid]::NewGuid().ToString('N')
  $command='"'+$ServiceExe+'" --service --index "'+$index+'" --volume '+$owned.Volume+' --pipe '+$pipeName+' --no-everything-ipc --save-interval-secs 1'
@@ -158,7 +161,7 @@ try{
  Stage 'final-terminal-stop-offline-cursor-and-restart'
  $final=Invoke-FxTxPreparedServiceStop $name $script:pipeName $ServiceExe $index $cli '2.5.3' $artifact 15
  & $verify $index (Join-Path $d 'post-rebuild.txt') 12 $final.token.published_generation|Set-Content (Join-Path $artifact 'final-offline-proof.json');Assert ($LASTEXITCODE -eq 0) 'Final offline proof failed'
- $offline=Cursor;Assert ($offline.journal_id -ne $heldCursor.journal_id -and $offline.last_usn -gt 0) 'Offline generation still carries old journal cursor'
+ $offline=Cursor;$offline|ConvertTo-Json|Set-Content (Join-Path $artifact 'canonical-final-cursor.json');Assert ($offline.journal_id -ne $heldCursor.journal_id -and $offline.last_usn -gt 0) 'Offline generation still carries old journal cursor'
  Start-Service $name;Wait-Condition {Ready} 60 'New journal durable index restart failed';Assert ((Has-File 'post-rebuild.txt' 12) -and (Has-File 'later-two.txt' 9) -and (Has-File 'blocked.txt' 11)) 'Durable new generation lost namespace on restart'
  $null=Invoke-FxTxPreparedServiceStop $name $script:pipeName $ServiceExe $index $cli '2.5.3' $artifact 15
  $rows.Add(@{test='actual-scm-journal-gap-live-index-replace-offline-restart';passed=$true;beforeEpoch=$beforeSwap;oldJournal=$heldCursor.journal_id;newJournal=$offline.journal_id;diskCursor=$offline.last_usn;offlineBeforeReplay=$true;pid=$samePid;noWatch=$false;noBackfill=$false})
@@ -168,7 +171,9 @@ try{
 }finally{
  if($aclB){Set-Acl -LiteralPath $b -AclObject $aclB};if($aclD){Set-Acl -LiteralPath $d -AclObject $aclD}
  $rows|ConvertTo-Json -Depth 15|Set-Content -Encoding UTF8 (Join-Path $artifact 'results.json')
+ # Retain only STOPPED disposable canonical index bytes for future corrected-reader replay.
  $safe=$true
  if($created){try{$s=Stop-Owned;if($s.State -ne 'Stopped'){$safe=$false}}catch{$safe=$false};if($safe){& sc.exe delete $name|Out-File (Join-Path $artifact 'delete-owned.log')}}
+ if($safe -and $index -and (Test-Path -LiteralPath $index)){Copy-Item -LiteralPath $index -Destination (Join-Path $artifact 'retained-index.bin');if(Test-Path -LiteralPath ($index+'.v6')){Copy-Item -LiteralPath ($index+'.v6') -Destination (Join-Path $artifact 'retained-index.bin.v6') -Recurse}}
  if($owned -and $safe){Dismount-DiskImage -ImagePath $owned.Image -ErrorAction Stop}
 }

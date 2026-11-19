@@ -239,16 +239,19 @@ pub fn usn_watch_forever(
                 | USN_REASON_DATA_EXTEND
                 | USN_REASON_DATA_TRUNCATION
                 | USN_REASON_BASIC_INFO_CHANGE,
-            // 阻塞等待：无数据时挂起至多 2 秒（有数据立刻返回）。同步句柄下有效；
-            // 64KB 未过滤增量攒够或超时即返回，避免小批量高频唤醒。
+            // A synchronous nonzero BytesToWaitFor REPEATS Timeout forever when
+            // idle; it is NOT a bounded two-second wait (MS READ_USN_JOURNAL_DATA).
+            // Nonwaiting reads return the actual consumed cursor, including EOF.
+            // Back off only at unchanged EOF below; never acknowledge QUERY tail.
             ReturnOnlyOnClose: 0,
-            Timeout: 2,
-            BytesToWaitFor: 64 * 1024,
+            Timeout: 0,
+            BytesToWaitFor: 0,
             UsnJournalID: journal_id,
         };
 
         // 追赶期（停机后首次 catch-up）大批量一次吃完，减少 ioctl 往返。
         let mut out = vec![0u8; 1024 * 1024];
+        let start_cursor = next_cursor;
         let mut returned: u32 = 0;
         let ioctl_ok = unsafe {
             DeviceIoControl(
@@ -337,7 +340,9 @@ pub fn usn_watch_forever(
             }
             publish_watch_batch(messages, journal_id, next_cursor as u64, &tx)?;
         }
-        // 无 sleep：阻塞式 READ 自带等待节拍；有数据时紧追，无数据时内核挂起。
+        // No busy loop at EOF; catch-up remains immediate. This also bounds idle
+        // worker observation so a genuine empty read can clear its own gap latch.
+        if next_cursor == start_cursor { std::thread::sleep(std::time::Duration::from_millis(250)); }
     }
 }
 

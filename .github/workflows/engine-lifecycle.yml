@@ -20,6 +20,7 @@ on:
       - 'scripts/test-upgrade-capabilities.ps1'
       - 'scripts/test-ntfs-identity.ps1'
       - 'scripts/test-namespace-scm.ps1'
+      - 'scripts/test-combined-roots.ps1'
       - 'scripts/gui-compat-tests/**'
       - 'installer/FindX.iss'
   workflow_dispatch:
@@ -49,6 +50,16 @@ jobs:
           if($LASTEXITCODE){exit $LASTEXITCODE}
           $compatAllowed=@('Cargo.lock','crates/findx2-windows/src/usn.rs','crates/findx2-core/examples/verify_persisted_file.rs','crates/findx2-gui-native/Cargo.toml','crates/findx2-gui-native/src/lib.rs','crates/findx2-gui-native/src/prefs.rs','crates/findx2-gui-native/src/session.rs','crates/findx2-gui-native/src/legacy_compat.rs','crates/findx2-gui-native/src/ui/mod.rs','crates/findx2-gui-native/src/ui/workspace.rs','crates/findx2-gui-native/src/ui/main_window.rs','scripts/gui-compat-tests/Cargo.toml','scripts/gui-compat-tests/Cargo.lock','scripts/test-namespace-scm.ps1')
           if(@($compat).Count -eq $compatAllowed.Count -and @($compat|Where-Object {$_ -notin $compatAllowed}).Count -eq 0){
+            git fetch origin 7983dd3f2d789e448d448dea5227bad2e8326b51 --depth=1
+            if($LASTEXITCODE){exit $LASTEXITCODE}
+            $idle=git diff --name-only 7983dd3f2d789e448d448dea5227bad2e8326b51 HEAD -- Cargo.lock Cargo.toml crates installer scripts/gui-compat-tests scripts/test-namespace-scm.ps1
+            if($LASTEXITCODE){exit $LASTEXITCODE}
+            if(@($idle).Count -eq 2 -and @($idle|Where-Object {$_ -notin @('crates/findx2-windows/src/usn.rs','scripts/test-namespace-scm.ps1')}).Count -eq 0){
+              $proof=gh run view 44464687947 --repo chaojimct/findx --json headSha,jobs|ConvertFrom-Json
+              if($LASTEXITCODE -or $proof.headSha -cne '7983dd3f2d789e448d448dea5227bad2e8326b51'){throw 'Missing exact GUI/compat/inspector test source'}
+              if(@($proof.jobs|ForEach-Object {$_.steps}|Where-Object {$_.name -eq 'Affected parent recovery and real replacement binding tests' -and $_.conclusion -eq 'success'}).Count -ne 1){throw 'Missing unchanged GUI/compat/inspector scoped success'}
+              'idle-only=true' >> $env:GITHUB_OUTPUT
+            }
             # Only bounded idle-reader recovery + GUI compatibility + offline inspector changed; no writer/IPC changes or full GUI build.
             # Prior journal native was NOT passed: stale-anchor inspection fixed
             # below and both genuine SCM cases rerun with the canonical reader.
@@ -140,12 +151,14 @@ jobs:
           if('${{ steps.engine-change.outputs.compat }}' -eq 'true'){
             cargo test --locked -p findx2-windows idle_checkpoint -- --test-threads=1
             if($LASTEXITCODE){exit $LASTEXITCODE}
+            if('${{ steps.engine-change.outputs.idle-only }}' -ne 'true'){
             cargo test --locked --manifest-path scripts/gui-compat-tests/Cargo.toml -- --test-threads=1
             if($LASTEXITCODE){exit $LASTEXITCODE}
             cargo test --locked -p findx2-core --example verify_persisted_file -- --test-threads=1
             if($LASTEXITCODE){exit $LASTEXITCODE}
             cargo check --locked -p findx2-gui-native
             if($LASTEXITCODE){exit $LASTEXITCODE}
+            }
           }elseif('${{ steps.engine-change.outputs.recovery }}' -eq 'true'){
             cargo test --locked -p findx2-service watch_recovery -- --test-threads=1
             if($LASTEXITCODE){exit $LASTEXITCODE}
@@ -161,6 +174,18 @@ jobs:
           if($LASTEXITCODE){exit $LASTEXITCODE}
           cargo build --locked -p findx2-windows --example namespace_index_copy
           if($LASTEXITCODE){exit $LASTEXITCODE}
+      - name: Preserve exact native test modules for subsequent no-rebuild reuse
+        if: steps.engine-change.outputs.parent == 'true'
+        shell: pwsh
+        run: |
+          $root='native-reuse-binaries';New-Item -ItemType Directory $root|Out-Null
+          foreach($p in @('target/debug/findx2-service.exe','target/debug/findx2.exe','target/debug/examples/verify_persisted_file.exe','target/debug/examples/namespace_index_copy.exe')){Copy-Item $p $root}
+          $files=@(Get-ChildItem $root -File|ForEach-Object {@{name=$_.Name;sha256=(Get-FileHash $_.FullName -Algorithm SHA256).Hash}})
+          @{sourceCommit=$env:GITHUB_SHA;profile='debug-native-tests-NOT-release';files=$files}|ConvertTo-Json -Depth 5|Set-Content (Join-Path $root 'source-hashes.json')
+      - name: Actual owned two-volume canonical root read-only compatibility
+        if: steps.engine-change.outputs.parent == 'true'
+        shell: powershell
+        run: ./scripts/test-combined-roots.ps1
       - name: Actual SCM parent permission retry and live journal/index replacement
         if: steps.engine-change.outputs.parent == 'true'
         shell: powershell
@@ -255,6 +280,8 @@ jobs:
             client-compile.log
             native-runtime-evidence/**
             native-namespace-evidence/**
+            native-combined-evidence/**
+            native-reuse-binaries/**
             ${{ runner.temp }}/FindXUpgradeTest_identity_*/native-identity.*
             ${{ runner.temp }}/FindXUpgradeTest_identity_*/owned-volume.json
           retention-days: 30
