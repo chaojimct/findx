@@ -767,6 +767,7 @@ fn usn_watch_loop(
     // A fatal namespace failure fences all subsequent cursors. Do not consume a later
     // successful batch as proof the failed prefix committed. Search remains available;
     // restart/rebuild is required and resumes from the retained durable watermark.
+    let watch_source=crate::runtime_lifecycle::watch_source(letter as u8).ok_or_else(||anyhow::anyhow!("invalid watch volume identity"))?;
     let mut namespace_gate = crate::watch_health::NamespaceGate::default();
     let mut unlink_resolver:Option<findx2_windows::NtfsUnlinkResolver>=None;
     let mut namespace_retry=crate::watch_health::NamespaceRetry::default();
@@ -781,7 +782,7 @@ fn usn_watch_loop(
             info!("卷 {letter} USN 监听线程停机退出");
             return Ok(());
         }
-        let mut lifecycle=match crate::runtime_lifecycle::enter(&engine,"watch-batch") {Ok(p)=>p.require_result(),Err(_)=>return Ok(())};
+        let mut lifecycle=match crate::runtime_lifecycle::enter(&engine,watch_source) {Ok(p)=>p.require_result(),Err(_)=>return Ok(())};
         if namespace_gate.blocked {
             let _ = rx.recv_timeout(Duration::from_millis(100));
             std::thread::sleep(Duration::from_millis(100));
@@ -841,6 +842,10 @@ fn usn_watch_loop(
                             set_watch_error(letter, engine.has_pending_namespace(volume_letter).then(||
                                 format!("missing-parent namespace events pending; durable cursor pinned for restart replay; {}", engine.pending_namespace_diagnostics(volume_letter))));
                             dirty_count += events.len();
+                            // Only successful atomic application of the real retained
+                            // prefix repairs this volume. Mere timeouts/fence drains or
+                            // another volume's healthy batch cannot clear its failure.
+                            if !engine.has_pending_namespace(volume_letter){lifecycle.recovered_source();}
                         }
                         Err(e) => {
                             set_watch_error(
@@ -900,6 +905,9 @@ fn usn_watch_loop(
                         set_watch_error(letter, Some(w));
                     } else {
                         set_watch_error(letter, None);
+                        // Actual native reader + accepted current-journal checkpoint
+                        // proves reconnect/rebuild recovery, not an idle timer.
+                        lifecycle.recovered_source();
                     }
                     // 注：这里只改 USN 游标，不影响搜索结果/排序，故不 bump revision
                     //（否则每次 checkpoint 都会误杀分页缓存）。真正改条目的是上面的 flush_pending。

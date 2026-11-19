@@ -42,6 +42,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          git fetch origin 76598791dbcf4c3148439de7cbee19cee6a48868 --depth=1
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          $recovery=git diff --name-only 76598791dbcf4c3148439de7cbee19cee6a48868 HEAD -- Cargo.lock Cargo.toml crates installer
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          $recoveryAllowed=@('crates/findx2-service/src/run.rs','crates/findx2-service/src/runtime_lifecycle.rs')
+          if(@($recovery).Count -eq 2 -and @($recovery|Where-Object {$_ -notin $recoveryAllowed}).Count -eq 0){
+            $proof=gh run view 44460607845 --repo chaojimct/findx --json headSha,jobs|ConvertFrom-Json
+            if($LASTEXITCODE -or $proof.headSha -cne '76598791dbcf4c3148439de7cbee19cee6a48868'){throw 'Missing exact prior test source'}
+            $steps=@($proof.jobs|ForEach-Object {$_.steps}|Where-Object {$_.name -eq 'Affected parent recovery and real replacement binding tests' -and $_.conclusion -eq 'success'})
+            if($steps.Count -ne 1){throw 'Missing previous unchanged Windows/core unit and compile evidence'}
+            # Prior native scenario FAILED stale runtime error recovery. Never reuse
+            # that result as passed; this branch reruns the actual SCM scenario.
+            'recovery=true' >> $env:GITHUB_OUTPUT
+            'parent=true' >> $env:GITHUB_OUTPUT
+            'changed=false' >> $env:GITHUB_OUTPUT
+            exit 0
+          }
           git fetch origin 0d7d1a188bfa4305bcc70ca7fecc1f1bbf850742 --depth=1
           if($LASTEXITCODE){exit $LASTEXITCODE}
           $parent=git diff --name-only 0d7d1a188bfa4305bcc70ca7fecc1f1bbf850742 HEAD -- Cargo.lock Cargo.toml crates installer
@@ -105,10 +122,15 @@ jobs:
         if: steps.engine-change.outputs.parent == 'true'
         shell: pwsh
         run: |
-          cargo test --locked -p findx2-windows ntfs_ -- --test-threads=1
-          if($LASTEXITCODE){exit $LASTEXITCODE}
-          cargo test --locked -p findx2-core --lib namespace_binding -- --test-threads=1
-          if($LASTEXITCODE){exit $LASTEXITCODE}
+          if('${{ steps.engine-change.outputs.recovery }}' -eq 'true'){
+            cargo test --locked -p findx2-service watch_recovery -- --test-threads=1
+            if($LASTEXITCODE){exit $LASTEXITCODE}
+          }else{
+            cargo test --locked -p findx2-windows ntfs_ -- --test-threads=1
+            if($LASTEXITCODE){exit $LASTEXITCODE}
+            cargo test --locked -p findx2-core --lib namespace_binding -- --test-threads=1
+            if($LASTEXITCODE){exit $LASTEXITCODE}
+          }
           cargo build --locked -p findx2-service -p findx2-cli
           if($LASTEXITCODE){exit $LASTEXITCODE}
           cargo build --locked -p findx2-core --example verify_persisted_file

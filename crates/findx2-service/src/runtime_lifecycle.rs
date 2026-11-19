@@ -136,6 +136,14 @@ impl Activity {
             p.error(error);
         }
     }
+    /// Only the real operation that repaired this exact source may request
+    /// recovery. Drop still atomically checks admission/outcome epoch: an older
+    /// repair cannot erase a newer failure, including one published at last exit.
+    pub(crate) fn recovered_source(&mut self) {
+        if let Some(p) = &mut self._owned {
+            if p.failure.is_none() {p.recover = true;p.success();}
+        }
+    }
     pub(crate) fn finish<T, E: std::fmt::Display>(mut self, result: Result<T, E>) -> Result<T, E> {
         match &result {
             Ok(_) => self.success(),
@@ -154,6 +162,11 @@ impl Activity {
         }
         self.finish(result)
     }
+}
+// A healthy different volume must never clear a failed volume's source.
+pub(crate) fn watch_source(volume:u8)->Option<&'static str>{
+ const SOURCES:[&str;26]=["watch-batch-A","watch-batch-B","watch-batch-C","watch-batch-D","watch-batch-E","watch-batch-F","watch-batch-G","watch-batch-H","watch-batch-I","watch-batch-J","watch-batch-K","watch-batch-L","watch-batch-M","watch-batch-N","watch-batch-O","watch-batch-P","watch-batch-Q","watch-batch-R","watch-batch-S","watch-batch-T","watch-batch-U","watch-batch-V","watch-batch-W","watch-batch-X","watch-batch-Y","watch-batch-Z"];
+ SOURCES.get(usize::from(volume.checked_sub(b'A')?)).copied()
 }
 pub(crate) fn error_optional(activity: &mut Option<Activity>, error: String) {
     if let Some(a) = activity {
@@ -1049,6 +1062,39 @@ mod tests {
         assert!(!published);
         drop(o);
         std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn watch_recovery_requires_verified_own_volume_not_heartbeat_or_other_volume(){
+        let(p,e,o,_)=fixture("watch-recovery-scope");
+        {let mut a=enter(&e,watch_source(b'C').unwrap()).unwrap().require_result();a.error("real parent permission failure C".into());}
+        {let mut a=enter(&e,watch_source(b'D').unwrap()).unwrap().require_result();a.recovered_source();}
+        {let mut a=enter(&e,watch_source(b'C').unwrap()).unwrap().require_result();a.success();}
+        assert!(o.retained_errors().iter().any(|s|s.contains("failure C")));
+        {let mut a=enter(&e,watch_source(b'C').unwrap()).unwrap().require_result();a.recovered_source();}
+        assert!(o.retained_errors().is_empty());assert!(watch_source(b'@').is_none());assert!(watch_source(b'[').is_none());
+        drop(o);std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn watch_recovery_stale_admission_cannot_clear_a_later_failure(){
+        let(p,e,o,_)=fixture("watch-recovery-late");let source=watch_source(b'C').unwrap();
+        let mut stale=enter(&e,source).unwrap().require_result();
+        {let mut failure=enter(&e,source).unwrap().require_result();failure.error("later native writer error".into());}
+        stale.recovered_source();drop(stale);
+        assert!(o.retained_errors().iter().any(|s|s.contains("later native writer error")));
+        {let mut fresh=enter(&e,source).unwrap().require_result();fresh.recovered_source();}
+        assert!(o.retained_errors().is_empty());drop(o);std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn watch_recovery_does_not_hide_own_error_or_a_late_foreign_volume_exit(){
+        let(p,e,o,_)=fixture("watch-recovery-error-wins");
+        {let mut a=enter(&e,watch_source(b'C').unwrap()).unwrap().require_result();a.error("same operation failed".into());a.recovered_source();}
+        let mut late=enter(&e,watch_source(b'D').unwrap()).unwrap().require_result();
+        {let mut a=enter(&e,watch_source(b'C').unwrap()).unwrap().require_result();a.recovered_source();}
+        late.error("late D source failure".into());drop(late);
+        {let mut a=enter(&e,watch_source(b'C').unwrap()).unwrap().require_result();a.recovered_source();}
+        assert!(o.retained_errors().iter().any(|s|s.contains("late D source failure")));
+        assert!(o.prepare(req(&e,'8'),until(),Arc::new(AtomicBool::new(false))).unwrap_err().contains("late D source failure"));
+        drop(o);std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
     }
     fn token(v:&serde_json::Value)->StopToken{
         let c=&v["core"];StopToken{protocol_version:2,engine_instance:c["engine_instance"].as_str().unwrap().into(),service_pid:std::process::id(),request_nonce:c["request_nonce"].as_str().unwrap().into(),index_identity:c["index_identity"].as_str().unwrap().into(),mutation_sequence:c["mutation_sequence"].as_u64().unwrap(),published_generation:c["published_generation"].as_u64().unwrap(),outcome_epoch:v["outcome_epoch"].as_u64().unwrap()}
