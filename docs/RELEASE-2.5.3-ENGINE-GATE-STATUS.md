@@ -1,4 +1,4 @@
-# 2.5.3 required gates — t226 bounded update
+# 2.5.3 required gates — t228 bounded update
 
 2026-11-19 Asia/Shanghai. All eight remain required; no N/A, override or release approval. Completed prior-byte evidence is reused, not rerun or silently attributed to new bytes.
 
@@ -6,6 +6,13 @@
 - aedfa5c CI44446796510: real native8/8, final save/OS errors, retained RAM/retry, nonce/instance, STOP/offline-before-replay.
 - Exact0a31012 six-file payload: all18 distinct actual ISS cases pass across CI44449891828 (11 genuine passes; seven fixture-scope failures) and CI44452691069 (the repaired seven pass). Full backup, IPC/GUI, candidate terminal rollback, PATH/three real COM shortcuts and reentry are covered for THAT payload. Backup injection is pre-copy; copied corruption is an integrity fault, not physical IO failure. Do not rerun old18 or call them a new changed-engine payload.
 - b952f27: root interpretation fix,16 targeted compatibility/query tests. GUI/IPC unchanged; root fix is not in0a payload.
+
+## t228 actual source/runtime result (not full-volume or release approval)
+- CI44460607845/7659879: fixed argv genuinely reached SCM/watch/backfill; real parent ACL denial retained exact prefix and persisted cursor, later events held. Restored namespace exposed a real stale runtime-error latch, not a health assertion to bypass.
+- 6ce07b2 fixes this with volume-qualified watch error sources and explicitly verified recovery guarded by existing admission/outcome epochs. Three focused TEMP regressions pass locally and in CI44461610643; another volume, an older recovery or own/late failure cannot mask an error.
+- CI44461610643 native CASE1 genuinely passed: real parent-chain ACL failure/hold -> ACL repair -> exact canonical child and later event -> unchanged PID/index epoch (no rescan) -> official bound prepare/STOP -> offline generation6 verification BEFORE replay -> actual SCM restart/data restoration. This is one genuine accepted case, not whole-volume acceptance.
+- Same run CASE2 reached real private journal delete/create and native rebuilt index (20 entries/9 dirs, new journal134395378783652748, cursor336, metadata ready/watch clear). It FAILED before post-rebuild listener sentinel: runtime rightly still reported the prior JournalGap until verified reader work. Test ordering demanded recovery before stimulating that new reader. Reordered to assert actual changed RAM epoch first, then create/observe the real sentinel, STILL require complete health and all old/new files, terminal STOP/offline/restart. No success yet for CASE2; receive its corrective CI. No production health predicate weakened.
+- Exact remaining categories: gates2/3 converge on final changed-payload integration;1/4/5/7/8 still require their stated independent acceptance;6 has a definite remaining legacy-import/session-persistence product gap. Old GUI hash cannot be reused if that GUI code changes.
 
 ## Exact remaining work, independent gates
 | Required gate | Evidence / implementation already present | Minimum remaining release-required action |

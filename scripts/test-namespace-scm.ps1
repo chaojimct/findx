@@ -141,12 +141,15 @@ try{
  Native-Tool "$env:SystemRoot\System32\fsutil.exe" ('usn deletejournal /d '+$owned.Volume)
  Native-Tool "$env:SystemRoot\System32\fsutil.exe" ('usn createjournal m=16777216 a=1048576 '+$owned.Volume)
  Set-Acl -LiteralPath $d -AclObject $aclD;$aclD=$null
- Wait-Condition {Ready} 120 'Same-volume native journal rebuild/replay never recovered'
- Wait-Condition {(Epoch) -ne $beforeSwap} 30 'Actual RAM index generation was not replaced'
+ # Establish actual index replacement FIRST, then stimulate the NEW reader.
+ # Demanding its verified recovery before its first post-swap event is circular:
+ # the old JournalGap must remain visible until an accepted native read proves it.
+ Wait-Condition {(Epoch) -ne $beforeSwap} 120 'Actual RAM index generation was not replaced'
  Assert ((Assert-OwnedService).ProcessId -eq $samePid) 'Journal replacement must exercise live process rebuild, not service restart'
- Wait-Condition {(Has-File 'blocked-two.txt' 11) -and (Has-File 'later-two.txt' 9) -and (Has-File 'blocked.txt' 11)} 30 'Lost old accepted or failed-prefix filesystem data during generation replacement'
  [IO.File]::WriteAllText((Join-Path $d 'post-rebuild.txt'),'post-rebuild')
  Wait-Condition {Has-File 'post-rebuild.txt' 12} 30 'New-generation actual USN listener did not resume'
+ Wait-Condition {Ready} 120 'Same-volume native journal rebuild/replay never recovered'
+ Wait-Condition {(Has-File 'blocked-two.txt' 11) -and (Has-File 'later-two.txt' 9) -and (Has-File 'blocked.txt' 11)} 30 'Lost old accepted or failed-prefix filesystem data during generation replacement'
  Stage 'final-terminal-stop-offline-cursor-and-restart'
  $final=Invoke-FxTxPreparedServiceStop $name $script:pipeName $ServiceExe $index $cli '2.5.3' $artifact 15
  & $verify $index (Join-Path $d 'post-rebuild.txt') 12 $final.token.published_generation|Set-Content (Join-Path $artifact 'final-offline-proof.json');Assert ($LASTEXITCODE -eq 0) 'Final offline proof failed'
