@@ -71,8 +71,8 @@ function Close-Gui($p){if(-not$p.HasExited){$p.Refresh();[FinalGuiExit]::Exit([u
 function Invoke-Gui($p,$label){$p.Refresh();$a=[Windows.Automation.AutomationElement]::FromHandle($p.MainWindowHandle);$c=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,$label);$script:foundControl=$null;Wait-Condition {$script:foundControl=$a.FindFirst([Windows.Automation.TreeScope]::Descendants,$c);return $null-ne$script:foundControl} 15 ('Actual GUI control did not render: '+$label);$e=$script:foundControl;Assert ($null-ne$e) ('Missing actual GUI control '+$label);([Windows.Automation.InvokePattern]$e.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern)).Invoke()}
 try{
  Stage 'one-shared-real-two-volume-dataset'
- foreach($v in 0..1){$dir=Join-Path $base ('v'+$v);$null=New-Item -ItemType Directory $dir;$vol=New-FxOwnedTestVolume (Join-Path $dir 'owned-health.vhd') ('FXTX'+[guid]::NewGuid().ToString('N').Substring(0,8).ToUpperInvariant());$volumes.Add($vol)
-  $body='native233body';for($i=0;$i-lt24000;$i++){[IO.File]::WriteAllText((Join-Path $vol.Root ('fx233-v'+$v+'-'+$i.ToString('D6')+'.bin')),$body,[Text.Encoding]::ASCII)}
+ foreach($v in 0..1){$dir=Join-Path $base ('v'+$v);$null=New-Item -ItemType Directory $dir;$vol=New-FxOwnedTestVolume (Join-Path $dir 'owned-health.vhd') ('FXTX'+[guid]::NewGuid().ToString('N').Substring(0,8).ToUpperInvariant()) -SizeMiB 256;$volumes.Add($vol)
+  $body='native233body';for($i=0;$i-lt24000;$i++){$parent=Join-Path $vol.Root ('p'+$i.ToString('D6'));$null=[IO.Directory]::CreateDirectory($parent);[IO.File]::WriteAllText((Join-Path $parent ('fx233-v'+$v+'-'+$i.ToString('D6')+'.bin')),$body,[Text.Encoding]::ASCII)}
   $deep=$vol.Root;for($d=0;$d-lt128;$d++){$deep+="d\";$null=[IO.Directory]::CreateDirectory(('\\?\'+$deep))};[IO.File]::WriteAllText(('\\?\'+$deep+'fx233-deep-v'+$v+'.txt'),'deep',[Text.Encoding]::ASCII)
  }
  $owned=$volumes[0];$null=New-Item -ItemType Directory (Join-Path $base 'programdata/FindX');$index=Join-Path $base 'programdata/FindX/index.bin'

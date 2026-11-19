@@ -28,24 +28,35 @@ jobs:
           run-id: 44475535981
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/findx-final253-payload
-      - name: Verify and reuse exact already-built runtime; NO engine or GUI build
-        id: stage
+      - uses: actions/download-artifact@v4
+        with:
+          name: findx-253-gui-candidate-migration
+          run-id: 44468255654
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/final-gui-input
+      - name: One incremental service-only build and stat lifecycle regressions
         shell: pwsh
         run: |
-          $ErrorActionPreference='Stop'
-          $source='0157cca03ea4e24c803624da968ee741393ba1b1'
-          foreach($p in @('crates','gui','installer','Cargo.toml','Cargo.lock','scripts/check_release.py')){
-            $current=git rev-parse "HEAD:$p";if($LASTEXITCODE){throw 'Current source missing'}
-            $built=git rev-parse "${source}:$p";if($LASTEXITCODE -or $current -cne $built){throw "Runtime source changed: $p"}
-          }
           $root="$env:RUNNER_TEMP/findx-final253-payload"
-          if((Get-FileHash "$root/stage-manifest.json").Hash -cne '9D423F2A1ABBF78B6A78AC4B0AAD5020E935727360104C1D2EAD09A21B2D9AA8'){throw 'Original stage manifest changed'}
+          if((Get-FileHash "$root/stage-manifest.json").Hash -cne '9D423F2A1ABBF78B6A78AC4B0AAD5020E935727360104C1D2EAD09A21B2D9AA8'){throw 'Old CLI input manifest changed'}
           $m=Get-Content "$root/stage-manifest.json" -Raw|ConvertFrom-Json
-          if($m.sourceCommit -cne $source -or $m.engineUnchanged -ne $false -or @($m.files).Count -ne 6){throw 'Not exact current payload'}
-          if(@(Get-ChildItem $root -Recurse -File).Count -ne 7){throw 'Extra/missing payload file'}
-          foreach($f in $m.files){$p=Join-Path $root $f.name;if((Get-FileHash $p).Hash.ToLowerInvariant() -cne $f.sha256 -or (Get-Item $p).Length -ne $f.length){throw 'Payload hash/length changed'}}
+          foreach($f in $m.files){$p=Join-Path $root $f.name;if((Get-FileHash $p).Hash.ToLowerInvariant() -cne $f.sha256 -or (Get-Item $p).Length -ne $f.length){throw 'Input payload hash changed'}}
           $null=New-Item -ItemType Directory target/release -Force
-          foreach($f in @('findx2-service.exe','findx2.exe','fx.exe')){Copy-Item (Join-Path $root $f) (Join-Path 'target/release' $f)}
+          foreach($f in @('findx2.exe','fx.exe')){Copy-Item (Join-Path $root $f) (Join-Path 'target/release' $f)}
+          Remove-Item -LiteralPath $root -Recurse
+          cargo test --locked -p findx2-service stat_settlement -- --nocapture
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          cargo build --locked --release -p findx2-service --bin findx2-service --target-dir target --jobs 2
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+      - name: Pin exact six files with new service and unchanged GUI CLI origins
+        id: stage
+        shell: pwsh
+        run: ./scripts/stage-final-payload.ps1 -GuiRoot "$env:RUNNER_TEMP/final-gui-input" -Destination "$env:RUNNER_TEMP/findx-final253-payload" -ReusedCliCommit '0157cca03ea4e24c803624da968ee741393ba1b1' -ReusedCliRun 44475535981
+      - uses: actions/upload-artifact@v4
+        with:
+          name: findx-253-stat-settled-E10D-final-payload
+          path: ${{ runner.temp }}/findx-final253-payload/**
+          retention-days: 30
       - name: Build existing data-only legacy generator after preserving runtime artifacts
         id: generator
         if: ${{ !cancelled() && steps.stage.outcome == 'success' }}
@@ -92,13 +103,13 @@ jobs:
           Expand-Archive $zip -DestinationPath (Join-Path $root 'unpacker')
           & (Join-Path $root 'unpacker/innounp.exe') -x -y ('-d'+(Join-Path $root 'extracted')) $setup
           if($LASTEXITCODE){throw 'Read-only setup extraction failed'}
-      - name: Only failed actual final-payload save-refusal retry; reuse existing 17 passed cases
+      - name: Only eight service-runtime affected installer cases; reuse unaffected source evidence
         id: installer
         if: ${{ !cancelled() && steps.stage.outcome == 'success' && steps.old.outcome == 'success' }}
         shell: powershell
         run: |
           if(-not(Test-Path "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe")){choco install innosetup -y --no-progress}
-          ./scripts/test-installer-native.ps1 -PublishedPayload "$env:RUNNER_TEMP/findx-published252-input/extracted/{app}" -CandidatePayload "$env:RUNNER_TEMP/findx-final253-payload" -Iscc "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe" -EngineCandidate -PayloadSourceCommit '0157cca03ea4e24c803624da968ee741393ba1b1' -OnlyCases @('running253-save-refusal')
+          ./scripts/test-installer-native.ps1 -PublishedPayload "$env:RUNNER_TEMP/findx-published252-input/extracted/{app}" -CandidatePayload "$env:RUNNER_TEMP/findx-final253-payload" -Iscc "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe" -EngineCandidate -PayloadSourceCommit $env:GITHUB_SHA -OnlyCases @('new-service-ipc','new-service-health-rollback','running253-success','running253-save-refusal','running253-backup-failure','running253-health-rollback','running253-interrupted-recovery','running253-copy-verification-rollback')
       - name: Archive only exact payload and bounded independent results
         if: always()
         uses: actions/upload-artifact@v4

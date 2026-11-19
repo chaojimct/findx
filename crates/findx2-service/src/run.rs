@@ -62,8 +62,8 @@ fn is_volume_frozen(letter: char) -> bool {
 /// watch 线程永不 stat 的另一半——随机 IO 在这里按 FRN 排序后批量消化，
 /// bulk 风暴时名字秒级可见、meta 随后追上（SSD 秒级、HDD 分钟级，但绝不卡住增量）。
 /// 无权限（非管理员）时 fill 恒空：排空丢弃，只记一次日志（文件本身已由 CreatePending 入库）。
-type StatWork=(Option<[u8;16]>,Option<crate::runtime_lifecycle::Reservation>);
-type StatMessage=(u64,Option<[u8;16]>,Option<crate::runtime_lifecycle::Reservation>);
+type StatWork=(Option<[u8;16]>,Option<crate::runtime_lifecycle::Activity>,u64);
+type StatMessage=(u64,Option<[u8;16]>,Option<crate::runtime_lifecycle::Reservation>,u64);
 
 fn spawn_stat_worker(
     engine: Arc<SearchEngine>,
@@ -82,8 +82,8 @@ fn spawn_stat_worker(
             // 主循环退出条件只有进程退出；recv_timeout 节拍顺带做批量超时。
             loop {
                 match rx.recv_timeout(std::time::Duration::from_millis(1000)) {
-                    Ok((frn, id128, work)) => {
-                        if let Some((_,Some(mut superseded)))=pending.insert(frn, (id128,work)){superseded.success();} // Coalesced into a newer owned item, not silently failed.
+                    Ok((frn, id128, work, epoch)) => {
+                        if let Some((_,Some(mut superseded),_))=pending.insert(frn, (id128,work.map(|p|p.activate()),epoch)){superseded.success();} // Coalesced into a newer owned item, not silently failed.
                         // 攒够一批就刷（5000 条或 1 秒超时，取先到者）。
                         if pending.len() >= 5000 {
                             drain_stat_batch(
@@ -136,57 +136,72 @@ fn drain_stat_batch(
     pending: &mut std::collections::HashMap<u64, StatWork>,
     logged_no_perm: &mut bool,
 ) {
-    if pending.is_empty() {
-        return;
-    }
-    let mut accepted=std::mem::take(pending); // Keep work reservations through IO AND commits.
-    // 注：重建冻结期无需特殊处理——合并后旧条目下标不变（新条目追加在后），
-    // patch 到墓碑/旧条目无害；新文件的 StatRefresh 在旧布局查不到会被跳过，
-    // journal 重放会重新排队。见 rebuild_volume 设计注释。
-    // 按 FRN 排序后批量 stat：MFT 记录号即 FRN 低 48 位，排序≈顺序读，HDD 友好。
-    let mut frns: Vec<u64> = accepted.keys().copied().collect();
-    frns.sort_unstable();
-    let id128s: Vec<Option<[u8; 16]>> = frns.iter().map(|f| accepted[f].0).collect();
-    let indices: Vec<usize> = (0..frns.len()).collect();
-    let volume = volume_device_path
-        .chars()
-        .rev()
-        .find(|c| c.is_ascii_alphabetic())
-        .unwrap_or('C') as u8;
-    let tickets: Vec<_> = frns
-        .iter()
-        .map(|&f| engine.metadata_ticket_by_id(volume, f))
-        .collect();
-    struct StatTicketLease<'a>{engine:&'a SearchEngine,tickets:&'a [Option<findx2_core::usage::MetadataTicket>]}
-    impl Drop for StatTicketLease<'_>{fn drop(&mut self){for ticket in self.tickets.iter().flatten(){self.engine.release_metadata_ticket(*ticket);}}}
-    let _tickets=StatTicketLease{engine,tickets:&tickets}; // Includes partial IO, missing results and unwind.
-    let updates = findx2_windows::fill_metadata_by_id_pooled(
-        volume_device_path,
-        &frns,
-        &id128s,
-        &indices,
-        None,
-        None,
-    );
-    if updates.is_empty() {
-        // 全失败：大概率无权限。节流日志（只记一次），否则每秒刷屏。
-        if !*logged_no_perm {
-            *logged_no_perm = true;
-            tracing::warn!(
-                "stat worker：批量 stat 持续失败（卷 {}，可能无管理员权限），新文件 size/mtime 将保持 0",
-                volume_device_path
-            );
+    drain_stat_batch_with(engine,volume_device_path,pending,logged_no_perm,|frns,ids,indices| {
+        findx2_windows::fill_metadata_by_id_pooled(volume_device_path,frns,ids,indices,None,None)
+    });
+}
+
+// Only a current, volume/full-FRN-qualified tombstone or an actually replaced
+// metadata epoch cancels queued IO. A failed OpenFileById is NEVER deletion proof.
+fn stat_obsolete(engine:&SearchEngine,volume:u8,frn:u64,epoch:u64)->bool {
+    let current=engine.metadata_epoch();
+    if epoch!=0 && current!=0 && current!=epoch && engine.metadata_coverage(current).is_ok(){return true;}
+    let g=engine.index_store();
+    g.entry_on_volume(volume,frn).is_some_and(|i| {
+        g.frns.get(i as usize)==Some(&frn) && g.entries.get(i as usize).is_some_and(|e|e.is_deleted()||e.is_dir_entry())
+    })
+}
+fn stat_source(volume:u8)->Option<&'static str>{
+    const S:[&str;26]=["stat-batch-A","stat-batch-B","stat-batch-C","stat-batch-D","stat-batch-E","stat-batch-F","stat-batch-G","stat-batch-H","stat-batch-I","stat-batch-J","stat-batch-K","stat-batch-L","stat-batch-M","stat-batch-N","stat-batch-O","stat-batch-P","stat-batch-Q","stat-batch-R","stat-batch-S","stat-batch-T","stat-batch-U","stat-batch-V","stat-batch-W","stat-batch-X","stat-batch-Y","stat-batch-Z"];
+    S.get(usize::from(volume.checked_sub(b'A')?)).copied()
+}
+fn drain_stat_batch_with(
+    engine:&Arc<SearchEngine>,volume_device_path:&str,
+    pending:&mut std::collections::HashMap<u64,StatWork>,logged_no_perm:&mut bool,
+    fetch:impl FnOnce(&[u64],&[Option<[u8;16]>],&[usize])->Vec<findx2_windows::MetaUpdate>,
+){
+    if pending.is_empty(){return;}
+    let volume=volume_device_path.chars().rev().find(|c|c.is_ascii_alphabetic()).unwrap_or('?').to_ascii_uppercase() as u8;
+    let Some(source)=stat_source(volume) else {return;};
+    // Queued reservations are activated on receipt, so this child admission can
+    // drain during prepare/STOP rather than deadlock behind its own parent work.
+    let mut batch=match crate::runtime_lifecycle::enter(engine,source){Ok(v)=>v.require_result(),Err(_)=>return};
+    let accepted=std::mem::take(pending);
+    let mut accepted:std::collections::HashMap<_,_>=accepted.into_iter().filter_map(|(frn,(id,mut work,epoch))|{
+        if stat_obsolete(engine,volume,frn,epoch){if let Some(w)=&mut work{w.success();}None}else{Some((frn,(id,work,epoch)))}
+    }).collect();
+    let mut frns:Vec<_>=accepted.keys().copied().collect();frns.sort_unstable();
+    let ids:Vec<_>=frns.iter().map(|f|accepted[f].0).collect();
+    let tickets:Vec<_>=frns.iter().map(|f|engine.metadata_ticket_by_id(volume,*f)).collect();
+    struct Lease<'a>{e:&'a SearchEngine,t:&'a [Option<findx2_core::usage::MetadataTicket>]}
+    impl Drop for Lease<'_>{fn drop(&mut self){for t in self.t.iter().flatten(){self.e.release_metadata_ticket(*t);}}}
+    let _lease=Lease{e:engine,t:&tickets};
+    let indices:Vec<_>=tickets.iter().enumerate().filter_map(|(i,t)|t.map(|_|i)).collect();
+    let updates=if indices.is_empty(){Vec::new()}else{fetch(&frns,&ids,&indices)};
+    let mut committed=vec![false;frns.len()];let mut error=None;
+    for (local,size,mtime,ctime) in updates {
+        match tickets.get(local).copied().flatten(){
+            Some(ticket)=>match engine.commit_metadata(ticket,size,mtime,ctime){
+                Ok(true)=>committed[local]=true,
+                Ok(false)=>{}, // retry with a NEW ticket; never write stale data
+                Err(e)=>error=Some(e),
+            },
+            None=>error=Some("stat producer returned an unadmitted local identity".into()),
         }
-        return;
     }
-    for (local, size, mtime, ctime) in updates {
-        if let Some(Some(ticket)) = tickets.get(local) {
-            match engine.commit_metadata(*ticket,size,mtime,ctime){
-                Ok(true)=>{if let Some((_,Some(work)))=accepted.get_mut(&frns[local]){work.success();}}
-                Ok(false)=>{if let Some((_,Some(work)))=accepted.get_mut(&frns[local]){work.error("stat result stale or rejected; no current metadata coverage proof".into());}}
-                Err(e)=>{if let Some((_,Some(work)))=accepted.get_mut(&frns[local]){work.error(e.to_string());}tracing::warn!("stat commit: {e}");}
-            }
-        }
+    for (i,frn) in frns.into_iter().enumerate(){
+        let (id,mut work,epoch)=accepted.remove(&frn).unwrap();
+        if committed[i]||stat_obsolete(engine,volume,frn,epoch){if let Some(w)=&mut work{w.success();}}
+        else{pending.insert(frn,(id,work,epoch));}
+    }
+    if !pending.is_empty()||error.is_some(){
+        *logged_no_perm=true;
+        batch.error(error.unwrap_or_else(||format!("{} stat operations unresolved (permission/transient/stale); ownership retained for retry, no deletion inferred",pending.len())));
+    }else{
+        *logged_no_perm=false;
+        // Exactly one worker owns this volume ledger. Another volume or a
+        // partial successful subset can NEVER erase this source's older failure.
+        batch.recovered_source();
     }
 }
 
@@ -878,7 +893,7 @@ fn usn_watch_loop(
                         anyhow::bail!("full 128-bit stat binding unresolved; refusing low64 alias");
                     }
                     engine.mark_metadata_dirty(volume_letter, file_id);
-                    stat_tx.send((file_id, file_id_128, crate::runtime_lifecycle::reserve(&engine,"queued-stat").map_err(anyhow::Error::msg)?.map(|p|p.require_result()))).map_err(|_| {
+                    stat_tx.send((file_id, file_id_128, crate::runtime_lifecycle::reserve(&engine,"queued-stat").map_err(anyhow::Error::msg)?.map(|p|p.require_result()),engine.metadata_epoch())).map_err(|_| {
                         anyhow::anyhow!("stat worker unavailable; metadata remains unknown")
                     })?;
                 }
@@ -1380,6 +1395,39 @@ fn persist_index_with_inner(
 
 #[cfg(test)]
 mod tests {
+    fn stat_fixture()->(std::path::PathBuf,std::sync::Arc<findx2_core::SearchEngine>,crate::runtime_lifecycle::Owner){
+        use findx2_core::{IndexBuilder,RawEntry,SearchEngine};
+        let d=std::env::temp_dir().join(format!("findx-stat-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));std::fs::create_dir(&d).unwrap();
+        let raw=|id,dir|RawEntry{file_id:id,file_id_128:None,parent_id:if dir{0}else{1},name:if dir{"root".into()}else{"file".into()},size:0,mtime:0,ctime:0,attrs:if dir{0x10}else{0},is_dir:dir};
+        let mut store=IndexBuilder::new(b'F',1,7,10).build_from_raw(vec![raw(10,false)],vec![raw(1,true)],false).unwrap();store.set_track_mutations(true);
+        let e=std::sync::Arc::new(SearchEngine::new(store));e.enable_usage(4*1024*1024).unwrap();let p=d.join("index.bin");findx2_core::v6_save_full(&findx2_core::V6Layout::for_index(&p),&e.index_store()).unwrap();
+        let o=crate::runtime_lifecycle::Owner::attach(e.clone(),p,std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))).unwrap();(d,e,o)
+    }
+    fn queued(e:&findx2_core::SearchEngine)->std::collections::HashMap<u64,super::StatWork>{
+        let work=crate::runtime_lifecycle::reserve(e,"queued-stat").unwrap().map(|p|p.require_result().activate());
+        [(10,(None,work,e.metadata_epoch()))].into_iter().collect()
+    }
+    #[test]fn stat_settlement_authoritative_delete_and_replaced_epoch_do_not_fake_failure(){
+        for replace in [false,true]{let(d,e,o)=stat_fixture();let mut p=queued(&e);
+            if replace{e.enable_usage(4*1024*1024).unwrap();}else{let i=e.index_store().entry_on_volume(b'F',10).unwrap();e.index_store_mut().delete_entry(i);}
+            super::drain_stat_batch_with(&e,r"\\.\F:",&mut p,&mut false,|_,_,_|panic!("obsolete IO must not run"));
+            assert!(p.is_empty());assert!(o.retained_errors().is_empty());drop(o);std::fs::remove_dir_all(d).unwrap();}
+    }
+    #[test]fn stat_settlement_permission_or_missing_results_retain_work_and_real_retry_repairs(){
+        let(d,e,o)=stat_fixture();let mut p=queued(&e);
+        super::drain_stat_batch_with(&e,r"\\.\F:",&mut p,&mut false,|_,_,_|vec![]);
+        assert_eq!(p.len(),1);assert!(!o.retained_errors().is_empty());assert!(!e.index_store().entries[e.index_store().entry_on_volume(b'F',10).unwrap() as usize].is_deleted());
+        super::drain_stat_batch_with(&e,r"\\.\F:",&mut p,&mut false,|_,_,indices|indices.iter().map(|i|(*i,77,0,0)).collect());
+        assert!(p.is_empty());assert!(o.retained_errors().is_empty());drop(o);std::fs::remove_dir_all(d).unwrap();
+    }
+    #[test]fn stat_settlement_stale_ticket_retries_without_old_generation_write(){
+        let(d,e,o)=stat_fixture();let mut p=queued(&e);let change=e.clone();
+        super::drain_stat_batch_with(&e,r"\\.\F:",&mut p,&mut false,move|_,_,indices|{change.mark_metadata_dirty(b'F',10);indices.iter().map(|i|(*i,999,0,0)).collect()});
+        assert_eq!(p.len(),1);assert!(!o.retained_errors().is_empty());
+        super::drain_stat_batch_with(&e,r"\\.\F:",&mut p,&mut false,|_,_,indices|indices.iter().map(|i|(*i,88,0,0)).collect());
+        assert!(p.is_empty());assert!(o.retained_errors().is_empty());let g=e.index_store();let i=g.entry_on_volume(b'F',10).unwrap();assert_eq!(g.entries[i as usize].size,88);drop(g);drop(o);std::fs::remove_dir_all(d).unwrap();
+    }
+
     #[test]
     fn shutdown_marker_publishes_shared_stop_and_releases_fake_watcher() {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
