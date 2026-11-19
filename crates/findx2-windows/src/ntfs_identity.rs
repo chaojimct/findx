@@ -127,7 +127,12 @@ pub(crate) fn epoch(h:HANDLE)->Result<Epoch,E>{
     let journal=unsafe{crate::usn::query_usn_journal(h)}.map_err(|e|E::Retry(format!("journal unavailable: {e}")))?.UsnJournalID;
     Ok(Epoch{volume,journal})
 }
-pub(crate) fn check(h:HANDLE,expected:Epoch)->Result<(),E>{verify_epoch(expected,epoch(h)?).map_err(E::from)}
+pub(crate) fn check(h:HANDLE,expected:Epoch)->Result<(),E>{
+ let actual=epoch(h)?;
+ if actual.volume!=expected.volume{return Err("native volume/geometry identity changed; never follow a foreign volume".into());}
+ if actual.journal!=expected.journal{return Err(E::EpochChanged("native journal epoch changed; retained cursor requires replay/rebuild".into()));}
+ Ok(())
+}
 pub(crate) fn absent(h:HANDLE,id:u64,expected:Epoch)->Result<bool,E>{
     check(h,expected)?;
     let ordinal=(id&INDEX_MASK) as i64;let mut bytes=vec![0u8;12+expected.volume.record_bytes as usize];let mut got=0;

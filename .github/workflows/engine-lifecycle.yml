@@ -19,6 +19,7 @@ on:
       - 'scripts/test-installer-runtime-contract.ps1'
       - 'scripts/test-upgrade-capabilities.ps1'
       - 'scripts/test-ntfs-identity.ps1'
+      - 'scripts/test-namespace-scm.ps1'
       - 'installer/FindX.iss'
   workflow_dispatch:
     inputs:
@@ -41,6 +42,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          git fetch origin 0d7d1a188bfa4305bcc70ca7fecc1f1bbf850742 --depth=1
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          $parent=git diff --name-only 0d7d1a188bfa4305bcc70ca7fecc1f1bbf850742 HEAD -- Cargo.lock Cargo.toml crates installer
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          $parentAllowed=@('crates/findx2-core/src/usage.rs','crates/findx2-service/src/run.rs','crates/findx2-windows/src/ntfs_namespace.rs','crates/findx2-windows/src/ntfs_identity.rs','crates/findx2-windows/examples/namespace_index_copy.rs')
+          if(@($parent).Count -eq $parentAllowed.Count -and @($parent|Where-Object {$_ -notin $parentAllowed}).Count -eq 0){
+            $proof=gh run view 44457772483 --repo chaojimct/findx --json conclusion,headSha|ConvertFrom-Json
+            if($LASTEXITCODE -or $proof.conclusion -ne 'success' -or $proof.headSha -cne '0d7d1a188bfa4305bcc70ca7fecc1f1bbf850742'){throw 'Missing prior exact namespace evidence'}
+            'parent=true' >> $env:GITHUB_OUTPUT
+            'changed=false' >> $env:GITHUB_OUTPUT
+            exit 0
+          }
           git fetch origin eb5e47238dfbf800ce6e08c9f9674f19c66d0abf --depth=1
           if($LASTEXITCODE){exit $LASTEXITCODE}
           $ns=git diff --name-only eb5e47238dfbf800ce6e08c9f9674f19c66d0abf HEAD -- Cargo.lock Cargo.toml crates installer
@@ -85,9 +98,27 @@ jobs:
             'Reuse unchanged ACK/IPC/service lifecycle evidence44446796510; any isolated root-path change receives targeted core tests, not a full-payload claim.'
           }
       - uses: dtolnay/rust-toolchain@stable
-        if: steps.engine-change.outputs.changed == 'true' || steps.engine-change.outputs.focused == 'true' || steps.engine-change.outputs.namespace == 'true'
+        if: steps.engine-change.outputs.changed == 'true' || steps.engine-change.outputs.focused == 'true' || steps.engine-change.outputs.namespace == 'true' || steps.engine-change.outputs.parent == 'true'
       - uses: Swatinem/rust-cache@v2
-        if: steps.engine-change.outputs.changed == 'true' || steps.engine-change.outputs.focused == 'true' || steps.engine-change.outputs.namespace == 'true'
+        if: steps.engine-change.outputs.changed == 'true' || steps.engine-change.outputs.focused == 'true' || steps.engine-change.outputs.namespace == 'true' || steps.engine-change.outputs.parent == 'true'
+      - name: Affected parent recovery and real replacement binding tests
+        if: steps.engine-change.outputs.parent == 'true'
+        shell: pwsh
+        run: |
+          cargo test --locked -p findx2-windows ntfs_ -- --test-threads=1
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          cargo test --locked -p findx2-core --lib namespace_binding -- --test-threads=1
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          cargo build --locked -p findx2-service -p findx2-cli
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          cargo build --locked -p findx2-core --example verify_persisted_file
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          cargo build --locked -p findx2-windows --example namespace_index_copy
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+      - name: Actual SCM parent permission retry and live journal/index replacement
+        if: steps.engine-change.outputs.parent == 'true'
+        shell: powershell
+        run: ./scripts/test-namespace-scm.ps1 -ServiceExe ./target/debug/findx2-service.exe
       - name: Changed namespace proof and atomic cursor/prefix regressions only
         if: steps.engine-change.outputs.namespace == 'true'
         shell: pwsh
@@ -111,7 +142,7 @@ jobs:
           cargo test --locked -p findx2-windows mft_identity_tests -- --test-threads=1 2>&1 | Tee-Object mft-identity-tests.log
           if($LASTEXITCODE){exit $LASTEXITCODE}
       - name: Production negotiation schema and refusal/ordering checks only
-        if: steps.engine-change.outputs.namespace != 'true'
+        if: steps.engine-change.outputs.namespace != 'true' && steps.engine-change.outputs.parent != 'true'
         shell: powershell
         run: ./scripts/test-upgrade-capabilities.ps1
       - name: Core authoritative admission and actual-writer checkpoint evidence (not runtime ACK)
@@ -133,7 +164,7 @@ jobs:
           cargo test --locked -p findx2-core --test upgrade_candidate --test multi_volume_incremental_path --test parent_direct -- --test-threads=1
           if($LASTEXITCODE){exit $LASTEXITCODE}
       - name: Official installer runtime ordering unit regressions (not SCM acceptance)
-        if: steps.engine-change.outputs.namespace != 'true'
+        if: steps.engine-change.outputs.namespace != 'true' && steps.engine-change.outputs.parent != 'true'
         shell: powershell
         run: ./scripts/test-installer-runtime-contract.ps1
       - name: GUI and CLI compile against actual shared IPC contract
@@ -177,6 +208,7 @@ jobs:
             mft-identity-tests.log
             client-compile.log
             native-runtime-evidence/**
+            native-namespace-evidence/**
             ${{ runner.temp }}/FindXUpgradeTest_identity_*/native-identity.*
             ${{ runner.temp }}/FindXUpgradeTest_identity_*/owned-volume.json
           retention-days: 30

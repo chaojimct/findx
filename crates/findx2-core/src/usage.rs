@@ -2200,6 +2200,11 @@ mod parent_direct_capability_tests {
   let raw=|id,parent,name:&str,dir|crate::RawEntry{file_id:id,file_id_128:None,parent_id:parent,name:name.into(),size:if dir{0}else{7},mtime:0,ctime:0,attrs:if dir{16}else{0},is_dir:dir};
   let store=crate::IndexBuilder::new(b'F',123,7,10).build_from_raw(vec![raw(2,1,"keep.txt",false)],vec![raw(1,0,"root",true)],true).unwrap();SearchEngine::new(store)
  }
+ #[test]fn namespace_binding_real_index_replace_rejects_retained_batch_without_cursor_mutation(){
+  let e=engine();e.enable_usage(16*1024*1024).unwrap();let old=e.metadata_epoch();let replacement=engine().index_store().clone();e.replace_index_store(replacement);assert!(e.apply_volume_batch_bound(b'F',&[],7,20,old,123).is_err());e.enable_usage(e.usage_budget()).unwrap();let fresh=e.metadata_epoch();assert_ne!(old,fresh);
+  let events=[crate::ChangeEvent::Delete{file_id:2}];let error=e.apply_volume_batch_bound(b'F',&events,7,20,old,123).unwrap_err();assert!(error.contains("generation/volume changed"));assert_eq!(e.index_store().volumes[0].last_usn,10);
+  e.apply_volume_batch_bound(b'F',&events,7,20,fresh,123).unwrap();assert_eq!(e.index_store().volumes[0].last_usn,20);
+ }
  #[test]fn namespace_binding_wrong_epoch_serial_or_journal_never_mutates_or_advances(){
   let e=engine();let epoch=e.metadata_epoch();let events=[crate::ChangeEvent::Delete{file_id:2}];
   for (ep,serial,journal) in [(epoch.wrapping_add(1),123,7),(epoch,124,7),(epoch,123,8)]{

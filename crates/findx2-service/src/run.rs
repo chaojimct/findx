@@ -739,7 +739,6 @@ fn usn_watch_loop(
                     (v.volume_letter as char).to_ascii_uppercase() == letter
                 })
                 .cloned()
-                .or_else(|| g.volumes.first().cloned())
         }?;
         let resume = findx2_windows::UsnResume {
             journal_id: vol_meta.usn_journal_id,
@@ -825,7 +824,16 @@ fn usn_watch_loop(
                     })();
                     let events=match prepared{Ok(e)=>{namespace_retry_delay=Duration::from_millis(100);e},Err(e)=>{
                         set_watch_error(letter,Some(format!("namespace resolution failed; exact prefix/cursor retained: {e}")));
-                        if e.retryable(){namespace_retry.hold((events,journal_id,next_usn,binding)).map_err(anyhow::Error::msg)?;namespace_retry_delay=(namespace_retry_delay*2).min(Duration::from_secs(1));}else{namespace_gate.blocked=true;}
+                        if e.requires_replay(){
+                            // Drop receiver BEFORE joining: an old bounded sender must
+                            // unblock normally. New native reader starts at retained disk
+                            // cursor, reports real JournalGap, and existing scoped rebuild
+                            // scans/replays before adopting a new RAM index generation.
+                            let(tx_new,rx_new)=mpsc::sync_channel::<findx2_windows::UsnWatchMsg>(1);
+                            let old=std::mem::replace(&mut rx,rx_new);drop(old);let _=worker.join();
+                            worker=make_worker(tx_new).ok_or_else(||anyhow::anyhow!("exact watch volume unavailable for journal recovery"))?;
+                            unlink_resolver=None;namespace_gate=crate::watch_health::NamespaceGate::default();
+                        }else if e.retryable(){namespace_retry.hold((events,journal_id,next_usn,binding)).map_err(anyhow::Error::msg)?;namespace_retry_delay=(namespace_retry_delay*2).min(Duration::from_secs(1));}else{namespace_gate.blocked=true;}
                         lifecycle.error(e.to_string());continue;
                     }};
                     match namespace_gate.apply_bound(&engine, volume_letter, &events, journal_id, next_usn,Some(binding)) {
@@ -964,6 +972,7 @@ fn usn_watch_loop(
                 }) {
                     Some(w) => {
                         worker = w;
+                        unlink_resolver=None;namespace_gate=crate::watch_health::NamespaceGate::default();
                     }
                     None => {
                         return Err(anyhow::anyhow!("卷 {letter} 重启监听时索引中无卷元数据"));
@@ -1013,23 +1022,33 @@ fn rebuild_volume(
     }
     let _unfreeze = Unfreeze(letter);
 
-    let (frozen, frozen_journal_id) = {
+    let (frozen, frozen_journal_id, expected_serial) = {
         let g = engine.index_store();
         g.volumes
             .iter()
             .find(|v| (v.volume_letter as char).to_ascii_uppercase() == letter)
-            .map(|v| (v.last_usn, v.usn_journal_id))
-            .unwrap_or((0, 0))
+            .map(|v| (v.last_usn, v.usn_journal_id, v.volume_serial))
+            .ok_or_else(||anyhow::anyhow!("exact rebuild volume absent; no foreign fallback"))?
     };
     info!("卷 {letter} 开始全量重建（frozen 游标 {frozen}，旧索引继续服务）…");
 
     // 1) 重新扫描（fast 首遍；size/mtime 由回填补——合并后 ready=false 会自动触发）。
-    let (files, dirs) = findx2_windows::scan_volume_fast(&vol_str)
-        .map_err(|e| anyhow::anyhow!("卷 {letter} MFT 重枚举失败: {e}"))?;
-    let serial = findx2_windows::get_volume_serial_number(&vol_str).unwrap_or(0);
+    let serial = findx2_windows::get_volume_serial_number(&vol_str)
+        .map_err(|e|anyhow::anyhow!("rebuild volume identity unavailable: {e}"))?;
+    if serial!=expected_serial{return Err(anyhow::anyhow!("rebuild refused foreign volume identity"));}
+    // Capture the NEW journal before enumeration, not after it. A changed journal
+    // cannot rewind to the old cursor; using an end-of-scan watermark loses changes
+    // that happened behind the scanner. Existing replay uses this pre-scan mark.
     let usn = findx2_windows::UsnJournalWatcher::new(&vol_str)
         .probe()
         .map_err(|e| anyhow::anyhow!("卷 {letter} journal 探测失败: {e}"))?;
+    let (files, dirs) = findx2_windows::scan_volume_fast(&vol_str)
+        .map_err(|e| anyhow::anyhow!("卷 {letter} MFT 重枚举失败: {e}"))?;
+    let after_serial=findx2_windows::get_volume_serial_number(&vol_str)
+        .map_err(|e|anyhow::anyhow!("rebuild post-scan volume identity unavailable: {e}"))?;
+    let(after_journal,_,_)=findx2_windows::query_journal_state(&vol_str)
+        .map_err(|e|anyhow::anyhow!("rebuild post-scan journal unavailable: {e}"))?;
+    if after_serial!=serial||after_journal!=usn.journal_id{return Err(anyhow::anyhow!("rebuild identity/journal changed during native scan; old index retained"));}
     let fresh = findx2_core::IndexBuilder::new(letter as u8, serial, usn.journal_id, usn.next_usn)
         .build_from_raw(files, dirs, false)
         .map_err(|e| anyhow::anyhow!("卷 {letter} 索引构建失败: {e}"))?;

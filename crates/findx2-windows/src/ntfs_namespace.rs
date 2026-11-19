@@ -1,12 +1,12 @@
 //! Exact-identity NTFS internal unlink translation. No path/name heuristics in event matching.
 use findx2_core::ChangeEvent;
 #[derive(Debug,Clone)]
-pub enum NamespaceResolveError { Retry(String), Unsafe(String) }
+pub enum NamespaceResolveError { Retry(String), Unsafe(String), EpochChanged(String) }
 impl From<String> for NamespaceResolveError{fn from(s:String)->Self{Self::Unsafe(s)}}
 impl From<&str> for NamespaceResolveError{fn from(s:&str)->Self{Self::Unsafe(s.into())}}
-impl std::fmt::Display for NamespaceResolveError{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{match self{Self::Retry(s)|Self::Unsafe(s)=>write!(f,"{s}")}}}
+impl std::fmt::Display for NamespaceResolveError{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{match self{Self::Retry(s)|Self::Unsafe(s)|Self::EpochChanged(s)=>write!(f,"{s}")}}}
 impl std::error::Error for NamespaceResolveError{}
-impl NamespaceResolveError{pub fn retryable(&self)->bool{matches!(self,Self::Retry(_))}}
+impl NamespaceResolveError{pub fn retryable(&self)->bool{matches!(self,Self::Retry(_))}pub fn requires_replay(&self)->bool{matches!(self,Self::EpochChanged(_))}}
 #[derive(Debug)] pub(crate) struct FileIdOpenError {pub win32:u32,pub native:u32}
 impl FileIdOpenError {
  fn absence_candidate(&self)->bool{matches!(self.win32,2|3|87|1168)&&self.native!=0xc0000056}
@@ -14,8 +14,11 @@ impl FileIdOpenError {
 }
 #[link(name="ntdll")] unsafe extern "system" {fn RtlGetLastNtStatus()->i32;}
 pub(crate) fn open_file_by_id_diagnostic(hint:windows::Win32::Foundation::HANDLE,id:u64)->Result<windows::Win32::Foundation::HANDLE,FileIdOpenError>{
+ open_file_by_id_access(hint,id,0)
+}
+fn open_file_by_id_access(hint:windows::Win32::Foundation::HANDLE,id:u64,access:u32)->Result<windows::Win32::Foundation::HANDLE,FileIdOpenError>{
  use windows::Win32::Storage::FileSystem::*;let mut d=FILE_ID_DESCRIPTOR::default();d.dwSize=std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32;d.Type=FileIdType;d.Anonymous.FileId=id as i64;
- match unsafe{OpenFileById(hint,&d,0,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,None,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT)}{Ok(h)=>Ok(h),Err(e)=>{let native=unsafe{RtlGetLastNtStatus()} as u32;Err(FileIdOpenError{win32:e.code().0 as u32&0xffff,native})}}
+ match unsafe{OpenFileById(hint,&d,access,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,None,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT)}{Ok(h)=>Ok(h),Err(e)=>{let native=unsafe{RtlGetLastNtStatus()} as u32;Err(FileIdOpenError{win32:e.code().0 as u32&0xffff,native})}}
 }
 #[derive(Clone,Debug)]
 pub struct OrdinaryLink { pub parent:u64, pub name:String }
@@ -95,7 +98,7 @@ mod windows_resolver {
   fn open_id(&self,id:u64)->Result<HANDLE,FileIdOpenError>{super::open_file_by_id_diagnostic(self.handle,id)}
   fn bind_candidate(&mut self,parent:u64)->Result<(),NamespaceResolveError>{
    let cached=self.bound.is_some_and(|b|b.parent==parent);
-   let handle=match self.open_id(parent){Ok(h)=>h,Err(e)=>{
+   let handle=match super::open_file_by_id_access(self.handle,parent,windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES.0){Ok(h)=>h,Err(e)=>{
     if !cached && e.absence_candidate() && crate::ntfs_identity::absent(self.handle,parent,self.epoch)? {return Ok(());}
     return Err(NamespaceResolveError::Retry(format!("parent unavailable: {} win32={} ntstatus={:#x}; exact prefix retained",e.classification(),e.win32,e.native)));
    }};
@@ -141,31 +144,61 @@ mod windows_resolver {
     parse_hardlink_records(&buffer[..ios.information],binding.parent).map_err(Into::into)
    })();unsafe{let _=CloseHandle(handle);}result
   }
+  // Native full identity and hardlink parent identity, never a basename/path guess.
+  // Results remain scratch until the caller's generation-bound atomic commit.
+  fn recover_parent(&mut self,id:u64,known:&impl Fn(u64)->bool,prefix:&mut Vec<ChangeEvent>,visiting:&mut std::collections::HashSet<u64>)->Result<bool,NamespaceResolveError>{
+   if prefix.iter().any(|e|matches!(e,ChangeEvent::Create{entry} if entry.is_dir&&entry.file_id==id)){return Ok(true);}
+   if id>>48==0{return Err("unqualified ordinary parent identity".into());}
+   if prefix.len()>=64||visiting.len()>=64||!visiting.insert(id){return Err("ordinary parent chain cyclic or exceeds bounded64; cursor retained".into());}
+   self.bind_candidate(id)?;
+   if self.bound.is_some_and(|b|b.parent==id){visiting.remove(&id);return Ok(false);}
+   let h=match super::open_file_by_id_access(self.handle,id,windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES.0){Ok(h)=>h,Err(e)=>{
+    if e.absence_candidate()&&crate::ntfs_identity::absent(self.handle,id,self.epoch)?{visiting.remove(&id);return Ok(false);}
+    return Err(NamespaceResolveError::Retry(format!("ordinary parent unavailable: {} win32={} ntstatus={:#x}",e.classification(),e.win32,e.native)));
+   }};
+   let mut info=BY_HANDLE_FILE_INFORMATION::default();let result=unsafe{GetFileInformationByHandle(h,&mut info)};unsafe{let _=CloseHandle(h);}result.map_err(|e|NamespaceResolveError::Retry(e.to_string()))?;
+   if info.dwVolumeSerialNumber!=self.serial||((info.nFileIndexHigh as u64)<<32|info.nFileIndexLow as u64)!=id||info.dwFileAttributes&16==0{return Err("ordinary parent fullFRN/volume/directory identity mismatch".into());}
+   if known(id){visiting.remove(&id);return Ok(true);}
+   let binding=self.bound.unwrap_or(UnlinkBinding{volume:self.volume,serial:self.serial,journal:self.journal,parent:u64::MAX});
+   let mut links=self.ordinary_links(id,binding)?;let meta=self.last_metadata;
+   links.sort_by_key(|l|!known(l.parent));
+   for link in links {
+    if self.recover_parent(link.parent,known,prefix,visiting)? {
+     let(size,mtime,ctime,attrs)=meta.ok_or("recovered ordinary parent lacks verified metadata")?;
+     prefix.push(ChangeEvent::Create{entry:findx2_core::RawEntry{file_id:id,file_id_128:None,parent_id:link.parent,name:link.name,size,mtime,ctime,attrs,is_dir:true}});
+     visiting.remove(&id);return Ok(true);
+    }
+   }
+   visiting.remove(&id);Ok(false)
+  }
   pub fn rewrite(&mut self,events:&[ChangeEvent],pending:&[ChangeEvent],missing_parents:&[u64],journal:u64,known_parent:impl Fn(u64)->bool,known_identity:impl Fn(u64)->bool)->Result<Vec<ChangeEvent>,NamespaceResolveError>{
    if journal!=self.journal{return Err("unlink resolver journal changed; cursor retained".into());}
    crate::ntfs_identity::check(self.handle,self.epoch)?;
    if let Some(binding)=self.bound {self.bind_candidate(binding.parent)?;}
-   for parent in missing_parents.iter().take(64){self.bind_candidate(*parent)?;if self.bound.is_some(){break;}}
-   let Some(binding)=self.bound else{crate::ntfs_identity::check(self.handle,self.epoch)?;return Ok(events.to_vec());};
+   let mut prefix=Vec::new();
+   for parent in missing_parents.iter().take(64){self.recover_parent(*parent,&known_parent,&mut prefix,&mut std::collections::HashSet::new())?;}
    let mut result=Vec::new();
    for (index,ev) in events.iter().chain(pending.iter()).enumerate(){
     let parent=match ev{ChangeEvent::CreatePending{parent_id,..}=>Some(*parent_id),ChangeEvent::Rename{new_parent_id,..}=>Some(*new_parent_id),_=>None};
-    if parent==Some(binding.parent){
-     let id=match ev{ChangeEvent::CreatePending{file_id,..}|ChangeEvent::Rename{file_id,..}=>*file_id,_=>unreachable!()};
-     let mut links=self.ordinary_links(id,binding)?;
-     if !links.is_empty(){let chosen=links.iter().position(|x|known_parent(x.parent)).ok_or("surviving ordinary alias parent outside resolvable indexed scope; cursor retained")?;links.swap(0,chosen);}
-     let rewritten=rewrite_bound_event(binding,self.volume,self.serial,journal,ev,Some(&links))?;
-     for placed in rewritten {
-      if let ChangeEvent::Rename{file_id,new_parent_id,new_name}=&placed {
-       if !known_identity(*file_id){
-        let (size,mtime,ctime,attrs)=self.last_metadata.ok_or("new ordinary alias lacks metadata; cursor retained")?;
-        result.push(ChangeEvent::Create{entry:findx2_core::RawEntry{file_id:*file_id,file_id_128:None,parent_id:*new_parent_id,name:new_name.clone(),size,mtime,ctime,attrs,is_dir:attrs&16!=0}});continue;
-       }
-      }
-      result.push(placed);
+    let resolved=parent.is_none_or(|id|known_parent(id)||prefix.iter().any(|e|matches!(e,ChangeEvent::Create{entry} if entry.is_dir&&entry.file_id==id)));
+    let internal=parent.is_some_and(|id|self.bound.is_some_and(|b|b.parent==id));
+    if !resolved||internal {
+     let id=match ev{ChangeEvent::CreatePending{file_id,file_id_128,..}=>{if file_id_128.is_some_and(|x|x[8..].iter().any(|b|*b!=0)){return Err("full128 namespace recovery unsupported; no low64 alias".into());}*file_id},ChangeEvent::Rename{file_id,..}=>*file_id,_=>unreachable!()};
+     let binding=self.bound.unwrap_or(UnlinkBinding{volume:self.volume,serial:self.serial,journal:self.journal,parent:u64::MAX});
+     let mut links=self.ordinary_links(id,binding)?;let meta=self.last_metadata;
+     links.sort_by_key(|l|!known_parent(l.parent));let mut chosen=None;let mut ordinary_seen=false;
+     for link in links {
+      self.bind_candidate(link.parent)?;if self.bound.is_some_and(|b|b.parent==link.parent){continue;}
+      ordinary_seen=true;if self.recover_parent(link.parent,&known_parent,&mut prefix,&mut std::collections::HashSet::new())?{chosen=Some(link);break;}
      }
+     if let Some(link)=chosen {
+      if known_identity(id){result.push(ChangeEvent::Rename{file_id:id,new_parent_id:link.parent,new_name:link.name});}
+      else{let(size,mtime,ctime,attrs)=meta.ok_or("ordinary alias lacks verified metadata")?;result.push(ChangeEvent::Create{entry:findx2_core::RawEntry{file_id:id,file_id_128:None,parent_id:link.parent,name:link.name,size,mtime,ctime,attrs,is_dir:attrs&16!=0}});}
+     }else if !ordinary_seen&&(internal||meta.is_none()){result.push(ChangeEvent::Delete{file_id:id});}
+     else{return Err(NamespaceResolveError::Retry("live ordinary alias parent unresolved; exact prefix retained".into()));}
     }else if index<events.len(){result.push(ev.clone());}
    }
+   prefix.extend(result);let result=prefix;
    crate::ntfs_identity::check(self.handle,self.epoch)?;
    Ok(result)
   }
