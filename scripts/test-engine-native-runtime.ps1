@@ -15,11 +15,19 @@ $null=[IO.Directory]::CreateDirectory($base)
 $artifact=Join-Path $repo 'native-runtime-evidence'
 $null=[IO.Directory]::CreateDirectory($artifact)
 $rows=[Collections.Generic.List[object]]::new()
-$owned=$null;$created=$false;$originalAcl=$null;$v6=$null
+$owned=$null;$created=$false;$originalAcl=$null;$v6=$null;$script:stage='initializing'
+function Stage([string]$Name){$script:stage=$Name;[ordered]@{stage=$Name;time=(Get-Date -Format o)}|ConvertTo-Json|Set-Content -Encoding UTF8 (Join-Path $artifact 'stage.json');Write-Host ('NATIVE STAGE: '+$Name)}
+function Capture-NativeDiagnostics {
+ if($created){try{Service-State|Select-Object Name,State,ProcessId,ExitCode,ServiceSpecificExitCode,PathName,StartName|ConvertTo-Json|Set-Content -Encoding UTF8 (Join-Path $artifact 'last-owned-scm-state.json')}catch{}}
+ foreach($name in @('latest-status.json','latest-capabilities.json','initial-index-state.json','last-owned-scm-state.json','stage.json')){
+  $path=Join-Path $artifact $name;if(Test-Path -LiteralPath $path){Write-Host ('OWNED DIAGNOSTIC '+$name);Write-Host ([IO.File]::ReadAllText($path))}
+ }
+ $log=Join-Path $base 'programdata\FindX\service-win.log';if(Test-Path -LiteralPath $log){Copy-Item -LiteralPath $log -Destination $artifact -Force;Write-Host 'OWNED SERVICE LOG';Write-Host ([IO.File]::ReadAllText($log))}
+}
 function Assert($ok,[string]$why){if(-not $ok){throw $why}}
 function Wait-Condition([scriptblock]$Test,[int]$Seconds,[string]$Why){
  $timer=[Diagnostics.Stopwatch]::StartNew();$last=$null
- while($timer.Elapsed.TotalSeconds -lt $Seconds){try{if(& $Test){return}}catch{$last=$_.Exception.Message};[Threading.Thread]::Sleep(200)}
+ while($timer.Elapsed.TotalSeconds -lt $Seconds){try{if(& $Test){return}}catch{$last=$_.Exception.Message;if($last.StartsWith('NativeTerminal:')){throw}};[Threading.Thread]::Sleep(200)}
  throw ($Why+'; last='+$last)
 }
 function Service-State {return Get-CimInstance Win32_Service -Filter "Name='$name'"}
@@ -44,6 +52,8 @@ function Rpc($request){
  }finally{if($reader){$reader.Dispose()};$pipe.Dispose()}
 }
 function Ready {
+ $service=Assert-OwnedService
+ if($service.State -eq 'Stopped'){throw ('NativeTerminal: owned SCM worker stopped before readiness; Win32='+$service.ExitCode+' serviceSpecific='+$service.ServiceSpecificExitCode)}
  $status=Rpc @{type='status'}
  $status|ConvertTo-Json -Depth 10|Set-Content -Encoding UTF8 (Join-Path $artifact 'latest-status.json')
  $cap=Rpc @{type='upgrade_capabilities';protocol_version=1};$cap|ConvertTo-Json -Depth 10|Set-Content -Encoding UTF8 (Join-Path $artifact 'latest-capabilities.json')
@@ -61,12 +71,26 @@ function Stop-Owned {
  return Service-State
 }
 try{
+ Stage 'create-attested-owned-vhd'
  $owned=New-FxOwnedTestVolume (Join-Path $base 'owned-health.vhd') ('FXTX'+[guid]::NewGuid().ToString('N').Substring(0,8).ToUpperInvariant())
  Copy-Item (Join-Path $base 'owned-volume.json') $artifact
  # This is a REAL initial native scan and metadata backfill, with native USN watch enabled.
  $null=[IO.Directory]::CreateDirectory((Join-Path $owned.Root 'native-runtime'))
- [IO.File]::WriteAllText((Join-Path $owned.Root 'native-runtime\initial-native-proof.txt'),'native-initial-123',[Text.Encoding]::ASCII)
- $index=Join-Path $base 'index.bin';$v6=$index+'.v6';$script:pipeName='findx253native'+[guid]::NewGuid().ToString('N')
+ $initialBody='native-initial-123';[IO.File]::WriteAllText((Join-Path $owned.Root 'native-runtime\initial-native-proof.txt'),$initialBody,[Text.Encoding]::ASCII)
+ # The service intentionally REFUSES a missing index; preserve that product safety behavior.
+ # Provision only this attested tiny VHD through the real supported native CLI, never fixture_root.
+ Stage 'native-fast-index-provisioning'
+ $index=Join-Path $base 'index.bin';$v6=$index+'.v6'
+ $cli=Join-Path $repo 'target\debug\findx2.exe';Assert ([IO.File]::Exists($cli)) 'Actual native indexing CLI not built'
+ & $cli index --volume $owned.Volume --output $index --max-scan-threads 1 *> (Join-Path $artifact 'native-initial-index.log')
+ Assert ($LASTEXITCODE -eq 0 -and [IO.File]::Exists($index)) 'Actual CLI failed to provision owned VHD index'
+ $verify=Join-Path $repo 'target\debug\examples\verify_persisted_file.exe'
+ $initial=& $verify --inspect-index $index
+ Assert ($LASTEXITCODE -eq 0) 'Cannot inspect actual native initial index'
+ $initial|Set-Content -Encoding UTF8 (Join-Path $artifact 'initial-index-state.json');$initialState=$initial|ConvertFrom-Json
+ Assert (-not $initialState.metadata_ready -and $initialState.entries -gt 0 -and @($initialState.volumes).Count -eq 1 -and $initialState.volumes[0].letter -ceq $owned.Volume.Substring(0,1) -and $initialState.volumes[0].root_prefix -ceq $owned.Root) 'Initial native index scope/fast-metadata state wrong; cannot claim service backfill'
+ Stage 'actual-scm-start-and-native-backfill'
+ $script:pipeName='findx253native'+[guid]::NewGuid().ToString('N')
  $command='"'+$ServiceExe+'" --service --index "'+$index+'" --volume '+$owned.Volume+' --pipe '+$pipeName+' --no-everything-ipc --usage-memory-mib 64 --save-interval-secs 1'
  Assert ($command -notmatch '--no-watch|--no-backfill|--fixture-root|--fixture-events') 'Native acceptance cannot use fixture bypasses'
  $null=New-Service -Name $name -BinaryPathName $command -StartupType Manual;$created=$true
@@ -74,12 +98,15 @@ try{
  $null=New-ItemProperty -Path $serviceKey -Name Environment -PropertyType MultiString -Value @('ProgramData='+(Join-Path $base 'programdata'))
  Start-Service $name
  Wait-Condition {Ready} 120 'Actual native whole-volume load/watch/backfill never became ready'
+ Stage 'verify-native-seed-backfill'
+ Wait-Condition {Has-File 'initial-native-proof.txt' $initialBody.Length} 30 'Actual initial native seed metadata not backfilled; readiness flag alone is insufficient'
  $first=Assert-OwnedService
  Assert ($first.StartName -eq 'LocalSystem') 'OS ACL fault must target the actual SCM account'
  $caps=Rpc @{type='upgrade_capabilities';protocol_version=1}
  Assert ($caps.type -eq 'upgrade_capabilities_result' -and -not $caps.durable_prepare) 'Unproved positive ACK must remain rejected'
  $caps|ConvertTo-Json -Depth 10|Set-Content (Join-Path $artifact 'capabilities-not-ack.json')
  $rows.Add(@{test='native-scm-vhd-load-watch-backfill';passed=$true;pid=$first.ProcessId;noWatch=$false;noBackfill=$false;fixture=$false})
+ Stage 'actual-os-write-denial'
  # Deny only the exact owned VHD-index directory to LOCAL SYSTEM. No injected fake writer.
  Wait-Condition {Test-Path -LiteralPath (Join-Path $v6 'published.json')} 30 'No actual published generation'
  $before=Get-Content (Join-Path $v6 'published.json') -Raw|ConvertFrom-Json
@@ -91,18 +118,21 @@ try{
  [IO.File]::WriteAllText((Join-Path $owned.Root ('native-runtime\'+$file)),$body,[Text.Encoding]::ASCII)
  Wait-Condition {Has-File $file $body.Length} 45 'Real USN/stat never committed expected RAM file; do not claim writer fault reached'
  Wait-Condition {$cap=Rpc @{type='upgrade_capabilities';protocol_version=1};$cap|ConvertTo-Json -Depth 10|Set-Content (Join-Path $artifact 'actual-os-writer-error.json');return ($cap.last_checkpoint_error -match 'denied|拒绝|os error 5|Access')} 30 'Did not reach actual OS writer access failure'
+ Stage 'actual-save-failure-stop-pending'
  $identity=Assert-OwnedService;$controller=Get-Service $name;$controller.Stop()
  Wait-Condition {(Service-State).State -eq 'Stop Pending'} 8 'Save failure did not retain SCM StopPending'
  [Threading.Thread]::Sleep(1500)
  $pending=Assert-OwnedService
  Assert ($pending.State -eq 'Stop Pending' -and $pending.ProcessId -eq $identity.ProcessId) 'Writer error was turned into successful exit or process replacement'
  $pending|Select-Object Name,State,ProcessId,ExitCode,ServiceSpecificExitCode|ConvertTo-Json|Set-Content (Join-Path $artifact 'save-failure-stop-pending.json')
+ Stage 'restore-acl-and-real-save-retry'
  Set-Acl -LiteralPath $v6 -AclObject $originalAcl;$originalAcl=$null
  $stopped=Stop-Owned
  Assert ($stopped.ExitCode -eq 0 -and $stopped.ServiceSpecificExitCode -eq 0) 'Recovered actual save did not stop cleanly'
  $after=Get-Content (Join-Path $v6 'published.json') -Raw|ConvertFrom-Json
  Assert ($after.manifest.generation -ge $before.manifest.generation) 'Disk generation regressed'
  $after|ConvertTo-Json -Depth 20|Set-Content (Join-Path $artifact 'recovered-published-generation.json')
+ Stage 'offline-disk-proof-before-restart'
  # Verify actual DISK metadata BEFORE restarting: USN replay cannot repair a bad save into a false PASS.
  $verify=Join-Path $repo 'target\debug\examples\verify_persisted_file.exe'
  & $verify $index (Join-Path $owned.Root ('native-runtime\'+$file)) $body.Length $after.manifest.generation | Set-Content (Join-Path $artifact 'offline-no-replay-disk-proof.json')
@@ -115,6 +145,7 @@ try{
  Assert ($restarted.ProcessId -ne $identity.ProcessId) 'Did not actually restart a service instance'
  $rows.Add(@{test='actual-os-write-failure-stop-pending-retry-native-recovery';passed=$true;beforeGeneration=$before.manifest.generation;afterGeneration=$after.manifest.generation;oldPid=$identity.ProcessId;newPid=$restarted.ProcessId;expectedBytes=$body.Length;upgradeAck=$false})
  $null=Stop-Owned
+ Stage 'actual-corrupt-index-load-error-scm'
  # Actual SCM error propagation, explicitly a corrupt-index LOAD failure, not a fake save-failure claim.
  $bad=Join-Path $base 'corrupt-owned-index.bin';[IO.File]::WriteAllText($bad,'invalid-private-index',[Text.Encoding]::ASCII)
  $badCommand=$command.Replace($index,$bad)
@@ -126,7 +157,8 @@ try{
  $failed|Select-Object Name,State,ProcessId,ExitCode,ServiceSpecificExitCode|ConvertTo-Json|Set-Content (Join-Path $artifact 'actual-scm-load-error.json')
  $rows.Add(@{test='actual-corrupt-index-load-error-to-scm';passed=$true;win32=$failed.ExitCode;serviceSpecific=$failed.ServiceSpecificExitCode;scope='load failure, NOT successful final RAM save or save-failure exit'})
 }catch{
- $rows.Add(@{test='native-runtime-current-stage';passed=$false;error=$_.Exception.Message})
+ $rows.Add(@{test='native-runtime-current-stage';stage=$script:stage;passed=$false;error=$_.Exception.Message})
+ Capture-NativeDiagnostics
  throw
 }finally{
  if($originalAcl -and $v6){Set-Acl -LiteralPath $v6 -AclObject $originalAcl}

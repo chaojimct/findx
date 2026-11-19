@@ -2,6 +2,11 @@
 use std::path::Path;
 fn main()->Result<(),Box<dyn std::error::Error>>{
  let args:Vec<_>=std::env::args().collect();
+ if args.len()==3 && args[1]=="--inspect-index" {
+  println!("{}",inspect_index(Path::new(&args[2]))?);
+  return Ok(());
+ }
+
  if args.len()!=5{return Err("usage: verify_persisted_file INDEX EXPECTED_FULL_PATH EXPECTED_BYTES EXPECTED_GENERATION".into());}
  let layout=findx2_core::V6Layout::for_index(Path::new(&args[1]));
  let before=findx2_core::persist_tx::read_published(&layout)?.ok_or("no actual published generation")?;
@@ -18,4 +23,20 @@ fn main()->Result<(),Box<dyn std::error::Error>>{
  if after.manifest.generation!=generation{return Err("persisted generation changed during offline read".into());}
  println!("{}",serde_json::json!({"passed":true,"offline":true,"watch":false,"replay":false,"path":args[2],"bytes":bytes,"generation":generation,"metadata_ready":store.metadata_ready}));
  Ok(())
+}
+
+fn inspect_index(path:&Path)->Result<serde_json::Value,Box<dyn std::error::Error>>{
+ let store=findx2_core::load_index_bin(path)?;
+ let volumes:Vec<_>=store.volumes.iter().map(|v|serde_json::json!({"letter":(v.volume_letter as char).to_string(),"root_prefix":v.root_prefix,"serial":v.volume_serial,"journal_id":v.usn_journal_id,"last_usn":v.last_usn})).collect();
+ Ok(serde_json::json!({"offline":true,"watch":false,"replay":false,"entries":store.entry_count(),"metadata_ready":store.metadata_ready,"volumes":volumes}))
+}
+#[cfg(test)]mod tests{
+ use super::*;
+ #[test]fn initial_index_inspection_reads_actual_disk_metadata_and_volume_without_engine_or_replay(){
+  use findx2_core::{IndexBuilder,RawEntry};
+  let root=std::env::temp_dir().join(format!("findx-offline-native-provision-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));std::fs::create_dir(&root).unwrap();let path=root.join("index.bin");
+  let raw=|id,dir|RawEntry{file_id:id,file_id_128:None,parent_id:if dir{0}else{1},name:if dir{"root".into()}else{"initial.txt".into()},size:18,mtime:0,ctime:0,attrs:if dir{0x10}else{0},is_dir:dir};
+  let store=IndexBuilder::new(b'F',123,456,789).build_from_raw(vec![raw(2,false)],vec![raw(1,true)],false).unwrap();findx2_core::save_index_bin(&path,&store).unwrap();
+  let v=inspect_index(&path).unwrap();assert_eq!(v["metadata_ready"],false);assert_eq!(v["volumes"][0]["letter"],"F");assert_eq!(v["volumes"][0]["serial"],123);assert_eq!(v["volumes"][0]["journal_id"],456);assert_eq!(v["volumes"][0]["last_usn"],789);assert_eq!(v["watch"],false);assert_eq!(v["replay"],false);assert!(v["entries"].as_u64().unwrap()>0);std::fs::remove_dir_all(root).unwrap();
+ }
 }

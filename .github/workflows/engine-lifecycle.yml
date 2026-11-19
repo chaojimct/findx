@@ -42,7 +42,11 @@ jobs:
         run: |
           cargo build --locked -p findx2-service
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked -p findx2-cli --bin findx2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --locked -p findx2-core --example verify_persisted_file
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p findx2-core --example verify_persisted_file -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Real native SCM VHD USN backfill and OS writer-failure recovery (no fixture bypass)
         shell: pwsh
