@@ -127,6 +127,10 @@ fn bare_terms(query: &str) -> String {
 
 fn handle_request(req: IpcRequest) -> IpcResponse {
     match req {
+        // A rendering fixture is never a durable engine, regardless of Status.
+        IpcRequest::UpgradeCapabilities { .. } => IpcResponse::Error {
+            message: "mock backend cannot prepare an upgrade or issue a durable-save receipt".into(),
+        },
         IpcRequest::UsageCapabilities | IpcRequest::UsageChildren { .. } => IpcResponse::Error {
             message: "mock backend does not support indexed usage".into(),
         },

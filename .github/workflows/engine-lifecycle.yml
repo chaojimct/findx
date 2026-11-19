@@ -5,6 +5,7 @@ on:
     paths:
       - 'crates/findx2-service/**'
       - 'crates/findx2-ipc/**'
+      - 'crates/findx2-gui-native/**'
       - '.github/workflows/engine-lifecycle.yml'
   workflow_dispatch:
 permissions:
@@ -22,6 +23,8 @@ jobs:
         run: |
           cargo test --locked -p findx2-ipc -p findx2-service -- --test-threads=1 2>&1 | Tee-Object engine-lifecycle-tests.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: GUI and CLI compile against actual shared IPC contract
+        run: cargo check --locked -p findx2-cli -p findx2-gui-native
       - name: No force-exit fallback and protocol remains fail-closed
         shell: pwsh
         run: |
