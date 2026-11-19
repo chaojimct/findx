@@ -62,25 +62,28 @@ fn is_volume_frozen(letter: char) -> bool {
 /// watch 线程永不 stat 的另一半——随机 IO 在这里按 FRN 排序后批量消化，
 /// bulk 风暴时名字秒级可见、meta 随后追上（SSD 秒级、HDD 分钟级，但绝不卡住增量）。
 /// 无权限（非管理员）时 fill 恒空：排空丢弃，只记一次日志（文件本身已由 CreatePending 入库）。
+type StatWork=(Option<[u8;16]>,Option<crate::runtime_lifecycle::Reservation>);
+type StatMessage=(u64,Option<[u8;16]>,Option<crate::runtime_lifecycle::Reservation>);
+
 fn spawn_stat_worker(
     engine: Arc<SearchEngine>,
     volume_device_path: String,
-) -> std::sync::mpsc::SyncSender<(u64, Option<[u8; 16]>)> {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Option<[u8; 16]>)>(
-        (4 * 1024 * 1024) / std::mem::size_of::<(u64, Option<[u8; 16]>)>(),
+) -> std::sync::mpsc::SyncSender<StatMessage> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<StatMessage>(
+        (4 * 1024 * 1024) / std::mem::size_of::<StatMessage>(),
     );
     std::thread::Builder::new()
         .name("findx2-stat-worker".into())
         .spawn(move || {
             use std::collections::HashMap;
             // FRN 去重（同文件多次变更只 stat 最后一次；value 无意义，占位）。
-            let mut pending: HashMap<u64, Option<[u8; 16]>> = HashMap::new();
+            let mut pending: HashMap<u64, StatWork> = HashMap::new();
             let mut logged_no_perm = false;
             // 主循环退出条件只有进程退出；recv_timeout 节拍顺带做批量超时。
             loop {
                 match rx.recv_timeout(std::time::Duration::from_millis(1000)) {
-                    Ok((frn, id128)) => {
-                        pending.insert(frn, id128);
+                    Ok((frn, id128, work)) => {
+                        pending.insert(frn, (id128,work));
                         // 攒够一批就刷（5000 条或 1 秒超时，取先到者）。
                         if pending.len() >= 5000 {
                             drain_stat_batch(
@@ -130,19 +133,20 @@ fn spawn_stat_worker(
 fn drain_stat_batch(
     engine: &Arc<SearchEngine>,
     volume_device_path: &str,
-    pending: &mut std::collections::HashMap<u64, Option<[u8; 16]>>,
+    pending: &mut std::collections::HashMap<u64, StatWork>,
     logged_no_perm: &mut bool,
 ) {
     if pending.is_empty() {
         return;
     }
+    let accepted=std::mem::take(pending); // Keep work reservations through IO AND commits.
     // 注：重建冻结期无需特殊处理——合并后旧条目下标不变（新条目追加在后），
     // patch 到墓碑/旧条目无害；新文件的 StatRefresh 在旧布局查不到会被跳过，
     // journal 重放会重新排队。见 rebuild_volume 设计注释。
     // 按 FRN 排序后批量 stat：MFT 记录号即 FRN 低 48 位，排序≈顺序读，HDD 友好。
-    let mut frns: Vec<u64> = pending.keys().copied().collect();
+    let mut frns: Vec<u64> = accepted.keys().copied().collect();
     frns.sort_unstable();
-    let id128s: Vec<Option<[u8; 16]>> = frns.iter().map(|f| pending[f]).collect();
+    let id128s: Vec<Option<[u8; 16]>> = frns.iter().map(|f| accepted[f].0).collect();
     let indices: Vec<usize> = (0..frns.len()).collect();
     let volume = volume_device_path
         .chars()
@@ -161,7 +165,6 @@ fn drain_stat_batch(
         None,
         None,
     );
-    pending.clear();
     if updates.is_empty() {
         // 全失败：大概率无权限。节流日志（只记一次），否则每秒刷屏。
         if !*logged_no_perm {
@@ -222,9 +225,11 @@ fn spawn_trigram_rebuild(engine: Arc<SearchEngine>, index: PathBuf, reason: &'st
     let Some(guard) = TrigramRebuildGuard::acquire() else {
         return;
     };
+    let lifecycle=match crate::runtime_lifecycle::reserve(&engine,"trigram-publisher") {Ok(v)=>v,Err(_)=>return};
     let spawned = std::thread::Builder::new()
         .name("findx2-trigram-rebuild".into())
         .spawn(move || {
+            let _lifecycle=lifecycle.map(|p|p.activate());
             let _guard = guard;
             info!("trigram：后台重建开始（{reason}）");
             let t0 = Instant::now();
@@ -417,6 +422,7 @@ pub(crate) fn run_foreground(
     }
 
     let engine = Arc::new(SearchEngine::new(store));
+    let lifecycle=crate::runtime_lifecycle::Owner::attach(engine.clone(),index.clone(),stop.clone()).map_err(anyhow::Error::msg)?;
     let budget = if let Some(mib) = flags.usage_memory_mib {
         mib.checked_mul(1024 * 1024)
             .ok_or_else(|| anyhow::anyhow!("usage byte budget overflow"))?
@@ -561,13 +567,22 @@ pub(crate) fn run_foreground(
             Err(_) => worker_errors.push("watch worker panicked during shutdown".into()),
         }
     }
-    if !worker_errors.is_empty() {
-        anyhow::bail!("shutdown not confirmed: {}", worker_errors.join("; "));
-    }
+    let _stop_work=loop {
+        match lifecycle.drain_stop(Instant::now()+Duration::from_secs(10)) {
+            Ok(p)=>break p,
+            Err(e)=>{error!("stop pending; RAM retained; runtime not drained: {e}");std::thread::sleep(Duration::from_secs(1));}
+        }
+    };
     // A successful IO observation is NOT an upgrade receipt: metadata/backfill/
     // stat producers still need a shared admission fence and drain in the next step.
-    let result = persist_shutdown_checkpoint(&engine, &index);
-    crate::shutdown::require_checkpoint_result(result, || engine.has_pending_persistence())?;
+    loop {
+        let result = persist_shutdown_checkpoint(&engine, &index);
+        match crate::shutdown::require_checkpoint_result(result, || engine.has_pending_persistence()) {
+            Ok(())=>break,
+            Err(e)=>{error!("STOP PENDING: save failed, RAM/IPC retained; retrying, NO ACK: {e}");std::thread::sleep(Duration::from_secs(5));}
+        }
+    }
+    if !worker_errors.is_empty(){anyhow::bail!("saved accepted RAM, but watch shutdown failed: {}",worker_errors.join("; "));}
     info!("Shutdown checkpoint IO complete; NOT a producer-fenced final RAM durability receipt");
     info!(counts=?findx2_windows::metadata_terminal_counts(), "metadata terminal buckets: missing/access/sharing/invalid_id/not_found/other/success");
     Ok(())
@@ -731,14 +746,11 @@ fn usn_watch_loop(
         // Try a partial-coverage checkpoint without claiming crash atomicity.
         if stop.load(Ordering::SeqCst) {
             flush_pending(&mut pending)?;
-            match persist_index(&engine, &index_path) {
-                Ok(true) => info!("Volume {letter} shutdown checkpoint generation published (protocol durable, not physical power-loss certified)"),
-                Ok(false) => info!("Volume {letter} shutdown checkpoint deferred to active writer"),
-                Err(e) => return Err(e.context(format!("Volume {letter} shutdown checkpoint failed; no final receipt"))),
-            }
+            // One global save follows joined watch workers AND drained stat/background work.
             info!("卷 {letter} USN 监听线程停机退出");
             return Ok(());
         }
+        let _lifecycle=match crate::runtime_lifecycle::enter(&engine,"watch-batch") {Ok(p)=>p,Err(_)=>return Ok(())};
         if namespace_gate.blocked {
             let _ = rx.recv_timeout(Duration::from_millis(100));
             std::thread::sleep(Duration::from_millis(100));
@@ -806,7 +818,7 @@ fn usn_watch_loop(
                         anyhow::bail!("full 128-bit stat binding unresolved; refusing low64 alias");
                     }
                     engine.mark_metadata_dirty(volume_letter, file_id);
-                    stat_tx.send((file_id, file_id_128)).map_err(|_| {
+                    stat_tx.send((file_id, file_id_128, crate::runtime_lifecycle::reserve(&engine,"queued-stat").map_err(anyhow::Error::msg)?)).map_err(|_| {
                         anyhow::anyhow!("stat worker unavailable; metadata remains unknown")
                     })?;
                 }
@@ -915,6 +927,7 @@ fn usn_watch_loop(
         if !pending.is_empty() && batch_started.elapsed() >= flush_every {
             dirty_count += flush_pending(&mut pending)?;
         }
+        dirty_count += flush_pending(&mut pending)?; // No accepted legacy batch crosses the prepare barrier.
     }
 }
 
@@ -1217,10 +1230,11 @@ pub(crate) fn persist_index(engine: &SearchEngine, path: &Path) -> anyhow::Resul
     })
 }
 
-fn persist_index_with(
+pub(crate) fn persist_index_with(
     engine: &SearchEngine, path: &Path,
     writer: impl FnOnce(&V6Layout, &findx2_core::CommitBatch) -> anyhow::Result<CommitOutcome>,
 ) -> anyhow::Result<bool> {
+    let _lifecycle=crate::runtime_lifecycle::enter(engine,"persister").map_err(anyhow::Error::msg)?;
     let _guard = match persist_lock().try_lock() {
         Ok(g) => g,
         Err(std::sync::TryLockError::Poisoned(e)) => {

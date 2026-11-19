@@ -205,7 +205,7 @@ impl SearchEngine {
             .map_err(|e| format!("index identity: {e}"))?;
         let identity = parent.join(index.file_name().ok_or("index has no filename")?);
         let admission = self.store.close(deadline, cancel)?;
-        let store = self
+        let mut store = self
             .store
             .inner
             .try_write_until(deadline)
@@ -215,6 +215,7 @@ impl SearchEngine {
             return Err("checkpoint cancelled/timed out before IO; no ACK".into());
         }
         let layout = crate::V6Layout::for_index(&identity);
+        store.mark_full_resync(); // Preserve RAM; next writer must not replay pre-snapshot structural deltas.
         let generation = publication
             .save_full(&layout, &store)
             .map_err(|e| format!("checkpoint writer: {e}"))?;

@@ -13,6 +13,7 @@ struct CapacityGuard(Arc<SearchEngine>);
 impl Drop for CapacityGuard{fn drop(&mut self){self.0.reclaim_metadata_ticket_capacity();}}
 pub(crate) fn ticket_pass<F>(engine:&Arc<SearchEngine>,epoch:u64,cancel:&AtomicBool,limits:Limits,mut fetch:F)->Result<Report,String>
 where F:FnMut(u8,&[MetadataWorkItem])->Result<Vec<(usize,u64,u64,u64)>,String>{
+    let _work=crate::runtime_lifecycle::enter(engine,"metadata-pipeline")?;
     if limits.active_bytes<256||limits.workers==0{return Err("metadata work byte/concurrency budget cannot admit work".into());}
     let _capacity=CapacityGuard(engine.clone());let end=engine.index_store().entry_count();let mut next=0;let mut report=Report::default();
     while next<end {

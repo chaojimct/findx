@@ -86,6 +86,7 @@ pub fn spawn_events(engine: Arc<SearchEngine>, script: PathBuf, stop: Arc<Atomic
     std::thread::spawn(move || {
         let mut consumed = 0;
         while !stop.load(Ordering::Acquire) {
+            let _work=match crate::runtime_lifecycle::enter(&engine,"fixture-events") {Ok(p)=>p,Err(_)=>return};
             if let Ok(text) = std::fs::read_to_string(&script) {
                 for line in text.lines().skip(consumed) {
                     consumed += 1;

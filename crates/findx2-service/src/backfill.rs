@@ -67,11 +67,14 @@ pub(crate) fn spawn_backfill(engine: Arc<SearchEngine>, index_path: std::path::P
         return;
     }
     let engine_err = engine.clone();
+    let lifecycle=match crate::runtime_lifecycle::reserve(&engine,"backfill") {Ok(v)=>v,Err(_)=>{BACKFILL_RUNNING.store(false,Ordering::SeqCst);return}};
     if let Err(e) = std::thread::Builder::new()
         .name("findx2-backfill".into())
         .spawn(move || {
+            let _lifecycle=lifecycle.map(|p|p.activate());
             let _guard = BackfillRunningGuard;
             if let Err(e) = backfill_loop(engine.clone(), index_path) {
+                crate::runtime_lifecycle::fail(&engine,format!("backfill failed: {e}"));
                 error!("元数据回填线程退出: {e}");
                 engine.set_backfill_error(Some(format!("元数据回填异常：{e}")));
             }
@@ -92,9 +95,11 @@ fn spawn_final_persist(engine: Arc<SearchEngine>, path: std::path::PathBuf) {
     spawn_final_persist_for_epoch(engine,path,None)
 }
 fn spawn_final_persist_for_epoch(engine:Arc<SearchEngine>,path:std::path::PathBuf,epoch:Option<u64>) {
+    let lifecycle=match crate::runtime_lifecycle::reserve(&engine,"metadata-finalizer") {Ok(v)=>v,Err(_)=>return};
     std::thread::Builder::new()
         .name("findx2-final-persist".into())
         .spawn(move || {
+            let _lifecycle=lifecycle.map(|p|p.activate());
             let t0 = Instant::now();
             // 1) flush overlay 进主索引（写锁 ~2-5s @ 8.5M 全填）。
             //    这步发生时回填线程已退出，不会再有新 put；search 会被这次写锁阻塞数秒。
