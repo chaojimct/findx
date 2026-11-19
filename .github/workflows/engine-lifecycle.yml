@@ -37,11 +37,18 @@ jobs:
           if($LASTEXITCODE){exit $LASTEXITCODE}
           $changed=git diff --name-only aedfa5ca8051704c1137522f67f94603893a3089 HEAD -- Cargo.lock Cargo.toml crates
           if($LASTEXITCODE){exit $LASTEXITCODE}
-          if($changed){'changed=true' >> $env:GITHUB_OUTPUT}else{
+          $rootFiles=@('crates/findx2-core/src/index.rs','crates/findx2-core/tests/upgrade_candidate.rs')
+          $rootOnly=@($changed).Count -eq 2 -and @($changed|Where-Object {$_ -notin $rootFiles}).Count -eq 0
+          if($rootOnly){
+            if((git rev-parse HEAD:crates/findx2-core/src/index.rs) -cne 'b608551a5c450df5b4e508c8684119ae21316d52'){$rootOnly=$false}
+            if((git rev-parse HEAD:crates/findx2-core/tests/upgrade_candidate.rs) -cne '0f3d850449535e67e647ab9c262f5d0adee9e572'){$rootOnly=$false}
+          }
+          if($rootOnly){'root_only=true' >> $env:GITHUB_OUTPUT}
+          if($changed -and -not $rootOnly){'changed=true' >> $env:GITHUB_OUTPUT}else{
             $proof=gh run view 44446796510 --repo chaojimct/findx --json conclusion,headSha | ConvertFrom-Json
             if($LASTEXITCODE -or $proof.conclusion -ne 'success' -or $proof.headSha -cne 'aedfa5ca8051704c1137522f67f94603893a3089'){throw 'Unverified engine evidence'}
             'changed=false' >> $env:GITHUB_OUTPUT
-            'Reuse unchanged Rust/core/IPC/GUI/native8 evidence44446796510; changed installer tested by fresh matrix.'
+            'Reuse unchanged ACK/IPC/service lifecycle evidence44446796510; any isolated root-path change receives targeted core tests, not a full-payload claim.'
           }
       - uses: dtolnay/rust-toolchain@stable
         if: steps.engine-change.outputs.changed == 'true'
@@ -59,6 +66,12 @@ jobs:
         run: |
           cargo test --locked -p findx2-ipc -p findx2-service -- --test-threads=1 2>&1 | Tee-Object engine-lifecycle-tests.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Changed canonical root compatibility regressions only
+        if: steps.engine-change.outputs.root_only == 'true'
+        shell: pwsh
+        run: |
+          cargo test --locked -p findx2-core --test upgrade_candidate --test multi_volume_incremental_path --test parent_direct -- --test-threads=1
+          if($LASTEXITCODE){exit $LASTEXITCODE}
       - name: Official installer runtime ordering unit regressions (not SCM acceptance)
         shell: powershell
         run: ./scripts/test-installer-runtime-contract.ps1
@@ -155,26 +168,29 @@ jobs:
       - name: Verify native COM fixture before expensive build
         shell: powershell
         run: ./scripts/test-installer-fixtures.ps1 -PublishedGui (Join-Path $env:RUNNER_TEMP 'findx-published252-input/extracted/{app}/FindX.exe')
-      - name: Build one complete final payload from the exact accepted engine source
-        shell: pwsh
+      - uses: actions/download-artifact@v4
+        with:
+          name: findx-253-rebuilt-engine-candidate-payload
+          run-id: 44449891828
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/findx-candidate253-payload
+      - name: Verify unchanged payload source and all six artifact hashes
+        shell: powershell
         run: |
-          # Old GUI differs in its mock-management rejection arms; source identity
-          # is not exact, so build it ONCE with the new engine, not a stale reuse.
-          cargo build --locked --release -p findx2-service -p findx2-cli -p findx2-gui-native
-          if($LASTEXITCODE){exit $LASTEXITCODE}
-          ./scripts/stage-engine-release.ps1 -BuildRoot target/release -Destination (Join-Path $env:RUNNER_TEMP 'findx-candidate253-payload')
+          $root=Join-Path $env:RUNNER_TEMP 'findx-candidate253-payload'
+          $m=Get-Content (Join-Path $root 'stage-manifest.json') -Raw|ConvertFrom-Json
+          if($m.sourceCommit -cne '0a31012c1415a1b1764d55813bfa5ece2f44073d' -or $m.files.Count -ne 6 -or $m.engineUnchanged -ne $false){throw 'Wrong immutable candidate origin'}
+          if(@(Get-ChildItem $root -Recurse -File).Count -ne 7 -or @($m.files.name|Select-Object -Unique).Count -ne 6){throw 'Unexpected candidate files'}
+          git diff --exit-code 0a31012c1415a1b1764d55813bfa5ece2f44073d HEAD -- installer
+          if($LASTEXITCODE){throw 'Installer product changed; cannot compose old11 and new7 evidence'}
+          foreach($f in $m.files){$p=Join-Path $root $f.name;if((Get-FileHash $p).Hash -ine $f.sha256 -or (Get-Item $p).Length -ne $f.length){throw 'Reused payload hash mismatch'}}
+          # Explicitly NOT the root-fixed current source payload or release approval.
+          # Root fix is tested separately above; final rebuilt payload remains mandatory.
       - name: Real official-ISS isolated final-payload package and native SCM matrix
         shell: powershell
         run: |
           $root=Join-Path $env:RUNNER_TEMP 'findx-published252-input'
-          ./scripts/test-installer-native.ps1 -PublishedPayload (Join-Path $root 'extracted/{app}') -CandidatePayload (Join-Path $env:RUNNER_TEMP 'findx-candidate253-payload') -Iscc "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" -EngineCandidate
-      - name: Retain immutable exact candidate payload (not a release approval)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: findx-253-rebuilt-engine-candidate-payload
-          path: ${{ runner.temp }}/findx-candidate253-payload/
-          retention-days: 7
+          ./scripts/test-installer-native.ps1 -PublishedPayload (Join-Path $root 'extracted/{app}') -CandidatePayload (Join-Path $env:RUNNER_TEMP 'findx-candidate253-payload') -Iscc "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" -EngineCandidate -PayloadSourceCommit '0a31012c1415a1b1764d55813bfa5ece2f44073d' -OnlyCases @('legacy-running-refusal','running253-success','running253-save-refusal','running253-backup-failure','running253-health-rollback','running253-interrupted-recovery','running253-copy-verification-rollback')
       - name: Retain only test-owned evidence
         if: always()
         uses: actions/upload-artifact@v4

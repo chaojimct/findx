@@ -1,4 +1,4 @@
-﻿param([Parameter(Mandatory=$true)][string]$PublishedPayload,[Parameter(Mandatory=$true)][string]$CandidatePayload,[Parameter(Mandatory=$true)][string]$Iscc,[switch]$EngineCandidate)
+﻿param([Parameter(Mandatory=$true)][string]$PublishedPayload,[Parameter(Mandatory=$true)][string]$CandidatePayload,[Parameter(Mandatory=$true)][string]$Iscc,[switch]$EngineCandidate,[string]$PayloadSourceCommit=$env:GITHUB_SHA,[string[]]$OnlyCases=@())
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 if($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows' -or $env:COMPUTERNAME -eq 'MZ' -or $env:USERPROFILE -eq 'C:\Users\chaoj'){throw 'Only disposable Windows CI runner allowed'}
@@ -9,7 +9,7 @@ $null=[IO.Directory]::CreateDirectory($base)
 $rows=[Collections.Generic.List[object]]::new()
 if($EngineCandidate){
  $manifest=Get-Content (Join-Path $CandidatePayload 'stage-manifest.json') -Raw|ConvertFrom-Json
- if($manifest.sourceCommit -cne $env:GITHUB_SHA -or $manifest.engineUnchanged -ne $false){throw 'Not this exact rebuilt engine candidate'}
+ if($manifest.sourceCommit -cne $PayloadSourceCommit -or $manifest.engineUnchanged -ne $false){throw 'Not this exact rebuilt engine candidate'}
  foreach($f in $manifest.files){$x=Join-Path $CandidatePayload $f.name;if((Get-FileHash $x).Hash.ToLowerInvariant() -cne $f.sha256 -or (Get-Item $x).Length -ne $f.length){throw 'Exact new payload manifest mismatch'}}
 }
 
@@ -49,7 +49,7 @@ function AssertPlatformRestored($snapshot){
 function Assert($condition,[string]$reason){if(-not $condition){throw $reason}}
 function Hash([string]$p){return (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash}
 function Write-NativeResults {
- [ordered]@{scope=$(if($EngineCandidate){'actual ISS exact rebuilt2.5.3 engine/GUI source+hash manifest; real running engine and published252 refusal; synthetic service ONLY for legacy stop-timeout'}else{'historical GUI-only fixture; not new engine acceptance'});cases=@($rows.ToArray());passed=@($rows | Where-Object{$_.passed}).Count;failed=@($rows | Where-Object{-not $_.passed}).Count;candidateGUIIntegrated=$true;candidateGuiSha256=(Hash (Join-Path $CandidatePayload 'FindX.exe'));productionTouched=$false} | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 (Join-Path $base 'results.json')
+ [ordered]@{scope=$(if($EngineCandidate){'actual ISS exact rebuilt2.5.3 engine/GUI source+hash manifest; real running engine and published252 refusal; synthetic service ONLY for legacy stop-timeout'}else{'historical GUI-only fixture; not new engine acceptance'});cases=@($rows.ToArray());passed=@($rows | Where-Object{$_.passed}).Count;failed=@($rows | Where-Object{-not $_.passed}).Count;payloadSourceCommit=$PayloadSourceCommit;installerSourceCommit=$env:GITHUB_SHA;requestedCases=@($cases);candidateGUIIntegrated=$true;candidateGuiSha256=(Hash (Join-Path $CandidatePayload 'FindX.exe'));productionTouched=$false} | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 (Join-Path $base 'results.json')
 }
 $hostSource=@'
 using System;
@@ -72,6 +72,10 @@ Add-Type -TypeDefinition $hostSource -OutputAssembly $fixtureHost -OutputType Wi
 $runningCases=@('running253-success','running253-save-refusal','running253-backup-failure','running253-health-rollback','running253-interrupted-recovery','running253-copy-verification-rollback')
 $cases=@('fresh-no-service','published252-stopped-service','backup-failure','health-rollback','legacy-running-refusal','stop-timeout','reentry-refusal','interrupted-recovery','new-service-ipc','new-service-health-rollback','fresh-selected-no-index','platform-rollback')
 if($EngineCandidate){$cases+= $runningCases}
+if($OnlyCases.Count){
+ if(@($OnlyCases|Select-Object -Unique).Count -ne $OnlyCases.Count -or @($OnlyCases|Where-Object {$_ -notin $cases}).Count){throw 'Unknown/duplicate requested cases'}
+ $cases=@($cases|Where-Object {$_ -in $OnlyCases})
+}
 foreach($case in $cases){
  $id=[guid]::NewGuid().ToString('N');$service='FindXUpgradeTest_'+$id;$pipe='findx-upgrade-test-'+$id
  $root=Join-Path $base $case;$app=Join-Path $root 'app 中文 space';$data=Join-Path $root 'index state';$native=Join-Path $root 'native config';$legacy=Join-Path $root 'legacy config';$tx=Join-Path $root 'tx';$stage=Join-Path $root 'payload';$build=Join-Path $root 'build'
@@ -117,7 +121,7 @@ foreach($case in $cases){
   if($case -in @('published252-stopped-service','legacy-running-refusal','stop-timeout') -or $isRunningNew){
    if($case -eq 'stop-timeout' -or ($case -eq 'legacy-running-refusal' -and -not $EngineCandidate)){Copy-Item -LiteralPath $fixtureHost -Destination (Join-Path $app 'findx2-service.exe') -Force}
    $command='"'+(Join-Path $app 'findx2-service.exe')+'" --service --index "'+(Join-Path $data 'index.bin')+'" --pipe '+$pipe
-   if($isRunningNew -or ($EngineCandidate -and $case -eq 'legacy-running-refusal')){$command+=' --volume '+$volume+' --no-everything-ipc --save-interval-secs 1 --usage-memory-mib 64'}
+   if($isRunningNew -or ($EngineCandidate -and $case -eq 'legacy-running-refusal')){$command+=' --volume '+$volume+' --no-everything-ipc --save-interval-secs 1'}
    $null=New-Service -Name $service -BinaryPathName $command -StartupType Manual;$created=$true
    $null=New-ItemProperty -Path ('HKLM:\SYSTEM\CurrentControlSet\Services\'+$service) -Name Environment -PropertyType MultiString -Value @('ProgramData='+(Join-Path $root 'programdata'))
    if($case -in @('legacy-running-refusal','stop-timeout') -or $isRunningNew){if($case -eq 'stop-timeout'){[IO.File]::WriteAllText((Join-Path $data 'index.bin.hold-stop'),'hold')};Start-Service $service;$originalServicePid=[int](Get-CimInstance Win32_Service -Filter ("Name='"+$service+"'")).ProcessId}
@@ -239,7 +243,7 @@ foreach($case in $cases){
     Assert ($savedRetry.ExitCode -eq 0 -and $rj.state -eq 'committed' -and $rj.backupVerified -and $rj.terminalHandoff.stage -eq 'stopped' -and $rj.terminalHandoff.offlineBeforeReplay) 'Real installer retry after OS write repair never completed durable handoff/backup/commit'
     AssertGuiHealth $retryTx;AssertIpcHealth $retryTx
    }else{
-    Assert ($j.terminalHandoff.stage -eq 'stopped' -and $j.terminalHandoff.offlineBeforeReplay -and $j.terminalHandoff.token.published_generation -gt 0) 'Not an actual bound receipt/STOP/offline chain'
+    Assert ($j.terminalHandoff -and $j.terminalHandoff.stage -eq 'stopped' -and $j.terminalHandoff.offlineBeforeReplay -and $j.terminalHandoff.token.published_generation -gt 0) 'Not an actual bound receipt/STOP/offline chain'
     if($case -eq 'running253-backup-failure'){Assert (-not $j.backupVerified -and $j.error -match 'Injected CI backup failure before any replacement' -and $j.state -eq 'rolled_back') 'Wrong backup refusal phase'}
     if($case -in @('running253-success','running253-health-rollback','running253-interrupted-recovery')){Assert $j.backupVerified 'No complete verified backup'}
     if($case -eq 'running253-copy-verification-rollback'){Assert ($j.backupVerified -and $j.state -eq 'rolled_back' -and $j.error -match 'Payload hash mismatch: resources[\\/]component-manifest.json' -and -not $j.candidateServiceStarted) 'Copied payload failed before intended integrity phase or candidate writer started prematurely';Assert (Test-Path (Join-Path $tx 'failed-new\app\resources\component-manifest.json')) 'Bad copied payload evidence lost'}
