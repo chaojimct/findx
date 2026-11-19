@@ -541,6 +541,14 @@ pub(crate) fn management(e:&SearchEngine, req:findx2_ipc::IpcRequest)->findx2_ip
         let s=lookup(e).ok_or("runtime lifecycle unavailable")?;
         let tx=s.control.lock().unwrap().clone().ok_or("actor unavailable")?;
         match req{
+            // Support negotiation is NOT a save ACK or metadata/readiness proof.
+            // A live actor is required above; prepare/commit still validate health,
+            // instance/request/index, producer fencing and actual durable generation.
+            Q::UpgradeCapabilities{protocol_version:2}=>Ok(R::UpgradeCapabilitiesResult{
+                protocol_version:2,durable_prepare:true,runtime_error:error_snapshot(e),
+                last_checkpoint_error:crate::ipc_dispatch::checkpoint_error_snapshot(),
+                reason:"authenticated protocol2 prepare/commit supported; capability is not a saved/stopped or metadata-ready acknowledgement".into()
+            }),
             Q::CheckpointIdentity{protocol_version:2}=>Ok(R::CheckpointIdentityResult{protocol_version:2,engine_instance:e.checkpoint_instance()?,service_pid:std::process::id(),index_identity:s.index_identity.clone()}),
             Q::PrepareStop{protocol_version:2,expected_instance,request_nonce,index_identity,timeout_ms}=>{
                 if index_identity!=s.index_identity||!(50..=120000).contains(&timeout_ms){return Err("wrong index or timeout bound".into());}
@@ -584,6 +592,29 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let owner = Owner::attach(e.clone(), path.clone(), stop.clone()).unwrap();
         (path, e, owner, stop)
+    }
+    #[test]
+    fn protocol2_capability_requires_live_actor_and_preserves_error_and_instance_boundaries(){
+        use findx2_ipc::{IpcRequest as Q,IpcResponse as R};
+        let(p,e,o,_)=fixture("capability-v2");
+        assert!(matches!(management(&e,Q::UpgradeCapabilities{protocol_version:2}),R::UpgradeCapabilitiesResult{protocol_version:2,durable_prepare:true,runtime_error:None,..}));
+        for protocol_version in [1,0,252,u32::MAX] {
+            assert!(matches!(management(&e,Q::UpgradeCapabilities{protocol_version}),R::Error{..}));
+        }
+        let slot=Arc::new(std::sync::RwLock::new(Some(e.clone())));
+        assert!(matches!(crate::ipc_dispatch::process_request(&slot,Q::UpgradeCapabilities{protocol_version:2}),R::Error{..}));
+        assert!(matches!(crate::ipc_dispatch::process_request(&slot,Q::UpgradeCapabilities{protocol_version:1}),R::UpgradeCapabilitiesResult{durable_prepare:false,..}));
+        let old=e.checkpoint_instance().unwrap();
+        o.retain_terminal_failure("capability must not conceal real producer failure".into());
+        assert!(matches!(management(&e,Q::UpgradeCapabilities{protocol_version:2}),R::UpgradeCapabilitiesResult{runtime_error:Some(error),..} if error.contains("real producer failure")));
+        drop(o);
+        assert!(matches!(management(&e,Q::UpgradeCapabilities{protocol_version:2}),R::Error{..}));
+        let fresh=Arc::new(SearchEngine::new(findx2_core::load_index_bin(&p).unwrap()));
+        let fresh_owner=Owner::attach(fresh.clone(),p.clone(),Arc::new(AtomicBool::new(false))).unwrap();
+        assert_ne!(old,fresh.checkpoint_instance().unwrap());
+        let error=fresh_owner.prepare(FreezeRequest{protocol_version:1,expected_instance:old,nonce:"a".repeat(32)},until(),Arc::new(AtomicBool::new(false))).unwrap_err();
+        assert!(error.contains("wrong instance"),"wrong rejection stage: {error}");
+        drop(fresh_owner);drop(fresh);drop(slot);drop(e);std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
     }
     fn req(e: &SearchEngine, n: char) -> FreezeRequest {
         FreezeRequest {

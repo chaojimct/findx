@@ -7,7 +7,7 @@ use findx2_ipc::{IpcRequest, IpcResponse};
 
 pub(crate) type EngineSlot = Arc<RwLock<Option<Arc<SearchEngine>>>>;
 
-fn checkpoint_error_snapshot() -> Option<String> {
+pub(crate) fn checkpoint_error_snapshot() -> Option<String> {
     #[cfg(windows)]
     { crate::run::last_persistence_error() }
     #[cfg(not(windows))]
@@ -35,7 +35,7 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
             durable_prepare: false,
             runtime_error: engine.as_deref().and_then(crate::runtime_lifecycle::error_snapshot),
             last_checkpoint_error: checkpoint_error_snapshot(),
-            reason: "protocol2 terminal candidate requires native acceptance; protocol1 never authorizes service stop; installer integration remains incomplete".into(),
+            reason: "protocol1 never authorizes service stop; protocol2 requires authenticated elevated Windows transport and a live prepare actor".into(),
         },
         (IpcRequest::UpgradeCapabilities { .. }, _) => IpcResponse::Error {
             message: "unsupported durable-upgrade protocol version; refuse before service stop".into(),
@@ -410,9 +410,10 @@ mod usage_tests {
 mod upgrade_negotiation_tests {
     use super::*;
     #[test]
-    fn upgrade_capabilities_never_claim_unimplemented_receipt_even_during_load() {
+    fn protocol1_capability_and_unauthenticated_protocol2_never_authorize_stop() {
         let slot: EngineSlot = Arc::new(RwLock::new(None));
         assert!(matches!(process_request(&slot, IpcRequest::UpgradeCapabilities { protocol_version: 1 }), IpcResponse::UpgradeCapabilitiesResult { protocol_version: 1, durable_prepare: false, .. }));
+        assert!(matches!(process_request(&slot, IpcRequest::UpgradeCapabilities { protocol_version: 2 }), IpcResponse::Error { .. }));
         assert!(matches!(process_request(&slot, IpcRequest::UpgradeCapabilities { protocol_version: 252 }), IpcResponse::Error { .. }));
     }
 }

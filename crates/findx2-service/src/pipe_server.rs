@@ -160,7 +160,7 @@ async fn handle_client(
                 // process_request 里 engine.search() 是 CPU-bound 重活（最长可达 100ms+），
                 // 直接在 tokio worker 上跑会把 worker 池打满，新管道连接 connect 失败 →
                 // 用户看到 ERROR_PIPE_BUSY (231)。挪到 blocking pool 隔离。
-                let management=matches!(&req,IpcRequest::PrepareStop{..}|IpcRequest::CommitStop{..}|IpcRequest::CancelStop{..}|IpcRequest::CheckpointIdentity{..});
+                let management=requires_management_authorization(&req);
                 let authorized=if management {management_authorized(pipe_handle)}else{false};
                 let slot_cloned = slot.clone();
                 let req_kind = req_kind_label(&req);
@@ -270,4 +270,18 @@ fn management_authorized(handle:usize)->bool{
         let allowed=CreateWellKnownSid(26,std::ptr::null(),sid.as_mut_ptr().cast(),&mut size)!=0&&CheckTokenMembership(std::ptr::null_mut(),sid.as_ptr().cast(),&mut member)!=0&&member!=0;
         let reverted=RevertToSelf()!=0;allowed&&reverted
     }).join().unwrap_or(false)
+}
+
+// V2 negotiation is available only through the same elevated transport as prepare.
+fn requires_management_authorization(req:&IpcRequest)->bool {
+    matches!(req,IpcRequest::UpgradeCapabilities{protocol_version:2}|IpcRequest::PrepareStop{..}|IpcRequest::CommitStop{..}|IpcRequest::CancelStop{..}|IpcRequest::CheckpointIdentity{..})
+}
+#[cfg(test)] mod protocol2_capability_transport_tests {
+    use super::*;
+    #[test] fn protocol2_capability_requires_os_authentication_not_public_dispatch(){
+        assert!(requires_management_authorization(&IpcRequest::UpgradeCapabilities{protocol_version:2}));
+        for protocol_version in [1,0,252,u32::MAX] {
+            assert!(!requires_management_authorization(&IpcRequest::UpgradeCapabilities{protocol_version}));
+        }
+    }
 }

@@ -4,6 +4,7 @@ on:
     branches: [release/v2.5.3-engine-durability]
     paths:
       - 'crates/findx2-core/**'
+      - 'crates/findx2-windows/**'
       - 'Cargo.lock'
       - 'crates/findx2-service/**'
       - 'crates/findx2-ipc/**'
@@ -16,8 +17,14 @@ on:
       - 'scripts/test-installer-native.ps1'
       - 'scripts/stage-engine-release.ps1'
       - 'scripts/test-installer-runtime-contract.ps1'
+      - 'scripts/test-upgrade-capabilities.ps1'
       - 'installer/FindX.iss'
   workflow_dispatch:
+    inputs:
+      run_installer_matrix:
+        description: 'Explicit immutable-payload matrix; source/blob guards still apply. Not release approval.'
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
@@ -33,6 +40,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          git fetch origin b952f2734fe043fcb192d354f1502aee600bcf40 --depth=1
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          $focused=git diff --name-only b952f2734fe043fcb192d354f1502aee600bcf40 HEAD -- Cargo.lock Cargo.toml crates installer
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          $allowed=@('crates/findx2-service/src/ipc_dispatch.rs','crates/findx2-service/src/pipe_server.rs','crates/findx2-service/src/runtime_lifecycle.rs','crates/findx2-windows/src/mft_read.rs','installer/transaction-receipt.psm1')
+          if(@($focused).Count -eq $allowed.Count -and @($focused|Where-Object {$_ -notin $allowed}).Count -eq 0){
+            $proof=gh run view 44452691069 --repo chaojimct/findx --json conclusion,headSha|ConvertFrom-Json
+            if($LASTEXITCODE -or $proof.conclusion -ne 'success' -or $proof.headSha -cne 'b952f2734fe043fcb192d354f1502aee600bcf40'){throw 'Missing prior exact-payload targeted evidence'}
+            'focused=true' >> $env:GITHUB_OUTPUT
+            'changed=false' >> $env:GITHUB_OUTPUT
+            'Targeted capability/MFT identity tests only; prior native8 and same0a18 evidence remain prior-byte evidence, NOT final changed-payload acceptance.'
+            exit 0
+          }
           git fetch origin aedfa5ca8051704c1137522f67f94603893a3089 --depth=1
           if($LASTEXITCODE){exit $LASTEXITCODE}
           $changed=git diff --name-only aedfa5ca8051704c1137522f67f94603893a3089 HEAD -- Cargo.lock Cargo.toml crates
@@ -51,9 +71,20 @@ jobs:
             'Reuse unchanged ACK/IPC/service lifecycle evidence44446796510; any isolated root-path change receives targeted core tests, not a full-payload claim.'
           }
       - uses: dtolnay/rust-toolchain@stable
-        if: steps.engine-change.outputs.changed == 'true'
+        if: steps.engine-change.outputs.changed == 'true' || steps.engine-change.outputs.focused == 'true'
       - uses: Swatinem/rust-cache@v2
-        if: steps.engine-change.outputs.changed == 'true'
+        if: steps.engine-change.outputs.changed == 'true' || steps.engine-change.outputs.focused == 'true'
+      - name: Affected authenticated capability and full-FRN MFT identity regressions only
+        if: steps.engine-change.outputs.focused == 'true'
+        shell: pwsh
+        run: |
+          cargo test --locked -p findx2-service capabilit -- --test-threads=1 2>&1 | Tee-Object capability-tests.log
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          cargo test --locked -p findx2-windows mft_identity_tests -- --test-threads=1 2>&1 | Tee-Object mft-identity-tests.log
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+      - name: Production negotiation schema and refusal/ordering checks only
+        shell: powershell
+        run: ./scripts/test-upgrade-capabilities.ps1
       - name: Core authoritative admission and actual-writer checkpoint evidence (not runtime ACK)
         if: steps.engine-change.outputs.changed == 'true'
         shell: pwsh
@@ -103,7 +134,7 @@ jobs:
           $source = Get-Content crates/findx2-service/src/win_service.rs -Raw
           if ($source -match 'std::process::exit') { throw 'SCM must never force-exit its worker' }
           $dispatch = Get-Content crates/findx2-service/src/ipc_dispatch.rs -Raw
-          if ($dispatch -match 'durable_prepare:\s*true') { throw 'Receipt cannot be enabled before producer fencing' }
+          if ($dispatch -match 'durable_prepare:\s*true') { throw 'Public/unauthenticated dispatch must never advertise a stop capability' }
       - name: Archive bounded A1 test log, not release approval
         if: always()
         uses: actions/upload-artifact@v4
@@ -112,11 +143,15 @@ jobs:
           path: |
             core-checkpoint-fence-tests.log
             engine-lifecycle-tests.log
+            capability-tests.log
+            mft-identity-tests.log
             client-compile.log
             native-runtime-evidence/**
           retention-days: 30
 
   native-package:
+    # Old same0a18 is complete. Changed engine/helper needs ONE final converged payload, not a per-microfix rebuild.
+    if: github.event_name == 'workflow_dispatch' && inputs.run_installer_matrix == true
     needs: windows-lifecycle
     runs-on: windows-latest
     timeout-minutes: 55

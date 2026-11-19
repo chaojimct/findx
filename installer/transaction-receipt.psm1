@@ -27,6 +27,13 @@ function Invoke-FxTxManagement([string]$ServiceName,[string]$PipeName,[string]$I
   return $line|ConvertFrom-Json
  }finally{if($reader){$reader.Dispose()};$pipe.Dispose()}
 }
+function Assert-FxTxUpgradeCapabilities($Capabilities){
+ if($Capabilities.type -cne 'upgrade_capabilities_result' -or ($Capabilities.protocol_version -isnot [int] -and $Capabilities.protocol_version -isnot [long]) -or $Capabilities.protocol_version -ne 2 -or $Capabilities.durable_prepare -isnot [bool] -or -not $Capabilities.durable_prepare){throw 'No authenticated supported protocol2 capability; refused BEFORE STOP'}
+ if($null -ne $Capabilities.runtime_error){throw ('Runtime lifecycle unhealthy; refused BEFORE STOP: '+$Capabilities.runtime_error)}
+ if($Capabilities.reason -isnot [string] -or -not $Capabilities.reason -or ($null -ne $Capabilities.last_checkpoint_error -and $Capabilities.last_checkpoint_error -isnot [string])){throw 'Malformed protocol2 capability diagnostic'}
+ # last_checkpoint_error is historical diagnostic, not a successful-save claim.
+ # Retrying after actual IO repair MUST still perform a fresh prepare/commit.
+}
 function Assert-FxTxStopToken($Token,$Identity,[string]$Nonce,[string]$Index){
  $fields=@('protocol_version','engine_instance','service_pid','request_nonce','index_identity','mutation_sequence','published_generation','outcome_epoch')
  if(@($Token.PSObject.Properties.Name).Count -ne $fields.Count){throw 'Unexpected complete stop token schema'}
@@ -67,6 +74,9 @@ function Invoke-FxTxPreparedServiceStop([string]$ServiceName,[string]$PipeName,[
  # Safe CLI version probe exits in argument parsing, BEFORE any runtime/index load.
  $version=& $Image --version;if($LASTEXITCODE -ne 0 -or ($version -join ' ') -cne ('findx2-service '+$ExpectedVersion) -or $ExpectedVersion -ne '2.5.3'){throw 'Legacy running service has no verified protocol2; refused BEFORE STOP'}
  $call={param($Request) Invoke-FxTxManagement $ServiceName $PipeName $Image $Index $owner $Request ($TimeoutSeconds*1000+5000)}
+ $capabilities=& $call @{type='upgrade_capabilities';protocol_version=2}
+ Assert-FxTxUpgradeCapabilities $capabilities
+ $capabilities|ConvertTo-Json -Depth 10|Set-Content -Encoding UTF8 (Join-Path $Evidence 'installer-capabilities.json')
  $identity=& $call @{type='checkpoint_identity';protocol_version=2}
  if($identity.type -ne 'checkpoint_identity_result' -or $identity.protocol_version -ne 2 -or $identity.service_pid -ne $owner.pid -or $identity.engine_instance -notmatch '^[a-f0-9]{32}$' -or (Convert-FxTxIndexIdentity $identity.index_identity) -ine (Get-FxTxPath $Index)){throw 'Legacy running service has no exact protocol2 identity; refused BEFORE STOP'}
  $nonce=[guid]::NewGuid().ToString('N');$token=$null;$committed=$false
@@ -91,4 +101,4 @@ function Invoke-FxTxPreparedServiceStop([string]$ServiceName,[string]$PipeName,[
   throw
  }
 }
-Export-ModuleMember -Function Invoke-FxTxPreparedServiceStop,Invoke-FxTxManagement,Assert-FxTxReceiptService,Assert-FxTxStopToken,Assert-FxTxReceiptFile,Assert-FxTxOfflineGeneration
+Export-ModuleMember -Function Assert-FxTxUpgradeCapabilities,Invoke-FxTxPreparedServiceStop,Invoke-FxTxManagement,Assert-FxTxReceiptService,Assert-FxTxStopToken,Assert-FxTxReceiptFile,Assert-FxTxOfflineGeneration

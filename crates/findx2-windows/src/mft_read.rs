@@ -33,7 +33,7 @@ mod imp {
         ctime: u64,
     }
 
-    /// 直读 $MFT，返回 `(record_size, HashMap<record_number, (size, mtime, ctime)>)`。
+    /// 直读 $MFT，返回 `(record_size, HashMap<full_FRN, (size, mtime, ctime)>)`。
     ///
     /// 通过卷句柄顺序读取 MFT 原始数据。当 MFT 碎片化时只覆盖第一个 extent，
     /// 命中率取决于 MFT 碎片程度。调用方应通过 NtQueryDirectoryFile 补全未命中的文件。
@@ -158,12 +158,13 @@ mod imp {
                     let rec_num = (total_read + off as u64) / record_size as u64;
                     off += record_size;
 
+                    let Some(full_frn) = corroborated_mft_identity(rec, rec_num) else { continue; };
                     if let Some(meta) = parse_mft_record_for_meta(rec) {
                         records_parsed += 1;
                         batch_parsed += 1;
                         if meta.size > 0 || meta.mtime > 0 || meta.ctime > 0 {
                             records_in_use += 1;
-                            meta_map.insert(rec_num, (meta.size, meta.mtime, meta.ctime));
+                            meta_map.insert(full_frn, (meta.size, meta.mtime, meta.ctime));
                         }
                     }
                 }
@@ -306,8 +307,56 @@ mod imp {
         meta_map: &HashMap<u64, (u64, u64, u64)>,
         frn: u64,
     ) -> Option<(u64, u64, u64)> {
-        let rec_num = frn & 0x0000_FFFF_FFFF_FFFF;
-        meta_map.get(&rec_num).copied()
+        // A reused MFT slot is a different identity. Never borrow its metadata
+        // from an ordinal-only, old-sequence or unqualified record.
+        if frn >> 48 == 0 { return None; }
+        meta_map.get(&frn).copied()
+    }
+
+    // $MFT is read after namespace enumeration and may already contain a new
+    // incarnation at the same ordinal. Corroborate the record header before
+    // binding parsed metadata, then require the complete sequence-bearing FRN.
+    // A lower/different header is NOT evidence for this requested identity.
+    fn corroborated_mft_identity(record:&[u8], ordinal:u64)->Option<u64> {
+        if record.len()<48 || &record[..4]!=MFT_MAGIC_FILE || ordinal>0x0000_ffff_ffff_ffff {return None;}
+        let sequence=u16::from_le_bytes(record[16..18].try_into().ok()?);
+        let flags=u16::from_le_bytes(record[22..24].try_into().ok()?);
+        let header=u32::from_le_bytes(record[44..48].try_into().ok()?);
+        if sequence==0 || flags&1==0 || header!=ordinal as u32 {return None;}
+        Some((sequence as u64)<<48|ordinal)
+    }
+
+    #[cfg(test)] mod mft_identity_tests {
+        use super::*;
+        fn record(ordinal:u32,sequence:u16)->Vec<u8>{
+            let mut b=vec![0u8;1024];b[..4].copy_from_slice(b"FILE");b[16..18].copy_from_slice(&sequence.to_le_bytes());b[22..24].copy_from_slice(&1u16.to_le_bytes());b[44..48].copy_from_slice(&ordinal.to_le_bytes());b
+        }
+        #[test] fn reused_slot_does_not_backfill_a_previous_full_identity(){
+            let rec=record(42,7);let full=corroborated_mft_identity(&rec,42).unwrap();
+            let map=HashMap::from([(full,(999,888,777))]);
+            assert_eq!(lookup_meta(&map,(7u64<<48)|42),Some((999,888,777)));
+            assert_eq!(lookup_meta(&map,(6u64<<48)|42),None);
+            assert_eq!(lookup_meta(&map,42),None);
+        }
+        #[test] fn lower_or_wrong_record_header_is_not_corroboration(){
+            assert_eq!(corroborated_mft_identity(&record(41,7),42),None);
+            assert_eq!(corroborated_mft_identity(&record(43,7),42),None);
+        }
+        #[test] fn partial_inactive_bad_magic_and_zero_sequence_are_not_identity(){
+            let mut rec=record(42,7);assert_eq!(corroborated_mft_identity(&rec[..47],42),None);
+            rec[22]=0;assert_eq!(corroborated_mft_identity(&rec,42),None);
+            rec=record(42,0);assert_eq!(corroborated_mft_identity(&rec,42),None);
+            rec=record(42,7);rec[..4].copy_from_slice(b"BAAD");assert_eq!(corroborated_mft_identity(&rec,42),None);
+        }
+        #[test] fn high_ordinal_is_preserved_but_overflow_does_not_alias(){
+            let ordinal=(1u64<<32)|42;let full=corroborated_mft_identity(&record(42,7),ordinal).unwrap();
+            assert_eq!(full,(7u64<<48)|ordinal);
+            assert_eq!(corroborated_mft_identity(&record(42,7),(1u64<<48)|42),None);
+        }
+        #[test] fn uncorroborated_ordinal_is_not_a_full_frn_metadata_hit(){
+            let map=HashMap::from([(42,(999,888,777))]);
+            assert_eq!(lookup_meta(&map,(7u64<<48)|42),None,"lower-48 ordinal is not corroborated full NTFS identity");
+        }
     }
 
     fn normalize_volume_path(volume: &str) -> String {
