@@ -342,7 +342,7 @@ try{
   if($script:s.testBuild){foreach($link in $links){if(-not (Get-FxTxPath $link).StartsWith($allowed+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Test shortcut outside runner temp'}}}
   $script:s.platform=Get-FxTxPlatformSnapshot $UninstallKey $ServiceName $links $roots.app ($AddPath -eq 1);Save-State
   if($script:s.fault -eq 'backup'){throw 'Injected CI backup failure before any replacement'}
-  $map=[ordered]@{};foreach($prop in $script:s.roots.PSObject.Properties){$map[$prop.Name]=[string]$prop.Value}
+  $map=Get-FxTxUpgradeBackupRoots $script:s.roots
   # Reserve a second old-set copy for rollback, plus bounded candidate staging.
   $estimate=Get-FxTxInventory $map
   $null=New-FxTxVerifiedBackup $map (Join-Path $TransactionRoot 'backup') -CandidateBytes ([decimal]$estimate.bytes + 268435456) -AdministratorsOnly

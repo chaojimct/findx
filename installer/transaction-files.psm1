@@ -65,7 +65,7 @@ function Get-FxTxMetadata([string]$Path) {
     $item=Get-Item -LiteralPath $Path -Force
     # These cannot be reproduced by an ordinary byte-copy transaction. Refuse,
     # never silently strip encryption, sparse/compression semantics or named data.
-    if(($item.Attributes -band ([IO.FileAttributes]::Encrypted -bor [IO.FileAttributes]::Compressed -bor [IO.FileAttributes]::SparseFile -bor [IO.FileAttributes]::Offline)) -ne 0){throw 'Unsupported encrypted/compressed/sparse/offline object; unchanged'}
+    if(($item.Attributes -band ([IO.FileAttributes]::Encrypted -bor [IO.FileAttributes]::Compressed -bor [IO.FileAttributes]::SparseFile -bor [IO.FileAttributes]::Offline)) -ne 0){throw ('Unsupported encrypted/compressed/sparse/offline object: '+$Path+'; attributes='+$item.Attributes+' (0x'+([int]$item.Attributes).ToString('X')+'); unchanged')}
     [FxTxNativeStreams]::RequireUnnamedOnly($Path)
     $security=if($script:RequireAuditSecurity){Get-Acl -LiteralPath $Path -Audit}else{Get-Acl -LiteralPath $Path}
     return [ordered]@{sddl=$security.Sddl;attributes=[int]$item.Attributes;lastWriteUtcTicks=$item.LastWriteTimeUtc.Ticks;creationUtcTicks=$item.CreationTimeUtc.Ticks}
@@ -77,6 +77,30 @@ function Set-FxTxMetadata([string]$Path,$Metadata,[bool]$Directory) {
     if($Directory){[IO.Directory]::SetCreationTimeUtc($Path,[datetime]::new([long]$Metadata.creationUtcTicks,[DateTimeKind]::Utc));[IO.Directory]::SetLastWriteTimeUtc($Path,[datetime]::new([long]$Metadata.lastWriteUtcTicks,[DateTimeKind]::Utc))}
     else{[IO.File]::SetCreationTimeUtc($Path,[datetime]::new([long]$Metadata.creationUtcTicks,[DateTimeKind]::Utc));[IO.File]::SetLastWriteTimeUtc($Path,[datetime]::new([long]$Metadata.lastWriteUtcTicks,[DateTimeKind]::Utc))}
 }
+# Only these individual files are owned settings. Native production intentionally
+# shares FindX-native-dev with development indexes; never quarantine that directory.
+# prefs.rs/legacy_compat.rs read legacy sources but only write native prefs/settings.
+function Get-FxTxOwnedConfigLeaf([string]$Name) {
+    switch ($Name) {
+        nativePreferences { return 'prefs.json' }
+        nativeSettings { return 'settings.json' }
+        legacySettings { return 'findx2-gui-settings.json' }
+        default { return '' }
+    }
+}
+function Get-FxTxComponentKind($Component) {
+    if($Component -is [Collections.IDictionary]) { if($Component.Contains('kind')) { return [string]$Component['kind'] } }
+    elseif($Component.PSObject.Properties['kind']) { return [string]$Component.kind }
+    return 'directory' # Existing schema1 directory backups remain restorable.
+}
+function Get-FxTxUpgradeBackupRoots($Roots) {
+    return [ordered]@{
+        app=[string]$Roots.app; data=[string]$Roots.data
+        nativePreferences=(Join-Path $Roots.nativeConfig 'prefs.json')
+        nativeSettings=(Join-Path $Roots.nativeConfig 'settings.json')
+        legacySettings=(Join-Path $Roots.legacyConfig 'findx2-gui-settings.json')
+    }
+}
 function Get-FxTxInventory([System.Collections.IDictionary]$Roots) {
     $components = @(); $files = @(); $directories = @(); [decimal]$bytes = 0
     foreach ($name in @($Roots.Keys | Sort-Object)) {
@@ -84,6 +108,19 @@ function Get-FxTxInventory([System.Collections.IDictionary]$Roots) {
         $root = Get-FxTxPath $Roots[$name]
         foreach ($c in $components) {
             if ((Test-FxTxWithin $root $c.path) -or (Test-FxTxWithin $c.path $root)) { throw 'Overlapping component roots' }
+        }
+        $ownedLeaf=Get-FxTxOwnedConfigLeaf $name
+        if($ownedLeaf) {
+            if([IO.Path]::GetFileName($root) -cne $ownedLeaf -or [IO.Directory]::Exists($root)) { throw 'Owned configuration must be its exact file or absent' }
+            $exists=[IO.File]::Exists($root)
+            $metadata=if($exists){Get-FxTxMetadata $root}else{$null}
+            $components += [ordered]@{name=$name;path=$root;exists=$exists;metadata=$metadata;kind='file'}
+            if($exists) {
+                $item=Get-Item -LiteralPath $root -Force
+                $files += [ordered]@{component=$name;relative='content';length=$item.Length;sha256=(Get-FxTxFileHash $root);attributes=$metadata.attributes;lastWriteUtcTicks=$metadata.lastWriteUtcTicks;sddl=$metadata.sddl;creationUtcTicks=$metadata.creationUtcTicks}
+                $bytes += $item.Length
+            }
+            continue
         }
         if ([IO.File]::Exists($root)) { throw 'Component root must be a directory or absent' }
         $exists = [IO.Directory]::Exists($root)
@@ -99,8 +136,8 @@ function Get-FxTxInventory([System.Collections.IDictionary]$Roots) {
                 if($files.Count+$directories.Count -ge 100000){throw 'Inventory object bound exceeded'}
                 if ($item.PSIsContainer) { $directories += [ordered]@{ component = $name; relative = $relative; metadata=(Get-FxTxMetadata $item.FullName) }; $queue.Enqueue($item.FullName); continue }
                 if ($files.Count -ge 100000) { throw 'Inventory bound exceeded; no partial acceptance' }
-                $len = $item.Length; $hash = Get-FxTxFileHash $item.FullName
                 $metadata=Get-FxTxMetadata $item.FullName
+                $len = $item.Length; $hash = Get-FxTxFileHash $item.FullName
                 $files += [ordered]@{ component = $name; relative = $relative; length = $len; sha256 = $hash; attributes = [int]$item.Attributes; lastWriteUtcTicks = $item.LastWriteTimeUtc.Ticks; sddl = $metadata.sddl; creationUtcTicks=$metadata.creationUtcTicks }
                 $bytes += $len
             }
@@ -120,6 +157,14 @@ function Test-FxTxBackup([string]$BackupRoot, $Manifest) {
     $names = @{}
     foreach ($component in $Manifest.components) {
         if ($component.name -notmatch '^[A-Za-z][A-Za-z0-9_-]{0,39}$' -or $names.ContainsKey($component.name)) { throw 'Invalid or duplicate backup component' }
+        $kind=Get-FxTxComponentKind $component
+        if($kind -notin @('file','directory')) { throw 'Unknown backup component kind' }
+        if($kind -eq 'file') {
+            $leaf=Get-FxTxOwnedConfigLeaf $component.name
+            if(-not $leaf -or [IO.Path]::GetFileName($component.path) -cne $leaf) { throw 'Invalid owned configuration backup path' }
+            $owned=@($Manifest.files | Where-Object {$_.component -eq $component.name})
+            if($owned.Count -ne [int][bool]$component.exists -or @($owned | Where-Object {$_.relative -cne 'content'}).Count -or @($Manifest.directories | Where-Object {$_.component -eq $component.name}).Count) { throw 'Invalid owned configuration backup shape' }
+        }
         $names[$component.name] = $true
     }
     foreach ($component in $Manifest.components) {
@@ -167,7 +212,7 @@ function New-FxTxVerifiedBackup([System.Collections.IDictionary]$Roots, [string]
     foreach ($c in $inventory.components) { if ($c.exists) { $null = [IO.Directory]::CreateDirectory((Join-Path $backup $c.name)) } }
     foreach ($dir in $inventory.directories) { $null = [IO.Directory]::CreateDirectory((Join-Path $backup ($dir.component + '\' + $dir.relative))) }
     foreach ($file in $inventory.files) {
-        $source = Join-Path $Roots[$file.component] $file.relative
+        $source = $(if(Get-FxTxOwnedConfigLeaf $file.component){[string]$Roots[$file.component]}else{Join-Path $Roots[$file.component] $file.relative})
         $dest = Join-Path $backup ($file.component + '\' + $file.relative)
         $null = [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($dest))
         $input = [IO.File]::Open($source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
@@ -229,6 +274,40 @@ function Set-FxTxComponentMetadata($Record,$Component,[string]$Path) {
  foreach($d in @($Record.directories | Where-Object {$_.component -eq $Component.name})){[FxTxNativeStreams]::RestoreLegacyDacl((Join-Path $Path $d.relative),$d.metadata.sddl)}
  [FxTxNativeStreams]::RestoreLegacyDacl($Path,$Component.metadata.sddl)
 }
+function Restore-FxTxOwnedConfig($Record,$Component,[string]$BackupRoot,[string]$Evidence) {
+    $target=Get-FxTxPath $Component.path
+    if([IO.Directory]::Exists($target)) { throw ('Owned config target became a directory: '+$target) }
+    if([IO.File]::Exists($target)) { $null=Get-FxTxMetadata $target }
+    $quarantine=Join-Path $Evidence ($Component.name+'-replaced-file')
+    if(-not $Component.exists) {
+        # Only remove our exact newly created owned file, never its parent/siblings.
+        if([IO.File]::Exists($target)) {
+            if(Test-Path -LiteralPath $quarantine) { throw 'Concurrent owned config creation; retained unchanged' }
+            [IO.File]::Move($target,$quarantine)
+        }
+        Assert-FxTxRestoredComponent $Record $Component $target
+        return
+    }
+    if(-not [IO.Directory]::Exists([IO.Path]::GetDirectoryName($target))) { throw 'Settings parent unexpectedly missing; retained verified backup' }
+    $file=@($Record.files | Where-Object {$_.component -eq $Component.name})[0]
+    # A previous atomic replacement may already have published before interruption.
+    if(-not [IO.File]::Exists($target) -or (Get-FxTxFileHash $target) -cne $file.sha256) {
+        if(Test-Path -LiteralPath $quarantine) { throw 'Concurrent settings change after recovery; retained both versions' }
+        $stage=Join-Path $Evidence ('.staging-'+$Component.name)
+        if([IO.File]::Exists($stage)) {
+            if((Get-FxTxFileHash $stage) -cne $file.sha256) { throw 'Partial settings staging differs; retained' }
+        } else {
+            $source=Join-Path $BackupRoot ($Component.name+'\content')
+            $input=[IO.File]::Open($source,'Open','Read','Read')
+            try {$output=[IO.File]::Open($stage,'CreateNew','Write','None');try {$input.CopyTo($output);$output.Flush($true)} finally {$output.Dispose()}} finally {$input.Dispose()}
+        }
+        if([IO.File]::Exists($target)) { [IO.File]::Replace($stage,$target,$quarantine) }
+        else { [IO.File]::Move($stage,$target) }
+    }
+    Set-FxTxMetadata $target $Component.metadata $false
+    [FxTxNativeStreams]::RestoreLegacyDacl($target,$Component.metadata.sddl)
+    Assert-FxTxRestoredComponent $Record $Component $target
+}
 function Restore-FxTxVerifiedBackup([string]$BackupRoot,[string]$EvidenceRoot) {
  # A create-new, flushed per-component plan distinguishes our partial recovery from
  # unknown pre-existing data. Re-entry never re-quarantines a partly restored tree.
@@ -241,6 +320,7 @@ function Restore-FxTxVerifiedBackup([string]$BackupRoot,[string]$EvidenceRoot) {
   if($owned.schema -ne 1 -or $owned.backupHash -cne $digest -or $owned.backup -cne (Get-FxTxPath $BackupRoot)){throw 'Restore plan does not match verified backup'}
  }else{$null=[IO.Directory]::CreateDirectory($evidence);Write-FxTxNewJson $plan ([ordered]@{schema=1;backup=(Get-FxTxPath $BackupRoot);backupHash=$digest})}
  foreach($c in $record.components){
+  if((Get-FxTxComponentKind $c) -eq 'file') { Restore-FxTxOwnedConfig $record $c $BackupRoot $evidence;continue }
   $target=Get-FxTxPath $c.path;$quarantine=Join-Path $evidence $c.name;$stage=Join-Path $evidence ('.staging\'+$c.name);$marker=Join-Path $evidence ('.component-'+$c.name+'.json')
   if([IO.File]::Exists($marker)){$progress=Get-Content -LiteralPath $marker -Raw -Encoding UTF8 | ConvertFrom-Json;if($progress.backupHash -cne $digest){throw 'Component plan mismatch'}}
   else{$progress=[pscustomobject]@{backupHash=$digest;phase='quarantine_intent'};Write-FxTxNewJson $marker $progress}
@@ -276,4 +356,4 @@ function Restore-FxTxVerifiedBackup([string]$BackupRoot,[string]$EvidenceRoot) {
  if(-not [IO.File]::Exists($complete)){Write-FxTxNewJson $complete ([ordered]@{schema=1;restored=$true;backupHash=$digest})}
  return $true
 }
-Export-ModuleMember -Function Enable-FxTxFullSecurity,Write-FxTxUpdateJson,Get-FxTxMetadata,Set-FxTxMetadata,Write-FxTxNewJson,Restore-FxTxVerifiedBackup, Read-FxTxVerifiedBackup, Get-FxTxInventory,New-FxTxVerifiedBackup,Test-FxTxBackup,Get-FxTxFileHash,Get-FxTxPath,Assert-FxTxRelative
+Export-ModuleMember -Function Get-FxTxUpgradeBackupRoots,Enable-FxTxFullSecurity,Write-FxTxUpdateJson,Get-FxTxMetadata,Set-FxTxMetadata,Write-FxTxNewJson,Restore-FxTxVerifiedBackup, Read-FxTxVerifiedBackup, Get-FxTxInventory,New-FxTxVerifiedBackup,Test-FxTxBackup,Get-FxTxFileHash,Get-FxTxPath,Assert-FxTxRelative

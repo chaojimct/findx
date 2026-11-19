@@ -1,0 +1,85 @@
+name: Owned settings scope and real production installer regression
+on:
+  push:
+    branches: [fix/legacy252-installer-handoff]
+    paths: ['.github/workflows/installer-settings-scope.yml']
+permissions:
+  contents: read
+  actions: read
+jobs:
+  real-legacy:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: chaojimct/findx
+    steps:
+      - shell: powershell
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - name: Owned preference rollback, interruption reentry, sparse exclusion and strict required-file refusal
+        shell: powershell
+        run: ./scripts/test-installer-settings-scope.ps1
+      - name: Seed actual production native settings directory with unrelated sparse and unknown files
+        shell: powershell
+        run: ./scripts/test-installer-settings-scope.ps1 -Mode SeedFormal
+      - name: Fetch exact actual-user legacy GUI and sealed current runtime, no runtime builds
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$d=New-Item -ItemType Directory "$env:RUNNER_TEMP/legacy252"
+          Invoke-WebRequest -UseBasicParsing https://github.com/chaojimct/findx/releases/download/v2.5.2/FindX-2.5.2-setup.exe -OutFile "$d/old-setup.exe"
+          Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/jrathlev/InnoUnpacker-Windows-GUI/refs/heads/master/innounp-2/bin/innounp-2.zip -OutFile "$d/unpacker.zip"
+          if((Get-FileHash "$d/unpacker.zip").Hash -ine 'f8e45c9676bebc7d7570108ab572673b541fcf7a7d3d24a04319ac6b5315b4e8'){throw 'Extractor differs'}
+          Expand-Archive "$d/unpacker.zip" "$d/extractor"
+          & "$d/extractor/innounp.exe" -x -y ("-d"+"$d/old") "$d/old-setup.exe" > "$d/unpack.log"
+          if($LASTEXITCODE){throw 'Legacy read-only unpack failed'}
+          if((Get-FileHash "$d/old/{app}/FindX.exe").Hash -ine '392cea03063d4b1ac57e62d5edcba45291ffe36e16c49bad472298d2b51c9a02'){throw 'Published252 GUI does NOT match actual MZ old GUI; stop, no substituted fixture'}
+          $lock=Get-Content release/2.5.3-seal-lock.json -Raw|ConvertFrom-Json
+          gh run download $lock.testedRun --name $lock.payloadArtifact --dir "$d/new"
+          if($LASTEXITCODE){throw 'Payload fetch failed'}
+          $m=@(Get-ChildItem "$d/new" -Recurse -Filter stage-manifest.json);if($m.Count -ne 1){throw 'Payload ambiguous'}
+          $stage=$m[0].DirectoryName
+          foreach($f in $lock.files){if((Get-FileHash (Join-Path $stage $f.name)).Hash -ine $f.sha256){throw 'Sealed runtime changed'}}
+          $stage|Set-Content "$d/stage.txt"
+      - name: Compile only actual production installer with normal-close fix
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$d=Join-Path $env:RUNNER_TEMP 'legacy252';$stage=(Get-Content "$d/stage.txt" -Raw).Trim()
+          $iscc="${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe"
+          if(-not(Test-Path $iscc)){choco install innosetup -y --no-progress;if($LASTEXITCODE){throw 'No compiler'}}
+          & $iscc /DUpgradeGatesApproved=1 /DMyAppVersion=2.5.3 "/DPublishDir=$stage" "/O$d/output" installer/FindX.iss
+          if($LASTEXITCODE){throw 'Production compile failed'}
+      - name: Actual original252 GUI two real windows -> normal close -> formal upgrade, no fixture or mock
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$d=Join-Path $env:RUNNER_TEMP 'legacy252';$app="C:\FindXLegacy252-$env:GITHUB_RUN_ID"
+          if((Test-Path $app)-or(Get-Service FindX2Search -ErrorAction SilentlyContinue)){throw 'Runner not pristine'}
+          New-Item -ItemType Directory $app|Out-Null;Copy-Item "$d/old/{app}/FindX.exe" "$app/FindX.exe"
+          $env:FINDX_NATIVE_OPEN_ABOUT='1'
+          $gui=Start-Process "$app/FindX.exe" -ArgumentList @('--pipe',"findx-legacy-ci-$env:GITHUB_RUN_ID") -PassThru
+          $null=$gui.Handle
+          $until=[DateTime]::UtcNow.AddSeconds(25)
+          do{$gui.Refresh();if($gui.HasExited){throw 'Actual legacy GUI exited before test'};if($gui.MainWindowHandle -ne [IntPtr]::Zero){break};Start-Sleep -Milliseconds 200}while([DateTime]::UtcNow-lt$until)
+          if($gui.MainWindowHandle-eq[IntPtr]::Zero){throw 'Actual legacy GUI never rendered; no fake success'}
+          Remove-Item Env:FINDX_NATIVE_OPEN_ABOUT
+          $setup=Start-Process "$d/output/FindX-2.5.3-setup.exe" -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/TYPE=custom','/COMPONENTS=main,clicfg','/TASKS=',('/DIR="'+$app+'"'),('/LOG="'+$d+'/production.log"')) -PassThru
+          if(-not $setup.WaitForExit(90000)){throw 'Actual legacy upgrade did not complete; no force'}
+          $setup.Refresh()
+          if($setup.ExitCode-ne0){throw ('Formal upgrade failed '+$setup.ExitCode)}
+          if(-not $gui.WaitForExit(1000)-or$gui.ExitCode-ne0){throw 'Old GUI not proven normal exit0'}
+          if((Get-Item "$app/FindX.exe").VersionInfo.ProductVersion-ne'2.5.3'){throw 'New payload not installed'}
+          if(Get-Service FindX2Search -ErrorAction SilentlyContinue){throw 'Unselected service unexpectedly registered'}
+          @{legacyGuiSha256='392cea03063d4b1ac57e62d5edcba45291ffe36e16c49bad472298d2b51c9a02';oldGuiExit=$gui.ExitCode;installerExit=$setup.ExitCode;fixtureOnly=$false;mock=$false;runtimeRebuilt=$false;scope='Actual252 GUI lifecycle and direct formal installer only; NO proof of old UI synchronous UAC crash cause or running252 service ACK support'}|ConvertTo-Json|Set-Content "$d/result.json"
+      - name: Assert real formal installer left unrelated sparse files, native dev index, attributes and ACL unchanged
+        shell: powershell
+        run: ./scripts/test-installer-settings-scope.ps1 -Mode VerifyFormal
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: installer-settings-scope-production
+          path: |
+            ${{ runner.temp }}/legacy252/production.log
+            ${{ runner.temp }}/legacy252/result.json
+            ${{ runner.temp }}/legacy252/output/*.exe
+            ${{ runner.temp }}/settings-scope-result.json
+            ${{ runner.temp }}/formal-settings-result.txt

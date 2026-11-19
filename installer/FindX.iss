@@ -1,4 +1,4 @@
-; FindX native Windows Inno Setup (publication blocked until upgrade gates pass)
+﻿; FindX native Windows Inno Setup (publication blocked until upgrade gates pass)
 ; 构建: 1) 在仓库根/ gui 中完成 tauri build --no-bundle
 ;       2) powershell -File installer\stage-inno.ps1
 ;       3) iscc /DMyAppVersion=x.y.z installer\FindX.iss
@@ -281,6 +281,8 @@ begin
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  FailureText: AnsiString;
 begin
   Result := '';
   if TxStarted then begin Result := 'Upgrade transaction already attempted; see retained evidence.'; Exit; end;
@@ -304,7 +306,10 @@ begin
 #ifndef TxTestBuild
     { MsgBox, unlike SuppressibleMsgBox, remains visible with /SUPPRESSMSGBOXES.
       Every preparation refusal must be visible, not only legacy-service ACK refusal. }
-    if WizardSilent then MsgBox(Result + #13#10 + '请正常关闭旧版所有 FindX 窗口后重试。不会强制退出或停止无保存回执的旧服务。', mbError, MB_OK);
+    FailureText := '';
+    if LoadStringFromFile(TxRoot + '\failure.txt', FailureText) then
+      Result := Result + #13#10 + Copy(UTF8Decode(FailureText), 1, 4096);
+    if WizardSilent then MsgBox(Result, mbError, MB_OK);
 #endif
   end;
 end;
