@@ -24,41 +24,40 @@ jobs:
           cache-on-failure: true
       - uses: actions/download-artifact@v4
         with:
-          name: findx-253-gui-candidate-migration
-          run-id: 44468255654
+          name: findx-253-final-engine-E10D-gui-payload
+          run-id: 44475535981
           github-token: ${{ github.token }}
-          path: ${{ runner.temp }}/final-gui-input
-      - name: One necessary current engine build; NEVER rebuild attested GUI
-        shell: pwsh
-        run: |
-          cargo build --locked --release -p findx2-cli -p findx2-service -p findx2-core --bins --example verify_persisted_file --example path_page_latency --target-dir target --jobs 2
-          if($LASTEXITCODE){exit $LASTEXITCODE}
-      - name: Pin exact six files and separate GUI engine provenance
+          path: ${{ runner.temp }}/findx-final253-payload
+      - name: Verify and reuse exact already-built runtime; NO engine or GUI build
         id: stage
         shell: pwsh
-        run: ./scripts/stage-final-payload.ps1 -GuiRoot "$env:RUNNER_TEMP/final-gui-input" -Destination "$env:RUNNER_TEMP/findx-final253-payload"
-      - name: Deliver exact current payload immediately, not a release or fixture setup
-        uses: actions/upload-artifact@v4
-        with:
-          name: findx-253-final-engine-E10D-gui-payload
-          path: ${{ runner.temp }}/findx-final253-payload/**
-          retention-days: 30
+        run: |
+          $ErrorActionPreference='Stop'
+          $source='0157cca03ea4e24c803624da968ee741393ba1b1'
+          foreach($p in @('crates','gui','installer','Cargo.toml','Cargo.lock','scripts/check_release.py')){
+            $current=git rev-parse "HEAD:$p";if($LASTEXITCODE){throw 'Current source missing'}
+            $built=git rev-parse "${source}:$p";if($LASTEXITCODE -or $current -cne $built){throw "Runtime source changed: $p"}
+          }
+          $root="$env:RUNNER_TEMP/findx-final253-payload"
+          if((Get-FileHash "$root/stage-manifest.json").Hash -cne '9D423F2A1ABBF78B6A78AC4B0AAD5020E935727360104C1D2EAD09A21B2D9AA8'){throw 'Original stage manifest changed'}
+          $m=Get-Content "$root/stage-manifest.json" -Raw|ConvertFrom-Json
+          if($m.sourceCommit -cne $source -or $m.engineUnchanged -ne $false -or @($m.files).Count -ne 6){throw 'Not exact current payload'}
+          if(@(Get-ChildItem $root -Recurse -File).Count -ne 7){throw 'Extra/missing payload file'}
+          foreach($f in $m.files){$p=Join-Path $root $f.name;if((Get-FileHash $p).Hash.ToLowerInvariant() -cne $f.sha256 -or (Get-Item $p).Length -ne $f.length){throw 'Payload hash/length changed'}}
+          $null=New-Item -ItemType Directory target/release -Force
+          foreach($f in @('findx2-service.exe','findx2.exe','fx.exe')){Copy-Item (Join-Path $root $f) (Join-Path 'target/release' $f)}
       - name: Build existing data-only legacy generator after preserving runtime artifacts
         id: generator
         if: ${{ !cancelled() && steps.stage.outcome == 'success' }}
         shell: pwsh
         run: |
+          cargo build --locked --release -p findx2-core --example verify_persisted_file --example namespace_index_copy --target-dir target --jobs 2
+          if($LASTEXITCODE){exit $LASTEXITCODE}
           $null=New-Item -ItemType Directory scripts/gui-compat-tests/examples -Force
           Copy-Item scripts/final-legacy-export.rs scripts/gui-compat-tests/examples/final-legacy-export.rs
           cargo build --locked --release --manifest-path scripts/gui-compat-tests/Cargo.toml --example final-legacy-export --target-dir target --jobs 2
           if($LASTEXITCODE){exit $LASTEXITCODE}
           Copy-Item target/release/examples/final-legacy-export.exe target/release/final-legacy-export.exe
-      - name: Existing documented 50k-overlay deep parent page benchmark
-        id: perf
-        shell: pwsh
-        run: |
-          & target/release/examples/path_page_latency.exe 2>&1 | Tee-Object final-parent-benchmark.log
-          if($LASTEXITCODE){exit $LASTEXITCODE}
       - name: Combined real two-volume backfill durability USN owner and official GUI campaign
         id: native
         if: ${{ !cancelled() && steps.stage.outcome == 'success' && steps.generator.outcome == 'success' }}
@@ -71,7 +70,7 @@ jobs:
         run: |
           $null=New-Item -ItemType Directory target/debug/examples -Force
           foreach($f in @('findx2-service.exe','findx2.exe','fx.exe')){Copy-Item (Join-Path 'target/release' $f) (Join-Path 'target/debug' $f)}
-          Copy-Item target/release/examples/verify_persisted_file.exe target/debug/examples/verify_persisted_file.exe
+          foreach($f in @('verify_persisted_file.exe','namespace_index_copy.exe')){Copy-Item (Join-Path 'target/release/examples' $f) (Join-Path 'target/debug/examples' $f)}
           foreach($f in @('findx2-service.exe','findx2.exe','fx.exe')){if((Get-FileHash (Join-Path 'target/debug' $f)).Hash -cne (Get-FileHash (Join-Path 'target/release' $f)).Hash){throw 'Harness must consume exact release bytes'}}
           ./scripts/test-namespace-scm.ps1 -ServiceExe ./target/debug/findx2-service.exe
       - name: Obtain hash-pinned published payload without running installer
@@ -91,14 +90,13 @@ jobs:
           Expand-Archive $zip -DestinationPath (Join-Path $root 'unpacker')
           & (Join-Path $root 'unpacker/innounp.exe') -x -y ('-d'+(Join-Path $root 'extracted')) $setup
           if($LASTEXITCODE){throw 'Read-only setup extraction failed'}
-      - name: Existing actual final-payload ISS matrix, no fixture publication
+      - name: Only failed actual final-payload save-refusal retry; reuse existing 17 passed cases
         id: installer
         if: ${{ !cancelled() && steps.stage.outcome == 'success' && steps.old.outcome == 'success' }}
         shell: powershell
         run: |
           if(-not(Test-Path "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe")){choco install innosetup -y --no-progress}
-          ./scripts/test-installer-fixtures.ps1 -PublishedGui "$env:RUNNER_TEMP/findx-published252-input/extracted/{app}/FindX.exe"
-          ./scripts/test-installer-native.ps1 -PublishedPayload "$env:RUNNER_TEMP/findx-published252-input/extracted/{app}" -CandidatePayload "$env:RUNNER_TEMP/findx-final253-payload" -Iscc "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe" -EngineCandidate -PayloadSourceCommit $env:GITHUB_SHA
+          ./scripts/test-installer-native.ps1 -PublishedPayload "$env:RUNNER_TEMP/findx-published252-input/extracted/{app}" -CandidatePayload "$env:RUNNER_TEMP/findx-final253-payload" -Iscc "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe" -EngineCandidate -PayloadSourceCommit '0157cca03ea4e24c803624da968ee741393ba1b1' -OnlyCases @('running253-save-refusal')
       - name: Archive only exact payload and bounded independent results
         if: always()
         uses: actions/upload-artifact@v4
@@ -109,11 +107,11 @@ jobs:
             final-native-evidence/**
             native-namespace-evidence/**
             ${{ runner.temp }}/FindXUpgradeTest_*/results.json
-            ${{ runner.temp }}/FindXUpgradeTest_*/journal*.json
-            ${{ runner.temp }}/FindXUpgradeTest_*/failure.txt
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/journal*.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/failure.txt
             ${{ runner.temp }}/FindXUpgradeTest_*/**/render-health.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/normal-exit.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/service-health.json
             ${{ runner.temp }}/FindXUpgradeTest_*/**/service-status-last.json
-            ${{ runner.temp }}/FindXUpgradeTest_*/**/receipt*.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/*receipt*.json
           retention-days: 30

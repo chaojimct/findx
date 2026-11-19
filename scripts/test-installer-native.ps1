@@ -240,6 +240,7 @@ foreach($case in $cases){
     $retryTx=Join-Path $root 'tx-save-retry';$retryArgs=$args.Replace(('/TXROOT="'+$tx+'"'),('/TXROOT="'+$retryTx+'"'))
     $savedRetry=Start-Process -FilePath $setup -ArgumentList $retryArgs -PassThru -Wait
     $rj=Journal $retryTx
+    Write-Host ('SAVE_RETRY_ACTUAL_EXIT='+$savedRetry.ExitCode+' JOURNAL='+($rj|ConvertTo-Json -Compress -Depth 20))
     Assert ($savedRetry.ExitCode -eq 0 -and $rj.state -eq 'committed' -and $rj.backupVerified -and $rj.terminalHandoff.stage -eq 'stopped' -and $rj.terminalHandoff.offlineBeforeReplay) 'Real installer retry after OS write repair never completed durable handoff/backup/commit'
     AssertGuiHealth $retryTx;AssertIpcHealth $retryTx
    }else{
