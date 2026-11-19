@@ -104,11 +104,13 @@ function Stop-ExactService {
 }
 function Restore-OriginalRuntime {
  $v=Get-ExactService
+ if($script:s.original.serviceExists -and -not $v){throw 'Original service registration missing; runtime recovery not confirmed'}
  if($script:s.PSObject.Properties.Name -contains 'terminalHandoff' -and $script:s.terminalHandoff -and $script:s.terminalHandoff.stage -notin @('stopped','cancelled')){throw 'Terminal handoff remains uncertain/committed and sealed; RAM retained, runtime restoration NOT claimed'}
  if($script:s.original.serviceRunning -and $v -and $v.State -eq 'Stopped'){
   Start-Service -Name $script:s.serviceName
   $controller=[ServiceProcess.ServiceController]::new($script:s.serviceName)
   try{$controller.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running,[TimeSpan]::FromSeconds($script:s.timeoutSeconds))}finally{$controller.Dispose()}
+  Wait-NewServiceReady
  }
  $v=Get-ExactService
  if($script:s.original.serviceRunning -and $v -and $v.State -ne 'Running'){throw 'Original service is still transitioning; runtime recovery not confirmed'}
@@ -210,6 +212,16 @@ function Wait-NewServiceReady {
 function Invoke-Rollback {
  if($script:s.state -eq 'committed' -or $script:s.state -eq 'rolled_back'){return}
  if($script:s.backupVerified){
+  # An existing originally-running service may now be the candidate writer.
+  # Obtain its own fresh receipt before restoring ANY old files; never overwrite
+  # a running writer or reuse the old instance's pre-upgrade receipt.
+  if($script:s.PSObject.Properties.Name -contains 'candidateServiceStarted' -and $script:s.candidateServiceStarted){
+   $candidate=Get-ExactService
+   if($candidate -and $candidate.State -ne 'Stopped'){
+    $proof=Join-Path $TransactionRoot 'candidate-rollback-stop';$null=[IO.Directory]::CreateDirectory($proof)
+    $null=Invoke-FxTxPreparedServiceStop -ServiceName $script:s.serviceName -PipeName $script:s.pipeName -Image (Join-Path $script:s.roots.app 'findx2-service.exe') -Index (Join-Path $script:s.roots.data 'index.bin') -Cli (Join-Path $script:s.roots.app 'findx2.exe') -ExpectedVersion $script:s.expectedVersion -Evidence $proof -TimeoutSeconds $script:s.timeoutSeconds -OnState {param($Handoff) $script:s.terminalHandoff=$Handoff;Save-State}
+   }
+  }
   # Each installer phase is a NEW PS process. Audit-aware verification must be
   # re-enabled during rollback/recovery, not just during initial backup.
   Enable-FxTxFullSecurity
@@ -248,7 +260,7 @@ try{
   if(Test-Path -LiteralPath (Join-Path $TransactionRoot 'journal.json')){throw 'Unfinished/existing transaction requires recovery, not overwrite'}
   if(Test-Path -LiteralPath $TransactionRoot){throw 'Transaction root must be new; prior evidence retained'}
   Set-FxTxPrivateDirectory $TransactionRoot
-  $script:s=[pscustomobject]@{schema=2;installerOwner=$null;state='created';roots=[pscustomobject]$roots;serviceName=$ServiceName;pipeName=$PipeName;expectedVersion=$ExpectedVersion;installService=($InstallService -eq 1);timeoutSeconds=$TimeoutSeconds;testVolume='C:';ownedTestVolume=$false;testBuild=[bool]$TestBuild;fault=$Fault;platform=$null;backupVerified=$false;createdService=$false;terminalHandoff=$null;original=[pscustomobject]@{serviceExists=$false;serviceRunning=$false;guiRunning=$false;guiStopped=$false;guiExitRequested=$false;serviceCommand='';serviceStartMode=''};error=''}
+  $script:s=[pscustomobject]@{schema=2;installerOwner=$null;state='created';roots=[pscustomobject]$roots;serviceName=$ServiceName;pipeName=$PipeName;expectedVersion=$ExpectedVersion;installService=($InstallService -eq 1);timeoutSeconds=$TimeoutSeconds;testVolume='C:';ownedTestVolume=$false;testBuild=[bool]$TestBuild;fault=$Fault;platform=$null;backupVerified=$false;createdService=$false;candidateServiceStarted=$false;terminalHandoff=$null;original=[pscustomobject]@{serviceExists=$false;serviceRunning=$false;guiRunning=$false;guiStopped=$false;guiExitRequested=$false;serviceCommand='';serviceStartMode=''};error=''}
   $script:lock=[IO.File]::Open((Join-Path $TransactionRoot 'phase.lock'),'OpenOrCreate','ReadWrite','None')
   if($TestVolumeImage){
    if(-not $TestBuild){throw 'Test volume is forbidden in production'}
@@ -330,6 +342,13 @@ try{
      # initiate a full-volume scan. Explicitly registered but NOT initialized/running.
      [IO.File]::WriteAllText((Join-Path $TransactionRoot 'service-uninitialized.flag'),'RegisteredStopped: no index; initialize explicitly in FindX settings')
     }
+   }
+   if($script:s.original.serviceExists -and $script:s.original.serviceRunning){
+    $existing=Get-ExactService
+    if(-not $existing -or $existing.State -ne 'Stopped'){throw 'Original running-service handoff changed before candidate start'}
+    $script:s.candidateServiceStarted=$true;Save-State
+    Start-Service -Name $script:s.serviceName
+    Wait-NewServiceReady
    }
    Verify-GuiHealth
    if($script:s.fault -eq 'health'){if($script:s.testBuild){[IO.File]::WriteAllText((Join-Path $script:s.roots.data 'index.bin'),'deliberately damaged CI fixture only')};throw 'Injected CI post-copy health failure'}
