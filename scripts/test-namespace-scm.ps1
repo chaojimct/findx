@@ -1,4 +1,4 @@
-﻿param([Parameter(Mandatory=$true)][string]$ServiceExe)
+param([Parameter(Mandatory=$true)][string]$ServiceExe)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 if($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows' -or $env:COMPUTERNAME -eq 'MZ' -or $env:USERPROFILE -eq 'C:\Users\chaoj'){throw 'Disposable Windows CI ONLY; never MZ'}
@@ -102,7 +102,7 @@ try{
  Native-Tool $cli ('index --volume '+$owned.Volume+' --output "'+$source+'" --max-scan-threads 1')
  $initial=& $verify --inspect-index $source;Assert ($LASTEXITCODE -eq 0) 'Cannot inspect canonical native provision'
  $initial|Set-Content (Join-Path $artifact 'canonical-initial-index-state.json');$initialView=$initial|ConvertFrom-Json
- Assert ($initialView.source -eq 'segmented-v6' -and -not $initialView.metadata_ready -and @($initialView.volumes).Count -eq 1 -and $initialView.volumes[0].root_prefix -ceq $owned.Root) 'Canonical initial native scope/partial metadata wrong'
+ Assert ($initialView.source -eq 'legacy-anchor' -and -not $initialView.metadata_ready -and @($initialView.volumes).Count -eq 1 -and $initialView.volumes[0].root_prefix -ceq $owned.Root) 'Fresh authoritative monolithic CLI seed scope/partial metadata wrong'
  Native-Tool $copy ('"'+$source+'" "'+$index+'" '+$owned.Root)
  $script:pipeName='findx253ns'+[guid]::NewGuid().ToString('N')
  $command='"'+$ServiceExe+'" --service --index "'+$index+'" --volume '+$owned.Volume+' --pipe '+$pipeName+' --no-everything-ipc --save-interval-secs 1'

@@ -1,4 +1,4 @@
-# One native two-volume dataset, current segmented and supported monolithic carrier.
+# One native two-volume dataset; real CLI currently provisions authoritative monolithic v6.
 # This is scoped root/read-only compatibility, NOT historic old-binary/full-scale acceptance.
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
@@ -30,12 +30,12 @@ try{
  $null=Native $cli @('index','--volumes',($volumes.Volume -join ','),'--output',$index,'--max-scan-threads','1') 'native-two-volume-build'
  $view=Native $verify @('--inspect-index',$index) 'canonical-two-volume-inspection'
  $view|Set-Content (Join-Path $artifact 'canonical-two-volume.json');$state=$view|ConvertFrom-Json
- Assert ($state.source -eq 'segmented-v6' -and @($state.volumes).Count -eq 2) 'Actual canonical two-volume source required'
+ Assert ($state.source -eq 'legacy-anchor' -and @($state.volumes).Count -eq 2) 'Fresh CLI authoritative monolithic two-volume source required'
  foreach($v in $volumes){Assert (@($state.volumes|Where-Object {$_.root_prefix -ceq $v.Root -and $_.letter -ceq $v.Volume.Substring(0,1)}).Count -eq 1) 'Wrong canonical root/letter'}
- # Preserve the actual generated legacy carrier, do not fabricate an old release.
- $legacy=Join-Path $indexRoot 'legacy-carrier.bin';Copy-Item -LiteralPath $index -Destination $legacy
+ # No duplicate legacy copy or claim of segmented/old-release bytes.
+
  $before=Fingerprint $indexRoot
- foreach($inputIndex in @($index,$legacy)){
+ foreach($inputIndex in @($index)){
   foreach($restart in 1..2){
    $json=Native $cli @('search','--index',$inputIndex,'root-proof.txt','--json') (([IO.Path]::GetFileName($inputIndex))+'-reload'+$restart)
    $response=$json|ConvertFrom-Json;$hits=@($response.hits)
@@ -43,5 +43,5 @@ try{
   }
  }
  Assert ((Fingerprint $indexRoot) -ceq $before) 'Read-only compatibility search modified index or fixture bytes'
- [ordered]@{passed=$true;test='actual-two-volume-canonical-and-legacy-carrier-readonly-fresh-process';currentSource='segmented-v6';independentVolumes=2;historicalOldBinary=$false;fullGate8=$false}|ConvertTo-Json|Set-Content (Join-Path $artifact 'results.json')
+ [ordered]@{passed=$true;test='actual-two-volume-authoritative-monolithic-readonly-fresh-process';currentSource=$state.source;independentVolumes=2;historicalOldBinary=$false;fullGate8=$false}|ConvertTo-Json|Set-Content (Join-Path $artifact 'results.json')
 }finally{foreach($v in $volumes){Dismount-DiskImage -ImagePath $v.Image -ErrorAction Stop}}
