@@ -1,0 +1,81 @@
+name: Production Inno startup regression (sealed runtime, no rebuild)
+on:
+  push:
+    branches: [release/v2.5.3-engine-durability]
+    paths: ['.github/workflows/inno-startup.yml']
+permissions:
+  contents: read
+  actions: read
+jobs:
+  production-startup:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: chaojimct/findx
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reproduce exact public setup failure, actual production silent path
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $d=New-Item -ItemType Directory "$env:RUNNER_TEMP/inno-startup"
+          $url='https://github.com/chaojimct/findx/releases/download/v2.5.3'
+          Invoke-WebRequest -UseBasicParsing "$url/FindX-2.5.3-setup.exe" -OutFile "$d/original.exe"
+          if((Get-FileHash "$d/original.exe").Hash -ine '9f6663cd13e13d711f98564a2d3e69c218296023162d0abab4a4af62fd17010e'){throw 'Original setup bytes differ'}
+          if(Get-Service FindX2Search -ErrorAction SilentlyContinue){throw 'Runner not pristine'}
+          $p=Start-Process "$d/original.exe" -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',('/DIR="'+$d+'/original-app"'),('/LOG="'+$d+'/original.log"')) -PassThru
+          if(-not $p.WaitForExit(60000)){throw 'Original setup hung; no forced termination'}
+          $p.Refresh();$log=Get-Content "$d/original.log" -Raw
+          if($p.ExitCode -eq 0 -or $log -notmatch 'Runtime error \(at 28:324\)' -or $log -notmatch 'Type Mismatch'){throw 'Exact production failure not reproduced'}
+          Write-Host 'PROVEN original published setup => Runtime error at 28:324 Type Mismatch'
+      - name: Fetch and strictly reuse exact sealed runtime; compile single-expression installer fix only
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $d=Join-Path $env:RUNNER_TEMP 'inno-startup'
+          $old=(git show v2.5.3:installer/FindX.iss) -join "`n"
+          $new=[IO.File]::ReadAllText("$env:GITHUB_WORKSPACE/installer/FindX.iss").Replace("`r`n","`n").TrimEnd("`n")
+          $expected=$old.Replace("GetDateTimeString('yyyymmddhhnnsszzz', '', '')","GetDateTimeString('yyyymmddhhnnsszzz', #0, #0)")
+          if($old -ceq $expected -or $new -cne $expected){throw 'Installer source delta is not exactly the Char argument fix'}
+          Invoke-WebRequest -UseBasicParsing 'https://github.com/chaojimct/findx/releases/download/v2.5.3/seal.json' -OutFile "$d/seal.json"
+          if((Get-FileHash "$d/seal.json").Hash -ine 'e32eeb0979be0d2fe67325e1eff720409660d184c861d0e1e83bf704529b0a2c'){throw 'Public seal changed'}
+          $seal=Get-Content "$d/seal.json" -Raw|ConvertFrom-Json
+          if(-not $seal.officialApproval -or $seal.fixtureOnly){throw 'Prior runtime acceptance absent'}
+          $lock=Get-Content release/2.5.3-seal-lock.json -Raw|ConvertFrom-Json
+          gh run download $lock.testedRun --name $lock.payloadArtifact --dir "$d/payload-download"
+          if($LASTEXITCODE){throw 'Sealed runtime fetch failed'}
+          $manifest=@(Get-ChildItem "$d/payload-download" -Recurse -Filter stage-manifest.json)
+          if($manifest.Count -ne 1){throw 'Ambiguous sealed payload'}
+          $stage=$manifest[0].DirectoryName
+          foreach($f in $seal.files|Where-Object{$_.name.StartsWith('payload\')}){
+            $file=Join-Path $stage $f.name.Substring(8)
+            if((Get-FileHash -LiteralPath $file).Hash -ine $f.sha256 -or (Get-Item -LiteralPath $file).Length -ne $f.length){throw ('Sealed file differs: '+$f.name)}
+          }
+          $iscc="${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe"
+          if(-not(Test-Path $iscc)){choco install innosetup -y --no-progress;if($LASTEXITCODE){throw 'Compiler unavailable'}}
+          & $iscc /DUpgradeGatesApproved=1 /DMyAppVersion=2.5.3 "/DPublishDir=$stage" "/O$d/fixed" installer/FindX.iss
+          if($LASTEXITCODE){throw 'Production setup-only compile failed'}
+      - name: Fixed actual production silent install (no TxTestBuild), unchanged runtime
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $d=Join-Path $env:RUNNER_TEMP 'inno-startup'
+          $setup=Join-Path $d 'fixed/FindX-2.5.3-setup.exe'
+          $p=Start-Process $setup -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/TYPE=custom','/COMPONENTS=main,clicfg','/TASKS=',('/DIR="'+$d+'/fixed-app"'),('/LOG="'+$d+'/fixed.log"')) -PassThru
+          if(-not $p.WaitForExit(120000)){throw 'Fixed setup timeout; no forced termination'}
+          $p.Refresh();$log=Get-Content "$d/fixed.log" -Raw
+          if($p.ExitCode -ne 0 -or $log -match 'Type Mismatch|Runtime error|Safe upgrade preparation failed'){throw ('Fixed production startup/install failed: '+$p.ExitCode)}
+          if(-not(Test-Path "$d/fixed-app/FindX.exe")){throw 'Did not actually install sealed payload'}
+          if(Get-Service FindX2Search -ErrorAction SilentlyContinue){throw 'Excluded service unexpectedly registered'}
+          @{originalSha256='9f6663cd13e13d711f98564a2d3e69c218296023162d0abab4a4af62fd17010e';rootCause='PrepareToInstall production GetDateTimeString receives empty strings for Char parameters';onlySourceDelta="GetDateTimeString('yyyymmddhhnnsszzz', #0, #0)";runtimeRebuilt=$false;fixtureOnly=$false;fixedExit=$p.ExitCode;fixedSetupSha256=(Get-FileHash $setup).Hash.ToLowerInvariant();publishable=$false;reason='Diagnostic 2.5.3 candidate only; never overwrite published assets'}|ConvertTo-Json|Set-Content "$d/result.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-inno-startup-regression
+          path: |
+            ${{ runner.temp }}/inno-startup/*.log
+            ${{ runner.temp }}/inno-startup/result.json
+            ${{ runner.temp }}/inno-startup/fixed/*.exe

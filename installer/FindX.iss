@@ -288,7 +288,7 @@ begin
   if GetEnv('GITHUB_ACTIONS') <> 'true' then begin Result := 'Test build runs only on the isolated CI runner.'; Exit; end;
   TxRoot := ExpandConstant('{param:TXROOT|}');
 #else
-  TxRoot := ExpandConstant('{commonappdata}\FindX-upgrades\') + GetDateTimeString('yyyymmddhhnnsszzz', '', '') ;
+  TxRoot := ExpandConstant('{commonappdata}\FindX-upgrades\') + GetDateTimeString('yyyymmddhhnnsszzz', #0, #0) ;
 #endif
   ExtractTemporaryFile('transaction-files.psm1');
   ExtractTemporaryFile('transaction-platform.psm1');
