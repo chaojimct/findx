@@ -1346,6 +1346,36 @@ fn persist_index_with_inner(
             return Ok(false);
         }
     };
+    persist_index_locked(engine, path, writer)
+}
+
+/// The metadata finalizer keeps its producer permit while the existing writer
+/// finishes. This is a mutex wait, not success-on-busy or a polling timeout.
+/// false means obsolete epoch, NEVER a durability receipt for that epoch.
+pub(crate) fn persist_metadata_final(engine: &SearchEngine, path: &Path, epoch: Option<u64>) -> anyhow::Result<bool> {
+    persist_metadata_final_with(engine, path, epoch, |layout, batch| {
+        v6_try_commit(layout, batch).map_err(|e| anyhow::anyhow!("{e:#}"))
+    })
+}
+fn persist_metadata_final_with(
+    engine: &SearchEngine, path: &Path, epoch: Option<u64>,
+    writer: impl FnOnce(&V6Layout, &findx2_core::CommitBatch) -> anyhow::Result<CommitOutcome>,
+) -> anyhow::Result<bool> {
+    // No producer is joined and no admission lock is held while waiting. The
+    // caller already owns an active finalizer, so STOP must drain it, not free RAM.
+    let _guard = persist_lock().lock().unwrap_or_else(|e| e.into_inner());
+    if epoch.is_some_and(|e| engine.metadata_epoch() != e) { return Ok(false); }
+    anyhow::ensure!(engine.metadata_ready(), "metadata coverage changed before final commit");
+    persist_index_locked(engine, path, writer)?;
+    // An epoch replacement during real IO cannot complete the old finalizer.
+    if epoch.is_some_and(|e| engine.metadata_epoch() != e) { return Ok(false); }
+    anyhow::ensure!(engine.metadata_ready(), "metadata coverage changed during final commit");
+    Ok(true)
+}
+fn persist_index_locked(
+    engine: &SearchEngine, path: &Path,
+    writer: impl FnOnce(&V6Layout, &findx2_core::CommitBatch) -> anyhow::Result<CommitOutcome>,
+) -> anyhow::Result<bool> {
     let Some(batch) = engine.take_persistence_batch() else { return Ok(true); };
     let mut pending = UnacknowledgedBatch { engine, batch: Some(batch) };
     let batch = pending.batch.as_ref().unwrap();
@@ -1555,6 +1585,70 @@ mod tests {
         engine.enable_usage(16*1024*1024).unwrap();
         (path,engine)
     }
+    fn metadata_finalizer_fixture(label: &str) -> (std::path::PathBuf, std::sync::Arc<findx2_core::SearchEngine>, crate::runtime_lifecycle::Owner) {
+        let (path,e)=checkpoint_fixture(label);
+        let owner=crate::runtime_lifecycle::Owner::attach(e.clone(),path.clone(),std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))).unwrap();
+        checkpoint_patch(&e,456);
+        assert!(e.complete_metadata_if_covered(e.metadata_epoch()).unwrap());
+        (path,e,owner)
+    }
+    #[test]
+    fn metadata_finalizer_real_writer_contention_retains_owner_then_commits() {
+        use std::{sync::mpsc,thread,time::Duration};
+        let (path,e,owner)=metadata_finalizer_fixture("finalizer-busy");
+        let (entered,seen)=mpsc::channel();let (release,go)=mpsc::channel();
+        let w=e.clone();let p=path.clone();
+        let writer=thread::spawn(move||super::persist_index_with(&w,&p,|layout,batch|{
+            entered.send(()).unwrap();go.recv_timeout(Duration::from_secs(5)).unwrap();
+            findx2_core::v6_try_commit(layout,batch).map_err(|e|anyhow::anyhow!("{e:#}"))
+        }));
+        seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        let permit=crate::runtime_lifecycle::reserve(&e,"metadata-finalizer").unwrap().unwrap().require_result();
+        let (done,result)=mpsc::channel();let f=e.clone();let p=path.clone();let epoch=e.metadata_epoch();
+        let finalizer=thread::spawn(move||{let activity=permit.activate();done.send(activity.finish_persistence(super::persist_metadata_final(&f,&p,Some(epoch)))).unwrap();});
+        assert!(result.recv_timeout(Duration::from_millis(40)).is_err());
+        assert!(owner.retained_errors().is_empty());
+        release.send(()).unwrap();assert!(writer.join().unwrap().unwrap());
+        assert!(result.recv_timeout(Duration::from_secs(5)).unwrap().unwrap());finalizer.join().unwrap();
+        assert!(owner.retained_errors().is_empty());
+        let disk=findx2_core::v6_load(&findx2_core::V6Layout::for_index(&path)).unwrap();assert!(disk.metadata_ready);
+        assert_eq!(disk.entries[disk.entry_on_volume(b'C',1).unwrap() as usize].size,456);
+        drop(owner);std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn metadata_finalizer_epoch_replaced_while_waiting_or_during_io_cannot_complete() {
+        use std::{sync::mpsc,thread,time::Duration};
+        let (path,e,owner)=metadata_finalizer_fixture("finalizer-epoch");let epoch=e.metadata_epoch();
+        let guard=super::persist_lock().lock().unwrap_or_else(|e|e.into_inner());
+        let f=e.clone();let p=path.clone();let (started,begin)=mpsc::channel();
+        let job=thread::spawn(move||{started.send(()).unwrap();super::persist_metadata_final_with(&f,&p,Some(epoch),|_,_|panic!("obsolete writer must not run"))});
+        begin.recv_timeout(Duration::from_secs(5)).unwrap();e.enable_usage(16*1024*1024).unwrap();drop(guard);
+        assert!(!job.join().unwrap().unwrap());
+        checkpoint_patch(&e,789);assert!(e.complete_metadata_if_covered(e.metadata_epoch()).unwrap());let epoch=e.metadata_epoch();
+        assert!(!super::persist_metadata_final_with(&e,&path,Some(epoch),|layout,batch|{
+            let outcome=findx2_core::v6_try_commit(layout,batch).map_err(|e|anyhow::anyhow!("{e:#}"))?;
+            e.enable_usage(16*1024*1024).unwrap();Ok(outcome)
+        }).unwrap());
+        assert_ne!(epoch,e.metadata_epoch());assert!(!e.metadata_ready());
+        drop(owner);std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn metadata_finalizer_real_writer_failure_retains_ram_and_requires_real_retry() {
+        let (path,e,owner)=metadata_finalizer_fixture("finalizer-failure");let epoch=e.metadata_epoch();
+        let permit=crate::runtime_lifecycle::reserve(&e,"metadata-finalizer").unwrap().unwrap().require_result().activate();
+        findx2_core::set_persist_fault(findx2_core::PersistFault::AfterDataSync);
+        let failed=permit.finish_persistence(super::persist_metadata_final(&e,&path,Some(epoch)));
+        findx2_core::clear_persist_fault();
+        assert!(format!("{:#}",failed.unwrap_err()).contains("after data sync"));
+        assert!(e.has_pending_persistence());assert!(!owner.retained_errors().is_empty());
+        assert_eq!(e.index_store().entries[e.index_store().entry_on_volume(b'C',1).unwrap() as usize].size,456);
+        let permit=crate::runtime_lifecycle::reserve(&e,"metadata-finalizer").unwrap().unwrap().require_result().activate();
+        assert!(permit.finish_persistence(super::persist_metadata_final(&e,&path,Some(epoch))).unwrap());
+        assert!(owner.retained_errors().is_empty());assert!(!e.has_pending_persistence());
+        let disk=findx2_core::v6_load(&findx2_core::V6Layout::for_index(&path)).unwrap();assert!(disk.metadata_ready);
+        drop(owner);std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     fn checkpoint_patch(engine: &findx2_core::SearchEngine, size:u64) {
         let ticket=engine.metadata_ticket_by_id(b'C',1).unwrap();
         assert!(engine.commit_metadata(ticket,size,0,0).unwrap());

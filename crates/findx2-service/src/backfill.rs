@@ -130,11 +130,13 @@ fn spawn_final_persist_for_epoch(engine:Arc<SearchEngine>,path:std::path::PathBu
                 return;
             }
             #[cfg(windows)]
-            match crate::run::persist_index(&engine, &path) {
+            match crate::run::persist_metadata_final(&engine, &path, epoch) {
                 Ok(true) => {},
                 Ok(false) => {
-                    crate::runtime_lifecycle::error_optional(&mut lifecycle,"terminal persistence deferred: no real commit".into());
-                    engine.set_backfill_error(Some("metadata covered; terminal persistence deferred by concurrent commit; regular persistence will retry".into()));
+                    // Epoch replacement is cancellation, NOT successful durable
+                    // completion or permission to remove the new epoch sidecar.
+                    crate::runtime_lifecycle::success_optional(&mut lifecycle);
+                    info!("obsolete metadata finalizer cancelled after writer wait");
                     return;
                 },
                 Err(e) => {
