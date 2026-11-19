@@ -1,0 +1,35 @@
+name: Standalone migration GUI candidate
+on:
+  push:
+    branches: [release/v2.5.3-engine-durability]
+    paths: ['.github/workflows/gui-candidate.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gui-only:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: durability-253-complete-payload
+          cache-on-failure: true
+      - name: Link latest migration GUI only; no engine or installer tests
+        shell: pwsh
+        run: |
+          cargo build --locked --release -p findx2-gui-native --jobs 2
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          New-Item -ItemType Directory gui-candidate|Out-Null
+          Copy-Item target/release/findx2-gui-native.exe gui-candidate/FindX-t231-candidate.exe
+          $p=Get-Item gui-candidate/FindX-t231-candidate.exe
+          @{sourceCommit=$env:GITHUB_SHA;guiTree=(git rev-parse HEAD:crates/findx2-gui-native);ipcTree=(git rev-parse HEAD:crates/findx2-ipc);lockBlob=(git rev-parse HEAD:Cargo.lock);profile='standalone-candidate-NOT-installed-NOT-release';file=$p.Name;bytes=$p.Length;sha256=(Get-FileHash $p.FullName -Algorithm SHA256).Hash}|ConvertTo-Json|Set-Content gui-candidate/source-manifest.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: findx-253-gui-candidate-migration
+          path: gui-candidate/*
+          retention-days: 14
