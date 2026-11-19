@@ -1,0 +1,120 @@
+name: Final current-engine immutable-GUI acceptance
+on:
+  push:
+    branches: [release/v2.5.3-engine-durability]
+    paths: ['.github/workflows/final-acceptance.yml', 'scripts/final-*', 'scripts/stage-final-payload.ps1']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  combined:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: durability-253-complete-payload
+          cache-on-failure: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: findx-253-gui-candidate-migration
+          run-id: 44468255654
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/final-gui-input
+      - name: One necessary current engine build; NEVER rebuild attested GUI
+        shell: pwsh
+        run: |
+          cargo build --locked --release -p findx2-cli -p findx2-service -p findx2-core --bins --example verify_persisted_file --example path_page_latency --jobs 2
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          $deps=Join-Path $pwd 'target/release/deps'
+          $lib=Get-ChildItem $deps -Filter 'librusty_leveldb-*.rlib'|Select-Object -First 1
+          if(-not $lib){
+            $env:CARGO_TARGET_DIR=Join-Path $pwd 'target'
+            cargo test --locked --release --manifest-path scripts/gui-compat-tests/Cargo.toml -- --test-threads=1
+            if($LASTEXITCODE){exit $LASTEXITCODE}
+            $lib=Get-ChildItem $deps -Filter 'librusty_leveldb-*.rlib'|Select-Object -First 1
+          }
+          if(-not $lib){throw 'Actual legacy data generator dependency missing'}
+          rustc --edition=2024 scripts/final-legacy-export.rs -L "dependency=$deps" --extern "rusty_leveldb=$($lib.FullName)" -o target/release/final-legacy-export.exe
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+      - name: Pin exact six files and separate GUI engine provenance
+        id: stage
+        shell: pwsh
+        run: ./scripts/stage-final-payload.ps1 -GuiRoot "$env:RUNNER_TEMP/final-gui-input" -Destination "$env:RUNNER_TEMP/findx-final253-payload"
+      - name: Deliver exact current payload immediately, not a release or fixture setup
+        uses: actions/upload-artifact@v4
+        with:
+          name: findx-253-final-engine-E10D-gui-payload
+          path: ${{ runner.temp }}/findx-final253-payload/**
+          retention-days: 30
+      - name: Existing documented 50k-overlay deep parent page benchmark
+        id: perf
+        shell: pwsh
+        run: |
+          & target/release/examples/path_page_latency.exe 2>&1 | Tee-Object final-parent-benchmark.log
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+      - name: Combined real two-volume backfill durability USN owner and official GUI campaign
+        id: native
+        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}
+        shell: powershell
+        run: ./scripts/final-native-campaign.ps1 -Payload "$env:RUNNER_TEMP/findx-final253-payload"
+      - name: Reuse native parent journal epoch recovery harness on exact newly built engine bytes
+        id: namespace
+        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}
+        shell: powershell
+        run: |
+          $null=New-Item -ItemType Directory target/debug/examples -Force
+          foreach($f in @('findx2-service.exe','findx2.exe','fx.exe')){Copy-Item (Join-Path 'target/release' $f) (Join-Path 'target/debug' $f)}
+          Copy-Item target/release/examples/verify_persisted_file.exe target/debug/examples/verify_persisted_file.exe
+          foreach($f in @('findx2-service.exe','findx2.exe','fx.exe')){if((Get-FileHash (Join-Path 'target/debug' $f)).Hash -cne (Get-FileHash (Join-Path 'target/release' $f)).Hash){throw 'Harness must consume exact release bytes'}}
+          ./scripts/test-namespace-scm.ps1 -ServiceExe ./target/debug/findx2-service.exe
+      - name: Obtain hash-pinned published payload without running installer
+        id: old
+        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path $env:RUNNER_TEMP 'findx-published252-input'
+          New-Item -ItemType Directory -Path $root | Out-Null
+          $setup=Join-Path $root 'published-setup.exe'
+          Invoke-WebRequest -UseBasicParsing https://github.com/chaojimct/findx/releases/download/v2.5.2/FindX-2.5.2-setup.exe -OutFile $setup
+          if((Get-FileHash $setup -Algorithm SHA256).Hash -ne '5766a666f0edcb947f21a9001b5eff0b701686956f65e8a7881a47bd29a9aef1'){throw 'Published setup digest mismatch'}
+          $zip=Join-Path $root 'innounp.zip'
+          Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/jrathlev/InnoUnpacker-Windows-GUI/refs/heads/master/innounp-2/bin/innounp-2.zip -OutFile $zip
+          if((Get-FileHash $zip -Algorithm SHA256).Hash -ne 'f8e45c9676bebc7d7570108ab572673b541fcf7a7d3d24a04319ac6b5315b4e8'){throw 'Pinned public unpacker digest changed; do not run'}
+          Expand-Archive $zip -DestinationPath (Join-Path $root 'unpacker')
+          & (Join-Path $root 'unpacker/innounp.exe') -x -y ('-d'+(Join-Path $root 'extracted')) $setup
+          if($LASTEXITCODE){throw 'Read-only setup extraction failed'}
+      - name: Existing actual final-payload ISS matrix, no fixture publication
+        id: installer
+        if: ${{ !cancelled() && steps.stage.outcome == 'success' && steps.old.outcome == 'success' }}
+        shell: powershell
+        run: |
+          if(-not(Test-Path "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe")){choco install innosetup -y --no-progress}
+          ./scripts/test-installer-fixtures.ps1 -PublishedGui "$env:RUNNER_TEMP/findx-published252-input/extracted/{app}/FindX.exe"
+          ./scripts/test-installer-native.ps1 -PublishedPayload "$env:RUNNER_TEMP/findx-published252-input/extracted/{app}" -CandidatePayload "$env:RUNNER_TEMP/findx-final253-payload" -Iscc "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe" -EngineCandidate -PayloadSourceCommit $env:GITHUB_SHA
+      - name: Archive only exact payload and bounded independent results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: findx-253-final-combined-acceptance
+          path: |
+            final-parent-benchmark.log
+            final-native-evidence/**
+            native-namespace-evidence/**
+            ${{ runner.temp }}/FindXUpgradeTest_*/results.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/journal*.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/failure.txt
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/render-health.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/normal-exit.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/service-health.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/service-status-last.json
+            ${{ runner.temp }}/FindXUpgradeTest_*/**/receipt*.json
+          retention-days: 30
