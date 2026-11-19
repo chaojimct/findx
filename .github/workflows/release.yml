@@ -304,6 +304,11 @@ jobs:
           if($LASTEXITCODE){throw 'Exact tested payload download failed'}
           $done=@{}
           foreach($p in $lock.proofs){$key=[string]$p.run+':'+$p.artifact;if($done.ContainsKey($key)){continue};$done[$key]=$true
+            if($p.artifact -ceq 'repository-evidence'){
+              if($p.sourcePath -cnotmatch '^release/evidence/[A-Za-z0-9_.-]+$'){throw 'Invalid committed evidence path'}
+              $dir=Join-Path "$env:RUNNER_TEMP/sealed-evidence" ([string]$done.Count);$null=New-Item -ItemType Directory $dir
+              Copy-Item -LiteralPath $p.sourcePath -Destination (Join-Path $dir $p.fileName);continue
+            }
             gh run download $p.run --repo chaojimct/findx --name $p.artifact --dir (Join-Path "$env:RUNNER_TEMP/sealed-evidence" ([string]$done.Count))
             if($LASTEXITCODE){throw 'Pinned independent raw proof download failed'}
           }

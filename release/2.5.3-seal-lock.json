@@ -1,76 +1,428 @@
 {
-  "version": "2.5.3",
-  "testedCommit": "aea0adc1a88e472457c14cf806a82950a87dc9cb",
-  "testedRun": 44334214875,
-  "artifactName": "findx-253-immutable-candidate-payload",
-  "stageManifestSha256": "70394f1087c1d90a626f8cb94ed0d78917252fadd6a7e6fdf9dbfc0feb1f4122",
-  "matrixSha256": "f01221c2e78824fae8154b69c6166a711d4359f584e153bd2511eb80c73b8a2b",
-  "engineBaseline": "v2.5.2",
-  "published252SetupSha256": "5766a666f0edcb947f21a9001b5eff0b701686956f65e8a7881a47bd29a9aef1",
-  "files": [
-    {
-      "name": "FindX.exe",
-      "length": 35040256,
-      "sha256": "8cdea0ad9639dcd00f9c08689fb69a6dab4d713c06b6287065796a607860900e"
-    },
-    {
-      "name": "FindX.installed",
-      "length": 3,
-      "sha256": "f1b2f662800122bed0ff255693df89c4487fbdcf453d3524a42d4ec20c3d9c04"
-    },
-    {
-      "name": "findx2-service.exe",
-      "length": 6636032,
-      "sha256": "981eadf760a0bf52f84e93a62718e18f2a194ab1c7096d3807606ca079d89cda"
-    },
-    {
-      "name": "findx2.exe",
-      "length": 6043136,
-      "sha256": "bf2e26674f7e719217b047bc55465278d355220e568521bc1f8fa9bbf59bc7ee"
-    },
-    {
-      "name": "fx.exe",
-      "length": 6043136,
-      "sha256": "0f45010b9f6c1f608551f32a6da8b1287d0ad9d25ea203e802fb5463d358b30c"
-    },
-    {
-      "name": "resources\\component-manifest.json",
-      "length": 1335,
-      "sha256": "462fdf08fa6e577ef7c4baacafa63ac3fc0439209dc8a65576ae3db9bfe134e4"
-    }
-  ],
-  "helpers": [
-    {
-      "gitBlob": "a7a261a2b1c538d3b76cdd815267f054c13df58d",
-      "path": "installer/FindX.iss"
-    },
-    {
-      "gitBlob": "4a0c17832bdcb16e2d7cdd1ebd1916053d11e6fc",
-      "path": "installer/transaction-files.psm1"
-    },
-    {
-      "gitBlob": "575d99604742fc92045a4a71a4a126e4088f4b0f",
-      "path": "installer/transaction-platform.psm1"
-    },
-    {
-      "gitBlob": "3041335eb875b9516e7b7fa8eda5753925f63e26",
-      "path": "installer/upgrade-transaction.ps1"
-    },
-    {
-      "gitBlob": "d6a11c4490de07dad443ade668289fc954dfa1ed",
-      "path": "installer/Languages/ChineseSimplified.isl"
-    },
-    {
-      "gitBlob": "8c2e7299c700784d4acbf910884c020ab2aa1187",
-      "path": "installer/Languages/Default.isl"
-    },
-    {
-      "gitBlob": "6b61c481dcb5b5b4dae0beccf182c6aae7a4f480",
-      "path": "gui/src-tauri/icons/icon.ico"
-    },
-    {
-      "gitBlob": "8280516e7d8c18be6b4e166c2f7bb25a279aedd1",
-      "path": "scripts/check_release.py"
-    }
-  ]
+    "version":  "2.5.3",
+    "schema":  "rebuilt-engine-composite-v2",
+    "testedCommit":  "a605bfc4ecf6c6eaaefdcfb0272fbc9a9e4bd800",
+    "testedRun":  44486547455,
+    "acceptanceCommit":  "3a4b2a023b27872be223afc368c6b49a315031a3",
+    "acceptanceRun":  44488255296,
+    "payloadArtifact":  "findx-253-finalizer-settled-E10D-final-payload",
+    "stageManifestSha256":  "6b4c3c781f15ffdfeaa6888aa14e1e44b6af785c59ea3ac802f4381f9e3f6882",
+    "files":  [
+                  {
+                      "name":  "FindX.exe",
+                      "length":  35951616,
+                      "sha256":  "e10ddda898cafe95caf86b7f119319dca70e0e7224acdc28984572ad633a839e"
+                  },
+                  {
+                      "name":  "FindX.installed",
+                      "length":  3,
+                      "sha256":  "f1b2f662800122bed0ff255693df89c4487fbdcf453d3524a42d4ec20c3d9c04"
+                  },
+                  {
+                      "name":  "findx2-service.exe",
+                      "length":  7136256,
+                      "sha256":  "6a86ad8d8ffe220cbeeeae50e7c5e6d691961ae43c4ae7fcc730222d5d788e8c"
+                  },
+                  {
+                      "name":  "findx2.exe",
+                      "length":  6086656,
+                      "sha256":  "cbc943c7a8e43be93a0b1e254d0d7eedbb31ec1f7656fdcb15b824abf6935ea9"
+                  },
+                  {
+                      "name":  "fx.exe",
+                      "length":  6086144,
+                      "sha256":  "a66fa9db7e4555a9b1d9810c983da4127a381cf76bac9ebc3bf05caa214e82dc"
+                  },
+                  {
+                      "name":  "resources\\component-manifest.json",
+                      "length":  1055,
+                      "sha256":  "985a0982751a28d1b24bf2ddfa9ff035066acc05fad8ee5c2df5bc94fce48789"
+                  }
+              ],
+    "helpers":  [
+                    {
+                        "path":  "installer/FindX.iss",
+                        "gitBlob":  "946fb85a6a4d7344461c5c9e26336c2b3bd6a29a"
+                    },
+                    {
+                        "path":  "installer/transaction-files.psm1",
+                        "gitBlob":  "4a0c17832bdcb16e2d7cdd1ebd1916053d11e6fc"
+                    },
+                    {
+                        "path":  "installer/transaction-platform.psm1",
+                        "gitBlob":  "575d99604742fc92045a4a71a4a126e4088f4b0f"
+                    },
+                    {
+                        "path":  "installer/transaction-receipt.psm1",
+                        "gitBlob":  "29f9f2a0869a7fe972b3a73a235f2a7f84344e7a"
+                    },
+                    {
+                        "path":  "installer/upgrade-transaction.ps1",
+                        "gitBlob":  "ea5ed279ad0bc320425a17884aa8bed35f1c2663"
+                    },
+                    {
+                        "path":  "installer/Languages/ChineseSimplified.isl",
+                        "gitBlob":  "d6a11c4490de07dad443ade668289fc954dfa1ed"
+                    },
+                    {
+                        "path":  "installer/Languages/Default.isl",
+                        "gitBlob":  "8c2e7299c700784d4acbf910884c020ab2aa1187"
+                    },
+                    {
+                        "path":  "gui/src-tauri/icons/icon.ico",
+                        "gitBlob":  "6b61c481dcb5b5b4dae0beccf182c6aae7a4f480"
+                    },
+                    {
+                        "path":  "scripts/check_release.py",
+                        "gitBlob":  "8280516e7d8c18be6b4e166c2f7bb25a279aedd1"
+                    }
+                ],
+    "installerCases":  [
+                           "fresh-no-service",
+                           "published252-stopped-service",
+                           "backup-failure",
+                           "health-rollback",
+                           "legacy-running-refusal",
+                           "stop-timeout",
+                           "reentry-refusal",
+                           "interrupted-recovery",
+                           "new-service-ipc",
+                           "new-service-health-rollback",
+                           "fresh-selected-no-index",
+                           "platform-rollback",
+                           "running253-success",
+                           "running253-save-refusal",
+                           "running253-backup-failure",
+                           "running253-health-rollback",
+                           "running253-interrupted-recovery",
+                           "running253-copy-verification-rollback"
+                       ],
+    "proofs":  [
+                   {
+                       "id":  "installer-unaffected10",
+                       "run":  44475535981,
+                       "commit":  "0157cca03ea4e24c803624da968ee741393ba1b1",
+                       "runConclusion":  "failure",
+                       "payloadCommit":  "0157cca03ea4e24c803624da968ee741393ba1b1",
+                       "artifact":  "findx-253-final-combined-acceptance",
+                       "fileName":  "results.json",
+                       "sha256":  "b4e10e447705b1e74d2e7610b19d5d4ffd6c7885f771aa36d7e64a3e83a98b1b",
+                       "kind":  "matrix",
+                       "selected":  [
+                                        "fresh-no-service",
+                                        "published252-stopped-service",
+                                        "backup-failure",
+                                        "health-rollback",
+                                        "legacy-running-refusal",
+                                        "stop-timeout",
+                                        "reentry-refusal",
+                                        "interrupted-recovery",
+                                        "fresh-selected-no-index",
+                                        "platform-rollback"
+                                    ],
+                       "reuseReason":  "Explicit unchanged-component evidence; reviewed service-only evolution is covered by fresh real finalizer, prepare/refusal and GUI/STOP runtime acceptance. Not identical-byte reexecution.",
+                       "unchangedPaths":  [
+                                              "crates/findx2-core",
+                                              "crates/findx2-windows",
+                                              "crates/findx2-ipc",
+                                              "crates/findx2-cli",
+                                              "crates/findx2-gui-native",
+                                              "installer",
+                                              "Cargo.toml",
+                                              "Cargo.lock"
+                                          ],
+                       "reviewedServiceDeltaSha256":  "f5ce0a258b2af9f42157eece58f998d49688efe67c5b8cba6097fd17bc000288"
+                   },
+                   {
+                       "id":  "installer-runtime6",
+                       "run":  44481898941,
+                       "commit":  "907316c3f48405712780eb596725018e20b48a69",
+                       "runConclusion":  "failure",
+                       "payloadCommit":  "907316c3f48405712780eb596725018e20b48a69",
+                       "artifact":  "findx-253-final-combined-acceptance",
+                       "fileName":  "results.json",
+                       "sha256":  "de74833abd5b27129e5a0cb798819fac1b1ac89b23cff5a855f5fc9eac0fbac9",
+                       "kind":  "matrix",
+                       "selected":  [
+                                        "new-service-ipc",
+                                        "new-service-health-rollback",
+                                        "running253-backup-failure",
+                                        "running253-health-rollback",
+                                        "running253-interrupted-recovery",
+                                        "running253-copy-verification-rollback"
+                                    ],
+                       "reuseReason":  "Explicit unchanged-component evidence; reviewed service-only evolution is covered by fresh real finalizer, prepare/refusal and GUI/STOP runtime acceptance. Not identical-byte reexecution.",
+                       "unchangedPaths":  [
+                                              "crates/findx2-core",
+                                              "crates/findx2-windows",
+                                              "crates/findx2-ipc",
+                                              "crates/findx2-cli",
+                                              "crates/findx2-gui-native",
+                                              "installer",
+                                              "Cargo.toml",
+                                              "Cargo.lock"
+                                          ],
+                       "reviewedServiceDeltaSha256":  "20ba127d886befd31081c9f9d72274cd22517edc86704bd905be216c79a0e47e"
+                   },
+                   {
+                       "id":  "native-known-usn-owner",
+                       "run":  44481898941,
+                       "commit":  "907316c3f48405712780eb596725018e20b48a69",
+                       "runConclusion":  "failure",
+                       "payloadCommit":  "907316c3f48405712780eb596725018e20b48a69",
+                       "artifact":  "findx-253-final-combined-acceptance",
+                       "fileName":  "results.json",
+                       "sha256":  "3ccf6cec58f787821093265fec87bac6e2c9e6458b4708ef76fa6fc63d528c5e",
+                       "kind":  "native",
+                       "selected":  [
+                                        "all48000-known-records-and-real128-parent-paths",
+                                        "native-both-volume-create-rename-confirmed-delete",
+                                        "real-service-single-owner"
+                                    ],
+                       "reuseReason":  "Explicit unchanged-component evidence; reviewed service-only evolution is covered by fresh real finalizer, prepare/refusal and GUI/STOP runtime acceptance. Not identical-byte reexecution.",
+                       "unchangedPaths":  [
+                                              "crates/findx2-core",
+                                              "crates/findx2-windows",
+                                              "crates/findx2-ipc",
+                                              "crates/findx2-cli",
+                                              "crates/findx2-gui-native",
+                                              "installer",
+                                              "Cargo.toml",
+                                              "Cargo.lock"
+                                          ],
+                       "reviewedServiceDeltaSha256":  "20ba127d886befd31081c9f9d72274cd22517edc86704bd905be216c79a0e47e"
+                   },
+                   {
+                       "id":  "native-parent-journal",
+                       "run":  44481898941,
+                       "commit":  "907316c3f48405712780eb596725018e20b48a69",
+                       "runConclusion":  "failure",
+                       "payloadCommit":  "907316c3f48405712780eb596725018e20b48a69",
+                       "artifact":  "findx-253-final-combined-acceptance",
+                       "fileName":  "results.json",
+                       "sha256":  "bcb06a35cf803e8994bcfd042f2098404022c2156113b1f4d015c489d3a20bd9",
+                       "kind":  "native",
+                       "selected":  [
+                                        "actual-scm-parent-denied-prefix-repair",
+                                        "actual-scm-journal-gap-live-index-replace-offline-restart"
+                                    ],
+                       "reuseReason":  "Explicit unchanged-component evidence; reviewed service-only evolution is covered by fresh real finalizer, prepare/refusal and GUI/STOP runtime acceptance. Not identical-byte reexecution.",
+                       "unchangedPaths":  [
+                                              "crates/findx2-core",
+                                              "crates/findx2-windows",
+                                              "crates/findx2-ipc",
+                                              "crates/findx2-cli",
+                                              "crates/findx2-gui-native",
+                                              "installer",
+                                              "Cargo.toml",
+                                              "Cargo.lock"
+                                          ],
+                       "reviewedServiceDeltaSha256":  "20ba127d886befd31081c9f9d72274cd22517edc86704bd905be216c79a0e47e"
+                   },
+                   {
+                       "id":  "current-installer2",
+                       "run":  44486547455,
+                       "commit":  "a605bfc4ecf6c6eaaefdcfb0272fbc9a9e4bd800",
+                       "runConclusion":  "failure",
+                       "payloadCommit":  "a605bfc4ecf6c6eaaefdcfb0272fbc9a9e4bd800",
+                       "artifact":  "findx-253-final-combined-acceptance",
+                       "fileName":  "results.json",
+                       "sha256":  "524420acdedf4b452862d869144d22a8c9f33802a14307723edf5902c064c7a6",
+                       "kind":  "matrix",
+                       "selected":  [
+                                        "running253-success",
+                                        "running253-save-refusal"
+                                    ]
+                   },
+                   {
+                       "id":  "current-backfill-migration3",
+                       "run":  44486547455,
+                       "commit":  "a605bfc4ecf6c6eaaefdcfb0272fbc9a9e4bd800",
+                       "runConclusion":  "failure",
+                       "payloadCommit":  "a605bfc4ecf6c6eaaefdcfb0272fbc9a9e4bd800",
+                       "artifact":  "findx-253-final-combined-acceptance",
+                       "fileName":  "results.json",
+                       "sha256":  "ddded5df2783153ff05b9c1da6e0ff146e46d2a45231067d9024fb058b899e15",
+                       "kind":  "native",
+                       "selected":  [
+                                        "real-full-two-volume-backfill",
+                                        "actual-partial-periodic-disk-generation",
+                                        "official-auto-import-and-normal-session-restart"
+                                    ]
+                   },
+                   {
+                       "id":  "current-gui-stop2",
+                       "run":  44488255296,
+                       "commit":  "3a4b2a023b27872be223afc368c6b49a315031a3",
+                       "runConclusion":  "success",
+                       "payloadCommit":  "a605bfc4ecf6c6eaaefdcfb0272fbc9a9e4bd800",
+                       "artifact":  "findx-253-final-combined-acceptance",
+                       "fileName":  "results.json",
+                       "sha256":  "50f780130b2476d94352087970a0c20633a3a03e4345a0508f20e879c1930a53",
+                       "kind":  "native",
+                       "selected":  [
+                                        "real-live-gui-rebind-new-scm-instance",
+                                        "current-engine-stop-offline-and-restart"
+                                    ]
+                   },
+                   {
+                       "id":  "existing-deep-overlay-benchmark",
+                       "run":  44475535981,
+                       "commit":  "0157cca03ea4e24c803624da968ee741393ba1b1",
+                       "runConclusion":  "failure",
+                       "payloadCommit":  "0157cca03ea4e24c803624da968ee741393ba1b1",
+                       "artifact":  "findx-253-final-combined-acceptance",
+                       "fileName":  "final-parent-benchmark.log",
+                       "sha256":  "5f35ce4a1fa55204a75895fcd6323b12cbee639cf79f9e80a6e1193b4cec0d03",
+                       "kind":  "text",
+                       "selected":  [
+
+                                    ],
+                       "reuseReason":  "Explicit unchanged-component evidence; reviewed service-only evolution is covered by fresh real finalizer, prepare/refusal and GUI/STOP runtime acceptance. Not identical-byte reexecution.",
+                       "unchangedPaths":  [
+                                              "crates/findx2-core"
+                                          ],
+                       "reviewedServiceDeltaSha256":  "f5ce0a258b2af9f42157eece58f998d49688efe67c5b8cba6097fd17bc000288",
+                       "requiredLiterals":  [
+                                                "depth=12 overlay=50000",
+                                                "round=0 hits=50",
+                                                "round=2 hits=50"
+                                            ]
+                   },
+                   {
+                       "id":  "legacy-format",
+                       "run":  44470156668,
+                       "commit":  "d7d3d7f95a3f240e3d30ed86bf32943b26c6bdf8",
+                       "runConclusion":  "success",
+                       "payloadCommit":  "d7d3d7f95a3f240e3d30ed86bf32943b26c6bdf8",
+                       "artifact":  "repository-evidence",
+                       "fileName":  "legacy-root-44470156668.txt",
+                       "sha256":  "eab8bde5f1444f97477846820533c014c982990f15c97cb61b429d9fe678909c",
+                       "kind":  "text",
+                       "selected":  [
+
+                                    ],
+                       "reuseReason":  "Explicit unchanged-component evidence; reviewed service-only evolution is covered by fresh real finalizer, prepare/refusal and GUI/STOP runtime acceptance. Not identical-byte reexecution.",
+                       "unchangedPaths":  [
+                                              "crates/findx2-core/src/persist.rs",
+                                              "crates/findx2-core/src/persist_v6.rs"
+                                          ],
+                       "reviewedServiceDeltaSha256":  "f5ce0a258b2af9f42157eece58f998d49688efe67c5b8cba6097fd17bc000288",
+                       "sourcePath":  "release/evidence/legacy-root-44470156668.txt",
+                       "requiredLiterals":  [
+                                                "test v5_two_volume_copy_upgrade_and_exact_backup_rollback ... ok",
+                                                "test legacy_second_volume_paths_are_canonical_without_rewriting_indexes ... ok"
+                                            ]
+                   },
+                   {
+                       "id":  "mft-identity-auth",
+                       "run":  44455592859,
+                       "commit":  "eb5e47238dfbf800ce6e08c9f9674f19c66d0abf",
+                       "runConclusion":  "success",
+                       "payloadCommit":  "eb5e47238dfbf800ce6e08c9f9674f19c66d0abf",
+                       "artifact":  "repository-evidence",
+                       "fileName":  "identity-protocol-44455592859.txt",
+                       "sha256":  "58dfed42ab85eae1b9fed75f67b46532bcecbe56bfcba6c8222a83df97bfc6a6",
+                       "kind":  "text",
+                       "selected":  [
+
+                                    ],
+                       "reuseReason":  "Explicit unchanged-component evidence; reviewed service-only evolution is covered by fresh real finalizer, prepare/refusal and GUI/STOP runtime acceptance. Not identical-byte reexecution.",
+                       "unchangedPaths":  [
+                                              "crates/findx2-windows/src/mft_read.rs"
+                                          ],
+                       "reviewedServiceDeltaSha256":  "a2adb81ebad167747db933549a82ec7e52f95b7c410a22cfff6921e92c8ffc4f",
+                       "sourcePath":  "release/evidence/identity-protocol-44455592859.txt",
+                       "requiredLiterals":  [
+                                                "mft_identity_tests::uncorroborated_ordinal_is_not_a_full_frn_metadata_hit ... ok",
+                                                "mft_identity_tests::reused_slot_does_not_backfill_a_previous_full_identity ... ok"
+                                            ]
+                   }
+               ],
+    "gates":  [
+                  {
+                      "id":  "partial-metadata-periodic-durability",
+                      "required":  true,
+                      "passed":  true,
+                      "proofIds":  [
+                                       "current-backfill-migration3"
+                                   ],
+                      "applicability":  "Actual USN marker15bytes persisted in stable canonical v6 generation4 while metadata_ready=false under owned SYSTEM read denial; offline before replay. ACL repair and same partial disk normal SCM restart then required real complete metadata/watch health at 48000-file/128-depth fixture. Partial proof is NOT complete coverage."
+                  },
+                  {
+                      "id":  "v6-powerfail-and-persist-error-propagation",
+                      "required":  true,
+                      "passed":  true,
+                      "proofIds":  [
+                                       "current-installer2",
+                                       "current-gui-stop2",
+                                       "mft-identity-auth"
+                                   ],
+                      "applicability":  "Actual OS write refusal retained same RAM owner; repaired writer and fresh bound prepare/STOP/offline generation succeeded. Current real AfterDataSync failure/RAM/retry and writer-contention/epoch regressions passed; inherited explicit boundary fault tests are simulations, not certified physical power-loss."
+                  },
+                  {
+                      "id":  "installer-transaction-health-and-rollback",
+                      "required":  true,
+                      "passed":  true,
+                      "proofIds":  [
+                                       "installer-unaffected10",
+                                       "installer-runtime6",
+                                       "current-installer2"
+                                   ],
+                      "applicability":  "18 distinct actual ISS cases via explicit unchanged-component applicability: prior10 + service-runtime6 + current2. Includes complete backup, original runtime recovery, copy-integrity/IPC/GUI rollback, real COM/PATH restore/reentry and old252 preSTOP refusal. Not one new-byte18-case run or physical copy IO failure."
+                  },
+                  {
+                      "id":  "full-volume-coverage-and-usn-identity",
+                      "required":  true,
+                      "passed":  true,
+                      "proofIds":  [
+                                       "native-known-usn-owner",
+                                       "native-parent-journal",
+                                       "mft-identity-auth",
+                                       "current-backfill-migration3"
+                                   ],
+                      "applicability":  "Real watched/backfilled entire two owned NTFS volumes:48000 exact known file metadata/paths and128 parents; both-volume create/rename/confirmed delete; parent ACL retained cursor/repair and actual journal/index replacement idle recovery/offline-before-replay/restart. Existing five full-FRN/header/sequence lower-MFT regressions inherited on unchanged reader. Not MZ production or every historical physical disk."
+                  },
+                  {
+                      "id":  "service-path-ipc-generation-single-instance",
+                      "required":  true,
+                      "passed":  true,
+                      "proofIds":  [
+                                       "native-known-usn-owner",
+                                       "current-gui-stop2",
+                                       "current-installer2"
+                                   ],
+                      "applicability":  "Actual competing index/pipe owner rejection, strict authenticated protocol2 identity/nonce/index/generation prepare, and actual official GUI querying a fresh exact path created AFTER new healthy SCM instance restart. Not cached query text, mock frame or a new GUI-process singleton requirement."
+                  },
+                  {
+                      "id":  "legacy-preferences-and-startup-resume",
+                      "required":  true,
+                      "passed":  true,
+                      "proofIds":  [
+                                       "current-backfill-migration3"
+                                   ],
+                      "applicability":  "Actual official E10D GUI automatic known-schema legacy preferences/settings import retained source/settings fields/history; real tray exit/relaunch restored two directory tabs. Unknown/corrupt sources remain preserved. No index format migration."
+                  },
+                  {
+                      "id":  "deep-parent-fallback-performance",
+                      "required":  true,
+                      "passed":  true,
+                      "proofIds":  [
+                                       "existing-deep-overlay-benchmark",
+                                       "native-known-usn-owner"
+                                   ],
+                      "applicability":  "Existing documented core page50/overlay50000/depth12 benchmark110/123/106us retained unchanged core; actual native128-parent canonical paths and full48000 query correctness also passed. No invented threshold or claim of full physical-disk performance."
+                  },
+                  {
+                      "id":  "legacy-multivolume-canonical-root-paths",
+                      "required":  true,
+                      "passed":  true,
+                      "proofIds":  [
+                                       "legacy-format",
+                                       "native-known-usn-owner",
+                                       "native-parent-journal"
+                                   ],
+                      "applicability":  "Existing16 pure root/format regressions include real v5 two-volume copied upgrade/exact backup rollback and legacy second-volume paths without rewriting; unchanged persistence loader provenance plus current real two-volume canonical full paths/USN and offline/restart proof. Pure legacy format tests are explicitly not native old-binary whole-volume tests; persisted format remains compatible."
+                  }
+              ]
 }

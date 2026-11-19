@@ -1,0 +1,10 @@
+# Verbatim existing successful source-exact loader regressions; PURE TEMP DATA, not native full-volume claim.
+# https://github.com/chaojimct/findx/actions/runs/44470156668/job/135377378656
+# d7d3d7f95a3f240e3d30ed86bf32943b26c6bdf8. Original log timestamps UTC. No rerun.
+2026-11-19T06:10:55.5051141Z test export_stage_c_legacy_fixtures_if_requested ... ok
+2026-11-19T06:10:55.5941971Z test identical_full_frns_across_volumes_never_cross_parent_or_root_after_reload ... ok
+2026-11-19T06:10:55.7547722Z test legacy_flat_in_place_prefix_is_still_unsafe ... ok
+2026-11-19T06:10:55.8902230Z test legacy_second_volume_paths_are_canonical_without_rewriting_indexes ... ok
+2026-11-19T06:10:55.8923201Z test second_volume_self_parent_root_and_nested_paths_match_cached_and_uncached ... ok
+2026-11-19T06:10:56.0229184Z test transactional_save_copies_legacy_and_ignores_later_prefix_patches ... ok
+2026-11-19T06:10:56.1761177Z test v5_two_volume_copy_upgrade_and_exact_backup_rollback ... ok

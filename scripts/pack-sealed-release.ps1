@@ -44,7 +44,7 @@ foreach($p in $lock.proofs){
   # An explicit reviewed delta accompanies, rather than hides, changed service
   # bytes. The current native finalization + affected ISS proofs remain mandatory.
   $delta=Join-Path $env:TEMP ('findx-seal-delta-'+[guid]::NewGuid().ToString('N')+'.txt')
-  try{& git -C $repo diff --no-ext-diff --binary $p.payloadCommit $lock.testedCommit -- crates/findx2-service | Out-File -LiteralPath $delta -Encoding utf8;Require ($LASTEXITCODE -eq 0 -and (Hash $delta) -ceq $p.reviewedServiceDeltaSha256) 'Reviewed service delta changed'}finally{Remove-Item -LiteralPath $delta -ErrorAction SilentlyContinue}
+  try{& git -C $repo diff --no-ext-diff --no-textconv --no-color --binary --full-index ('--output='+$delta) $p.payloadCommit $lock.testedCommit -- crates/findx2-service;Require ($LASTEXITCODE -eq 0 -and (Hash $delta) -ceq $p.reviewedServiceDeltaSha256) 'Reviewed service delta changed'}finally{Remove-Item -LiteralPath $delta -ErrorAction SilentlyContinue}
  }
  if($p.kind -ceq 'matrix'){
   $v=Get-Content -LiteralPath $file -Raw -Encoding UTF8|ConvertFrom-Json

@@ -1,0 +1,11 @@
+# Verbatim selected existing completed CI PASS lines; PURE identity/authentication regressions, not whole-volume/native ACK acceptance.
+# https://github.com/chaojimct/findx/actions/runs/44455592859/job/135329714640
+# Source eb5e47238dfbf800ce6e08c9f9674f19c66d0abf, success; raw timestamps UTC. No rerun.
+2026-11-19T04:04:31.3737571Z test ipc_dispatch::upgrade_negotiation_tests::protocol1_capability_and_unauthenticated_protocol2_never_authorize_stop ... ok
+2026-11-19T04:04:31.3740269Z test pipe_server::protocol2_capability_transport_tests::protocol2_capability_requires_os_authentication_not_public_dispatch ... ok
+2026-11-19T04:04:31.4520428Z test runtime_lifecycle::tests::protocol2_capability_requires_live_actor_and_preserves_error_and_instance_boundaries ... ok
+2026-11-19T04:04:42.3515159Z test mft_read::imp::mft_identity_tests::high_ordinal_is_preserved_but_overflow_does_not_alias ... ok
+2026-11-19T04:04:42.3516938Z test mft_read::imp::mft_identity_tests::lower_or_wrong_record_header_is_not_corroboration ... ok
+2026-11-19T04:04:42.3519412Z test mft_read::imp::mft_identity_tests::partial_inactive_bad_magic_and_zero_sequence_are_not_identity ... ok
+2026-11-19T04:04:42.3525042Z test mft_read::imp::mft_identity_tests::reused_slot_does_not_backfill_a_previous_full_identity ... ok
+2026-11-19T04:04:42.3527685Z test mft_read::imp::mft_identity_tests::uncorroborated_ordinal_is_not_a_full_frn_metadata_hit ... ok
