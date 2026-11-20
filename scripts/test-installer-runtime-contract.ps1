@@ -4,7 +4,7 @@ $ErrorActionPreference='Stop'
 $path=Join-Path $PSScriptRoot '..\installer\upgrade-transaction.ps1'
 $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors)
 if($errors.Count){throw ($errors|Out-String)}
-foreach($name in @('Invoke-Rollback','Restore-OriginalRuntime')){
+foreach($name in @('Resolve-UpgradeServiceStart','Resolve-RollbackRuntime','Invoke-Rollback','Restore-OriginalRuntime')){
  $node=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst]},$true)|Where-Object {$_.Name -eq $name})
  if($node.Count -ne 1){throw 'Missing exact production function'}
  Invoke-Expression $node[0].Extent.Text
@@ -38,5 +38,20 @@ try{
   else{Assert $failed 'Unsafe state was incorrectly accepted';Assert (-not $script:events.Contains('restore') -and -not $script:events.Contains('rolled_back')) 'Failure must never claim old-set restore or recovery'}
   $rows+=@{case=$case;passed=$true;kind='pure production state-order unit, not native acceptance';events=@($script:events.ToArray())}
  }
+ Assert ((Resolve-UpgradeServiceStart $true $true 'Manual' 'Stopped') -eq 'start-prior-running') 'Previously running service must still restart'
+ Assert ((Resolve-UpgradeServiceStart $true $false 'Auto' 'Stopped') -eq 'start-automatic') 'Stopped automatic service must start after a successful upgrade'
+ Assert ((Resolve-UpgradeServiceStart $true $false 'Automatic' 'Stopped') -eq 'start-automatic') 'Automatic startup alias must start'
+ Assert ((Resolve-UpgradeServiceStart $true $false 'Manual' 'Stopped') -eq 'leave-stopped') 'Previously stopped manual service must stay stopped'
+ Assert ((Resolve-UpgradeServiceStart $true $false 'Disabled' 'Stopped') -eq 'leave-stopped') 'Disabled service must stay stopped'
+ Assert ((Resolve-UpgradeServiceStart $false $false 'Auto' 'Stopped') -eq 'skip-absent') 'A service created in this transaction is not this decision'
+ $runningHandoff=$false;try{Resolve-UpgradeServiceStart $true $true 'Auto' 'Running'}catch{$runningHandoff=$true};Assert $runningHandoff 'A previously running service must still be stopped before the candidate starts'
+ Assert ((Resolve-RollbackRuntime $true 'Stopped') -eq 'start') 'Rollback must restart a service that was running before install'
+ Assert ((Resolve-RollbackRuntime $false 'Stopped') -eq 'leave-stopped') 'Rollback must not start a service that was stopped before install'
+ Assert ((Resolve-RollbackRuntime $false 'Running') -eq 'leave-stopped') 'Rollback must not keep a candidate started only because startup was automatic'
+ $script:events=[Collections.Generic.List[string]]::new();$script:serviceState='Running';$script:missing=$false;$script:receiptFails=$false;$script:healthFails=$false
+ $script:s=[pscustomobject]@{state='installed';backupVerified=$true;candidateServiceStarted=$true;createdService=$false;serviceName='NotARealService';pipeName='NotARealPipe';expectedVersion='2.5.3';timeoutSeconds=1;roots=[pscustomobject]@{app='not-a-real-app';data='not-a-real-index'};platform=$null;terminalHandoff=[pscustomobject]@{stage='stopped'};original=[pscustomobject]@{serviceExists=$true;serviceRunning=$false;guiRunning=$false;guiExitRequested=$false;serviceStartMode='Auto'}}
+ Invoke-Rollback
+ Assert ($script:s.state -eq 'rolled_back' -and $script:events.IndexOf('receipt') -ge 0 -and $script:events.IndexOf('receipt') -lt $script:events.IndexOf('restore') -and -not $script:events.Contains('start')) 'Rollback of an automatic start must stop the candidate and restore the prior stopped state'
+ $rows+=@{case='stopped-automatic-upgrade-and-rollback';passed=$true;kind='pure production decision unit, not native SCM acceptance';events=@($script:events.ToArray())}
  $rows|ConvertTo-Json -Depth 8
 }finally{if(Test-Path $TransactionRoot){Remove-Item -LiteralPath $TransactionRoot -Recurse -Force}}

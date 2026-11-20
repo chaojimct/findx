@@ -102,11 +102,32 @@ function Stop-ExactService {
   Wait-ServiceStopped ([int]$v.ProcessId)
  }
 }
+function Resolve-UpgradeServiceStart {
+ param([bool]$Exists,[bool]$WasRunning,[string]$StartMode,[string]$State)
+ if(-not $Exists){ return 'skip-absent' }
+ if($WasRunning){
+  if($State -ne 'Stopped'){ throw 'Original running-service handoff changed before candidate start' }
+  return 'start-prior-running'
+ }
+ # A successful upgrade of the standard automatic service must not preserve a
+ # pre-install STOPPED state. Manual and disabled services stay stopped.
+ if(($StartMode -eq 'Auto' -or $StartMode -eq 'Automatic') -and $State -eq 'Stopped'){ return 'start-automatic' }
+ return 'leave-stopped'
+}
+function Resolve-RollbackRuntime {
+ param([bool]$WasRunning,[string]$State)
+ if($WasRunning -and $State -eq 'Stopped'){ return 'start' }
+ if($WasRunning -and $State -ne 'Running'){ throw 'Original service is still transitioning; runtime recovery not confirmed' }
+ # Includes an automatic service this upgrade started and rollback already stopped.
+ return 'leave-stopped'
+}
 function Restore-OriginalRuntime {
  $v=Get-ExactService
  if($script:s.original.serviceExists -and -not $v){throw 'Original service registration missing; runtime recovery not confirmed'}
  if($script:s.PSObject.Properties.Name -contains 'terminalHandoff' -and $script:s.terminalHandoff -and $script:s.terminalHandoff.stage -notin @('stopped','cancelled')){throw 'Terminal handoff remains uncertain/committed and sealed; RAM retained, runtime restoration NOT claimed'}
- if($script:s.original.serviceRunning -and $v -and $v.State -eq 'Stopped'){
+ $state=if($v){[string]$v.State}else{'Missing'}
+ $runtime=Resolve-RollbackRuntime ([bool]$script:s.original.serviceRunning) $state
+ if($runtime -eq 'start'){
   Start-Service -Name $script:s.serviceName
   $controller=[ServiceProcess.ServiceController]::new($script:s.serviceName)
   try{$controller.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running,[TimeSpan]::FromSeconds($script:s.timeoutSeconds))}finally{$controller.Dispose()}
@@ -114,7 +135,6 @@ function Restore-OriginalRuntime {
  }
  $v=Get-ExactService
  if($script:s.original.serviceRunning -and $v -and $v.State -ne 'Running'){throw 'Original service is still transitioning; runtime recovery not confirmed'}
- # Existing stopped services are deliberately NOT started.
  if($script:s.original.guiRunning -and $script:s.original.guiExitRequested -and (Get-InstalledGui).Count -eq 0){[IO.File]::WriteAllText((Join-Path $TransactionRoot 'restart-original-user-gui.flag'),(Join-Path $script:s.roots.app 'FindX.exe'))}
 }
 function Get-InstalledGui {
@@ -382,12 +402,25 @@ try{
      [IO.File]::WriteAllText((Join-Path $TransactionRoot 'service-uninitialized.flag'),'RegisteredStopped: no index; initialize explicitly in FindX settings')
     }
    }
-   if($script:s.original.serviceExists -and $script:s.original.serviceRunning){
+   if($script:s.original.serviceExists){
     $existing=Get-ExactService
-    if(-not $existing -or $existing.State -ne 'Stopped'){throw 'Original running-service handoff changed before candidate start'}
-    $script:s.candidateServiceStarted=$true;Save-State
-    Start-Service -Name $script:s.serviceName
-    Wait-NewServiceReady
+    $state=if($existing){[string]$existing.State}else{'Missing'}
+    $decision=Resolve-UpgradeServiceStart $true ([bool]$script:s.original.serviceRunning) ([string]$script:s.original.serviceStartMode) $state
+    if($decision -eq 'start-prior-running'){
+     $script:s.candidateServiceStarted=$true;Save-State
+     Start-Service -Name $script:s.serviceName
+     Wait-NewServiceReady
+    }elseif($decision -eq 'start-automatic'){
+     # Index bytes were already validated offline. Reach SCM Running, then commit.
+     # A still-loading index is not a failed upgrade. Rollback stops this candidate
+     # and leaves the exact prior stopped state.
+     $script:s.candidateServiceStarted=$true;Save-State
+     Start-Service -Name $script:s.serviceName
+     $controller=[ServiceProcess.ServiceController]::new($script:s.serviceName)
+     try{$controller.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running,[TimeSpan]::FromSeconds($script:s.timeoutSeconds))}finally{$controller.Dispose()}
+     $started=Get-ExactService
+     if(-not $started -or $started.State -ne 'Running'){throw 'Automatic service did not reach Running; previous stopped state will be restored'}
+    }
    }
    Verify-GuiHealth
    if($script:s.fault -eq 'health'){if($script:s.testBuild){[IO.File]::WriteAllText((Join-Path $script:s.roots.data 'index.bin'),'deliberately damaged CI fixture only')};throw 'Injected CI post-copy health failure'}
