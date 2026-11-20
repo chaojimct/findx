@@ -20,8 +20,22 @@ pub fn entry_visible(show_hidden: bool, hidden: bool, entry: &str, reveal: Optio
     reveal.is_some_and(|target| same_locate_path(entry, target))
 }
 fn same_locate_path(a: &str, b: &str) -> bool {
-    let norm = |s: &str| s.replace('/', "\\").trim_end_matches(['\\', '/']).to_lowercase();
-    norm(a) == norm(b)
+    normalize_locate_path(a) == normalize_locate_path(b)
+}
+
+/// `canonicalize` on Windows returns `\\?\` verbatim paths. Locate focus is the
+/// path the user clicked, so both forms have to compare equal. UNC is stripped
+/// before the plain `\\?\` prefix. This matches `display_path` / `key`.
+fn normalize_locate_path(path: &str) -> String {
+    let path = path.replace('/', "\\");
+    let path = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        path
+    };
+    path.trim_end_matches('\\').to_lowercase()
 }
 pub fn list_with_hidden(
     path: &Path,
@@ -479,7 +493,22 @@ pub fn standard_locations() -> Vec<(&'static str, &'static str, PathBuf)> {
 
 #[cfg(test)]
 mod locate_visibility_tests {
-    use super::entry_visible;
+    use super::{entry_visible, same_locate_path};
+    #[test]
+    fn verbatim_prefix_matches_the_path_the_user_clicked() {
+        assert!(same_locate_path(
+            r"\\?\C:\Users\foo\hidden.txt",
+            r"C:\Users\foo\hidden.txt"
+        ));
+        assert!(same_locate_path(
+            r"\\?\UNC\server\share\a",
+            r"\\server\share\a"
+        ));
+        assert!(!same_locate_path(
+            r"\\?\C:\Users\foo\hidden.txt",
+            r"C:\Users\foo\other.txt"
+        ));
+    }
     #[test]
     fn hidden_target_is_listed_only_when_it_is_the_locate_focus() {
         assert!(!entry_visible(false, true, r"C:\Users\.conda", None));
