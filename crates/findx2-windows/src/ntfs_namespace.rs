@@ -128,6 +128,40 @@ fn map_event_parent(ev: &ChangeEvent, map: &std::collections::HashMap<u64, u64>)
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JournalDirectory<'a> {
+    pub parent: u64,
+    pub name: &'a str,
+    pub attrs: u32,
+}
+
+/// A directory create already present in this batch. Its name and parent came
+/// from the journal, so resolving it does not require opening the object.
+/// A non-directory, or a 128-bit identity, is not usable here.
+pub(crate) fn journal_directory<'a>(events: &'a [ChangeEvent], pending: &'a [ChangeEvent], id: u64) -> Option<JournalDirectory<'a>> {
+    events.iter().chain(pending.iter()).find_map(|ev| match ev {
+        ChangeEvent::CreatePending { file_id, file_id_128, parent_id, name, attrs, is_dir: true } if *file_id == id => {
+            if file_id_128.is_some_and(|raw| raw[8..].iter().any(|b| *b != 0)) { None }
+            else { Some(JournalDirectory { parent: *parent_id, name: name.as_str(), attrs: *attrs }) }
+        }
+        ChangeEvent::Create { entry } if entry.is_dir && entry.file_id == id => {
+            if entry.file_id_128.is_some_and(|raw| raw[8..].iter().any(|b| *b != 0)) { None }
+            else { Some(JournalDirectory { parent: entry.parent_id, name: entry.name.as_str(), attrs: entry.attrs }) }
+        }
+        _ => None,
+    })
+}
+
+pub(crate) fn parent_probe_required(already_resolved: bool) -> bool { !already_resolved }
+
+pub(crate) fn prefix_defines_dir(prefix: &[ChangeEvent], id: u64) -> bool {
+    prefix.iter().any(|ev| match ev {
+        ChangeEvent::Create { entry } => entry.is_dir && entry.file_id == id,
+        ChangeEvent::CreatePending { file_id, is_dir: true, .. } => *file_id == id,
+        _ => false,
+    })
+}
+
 fn retarget_file_id(ev: &ChangeEvent, id: u64) -> ChangeEvent {
     match ev {
         ChangeEvent::CreatePending { file_id, file_id_128, parent_id, name, attrs, is_dir } => ChangeEvent::CreatePending {
@@ -221,10 +255,22 @@ mod windows_resolver {
   }
   // Native full identity and hardlink parent identity, never a basename/path guess.
   // Results remain scratch until the caller's generation-bound atomic commit.
-  fn recover_parent(&mut self,id:u64,known:&impl Fn(u64)->bool,prefix:&mut Vec<ChangeEvent>,visiting:&mut std::collections::HashSet<u64>)->Result<bool,NamespaceResolveError>{
-   if prefix.iter().any(|e|matches!(e,ChangeEvent::Create{entry} if entry.is_dir&&entry.file_id==id)){return Ok(true);}
+  fn recover_parent(&mut self,id:u64,known:&impl Fn(u64)->bool,prefix:&mut Vec<ChangeEvent>,visiting:&mut std::collections::HashSet<u64>,events:&[ChangeEvent],pending:&[ChangeEvent])->Result<bool,NamespaceResolveError>{
+   if super::prefix_defines_dir(prefix,id){return Ok(true);}
    if id>>48==0{return Err("unqualified ordinary parent identity".into());}
    if prefix.len()>=64||visiting.len()>=64||!visiting.insert(id){return Err("ordinary parent chain cyclic or exceeds bounded64; cursor retained".into());}
+   // The journal already names this directory and its parent. FILE_READ_ATTRIBUTES
+   // can return ACCESS_DENIED without proving the record is gone. Do not open it,
+   // and do not invent a parent that the journal did not supply.
+   if !super::parent_probe_required(known(id)){visiting.remove(&id);return Ok(true);}
+   if let Some(dir)=super::journal_directory(events,pending,id){
+    if dir.parent!=id && self.recover_parent(dir.parent,known,prefix,visiting,events,pending)? {
+     if !super::prefix_defines_dir(prefix,id){
+      prefix.push(ChangeEvent::CreatePending{file_id:id,file_id_128:None,parent_id:dir.parent,name:dir.name.to_string(),attrs:dir.attrs,is_dir:true});
+     }
+     visiting.remove(&id);return Ok(true);
+    }
+   }
    self.bind_candidate(id)?;
    if self.bound.is_some_and(|b|b.parent==id){visiting.remove(&id);return Ok(false);}
    let h=match super::open_file_by_id_access(self.handle,id,windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES.0){Ok(h)=>h,Err(e)=>{
@@ -238,7 +284,7 @@ mod windows_resolver {
    let mut links=self.ordinary_links(id,binding)?;let meta=self.last_metadata;
    links.sort_by_key(|l|!known(l.parent));
    for link in links {
-    if self.recover_parent(link.parent,known,prefix,visiting)? {
+    if self.recover_parent(link.parent,known,prefix,visiting,events,pending)? {
      let(size,mtime,ctime,attrs)=meta.ok_or("recovered ordinary parent lacks verified metadata")?;
      prefix.push(ChangeEvent::Create{entry:findx2_core::RawEntry{file_id:id,file_id_128:None,parent_id:link.parent,name:link.name,size,mtime,ctime,attrs,is_dir:true}});
      visiting.remove(&id);return Ok(true);
@@ -271,11 +317,11 @@ mod windows_resolver {
    let events:Vec<ChangeEvent>=events.iter().map(|ev| super::map_event_parent(ev,&parent_map)).collect();
    let pending:Vec<ChangeEvent>=pending.iter().map(|ev| super::map_event_parent(ev,&parent_map)).collect();
    let mut prefix=Vec::new();
-   for parent in canonical_missing{self.recover_parent(parent,&known_parent,&mut prefix,&mut std::collections::HashSet::new()).map_err(|e|super::annotate(e,"parent",parent,None,&events,&pending))?;}
+   for parent in canonical_missing{self.recover_parent(parent,&known_parent,&mut prefix,&mut std::collections::HashSet::new(),&events,&pending).map_err(|e|super::annotate(e,"parent",parent,None,&events,&pending))?;}
    let mut result=Vec::new();
    for (index,ev) in events.iter().chain(pending.iter()).enumerate(){
     let parent=match ev{ChangeEvent::CreatePending{parent_id,..}=>Some(*parent_id),ChangeEvent::Rename{new_parent_id,..}=>Some(*new_parent_id),_=>None};
-    let resolved=parent.is_none_or(|id|known_parent(id)||prefix.iter().any(|e|matches!(e,ChangeEvent::Create{entry} if entry.is_dir&&entry.file_id==id)));
+    let resolved=parent.is_none_or(|id|known_parent(id)||super::prefix_defines_dir(&prefix,id));
     let internal=parent.is_some_and(|id|self.bound.is_some_and(|b|b.parent==id));
     let original_parent_remapped=match ev{
      ChangeEvent::CreatePending{parent_id,..}=>parent_map.values().any(|base| base==parent_id),
@@ -304,7 +350,7 @@ mod windows_resolver {
      links.sort_by_key(|l|!known_parent(l.parent));let mut chosen=None;let mut ordinary_seen=false;
      for link in links {
       self.bind_candidate(link.parent).map_err(|e|super::annotate(e,"hardlink-parent",link.parent,Some(ev),&[],&[]))?;if self.bound.is_some_and(|b|b.parent==link.parent){continue;}
-      ordinary_seen=true;if self.recover_parent(link.parent,&known_parent,&mut prefix,&mut std::collections::HashSet::new()).map_err(|e|super::annotate(e,"hardlink-parent",link.parent,Some(ev),&[],&[]))?{chosen=Some(link);break;}
+      ordinary_seen=true;if self.recover_parent(link.parent,&known_parent,&mut prefix,&mut std::collections::HashSet::new(),&events,&pending).map_err(|e|super::annotate(e,"hardlink-parent",link.parent,Some(ev),&[],&[]))?{chosen=Some(link);break;}
      }
      if let Some(link)=chosen {
       if known_identity(id){result.push(ChangeEvent::Rename{file_id:id,new_parent_id:link.parent,new_name:link.name});}
@@ -389,6 +435,39 @@ mod tests {
   assert!(!text.contains("Users")&&!text.contains('\\')&&!text.contains(':'),"{text}");
  }
  #[test]fn several_links_preserve_exact_case(){let links=[OrdinaryLink{parent:900,name:"internal".into()},OrdinaryLink{parent:2,name:"KeepCASE.bin".into()},OrdinaryLink{parent:3,name:"other.bin".into()}];let v=rewrite_bound_event(b(),b'C',1,7,&ev(900),Some(&links)).unwrap();assert!(matches!(&v[0],ChangeEvent::Rename{new_name,new_parent_id:2,..} if new_name=="KeepCASE.bin"));}
+ #[test]
+ fn access_denied_parent_uses_the_journal_directory_and_keeps_the_base() {
+  const FILE: u64 = 0x3600000004421e;
+  const PARENT: u64 = 0x470000002d1a80;
+  const BASE: u64 = 0x0005_0000_0008_5567;
+  const CHILD: u64 = 0x0001_0000_0004_421f;
+  let name = "21d9a857-8903-45c7-a571-052b561452f4";
+  let dir = ChangeEvent::CreatePending { file_id: FILE, file_id_128: None, parent_id: PARENT, name: name.into(), attrs: 0x10, is_dir: true };
+  let child = ChangeEvent::CreatePending { file_id: CHILD, file_id_128: None, parent_id: FILE, name: "child.tmp".into(), attrs: 0, is_dir: false };
+  let found = journal_directory(std::slice::from_ref(&dir), &[], FILE).unwrap();
+  assert_eq!(found.parent, PARENT);
+  assert_eq!(found.name, name);
+  let file_only = ChangeEvent::CreatePending { file_id: FILE, file_id_128: None, parent_id: PARENT, name: name.into(), attrs: 0, is_dir: false };
+  assert!(journal_directory(std::slice::from_ref(&file_only), &[], FILE).is_none());
+  let root = findx2_core::platform::RawEntry { file_id: 1, file_id_128: None, parent_id: 0, name: String::new(), size: 0, mtime: 0, ctime: 0, attrs: 0x10, is_dir: true };
+  let parent = findx2_core::platform::RawEntry { file_id: PARENT, file_id_128: None, parent_id: 1, name: "parent".into(), size: 0, mtime: 0, ctime: 0, attrs: 0x10, is_dir: true };
+  let base = findx2_core::platform::RawEntry { file_id: BASE, file_id_128: None, parent_id: 1, name: "Microsoft.VisualStudio.WebToolsExtensions.vsix".into(), size: 9, mtime: 0, ctime: 0, attrs: 0, is_dir: false };
+  let store = findx2_core::IndexBuilder::new(b'C', 1, 7, 10).build_from_raw(vec![base], vec![root, parent], false).unwrap();
+  let engine = findx2_core::SearchEngine::new(store);
+  engine.enable_usage(1024 * 1024).unwrap();
+  let events = [dir, child];
+  assert!(engine.namespace_parent_resolvable(b'C', FILE, &events));
+  assert!(!parent_probe_required(true));
+  assert!(parent_probe_required(false));
+  engine.apply_volume_batch(b'C', &events, 7, 20).unwrap();
+  let g = engine.index_store();
+  assert_eq!(g.volumes[0].last_usn, 20);
+  assert!(g.dir_on_volume(b'C', FILE).is_some());
+  assert!(g.entry_on_volume(b'C', CHILD).is_some());
+  let base_idx = g.entry_on_volume(b'C', BASE).unwrap() as usize;
+  assert!(!g.entries[base_idx].is_deleted());
+  assert_eq!(g.name_bytes(&g.entries[base_idx]), b"Microsoft.VisualStudio.WebToolsExtensions.vsix");
+ }
 }
 
 #[cfg(test)]mod hardlink_buffer_tests{
