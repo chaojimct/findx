@@ -7,7 +7,7 @@ use gpui_kit::component::switch::Switch;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::scroll::ScrollableElement;
-use gpui_kit::component::{Disableable as _, Selectable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Selectable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -642,7 +642,7 @@ impl Render for SettingsWindow {
                     .min_h_0()
                     .overflow_y_scrollbar()
                     .p_6()
-                    .child(body),
+                    .child(h_flex().w_full().justify_center().child(body)),
             );
         v_flex()
             .size_full()
@@ -703,62 +703,74 @@ impl SettingsWindow {
                         "选择后立即预览，取消或丢弃可还原。",
                         tokens,
                     ))
-                    .child(h_flex().gap_3().children(ThemeStyle::ALL.into_iter().map(
+                    .child(h_flex().w_full().gap_3().items_stretch().children(ThemeStyle::ALL.into_iter().map(
                         |(style, label)| {
                             let p = FindxTokens::for_style(style, dark);
                             let selected = self.style == style;
-                            Button::new(SharedString::from(format!("theme-style-{label}")))
-                                .ghost()
-                                .accessibility_label(format!("主题风格：{label}"))
-                                .selected(selected)
-                                .h(px(136.))
-                                .flex_shrink_0()
+                            div()
+                                .id(SharedString::from(format!("theme-style-{label}")))
+                                .flex()
                                 .flex_col()
-                                .w(px(200.))
+                                .flex_1()
+                                .min_w_0()
+                                .h(px(156.))
+                                .overflow_hidden()
                                 .p_3()
-                                .gap_3()
+                                .gap_2()
                                 .rounded_lg()
                                 .border_2()
                                 .border_color(if selected { tokens.accent } else { tokens.border })
                                 .bg(p.bg)
                                 .cursor_pointer()
                                 .child(
-                                    v_flex().w_full().items_center().child(
-                                        h_flex()
-                                            .w(px(168.))
-                                            .h(px(72.))
-                                            .rounded_md()
-                                            .overflow_hidden()
-                                            .border_1()
-                                            .border_color(p.border)
-                                            .child(div().w(px(34.)).h_full().bg(p.surface))
-                                            .child(
-                                                v_flex()
-                                                    .flex_1()
-                                                    .p_2()
-                                                    .gap_2()
-                                                    .child(div().h(px(8.)).w_full().bg(p.surface))
-                                                    .child(div().h(px(8.)).w(px(72.)).bg(p.row_selected))
-                                                    .child(div().h(px(8.)).w(px(92.)).bg(p.border_soft)),
-                                            ),
-                                    ),
+                                    h_flex()
+                                        .w_full()
+                                        .h(px(88.))
+                                        .flex_shrink_0()
+                                        .rounded_md()
+                                        .overflow_hidden()
+                                        .border_1()
+                                        .border_color(p.border)
+                                        .child(div().w(px(34.)).h_full().flex_shrink_0().bg(p.surface))
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .p_2()
+                                                .gap_2()
+                                                .child(div().h(px(8.)).w_full().bg(p.surface))
+                                                .child(div().h(px(8.)).w(px(72.)).bg(p.row_selected))
+                                                .child(div().h(px(8.)).w(px(92.)).bg(p.border_soft)),
+                                        ),
                                 )
                                 .child(
-                                    h_flex().h(px(20.)).items_center().gap_2().child(
-                                        div()
-                                            .id(SharedString::from(format!("theme-check-{label}")))
-                                            .w(px(16.))
-                                            .h(px(16.))
-                                            .flex_shrink_0()
-                                            .when(selected, |slot| {
-                                                slot.child(Icon::new(IconName::Check).size_3())
-                                            }),
-                                    ).child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(p.text_primary)
-                                            .child(label.to_string()),
-                                    ))
+                                    h_flex()
+                                        .h(px(24.))
+                                        .w_full()
+                                        .flex_shrink_0()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .id(SharedString::from(format!("theme-check-{label}")))
+                                                .w(px(16.))
+                                                .h(px(16.))
+                                                .flex_shrink_0()
+                                                .when(selected, |slot| {
+                                                    slot.child(Icon::new(IconName::Check).size_3())
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .text_sm()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .text_color(p.text_primary)
+                                                .child(label.to_string()),
+                                        ),
+                                )
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.style = style;
                                     this.preview_theme(cx);
@@ -798,6 +810,7 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let selected = self.settings.drives.clone();
+        let drive_rows = roots.len().clamp(1, 4) as f32;
         v_flex()
             .w_full()
             .gap_4()
@@ -808,7 +821,7 @@ impl SettingsWindow {
                         "勾选要扫描的磁盘。都不勾选时扫描全部磁盘。保存后，在高级维护中重建才会生效。",
                         tokens,
                     ))
-                    .child(v_flex().id("settings-drives-viewport").h(px(128.)).flex_shrink_0().gap_2().overflow_y_scrollbar()
+                    .child(v_flex().id("settings-drives-viewport").h(px(drive_rows * 40.)).flex_shrink_0().gap_2().overflow_y_scrollbar()
             .when(roots.is_empty(), |this| {
                 this.child(div().text_sm().text_color(tokens.text_tertiary).child("（加载磁盘列表中…）"))
             })
@@ -987,7 +1000,7 @@ impl SettingsWindow {
                 this.autostart_supported = auto.supported && auto.unsupported_reason.is_none();
                 match snapshot {
                     Ok(s) => {
-                        this.service_hint = service_state_label(&s.state).into();
+                        this.service_hint.clear();
                         if this.service_snapshot.is_none()
                             && this.session.read(cx).live
                             && let Ok((interval, backfill, everything)) =
@@ -1901,7 +1914,7 @@ fn section_title(text: &str, tokens: FindxTokens) -> impl IntoElement {
 }
 
 fn settings_page() -> Div {
-    v_flex().w_full().max_w(px(720.)).gap_4()
+    v_flex().w(px(960.)).max_w_full().gap_4()
 }
 
 fn settings_card(tokens: FindxTokens) -> Div {

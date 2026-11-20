@@ -2477,7 +2477,8 @@ impl MainWindow {
         let footer = self.session.read(cx).engine_footer.clone();
         let left: String = if self.workspace.mode == ViewMode::Search {
             if !footer.connected {
-                footer.label()
+                // The right-hand indicator already shows 服务未运行 / 未连接 / 连接已断开.
+                String::new()
             } else if self.file_actions.summary.is_empty() {
                 self.search_status.to_string()
             } else {

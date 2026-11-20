@@ -48,7 +48,7 @@ fn settings_identification_keeps_permanent_rows_and_diagnostics_viewport() {
     assert!(!src.contains('·'));
     assert!(!src.contains("render_advanced_tab"));
     assert!(src.contains("fn settings_page"));
-    assert!(src.contains(".max_w(px(720.))"));
+    assert!(src.contains(".w(px(960.)).max_w_full()"));
     assert!(src.contains("theme-check-"));
     assert!(src.contains("id(\"settings-footer-hint\")"));
     assert!(src.contains(".w(px(96.))"));
