@@ -23,8 +23,8 @@ function Journal([string]$root){return (Get-Content -LiteralPath (Join-Path $roo
 function AssertGuiHealth([string]$root){
  $render=Get-Content -LiteralPath (Join-Path $root 'gui-health\render-health.json') -Raw -Encoding UTF8 | ConvertFrom-Json
  $exit=Get-Content -LiteralPath (Join-Path $root 'gui-health\normal-exit.json') -Raw -Encoding UTF8 | ConvertFrom-Json
- Assert ($render.version -eq '2.5.3' -and $render.frames -ge 3 -and $render.storage_ok -and $render.isolated -and $render.normal_quit_requested) 'Actual final GUI render/persistence health missing'
- Assert ($exit.version -eq '2.5.3' -and $exit.passed -and $exit.normal_event_loop_return) 'Actual final GUI normal event-loop return missing'
+ Assert ($render.version -eq '2.5.8' -and $render.frames -ge 3 -and $render.storage_ok -and $render.isolated -and $render.normal_quit_requested) 'Actual final GUI render/persistence health missing'
+ Assert ($exit.version -eq '2.5.8' -and $exit.passed -and $exit.normal_event_loop_return) 'Actual final GUI normal event-loop return missing'
 }
 function AssertIpcHealth([string]$root){
  $health=Get-Content -LiteralPath (Join-Path $root 'service-health.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -137,9 +137,9 @@ foreach($case in $cases){
    }
   }
   if($case -eq 'running253-copy-verification-rollback'){[IO.File]::AppendAllText((Join-Path $stage 'resources\component-manifest.json'),'deliberate-private-copied-payload-corruption')}
-  & $Iscc '/DMyAppVersion=2.5.3' '/DTxTestBuild=1' (('/DMyServiceName=')+$service) (('/DTxPipeName=')+$pipe) ('/DPublishDir='+$stage) ('/O'+$build) (Join-Path $repo 'installer\FindX.iss') *> (Join-Path $root 'compile.log')
+  & $Iscc '/DMyAppVersion=2.5.8' '/DTxTestBuild=1' (('/DMyServiceName=')+$service) (('/DTxPipeName=')+$pipe) ('/DPublishDir='+$stage) ('/O'+$build) (Join-Path $repo 'installer\FindX.iss') *> (Join-Path $root 'compile.log')
   Assert ($LASTEXITCODE -eq 0) 'Official ISS test-mode compilation failed'
-  $setup=Join-Path $build 'FindX-2.5.3-fixture-setup.exe';$fault=if($case -in @('backup-failure','running253-backup-failure')){'backup'}elseif($case -in @('health-rollback','new-service-health-rollback','running253-health-rollback')){'health'}elseif($case -eq 'platform-rollback'){'post-platform'}elseif($case -eq 'stop-timeout'){'stop-timeout'}elseif($case -in @('interrupted-recovery','running253-interrupted-recovery')){'interrupt-after-copy'}else{'none'}
+  $setup=Join-Path $build 'FindX-2.5.8-fixture-setup.exe';$fault=if($case -in @('backup-failure','running253-backup-failure')){'backup'}elseif($case -in @('health-rollback','new-service-health-rollback','running253-health-rollback')){'health'}elseif($case -eq 'platform-rollback'){'post-platform'}elseif($case -eq 'stop-timeout'){'stop-timeout'}elseif($case -in @('interrupted-recovery','running253-interrupted-recovery')){'interrupt-after-copy'}else{'none'}
   $args='/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOICONS /COMPONENTS="main,clicfg" /TASKS="" /DIR="'+$app+'" /TXROOT="'+$tx+'" /TXDATA="'+$data+'" /TXNATIVE="'+$native+'" /TXLEGACY="'+$legacy+'" /TXFAULT='+$fault+' /LOG="'+(Join-Path $root 'setup.log')+'"'
   $group=Join-Path $root 'shortcuts group';$desktop=Join-Path $root 'shortcuts desktop'
   if($ownedVolumeImage){$args+=' /TXIMAGE="'+$ownedVolumeImage+'"'}
