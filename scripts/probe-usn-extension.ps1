@@ -3,12 +3,60 @@
 # hardlink names of one already-known base file. It does not write the journal,
 # the index, or a cursor. UTF-8 BOM is required on Windows PowerShell 5.1.
 param(
+    [switch]$SelfTest,
     [string]$Pipe = "findx2",
     [string]$Volume = "C",
     [string]$Target = "9000000085571",
     [string]$Base = "5000000085567"
 )
 $ErrorActionPreference = "Stop"
+function ConvertTo-ProbeArray($Value) {
+    if ($null -eq $Value) { return @() }
+    $method = $Value.GetType().GetMethod('ToArray', [type[]]@())
+    if ($null -ne $method) { return $method.Invoke($Value, $null) }
+    if ($Value -is [System.Array]) { return $Value }
+    return @($Value)
+}
+function Publish-ProbeResult($Result) {
+    $Result.hits = ConvertTo-ProbeArray $Result.hits
+    $Result.hardlinks = ConvertTo-ProbeArray $Result.hardlinks
+    $file = 0
+    $parent = 0
+    $match = $false
+    foreach ($hit in $Result.hits) {
+        if ($hit.role -eq 'file') { $file++ }
+        if ($hit.role -eq 'parent') { $parent++ }
+        foreach ($link in $Result.hardlinks) {
+            if ($hit.name.Equals([string]$link.name, [StringComparison]::OrdinalIgnoreCase)) { $match = $true }
+        }
+    }
+    $Result.fileHits = $file
+    $Result.parentHits = $parent
+    $Result.fileNameMatchesHardlink = $match
+    $Result | ConvertTo-Json -Depth 6
+}
+if ($SelfTest) {
+    $hits = New-Object System.Collections.Generic.List[object]
+    $hits.Add([pscustomobject]@{ role = 'file'; name = 'ntdll.dll' })
+    $hits.Add([pscustomobject]@{ role = 'parent'; name = 'Windows' })
+    $links = New-Object System.Collections.Generic.List[object]
+    $links.Add([pscustomobject]@{ parent = '0x5'; name = 'NTDLL.DLL' })
+    $stored = [ordered]@{ hits = $hits; hardlinks = $links }
+    if ($PSVersionTable.PSVersion.Major -le 5) {
+        $threw = $false
+        try { foreach ($item in @($stored.hits)) { $null = $item } } catch { $threw = $true }
+        if (-not $threw) { throw 'PS 5.1 did not reject List[object] stored in an ordered dictionary' }
+    }
+    $stored.hits = ConvertTo-ProbeArray $stored.hits
+    $stored.hardlinks = ConvertTo-ProbeArray $stored.hardlinks
+    $json = Publish-ProbeResult $stored
+    if ($stored.fileHits -ne 1 -or $stored.parentHits -ne 1 -or $stored.fileNameMatchesHardlink -ne $true) {
+        throw 'probe array counts failed'
+    }
+    if ($json -notmatch '"fileHits":\s*1' -or $json -notmatch '"parentHits":\s*1') { throw 'probe json counts failed' }
+    Write-Output 'probe-usn-ps51-ok'
+    exit 0
+}
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
@@ -78,9 +126,11 @@ $result = [ordered]@{
     hardlinks = @()
     truncated = $false
 }
+$volumeHandle = $null
+try {
 if ($null -eq $status -or $status.type -ne "status_result") {
     $result.stopped = "live status unavailable"
-    $result | ConvertTo-Json -Depth 6
+    Publish-ProbeResult $result
     exit 0
 }
 $result.checkpoint = [ordered]@{
@@ -94,14 +144,14 @@ $result.checkpoint = [ordered]@{
 }
 if ($liveJournalId -eq 0 -or $liveLast -eq 0) {
     $result.stopped = "live checkpoint is empty"
-    $result | ConvertTo-Json -Depth 6
+    Publish-ProbeResult $result
     exit 0
 }
 $device = "\\.\$letter`:"
 $volumeHandle = Open-Volume $device
 if ($null -eq $volumeHandle) {
     $result.stopped = "volume handle unavailable"
-    $result | ConvertTo-Json -Depth 6
+    Publish-ProbeResult $result
     exit 0
 }
 $query = New-Object byte[] 64
@@ -111,7 +161,7 @@ $ok = [FxUsn]::DeviceIoControl($volumeHandle, [FxUsn]::FSCTL_QUERY, $empty, 0, $
 if (-not $ok -or $got -lt 24) {
     [void][FxUsn]::CloseHandle($volumeHandle)
     $result.stopped = "journal query failed"
-    $result | ConvertTo-Json -Depth 6
+    Publish-ProbeResult $result
     exit 0
 }
 $liveJournal = [BitConverter]::ToUInt64($query, 0)
@@ -121,14 +171,14 @@ $result.journal = [ordered]@{ id = ("0x{0:x}" -f $liveJournal); firstUsn = $firs
 if ($liveJournal -ne $liveJournalId) {
     [void][FxUsn]::CloseHandle($volumeHandle)
     $result.stopped = "live journal id differs from the service checkpoint"
-    $result | ConvertTo-Json -Depth 6
+    Publish-ProbeResult $result
     exit 0
 }
 $start = [BitConverter]::ToInt64([BitConverter]::GetBytes($liveLast), 0)
 if ($start -lt $firstUsn) {
     [void][FxUsn]::CloseHandle($volumeHandle)
     $result.stopped = "checkpoint is below the journal tail; not scanning forward"
-    $result | ConvertTo-Json -Depth 6
+    Publish-ProbeResult $result
     exit 0
 }
 $cursor = $start
@@ -196,7 +246,7 @@ while ($bytesRead -lt 262144 -and $scanned -lt 2048 -and $hits.Count -lt 32) {
 }
 $result.scanned = $scanned
 $result.bytesRead = $bytesRead
-$result.hits = $hits
+$result.hits = ConvertTo-ProbeArray $hits
 $desc = New-Object FxUsn+Desc
 $desc.Size = 24
 $desc.Type = 0
@@ -224,7 +274,7 @@ if (-not [FxUsn]::Invalid($opened)) {
             if ($next -eq 0) { break }
             $at += $next
         }
-        $result.hardlinks = $links
+        $result.hardlinks = ConvertTo-ProbeArray $links
     } else {
         $result.hardlinkStatus = ("0x{0:x8}" -f ($nt -band 0xffffffff))
     }
@@ -232,15 +282,14 @@ if (-not [FxUsn]::Invalid($opened)) {
     $result.hardlinkStatus = "base open failed"
 }
 [void][FxUsn]::CloseHandle($volumeHandle)
-$result.fileNameMatchesHardlink = $false
-foreach ($hit in @($result.hits)) {
-    if ($hit.role -ne "file") { continue }
-    foreach ($link in @($result.hardlinks)) {
-        if ($hit.name.Equals([string]$link.name, [StringComparison]::OrdinalIgnoreCase)) {
-            $result.fileNameMatchesHardlink = $true
-        }
-    }
+$volumeHandle = $null
+Publish-ProbeResult $result
+} catch {
+    if ($null -ne $volumeHandle -and -not [FxUsn]::Invalid($volumeHandle)) { [void][FxUsn]::CloseHandle($volumeHandle) }
+    if (Test-Path variable:hits) { $result.hits = ConvertTo-ProbeArray $hits }
+    if (Test-Path variable:links) { $result.hardlinks = ConvertTo-ProbeArray $links }
+    $msg = [string]$_.Exception.Message
+    if ($msg -match '[A-Za-z]:\\|\\\\|Users\\') { $msg = $_.Exception.GetType().Name }
+    $result.scriptError = $msg
+    Publish-ProbeResult $result
 }
-$result.parentHits = @($result.hits | Where-Object { $_.role -eq "parent" }).Count
-$result.fileHits = @($result.hits | Where-Object { $_.role -eq "file" }).Count
-$result | ConvertTo-Json -Depth 6
