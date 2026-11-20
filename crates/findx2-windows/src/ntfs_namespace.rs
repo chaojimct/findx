@@ -28,6 +28,31 @@ fn open_file_by_id_access(hint:windows::Win32::Foundation::HANDLE,id:u64,access:
 pub struct OrdinaryLink { pub parent:u64, pub name:String }
 #[derive(Clone,Copy,Debug)]
 pub struct UnlinkBinding { pub volume:u8, pub serial:u32, pub journal:u64, pub parent:u64 }
+fn log_basename(name:&str)->String{
+ let base=name.rsplit(['\\','/']).next().unwrap_or(name);
+ let base=base.rsplit(':').next().unwrap_or(base);
+ base.chars().take(80).map(|ch| if ch.is_control(){'?'}else{ch}).collect()
+}
+fn event_parts(ev:&ChangeEvent)->(&'static str,u64,u64,&str){
+ match ev{
+  ChangeEvent::Create{entry}=>("create",entry.file_id,entry.parent_id,entry.name.as_str()),
+  ChangeEvent::CreatePending{file_id,parent_id,name,..}=>("create_pending",*file_id,*parent_id,name.as_str()),
+  ChangeEvent::Rename{file_id,new_parent_id,new_name}=>("rename",*file_id,*new_parent_id,new_name.as_str()),
+  ChangeEvent::Delete{file_id}=>("delete",*file_id,0,""),
+  ChangeEvent::DataOrMeta{file_id,create_if_missing,..}=>("metadata",*file_id,create_if_missing.as_ref().map(|c|c.parent_id).unwrap_or(0),create_if_missing.as_ref().map(|c|c.name.as_str()).unwrap_or("")),
+ }
+}
+fn failure_context(role:&str,frn:u64,explicit:Option<&ChangeEvent>,events:&[ChangeEvent],pending:&[ChangeEvent])->String{
+ let ev=explicit.or_else(||events.iter().chain(pending.iter()).find(|ev|{let(_,file,parent,_)=event_parts(ev);file==frn||parent==frn}));
+ match ev{
+  Some(ev)=>{let(kind,file,parent,name)=event_parts(ev);format!(" role={role} frn={frn:#x} event={kind} file={file:#x} parent={parent:#x} name={}",log_basename(name))},
+  None=>format!(" role={role} frn={frn:#x} event=none file=0 parent=0 name="),
+ }
+}
+fn annotate(err:NamespaceResolveError,role:&str,frn:u64,explicit:Option<&ChangeEvent>,events:&[ChangeEvent],pending:&[ChangeEvent])->NamespaceResolveError{
+ let ctx=failure_context(role,frn,explicit,events,pending);
+ match err{NamespaceResolveError::Retry(s)=>NamespaceResolveError::Retry(format!("{s};{ctx}")),NamespaceResolveError::Unsafe(s)=>NamespaceResolveError::Unsafe(format!("{s};{ctx}")),NamespaceResolveError::EpochChanged(s)=>NamespaceResolveError::EpochChanged(format!("{s};{ctx}"))}
+}
 /// Binding is constructed only after volume/journal/FRN and canonical metadata verification.
 fn rewrite_bound_event(binding:UnlinkBinding,volume:u8,serial:u32,journal:u64,event:&ChangeEvent,ordinary:Option<&[OrdinaryLink]>) -> Result<Vec<ChangeEvent>,String> {
     if binding.volume!=volume || binding.serial!=serial || binding.journal!=journal {return Err("internal namespace binding epoch/volume mismatch; cursor retained".into());}
@@ -231,10 +256,11 @@ mod windows_resolver {
    let mut parent_map=std::collections::HashMap::<u64,u64>::new();
    let mut canonical_missing=Vec::new();
    for parent in missing_parents.iter().copied().take(64){
-    let canon=match self.extension_after_open_failure(parent)?{
+    let opened=self.extension_after_open_failure(parent).map_err(|e|super::annotate(e,"parent",parent,None,events,pending))?;
+    let canon=match opened{
      Some(t)=>match crate::ntfs_witness::extension_action(crate::ntfs_witness::IdRole::Parent,Some(t),false){
       crate::ntfs_witness::ExtensionAction::Retarget(base)=>base,
-      crate::ntfs_witness::ExtensionAction::Retain(reason)=>return Err(NamespaceResolveError::Retry(format!("{reason} parent={parent:#x} base={:#x}; cursor retained",t.base))),
+      crate::ntfs_witness::ExtensionAction::Retain(reason)=>return Err(super::annotate(NamespaceResolveError::Retry(format!("{reason} parent={parent:#x} base_raw={:#x}; cursor retained",t.base)),"parent",parent,None,events,pending)),
       _=>parent,
      },
      None=>parent,
@@ -245,7 +271,7 @@ mod windows_resolver {
    let events:Vec<ChangeEvent>=events.iter().map(|ev| super::map_event_parent(ev,&parent_map)).collect();
    let pending:Vec<ChangeEvent>=pending.iter().map(|ev| super::map_event_parent(ev,&parent_map)).collect();
    let mut prefix=Vec::new();
-   for parent in canonical_missing{self.recover_parent(parent,&known_parent,&mut prefix,&mut std::collections::HashSet::new())?;}
+   for parent in canonical_missing{self.recover_parent(parent,&known_parent,&mut prefix,&mut std::collections::HashSet::new()).map_err(|e|super::annotate(e,"parent",parent,None,&events,&pending))?;}
    let mut result=Vec::new();
    for (index,ev) in events.iter().chain(pending.iter()).enumerate(){
     let parent=match ev{ChangeEvent::CreatePending{parent_id,..}=>Some(*parent_id),ChangeEvent::Rename{new_parent_id,..}=>Some(*new_parent_id),_=>None};
@@ -257,16 +283,16 @@ mod windows_resolver {
      _=>false,
     };
     if !resolved||internal||original_parent_remapped {
-     let mut id=match ev{ChangeEvent::CreatePending{file_id,file_id_128,..}=>{if file_id_128.is_some_and(|x|x[8..].iter().any(|b|*b!=0)){return Err("full128 namespace recovery unsupported; no low64 alias".into());}*file_id},ChangeEvent::Rename{file_id,..}=>*file_id,_=>unreachable!()};
-     if let Some(t)=self.extension_after_open_failure(id)?{
+     let mut id=match ev{ChangeEvent::CreatePending{file_id,file_id_128,..}=>{if file_id_128.is_some_and(|x|x[8..].iter().any(|b|*b!=0)){return Err(super::annotate("full128 namespace recovery unsupported; no low64 alias".into(),"file",*file_id,Some(ev),&[],&[]));}*file_id},ChangeEvent::Rename{file_id,..}=>*file_id,_=>unreachable!()};
+     if let Some(t)=self.extension_after_open_failure(id).map_err(|e|super::annotate(e,"file",id,Some(ev),&[],&[]))?{
       let binding=UnlinkBinding{volume:self.volume,serial:self.serial,journal:self.journal,parent:u64::MAX};
-      let names=self.ordinary_links(t.base,binding)?;
+      let names=self.ordinary_links(t.base,binding).map_err(|e|super::annotate(e,"file",id,Some(ev),&[],&[]))?;
       let name=match ev{ChangeEvent::CreatePending{name,..}=>name.as_str(),ChangeEvent::Rename{new_name,..}=>new_name.as_str(),_=>""};
       let matched=names.iter().any(|link| link.name.eq_ignore_ascii_case(name));
       match crate::ntfs_witness::extension_action(crate::ntfs_witness::IdRole::File,Some(t),matched){
        crate::ntfs_witness::ExtensionAction::Retarget(base)=>id=base,
-       crate::ntfs_witness::ExtensionAction::Retain(reason)=>return Err(NamespaceResolveError::Retry(format!("{reason} file={id:#x} base={:#x}; cursor retained",t.base))),
-       _=>return Err(NamespaceResolveError::Retry(format!("in-use extension file={id:#x} was not retargeted; cursor retained"))),
+       crate::ntfs_witness::ExtensionAction::Retain(reason)=>return Err(super::annotate(NamespaceResolveError::Retry(format!("{reason} file={id:#x} base_raw={:#x}; cursor retained",t.base)),"file",id,Some(ev),&[],&[])),
+       _=>return Err(super::annotate(NamespaceResolveError::Retry(format!("in-use extension file={id:#x} base_raw={:#x} was not retargeted; cursor retained",t.base)),"file",id,Some(ev),&[],&[])),
       }
      }
      if resolved && !internal {
@@ -274,17 +300,17 @@ mod windows_resolver {
       continue;
      }
      let binding=self.bound.unwrap_or(UnlinkBinding{volume:self.volume,serial:self.serial,journal:self.journal,parent:u64::MAX});
-     let mut links=self.ordinary_links(id,binding)?;let meta=self.last_metadata;
+     let mut links=self.ordinary_links(id,binding).map_err(|e|super::annotate(e,"file-links",id,Some(ev),&[],&[]))?;let meta=self.last_metadata;
      links.sort_by_key(|l|!known_parent(l.parent));let mut chosen=None;let mut ordinary_seen=false;
      for link in links {
-      self.bind_candidate(link.parent)?;if self.bound.is_some_and(|b|b.parent==link.parent){continue;}
-      ordinary_seen=true;if self.recover_parent(link.parent,&known_parent,&mut prefix,&mut std::collections::HashSet::new())?{chosen=Some(link);break;}
+      self.bind_candidate(link.parent).map_err(|e|super::annotate(e,"hardlink-parent",link.parent,Some(ev),&[],&[]))?;if self.bound.is_some_and(|b|b.parent==link.parent){continue;}
+      ordinary_seen=true;if self.recover_parent(link.parent,&known_parent,&mut prefix,&mut std::collections::HashSet::new()).map_err(|e|super::annotate(e,"hardlink-parent",link.parent,Some(ev),&[],&[]))?{chosen=Some(link);break;}
      }
      if let Some(link)=chosen {
       if known_identity(id){result.push(ChangeEvent::Rename{file_id:id,new_parent_id:link.parent,new_name:link.name});}
-      else{let(size,mtime,ctime,attrs)=meta.ok_or("ordinary alias lacks verified metadata")?;result.push(ChangeEvent::Create{entry:findx2_core::RawEntry{file_id:id,file_id_128:None,parent_id:link.parent,name:link.name,size,mtime,ctime,attrs,is_dir:attrs&16!=0}});}
+      else{let(size,mtime,ctime,attrs)=meta.ok_or_else(||super::annotate("ordinary alias lacks verified metadata".into(),"file",id,Some(ev),&[],&[]))?;result.push(ChangeEvent::Create{entry:findx2_core::RawEntry{file_id:id,file_id_128:None,parent_id:link.parent,name:link.name,size,mtime,ctime,attrs,is_dir:attrs&16!=0}});}
      }else if !ordinary_seen&&(internal||meta.is_none()){result.push(ChangeEvent::Delete{file_id:id});}
-     else{return Err(NamespaceResolveError::Retry("live ordinary alias parent unresolved; exact prefix retained".into()));}
+     else{return Err(super::annotate(NamespaceResolveError::Retry("live ordinary alias parent unresolved; exact prefix retained".into()),"file-links",id,Some(ev),&[],&[]));}
     }else if index<events.len(){result.push(ev.clone());}
    }
    prefix.extend(result);let result=prefix;
@@ -355,6 +381,13 @@ mod tests {
  #[test]fn same_name_ordinary_parent_not_filtered(){let e=ev(901);assert!(matches!(rewrite_bound_event(b(),b'C',1,7,&e,Some(&[])).unwrap().as_slice(),[ChangeEvent::CreatePending{parent_id:901,..}]));}
  #[test]fn different_parent_sequence_not_filtered(){let e=ev(900+(1u64<<48));assert!(matches!(rewrite_bound_event(b(),b'C',1,7,&e,Some(&[])).unwrap().as_slice(),[ChangeEvent::CreatePending{..}]));}
  #[test]fn unresolved_links_fail_closed(){assert!(rewrite_bound_event(b(),b'C',1,7,&ev(900),None).is_err());}
+ #[test]fn failure_context_records_role_event_and_basename_only(){
+  let ev=ChangeEvent::CreatePending{file_id:0x0005_0000_0008_5567,file_id_128:None,parent_id:0x0009_0000_0008_5571,name:r"C:\Users\secret\Microsoft.VisualStudio.WebToolsExtensions.vsix".into(),attrs:0,is_dir:false};
+  let text=failure_context("parent",0x0009_0000_0008_5571,None,std::slice::from_ref(&ev),&[]);
+  assert!(text.contains("role=parent")&&text.contains("frn=0x9000000085571")&&text.contains("event=create_pending")&&text.contains("file=0x5000000085567")&&text.contains("parent=0x9000000085571"),"{text}");
+  assert!(text.contains("name=Microsoft.VisualStudio.WebToolsExtensions.vsix"),"{text}");
+  assert!(!text.contains("Users")&&!text.contains('\\')&&!text.contains(':'),"{text}");
+ }
  #[test]fn several_links_preserve_exact_case(){let links=[OrdinaryLink{parent:900,name:"internal".into()},OrdinaryLink{parent:2,name:"KeepCASE.bin".into()},OrdinaryLink{parent:3,name:"other.bin".into()}];let v=rewrite_bound_event(b(),b'C',1,7,&ev(900),Some(&links)).unwrap();assert!(matches!(&v[0],ChangeEvent::Rename{new_name,new_parent_id:2,..} if new_name=="KeepCASE.bin"));}
 }
 
