@@ -198,6 +198,22 @@ pub(crate) fn absent(h:HANDLE,id:u64,expected:Epoch)->Result<bool,E>{
             base.raw, base.ordinal, base.sequence
         )));
     }
+    // The slot now holds a different sequence. OpenFileById of that current
+    // record is the wrong witness: an extension fails with 87, and its base is
+    // not the expired identity. Two stable headers prove only the requested FRN
+    // is gone.
+    if crate::ntfs_witness::frn_ordinal(c.candidate)==crate::ntfs_witness::frn_ordinal(id)
+        && crate::ntfs_witness::frn_sequence(c.candidate)!=crate::ntfs_witness::frn_sequence(id)
+    {
+        let first=header_of(expected.volume.record_bytes,&bytes)?;
+        let again=read_record(h,first.ordinal,expected.volume.record_bytes)?;
+        let second=header_of(expected.volume.record_bytes,&again)?;
+        return match crate::ntfs_witness::reused_sequence_absent(id,first,second){
+            Ok(true)=>{check(h,expected)?;Ok(true)},
+            Ok(false)=>Err(E::Retry(format!("sequence reuse did not prove absence requested={id:#x} current={:#x} base_raw={:#x}; cursor retained",c.candidate,first.base.raw))),
+            Err(reason)=>Err(E::Retry(format!("{reason}; requested={id:#x} current={:#x} base_raw={:#x}; cursor retained",c.candidate,first.base.raw))),
+        };
+    }
     // FSCTL returns the nearest in-use ordinal <= requested. Decoded kernel
     // records can have stale USA tails outside used bytes. Never relax that into
     // a naked lower-record proof: independently reopen its COMPLETE sequence FRN

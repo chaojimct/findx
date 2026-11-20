@@ -189,6 +189,22 @@ pub fn extension_action(
     }
 }
 
+/// The requested full FRN is gone when two reads of its ordinal agree on a
+/// different in-use sequence. The current record and its base are not opened
+/// and are not a retarget. A changed second read keeps the cursor.
+pub fn reused_sequence_absent(requested: u64, first: RecordHeader, second: RecordHeader) -> Result<bool, &'static str> {
+    if frn_sequence(requested) == 0 || frn_ordinal(requested) == 0 {
+        return Err("unqualified requested identity");
+    }
+    if first.ordinal != second.ordinal || first.sequence != second.sequence || first.flags != second.flags || first.base.raw != second.base.raw {
+        return Err("replacement record changed between reads");
+    }
+    if first.ordinal != frn_ordinal(requested) || first.sequence == 0 || first.flags & 1 == 0 {
+        return Ok(false);
+    }
+    Ok(first.sequence != frn_sequence(requested))
+}
+
 /// A reserved in-use record proves a higher slot is free only when a second
 /// record read returns the same full FRN and that ordinal is strictly lower.
 /// Header-only identity of an in-use reserved metadata record. Attribute bodies
@@ -341,6 +357,41 @@ mod tests {
         assert_eq!(parsed.base.raw, base_raw);
         assert_eq!(parsed.base.ordinal, 0x85567);
         assert_eq!(parsed.base.sequence, 5);
+    }
+
+    #[test]
+    fn old_sequence_6_is_absent_without_rebinding_sequence_9_base() {
+        const OLD: u64 = 0x0006_0000_0008_5571;
+        const CURRENT: u64 = 0x0009_0000_0008_5571;
+        const BASE: u64 = 0x0005_0000_0008_5567;
+        let base_raw = u64::from_le_bytes([0x67, 0x55, 0x08, 0x00, 0x00, 0x00, 0x05, 0x00]);
+        assert_eq!(base_raw, BASE);
+        let current = header(0x85571, 9, 1, base_raw);
+        let base = header(0x85567, 5, 1, 0);
+        assert!(reused_sequence_absent(OLD, current, current).unwrap());
+        assert!(!reused_sequence_absent(CURRENT, current, current).unwrap());
+        assert!(reused_sequence_absent(OLD, current, header(0x85571, 10, 1, base_raw)).is_err());
+        assert!(reused_sequence_absent(OLD, current, header(0x85571, 9, 1, 0)).is_err());
+        assert!(corroborated_extension(OLD, current, current, base, current).unwrap().is_none());
+        let live = corroborated_extension(CURRENT, current, current, base, current).unwrap().unwrap();
+        assert_eq!(
+            extension_action(IdRole::File, Some(live), false),
+            ExtensionAction::Retain("in-use extension file name is not a base hardlink")
+        );
+        let root = findx2_core::platform::RawEntry { file_id: 1, file_id_128: None, parent_id: 0, name: String::new(), size: 0, mtime: 0, ctime: 0, attrs: 0x10, is_dir: true };
+        let base_file = findx2_core::platform::RawEntry { file_id: BASE, file_id_128: None, parent_id: 1, name: "Microsoft.VisualStudio.WebToolsExtensions.vsix".into(), size: 1, mtime: 0, ctime: 0, attrs: 0, is_dir: false };
+        let expired = findx2_core::platform::RawEntry { file_id: OLD, file_id_128: None, parent_id: 1, name: "00060000000855717B2A73E5".into(), size: 1, mtime: 0, ctime: 0, attrs: 0, is_dir: false };
+        let store = findx2_core::IndexBuilder::new(b'C', 1, 7, 10).build_from_raw(vec![base_file, expired], vec![root], false).unwrap();
+        let engine = findx2_core::SearchEngine::new(store);
+        engine.enable_usage(1024 * 1024).unwrap();
+        engine.apply_volume_batch(b'C', &[findx2_core::ChangeEvent::Delete { file_id: OLD }], 7, 20).unwrap();
+        let g = engine.index_store();
+        let base_idx = g.entry_on_volume(b'C', BASE).unwrap() as usize;
+        assert!(!g.entries[base_idx].is_deleted());
+        assert_eq!(g.name_bytes(&g.entries[base_idx]), b"Microsoft.VisualStudio.WebToolsExtensions.vsix");
+        let old_idx = g.entry_on_volume(b'C', OLD).unwrap() as usize;
+        assert!(g.entries[old_idx].is_deleted());
+        assert_eq!(g.volumes[0].last_usn, 20);
     }
 
     #[test]
