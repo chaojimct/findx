@@ -552,7 +552,15 @@ function Invoke-Rollback {
   Set-State 'rollback_requested'
   if($script:s.createdService){Stop-ExactService}else{
    $original=Get-ExactService
-   if($original -and -not $script:s.original.serviceRunning -and $original.State -ne 'Stopped'){throw 'Previously stopped service changed externally; not stopped by rollback'}
+   if($original -and $original.State -ne 'Stopped'){
+    # journal 之外的运行态差异不再拒绝整个恢复：中断升级期间外部可能把服务重新拉起
+    # （用户在两次尝试之间手动启动了旧服务，或上一事务收尾未完成）。恢复死事务不能因
+    # 「世界已经往前走」而永远卡死——统一走 SCM 优雅停止（超时仍在 Wait-ServiceStopped
+    # 抛错保底，不强杀）。恢复完成后是否重启由 original.serviceRunning 决定，
+    # 与 journal 快照一致（原本停着的恢复后保持停止）。
+    Stop-ExactService
+    [IO.File]::WriteAllText((Join-Path $TransactionRoot 'rollback-external-service-stop.txt'),('state='+$original.State),[Text.UTF8Encoding]::new($false))
+   }
   }
   if((Get-InstalledGui).Count){throw 'Candidate GUI still active; retained backup, refusing unsafe restore'}
   if($script:s.createdService){

@@ -154,7 +154,19 @@ function Restore-FxTxPlatform($Snapshot,[string]$EvidenceRoot) {
   }
  }finally{$key.Dispose()}
  $key=Open-FxTxRegistry $Snapshot.runSpec
- try{Assert-FxTxSame (Read-FxTxRegistryValue $key 'FindX') $Snapshot.run 'User autostart (installer does not mutate it)'}finally{if($key){$key.Dispose()}}
+ # 自启动值安装器从不改写，也不属于回滚必须恢复的字段。中断升级的收尾期里 GUI 可能
+ # 被用户重新启动过并改写该值——比对失败如果直接抛错，会把整个回滚卡死在
+ # 「永远无法收尾」的死循环（实测 2.5.7 #005 恢复即卡在此处）。改为留证继续：
+ # 保留用户当前的值不动，把差异快照进 EvidenceRoot 供事后核查。
+ try{
+  $now=Read-FxTxRegistryValue $key 'FindX'
+  $expected=$Snapshot.run | ConvertTo-Json -Depth 12 -Compress
+  $actual=$now | ConvertTo-Json -Depth 12 -Compress
+  if($actual -cne $expected){
+   $null=[IO.Directory]::CreateDirectory($EvidenceRoot)
+   [IO.File]::WriteAllText((Join-Path $EvidenceRoot 'autostart-drift.json'),(@{expected=$expected;actual=$actual}|ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($false))
+  }
+ }catch{}finally{if($key){$key.Dispose()}}
  $n=0;foreach($item in $Snapshot.shortcuts){
   $identity=$n;$n++ # Stable leaf identity, even when an earlier leaf is already restored.
   $null=Get-FxTxPath $item.path
