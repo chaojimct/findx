@@ -19,7 +19,7 @@ def validate(root=ROOT, expected=None, require_ready=False):
     native=tomllib.loads((root/'crates/findx2-gui-native/Cargo.toml').read_text(encoding='utf8'))
     if 'pinyin' not in native['features']['default']: errors.append('native default pinyin disabled')
     # 2.5.3 is the sealed payload: its plan and gates stay mandatory.
-    # 2.5.4 and later tags build from this source. They must not require
+    # 2.5.5 and later tags build from this source. They must not require
     # release/<version>.json or the 2.5.3 seal lock.
     plan_path=root/'release'/f'{version}.json'
     if plan_path.exists():
