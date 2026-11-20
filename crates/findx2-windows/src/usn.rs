@@ -490,6 +490,36 @@ pub(crate) fn open_volume_handle(path: &str) -> Result<windows::Win32::Foundatio
     }
 }
 
+/// Hint for `OpenFileById`. Access 0 plus backup semantics, not `GENERIC_READ`.
+/// A `GENERIC_READ` handle on `\\.\C:` is a DASD handle. On the installed system
+/// volume, `OpenFileById` against that handle returns `STATUS_INVALID_PARAMETER`
+/// (`0xC000000D`, win32 87) even for a live base file. USN and FSCTL stay on the
+/// `GENERIC_READ` handle. This matches the reparse opener in `mft.rs`.
+pub(crate) fn open_id_hint_handle(path: &str) -> Result<windows::Win32::Foundation::HANDLE> {
+    let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    let h = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    };
+    match h {
+        Ok(handle) if !handle.is_invalid() => Ok(handle),
+        Ok(handle) => {
+            let _ = unsafe { CloseHandle(handle) };
+            Err(findx2_core::Error::Platform("文件号提示句柄无效".into()))
+        }
+        Err(e) => Err(findx2_core::Error::Platform(format!(
+            "打开文件号提示句柄失败: {e}"
+        ))),
+    }
+}
+
 pub(crate) fn volume_device_path(volume: &str) -> String {
     let v = volume.trim().trim_end_matches('\\');
     if v.len() == 1

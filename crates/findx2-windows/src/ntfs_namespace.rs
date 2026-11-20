@@ -16,7 +16,8 @@ impl FileIdOpenError {
 #[link(name="ntdll")] unsafe extern "system" {fn RtlGetLastNtStatus()->i32;}
 #[cfg(windows)]
 pub(crate) fn open_file_by_id_diagnostic(hint:windows::Win32::Foundation::HANDLE,id:u64)->Result<windows::Win32::Foundation::HANDLE,FileIdOpenError>{
- // DesiredAccess 0 is STATUS_INVALID_PARAMETER (0xC000000D / win32 87) on real NTFS.
+ // The caller must pass the access-0 id hint, not a GENERIC_READ DASD handle.
+ // DesiredAccess here stays FILE_READ_ATTRIBUTES; zero access is not the live failure.
  open_file_by_id_access(hint,id,windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES.0)
 }
 #[cfg(windows)]
@@ -89,21 +90,23 @@ mod windows_resolver {
  #[repr(C)] struct IoStatus { status:usize, information:usize }
  #[link(name="ntdll")]
  extern "system" { fn NtQueryInformationFile(handle:HANDLE,ios:*mut IoStatus,buffer:*mut u8,length:u32,class:u32)->i32; }
- pub struct NtfsUnlinkResolver { handle:HANDLE,volume:u8,serial:u32,journal:u64,epoch:crate::ntfs_identity::Epoch,bound:Option<UnlinkBinding>, last_metadata:Option<(u64,u64,u64,u32)> }
- impl Drop for NtfsUnlinkResolver {fn drop(&mut self){unsafe{let _=CloseHandle(self.handle);}}}
+ pub struct NtfsUnlinkResolver { handle:HANDLE,id_hint:HANDLE,volume:u8,serial:u32,journal:u64,epoch:crate::ntfs_identity::Epoch,bound:Option<UnlinkBinding>, last_metadata:Option<(u64,u64,u64,u32)> }
+ impl Drop for NtfsUnlinkResolver {fn drop(&mut self){unsafe{let _=CloseHandle(self.id_hint);let _=CloseHandle(self.handle);}}}
  impl NtfsUnlinkResolver {
   pub fn new(volume_path:&str,volume:u8,serial:u32,journal:u64)->Result<Self,NamespaceResolveError>{
    if crate::get_volume_serial_number(volume_path).map_err(|e|NamespaceResolveError::Retry(e.to_string()))?!=serial{return Err("namespace volume serial mismatch".into());}
-   let handle=crate::usn::open_volume_handle(&crate::usn::volume_device_path(volume_path)).map_err(|e|NamespaceResolveError::Retry(e.to_string()))?;
+   let device=crate::usn::volume_device_path(volume_path);
+   let handle=crate::usn::open_volume_handle(&device).map_err(|e|NamespaceResolveError::Retry(e.to_string()))?;
    let checked=crate::ntfs_identity::epoch(handle).and_then(|epoch|if epoch.journal!=journal||epoch.volume.serial as u32!=serial{Err("namespace volume/journal identity mismatch".into())}else{Ok(epoch)});
    let epoch=match checked{Ok(e)=>e,Err(e)=>{unsafe{let _=CloseHandle(handle);}return Err(e)}};
-   Ok(Self{handle,volume,serial,journal,epoch,bound:None,last_metadata:None})
+   let id_hint=match crate::usn::open_id_hint_handle(&device){Ok(h)=>h,Err(e)=>{unsafe{let _=CloseHandle(handle);}return Err(NamespaceResolveError::Retry(e.to_string()))}};
+   Ok(Self{handle,id_hint,volume,serial,journal,epoch,bound:None,last_metadata:None})
   }
-  fn open_id(&self,id:u64)->Result<HANDLE,FileIdOpenError>{super::open_file_by_id_diagnostic(self.handle,id)}
+  fn open_id(&self,id:u64)->Result<HANDLE,FileIdOpenError>{super::open_file_by_id_diagnostic(self.id_hint,id)}
   fn bind_candidate(&mut self,parent:u64)->Result<(),NamespaceResolveError>{
    let cached=self.bound.is_some_and(|b|b.parent==parent);
-   let handle=match super::open_file_by_id_access(self.handle,parent,windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES.0){Ok(h)=>h,Err(e)=>{
-    if !cached && e.absence_candidate() && crate::ntfs_identity::absent(self.handle,parent,self.epoch)? {return Ok(());}
+   let handle=match super::open_file_by_id_access(self.id_hint,parent,windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES.0){Ok(h)=>h,Err(e)=>{
+    if !cached && e.absence_candidate() && crate::ntfs_identity::absent(self.handle,self.id_hint,parent,self.epoch)? {return Ok(());}
     return Err(NamespaceResolveError::Retry(format!("parent unavailable: {} win32={} ntstatus={:#x}; exact prefix retained",e.classification(),e.win32,e.native)));
    }};
    let result=(||->Result<_,NamespaceResolveError>{
@@ -125,7 +128,7 @@ mod windows_resolver {
    let handle=match self.open_id(id){
     Ok(h)=>h,
     Err(e) if e.absence_candidate()=>{
-     if crate::ntfs_identity::absent(self.handle,id,self.epoch)? {return Ok(Vec::new());}
+     if crate::ntfs_identity::absent(self.handle,self.id_hint,id,self.epoch)? {return Ok(Vec::new());}
      return Err(NamespaceResolveError::Retry("identity remains live; no deletion proof, batch retained".into()));
     },
     Err(e)=>return Err(NamespaceResolveError::Retry(format!("{} win32={} ntstatus={:#x}; batch retained",e.classification(),e.win32,e.native))),
@@ -156,8 +159,8 @@ mod windows_resolver {
    if prefix.len()>=64||visiting.len()>=64||!visiting.insert(id){return Err("ordinary parent chain cyclic or exceeds bounded64; cursor retained".into());}
    self.bind_candidate(id)?;
    if self.bound.is_some_and(|b|b.parent==id){visiting.remove(&id);return Ok(false);}
-   let h=match super::open_file_by_id_access(self.handle,id,windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES.0){Ok(h)=>h,Err(e)=>{
-    if e.absence_candidate()&&crate::ntfs_identity::absent(self.handle,id,self.epoch)?{visiting.remove(&id);return Ok(false);}
+   let h=match super::open_file_by_id_access(self.id_hint,id,windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES.0){Ok(h)=>h,Err(e)=>{
+    if e.absence_candidate()&&crate::ntfs_identity::absent(self.handle,self.id_hint,id,self.epoch)?{visiting.remove(&id);return Ok(false);}
     return Err(NamespaceResolveError::Retry(format!("ordinary parent unavailable: {} win32={} ntstatus={:#x}",e.classification(),e.win32,e.native)));
    }};
    let mut info=BY_HANDLE_FILE_INFORMATION::default();let result=unsafe{GetFileInformationByHandle(h,&mut info)};unsafe{let _=CloseHandle(h);}result.map_err(|e|NamespaceResolveError::Retry(e.to_string()))?;
@@ -223,21 +226,21 @@ mod windows_resolver {
    let marker=std::fs::read_to_string(format!("{root}.findx-identity-ci-owned")).unwrap();assert_eq!(marker,std::env::var("GITHUB_SHA").unwrap());
    let d=std::path::PathBuf::from(&root).join("owned-identity");std::fs::create_dir(&d).unwrap();let path=d.join("live.txt");std::fs::write(&path,b"public owned identity").unwrap();
    let held=OpenOptions::new().read(true).share_mode(7).open(&path).unwrap();let(id,serial)=identity(&held);
-   let h=crate::usn::open_volume_handle(&crate::usn::volume_device_path(&root)).unwrap();let epoch=crate::ntfs_identity::epoch(h).unwrap();assert_eq!(epoch.volume.serial as u32,serial);
+   let h=crate::usn::open_volume_handle(&crate::usn::volume_device_path(&root)).unwrap();let hint=crate::usn::open_id_hint_handle(&crate::usn::volume_device_path(&root)).unwrap();let epoch=crate::ntfs_identity::epoch(h).unwrap();assert_eq!(epoch.volume.serial as u32,serial);
    let mut resolver=NtfsUnlinkResolver::new(&root,root.as_bytes()[0],serial,epoch.journal).unwrap();let binding=UnlinkBinding{volume:root.as_bytes()[0],serial,journal:epoch.journal,parent:u64::MAX};
-   assert!(!crate::ntfs_identity::absent(h,id,epoch).unwrap());assert!(!resolver.ordinary_links(id,binding).unwrap().is_empty());
+   assert!(!crate::ntfs_identity::absent(h,hint,id,epoch).unwrap());assert!(!resolver.ordinary_links(id,binding).unwrap().is_empty());
    let old=((((id>>48) as u16).wrapping_add(1).max(1) as u64)<<48)|(id&0x0000_ffff_ffff_ffff);
-   assert!(super::super::open_file_by_id_diagnostic(h,old).is_err());assert!(crate::ntfs_identity::absent(h,old,epoch).unwrap());
+   assert!(super::super::open_file_by_id_diagnostic(hint,old).is_err());assert!(crate::ntfs_identity::absent(h,hint,old,epoch).unwrap());
    let alias=d.join("survivor.txt");std::fs::hard_link(&path,&alias).unwrap();drop(held);std::fs::remove_file(&path).unwrap();
    assert!(resolver.ordinary_links(id,binding).unwrap().iter().any(|l|l.name=="survivor.txt"));assert_eq!(std::fs::read(&alias).unwrap(),b"public owned identity");
    std::fs::remove_file(&alias).unwrap();eventually_deleted(&mut resolver,id,binding);
    let p=d.join("pending.txt");std::fs::write(&p,b"pending public").unwrap();let read=OpenOptions::new().read(true).share_mode(7).open(&p).unwrap();let(pid,_)=identity(&read);
    let deleting=OpenOptions::new().access_mode(0x10000|0x80).share_mode(7).open(&p).unwrap();let disposition=windows::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO{DeleteFile:true};
    unsafe{windows::Win32::Storage::FileSystem::SetFileInformationByHandle(fh(&deleting),windows::Win32::Storage::FileSystem::FileDispositionInfo,(&disposition as *const windows::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO).cast(),std::mem::size_of_val(&disposition) as u32)}.unwrap();drop(deleting);
-   let failure=super::super::open_file_by_id_diagnostic(h,pid).unwrap_err();assert_eq!(failure.native,0xc0000056);assert_eq!(failure.classification(),"delete-pending");assert!(!failure.absence_candidate());let error=resolver.ordinary_links(pid,binding).unwrap_err();assert!(error.retryable()&&error.to_string().contains("delete-pending"));
+   let failure=super::super::open_file_by_id_diagnostic(hint,pid).unwrap_err();assert_eq!(failure.native,0xc0000056);assert_eq!(failure.classification(),"delete-pending");assert!(!failure.absence_candidate());let error=resolver.ordinary_links(pid,binding).unwrap_err();assert!(error.retryable()&&error.to_string().contains("delete-pending"));
    drop(read);eventually_deleted(&mut resolver,pid,binding);
    assert!(crate::ntfs_identity::check(h,crate::ntfs_identity::Epoch{journal:epoch.journal.wrapping_add(1),..epoch}).is_err());
-   unsafe{let _=CloseHandle(h);}drop(resolver);std::fs::remove_dir_all(d).unwrap();
+   unsafe{let _=CloseHandle(hint);let _=CloseHandle(h);}drop(resolver);std::fs::remove_dir_all(d).unwrap();
    println!("NAMESPACE_NATIVE_OWNED_PASS live_not_absent=true noncurrent_sequence_proven=true surviving_alias_preserved=true deleted_proven=true real_delete_pending_retained=true repaired_retry=true wrong_epoch_refused=true no_host_volume=true");
   }
  }

@@ -21,7 +21,7 @@ use rayon::prelude::*;
 #[cfg(windows)]
 use windows::core::PCWSTR;
 #[cfg(windows)]
-use windows::Win32::Foundation::{CloseHandle, GENERIC_READ};
+use windows::Win32::Foundation::CloseHandle;
 #[cfg(windows)]
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -103,10 +103,12 @@ pub fn fill_metadata_by_id_pooled(
 
             // 每个 rayon 任务独立打开一次卷句柄；块内 OpenFileById 全部复用它。
             let wide: Vec<u16> = path_owned.encode_utf16().chain(Some(0)).collect();
+            // Access 0, not GENERIC_READ. A DASD volume handle makes OpenFileById
+            // return STATUS_INVALID_PARAMETER (win32 87 / 0xC000000D) on the system volume.
             let vol = unsafe {
                 CreateFileW(
                     PCWSTR(wide.as_ptr()),
-                    GENERIC_READ.0,
+                    0,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     None,
                     OPEN_EXISTING,
