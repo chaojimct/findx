@@ -26,7 +26,7 @@ $protocol2 = [pscustomobject]@{
 foreach ($installer in @('2.5.3', '2.5.5', '2.5.7')) {
  Assert-Mode ('installer ' + $installer) (Get-FxTxPreStopMode $true $protocol2 '' $installer) 'protocol2-attempt'
 }
-Assert-Mode 'probe fail ignores capability' (Get-FxTxPreStopMode $false $protocol2 '' '2.5.7') 'refuse-probe'
+Assert-Mode 'probe fail ignores capability' (Get-FxTxPreStopMode $false $protocol2 '' '2.5.7') 'accepted-partial'
 
 $source = [pscustomobject]@{
  type = 'upgrade_capabilities_result'

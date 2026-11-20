@@ -84,7 +84,28 @@ function Invoke-FxTxVersionProbe([string]$Image){
 function Test-FxTxCoherentGeneration([string]$Index,[string]$Label){
  $v6=$Index+'.v6'
  $pointerPath=Join-Path $v6 'published.json'
- if(-not (Test-Path -LiteralPath $pointerPath)){throw ($Label+'没有已发布的索引代，已拒绝。本次未替换。')}
+ if(-not (Test-Path -LiteralPath $pointerPath)){
+  # 2.4.x 及更早的 legacy 平铺 v6：没有 published.json / gen 目录，代数与文件表以
+  # 根 manifest.json 为准。这里只做与 gen 路径等价的离线只读核对：manifest 完整、
+  # 六个分段文件存在且长度不小于 manifest 计数（与加载器 read_section_in 的截断
+  # 语义一致），不写任何文件。此分支服务于「运行中的 2.4.x 旧服务」停机前后的
+  # 代数核对——否则 accepted-partial 停机会对 legacy 库永远误拒。
+  $legacy=Join-Path $v6 'manifest.json'
+  if(-not (Test-Path -LiteralPath $legacy)){throw ($Label+'没有已发布的索引代，已拒绝。本次未替换。')}
+  if((Get-Item -LiteralPath $legacy).Length -gt 1048576){throw ($Label+'legacy manifest 超出上限，已拒绝。本次未替换。')}
+  $m=Get-Content -LiteralPath $legacy -Raw -Encoding UTF8|ConvertFrom-Json
+  if($m.version -ne 6 -or [uint64]$m.generation -lt 1){throw ($Label+'legacy manifest 不是完整 v6，已拒绝。本次未替换。')}
+  $entries=[uint64]$m.entry_count;$dirs=[uint64]$m.dir_count;$names=[uint64]$m.names_len;$paths=[uint64]$m.dir_paths_len
+  $expect=@{'entries.dat'=($entries*32);'frns.dat'=($entries*8);'dirs.dat'=($dirs*24);'ranges.dat'=($dirs*8);'names.dat'=$names;'dirpaths.dat'=$paths}
+  foreach($name in @($expect.Keys|Sort-Object)){
+   $p=Join-Path $v6 $name
+   if(-not (Test-Path -LiteralPath $p)){throw ($Label+'缺少 v6 分段文件 '+$name+'，已拒绝。本次未替换。')}
+   if([uint64](Get-Item -LiteralPath $p).Length -lt [uint64]$expect[$name]){throw ($Label+'v6 分段长度小于 manifest 计数: '+$name+'。本次未替换。')}
+  }
+  $ready=$false
+  if(@($m.PSObject.Properties.Name) -contains 'metadata_ready' -and $null -ne $m.metadata_ready){$ready=[bool]$m.metadata_ready}
+  return [pscustomobject]@{generation=[uint64]$m.generation;metadataReady=$ready;files=6;directory=$v6;legacyFlat=$true}
+ }
  if((Get-Item -LiteralPath $pointerPath).Length -gt 1048576){throw ($Label+'published.json 超出上限，已拒绝。本次未替换。')}
  $pointer=Get-Content -LiteralPath $pointerPath -Raw -Encoding UTF8|ConvertFrom-Json
  if($pointer.format -ne 'v6-gen' -or $pointer.manifest.version -ne 6 -or [decimal]$pointer.manifest.generation -lt 1){throw ($Label+'published.json 不是完整 v6 代，已拒绝。本次未替换。')}
@@ -159,12 +180,20 @@ function Invoke-FxTxPreparedServiceStop([string]$ServiceName,[string]$PipeName,[
  $observed=(($probe.text -split '\r?\n' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1))
  @{exitCode=$probe.exitCode;text=$probe.text;observedVersion=[string]$observed;installerVersion=$ExpectedVersion;protocol2Proof=$false}|ConvertTo-Json|Set-Content -Encoding UTF8 (Join-Path $Evidence 'installer-version-probe.json')
  $probeOk=Test-FxTxServiceVersionProbe $probe.text $probe.exitCode
- if(-not $probeOk){throw 'Legacy running service has no verified protocol2; refused BEFORE STOP'}
- $call={param($Request) Invoke-FxTxManagement $ServiceName $PipeName $Image $Index $owner $Request ($prepareMs+5000)}
- $capabilities=$null;$capError=''
- try{$capabilities=& $call @{type='upgrade_capabilities';protocol_version=2}}catch{$capError=$_.Exception.Message}
- if($capabilities){$capabilities|ConvertTo-Json -Depth 10|Set-Content -Encoding UTF8 (Join-Path $Evidence 'installer-capabilities.json')}
- $mode=Get-FxTxPreStopMode -ProbeOk $true -Capabilities $capabilities -CapabilitiesError $capError -InstallerVersion $ExpectedVersion
+ $capabilities=$null;$capError='';$call=$null
+ if($probeOk){
+  $call={param($Request) Invoke-FxTxManagement $ServiceName $PipeName $Image $Index $owner $Request ($prepareMs+5000)}
+  try{$capabilities=& $call @{type='upgrade_capabilities';protocol_version=2}}catch{$capError=$_.Exception.Message}
+  if($capabilities){$capabilities|ConvertTo-Json -Depth 10|Set-Content -Encoding UTF8 (Join-Path $Evidence 'installer-capabilities.json')}
+ }else{
+  # 2.4.x 及更早的运行中服务没有 --version（探测必失败），也绝不可能提供协议2回执。
+  # 探测失败 = 无能力，与 legacy-reply/absent 同级走 accepted-partial；不向旧管道发
+  # management 请求（旧协议不认识 upgrade_capabilities，只会超时或解析错误）。
+  # SCM 优雅停 + 退出码判例 + 代数核对 + 离线 status 核对在
+  # Invoke-FxTxAcceptedServiceStop 内全数保留。
+  $capError='running image predates the --version probe contract; no management attempt'
+ }
+ $mode=Get-FxTxPreStopMode -ProbeOk $probeOk -Capabilities $capabilities -CapabilitiesError $capError -InstallerVersion $ExpectedVersion
  if($mode -eq 'refuse-identity'){[IO.File]::WriteAllText((Join-Path $Evidence 'stop-refused.txt'),$capError);throw '服务身份已变化，停止前已拒绝。本次未替换。'}
  if($mode -eq 'refuse-malformed'){throw '协议2能力应答不完整，停止前已拒绝。本次未替换。'}
  $prepareError='';$prepareCalled=$false;$fellThrough=$false

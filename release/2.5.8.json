@@ -12,6 +12,12 @@
       "passed": true
     },
     {
+      "id": "legacy-2-4-multivolume-index-loads",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
       "id": "ps51-encoding-and-packaged-helpers",
       "priority": "P0",
       "required": true,

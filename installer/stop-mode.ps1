@@ -46,7 +46,11 @@ function Get-FxTxPreStopMode {
  )
  # InstallerVersion is the package being installed. It must not choose the mode.
  $null = $InstallerVersion
- if (-not $ProbeOk) { return 'refuse-probe' }
+ # 2.5.8 起停机按「能力」而非版本号决策。探测失败 = 运行镜像早于 --version 契约
+ # （2.4.x 及更早），绝无可能提供协议2回执——与 legacy-reply/absent 同级走
+ # accepted-partial（SCM 优雅停 + 退出码判例 + 停止后代数核对 + 离线 status
+ # 完整性核对，护栏全在 Invoke-FxTxAcceptedServiceStop），不再拒绝整个安装。
+ if (-not $ProbeOk) { return 'accepted-partial' }
  if (Test-FxTxIdentityRefusal $CapabilitiesError) { return 'refuse-identity' }
  switch (Get-FxTxCapabilityClass $Capabilities) {
   'protocol2' { return 'protocol2-attempt' }
