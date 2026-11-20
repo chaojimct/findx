@@ -1,3 +1,33 @@
+## [2.5.7] - 2026-11-20
+
+相对已发布的 v2.5.6。引擎源是 `8f411829805fad030b60dffe92c711b08e065794`。该提交在 v2.5.6 的版本号提交之前，因此版本从 2.5.5 升到 2.5.7，之后的引擎改动都保留。v2.5.6 的标签、安装包和发行说明保持不动。
+
+这是部分修复：积压追赶、队列满时把未验证状态持久保存，以及停止时不再新打开文件。不是所有问题都已修好。
+
+### 已落地
+
+- 追赶日志时不再逐个等待文件打开。历史记录按批刷新元数据；队列满则标成未知，并继续推进游标。
+- 队列满时，已存在文件的旧大小写成持久未验证。保存和重新加载后仍不算已验证。缺席或复用的文件引用不删除。
+- 停止时，已经进入内核的打开不会被打断。停止后不再按批打开队列里的文件；没打开的已有文件写成持久未验证，游标和身份不变。
+
+### 本机 Windows 验收
+
+验收的是上述源在本机编译的服务，SHA256 `c75de0f17a42c028c7beadfea53db1b379f1632372b467dbaa877ed758d7d564`，7201792 字节。正式安装包由官方流程重新编译，以本次发布资产的哈希为准。
+
+- 同一路径：新建 647 毫秒，重命名 617 毫秒，旧名 57 毫秒消失，删除 640 毫秒。
+- 追上并超过先前日志水位，大约每秒 107 万个 USN 偏移单位。这是日志偏移，不是记录条数，也不是公平性能基准。
+- 正常停止 21:36:09.759，保存 21:36:54.483，退出 21:36:55.184，约 45 秒。代次 52042，末尾偏移 98207750048。
+- 完整备份、正式清单和大小已核对。同一程序 21:37:17 重启，PID 52700。21:38:56 已加载，healthy 为真，watch_error 为空，条目 4916722。
+- 本机管道查询 ntdll：72 毫秒，36 条命中，14 条精确。先前 5 条已知路径仍在。
+
+### 已知限制
+
+- 这次保存的是带有来源错误的已验收状态：仍有 680 个 stat 未解决，metadata_ready 为 false。Win32 1066、specific 1，不是 protocol2 耐久回执。不能据此认为属性已全部核验，或已有健康停机回执。
+- 已经进入内核的 OpenFileById 仍然不能取消，也没有有界超时。停止只会不再发起新的打开；队列里没打开的元数据会一直保持未知。
+- 这次是 RDP 用户会话 1。监视选择控制台会话，所以没有 everything-host。SDK QUERYW 和 uTools 这次没有验收。此前 3ea 源上的 SDK 基线通过，不能当成 2.5.7 修好了 uTools、RDP 或全部兼容。
+- 没有 macOS 界面验收，也没有整卷验收。
+- 回滚必须整份索引树和与之匹配的程序一起换回。不要把旧程序放到已被新版本写过的索引树上。
+
 ## 2.5.3 (candidate, publication gates still closed)
 
 - Integrate the tested native Usage refinements: stable depth preference, click-selected absolute-path Inspector and bounded children, compact details, indexed sibling menus with fixed heading, toolbar icons, consistent classification, responsive resize/hit geometry and interruptible spatial navigation.
