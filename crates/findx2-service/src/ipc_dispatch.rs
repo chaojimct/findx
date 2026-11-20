@@ -114,6 +114,7 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                 watch_error: crate::watch_health::watch_error_summary(),
                 backfill_error: None,
                 tombstone_count: None,
+                indexed_drive_mask: 0,
             }
         }
         (IpcRequest::Search { .. }, None) => IpcResponse::Error {
@@ -171,6 +172,9 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                             backfill_error
                         },
                         tombstone_count: Some(g.deleted.len() as u64),
+                        indexed_drive_mask: crate::everything_status::drive_mask_from_letters(
+                            g.volumes.iter().map(|v| v.volume_letter),
+                        ),
                     }
                 }
                 None => {
@@ -193,6 +197,7 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                         watch_error: crate::watch_health::watch_error_summary(),
                         backfill_error,
                         tombstone_count: None,
+                        indexed_drive_mask: 0,
                     }
                 }
             }

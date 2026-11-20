@@ -172,6 +172,9 @@ pub enum IpcResponse {
         /// 阈值约定见 `IndexStore::should_compact`（≥10 万条目且墓碑比 >25%）。
         #[serde(default)]
         tombstone_count: Option<u64>,
+        /// Bit 0 is A:. Old peers omit it; the host then falls back to `volume_letter`.
+        #[serde(default)]
+        indexed_drive_mask: u32,
     },
     UpgradeCapabilitiesResult {
         protocol_version: u32,

@@ -11,7 +11,7 @@
 //!   与 `WM_COPYDATA` 的 `wParam` 重复；旧实现误读 16 为 reply_msg 会导致客户端收不到结果。）
 //! - QUERYA / QUERYW 按字符宽度回包（A → 本地窄字节、W → UTF-16）
 //! - QUERY2 的 `sort_type` 映射为 `ParsedQuery::sort_by/sort_desc`
-//! - `IS_DB_BUSY` / `IS_DB_LOADED` 接 `SearchEngine::metadata_ready` 等
+//! - `IS_DB_LOADED` 表示索引已可搜索（含空库和未完成的元数据）。`IS_DB_BUSY` 只表示正在加载或回填。
 //! - 回复：`WM_COPYDATA` 在独立线程中延迟约 5ms 再 `SendMessage`，与 v1 一致，避免与部分客户端的发送路径重入
 
 #![allow(unsafe_code)]
@@ -26,6 +26,7 @@ use std::time::Duration;
 use findx2_core::{ParsedQuery, QueryParser, SearchEngine, SearchHit, SearchOptions, SortField};
 use findx2_ipc::{IpcRequest, IpcResponse, SearchHitDto};
 use tracing::{error, info};
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -72,25 +73,6 @@ const IPC_IS_DB_BUSY: usize = 402;
 const IPC_IS_FAST_SORT: usize = 410;
 const IPC_IS_FILE_INFO_INDEXED: usize = 411;
 
-const REQUEST_NAME: u32 = 0x0000_0001;
-const REQUEST_PATH: u32 = 0x0000_0002;
-const REQUEST_FULL_PATH_AND_NAME: u32 = 0x0000_0004;
-const REQUEST_EXTENSION: u32 = 0x0000_0008;
-const REQUEST_SIZE: u32 = 0x0000_0010;
-const REQUEST_DATE_CREATED: u32 = 0x0000_0020;
-const REQUEST_DATE_MODIFIED: u32 = 0x0000_0040;
-const REQUEST_DATE_ACCESSED: u32 = 0x0000_0080;
-const REQUEST_ATTRIBUTES: u32 = 0x0000_0100;
-const REQUEST_FILE_LIST_FILE_NAME: u32 = 0x0000_0200;
-const REQUEST_RUN_COUNT: u32 = 0x0000_0400;
-const REQUEST_DATE_RUN: u32 = 0x0000_0800;
-const REQUEST_DATE_RECENTLY_CHANGED: u32 = 0x0000_1000;
-const REQUEST_HIGHLIGHTED_NAME: u32 = 0x0000_2000;
-const REQUEST_HIGHLIGHTED_PATH: u32 = 0x0000_4000;
-const REQUEST_HIGHLIGHTED_FULL_PATH_AND_NAME: u32 = 0x0000_8000;
-
-const ITEM_FOLDER: u32 = 0x01;
-
 /// Everything IPC `search_flags`（everything_ipc.h）
 const IPC_REGEX: u32 = 0x0001;
 const IPC_MATCHCASE: u32 = 0x0002;
@@ -130,12 +112,59 @@ pub(crate) fn run_everything_host_via_pipe(pipe: String) -> anyhow::Result<()> {
     r.map_err(|e| anyhow::anyhow!("Everything 兼容窗口: {e}"))
 }
 
+fn wide_z(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(Some(0)).collect()
+}
+
+unsafe extern "system" fn visit_everything_window(hwnd: HWND, data: LPARAM) -> windows::core::BOOL {
+    let mut class = [0u16; 64];
+    let n = GetClassNameW(hwnd, &mut class);
+    if n <= 0 {
+        return true.into();
+    }
+    let name = String::from_utf16_lossy(&class[..n as usize]);
+    if name != crate::everything_status::SDK_WINDOW_CLASS_IPC
+        && name != crate::everything_status::SDK_WINDOW_CLASS_MAIN
+    {
+        return true.into();
+    }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid != std::process::id() {
+        let count = &mut *(data.0 as *mut u32);
+        *count += 1;
+        info!(
+            "Everything 类名冲突 hwnd={:?} pid={pid} class={name}。{}",
+            hwnd,
+            crate::everything_status::COMPETING_PROCESS_POLICY
+        );
+    }
+    true.into()
+}
+
+fn log_foreign_everything_windows() {
+    let mut foreign = 0u32;
+    unsafe {
+        let _ = EnumWindows(
+            Some(visit_everything_window),
+            LPARAM(&mut foreign as *mut u32 as isize),
+        );
+    }
+    if foreign == 0 {
+        info!("没有其他进程占用 Everything SDK 窗口类");
+    }
+}
+
 unsafe fn message_loop() -> windows::core::Result<()> {
     let hinst = GetModuleHandleW(None)?;
     let hi = HINSTANCE(hinst.0);
 
-    let class_ipc = windows::core::w!("EVERYTHING_TASKBAR_NOTIFICATION");
-    let class_alt = windows::core::w!("EVERYTHING");
+    let class_ipc_w = wide_z(crate::everything_status::SDK_WINDOW_CLASS_IPC);
+    let class_alt_w = wide_z(crate::everything_status::SDK_WINDOW_CLASS_MAIN);
+    let title_w = wide_z(crate::everything_status::SDK_WINDOW_CLASS_MAIN);
+    let class_ipc = PCWSTR(class_ipc_w.as_ptr());
+    let class_alt = PCWSTR(class_alt_w.as_ptr());
+    let title = PCWSTR(title_w.as_ptr());
 
     // 与 FindX v1 一致：始终在本进程注册窗口类。若与真 Everything 同时运行，`FindWindow` 只会找到其中一个，
     // 并行双开时请自行退出 Everything 或仅用其一；此前用 FindWindow 直接 return 会导致「未装 Everything 也从未创建 IPC」的误判场景更难排查。
@@ -156,7 +185,7 @@ unsafe fn message_loop() -> windows::core::Result<()> {
     let hwnd = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
         class_ipc,
-        windows::core::w!("EVERYTHING"),
+        title,
         WS_POPUP,
         0,
         0,
@@ -182,7 +211,7 @@ unsafe fn message_loop() -> windows::core::Result<()> {
         hwnd_alt = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             class_alt,
-            windows::core::w!("EVERYTHING"),
+            title,
             WS_POPUP,
             0,
             0,
@@ -208,7 +237,11 @@ unsafe fn message_loop() -> windows::core::Result<()> {
         return Err(windows::core::Error::from_thread());
     }
 
-    info!("Everything IPC 兼容层已启动");
+    log_foreign_everything_windows();
+    info!(
+        "Everything IPC 兼容层已启动。{}",
+        crate::everything_status::COMPETING_PROCESS_POLICY
+    );
 
     loop {
         let mut msg = MSG::default();
@@ -248,82 +281,81 @@ unsafe extern "system" fn wnd_proc(
         return handle_copydata(hwnd, wparam, lparam).unwrap_or(LRESULT(0));
     }
     if msg == WM_USER {
-        return handle_wm_user(wparam).unwrap_or(LRESULT(0));
+        return handle_wm_user(wparam, lparam).unwrap_or(LRESULT(0));
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
-fn db_busy_now() -> bool {
-    if let Some(hook) = IS_DB_BUSY_HOOK.get() {
-        if (hook)() {
-            return true;
-        }
-    }
-    if let Some(st) = pipe_status() {
-        return !st.0 || st.1;
+fn external_busy() -> bool {
+    IS_DB_BUSY_HOOK.get().is_some_and(|hook| hook())
+}
+
+fn current_snapshot() -> crate::everything_status::EngineSnapshot {
+    if PIPE_NAME.lock().ok().and_then(|g| g.clone()).is_some() {
+        return crate::everything_status::snapshot_from_status(pipe_status());
     }
     let g = match ENGINE.lock() {
         Ok(g) => g,
-        Err(_) => return false,
+        Err(_) => return crate::everything_status::snapshot_from_status(None),
     };
     let Some(eng) = g.as_ref() else {
-        return false;
+        return crate::everything_status::snapshot_from_status(None);
     };
-    !eng.metadata_ready()
+    let store = eng.index_store();
+    crate::everything_status::snapshot_from_status(Some(crate::everything_status::StatusParts {
+        loading: false,
+        metadata_ready: eng.metadata_ready(),
+        backfill_done: 0,
+        backfill_total: 0,
+        drive_mask: crate::everything_status::drive_mask_from_letters(
+            store.volumes.iter().map(|v| v.volume_letter),
+        ),
+        volume_letter: None,
+    }))
 }
 
-fn db_is_loaded() -> bool {
-    if let Some((ready, loading, entries)) = pipe_status() {
-        return ready && !loading && entries > 0;
-    }
-    let g = match ENGINE.lock() {
-        Ok(g) => g,
-        Err(_) => return false,
-    };
-    g.as_ref()
-        .map(|eng| eng.index_store().entry_count() > 0)
-        .unwrap_or(false)
-}
-
-/// `(metadata_ready, loading, entry_count)`
-fn pipe_status() -> Option<(bool, bool, u64)> {
+fn pipe_status() -> Option<crate::everything_status::StatusParts> {
     let pipe = PIPE_NAME.lock().ok()?.clone()?;
     match pipe_rpc(&pipe, &IpcRequest::Status)? {
         IpcResponse::StatusResult {
             metadata_ready,
             loading,
-            entry_count,
+            backfill_done,
+            backfill_total,
+            indexed_drive_mask,
+            volume_letter,
             ..
-        } => Some((metadata_ready, loading, entry_count)),
+        } => Some(crate::everything_status::StatusParts {
+            loading,
+            metadata_ready,
+            backfill_done,
+            backfill_total,
+            drive_mask: indexed_drive_mask,
+            volume_letter,
+        }),
         _ => None,
     }
 }
 
-fn handle_wm_user(wparam: WPARAM) -> Option<LRESULT> {
+fn handle_wm_user(wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
     let cmd = wparam.0 as usize;
+    let snapshot = current_snapshot();
+    let flags = crate::everything_status::sdk_flags(snapshot, external_busy());
     let r = match cmd {
         IPC_GET_MAJOR_VERSION => 1usize,
         IPC_GET_MINOR_VERSION => 4,
         IPC_GET_REVISION => 1,
         IPC_GET_BUILD_NUMBER => 1026,
         IPC_GET_TARGET_MACHINE => target_machine_value(),
-        IPC_IS_NTFS_DRIVE_INDEXED => 1,
-        IPC_IS_DB_LOADED => {
-            if db_is_loaded() {
-                1
-            } else {
-                0
-            }
+        IPC_IS_NTFS_DRIVE_INDEXED => {
+            crate::everything_status::drive_indexed(snapshot.drive_mask, lparam.0 as u32) as usize
         }
-        IPC_IS_DB_BUSY => {
-            if db_busy_now() {
-                1
-            } else {
-                0
-            }
+        IPC_IS_DB_LOADED => flags.loaded as usize,
+        IPC_IS_DB_BUSY => flags.busy as usize,
+        IPC_IS_FAST_SORT => {
+            crate::everything_status::fast_sort_supported(flags.loaded == 1, lparam.0 as u32) as usize
         }
-        IPC_IS_FAST_SORT => 1,
-        IPC_IS_FILE_INFO_INDEXED => 1,
+        IPC_IS_FILE_INFO_INDEXED => flags.file_info_indexed as usize,
         _ => 0,
     };
     Some(LRESULT(r as isize))
@@ -374,32 +406,21 @@ unsafe fn handle_query(
         return Some(LRESULT(0));
     }
     let data = slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize);
-    let max_results = read_u32_le(data, 0).unwrap_or(100);
-    let offset = read_u32_le(data, 4).unwrap_or(0);
     // SDK：`reply_copydata_message` @8，`search_flags` @12，`reply_hwnd` @16（与 wParam 一致）
-    let reply_msg = read_u32_le(data, 8).unwrap_or(0);
-    if reply_msg == 0 {
-        return Some(LRESULT(0));
-    }
-    let search_flags = read_u32_le(data, 12).unwrap_or(0);
-    let search_str = if wide {
-        extract_wstring(&data[20..])
-    } else {
-        extract_astring(&data[20..])
-    };
-    let mut max = max_results as usize;
+    let parsed = crate::everything_status::parse_query1(data, wide)?;
+    let mut max = parsed.max_results as usize;
     if max == 0 {
         max = 100;
     }
     let results = do_search(
-        &search_str,
-        offset as usize + max,
-        search_flags,
+        &parsed.search,
+        parsed.offset as usize + max,
+        parsed.search_flags,
         SortField::Name,
         false,
     )?;
     send_query1_reply(
-        reply_hwnd, my_hwnd, reply_msg, results, offset, max as u32, wide,
+        reply_hwnd, my_hwnd, parsed.reply_msg, results, parsed.offset, max as u32, wide,
     );
     Some(LRESULT(1))
 }
@@ -414,37 +435,27 @@ unsafe fn handle_query2(
         return Some(LRESULT(0));
     }
     let data = slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize);
-    let reply_msg = read_u32_le(data, 4)?;
-    let search_flags = read_u32_le(data, 8).unwrap_or(0);
-    let offset = read_u32_le(data, 12).unwrap_or(0);
-    let max_results = read_u32_le(data, 16).unwrap_or(100);
-    let request_flags = read_u32_le(data, 20).unwrap_or(0);
-    let sort_type = read_u32_le(data, 24).unwrap_or(0);
-    let search_str = if wide {
-        extract_wstring(&data[28..])
-    } else {
-        extract_astring(&data[28..])
-    };
-    let mut max = max_results as usize;
+    let parsed = crate::everything_status::parse_query2(data, wide)?;
+    let mut max = parsed.max_results as usize;
     if max == 0 {
         max = 100;
     }
-    let (sort_field, sort_desc) = map_sort_type(sort_type);
+    let (sort_field, sort_desc) = map_sort_type(parsed.sort_type);
     let results = do_search(
-        &search_str,
-        offset as usize + max,
-        search_flags,
+        &parsed.search,
+        parsed.offset as usize + max,
+        parsed.search_flags,
         sort_field,
         sort_desc,
     )?;
     send_query2_reply(
         reply_hwnd,
         my_hwnd,
-        reply_msg,
+        parsed.reply_msg,
         results,
-        offset,
+        parsed.offset,
         max as u32,
-        request_flags,
+        parsed.request_flags,
         wide,
     );
     Some(LRESULT(1))
@@ -477,31 +488,6 @@ fn map_sort_type(t: u32) -> (SortField, bool) {
         25 | 26 => (SortField::Name, t == 26),
         _ => (SortField::Name, false),
     }
-}
-
-fn read_u32_le(data: &[u8], off: usize) -> Option<u32> {
-    data.get(off..off + 4)
-        .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-}
-
-fn extract_wstring(data: &[u8]) -> String {
-    if data.len() < 2 {
-        return String::new();
-    }
-    let mut u16s = Vec::with_capacity(data.len() / 2);
-    for chunk in data.chunks_exact(2) {
-        let v = u16::from_le_bytes([chunk[0], chunk[1]]);
-        if v == 0 {
-            break;
-        }
-        u16s.push(v);
-    }
-    String::from_utf16_lossy(&u16s)
-}
-
-fn extract_astring(data: &[u8]) -> String {
-    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-    String::from_utf8_lossy(&data[..end]).into_owned()
 }
 
 /// `query`：查询字符串；`max_total`：上限（含 offset）；`ipc_flags`：`EVERYTHING_IPC_*` search_flags。
@@ -620,16 +606,7 @@ fn apply_ipc_search_flags(pq: &mut ParsedQuery, flags: u32) {
     }
 }
 
-struct IpcHit {
-    full_path: String,
-    name: String,
-    parent: String,
-    is_dir: bool,
-    size: u64,
-    mtime: u64,
-    ctime: u64,
-    attrs: u32,
-}
+type IpcHit = crate::everything_status::IpcHit;
 
 fn ipc_hit_from_search(engine: &SearchEngine, h: &SearchHit) -> Option<IpcHit> {
     let store = engine.index_store();
@@ -667,9 +644,9 @@ fn send_query1_reply(
     let remain = results.len().saturating_sub(start);
     let count = (max_results as usize).min(remain);
     let buf = if wide {
-        build_list_w(&results, offset, start, count)
+        crate::everything_status::build_list_w(&results, offset, start, count)
     } else {
-        build_list_a(&results, offset, start, count)
+        crate::everything_status::build_list_a(&results, offset, start, count)
     };
     spawn_copydata_reply(reply_hwnd, my_hwnd, reply_msg, buf);
 }
@@ -687,7 +664,7 @@ fn send_query2_reply(
     let start = offset.min(results.len() as u32) as usize;
     let remain = results.len().saturating_sub(start);
     let count = (max_results as usize).min(remain);
-    let buf = build_list2(&results, offset, start, count, request_flags, wide);
+    let buf = crate::everything_status::build_list2(&results, offset, start, count, request_flags, wide);
     spawn_copydata_reply(reply_hwnd, my_hwnd, reply_msg, buf);
 }
 
@@ -715,235 +692,3 @@ fn spawn_copydata_reply(reply_hwnd: HWND, my_hwnd: HWND, reply_msg: u32, buf: Ve
     });
 }
 
-fn build_list_w(results: &[IpcHit], offset: u32, start: usize, count: usize) -> Vec<u8> {
-    let mut tot_folders = 0u32;
-    let mut tot_files = 0u32;
-    for r in results {
-        if r.is_dir {
-            tot_folders += 1;
-        } else {
-            tot_files += 1;
-        }
-    }
-    let mut strings: Vec<u8> = Vec::new();
-    let mut items: Vec<(u32, usize, usize)> = Vec::new();
-    let mut num_folders = 0u32;
-    let mut num_files = 0u32;
-    for i in start..start + count {
-        let r = &results[i];
-        let fn_off = strings.len() / 2;
-        for u in r.name.encode_utf16() {
-            strings.extend_from_slice(&u.to_le_bytes());
-        }
-        strings.extend_from_slice(&[0, 0]);
-        let path_off = strings.len() / 2;
-        for u in r.parent.encode_utf16() {
-            strings.extend_from_slice(&u.to_le_bytes());
-        }
-        strings.extend_from_slice(&[0, 0]);
-        let fl = if r.is_dir {
-            num_folders += 1;
-            ITEM_FOLDER
-        } else {
-            num_files += 1;
-            0
-        };
-        items.push((fl, fn_off, path_off));
-    }
-
-    let header_size = 28usize;
-    let str_base = header_size + count * 12;
-    let total = str_base + strings.len();
-    let mut buf = vec![0u8; total];
-
-    buf[0..4].copy_from_slice(&tot_folders.to_le_bytes());
-    buf[4..8].copy_from_slice(&tot_files.to_le_bytes());
-    buf[8..12].copy_from_slice(&(results.len() as u32).to_le_bytes());
-    buf[12..16].copy_from_slice(&num_folders.to_le_bytes());
-    buf[16..20].copy_from_slice(&num_files.to_le_bytes());
-    buf[20..24].copy_from_slice(&(count as u32).to_le_bytes());
-    buf[24..28].copy_from_slice(&offset.to_le_bytes());
-
-    for (i, (fl, fn_off, pa_off)) in items.iter().enumerate() {
-        let pos = header_size + i * 12;
-        buf[pos..pos + 4].copy_from_slice(&fl.to_le_bytes());
-        buf[pos + 4..pos + 8].copy_from_slice(&((str_base + fn_off * 2) as u32).to_le_bytes());
-        buf[pos + 8..pos + 12].copy_from_slice(&((str_base + pa_off * 2) as u32).to_le_bytes());
-    }
-    buf[str_base..str_base + strings.len()].copy_from_slice(&strings);
-    buf
-}
-
-/// QUERYA 回复：与 QUERYW 同 header（28B）+ 同 item 表（12B），但字符串区按 ANSI 字节、偏移以字节计算。
-fn build_list_a(results: &[IpcHit], offset: u32, start: usize, count: usize) -> Vec<u8> {
-    let mut tot_folders = 0u32;
-    let mut tot_files = 0u32;
-    for r in results {
-        if r.is_dir {
-            tot_folders += 1;
-        } else {
-            tot_files += 1;
-        }
-    }
-    let mut strings: Vec<u8> = Vec::new();
-    let mut items: Vec<(u32, usize, usize)> = Vec::new();
-    let mut num_folders = 0u32;
-    let mut num_files = 0u32;
-    for i in start..start + count {
-        let r = &results[i];
-        let fn_off = strings.len();
-        strings.extend_from_slice(r.name.as_bytes());
-        strings.push(0);
-        let path_off = strings.len();
-        strings.extend_from_slice(r.parent.as_bytes());
-        strings.push(0);
-        let fl = if r.is_dir {
-            num_folders += 1;
-            ITEM_FOLDER
-        } else {
-            num_files += 1;
-            0
-        };
-        items.push((fl, fn_off, path_off));
-    }
-
-    let header_size = 28usize;
-    let str_base = header_size + count * 12;
-    let total = str_base + strings.len();
-    let mut buf = vec![0u8; total];
-
-    buf[0..4].copy_from_slice(&tot_folders.to_le_bytes());
-    buf[4..8].copy_from_slice(&tot_files.to_le_bytes());
-    buf[8..12].copy_from_slice(&(results.len() as u32).to_le_bytes());
-    buf[12..16].copy_from_slice(&num_folders.to_le_bytes());
-    buf[16..20].copy_from_slice(&num_files.to_le_bytes());
-    buf[20..24].copy_from_slice(&(count as u32).to_le_bytes());
-    buf[24..28].copy_from_slice(&offset.to_le_bytes());
-
-    for (i, (fl, fn_off, pa_off)) in items.iter().enumerate() {
-        let pos = header_size + i * 12;
-        buf[pos..pos + 4].copy_from_slice(&fl.to_le_bytes());
-        buf[pos + 4..pos + 8].copy_from_slice(&((str_base + fn_off) as u32).to_le_bytes());
-        buf[pos + 8..pos + 12].copy_from_slice(&((str_base + pa_off) as u32).to_le_bytes());
-    }
-    buf[str_base..str_base + strings.len()].copy_from_slice(&strings);
-    buf
-}
-
-fn build_list2(
-    results: &[IpcHit],
-    offset: u32,
-    start: usize,
-    count: usize,
-    request_flags: u32,
-    wide: bool,
-) -> Vec<u8> {
-    let header_size = 20usize;
-    let items_size = count * 8;
-    let data_start = header_size + items_size;
-
-    let mut payload: Vec<u8> = Vec::new();
-    let mut data_offsets: Vec<u32> = Vec::with_capacity(count);
-
-    for i in start..start + count {
-        let r = &results[i];
-        data_offsets.push((data_start + payload.len()) as u32);
-        write_item2_payload(&mut payload, r, request_flags, wide);
-    }
-
-    let mut buf = vec![0u8; data_start + payload.len()];
-    buf[data_start..].copy_from_slice(&payload);
-
-    buf[0..4].copy_from_slice(&(results.len() as u32).to_le_bytes());
-    buf[4..8].copy_from_slice(&(count as u32).to_le_bytes());
-    buf[8..12].copy_from_slice(&offset.to_le_bytes());
-    buf[12..16].copy_from_slice(&request_flags.to_le_bytes());
-    buf[16..20].copy_from_slice(&1u32.to_le_bytes());
-
-    for i in 0..count {
-        let pos = header_size + i * 8;
-        let r = &results[start + i];
-        let flags = if r.is_dir { ITEM_FOLDER } else { 0 };
-        buf[pos..pos + 4].copy_from_slice(&flags.to_le_bytes());
-        buf[pos + 4..pos + 8].copy_from_slice(&data_offsets[i].to_le_bytes());
-    }
-
-    buf
-}
-
-fn write_ipc_string(b: &mut Vec<u8>, s: &str, wide: bool) {
-    if wide {
-        let n = s.encode_utf16().count() as u32;
-        b.write_all(&n.to_le_bytes()).ok();
-        for u in s.encode_utf16() {
-            b.write_all(&u.to_le_bytes()).ok();
-        }
-        b.write_all(&0u16.to_le_bytes()).ok();
-    } else {
-        let bytes = s.as_bytes();
-        let n = bytes.len() as u32;
-        b.write_all(&n.to_le_bytes()).ok();
-        b.write_all(bytes).ok();
-        b.write_all(&[0u8]).ok();
-    }
-}
-
-fn write_item2_payload(ms: &mut Vec<u8>, r: &IpcHit, rf: u32, wide: bool) {
-    if rf & REQUEST_NAME != 0 {
-        write_ipc_string(ms, &r.name, wide);
-    }
-    if rf & REQUEST_PATH != 0 {
-        write_ipc_string(ms, &r.parent, wide);
-    }
-    if rf & REQUEST_FULL_PATH_AND_NAME != 0 {
-        write_ipc_string(ms, &r.full_path, wide);
-    }
-    if rf & REQUEST_EXTENSION != 0 {
-        let ext = if r.is_dir {
-            String::new()
-        } else {
-            r.name
-                .rfind('.')
-                .map(|i| r.name[i + 1..].to_string())
-                .unwrap_or_default()
-        };
-        write_ipc_string(ms, &ext, wide);
-    }
-    if rf & REQUEST_SIZE != 0 {
-        ms.write_all(&r.size.to_le_bytes()).ok();
-    }
-    if rf & REQUEST_DATE_CREATED != 0 {
-        ms.write_all(&(r.ctime as i64).to_le_bytes()).ok();
-    }
-    if rf & REQUEST_DATE_MODIFIED != 0 {
-        ms.write_all(&(r.mtime as i64).to_le_bytes()).ok();
-    }
-    if rf & REQUEST_DATE_ACCESSED != 0 {
-        ms.write_all(&0i64.to_le_bytes()).ok();
-    }
-    if rf & REQUEST_ATTRIBUTES != 0 {
-        // Win32 文件属性宏：低 8 位由 USN/MFT 直接给出（READONLY=0x1, HIDDEN=0x2, SYSTEM=0x4, DIRECTORY=0x10, ARCHIVE=0x20, …）
-        ms.write_all(&r.attrs.to_le_bytes()).ok();
-    }
-    if rf & REQUEST_FILE_LIST_FILE_NAME != 0 {
-        write_ipc_string(ms, "", wide);
-    }
-    if rf & REQUEST_RUN_COUNT != 0 {
-        ms.write_all(&0u32.to_le_bytes()).ok();
-    }
-    if rf & REQUEST_DATE_RUN != 0 {
-        ms.write_all(&0i64.to_le_bytes()).ok();
-    }
-    if rf & REQUEST_DATE_RECENTLY_CHANGED != 0 {
-        ms.write_all(&0i64.to_le_bytes()).ok();
-    }
-    if rf & REQUEST_HIGHLIGHTED_NAME != 0 {
-        write_ipc_string(ms, &r.name, wide);
-    }
-    if rf & REQUEST_HIGHLIGHTED_PATH != 0 {
-        write_ipc_string(ms, &r.parent, wide);
-    }
-    if rf & REQUEST_HIGHLIGHTED_FULL_PATH_AND_NAME != 0 {
-        write_ipc_string(ms, &r.full_path, wide);
-    }
-}

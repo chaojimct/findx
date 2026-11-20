@@ -1,6 +1,7 @@
 //! findx2 常驻服务：Windows 命名管道 / Unix socket；默认前台运行。
 
 mod cli;
+mod everything_status;
 mod ipc_dispatch;
 mod load_state;
 mod startup_compact;
