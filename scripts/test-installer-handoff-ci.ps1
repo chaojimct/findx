@@ -12,7 +12,9 @@ $evidence = Join-Path $env:RUNNER_TEMP 'handoff-evidence'
 $null = New-Item -ItemType Directory -Force -Path $evidence
 $publishedSetup = '9f6663cd13e13d711f98564a2d3e69c218296023162d0abab4a4af62fd17010e'
 $publishedGui = 'e10ddda898cafe95caf86b7f119319dca70e0e7224acdc28984572ad633a839e'
-$unpackerHash = 'f8e45c9676bebc7d7570108ab572673b541fcf7a7d3d24a04319ac6b5315b4e8'
+# Upstream innounp-2.zip changed after the older workflows were pinned.
+# The extracted FindX.exe must still match the sealed 2.5.3 image below.
+$unpackerHash = '078ddb005aa17e669f0b5545980bff92200f7401418174172dca0d75f9e5d8f0'
 $id = [guid]::NewGuid().ToString('N')
 $service = 'FindXUpgradeTest_' + $id
 $pipe = 'findx-upgrade-test-' + $id
