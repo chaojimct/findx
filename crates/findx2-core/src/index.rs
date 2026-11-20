@@ -361,6 +361,8 @@ pub struct FileEntry {
     pub dir_idx: u32,
     pub attrs: u32,
     pub n_len: u16,
+    /// bit0：这条已入库文件的 size/mtime 不得再当成已验证。全局 `metadata_ready`
+    /// 翻回 true 也不会把它恢复成已知；只有新的元数据提交会清掉这一位。
     pub _pad: u16,
 }
 
@@ -401,6 +403,7 @@ impl FileEntry {
     pub const ATTR_READONLY: u32 = 1 << 3;
     pub const ATTR_ARCHIVE: u32 = 1 << 4;
     pub const ATTR_DELETED: u32 = 1 << 5;
+    pub const META_UNVERIFIED: u16 = 1;
     /// bits[8..15] ext_hash_u8
     pub fn ext_hash_u8(self) -> u8 {
         ((self.attrs >> 8) & 0xff) as u8
@@ -413,6 +416,18 @@ impl FileEntry {
     #[inline]
     pub fn is_dir_entry(self) -> bool {
         self.attrs & Self::ATTR_IS_DIR != 0
+    }
+
+    pub fn metadata_unverified(self) -> bool {
+        self._pad & Self::META_UNVERIFIED != 0
+    }
+
+    pub fn set_metadata_unverified(&mut self, unverified: bool) {
+        if unverified {
+            self._pad |= Self::META_UNVERIFIED;
+        } else {
+            self._pad &= !Self::META_UNVERIFIED;
+        }
     }
 
     /// 从 USN/MFT 的 Windows `FileAttributes` 低 8 位装入「文件」条目的 attrs 低字节。
@@ -504,9 +519,9 @@ pub struct IndexStore {
 ///   commit 见到它就走全量分段重写（仍远少于 v5 的单文件全量 + 原子 rename 开销，且低频）。
 #[derive(Debug, Clone)]
 pub enum Mutation {
-    /// Coalesced backfill checkpoint: packed disk metadata, 20 transient bytes/slot,
-    /// instead of retaining one large Mutation enum for every producer update.
-    MetadataBatch(Vec<(u32, [u8; 16])>),
+    /// Coalesced checkpoint: 16 bytes of size/mtime/ctime plus the 2-byte trust pad.
+    /// The pad is written at entry offset 30, not appended onto the first 16 bytes.
+    MetadataBatch(Vec<(u32, [u8; 18])>),
     /// `DataOrMeta` / 单条元数据 patch：只改 `entries[idx]` 的 size/mtime/ctime（16B 原地 pwrite）。
     Meta {
         idx: u32,

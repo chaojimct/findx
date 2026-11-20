@@ -361,8 +361,10 @@ fn commit_delta_into(
             Mutation::MetadataBatch(patches) => {
                 for (idx, data) in patches {
                     if *idx as usize >= cur_e { return Err(persist_err("metadata batch slot out of bounds, need full")); }
-                    pwrite(fe.as_mut().unwrap(), (*idx as usize * ENTRY_SIZE) as u64, data, F_ENTRIES)?;
-                    bytes += 16;
+                    let at = (*idx as usize * ENTRY_SIZE) as u64;
+                    pwrite(fe.as_mut().unwrap(), at, &data[..16], F_ENTRIES)?;
+                    pwrite(fe.as_mut().unwrap(), at + 30, &data[16..18], F_ENTRIES)?;
+                    bytes += 18;
                 }
             }
             Mutation::Meta { idx, size, mtime, ctime } => {

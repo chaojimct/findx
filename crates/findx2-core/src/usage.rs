@@ -365,7 +365,8 @@ impl UsageRuntime {
             let p = t.logical_parent(e.dir_idx);
             if (p as usize) >= d { return Err("usage entry volume unresolved".into()); }
             if !e.is_deleted() { t.link_file(idx as u32, p); }
-            let unknown = !g.metadata_ready;
+            // 全局未就绪时全部未知。已经标过的条目在全局位被重新打回 true 后仍是未知。
+            let unknown = e.metadata_unverified() || !g.metadata_ready;
             t.freshness.set(idx, u8::from(!unknown));
             if !e.is_deleted() {
                 let w = Totals::file(e.size, unknown);
@@ -757,6 +758,7 @@ impl SearchEngine {
         let old = Totals::file(self.effective_size(&g, t.entry), r.freshness.get(t.entry) != 1);
         // Ticket validation, store mutation and overlay publication share one lock.
         // Do not confuse incomplete metadata coverage with an inconsistent snapshot.
+        g.entries.get_mut(t.entry).ok_or("usage entry unavailable")?.set_metadata_unverified(false);
         self.mirror_metadata_for_persistence(&mut g,t.entry,size,mtime,ctime).map_err(|e| e.to_string())?;
         self.metadata_overlay.put(t.entry, size, crate::index::filetime_to_unix_secs(mtime), crate::index::filetime_to_unix_secs(ctime));
         r.freshness.set(t.entry, 1);
@@ -765,6 +767,40 @@ impl SearchEngine {
         self.bump_revision();
         drop(g);
         Ok(true)
+    }
+    /// 丢弃一次 stat 之前，把已存在的文件记成持久的未验证。
+    /// `Ok(false)`：索引里没有这个活文件，不删除、不改其它 FRN。
+    /// 用法统计未初始化或已出错时仍然写条目位，不能当成已经跟踪。
+    pub fn retain_unverified_metadata(&self, volume: u8, frn: u64) -> Result<bool, String> {
+        let mut g = self.store.write();
+        let Some(idx) = g.entry_on_volume(volume, frn).map(|i| i as usize) else { return Ok(false); };
+        if g.frns.get(idx) != Some(&frn) { return Ok(false); }
+        let Some(e) = g.entries.get(idx).copied() else { return Ok(false); };
+        if e.is_deleted() || e.is_dir_entry() { return Ok(false); }
+        g.entries[idx].set_metadata_unverified(true);
+        if g.mutation_log.is_some() { self.note_metadata_slot(idx as u32); }
+        if g.metadata_ready { g.metadata_ready = false; }
+        let mut r = self.usage.lock();
+        if r.epoch != 0 && r.error.is_none() {
+            let parent = g.entries[idx].dir_idx;
+            let size = self.effective_size(&g, idx);
+            let old = Totals::file(size, r.freshness.get(idx) != 1);
+            r.freshness.set(idx, 2);
+            r.apply_file_delta(parent, old, Totals::file(size, true), true, true);
+            r.invalidate_ticket(idx);
+        }
+        drop(r);
+        self.bump_revision();
+        Ok(true)
+    }
+    /// 磁盘上仍保留的 size/mtime。`verified` 只在全局就绪且该条目没有未验证位时为真。
+    pub fn metadata_claim(&self, volume: u8, frn: u64) -> Option<(u64, u32, u32, bool)> {
+        let g = self.store.read();
+        let idx = g.entry_on_volume(volume, frn)? as usize;
+        if g.frns.get(idx) != Some(&frn) { return None; }
+        let e = g.entries.get(idx)?;
+        if e.is_deleted() || e.is_dir_entry() { return None; }
+        Some((e.size, e.mtime, e.ctime, g.metadata_ready && !e.metadata_unverified()))
     }
     pub fn mark_metadata_dirty(&self, volume: u8, frn: u64) {
         let g = self.store.read();
@@ -1301,6 +1337,106 @@ mod tests {
         let e = SearchEngine::new(store(b'C'));
         e.enable_usage(16 * 1024 * 1024).unwrap();
         e
+    }
+    fn pair() -> IndexStore {
+        let mut g = crate::IndexBuilder::new(b'C', 1, 7, 10).build_from_raw(
+            vec![raw(10, 1, "kept.bin", 111, false), raw(11, 1, "stale.bin", 222, false)],
+            vec![raw(1, 0, "root", 0, true)],
+            true,
+        ).unwrap();
+        let kept = g.entry_on_volume(b'C', 10).unwrap() as usize;
+        let stale = g.entry_on_volume(b'C', 11).unwrap() as usize;
+        g.entries[kept].mtime = 1_700_000_011;
+        g.entries[kept].ctime = 1_700_000_012;
+        g.entries[stale].mtime = 1_700_000_021;
+        g.entries[stale].ctime = 1_700_000_022;
+        g.metadata_ready = true;
+        g.set_track_mutations(true);
+        g
+    }
+    #[test]
+    fn overflow_keeps_stored_size_but_not_verified_across_reload_and_ready_flip() {
+        let dir = std::env::temp_dir().join(format!("findx-unverified-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.bin");
+        let layout = crate::V6Layout::for_index(&path);
+        let initial = pair();
+        crate::v6_save_full(&layout, &initial).unwrap();
+        let e = SearchEngine::new(initial);
+        e.enable_usage(16 * 1024 * 1024).unwrap();
+        let before = e.index_store().entries.len();
+        assert_eq!(e.metadata_claim(b'C', 10), Some((111, 1_700_000_011, 1_700_000_012, true)));
+        assert_eq!(e.metadata_claim(b'C', 11), Some((222, 1_700_000_021, 1_700_000_022, true)));
+        assert_eq!(e.retain_unverified_metadata(b'C', 10 | (9 << 48)).unwrap(), false);
+        assert_eq!(e.retain_unverified_metadata(b'C', 999).unwrap(), false);
+        assert!(e.metadata_ready());
+        assert_eq!(e.index_store().entries.len(), before);
+        assert!(!e.index_store().entries[e.index_store().entry_on_volume(b'C', 10).unwrap() as usize].is_deleted());
+        assert_eq!(e.metadata_coverage(e.metadata_epoch()).unwrap().unknown, 0);
+        assert_eq!(e.retain_unverified_metadata(b'C', 11).unwrap(), true);
+        assert!(!e.metadata_ready());
+        assert_eq!(e.metadata_claim(b'C', 11), Some((222, 1_700_000_021, 1_700_000_022, false)));
+        assert_eq!(e.metadata_claim(b'C', 10).unwrap().0, 111);
+        assert!(!e.index_store().entries[e.index_store().entry_on_volume(b'C', 10).unwrap() as usize].metadata_unverified());
+        assert_eq!(e.metadata_coverage(e.metadata_epoch()).unwrap().unknown, 1);
+        let epoch = e.metadata_epoch();
+        let work = e.metadata_work_batch(epoch, 0, e.index_store().entries.len(), 64 * 1024).unwrap();
+        assert!(work.items.iter().any(|item| item.frn == 11));
+        assert!(work.items.iter().all(|item| item.frn != 10));
+        assert!(!e.complete_metadata_if_covered(epoch).unwrap());
+        let err = e.set_metadata_ready(true).unwrap_err().to_string();
+        assert!(err.contains("unverified"), "{err}");
+        let (hits, _) = e.search(&crate::QueryParser::parse("stale.bin").unwrap(), &crate::SearchOptions::default()).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].size, 0);
+        let batch = e.take_persistence_batch().expect("delta");
+        assert!(!batch.metadata_ready);
+        assert!(matches!(crate::v6_try_commit(&layout, &batch).unwrap(), crate::CommitOutcome::Delta { .. }));
+        let loaded = crate::v6_load(&layout).unwrap();
+        assert!(!loaded.metadata_ready);
+        let stale = loaded.entry_on_volume(b'C', 11).unwrap() as usize;
+        let kept = loaded.entry_on_volume(b'C', 10).unwrap() as usize;
+        assert_eq!(loaded.entries[stale].size, 222);
+        assert_eq!(loaded.entries[stale].mtime, 1_700_000_021);
+        assert!(loaded.entries[stale].metadata_unverified());
+        assert!(!loaded.entries[stale].is_deleted());
+        assert_eq!(loaded.entries[kept].size, 111);
+        assert!(!loaded.entries[kept].metadata_unverified());
+        let restored = SearchEngine::new(loaded);
+        restored.enable_usage(16 * 1024 * 1024).unwrap();
+        assert!(restored.metadata_coverage(restored.metadata_epoch()).unwrap().unknown >= 2);
+        restored.index_store_mut().metadata_ready = true;
+        restored.enable_usage(16 * 1024 * 1024).unwrap();
+        assert_eq!(restored.metadata_claim(b'C', 11), Some((222, 1_700_000_021, 1_700_000_022, false)));
+        assert_eq!(restored.metadata_claim(b'C', 10), Some((111, 1_700_000_011, 1_700_000_012, true)));
+        assert_eq!(restored.metadata_coverage(restored.metadata_epoch()).unwrap().unknown, 1);
+        let (kept_hits, _) = restored.search(&crate::QueryParser::parse("size:>100 kept.bin").unwrap(), &crate::SearchOptions::default()).unwrap();
+        assert_eq!(kept_hits.len(), 1);
+        assert_eq!(kept_hits[0].size, 111);
+        let (stale_hits, _) = restored.search(&crate::QueryParser::parse("size:>100 stale.bin").unwrap(), &crate::SearchOptions::default()).unwrap();
+        assert!(stale_hits.is_empty());
+        let bare_path = dir.join("nouage.bin");
+        let bare_layout = crate::V6Layout::for_index(&bare_path);
+        let bare_initial = pair();
+        crate::v6_save_full(&bare_layout, &bare_initial).unwrap();
+        let bare = SearchEngine::new(bare_initial);
+        assert_eq!(bare.metadata_epoch(), 0);
+        assert_eq!(bare.retain_unverified_metadata(b'C', 11).unwrap(), true);
+        assert!(!bare.metadata_ready());
+        assert_eq!(bare.metadata_claim(b'C', 11), Some((222, 1_700_000_021, 1_700_000_022, false)));
+        assert_eq!(bare.metadata_claim(b'C', 10), Some((111, 1_700_000_011, 1_700_000_012, false)));
+        let bare_batch = bare.take_persistence_batch().expect("usage-off delta");
+        assert!(matches!(crate::v6_try_commit(&bare_layout, &bare_batch).unwrap(), crate::CommitOutcome::Delta { .. }));
+        let bare_loaded = crate::v6_load(&bare_layout).unwrap();
+        assert!(bare_loaded.entries[bare_loaded.entry_on_volume(b'C', 11).unwrap() as usize].metadata_unverified());
+        assert!(!bare_loaded.entries[bare_loaded.entry_on_volume(b'C', 10).unwrap() as usize].is_deleted());
+        let bare_restored = SearchEngine::new(bare_loaded);
+        bare_restored.enable_usage(16 * 1024 * 1024).unwrap();
+        bare_restored.index_store_mut().metadata_ready = true;
+        bare_restored.enable_usage(16 * 1024 * 1024).unwrap();
+        assert_eq!(bare_restored.metadata_claim(b'C', 11).unwrap().3, false);
+        assert_eq!(bare_restored.metadata_claim(b'C', 10).unwrap().3, true);
+        std::fs::remove_dir_all(dir).unwrap();
     }
     fn size(e: &SearchEngine) -> u64 { e.usage_page("C:\\", None, None, 1024).unwrap().root.logical }
     fn ntfs_shape(letter:u8)->IndexStore {
@@ -2039,6 +2175,7 @@ impl SearchEngine {
             let e=&g.entries[idx];
             if e.is_deleted()||e.is_dir_entry()||r.freshness.get(idx)==1 {continue;}
             let parent=e.dir_idx;let old=Totals::file(self.effective_size(&g,idx),true);
+            g.entries[idx].set_metadata_unverified(false);
             self.mirror_metadata_for_persistence(&mut g,idx,size,mtime,ctime).map_err(|e|e.to_string())?;
             self.metadata_overlay.put(idx,size,crate::index::filetime_to_unix_secs(mtime),crate::index::filetime_to_unix_secs(ctime));
             r.freshness.set(idx,1);r.invalidate_ticket(idx);

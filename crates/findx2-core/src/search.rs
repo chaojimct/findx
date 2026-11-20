@@ -968,8 +968,8 @@ impl SearchEngine {
                     let mut out = v.to_vec();
                     let desc = q.sort_desc;
                     let cmp = |a: &u32, b: &u32| -> std::cmp::Ordering {
-                        let sa = store.entries[*a as usize].size;
-                        let sb = store.entries[*b as usize].size;
+                        let sa = if store.entries[*a as usize].metadata_unverified() { 0 } else { store.entries[*a as usize].size };
+                        let sb = if store.entries[*b as usize].metadata_unverified() { 0 } else { store.entries[*b as usize].size };
                         if desc {
                             sb.cmp(&sa)
                         } else {
@@ -988,8 +988,8 @@ impl SearchEngine {
                     let mut out = v.to_vec();
                     let desc = q.sort_desc;
                     let cmp = |a: &u32, b: &u32| -> std::cmp::Ordering {
-                        let sa = store.entries[*a as usize].mtime;
-                        let sb = store.entries[*b as usize].mtime;
+                        let sa = if store.entries[*a as usize].metadata_unverified() { 0 } else { store.entries[*a as usize].mtime };
+                        let sb = if store.entries[*b as usize].metadata_unverified() { 0 } else { store.entries[*b as usize].mtime };
                         if desc {
                             sb.cmp(&sa)
                         } else {
@@ -1008,8 +1008,8 @@ impl SearchEngine {
                     let mut out = v.to_vec();
                     let desc = q.sort_desc;
                     let cmp = |a: &u32, b: &u32| -> std::cmp::Ordering {
-                        let sa = store.entries[*a as usize].ctime;
-                        let sb = store.entries[*b as usize].ctime;
+                        let sa = if store.entries[*a as usize].metadata_unverified() { 0 } else { store.entries[*a as usize].ctime };
+                        let sb = if store.entries[*b as usize].metadata_unverified() { 0 } else { store.entries[*b as usize].ctime };
                         if desc {
                             sb.cmp(&sa)
                         } else {
@@ -1200,10 +1200,11 @@ impl SearchEngine {
                 } else {
                     for idx in dirty.iter() {
                         if let Some(e) = g.entries.get(idx as usize) {
-                            let mut bytes = [0; 16];
+                            let mut bytes = [0u8; 18];
                             bytes[..8].copy_from_slice(&e.size.to_le_bytes());
                             bytes[8..12].copy_from_slice(&e.mtime.to_le_bytes());
-                            bytes[12..].copy_from_slice(&e.ctime.to_le_bytes());
+                            bytes[12..16].copy_from_slice(&e.ctime.to_le_bytes());
+                            bytes[16..18].copy_from_slice(&e._pad.to_le_bytes());
                             patches.push((idx, bytes));
                         }
                     }
@@ -1234,6 +1235,9 @@ impl SearchEngine {
 
     /// All callers hold the namespace write lock. No per-file mutation payload is
     /// retained during backfill; repeated writes to one slot coalesce in a bitmap.
+    pub(crate) fn note_metadata_slot(&self, idx: u32) {
+        self.metadata_dirty.lock().insert(idx);
+    }
     pub(crate) fn mirror_metadata_for_persistence(&self, g: &mut IndexStore, idx: usize,
         size: u64, mtime: u64, ctime: u64) -> Result<()> {
         let e = g.entries.get_mut(idx).ok_or_else(|| crate::Error::Platform("metadata slot out of bounds".into()))?;
@@ -1367,6 +1371,12 @@ impl SearchEngine {
     /// A scoped drain mirrors concurrent producer writes, then publishes readiness.
     pub fn set_metadata_ready(&self, ready: bool) -> Result<()> {
         if ready {
+            {
+                let g = self.store.read();
+                if g.entries.iter().any(|e| !e.is_deleted() && !e.is_dir_entry() && e.metadata_unverified()) {
+                    return Err(crate::Error::Platform("unverified metadata remains; refusing ready".into()));
+                }
+            }
             let _drain = self.begin_metadata_drain();
             let epoch = { let _g = self.store.read(); self.usage.lock().epoch };
             self.flush_metadata_overlay_for_epoch(Some(epoch))?;
@@ -1393,6 +1403,9 @@ impl Drop for MetadataDrainGuard<'_> {
 
 #[inline]
 fn effective_meta(overlay: &MetaOverlay, store: &IndexStore, idx: u32) -> (u64, u64, u64) {
+    if store.entries[idx as usize].metadata_unverified() {
+        return (0, 0, 0);
+    }
     if let Some((size, mtime, ctime)) = overlay.get(idx as usize) {
         return (
             size,
@@ -1413,6 +1426,9 @@ fn effective_meta(overlay: &MetaOverlay, store: &IndexStore, idx: u32) -> (u64, 
 /// 回填阶段主索引可能仍是 USN/首遍占位，overlay 已是磁盘读出的真值；只读 store 会导致侧栏时间条件与列表日期不一致。
 #[inline]
 fn entry_meta_for_filter(overlay: &MetaOverlay, store: &IndexStore, idx: u32) -> (u64, u32, u32) {
+    if store.entries[idx as usize].metadata_unverified() {
+        return (0, 0, 0);
+    }
     if let Some(triple) = overlay.get(idx as usize) {
         return triple;
     }
@@ -1738,8 +1754,9 @@ where
                     return acc;
                 }
             }
-            // 4) 元数据：size 仅 metadata_ready 后可信；时间戳首遍即可筛（与侧栏 dm:/dc: 一致）
+            // 4) 元数据：size 仅 metadata_ready 后可信；单条未验证位在全局位翻回后仍然排除。
             if any_size_filter {
+                if e.metadata_unverified() { return acc; }
                 if let Some(v) = size_min {
                     if e.size < v {
                         return acc;
@@ -1752,6 +1769,7 @@ where
                 }
             }
             if any_time_filter {
+                if e.metadata_unverified() { return acc; }
                 let (_, mt, ct) = entry_meta_for_filter(overlay, store, idx);
                 if let Some(v) = mtime_min {
                     if mt < v {
@@ -1910,6 +1928,7 @@ where
                     }
                 }
                 if any_size_filter {
+                    if e.metadata_unverified() { return (acc, pin_local); }
                     if let Some(v) = size_min {
                         if e.size < v {
                             return (acc, pin_local);
@@ -1922,6 +1941,7 @@ where
                     }
                 }
                 if any_time_filter {
+                    if e.metadata_unverified() { return (acc, pin_local); }
                     let (_, mt, ct) = entry_meta_for_filter(overlay, store, idx);
                     if let Some(v) = mtime_min {
                         if mt < v {
@@ -2066,6 +2086,7 @@ fn slow_attr_candidates(store: &IndexStore, overlay: &MetaOverlay, q: &ParsedQue
             return false;
         }
         if metadata_ready {
+            if e.metadata_unverified() && (q.size_min.is_some() || q.size_max.is_some()) { return false; }
             if let Some(v) = q.size_min {
                 if e.size < v {
                     return false;
@@ -2078,6 +2099,7 @@ fn slow_attr_candidates(store: &IndexStore, overlay: &MetaOverlay, q: &ParsedQue
             }
         }
         if any_time_filter {
+            if e.metadata_unverified() { return false; }
             let (_, mt, ct) = entry_meta_for_filter(overlay, store, idx);
             if let Some(v) = mtime_min {
                 if mt < v {

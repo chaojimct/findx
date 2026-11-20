@@ -66,8 +66,9 @@ type StatWork=(Option<[u8;16]>,Option<crate::runtime_lifecycle::Activity>,u64);
 type StatMessage=(u64,Option<[u8;16]>,Option<crate::runtime_lifecycle::Reservation>,u64);
 
 /// Queue one metadata hint without waiting for `OpenFileById`.
-/// `false` means the bounded stat queue is full: this hint stays unknown and
-/// the journal cursor must still advance. A disconnected worker is an error.
+/// `false` means the bounded queue is full: an existing file is durably unverified
+/// before the reservation is acknowledged. A missing FRN is not deleted.
+/// Failure to record that state does not acknowledge the reservation.
 fn offer_stat(tx:&std::sync::mpsc::SyncSender<StatMessage>,engine:&Arc<SearchEngine>,volume:u8,file_id:u64,file_id_128:Option<[u8;16]>)->anyhow::Result<bool>{
     if file_id_128.is_some_and(|id| id[8..].iter().any(|&b| b != 0)) {
         anyhow::bail!("full 128-bit stat binding unresolved; refusing low64 alias");
@@ -76,9 +77,14 @@ fn offer_stat(tx:&std::sync::mpsc::SyncSender<StatMessage>,engine:&Arc<SearchEng
     let queued=crate::runtime_lifecycle::reserve(engine,"queued-stat").map_err(anyhow::Error::msg)?.map(|p|p.require_result());
     match tx.try_send((file_id,file_id_128,queued,engine.metadata_epoch())) {
         Ok(())=>Ok(true),
-        Err(std::sync::mpsc::TrySendError::Full((_,_,mut work,_)))=>{
-            if let Some(reservation)=work.as_mut(){reservation.success();}
-            Ok(false)
+        Err(std::sync::mpsc::TrySendError::Full((id,_,mut work,_)))=>{
+            match engine.retain_unverified_metadata(volume, id) {
+                Ok(_) => {
+                    if let Some(reservation)=work.as_mut(){reservation.success();}
+                    Ok(false)
+                }
+                Err(error) => Err(anyhow::anyhow!(error)),
+            }
         }
         Err(std::sync::mpsc::TrySendError::Disconnected(_))=>Err(anyhow::anyhow!("stat worker unavailable; metadata remains unknown")),
     }
@@ -913,7 +919,7 @@ fn usn_watch_loop(
                 }
                 findx2_windows::UsnWatchMsg::StatBatch { items } => {
                     dirty_count += flush_pending(&mut pending)?;
-                    // 队列满以后仍把本批标成未知，但不打开文件、不挡住下一次日志读取。
+                    // 队列满以后，其余已存在的文件写成持久未验证，不打开、不挡住下一次读取。
                     let mut room = true;
                     for (file_id, file_id_128) in items {
                         if room {
@@ -921,7 +927,7 @@ fn usn_watch_loop(
                         } else if file_id_128.is_some_and(|id| id[8..].iter().any(|&b| b != 0)) {
                             anyhow::bail!("full 128-bit stat binding unresolved; refusing low64 alias");
                         } else {
-                            engine.mark_metadata_dirty(volume_letter, file_id);
+                            engine.retain_unverified_metadata(volume_letter, file_id).map_err(anyhow::Error::msg)?;
                         }
                     }
                 }
@@ -1485,6 +1491,50 @@ mod tests {
         drop(o);
         std::fs::remove_dir_all(d).unwrap();
     }
+    #[test]
+    fn full_stat_queue_keeps_nonzero_size_unknown_and_the_queued_hint() {
+        use findx2_core::{IndexBuilder, RawEntry, SearchEngine};
+        let d = std::env::temp_dir().join(format!("findx-stat-full-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&d).unwrap();
+        let raw = |id, name: &str, size, mtime| RawEntry { file_id: id, file_id_128: None, parent_id: 1, name: name.into(), size, mtime, ctime: mtime, attrs: 0, is_dir: false };
+        let mut store = IndexBuilder::new(b'F', 1, 7, 10).build_from_raw(
+            vec![raw(10, "kept.bin", 111, 1_700_000_011), raw(11, "stale.bin", 222, 1_700_000_021)],
+            vec![RawEntry { file_id: 1, file_id_128: None, parent_id: 0, name: "root".into(), size: 0, mtime: 0, ctime: 0, attrs: 0x10, is_dir: true }],
+            true,
+        ).unwrap();
+        let kept = store.entry_on_volume(b'F', 10).unwrap() as usize;
+        let stale = store.entry_on_volume(b'F', 11).unwrap() as usize;
+        store.entries[kept].mtime = 1_700_000_011;
+        store.entries[kept].ctime = 1_700_000_012;
+        store.entries[stale].mtime = 1_700_000_021;
+        store.entries[stale].ctime = 1_700_000_022;
+        store.set_track_mutations(true);
+        let e = std::sync::Arc::new(SearchEngine::new(store));
+        e.enable_usage(4 * 1024 * 1024).unwrap();
+        let p = d.join("index.bin");
+        findx2_core::v6_save_full(&findx2_core::V6Layout::for_index(&p), &e.index_store()).unwrap();
+        let o = crate::runtime_lifecycle::Owner::attach(e.clone(), p, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))).unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let first = crate::runtime_lifecycle::reserve(&e, "queued-stat").unwrap().map(|p| p.require_result());
+        tx.try_send((10u64, None, first, e.metadata_epoch())).unwrap();
+        let started = std::time::Instant::now();
+        assert!(!super::offer_stat(&tx, &e, b'F', 11, None).unwrap());
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert!(o.retained_errors().is_empty());
+        assert_eq!(e.metadata_claim(b'F', 11), Some((222, 1_700_000_021, 1_700_000_022, false)));
+        assert_eq!(e.metadata_claim(b'F', 10).unwrap().0, 111);
+        assert!(!e.metadata_ready());
+        assert_eq!(e.metadata_coverage(e.metadata_epoch()).unwrap().unknown, 1);
+        match rx.try_recv() {
+            Ok((10, None, mut work, _)) => { if let Some(r) = work.as_mut() { r.success(); } }
+            Ok((id, _, _, _)) => panic!("queued hint changed id {id}"),
+            Err(_) => panic!("full queue dropped the retained hint"),
+        }
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        drop(o);
+        std::fs::remove_dir_all(d).unwrap();
+    }
     #[test]fn stat_settlement_authoritative_delete_and_replaced_epoch_do_not_fake_failure(){
         for replace in [false,true]{let(d,e,o)=stat_fixture();let mut p=queued(&e);
             if replace{e.enable_usage(4*1024*1024).unwrap();}else{let i=e.index_store().entry_on_volume(b'F',10).unwrap();e.index_store_mut().delete_entry(i);}
@@ -1849,7 +1899,7 @@ mod tests {
             findx2_core::Mutation::MetadataBatch(items) => {
                 assert_eq!(items.len(),1);
                 assert_eq!(u64::from_le_bytes(items[0].1[..8].try_into().unwrap()),9999);
-                assert_eq!(std::mem::size_of_val(&items[0]),20);
+                assert_eq!(std::mem::size_of_val(&items[0]),24);
             }
             _ => panic!("expected compact final metadata projection"),
         }
