@@ -33,6 +33,7 @@ pub use nt_dir_query::DirMetadataReader;
 #[cfg(windows)]
 pub use open_by_id::metadata_terminal_counts;
 
+mod ntfs_witness;
 #[cfg(windows)]
 mod ntfs_namespace;
 

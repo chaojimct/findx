@@ -839,7 +839,10 @@ fn usn_watch_loop(
                         unlink_resolver.as_mut().unwrap().rewrite(&events,&parked,&missing,journal_id,|p|engine.namespace_parent_resolvable(volume_letter,p,&events),|id|engine.namespace_identity_live(volume_letter,id))
                     })();
                     let events=match prepared{Ok(e)=>{namespace_retry_delay=Duration::from_millis(100);e},Err(e)=>{
-                        set_watch_error(letter,Some(format!("namespace resolution failed; exact prefix/cursor retained: {e}")));
+                        let detail=format!("namespace resolution failed; exact prefix/cursor retained: {e}");
+                        tracing::warn!("watch={letter}: {detail}");
+                        crate::win_service::append_service_log(&format!("watch={letter}: {detail}"));
+                        set_watch_error(letter,Some(detail));
                         if e.requires_replay(){
                             // Drop receiver BEFORE joining: an old bounded sender must
                             // unblock normally. New native reader starts at retained disk

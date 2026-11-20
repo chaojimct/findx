@@ -14,7 +14,8 @@ impl FileIdOpenError {
 }
 #[link(name="ntdll")] unsafe extern "system" {fn RtlGetLastNtStatus()->i32;}
 pub(crate) fn open_file_by_id_diagnostic(hint:windows::Win32::Foundation::HANDLE,id:u64)->Result<windows::Win32::Foundation::HANDLE,FileIdOpenError>{
- open_file_by_id_access(hint,id,0)
+ // DesiredAccess 0 is STATUS_INVALID_PARAMETER (0xC000000D / win32 87) on real NTFS.
+ open_file_by_id_access(hint,id,windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES.0)
 }
 fn open_file_by_id_access(hint:windows::Win32::Foundation::HANDLE,id:u64,access:u32)->Result<windows::Win32::Foundation::HANDLE,FileIdOpenError>{
  use windows::Win32::Storage::FileSystem::*;let mut d=FILE_ID_DESCRIPTOR::default();d.dwSize=std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32;d.Type=FileIdType;d.Anonymous.FileId=id as i64;

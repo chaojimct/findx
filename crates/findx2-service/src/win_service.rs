@@ -33,6 +33,10 @@ use crate::cli::Cli;
 pub const SERVICE_NAME: &str = "FindX2Search";
 
 /// 分发层日志：service_main 各关键节点 append 一行，退出/崩溃时最后几行即现场。
+pub(crate) fn append_service_log(msg: &str) {
+    svc_log(msg);
+}
+
 fn svc_log(msg: &str) {
     #[cfg(test)]
     { let _ = msg; return; }
