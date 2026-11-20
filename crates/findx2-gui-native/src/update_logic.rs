@@ -1166,7 +1166,9 @@ fn start_silent_setup_windows(path: &Path) -> Result<(), String> {
     let params = HSTRING::from(SILENT_SETUP_ARGS);
     let dir = HSTRING::from(cwd.as_os_str());
     let rc = unsafe { ShellExecuteW(None, w!("runas"), &file, &params, &dir, SW_SHOWNORMAL) };
-    // ShellExecute returns a HINSTANCE value; >32 means success.
+    // >32 means the shell accepted runas. That is not proof the user already
+    // confirmed UAC, so this process stays up. The elevated installer asks the
+    // installed GUI, including shipped 2.5.3, to take its normal quit path.
     if rc.0 as usize <= 32 {
         return Err(format!(
             "无法启动安装程序（ShellExecute 返回 {}）。若取消了 UAC，则未开始安装。",

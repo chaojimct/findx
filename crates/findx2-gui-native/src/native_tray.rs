@@ -5,7 +5,8 @@ use std::{cell::Cell, mem::size_of, sync::mpsc::{self, Receiver, SyncSender}};
 use windows::{core::{w, PCWSTR}, Win32::{Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM}, UI::{Shell::*, WindowsAndMessaging::*}}};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event { Show, Exit }
-struct State { callback:u32, taskbar:u32, data:NOTIFYICONDATAW, tx:SyncSender<Event>, ready:Cell<bool> }
+struct State { callback:u32, taskbar:u32, quit:u32, data:NOTIFYICONDATAW, tx:SyncSender<Event>, ready:Cell<bool> }
+fn wide(text:&str)->Vec<u16> { text.encode_utf16().chain(std::iter::once(0)).collect() }
 pub struct Tray { hwnd:HWND, state:Box<State>, rx:Receiver<Event> }
 const SUBCLASS:usize=0x46495854;
 impl Tray {
@@ -19,18 +20,28 @@ impl Tray {
         unsafe {
             let callback=RegisterWindowMessageW(w!("FindX.Native.Tray.v1"));
             let taskbar=RegisterWindowMessageW(w!("TaskbarCreated"));
-            if callback==0 || taskbar==0 {return None;}
+            let quit_name=wide(crate::gui_quit::NORMAL_QUIT_MESSAGE);
+            let quit=RegisterWindowMessageW(PCWSTR(quit_name.as_ptr()));
+            if callback==0 || taskbar==0 || quit==0 {return None;}
+            // Elevated setup may post only this message. Shipped 2.5.3 does not allow it.
+            let _=ChangeWindowMessageFilterEx(hwnd,quit,MSGFLT_ALLOW,None);
             let mut data=NOTIFYICONDATAW::default();
             data.cbSize=size_of::<NOTIFYICONDATAW>() as u32;data.hWnd=hwnd;data.uID=1;
             data.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP;data.uCallbackMessage=callback;
             let module=windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok();
-            data.hIcon=module.and_then(|m|LoadIconW(Some(HINSTANCE(m.0)),PCWSTR(1usize as *const u16)).ok())
-                .or_else(||LoadIconW(None,IDI_APPLICATION).ok())?;
+            // A missing icon must not drop the quit subclass. Shipped 2.5.3 is quit from its tray;
+            // a future build still has to answer FindX.Native.NormalQuit.v1 when the icon fails.
+            if let Some(icon)=module.and_then(|m|LoadIconW(Some(HINSTANCE(m.0)),PCWSTR(1usize as *const u16)).ok())
+                .or_else(||LoadIconW(None,IDI_APPLICATION).ok()) {
+                data.hIcon=icon;
+            } else {
+                data.uFlags=NIF_MESSAGE|NIF_TIP;
+            }
             for (out,ch) in data.szTip.iter_mut().take(127).zip(title.encode_utf16()){*out=ch;}
-            let mut state=Box::new(State{callback,taskbar,data,tx,ready:Cell::new(false)});
+            let mut state=Box::new(State{callback,taskbar,quit,data,tx,ready:Cell::new(false)});
             if !SetWindowSubclass(hwnd,Some(callback_proc),SUBCLASS,(&mut *state) as *mut State as usize).as_bool(){return None;}
+            // The icon can fail. The quit subclass still has to stay, or an upgrade cannot exit.
             state.ready.set(Shell_NotifyIconW(NIM_ADD,&state.data).as_bool());
-            if !state.ready.get() {let _=RemoveWindowSubclass(hwnd,Some(callback_proc),SUBCLASS);return None;}
             Some(Self{hwnd,state,rx})
         }
     }
@@ -45,6 +56,10 @@ impl Drop for Tray {
 unsafe extern "system" fn callback_proc(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM,_:usize,reference:usize)->LRESULT {
     // The Box is owned by the window entity and the subclass is removed before it drops.
     let s=unsafe{&*(reference as *const State)};
+    if msg==s.quit {
+        let _=s.tx.try_send(Event::Exit);
+        return LRESULT(0);
+    }
     if msg==s.taskbar {
         s.ready.set(unsafe{Shell_NotifyIconW(NIM_ADD,&s.data)}.as_bool());
         // Failed recreation must not strand a hidden window without its icon.
@@ -55,7 +70,8 @@ unsafe extern "system" fn callback_proc(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM,_:
             WM_RBUTTONUP|WM_CONTEXTMENU => unsafe {
                 if let Ok(menu)=CreatePopupMenu(){
                     let _=AppendMenuW(menu,MF_STRING,1,w!("显示 FindX"));
-                    let _=AppendMenuW(menu,MF_STRING,2,w!("退出 FindX（不停止索引服务）"));
+                    let quit_caption=wide(crate::gui_quit::TRAY_QUIT_CAPTION);
+                    let _=AppendMenuW(menu,MF_STRING,2,PCWSTR(quit_caption.as_ptr()));
                     let mut p=POINT::default();let _=GetCursorPos(&mut p);let _=SetForegroundWindow(hwnd);
                     let id=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_NONOTIFY|TPM_RIGHTBUTTON,p.x,p.y,None,hwnd,None).0;
                     let _=DestroyMenu(menu);let _=PostMessageW(Some(hwnd),WM_NULL,WPARAM(0),LPARAM(0));
