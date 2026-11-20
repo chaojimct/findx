@@ -84,7 +84,8 @@ fn settings_identification_keeps_permanent_rows_and_diagnostics_viewport() {
  let src=include_str!("workspace.rs");
  let failure=src.split("// A terminal error ends pending navigation too.").nth(1).unwrap().split("let degraded =").next().unwrap();
  assert!(failure.contains("this.cancel_engine_usage(cx)"));
- assert!(failure.contains("this.workspace.scan_status = format!(\"目录读取失败：{e}\")"));
+ assert!(failure.contains("format!(\"目录读取失败：{e}\")"));
+ assert!(failure.contains("GENERATION_RESTART_MESSAGE"));
  assert!(failure.contains("this.workspace.engine_checked = false"));
 }
 

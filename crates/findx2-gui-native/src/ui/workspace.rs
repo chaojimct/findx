@@ -1877,36 +1877,104 @@ impl MainWindow {
                         ),
                     }
                 }
-                let mut guard=crate::indexed_usage::EmptyPageGuard::new(expected,after);
-                let mut cursor=after;
-                let mut stamp=expected;
+                let mut page_cursor = crate::indexed_usage::UsagePageCursor {
+                    expected,
+                    after,
+                    restarts: 0,
+                };
                 loop {
-                    crate::indexed_usage::ensure_not_cancelled(&cancel)?;
-                    let response=ipc.request_cancellable(endpoint.clone(),findx2_ipc::IpcRequest::UsageChildren{
-                        path:path.clone(),expected:stamp,after:cursor,max_bytes:48*1024,
-                    }, cancel.clone()).await.map_err(|_|"usage request cancelled".to_string())??;
-                    crate::indexed_usage::ensure_not_cancelled(&cancel)?;
-                    let page=match response {
-                        findx2_ipc::IpcResponse::UsageChildrenResult{page}=>page,
-                        findx2_ipc::IpcResponse::Error{message}=>return Err(message),
-                        _=>return Err("incompatible indexed usage response".into()),
-                    };
-                    if let Some(next)=guard.follow(&page)? {
-                        stamp=Some((page.epoch,page.generation));cursor=Some(next);
-                    } else {
-                        let tree=crate::indexed_depth::expand(&page,requested.clone(),requested_depth,page_cache.clone(),cancel.clone(),|path,after,stamp| {
-                            let ipc=ipc.clone();let endpoint=endpoint.clone();let cancel=cancel.clone();
-                            async move {
-                                match ipc.request_cancellable(endpoint,findx2_ipc::IpcRequest::UsageChildren{
-                                    path:display_path(&path),expected:Some(stamp),after,max_bytes:48*1024,
-                                },cancel).await.map_err(|_|"usage descendant request cancelled".to_string())?? {
-                                    findx2_ipc::IpcResponse::UsageChildrenResult{page}=>Ok(page),
-                                    findx2_ipc::IpcResponse::Error{message}=>Err(message),
-                                    _=>Err("incompatible descendant response".into()),
-                                }
+                    let attempt: Result<_, String> = async {
+                        let mut guard = crate::indexed_usage::EmptyPageGuard::new(
+                            page_cursor.expected,
+                            page_cursor.after,
+                        );
+                        let mut cursor = page_cursor.after;
+                        let mut stamp = page_cursor.expected;
+                        loop {
+                            crate::indexed_usage::ensure_not_cancelled(&cancel)?;
+                            let response = ipc
+                                .request_cancellable(
+                                    endpoint.clone(),
+                                    findx2_ipc::IpcRequest::UsageChildren {
+                                        path: path.clone(),
+                                        expected: stamp,
+                                        after: cursor,
+                                        max_bytes: 48 * 1024,
+                                    },
+                                    cancel.clone(),
+                                )
+                                .await
+                                .map_err(|_| "usage request cancelled".to_string())??;
+                            crate::indexed_usage::ensure_not_cancelled(&cancel)?;
+                            let page = match response {
+                                findx2_ipc::IpcResponse::UsageChildrenResult { page } => page,
+                                findx2_ipc::IpcResponse::Error { message } => return Err(message),
+                                _ => return Err("incompatible indexed usage response".into()),
+                            };
+                            if let Some(next) = guard.follow(&page)? {
+                                stamp = Some((page.epoch, page.generation));
+                                cursor = Some(next);
+                            } else {
+                                let tree = crate::indexed_depth::expand(
+                                    &page,
+                                    requested.clone(),
+                                    requested_depth,
+                                    page_cache.clone(),
+                                    cancel.clone(),
+                                    |path, after, stamp| {
+                                        let ipc = ipc.clone();
+                                        let endpoint = endpoint.clone();
+                                        let cancel = cancel.clone();
+                                        async move {
+                                            match ipc
+                                                .request_cancellable(
+                                                    endpoint,
+                                                    findx2_ipc::IpcRequest::UsageChildren {
+                                                        path: display_path(&path),
+                                                        expected: Some(stamp),
+                                                        after,
+                                                        max_bytes: 48 * 1024,
+                                                    },
+                                                    cancel,
+                                                )
+                                                .await
+                                                .map_err(|_| {
+                                                    "usage descendant request cancelled".to_string()
+                                                })??
+                                            {
+                                                findx2_ipc::IpcResponse::UsageChildrenResult {
+                                                    page,
+                                                } => Ok(page),
+                                                findx2_ipc::IpcResponse::Error { message } => {
+                                                    Err(message)
+                                                }
+                                                _ => Err("incompatible descendant response".into()),
+                                            }
+                                        }
+                                    },
+                                )
+                                .await?;
+                                return Ok((page, guard.skipped(), tree));
                             }
-                        }).await?;
-                        return Ok((page,guard.skipped(),tree))
+                        }
+                    }
+                    .await;
+                    match attempt {
+                        Err(e) => {
+                            let (next, decision) = page_cursor.restart_after(&e);
+                            match decision {
+                                crate::indexed_usage::GenerationRetry::Again(delay) => {
+                                    page_cursor = next;
+                                    cx.background_executor().timer(delay).await;
+                                    if cancel.load(Ordering::Acquire) {
+                                        break Err(e);
+                                    }
+                                }
+                                crate::indexed_usage::GenerationRetry::Exhausted
+                                | crate::indexed_usage::GenerationRetry::Other => break Err(e),
+                            }
+                        }
+                        ok => break ok,
                     }
                 }
             }
@@ -1937,7 +2005,11 @@ impl MainWindow {
                             this.cancel_engine_usage(cx);
                         }
                         this.workspace.scan_stale = !e.contains("不支持");
-                        this.workspace.scan_status = format!("目录读取失败：{e}");
+                        this.workspace.scan_status = if crate::indexed_usage::is_usage_generation_restart(&e) {
+                            crate::indexed_usage::GENERATION_RESTART_MESSAGE.to_string()
+                        } else {
+                            format!("目录读取失败：{e}")
+                        };
                         if crate::isolation::development_var_os("FINDX_NATIVE_USAGE_TRACE").is_some() {
                             eprintln!("usage_navigation_failed requested={:?} error={}",requested,e);
                         }
@@ -2313,8 +2385,16 @@ impl MainWindow {
 
     pub(super) fn workspace_footer_label(&self) -> String {
         let detail = self.workspace_scan_status();
-        if self.workspace.engine_usage && self.workspace.scan_status.starts_with("目录读取失败：") {
-            return if self.workspace.engine_busy{"上次目录读取失败，正在重试；详情保留诊断"}else{"目录读取失败，保留原画面；详见提示"}.into();
+        if self.workspace.engine_usage {
+            let scene_visible =
+                self.workspace.usage_scene.is_some() && self.scan_node().is_some();
+            if let Some(label) = crate::indexed_usage::usage_failure_footer(
+                &self.workspace.scan_status,
+                self.workspace.engine_busy,
+                scene_visible,
+            ) {
+                return label.into();
+            }
         }
         if self.workspace.engine_usage {
             crate::footer_status::compact_usage(

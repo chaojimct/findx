@@ -53,6 +53,76 @@ pub fn ensure_not_cancelled(cancel:&std::sync::atomic::AtomicBool)->Result<(),St
 /// One asynchronous GUI batch may skip at most 16 empty continuation pages.
 /// It retains the final continuation on yield; no corpus coverage is truncated.
 pub const MAX_EMPTY_PAGE_HOPS:usize=16;
+/// Freshly started services bump the usage generation while a page is in flight.
+/// Retry the directory from page 0 a few times, then stop.
+pub const MAX_GENERATION_RESTARTS: u32 = 3;
+pub const GENERATION_RESTART_MESSAGE: &str = "索引正在实时更新，请稍后重试";
+
+pub fn is_usage_generation_restart(err: &str) -> bool {
+    let kind = err.to_ascii_lowercase();
+    kind.contains("generation changed")
+        || kind.contains("restart page")
+        || kind.contains("restart pagination")
+}
+
+pub enum GenerationRetry {
+    Again(Duration),
+    Exhausted,
+    Other,
+}
+
+pub fn generation_restart_backoff(restart: u32) -> Duration {
+    Duration::from_millis(120 * u64::from(restart.max(1)))
+}
+
+/// `restarts` is how many full page-0 retries have already been issued.
+pub fn generation_retry(restarts: u32, err: &str) -> GenerationRetry {
+    if !is_usage_generation_restart(err) {
+        return GenerationRetry::Other;
+    }
+    if restarts >= MAX_GENERATION_RESTARTS {
+        GenerationRetry::Exhausted
+    } else {
+        GenerationRetry::Again(generation_restart_backoff(restarts + 1))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UsagePageCursor {
+    pub expected: Option<(u64, u64)>,
+    pub after: Option<u32>,
+    pub restarts: u32,
+}
+
+impl UsagePageCursor {
+    /// A generation mismatch drops the continuation and starts again at page 0.
+    pub fn restart_after(mut self, err: &str) -> (Self, GenerationRetry) {
+        let decision = generation_retry(self.restarts, err);
+        if matches!(decision, GenerationRetry::Again(_)) {
+            self.restarts += 1;
+            self.expected = None;
+            self.after = None;
+        }
+        (self, decision)
+    }
+}
+
+/// Footer copy for a failed usage load. "保留原画面" only when a scene is still shown.
+pub fn usage_failure_footer(status: &str, busy: bool, scene_visible: bool) -> Option<&'static str> {
+    let failed = status.starts_with("目录读取失败") || status == GENERATION_RESTART_MESSAGE;
+    if !failed {
+        return None;
+    }
+    Some(if busy {
+        "正在重新读取目录"
+    } else if scene_visible {
+        "目录读取失败，保留原画面"
+    } else if status == GENERATION_RESTART_MESSAGE {
+        GENERATION_RESTART_MESSAGE
+    } else {
+        "目录读取失败，可稍后重试"
+    })
+}
 pub struct EmptyPageGuard {seen:[u32;17],len:usize,hops:usize,expected:Option<(u64,u64)>}
 impl EmptyPageGuard {
  pub fn new(expected:Option<(u64,u64)>,after:Option<u32>)->Self {
@@ -134,6 +204,42 @@ mod continuation_tests {
   let mut g=EmptyPageGuard::new(Some((1,2)),Some(3));assert!(g.follow(&page(Some(3),false)).unwrap_err().contains("cycle"));
   let mut g=EmptyPageGuard::new(None,None);g.follow(&page(Some(1),false)).unwrap();g.follow(&page(Some(2),false)).unwrap();assert!(g.follow(&page(Some(1),false)).is_err());
   let mut p=page(Some(4),false);p.generation=3;assert!(EmptyPageGuard::new(Some((1,2)),None).follow(&p).is_err());
+ }
+ #[test]fn generation_change_restarts_from_page_zero_then_stops(){
+  assert!(is_usage_generation_restart("usage generation changed; restart page"));
+  assert!(is_usage_generation_restart("usage generation changed during descendant expansion; refresh"));
+  assert!(is_usage_generation_restart("usage generation changed while skipping empty pages; refresh"));
+  assert!(!is_usage_generation_restart("usage directory identity/metrics changed during expansion; refresh"));
+  assert!(!is_usage_generation_restart("usage request cancelled"));
+  assert!(matches!(generation_retry(0,"usage generation changed; restart page"),GenerationRetry::Again(_)));
+  assert!(matches!(generation_retry(MAX_GENERATION_RESTARTS-1,"usage generation changed; restart page"),GenerationRetry::Again(delay) if delay==generation_restart_backoff(MAX_GENERATION_RESTARTS)));
+  assert!(matches!(generation_retry(MAX_GENERATION_RESTARTS,"usage generation changed; restart page"),GenerationRetry::Exhausted));
+  assert!(matches!(generation_retry(0,"permission denied"),GenerationRetry::Other));
+  let continued=UsagePageCursor{expected:Some((1,2)),after:Some(9),restarts:0};
+  let (restarted,decision)=continued.restart_after("usage generation changed; restart page");
+  assert!(matches!(decision,GenerationRetry::Again(_)));
+  assert_eq!(restarted,UsagePageCursor{expected:None,after:None,restarts:1});
+  let mut cursor=restarted;
+  for _ in 1..MAX_GENERATION_RESTARTS {
+   let (next,decision)=cursor.restart_after("usage generation changed during descendant expansion; refresh");
+   assert!(matches!(decision,GenerationRetry::Again(_)));
+   assert_eq!((next.expected,next.after),(None,None));
+   cursor=next;
+  }
+  let (exhausted,decision)=cursor.restart_after("usage generation changed; restart page");
+  assert!(matches!(decision,GenerationRetry::Exhausted));
+  assert_eq!(exhausted.restarts,MAX_GENERATION_RESTARTS);
+  let kept=UsagePageCursor{expected:Some((4,5)),after:Some(2),restarts:0};
+  let (kept,decision)=kept.restart_after("usage directory identity/metrics changed during expansion; refresh");
+  assert!(matches!(decision,GenerationRetry::Other));
+  assert_eq!(kept.expected,Some((4,5)));
+  assert_eq!(kept.after,Some(2));
+  assert!(!GENERATION_RESTART_MESSAGE.contains("generation"));
+  assert_eq!(usage_failure_footer(GENERATION_RESTART_MESSAGE,false,false),Some(GENERATION_RESTART_MESSAGE));
+  assert_eq!(usage_failure_footer(GENERATION_RESTART_MESSAGE,false,true),Some("目录读取失败，保留原画面"));
+  assert_eq!(usage_failure_footer("目录读取失败：拒绝访问",true,true),Some("正在重新读取目录"));
+  assert_eq!(usage_failure_footer("目录读取失败：拒绝访问",false,false),Some("目录读取失败，可稍后重试"));
+  assert_eq!(usage_failure_footer("当前层完整",false,true),None);
  }
  #[test]fn bounded_batch_yields_without_discarding_continuation(){
   let mut g=EmptyPageGuard::new(None,None);let mut last=None;

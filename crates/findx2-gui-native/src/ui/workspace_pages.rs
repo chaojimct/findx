@@ -910,16 +910,41 @@ impl MainWindow {
             )
     }
 
-    pub(super) fn usage_empty(&self, label: &str, tokens: FindxTokens) -> impl IntoElement {
-        div()
+    pub(super) fn usage_empty(
+        &self,
+        label: &str,
+        tokens: FindxTokens,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let retry = label == crate::indexed_usage::GENERATION_RESTART_MESSAGE;
+        v_flex()
             .size_full()
-            .flex()
             .items_center()
             .justify_center()
+            .gap_3()
             .p_6()
-            .text_sm()
-            .text_color(tokens.text_secondary)
-            .child(label.to_string())
+            .child(
+                div()
+                    .h(px(20.))
+                    .flex_shrink_0()
+                    .text_sm()
+                    .text_color(tokens.text_secondary)
+                    .child(label.to_string()),
+            )
+            .child(
+                div().h(px(32.)).flex_shrink_0().when(retry, |slot| {
+                    slot.child(
+                        Button::new("usage-generation-retry")
+                            .w(px(72.))
+                            .h(px(32.))
+                            .flex_shrink_0()
+                            .label("重试")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.load_engine_usage(false, cx);
+                            })),
+                    )
+                }),
+            )
     }
 
     fn render_usage_details(

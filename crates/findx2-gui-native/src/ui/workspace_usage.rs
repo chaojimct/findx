@@ -1172,7 +1172,7 @@ impl MainWindow {
                 .size_full(),
             );
         if let Some(message) = empty {
-            view = view.child(self.usage_empty(message, tokens));
+            view = view.child(self.usage_empty(message, tokens, cx));
         }
         view.into_any_element()
     }
