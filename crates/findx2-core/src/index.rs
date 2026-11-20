@@ -1133,8 +1133,14 @@ impl IndexStore {
                 // 与条目同口径：目录要么是它自己的墓碑位，要么父链断掉
                 let self_ok = match self.frn_to_entry.get(&d.frn) {
                     Some(&ei) => !self.entries[ei as usize].is_deleted(),
-                    // 目录不在 entries 里（历史 v2/v3 布局）：只能靠父链判断
-                    None => true,
+                    None => {
+                        // 历史 v2/v3 布局的目录没有条目，保持存活（原语义）。
+                        // 例外：自父且有真名的目录是 2.4.x 首扫描期的下标巧合根
+                        // （dirs[0] 的 parent_idx==0 恰等于自身下标，实测无条目）——
+                        // 它没有卷归属，全卷摘除杀不掉，一路幸存让最终库
+                        // roots=4≠volumes=3、usage 永远挂不上。视为可摘除。
+                        !(d.parent_idx as usize == i && d.name_len != 0)
+                    }
                 };
                 if !self_ok {
                     continue;
