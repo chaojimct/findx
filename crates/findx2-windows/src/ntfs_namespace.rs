@@ -12,11 +12,14 @@ impl FileIdOpenError {
  fn absence_candidate(&self)->bool{matches!(self.win32,2|3|87|1168)&&self.native!=0xc0000056}
  fn classification(&self)->&'static str{if self.native==0xc0000056{"delete-pending"}else if self.win32==5{"permission-denied"}else{"identity-open-unavailable"}}
 }
+#[cfg(windows)]
 #[link(name="ntdll")] unsafe extern "system" {fn RtlGetLastNtStatus()->i32;}
+#[cfg(windows)]
 pub(crate) fn open_file_by_id_diagnostic(hint:windows::Win32::Foundation::HANDLE,id:u64)->Result<windows::Win32::Foundation::HANDLE,FileIdOpenError>{
  // DesiredAccess 0 is STATUS_INVALID_PARAMETER (0xC000000D / win32 87) on real NTFS.
  open_file_by_id_access(hint,id,windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES.0)
 }
+#[cfg(windows)]
 fn open_file_by_id_access(hint:windows::Win32::Foundation::HANDLE,id:u64,access:u32)->Result<windows::Win32::Foundation::HANDLE,FileIdOpenError>{
  use windows::Win32::Storage::FileSystem::*;let mut d=FILE_ID_DESCRIPTOR::default();d.dwSize=std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32;d.Type=FileIdType;d.Anonymous.FileId=id as i64;
  match unsafe{OpenFileById(hint,&d,access,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,None,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT)}{Ok(h)=>Ok(h),Err(e)=>{let native=unsafe{RtlGetLastNtStatus()} as u32;Err(FileIdOpenError{win32:e.code().0 as u32&0xffff,native})}}

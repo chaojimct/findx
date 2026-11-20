@@ -116,8 +116,11 @@ fn corroborate(c:&Claim,v:VolumeData,witness:Option<(u64,u32)>)->Result<bool,Str
     if witness!=Some((c.candidate,v.serial as u32)){return Err("uncorroborated MFT record; exact independent identity/volume required; cursor retained".into());}
     Ok(c.absent)
 }
+#[cfg(windows)]
 use crate::ntfs_namespace::NamespaceResolveError as E;
+#[cfg(windows)]
 use windows::Win32::{Foundation::{HANDLE,CloseHandle},System::{IO::DeviceIoControl,Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA,FSCTL_GET_NTFS_FILE_RECORD,NTFS_VOLUME_DATA_BUFFER}},Storage::FileSystem::{GetFileInformationByHandle,BY_HANDLE_FILE_INFORMATION}};
+#[cfg(windows)]
 pub(crate) fn epoch(h:HANDLE)->Result<Epoch,E>{
     let mut b=NTFS_VOLUME_DATA_BUFFER::default();let mut got=0;
     unsafe{DeviceIoControl(h,FSCTL_GET_NTFS_VOLUME_DATA,None,0,Some((&mut b as *mut NTFS_VOLUME_DATA_BUFFER).cast()),std::mem::size_of_val(&b) as u32,Some(&mut got),None)}.map_err(|e|E::Retry(format!("NTFS geometry unavailable: {e}")))?;
@@ -127,12 +130,14 @@ pub(crate) fn epoch(h:HANDLE)->Result<Epoch,E>{
     let journal=unsafe{crate::usn::query_usn_journal(h)}.map_err(|e|E::Retry(format!("journal unavailable: {e}")))?.UsnJournalID;
     Ok(Epoch{volume,journal})
 }
+#[cfg(windows)]
 pub(crate) fn check(h:HANDLE,expected:Epoch)->Result<(),E>{
  let actual=epoch(h)?;
  if actual.volume!=expected.volume{return Err("native volume/geometry identity changed; never follow a foreign volume".into());}
  if actual.journal!=expected.journal{return Err(E::EpochChanged("native journal epoch changed; retained cursor requires replay/rebuild".into()));}
  Ok(())
 }
+#[cfg(windows)]
 pub(crate) fn absent(h:HANDLE,id:u64,expected:Epoch)->Result<bool,E>{
     check(h,expected)?;
     let ordinal=(id&INDEX_MASK) as i64;let mut bytes=vec![0u8;12+expected.volume.record_bytes as usize];let mut got=0;
