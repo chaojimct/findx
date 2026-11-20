@@ -50,6 +50,12 @@ $payload+=[ordered]@{name=$markerName;sha256=$markerSha;length=$markerBytes.Leng
 $manifest=[ordered]@{version=$version;gui=$Gui;main_source=(Split-Path $main -Leaf);files=$payload;installation_performed=$false}
 if ($PlanOnly) { $manifest | ConvertTo-Json -Depth 6; return }
 if ($Gui -eq 'native' -and (Get-Item -LiteralPath $main).VersionInfo.ProductVersion -ne $version) { throw 'Native Windows PE ProductVersion does not match workspace version; rebuild candidate first.' }
+if ($Gui -eq 'native') {
+  foreach ($pair in @(@('findx2-service.exe', "findx2-service $version"), @('findx2.exe', "findx2 $version"), @('fx.exe', "findx2 $version"))) {
+    $probe = & (Join-Path $rel $pair[0]) --version
+    if ($LASTEXITCODE -ne 0 -or (($probe | Out-String).Trim() -cne $pair[1])) { throw "$($pair[0]) --version is not $($pair[1]); rebuild that binary from this commit." }
+  }
+}
 if (Test-Path -LiteralPath $StageDir) {
   $old=Join-Path $StageDir 'stage-manifest.json'
   if (Test-Path -LiteralPath $old) {

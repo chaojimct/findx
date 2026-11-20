@@ -1,0 +1,8 @@
+{
+  "version": "2.5.8",
+  "baseline": "2.5.7",
+  "channel": "local-candidate",
+  "publish_ready": false,
+  "windows_gui": "native",
+  "gates": []
+}

@@ -2224,7 +2224,7 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
 name = "findx2-cli"
-version = "2.5.5"
+version = "2.5.8"
 dependencies = [
  "chrono",
  "clap",
@@ -2243,7 +2243,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-core"
-version = "2.5.5"
+version = "2.5.8"
 dependencies = [
  "chrono",
  "crc32fast",
@@ -2267,7 +2267,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-gui"
-version = "2.5.5"
+version = "2.5.8"
 dependencies = [
  "arboard",
  "base64 0.22.1",
@@ -2290,7 +2290,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-gui-native"
-version = "2.5.5"
+version = "2.5.8"
 dependencies = [
  "encoding_rs",
  "findx2-ipc",
@@ -2316,7 +2316,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-ipc"
-version = "2.5.5"
+version = "2.5.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -2324,7 +2324,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-linux"
-version = "2.5.5"
+version = "2.5.8"
 dependencies = [
  "findx2-core",
  "libc",
@@ -2334,7 +2334,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-macos"
-version = "2.5.5"
+version = "2.5.8"
 dependencies = [
  "findx2-core",
  "libc",
@@ -2343,7 +2343,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-service"
-version = "2.5.5"
+version = "2.5.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2365,7 +2365,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-windows"
-version = "2.5.5"
+version = "2.5.8"
 dependencies = [
  "findx2-core",
  "rayon",

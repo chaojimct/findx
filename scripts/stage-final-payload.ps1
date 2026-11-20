@@ -10,7 +10,7 @@ if((Get-FileHash (Join-Path $GuiRoot $m.file)).Hash-cne$m.sha256){throw 'GUI dow
 if(Test-Path $Destination){throw 'Never overwrite staged payload'};$null=New-Item -ItemType Directory $Destination
 Copy-Item (Join-Path $GuiRoot $m.file) (Join-Path $Destination 'FindX.exe')
 foreach($n in @('findx2-service.exe','findx2.exe','fx.exe')){Copy-Item (Join-Path 'target/release' $n) (Join-Path $Destination $n)}
-$v=& (Join-Path $Destination 'findx2-service.exe') --version;if($LASTEXITCODE-or$v-cne'findx2-service 2.5.3'){throw 'Engine version mismatch'}
+$v=& (Join-Path $Destination 'findx2-service.exe') --version;$engineVersion=([string]($v|Out-String)).Trim();if($LASTEXITCODE -or $engineVersion -notmatch '^findx2-service \d+\.\d+\.\d+$'){throw 'Engine version probe failed'};$productVersion=$engineVersion.Substring('findx2-service '.Length)
 [IO.File]::WriteAllBytes((Join-Path $Destination 'FindX.installed'),[byte[]](0x31,13,10));$null=New-Item -ItemType Directory (Join-Path $Destination 'resources')
 if($ReusedCliCommit){
  if($ReusedCliCommit-cne'0157cca03ea4e24c803624da968ee741393ba1b1'-or$ReusedCliRun-ne44475535981){throw 'Unknown reused CLI origin'}
@@ -19,7 +19,7 @@ if($ReusedCliCommit){
  }
 }
 $components=@(foreach($n in @('FindX.exe','findx2-service.exe','findx2.exe','fx.exe')){[ordered]@{name=$n;sourceCommit=$(if($n-eq'FindX.exe'){$m.sourceCommit}elseif($n-ne'findx2-service.exe'-and$ReusedCliCommit){$ReusedCliCommit}else{$head});sha256=(Get-FileHash (Join-Path $Destination $n)).Hash.ToLowerInvariant()}})
-[ordered]@{version='2.5.3';sourceCommit=$head;engineUnchanged=$false;engineBaseline='v2.5.2 source plus authorized fixes';components=$components;guiBuildRun=44468255654;reusedCliBuildRun=$ReusedCliRun}|ConvertTo-Json -Depth 8|Set-Content (Join-Path $Destination 'resources/component-manifest.json') -Encoding utf8
+[ordered]@{version=$productVersion;sourceCommit=$head;engineUnchanged=$false;engineBaseline='v2.5.2 source plus authorized fixes';components=$components;guiBuildRun=44468255654;reusedCliBuildRun=$ReusedCliRun}|ConvertTo-Json -Depth 8|Set-Content (Join-Path $Destination 'resources/component-manifest.json') -Encoding utf8
 $files=@(Get-ChildItem $Destination -Recurse -File|ForEach-Object{[ordered]@{name=$_.FullName.Substring($Destination.Length+1);length=$_.Length;sha256=(Get-FileHash $_.FullName).Hash.ToLowerInvariant()}})
 if($files.Count-ne6){throw 'Exactly six final payload files required'}
-[ordered]@{version='2.5.3';sourceCommit=$head;engineUnchanged=$false;guiSourceCommit=$m.sourceCommit;files=$files}|ConvertTo-Json -Depth 10|Set-Content (Join-Path $Destination 'stage-manifest.json') -Encoding utf8
+[ordered]@{version=$productVersion;sourceCommit=$head;engineUnchanged=$false;guiSourceCommit=$m.sourceCommit;files=$files}|ConvertTo-Json -Depth 10|Set-Content (Join-Path $Destination 'stage-manifest.json') -Encoding utf8

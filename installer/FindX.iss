@@ -1,7 +1,7 @@
 ﻿; FindX native Windows Inno Setup (publication blocked until upgrade gates pass)
 ; 构建: 1) 在仓库根/ gui 中完成 tauri build --no-bundle
 ;       2) powershell -File installer\stage-inno.ps1
-;       3) iscc /DMyAppVersion=x.y.z installer\FindX.iss
+;       3) iscc /DUpgradeGatesApproved=1 /DMyAppVersion=2.5.8 /DPublishDir=<stage绝对路径> installer\FindX.iss
 ;       CI 建议再加 /DPublishDir=<仓库>\installer\stage 绝对路径，避免 ISCC 解析不到 stage\*
 ;
 ; 与 v1 的 FindX.iss 类似：多任务（服务注册、PATH、桌面快捷方式、安装后启动），无 .NET 检测。
@@ -13,7 +13,7 @@
 #endif
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.5.5"
+  #define MyAppVersion "2.5.8"
 #endif
 
 #define MyAppName      "FindX"
