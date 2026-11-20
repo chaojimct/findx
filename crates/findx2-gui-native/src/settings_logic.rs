@@ -160,7 +160,7 @@ pub fn commit_search_limit(text: &str) -> DraftCommit {
     }
     match trimmed.parse::<u64>() {
         Ok(value) if (1..=SEARCH_LIMIT_U32_MAX).contains(&value) => DraftCommit::Ok(value),
-        _ => DraftCommit::Err("结果条数上限须在 1 到 4294967295 之间，与设置字段 u32 一致。"),
+        _ => DraftCommit::Err("结果条数上限须在 1 到 4294967295 之间。"),
     }
 }
 
@@ -168,14 +168,14 @@ pub fn commit_search_limit(text: &str) -> DraftCommit {
 pub fn commit_save_interval_secs(text: &str) -> DraftCommit {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return DraftCommit::Err("增量落盘间隔还是空的。保存前需要填一个不小于 1 的整数秒。");
+        return DraftCommit::Err("落盘间隔还是空的。保存前请填写不小于 1 的整数秒。");
     }
     if !trimmed.chars().all(|c| c.is_ascii_digit()) {
-        return DraftCommit::Err("增量落盘间隔必须是十进制整数秒。");
+        return DraftCommit::Err("落盘间隔必须是整数秒。");
     }
     match trimmed.parse::<u64>() {
         Ok(value) if value >= 1 => DraftCommit::Ok(value),
-        _ => DraftCommit::Err("增量落盘间隔必须是不小于 1 的整数秒。"),
+        _ => DraftCommit::Err("落盘间隔必须是不小于 1 的整数秒。"),
     }
 }
 

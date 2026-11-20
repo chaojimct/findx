@@ -2610,6 +2610,7 @@ impl MainWindow {
         match self.workspace.mode {
             ViewMode::Search => div()
                 .id("search-table-context")
+                .relative()
                 .size_full()
                 .child(crate::ui::native_focus::table_frame(
                     DataTable::new(&self.table)
@@ -2636,6 +2637,7 @@ impl MainWindow {
                             .unwrap()
                     }
                 })
+                .when(self.service_down(cx), |view| view.child(self.render_service_down(cx)))
                 .into_any_element(),
             ViewMode::Directory => self.render_directory_table(window, cx),
             ViewMode::Usage => self.render_workspace_usage(cx).into_any_element(),

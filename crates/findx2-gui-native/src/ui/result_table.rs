@@ -180,7 +180,22 @@ impl TableDelegate for ResultsTable {
     }
     fn render_empty(&mut self, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
         let label = self.owner.read_with(cx, |view, cx| view.search_empty_message(cx)).unwrap_or_default();
-        div().size_full().flex().items_center().justify_center().child(label)
+        let tokens = *cx.global::<crate::theme::FindxTokens>();
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_6()
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(360.))
+                    .text_center()
+                    .whitespace_normal()
+                    .text_color(tokens.text_secondary)
+                    .child(label),
+            )
     }
     fn has_more(&self, _: &App) -> bool {
         self.more

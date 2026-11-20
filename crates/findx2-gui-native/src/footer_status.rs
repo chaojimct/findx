@@ -96,10 +96,19 @@ impl EngineFooter {
     }
     pub fn label(&self) -> String {
         if !self.connected {
+            if self
+                .error
+                .as_deref()
+                .is_some_and(crate::status_logic::is_service_not_listening)
+            {
+                return "服务未运行".into();
+            }
             return if self.error.is_none() && self.last.is_none() {
                 "连接中…"
-            } else {
+            } else if self.last.is_some() {
                 "连接已断开"
+            } else {
+                "未连接"
             }
             .into();
         }
@@ -155,7 +164,14 @@ impl EngineFooter {
     }
     pub fn tooltip(&self) -> String {
         if !self.connected {
-            return "连接尚未建立或已断开，列表和统计暂不更新；重连后会继续刷新。".into();
+            if self
+                .error
+                .as_deref()
+                .is_some_and(crate::status_logic::is_service_not_listening)
+            {
+                return "索引服务未运行。启动服务后即可搜索。".into();
+            }
+            return "未连接到索引服务，列表和统计暂不更新。".into();
         }
         if self.error.is_some() {
             return "服务暂时无法响应，保留上次统计；请稍后重试。".into();
@@ -343,6 +359,18 @@ mod tests {
         .unwrap()));
         assert_eq!(f.label(), "连接已断开");
         assert!(f.counts_label().starts_with("上次"));
+    }
+    #[test]
+    fn stopped_service_uses_a_short_unclipped_label() {
+        let mut f = EngineFooter::default();
+        f.observe(&Err("无法连接索引服务：服务未运行。".into()));
+        assert_eq!(f.label(), "服务未运行");
+        assert!(!f.label().contains('·'));
+        assert!(!f.tooltip().contains("pipe"));
+        assert!(!f.tooltip().contains("--live"));
+        let mut other = EngineFooter::default();
+        other.observe(&Err("暂时无法连接".into()));
+        assert_eq!(other.label(), "未连接");
     }
     #[test]
     fn endpoint_change_drops_old_stats() {

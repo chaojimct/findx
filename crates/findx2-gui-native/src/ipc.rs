@@ -174,13 +174,18 @@ async fn dispatch(job: Job) {
 }
 
 fn map_pipe_open_err(endpoint: &str, e: std::io::Error) -> String {
-    match e.raw_os_error() {
-        Some(2) => format!(
-            "无法连接 `{endpoint}`：管道不存在或服务未监听。若使用 --live，请确认现有 findx2-service 正在运行；不要启动第二个服务进程。"
-        ),
-        Some(5) => format!("无法连接 `{endpoint}`：拒绝访问。"),
-        _ => format!("无法连接 `{endpoint}`: {e}"),
+    let _ = endpoint;
+    // ENOENT / ERROR_FILE_NOT_FOUND, and connection refused on Unix sockets.
+    let not_listening = matches!(e.raw_os_error(), Some(2) | Some(61) | Some(111))
+        || e.kind() == std::io::ErrorKind::NotFound
+        || e.kind() == std::io::ErrorKind::ConnectionRefused;
+    if not_listening {
+        return "无法连接索引服务：服务未运行。".into();
     }
+    if e.raw_os_error() == Some(5) {
+        return "无法连接索引服务：拒绝访问。".into();
+    }
+    "无法连接索引服务。".into()
 }
 
 async fn write_request<S: AsyncRead + AsyncWrite + Unpin>(

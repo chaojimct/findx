@@ -166,6 +166,8 @@ pub struct MainWindow {
     selected: Option<usize>,
     match_total: u32,
     search_status: SharedString,
+    service_action_busy: bool,
+    resume_search_when_connected: bool,
     search_gen: u64,
     search_keyboard: crate::interaction_logic::SearchKeyboard,
     status_gen: u64,
@@ -229,6 +231,11 @@ impl MainWindow {
                         this.exit_requested = false;
                         this.settings_pending_mode = None;
                         cx.notify();
+                    }
+                    SettingsEvent::ServiceChanged => this.poll_status(cx),
+                    SettingsEvent::ServiceReady => {
+                        this.resume_search_when_connected = true;
+                        this.poll_status(cx);
                     }
                 }
             }),
@@ -338,6 +345,8 @@ impl MainWindow {
             selected: None,
             match_total: 0,
             search_status: "就绪".into(),
+            service_action_busy: false,
+            resume_search_when_connected: false,
             search_gen: 0,
             search_keyboard: Default::default(),
             status_gen: 0,
@@ -576,12 +585,109 @@ impl MainWindow {
     }
 
     pub(super) fn search_empty_message(&self, cx: &App) -> String {
+        if self.service_down(cx) {
+            return "索引服务未运行".into();
+        }
         crate::search_logic::empty_result_label(
             !self.current_query(cx).trim().is_empty(),
             self.loading,
             self.search_status.as_ref(),
         )
         .into()
+    }
+
+    pub(super) fn service_down(&self, cx: &App) -> bool {
+        if self.loading || !self.hits.is_empty() {
+            return false;
+        }
+        let session = self.session.read(cx);
+        !session.connected
+            && session
+                .last_error
+                .as_deref()
+                .is_some_and(status_logic::is_service_not_listening)
+    }
+
+    pub(super) fn render_service_down(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tokens = Self::tokens(cx);
+        let official = self.session.read(cx).official_product;
+        let busy = self.service_action_busy;
+        v_flex()
+            .absolute()
+            .inset_0()
+            .bg(tokens.bg)
+            .items_center()
+            .justify_center()
+            .p_6()
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(360.))
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_base().text_center().child("索引服务未运行"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_center()
+                            .whitespace_normal()
+                            .text_color(tokens.text_secondary)
+                            .child(if official {
+                                "启动后台索引服务后即可开始搜索。"
+                            } else {
+                                "请先启动已有的索引服务，再重新搜索。"
+                            }),
+                    )
+                    .when(official, |view| {
+                        view.child(
+                            Button::new("search-start-service")
+                                .primary()
+                                .w(px(128.))
+                                .h(px(32.))
+                                .label("启动服务")
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, _, cx| this.start_official_service(cx))),
+                        )
+                    })
+                    .child(
+                        div()
+                            .h(px(20.))
+                            .text_xs()
+                            .text_color(tokens.text_tertiary)
+                            .child(if busy { "正在启动服务" } else { "" }),
+                    ),
+            )
+    }
+
+    fn start_official_service(&mut self, cx: &mut Context<Self>) {
+        if self.service_action_busy || !self.session.read(cx).official_product {
+            return;
+        }
+        self.service_action_busy = true;
+        self.resume_search_when_connected = true;
+        self.search_status = "服务未运行".into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async { crate::service_control::start_official() })
+                .await;
+            this.update(cx, |this, cx| {
+                this.service_action_busy = false;
+                match result {
+                    Ok(_) => this.poll_status(cx),
+                    Err(error) => {
+                        this.resume_search_when_connected = false;
+                        this.search_status = "服务未运行".into();
+                        this.session.update(cx, |session, _| {
+                            session.last_error = Some(error);
+                        });
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
     fn current_query(&self, cx: &App) -> String {
         let raw = self.search.read(cx).value().to_string();
@@ -684,12 +790,12 @@ impl MainWindow {
                         let head = if total == 0 {
                             "无匹配".to_string()
                         } else if shown >= total {
-                            format!("匹配 {} 条", total)
+                            format!("匹配 {total} 条")
                         } else {
-                            format!("匹配 {total} 条 · 已显示 {shown} 条")
+                            format!("匹配 {total} 条，已显示 {shown} 条")
                         };
                         this.search_status = if out.elapsed_ms > 0 {
-                            format!("{head} · {} ms", out.elapsed_ms).into()
+                            format!("{head}，{} ms", out.elapsed_ms).into()
                         } else {
                             head.into()
                         };
@@ -701,7 +807,17 @@ impl MainWindow {
                         this.record_reset("查询失败");
                         this.search_selection.clear();
                         this.selected = None;
-                        this.search_status = format!("错误: {err}").into();
+                        this.search_status = if status_logic::is_service_not_listening(&err) {
+                            "服务未运行".into()
+                        } else {
+                            "搜索失败".into()
+                        };
+                        this.session.update(cx, |session, _| {
+                            session.engine_footer.observe(&Err(err.clone()));
+                            session.connected = false;
+                            session.last_error = Some(err.clone());
+                            session.index_status = status_logic::disconnected_status(&err);
+                        });
                         this.request_preview(cx);
                     }
                 }
@@ -785,7 +901,7 @@ impl MainWindow {
                             this.match_total = out.total;
                         }
                         this.search_status = format!(
-                            "匹配 {} 条 · 已加载 {} 条",
+                            "匹配 {} 条，已加载 {} 条",
                             this.match_total,
                             this.hits.len()
                         )
@@ -793,8 +909,11 @@ impl MainWindow {
                     }
                     Err(err) => {
                         this.page_error = true;
-                        this.search_status =
-                            format!("加载下一页失败（重新搜索可重试）: {err}").into();
+                        this.search_status = if status_logic::is_service_not_listening(&err) {
+                            "服务未运行".into()
+                        } else {
+                            "加载下一页失败，请重新搜索".into()
+                        };
                     }
                 }
                 this.sync_table(false, cx);
@@ -848,6 +967,8 @@ impl MainWindow {
                 if this.session.read(cx).endpoint != endpoint {
                     return;
                 }
+                let resume = this.resume_search_when_connected;
+                let mut connected_now = false;
                 this.session.update(cx, |session, cx| {
                     session.engine_footer.observe(&result);
                     session.connected = session.engine_footer.connected;
@@ -862,6 +983,7 @@ impl MainWindow {
                                     .as_secs(),
                             );
                             session.last_error = None;
+                            connected_now = true;
                             session.index_status = status_logic::apply_status(
                                 Some(&session.index_status),
                                 &resp,
@@ -876,6 +998,12 @@ impl MainWindow {
                     }
                     cx.notify();
                 });
+                if connected_now && resume {
+                    this.resume_search_when_connected = false;
+                    if !this.current_query(cx).trim().is_empty() {
+                        this.run_search(cx);
+                    }
+                }
                 cx.notify();
             })
             .ok();
@@ -2317,8 +2445,8 @@ impl MainWindow {
                 .bg(tokens.surface)
                 .text_xs()
                 .text_color(tokens.text_secondary)
-                .child(div().w(px(200.)).flex_shrink_0().text_ellipsis().child(if selected > 0 {
-                    format!("{selected} 个项目已选择 · 共 {count} 个项目")
+                .child(div().w(px(220.)).flex_shrink_0().text_ellipsis().child(if selected > 0 {
+                    format!("已选择 {selected} 个，共 {count} 个")
                 } else {
                     format!("{count} 个项目")
                 }))
@@ -2346,16 +2474,18 @@ impl MainWindow {
                 )
                 .into_any_element();
         }
+        let footer = self.session.read(cx).engine_footer.clone();
         let left: String = if self.workspace.mode == ViewMode::Search {
-            if self.file_actions.summary.is_empty() {
+            if !footer.connected {
+                footer.label()
+            } else if self.file_actions.summary.is_empty() {
                 self.search_status.to_string()
             } else {
-                format!("{} · {}", self.search_status, self.file_actions.summary)
+                format!("{}  {}", self.search_status, self.file_actions.summary)
             }
         } else {
             self.workspace_footer_label()
         };
-        let footer = self.session.read(cx).engine_footer.clone();
         let left_detail = if self.workspace.mode == ViewMode::Usage {
             self.workspace_scan_status()
         } else {
@@ -2428,7 +2558,7 @@ impl MainWindow {
                     } else {
                         "icons/circle-check.svg"
                     }))
-                    .w(px(108.)).flex_shrink_0()
+                    .w(px(156.)).flex_shrink_0()
                     .label(footer.label())
                     .h(px(24.))
                     .text_color(if footer.warning() {

@@ -29,16 +29,89 @@ pub enum Action {
 impl Action {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Start => "启动正式服务",
-            Self::Stop => "停止正式服务",
-            Self::Auto => "服务开机自动启动",
-            Self::Manual => "服务改为手动启动",
-            Self::GuiAutoOn => "启用正式 GUI 登录启动",
-            Self::GuiAutoOff => "关闭正式 GUI 登录启动",
-            Self::Compact => "备份后压缩正式索引",
-            Self::Rebuild => "备份后重建正式索引",
+            Self::Start => "启动服务",
+            Self::Stop => "停止服务",
+            Self::Auto => "服务开机自启",
+            Self::Manual => "服务手动启动",
+            Self::GuiAutoOn => "登录时自动启动 FindX",
+            Self::GuiAutoOff => "关闭登录自启",
+            Self::Compact => "备份后压缩索引",
+            Self::Rebuild => "备份后重建索引",
             Self::ApplyPreferences => "应用已保存的服务选项",
         }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+            Self::GuiAutoOn => "gui-auto-on",
+            Self::GuiAutoOff => "gui-auto-off",
+            Self::Compact => "compact",
+            Self::Rebuild => "rebuild",
+            Self::ApplyPreferences => "apply-preferences",
+        }
+    }
+
+    pub fn parse(key: &str) -> Option<Self> {
+        Some(match key {
+            "start" => Self::Start,
+            "stop" => Self::Stop,
+            "auto" => Self::Auto,
+            "manual" => Self::Manual,
+            "gui-auto-on" => Self::GuiAutoOn,
+            "gui-auto-off" => Self::GuiAutoOff,
+            "compact" => Self::Compact,
+            "rebuild" => Self::Rebuild,
+            "apply-preferences" => Self::ApplyPreferences,
+            _ => return None,
+        })
+    }
+
+    /// SCM start/stop/config and index maintenance need an elevated token on Windows.
+    /// Login autostart only writes the current user's HKCU Run key.
+    pub fn needs_elevation(self) -> bool {
+        !matches!(self, Self::GuiAutoOn | Self::GuiAutoOff)
+    }
+
+    /// Start, stop and the two switches are themselves the confirmation.
+    /// Maintenance still asks, because it rewrites the index.
+    pub fn needs_confirmation(self) -> bool {
+        matches!(
+            self,
+            Self::Compact | Self::Rebuild | Self::ApplyPreferences
+        )
+    }
+}
+
+fn completed(action: Action) -> String {
+    match action {
+        Action::Start => "服务已启动".into(),
+        Action::Stop => "服务已停止".into(),
+        Action::Auto => "已设为开机自启".into(),
+        Action::Manual => "已改为手动启动".into(),
+        Action::GuiAutoOn => "登录时将自动启动 FindX".into(),
+        Action::GuiAutoOff => "已关闭登录时自动启动".into(),
+        Action::Compact | Action::Rebuild | Action::ApplyPreferences => {
+            format!("{}完成", action.label())
+        }
+    }
+}
+
+/// UAC cancel is Win32 ERROR_CANCELLED (1223). Keep the mapping pure so tests
+/// can lock the user-facing copy without a consent prompt.
+pub fn elevation_failure(code: u32) -> String {
+    let win32 = if code & 0xFFFF_0000 == 0x8007_0000 {
+        code & 0xFFFF
+    } else {
+        code
+    };
+    if win32 == 1223 {
+        "已取消管理员授权，服务未更改".into()
+    } else {
+        format!("无法请求管理员权限（{win32}）")
     }
 }
 fn hidden(c: &mut Command) {
@@ -464,30 +537,75 @@ fn wait_state(state: &str) -> Result<(), String> {
     }
     Err(format!("等待 SCM {state} 超时；请查看诊断，不代表操作成功"))
 }
-/// Only invoke after the UI displays the exact target and obtains explicit confirmation.
+fn same_snapshot(current: &Snapshot, expected: &Snapshot) -> bool {
+    current.path_name == expected.path_name
+        && current.process_id == expected.process_id
+        && current.state == expected.state
+}
+
+/// Only invoke after the UI shows the verified target. Windows SCM changes from a
+/// standard-user GUI are re-run through a hidden elevated copy of this executable.
 pub fn execute(
     action: Action,
     expected: Snapshot,
     preferences: crate::settings_logic::FindxGuiSettings,
 ) -> Result<String, String> {
     let current = snapshot()?;
-    if current.path_name != expected.path_name
-        || current.process_id != expected.process_id
-        || current.state != expected.state
-    {
-        return Err("确认后服务状态已改变；请刷新重新确认".into());
+    if !same_snapshot(&current, &expected) {
+        return Err("服务状态已变化，请刷新后再试".into());
     }
+    dispatch(action, &current, &preferences)
+}
+
+/// Start the identity-checked official service from the search empty state.
+/// Preferences are unused for start; the registered command line stays in place.
+pub fn start_official() -> Result<String, String> {
+    let current = snapshot()?;
+    if current.state.eq_ignore_ascii_case("Running") {
+        return Ok(completed(Action::Start));
+    }
+    let preferences =
+        crate::settings_logic::FindxGuiSettings::isolated_default("findx2", String::new());
+    execute(Action::Start, current, preferences)
+}
+
+fn dispatch(
+    action: Action,
+    current: &Snapshot,
+    preferences: &crate::settings_logic::FindxGuiSettings,
+) -> Result<String, String> {
+    #[cfg(windows)]
+    if action.needs_elevation() && !is_elevated() {
+        return relaunch_elevated(action, current, preferences);
+    }
+    perform(action, current, preferences)
+}
+
+fn perform(
+    action: Action,
+    current: &Snapshot,
+    preferences: &crate::settings_logic::FindxGuiSettings,
+) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     {
-        let _ = &preferences;
-        return execute_linux(action, &current, &preferences);
+        return execute_linux(action, current, preferences);
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = &preferences;
-        return execute_macos(action, &current, &preferences);
+        return execute_macos(action, current, preferences);
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        perform_windows(action, current, preferences).map_err(friendly_service_error)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn perform_windows(
+    action: Action,
+    current: &Snapshot,
+    preferences: &crate::settings_logic::FindxGuiSettings,
+) -> Result<String, String> {
     match action {
         Action::Start => {
             if current.state != "Running" {
@@ -520,10 +638,192 @@ pub fn execute(
                 return Err("正式 GUI 自启动回读不一致".into());
             }
         }
-        Action::ApplyPreferences => return apply_preferences(&current, &preferences),
-        Action::Compact | Action::Rebuild => return maintenance(action, &current),
+        Action::ApplyPreferences => return apply_preferences(current, preferences),
+        Action::Compact | Action::Rebuild => return maintenance(action, current),
     }
-    Ok(format!("{}完成；SCM/注册表已回读验证", action.label()))
+    Ok(completed(action))
+}
+
+fn friendly_service_error(err: String) -> String {
+    let lower = err.to_ascii_lowercase();
+    if err.contains("拒绝访问")
+        || lower.contains("access is denied")
+        || err.contains("退出码 Some(5)")
+        || err.contains("退出码 5")
+    {
+        return "没有权限更改索引服务。若取消了授权提示，服务不会变化。".into();
+    }
+    err
+}
+
+#[cfg(windows)]
+fn is_elevated() -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TokenElevation};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, TOKEN_QUERY};
+    unsafe {
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut returned = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut TOKEN_ELEVATION as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        );
+        let _ = CloseHandle(token);
+        ok.is_ok() && elevation.TokenIsElevated != 0
+    }
+}
+
+#[cfg(windows)]
+fn relaunch_elevated(
+    action: Action,
+    expected: &Snapshot,
+    preferences: &crate::settings_logic::FindxGuiSettings,
+) -> Result<String, String> {
+    let dir = std::env::temp_dir().join(format!(
+        "findx-service-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let request = dir.join("request.json");
+    let payload = serde_json::json!({
+        "action": action.key(),
+        "expected": expected,
+        "preferences": preferences,
+    });
+    std::fs::write(&request, serde_json::to_vec(&payload).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let params = format!(
+        "--elevated-service {}",
+        quote_windows_arg(&request.display().to_string())
+    );
+    let launched = shell_runas(&exe, &params);
+    let result_path = request.with_extension("result.json");
+    let message = match launched {
+        Err(code) => Err(elevation_failure(code)),
+        Ok(exit) => read_elevated_result(&result_path, exit),
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    message
+}
+
+#[cfg(windows)]
+fn read_elevated_result(path: &Path, exit: u32) -> Result<String, String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    let message = value
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or(if exit == 0 {
+            "操作完成"
+        } else {
+            "服务操作失败"
+        })
+        .to_string();
+    if exit == 0 && value.get("ok").and_then(|v| v.as_bool()) != Some(false) {
+        Ok(message)
+    } else {
+        Err(message)
+    }
+}
+
+#[cfg(windows)]
+fn shell_runas(exe: &Path, params: &str) -> Result<u32, u32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, WaitForSingleObject, WAIT_OBJECT_0,
+    };
+    use windows::Win32::UI::Shell::{
+        SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+        ShellExecuteExW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    use windows::core::PCWSTR;
+    let file = exe.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+    let verb: Vec<u16> = "runas".encode_utf16().chain(Some(0)).collect();
+    let parameters: Vec<u16> = params.encode_utf16().chain(Some(0)).collect();
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR(parameters.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+    if let Err(error) = unsafe { ShellExecuteExW(&mut info) } {
+        return Err(error.code().0 as u32);
+    }
+    let handle = info.hProcess;
+    if handle.is_invalid() {
+        return Err(0);
+    }
+    let waited = unsafe { WaitForSingleObject(handle, 0xFFFF_FFFF) };
+    let mut code = 1u32;
+    if waited == WAIT_OBJECT_0 {
+        let _ = unsafe { GetExitCodeProcess(handle, &mut code) };
+    } else {
+        code = 1;
+    }
+    let _ = unsafe { CloseHandle(handle) };
+    Ok(code)
+}
+
+#[derive(Deserialize)]
+struct ElevatedRequest {
+    action: String,
+    expected: Snapshot,
+    preferences: crate::settings_logic::FindxGuiSettings,
+}
+
+/// Hidden entry used by the elevated copy. It never opens a window or a console.
+pub fn run_elevated_request(path: &Path) -> i32 {
+    let outcome = elevated_request_inner(path);
+    let body = match &outcome {
+        Ok(message) => serde_json::json!({"ok": true, "message": message}),
+        Err(message) => serde_json::json!({"ok": false, "message": message}),
+    };
+    let _ = std::fs::write(
+        path.with_extension("result.json"),
+        serde_json::to_vec(&body).unwrap_or_default(),
+    );
+    if outcome.is_ok() { 0 } else { 1 }
+}
+
+fn elevated_request_inner(path: &Path) -> Result<String, String> {
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        return Err("当前平台不使用 UAC 提权".into());
+    }
+    #[cfg(windows)]
+    {
+        if !is_elevated() {
+            return Err("管理员权限未生效，服务未更改".into());
+        }
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let request: ElevatedRequest =
+            serde_json::from_slice(&bytes).map_err(|e| format!("无法读取提权请求：{e}"))?;
+        let action = Action::parse(&request.action).ok_or("拒绝未知的服务操作")?;
+        if !action.needs_elevation() {
+            return Err("该操作不需要提权".into());
+        }
+        // Re-validate the live official service inside the elevated process.
+        // A swapped request still cannot name any service other than FindX2Search.
+        execute(action, request.expected, request.preferences)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -560,10 +860,7 @@ fn execute_linux(
         Action::ApplyPreferences => return unix_apply_preferences(current, preferences),
         Action::Compact | Action::Rebuild => return maintenance(action, current),
     }
-    Ok(format!(
-        "{}完成；systemd 用户服务已回读验证",
-        action.label()
-    ))
+    Ok(completed(action))
 }
 
 fn linux_systemctl(args: &[&str]) -> Result<String, String> {
@@ -601,7 +898,7 @@ fn execute_macos(
         Action::ApplyPreferences => return unix_apply_preferences(current, preferences),
         Action::Compact | Action::Rebuild => return maintenance(action, current),
     }
-    Ok(format!("{}完成；LaunchAgent 已执行", action.label()))
+    Ok(completed(action))
 }
 
 #[cfg(target_os = "macos")]
@@ -1340,6 +1637,28 @@ fn apply_preferences(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn privileged_actions_stay_explicit_and_cancel_is_not_a_failure_dump() {
+        assert!(Action::Start.needs_elevation());
+        assert!(Action::Stop.needs_elevation());
+        assert!(Action::Auto.needs_elevation());
+        assert!(Action::Manual.needs_elevation());
+        assert!(Action::Compact.needs_elevation());
+        assert!(Action::Rebuild.needs_elevation());
+        assert!(Action::ApplyPreferences.needs_elevation());
+        assert!(!Action::GuiAutoOn.needs_elevation());
+        assert!(!Action::GuiAutoOff.needs_elevation());
+        assert!(!Action::Start.needs_confirmation());
+        assert!(Action::Rebuild.needs_confirmation());
+        assert_eq!(Action::parse("start"), Some(Action::Start));
+        assert!(Action::parse("kill-all").is_none());
+        assert!(elevation_failure(1223).contains("已取消"));
+        assert!(elevation_failure(0x8007_04C7).contains("已取消"));
+        assert!(!elevation_failure(1223).contains("·"));
+        let denied = friendly_service_error("退出码 Some(5): Access is denied.".into());
+        assert!(denied.contains("没有权限"));
+        assert!(!denied.contains("Access is denied"));
+    }
     #[test]
     fn quoted_service_command_splits() {
         let s = r#""C:\Program Files\FindX\findx2-service.exe" --service --index "C:\ProgramData\FindX\index.bin" --pipe findx2"#;

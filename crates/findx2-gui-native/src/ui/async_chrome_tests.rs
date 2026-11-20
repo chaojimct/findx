@@ -18,7 +18,7 @@ fn shared_footer_async_polls_cannot_insert_activity_button() {
     assert!(!footer.contains("ViewMode::Search && self.workspace.scanning"));
     assert!(footer.contains(".disabled(!self.workspace.scanning)"));
     assert!(footer.contains(".w(px(216.))"));
-    assert!(footer.contains(".w(px(108.))"));
+    assert!(footer.contains(".w(px(156.))"));
     // The true engine warning is retained, not hidden by this layout correction.
     assert!(footer.contains("footer.warning()")); assert!(footer.contains("footer.tooltip()"));
 }
@@ -36,7 +36,24 @@ fn settings_identification_keeps_permanent_rows_and_diagnostics_viewport() {
     let src=include_str!("settings_window.rs");
     let service=src.split("fn render_service_tab").nth(1).unwrap().split("fn render_service_confirm").next().unwrap();
     assert!(!service.contains(".when_some(self.service_snapshot"));
-    for id in ["service-hint", "service-path", "service-options", "autostart-hint"] {assert!(service.contains(id));}
+    assert!(!service.contains('·'));
+    assert!(!service.contains("native-dev"));
+    for id in ["service-status", "service-hint", "service-start-stop", "service-refresh", "service-boot", "service-login", "service-path", "service-options", "高级维护", "启动服务", "停止服务"] {
+        assert!(service.contains(id), "missing {id}");
+    }
+    assert!(service.contains(".disabled(locked)") || service.contains(".disabled(self.service_busy"));
+    let index=src.split("fn render_index_tab").nth(1).unwrap().split("fn render_search_tab").next().unwrap();
+    assert!(!index.contains("native-dev"));
+    assert!(!index.contains('·'));
+    assert!(!src.contains('·'));
+    assert!(!src.contains("render_advanced_tab"));
+    assert!(src.contains("fn settings_page"));
+    assert!(src.contains(".max_w(px(720.))"));
+    assert!(src.contains("theme-check-"));
+    assert!(src.contains("id(\"settings-footer-hint\")"));
+    assert!(src.contains(".w(px(96.))"));
+    assert!(src.contains(".w(px(88.))"));
+    assert!(src.contains("id(\"service-advanced-body\")"));
     assert!(src.contains("id(\"raw-status-viewport\").h(px(192.))"));
 }
 

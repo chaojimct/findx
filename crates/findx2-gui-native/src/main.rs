@@ -17,6 +17,14 @@ fn main() {
         findx2_gui_native::office_host::host_main(&raw);
         return;
     }
+    // Elevated service helper: windows subsystem, no console, no window.
+    // Must run before argument parsing so a normal launch never treats it as UI.
+    if raw.get(1).is_some_and(|s| s == "--elevated-service") {
+        let code = raw.get(2).map(|path| {
+            findx2_gui_native::service_control::run_elevated_request(std::path::Path::new(path))
+        });
+        std::process::exit(code.unwrap_or(2));
+    }
     if raw.len() == 2 && matches!(raw[1].as_str(), "--version" | "-V") {
         attach_cli_console();
         println!("FindX {} (native)", env!("CARGO_PKG_VERSION"));

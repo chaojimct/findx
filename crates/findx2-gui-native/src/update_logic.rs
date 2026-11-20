@@ -253,12 +253,12 @@ pub fn update_card_model(
     if !updater_allowed(official_product) {
         return UpdateCardModel {
             official: false,
-            title: "应用更新 · 未连接安装协议".into(),
-            version_line: format!("当前 native-dev 版本 {current_version}"),
-            body: "此开发客户端不检查、下载或安装更新。更新请使用正式安装的 FindX；不展示虚构的新版本或下载进度。".into(),
-            button_label: "检查 / 安装更新（不可操作）".into(),
+            title: "应用更新".into(),
+            version_line: format!("当前版本 {current_version}"),
+            body: "当前程序不能在这里检查或安装更新。请使用已安装的 FindX。".into(),
+            button_label: "检查更新".into(),
             button_enabled: false,
-            auto_check_label: "自动检查偏好（只保存，本客户端不执行）".into(),
+            auto_check_label: "自动检查更新".into(),
             status: None,
             progress_text: None,
         };
@@ -1324,8 +1324,11 @@ mod tests {
         let model = update_card_model(false, "2.5.2", &OfficialUpdateState::default(), true);
         assert!(!model.official);
         assert!(!model.button_enabled);
-        assert!(model.button_label.contains("不可操作"));
-        assert!(model.version_line.contains("native-dev"));
+        assert_eq!(model.button_label, "检查更新");
+        assert_eq!(model.version_line, "当前版本 2.5.2");
+        assert!(!model.version_line.contains("native-dev"));
+        assert!(!model.body.contains("native-dev"));
+        assert!(!model.title.contains('·'));
         assert!(!model.body.contains("2.4.11"));
         assert!(!model.body.contains("占位"));
         assert!(should_auto_check(false, true, 0) == false);

@@ -169,7 +169,7 @@ impl MainWindow {
         self.loading = false;
         self.page_loading = false;
         self.page_error = false;
-        self.search_status = "范围索引搜索 · 含子目录 · 输入查询后开始；不扫描文件系统".into();
+        self.search_status = "范围索引搜索，含子目录。输入查询后开始，不扫描文件系统".into();
         self.workspace_switch(ViewMode::Search, cx);
         self.search.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();

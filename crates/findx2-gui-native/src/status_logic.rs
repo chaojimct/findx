@@ -173,10 +173,30 @@ pub fn apply_status(
     summarize_status(resp, enable_metadata_backfill)
 }
 
+/// Pipe missing, socket missing, or connection refused: the official service is
+/// not listening. Other failures stay a generic disconnect.
+pub fn is_service_not_listening(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    message.contains("服务未运行")
+        || message.contains("管道不存在")
+        || message.contains("服务未监听")
+        || message.contains("端点不存在")
+        || lower.contains("connection refused")
+        || lower.contains("no such file")
+        || lower.contains("os error 2")
+}
+
 pub fn disconnected_status(message: &str) -> IndexStatusView {
-    IndexStatusView {
-        summary: "未连接隔离后端".into(),
-        detail: Some(message.to_string()),
+    if is_service_not_listening(message) {
+        IndexStatusView {
+            summary: "服务未运行".into(),
+            detail: Some("启动后台索引服务后即可开始搜索。".into()),
+        }
+    } else {
+        IndexStatusView {
+            summary: "未连接".into(),
+            detail: Some("暂时无法连接索引服务。".into()),
+        }
     }
 }
 
@@ -184,6 +204,19 @@ pub fn disconnected_status(message: &str) -> IndexStatusView {
 mod tests {
     use super::*;
     use findx2_ipc::IpcResponse;
+
+    #[test]
+    fn stopped_service_is_distinct_from_a_generic_disconnect() {
+        assert!(is_service_not_listening("无法连接索引服务：服务未运行。"));
+        assert!(is_service_not_listening(
+            "无法连接 `\\\\.\\pipe\\findx2`：管道不存在或服务未监听。"
+        ));
+        assert!(!is_service_not_listening("无法连接索引服务：拒绝访问。"));
+        let down = disconnected_status("无法连接索引服务：服务未运行。");
+        assert_eq!(down.summary, "服务未运行");
+        assert!(!down.summary.contains('·'));
+        assert_eq!(disconnected_status("超时").summary, "未连接");
+    }
 
     #[test]
     fn ready_index_uses_count_label() {
