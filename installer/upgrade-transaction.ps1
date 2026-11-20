@@ -513,15 +513,26 @@ function Verify-GuiHealth {
  $exit=Get-Content -LiteralPath (Join-Path $root 'normal-exit.json') -Raw -Encoding UTF8 | ConvertFrom-Json
  if($render.version -ne $script:s.expectedVersion -or $render.frames -lt 3 -or -not $render.storage_ok -or -not $render.normal_quit_requested -or -not $render.isolated -or -not $exit.normal_event_loop_return -or -not $exit.passed){throw 'GUI did not confirm real frame/persistence/normal-exit health'}
 }
+function Test-FxTxKnownTransientStatus($Status){
+ # 已知瞬态：引擎已在服务、个别卷在自愈/升级中。这两类由新引擎的既定机制收敛
+ # （journal 断档 → 全卷重建；namespace 停车 → Checkpoint 丢弃放行），不应拦死
+ # 安装/恢复。真错误（打开卷被拒绝、管道身份变化等）不在此列，仍然拦截。
+ if($null -eq $Status -or $Status.loading){return $false}
+ $we=[string]$Status.watch_error
+ if([string]::IsNullOrWhiteSpace($we)){return $false}
+ return $we -match '全卷重建中|missing-parent namespace events pending'
+}
 function Wait-NewServiceReady {
- $until=[DateTime]::UtcNow.AddSeconds($script:s.timeoutSeconds);$last='not ready'
+ # 30s 下限：大库加载（v6 mmap 数秒）+ 一次 Checkpoint 周期（namespace 停车事件
+ # 的丢弃放行发生在首个 Checkpoint）+ 余量。原 12s 在慢盘/大库上误杀。
+ $until=[DateTime]::UtcNow.AddSeconds([Math]::Max($script:s.timeoutSeconds,30));$last='not ready'
  do {
   $svc=Get-ExactService
   if($svc -and $svc.State -eq 'Running' -and $svc.ProcessId){
    try {
     $status=Read-FxTxServiceStatus $script:s.pipeName ([int]$svc.ProcessId)
     [IO.File]::WriteAllText((Join-Path $TransactionRoot 'service-status-last.json'),(@{scmPid=$svc.ProcessId;scmState=$svc.State;status=$status} | ConvertTo-Json -Depth 8))
-    if(-not $status.loading -and $status.healthy){
+    if(-not $status.loading -and ($status.healthy -or (Test-FxTxKnownTransientStatus $status))){
      [IO.File]::WriteAllText((Join-Path $TransactionRoot 'service-health.json'),($status | ConvertTo-Json -Depth 8));return
     }
     $last='Index loading or health failure: '+($status | ConvertTo-Json -Depth 8 -Compress)

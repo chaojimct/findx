@@ -866,15 +866,30 @@ fn usn_watch_loop(
                     next_usn,
                 } => {
                     dirty_count += flush_pending(&mut pending)?;
+                    // 停车事件在重放消费后仍无法解析 = 引用已被替换的 store 快照
+                    // （升级/回滚换库窗口的典型产物；USN 单调序保证父目录的创建事件
+                    // 不可能晚于子事件，继续钉死游标只会让 Status.healthy 永久 false，
+                    // 安装器与升级器全数卡死——本机实测 64 条 C: 临时文件事件）。
+                    // 丢弃放行；父目录当前可解析的事件保留；该区域由全卷重建
+                    // （legacy 拓扑升级 / journal 断档自愈）兜底。
+                    if engine.has_pending_namespace(volume_letter) {
+                        let dropped = engine.discard_unresolved_namespace(volume_letter);
+                        if dropped > 0 {
+                            info!(
+                                "卷 {letter} 丢弃 {dropped} 条引用已替换快照的 namespace 停车事件，游标放行"
+                            );
+                        }
+                        if engine.has_pending_namespace(volume_letter) {
+                            set_watch_error(letter, Some(format!("missing-parent namespace events pending; durable cursor pinned for restart replay; {}", engine.pending_namespace_diagnostics(volume_letter))));
+                            lifecycle.error("unresolved namespace parents; cursor retained".into());
+                            continue;
+                        }
+                        set_watch_error(letter, None);
+                    }
                     if let Err(e) = namespace_gate.apply(&engine, volume_letter, &[], journal_id, next_usn) {
                         set_watch_error(letter, Some(format!("checkpoint rejected; namespace fenced: {e}")));
                         namespace_gate.blocked = true;
                         lifecycle.error(e);
-                        continue;
-                    }
-                    if engine.has_pending_namespace(volume_letter) {
-                        set_watch_error(letter, Some(format!("missing-parent namespace events pending; durable cursor pinned for restart replay; {}", engine.pending_namespace_diagnostics(volume_letter))));
-                        lifecycle.error("unresolved namespace parents; cursor retained".into());
                         continue;
                     }
                     // 存活确认：收到 journal 心跳即视为健康，复位退避/重建计数。

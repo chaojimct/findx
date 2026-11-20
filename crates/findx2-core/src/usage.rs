@@ -1189,6 +1189,59 @@ impl SearchEngine {
     pub fn has_pending_namespace(&self, volume: u8) -> bool {
         self.orphans.lock().ordered.iter().any(|(v, _, _)| *v == volume)
     }
+    /// 丢弃「重放消费后仍无法解析」的 namespace 停车事件，返回丢弃数。
+    ///
+    /// 触发语境：CheckPoint 到达意味着本批 journal 事件已完整消费过一轮（含多轮
+    /// 链式解析）；仍留在停车场的事件，其父目录在当前 store 与同批事件里都不存在。
+    /// USN 是卷内单调序——父目录的创建事件不可能晚于子事件，这些事件永远等不到父
+    /// 目录（典型来源：升级/回滚窗口期间 store 被原子换入换出，事件绑定的目录身份
+    /// 属于已被替换的快照；本机实测 64 条 C: 临时文件事件把游标钉死、healthy 永久
+    /// false、安装器与升级器全部卡死）。钉死不产生任何额外信息——丢弃并放行游标；
+    /// 该目录区域由全卷重建（legacy 拓扑升级 / journal 断档自愈）兜底恢复，若文件
+    /// 仍存在，后续任何真实事件（改名/删除/重建）都会重新走增量路径。
+    ///
+    /// 父目录在当前 store 可解析的事件保留，不受影响。
+    pub fn discard_unresolved_namespace(&self, volume: u8) -> usize {
+        let mut o = self.orphans.lock();
+        let prior = o.take_volume(volume);
+        drop(o);
+        if prior.is_empty() {
+            return 0;
+        }
+        let mut keep: Vec<ChangeEvent> = Vec::new();
+        let mut dropped: Vec<ChangeEvent> = Vec::new();
+        {
+            let g = self.store.read();
+            for ev in prior {
+                let parent = match &ev {
+                    ChangeEvent::Create { entry } => Some(entry.parent_id),
+                    ChangeEvent::CreatePending { parent_id, .. } => Some(*parent_id),
+                    ChangeEvent::Rename { new_parent_id, .. } => Some(*new_parent_id),
+                    _ => None,
+                };
+                let resolvable = match parent {
+                    None => true,
+                    Some(p) => g.dir_on_volume(volume, p).is_some(),
+                };
+                if resolvable {
+                    keep.push(ev);
+                } else {
+                    dropped.push(ev);
+                }
+            }
+        }
+        if !dropped.is_empty() {
+            crate::progress!(
+                "警告：卷 {} 丢弃 {} 条不可解析的 namespace 停车事件（引用已替换的 store 快照，游标放行，区域由全卷重建兜底）",
+                volume as char,
+                dropped.len()
+            );
+        }
+        if !keep.is_empty() {
+            self.restore_orphans(volume, keep);
+        }
+        dropped.len()
+    }
     fn restore_orphans(&self, volume: u8, prior: Vec<ChangeEvent>) {
         let mut o = self.orphans.lock();
         // Remove a partially parked failed batch before restoring the exact prior queue.
