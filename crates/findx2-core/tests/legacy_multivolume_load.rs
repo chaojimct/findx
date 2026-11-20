@@ -15,7 +15,7 @@
 
 use findx2_core::index::{hash_ext8, FileEntry};
 use findx2_core::persist_v6::{V6Layout, V6Manifest, V6Volume};
-use findx2_core::{load_store_auto, v6_load, v6_save_full};
+use findx2_core::{load_store_auto, v6_load, v6_save_full, SearchEngine};
 use std::path::PathBuf;
 
 /// 手工写一个 2.4.x 形态的 legacy v6 平铺目录（manifest.json + 六个分段文件）。
@@ -38,20 +38,31 @@ fn write_legacy_flat(root: &std::path::Path) -> V6Manifest {
         (1011, 9, "Downloads"),       // idx 11
     ];
 
-    // (frn, dir_idx, name, is_dir, size)：条目按卷扫描段排列 E[0,4) D[4,8) C[8,12)。
+    // (frn, dir_idx, name, is_dir, size)：条目按卷扫描段排列 E[0,7) D[7,14) C[14,21)。
+    // 保真：2.4.x 扫描为每个 MFT 记录建条目——每个目录都有自己的 dir-entry
+    // （compact 的目录裁决靠「目录条目被墓碑」判死，缺 dir-entry 的目录是漏网孤儿）。
     let entries: &[(u64, u32, &str, bool, u64)] = &[
-        (2000, 0, "e0.txt", false, 10),   // 0  E:\Program Files
-        (1001, 1, "Windows NT", true, 0), // 1  目录条目本身
-        (2002, 3, "sys.txt", false, 20),  // 2  E:\Windows\System32
-        (2003, 2, "win.txt", false, 30),  // 3  E:\Windows
-        (2004, 5, "d0.txt", false, 40),   // 4  D:\Docs\sub
-        (1006, 6, "EmptyDir", true, 0),   // 5  空目录条目
-        (2006, 7, "t0.txt", false, 50),  // 6  D:\Tools
-        (2007, 4, "d1.txt", false, 60),   // 7  D:\Docs
-        (1009, 9, "alice", true, 0),      // 8  目录条目
-        (2009, 10, "a0.txt", false, 70),  // 9  C:\Users\alice\Desktop
-        (2010, 11, "b0.txt", false, 80),  // 10 C:\Users\alice\Downloads
-        (2011, 8, "u0.txt", false, 90),   // 11 C:\Users
+        (1000, 0, "Program Files", true, 0),   // 0  目录条目（E:）
+        (1001, 1, "Windows NT", true, 0),      // 1  目录条目（dirs[0] 的真实子目录，碰撞用例）
+        (1002, 2, "Windows", true, 0),         // 2  目录条目
+        (1003, 3, "System32", true, 0),        // 3  目录条目
+        (2000, 0, "e0.txt", false, 10),        // 4  E:\Program Files
+        (2002, 3, "sys.txt", false, 20),      // 5  E:\Windows\System32
+        (2003, 2, "win.txt", false, 30),      // 6  E:\Windows
+        (1004, 4, "Docs", true, 0),            // 7  目录条目（D:）
+        (1005, 5, "sub", true, 0),             // 8  目录条目
+        (1006, 6, "EmptyDir", true, 0),        // 9  空目录条目
+        (1007, 7, "Tools", true, 0),           // 10 目录条目
+        (2004, 5, "d0.txt", false, 40),       // 11 D:\Docs\sub
+        (2006, 7, "t0.txt", false, 50),       // 12 D:\Tools
+        (2007, 4, "d1.txt", false, 60),       // 13 D:\Docs
+        (1008, 8, "Users", true, 0),           // 14 目录条目（C:）
+        (1009, 9, "alice", true, 0),           // 15 目录条目
+        (1010, 10, "Desktop", true, 0),        // 16 目录条目
+        (1011, 11, "Downloads", true, 0),      // 17 目录条目
+        (2009, 10, "a0.txt", false, 70),      // 18 C:\Users\alice\Desktop
+        (2010, 11, "b0.txt", false, 80),      // 19 C:\Users\alice\Downloads
+        (2011, 8, "u0.txt", false, 90),        // 20 C:\Users
     ];
 
     // names_buf：名字顺序追加，记录每个名字的偏移。
@@ -134,7 +145,7 @@ fn write_legacy_flat(root: &std::path::Path) -> V6Manifest {
                 serial: 2,
                 journal_id: 22,
                 last_usn: 0,
-                first_entry_idx: 4,
+                first_entry_idx: 7,
                 root_prefix: "D:\\".into(),
                 volume_id: "D".into(),
             },
@@ -143,7 +154,7 @@ fn write_legacy_flat(root: &std::path::Path) -> V6Manifest {
                 serial: 3,
                 journal_id: 33,
                 last_usn: 0,
-                first_entry_idx: 8,
+                first_entry_idx: 14,
                 root_prefix: "C:\\".into(),
                 volume_id: "C".into(),
             },
@@ -191,7 +202,7 @@ fn legacy_multivolume_flat_v6_loads_and_resolves() {
 
     // 2.5.7/2.5.8 在这里直接 Err("ambiguous multi-volume root topology")。
     let store = v6_load(&layout).unwrap();
-    assert_eq!(store.entry_count(), 12);
+    assert_eq!(store.entry_count(), 21);
     assert_eq!(store.dirs.len(), 12);
     assert!(store.legacy_global_scope, "legacy 库必须置 legacy_global_scope");
 
@@ -228,7 +239,7 @@ fn legacy_multivolume_survives_v5_and_gen_roundtrips() {
     findx2_core::save_index_bin(&p, &store).unwrap();
     let v5 = findx2_core::load_index_bin(&p).unwrap();
     assert!(v5.legacy_global_scope);
-    assert_eq!(v5.entry_count(), 12);
+    assert_eq!(v5.entry_count(), 21);
     let d_idx = v5.entry_on_volume(b'D', FRN_D_FILE).unwrap();
     assert_eq!(v5.name_str(&v5.entries[d_idx as usize]).unwrap(), "d0.txt");
 
@@ -236,12 +247,97 @@ fn legacy_multivolume_survives_v5_and_gen_roundtrips() {
     v6_save_full(&layout, &v5).unwrap();
     let gen = v6_load(&layout).unwrap();
     assert!(gen.legacy_global_scope);
-    assert_eq!(gen.entry_count(), 12);
+    assert_eq!(gen.entry_count(), 21);
     let c_idx = gen.entry_on_volume(b'C', FRN_C_FILE).unwrap();
     assert_eq!(gen.name_str(&gen.entries[c_idx as usize]).unwrap(), "a0.txt");
     // load_store_auto（service/CLI 入口）同样可用。
     let auto = load_store_auto(&p).unwrap();
-    assert_eq!(auto.entry_count(), 12);
+    assert_eq!(auto.entry_count(), 21);
+}
+
+#[test]
+fn legacy_multivolume_sequential_rebuild_upgrades_topology_for_usage() {
+    // 模拟服务「legacy 拓扑自动升级」（run.rs 启动线程）：按卷顺序执行
+    // remove_volume_entries + merge_index_stores（service::rebuild_volume 的两个
+    // 核心原语，与服务代码同路径），旧拓扑库应被逐步换为新格式——每卷一个自父根，
+    // usage（目录占用树）可构建，重载后走严格逐卷 scope。
+    let (_p, layout) = tmp_index("upgrade");
+    write_legacy_flat(&layout.dir);
+    let mut merged = v6_load(&layout).unwrap();
+    assert!(merged.legacy_global_scope);
+    assert_eq!(merged.volumes.len(), 3);
+
+    // fresh 卷扫描产物：IndexBuilder + build_from_raw（rebuild_volume 同路径，
+    // metadata_ready=false 与 fast 首遍一致）。
+    let fresh = |letter: u8| {
+        let dirs = vec![findx2_core::platform::RawEntry {
+            file_id: letter as u64 * 1000 + 1,
+            file_id_128: None,
+            parent_id: 0,
+            name: format!("vol-{}", letter as char).into(),
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            attrs: 0x10,
+            is_dir: true,
+        }];
+        let files = vec![findx2_core::platform::RawEntry {
+            file_id: letter as u64 * 1000 + 2,
+            file_id_128: None,
+            parent_id: letter as u64 * 1000 + 1,
+            name: format!("{}-data.txt", letter as char).into(),
+            size: 42,
+            mtime: 0,
+            ctime: 0,
+            attrs: 0,
+            is_dir: false,
+        }];
+        findx2_core::IndexBuilder::new(letter, letter as u32, letter as u64, 1000)
+            .build_from_raw(files, dirs, false)
+            .unwrap()
+    };
+
+    for letter in [b'E', b'D', b'C'] {
+        // 物理摘除旧卷：compact 可达性裁决对 legacy parent_idx==0 哨兵视为链完整，
+        // 其他卷目录不受牵连；每卷都有 dir-entry（fixture 保真点）保证整卷摘净。
+        // 自父根（新格式）由 directory_retention 视为链终结，先合并进来的卷不受牵连。
+        merged.remove_volume_entries(letter as char);
+        merged = findx2_core::index::merge_index_stores(vec![merged, fresh(letter)]).unwrap();
+        assert_eq!(merged.volumes.len(), 3, "中间态卷数恒为 3");
+    }
+
+    // 全部完成后：自父根数 == 卷数（新格式），旧 legacy 目录全部随卷摘除。
+    let roots = merged
+        .dirs
+        .iter()
+        .enumerate()
+        .filter(|(i, d)| d.parent_idx as usize == *i)
+        .count();
+    assert_eq!(roots, merged.volumes.len(), "每卷应有一个自父根");
+    assert_eq!(merged.dirs.len(), 3, "旧 legacy 目录应全部随卷摘除");
+    assert_eq!(merged.entry_count(), 6, "三卷 × (1 目录条目 + 1 文件)");
+
+    // usage（目录占用树）可构建：服务启动 enable_usage 的同一入口。
+    let engine = SearchEngine::new(merged);
+    assert!(!engine.usage_available());
+    engine.enable_usage(16 * 1024 * 1024).unwrap();
+    assert!(engine.usage_available(), "新格式拓扑下占用树必须可用");
+    let page = engine
+        .usage_page("E:\\", None, None, 64 * 1024)
+        .expect("usage page must resolve the volume root");
+    assert!(
+        page.children.iter().any(|c| c.name == "E-data.txt"),
+        "卷根下应列出该卷文件，got {:?}",
+        page.children.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+    );
+
+    // 落盘 → 重载：严格逐卷 scope，legacy 标志不再置位，usage 复验可用。
+    v6_save_full(&layout, &engine.index_store().clone()).unwrap();
+    let reloaded = v6_load(&layout).unwrap();
+    assert!(!reloaded.legacy_global_scope, "升级后重载不得再走 legacy 全局表");
+    let engine2 = SearchEngine::new(reloaded);
+    engine2.enable_usage(16 * 1024 * 1024).unwrap();
+    assert!(engine2.usage_available());
 }
 
 #[test]

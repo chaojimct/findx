@@ -374,6 +374,66 @@ pub(crate) fn run_foreground(
         *g = Some(engine.clone());
     }
 
+    // legacy 多卷索引拓扑自动升级：2.4.x 旧库没有每卷自父根（顶层目录 parent_idx==0
+    // 哨兵），usage（目录占用树）等新特性在旧拓扑上无法构建——启动期的 enable_usage
+    // 在上面刚失败过（搜索不受影响，rebuild_scoped_identity_maps 已退回 slot-0 全局表）。
+    // 装好新引擎后按卷顺序后台重建：rebuild_volume 走 MFT 重扫 + 物理摘除旧卷 + 合并
+    // 换入（merge 的 +dir_base 平移会为每卷产生自父根），全部完成后索引即为新格式，
+    // 最后一卷的 rebuild_volume 内置 enable_usage 重试自然成功。期间旧索引持续服务，
+    // 冻结协议保证重建窗口的事件由 frozen 游标回放，零丢失。个别卷失败（如移动盘
+    // 不在线）只保留旧数据并留状态提示，下次启动自动重试（部分升级后 roots 仍对不上
+    // 卷数，legacy 标志继续置位）。
+    if engine.index_store().legacy_global_scope && !flags.no_watch {
+        let letters: Vec<char> = {
+            let g = engine.index_store();
+            g.volumes
+                .iter()
+                .map(|v| (v.volume_letter as char).to_ascii_uppercase())
+                .collect()
+        };
+        info!(
+            "检测到 2.4.x 旧版多卷索引拓扑（{} 卷 {}）：后台按卷全量重建，转换为新引擎格式（占用等新特性随后可用）…",
+            letters.len(),
+            letters.iter().map(|c| format!("{c}:")).collect::<Vec<_>>().join(" ")
+        );
+        let eng = engine.clone();
+        let idx = index.clone();
+        let total = letters.len();
+        std::thread::Builder::new()
+            .name("legacy-index-upgrade".into())
+            .spawn(move || {
+                let mut ok = 0usize;
+                for letter in letters {
+                    crate::watch_health::set_watch_error(
+                        letter,
+                        Some("旧版索引拓扑升级中：MFT 重扫本卷（搜索走旧数据不受影响）…".into()),
+                    );
+                    match rebuild_volume(&eng, letter, &idx) {
+                        Ok(()) => {
+                            ok += 1;
+                            crate::watch_health::set_watch_error(letter, None);
+                            info!("卷 {letter} 拓扑升级完成");
+                        }
+                        Err(e) => {
+                            error!("卷 {letter} 拓扑升级失败: {e:#}（保留旧数据，下次启动重试）");
+                            crate::watch_health::set_watch_error(
+                                letter,
+                                Some(format!("旧拓扑升级失败: {e}；下次启动重试")),
+                            );
+                        }
+                    }
+                }
+                if ok == total {
+                    info!("旧版索引拓扑升级完成（{total} 卷）：目录占用树已随最后重建挂载");
+                } else {
+                    tracing::warn!(
+                        "旧版索引拓扑升级部分完成（{ok}/{total}）：占用树仍不可用，失败卷下次启动自动重试"
+                    );
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("spawn legacy-index-upgrade 失败: {e}"))?;
+    }
+
     // 边车缺失 / 加载时被判不可信（重建窗口内崩溃过）：后台补建一次，
     // 本轮搜索先走全表扫描兜底，构建完成后自动切到剪枝路径。
     if !flags.no_watch && engine.index_store().trigram.is_none() {

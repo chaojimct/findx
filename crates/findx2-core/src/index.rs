@@ -1140,8 +1140,13 @@ impl IndexStore {
                     continue;
                 }
                 let parent_ok = d.parent_idx == 0
+                    || d.parent_idx as usize == i
                     || ((d.parent_idx as usize) < self.dirs.len()
                         && dir_alive[d.parent_idx as usize]);
+                // 注：parent_idx==i（自父）是新格式每卷的合成根目录——链在此终结，
+                // 与 legacy 的 parent_idx==0 哨兵同级。旧判定只认 0，自父根会被
+                // 判死并连带整卷条目被丢（多卷库任何一次 remove_volume_entries 都会
+                // 把其他新格式卷的数据摧毁；legacy 升级流程实测命中）。
                 if parent_ok {
                     dir_alive[i] = true;
                     changed = true;
