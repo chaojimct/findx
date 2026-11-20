@@ -53,7 +53,10 @@ pub(super) struct FileActions {
     notice_generation: u64,
     menu_subscription: Option<Subscription>,
     context_blank: bool,
-    pub(super) pending_shell: Option<crate::open_path::ShellDialog>,
+    context_armed: bool,
+    context_epoch: u64,
+    context_hits: Vec<SearchHitDto>,
+    pub(super) pending_shell: Option<(crate::open_path::ShellDialog, SearchHitDto)>,
     clipboard: Clipboard,
     clipboard_generation: u64,
     pointer_event: Option<(bool, usize)>,
@@ -273,8 +276,22 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) {
         if self.file_actions.native_menu.finish(token) {
-            self.file_actions.context_blank = false;
+            let epoch = self.file_actions.context_epoch;
             self.file_actions.native_menu_focus_subscription = None;
+            // The menu click dispatches its action on the next turn, after
+            // dismiss has already restored the previous focus. Keep the row
+            // snapshot until that action consumes it.
+            let owner = cx.weak_entity();
+            cx.defer(move |cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    if this.file_actions.context_armed && this.file_actions.context_epoch == epoch {
+                        this.file_actions.context_armed = false;
+                        this.file_actions.context_blank = false;
+                        this.file_actions.context_hits.clear();
+                    }
+                    cx.notify();
+                });
+            });
             cx.notify();
         }
     }
@@ -324,6 +341,7 @@ impl MainWindow {
         self.dismiss_file_menu(cx);
         self.track_native_menu_focus(menu.focus_handle(cx), window, cx);
         self.build_file_context_menu(menu, blank, window, cx)
+            .action_context(self.focus.clone())
     }
     fn build_file_context_menu(
         &mut self,
@@ -340,7 +358,10 @@ impl MainWindow {
             hits.first().is_some_and(|h| h.is_directory),
         );
         let blank = context == FileMenuContext::Blank;
+        self.file_actions.context_epoch = self.file_actions.context_epoch.wrapping_add(1);
+        self.file_actions.context_armed = true;
         self.file_actions.context_blank = blank;
+        self.file_actions.context_hits = if blank { Vec::new() } else { hits.clone() };
         let single = matches!(context, FileMenuContext::File | FileMenuContext::Directory);
         let directory = context == FileMenuContext::Directory;
         let busy = self.file_actions.busy || self.workspace.op_busy;
@@ -501,24 +522,34 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.text_edit_active(window, cx) || !self.file_scope_current() {
-            return;
-        }
-        let blank = std::mem::take(&mut self.file_actions.context_blank);
-        // A blank-area action must never inherit the stale selected row.
-        let hits = if blank {
-            Vec::new()
-        } else {
-            self.selected_file_hits()
+        let menu_snapshot = self.file_actions.context_armed.then(|| {
+            self.file_actions.context_armed = false;
+            self.file_actions.context_epoch = self.file_actions.context_epoch.wrapping_add(1);
+            (
+                std::mem::take(&mut self.file_actions.context_blank),
+                std::mem::take(&mut self.file_actions.context_hits),
+            )
+        });
+        let editor_focused = self.text_edit_active(window, cx);
+        let resolved = crate::interaction_logic::resolve_context_rows(
+            menu_snapshot,
+            editor_focused,
+            self.file_scope_current(),
+            self.selected_file_hits(),
+        );
+        let (blank, hits) = match resolved {
+            crate::interaction_logic::ContextResolution::Ignored => return,
+            crate::interaction_logic::ContextResolution::Blank => (true, Vec::new()),
+            crate::interaction_logic::ContextResolution::Rows(hits) => (false, hits),
         };
         let single = hits.len() == 1;
         let current_root = self.workspace.mode == ViewMode::Directory && (blank || hits.is_empty());
         match kind {
-            0 if single => self.workspace_enter(cx),
+            0 if single => self.workspace_open_hit(hits[0].clone(), cx),
             1 if single && !hits[0].is_directory => {
-                self.open_shell_dialog(crate::open_path::ShellDialog::OpenWith, cx)
+                self.open_shell_dialog(hits[0].clone(), crate::open_path::ShellDialog::OpenWith, cx)
             }
-            2 if single => self.workspace_reveal(cx),
+            2 if single => self.reveal_in_directory(&hits[0], cx),
             3 if !hits.is_empty() => {
                 cx.write_to_clipboard(ClipboardItem::new_string(
                     hits.iter()
@@ -538,11 +569,17 @@ impl MainWindow {
                 self.file_actions.confirm_target = self.paste_directory();
             }
             7 if single && !self.file_actions.busy => {
-                self.begin_workspace_operation(FileAction::Rename, window, cx)
+                self.begin_workspace_operation(FileAction::Rename, hits[0].clone(), window, cx)
             }
-            8 if single => self.open_shell_dialog(crate::open_path::ShellDialog::Properties, cx),
+            8 if single => self.open_shell_dialog(
+                hits[0].clone(),
+                crate::open_path::ShellDialog::Properties,
+                cx,
+            ),
             9 if current_root => self.analyze_directory(self.workspace.location.clone(), cx),
-            9 if single && hits[0].is_directory => self.workspace_analyze_selected(cx),
+            9 if single && hits[0].is_directory => {
+                self.analyze_directory(PathBuf::from(&hits[0].path), cx);
+            }
             10 if current_root => {
                 self.begin_scoped_search(self.workspace.location.clone(), window, cx)
             }
@@ -736,7 +773,7 @@ impl MainWindow {
                         let count = sources.len();
                         this.file_actions.clipboard = Clipboard { sources, cut };
                         this.file_actions.summary = format!(
-                            "应用内{} {count} 项 · 到目标目录粘贴；尚未修改源文件",
+                            "应用内{} {count} 项，到目标目录粘贴；尚未修改源文件",
                             if cut { "剪切" } else { "复制" }
                         );
                     }
@@ -750,15 +787,13 @@ impl MainWindow {
     }
     pub(super) fn open_shell_dialog(
         &mut self,
+        hit: SearchHitDto,
         dialog: crate::open_path::ShellDialog,
         cx: &mut Context<Self>,
     ) {
-        let Some(hit) = self.active_workspace_hit() else {
-            return;
-        };
-        if !self.ensure_selection_identity(cx) {
+        if !self.ensure_selection_identity(&hit, cx) {
             if self.identity_pending {
-                self.file_actions.pending_shell = Some(dialog);
+                self.file_actions.pending_shell = Some((dialog, hit));
             } else {
                 self.workspace.status = "位置不可用或身份已变化；请刷新后重选".into();
                 return;
@@ -804,7 +839,7 @@ impl MainWindow {
         let cancel = self.file_actions.cancel.clone();
         let clipboard = self.file_actions.clipboard.clone();
         let generation = self.file_actions.clipboard_generation;
-        self.file_actions.summary = "正在处理文件 · 可导航或取消；完成项不会自动撤销".into();
+        self.file_actions.summary = "正在处理文件，可导航或取消；完成项不会自动撤销".into();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(
@@ -814,7 +849,7 @@ impl MainWindow {
             this.update(cx, |this, cx| {
                 this.file_actions.busy = false;
                 this.file_actions.summary = format!(
-                    "{} · 成功 {} / 失败或冲突 {} · 不覆盖；索引稍后同步",
+                    "{}，成功 {} / 失败或冲突 {}，不覆盖；索引稍后同步",
                     if result.cancelled {
                         "操作已取消"
                     } else {

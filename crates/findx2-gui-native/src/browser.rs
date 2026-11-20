@@ -10,12 +10,24 @@ use std::{
 };
 pub type Cancel = Arc<AtomicBool>;
 pub fn list(path: &Path, cancel: &Cancel) -> Result<(PathBuf, Vec<SearchHitDto>, bool), String> {
-    list_with_hidden(path, cancel, true)
+    list_with_hidden(path, cancel, true, None)
+}
+/// A hidden entry stays visible when it is the explicit locate target.
+pub fn entry_visible(show_hidden: bool, hidden: bool, entry: &str, reveal: Option<&str>) -> bool {
+    if show_hidden || !hidden {
+        return true;
+    }
+    reveal.is_some_and(|target| same_locate_path(entry, target))
+}
+fn same_locate_path(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.replace('/', "\\").trim_end_matches(['\\', '/']).to_lowercase();
+    norm(a) == norm(b)
 }
 pub fn list_with_hidden(
     path: &Path,
     cancel: &Cancel,
     show_hidden: bool,
+    reveal: Option<&Path>,
 ) -> Result<(PathBuf, Vec<SearchHitDto>, bool), String> {
     let path = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
     let mut rows = Vec::new();
@@ -30,18 +42,26 @@ pub fn list_with_hidden(
         }
         let e = item.map_err(|e| e.to_string())?;
         let Ok(meta) = e.metadata() else { continue };
-        if !show_hidden {
+        let hidden = {
             #[cfg(windows)]
             {
                 use std::os::windows::fs::MetadataExt;
-                if meta.file_attributes() & 0x2 != 0 {
-                    continue;
-                }
+                meta.file_attributes() & 0x2 != 0
             }
             #[cfg(not(windows))]
-            if e.file_name().to_string_lossy().starts_with('.') {
-                continue;
+            {
+                e.file_name().to_string_lossy().starts_with('.')
             }
+        };
+        let entry_path = e.path();
+        let reveal_text = reveal.map(|p| p.to_string_lossy().into_owned());
+        if !entry_visible(
+            show_hidden,
+            hidden,
+            &entry_path.to_string_lossy(),
+            reveal_text.as_deref(),
+        ) {
+            continue;
         }
         rows.push(SearchHitDto {
             entry_idx: rows.len() as u32,
@@ -457,6 +477,19 @@ pub fn standard_locations() -> Vec<(&'static str, &'static str, PathBuf)> {
     }
 }
 
+#[cfg(test)]
+mod locate_visibility_tests {
+    use super::entry_visible;
+    #[test]
+    fn hidden_target_is_listed_only_when_it_is_the_locate_focus() {
+        assert!(!entry_visible(false, true, r"C:\Users\.conda", None));
+        assert!(entry_visible(false, true, r"C:\Users\.conda", Some(r"C:\Users\.conda")));
+        assert!(entry_visible(false, true, r"C:/Users/.conda", Some(r"C:\Users\.conda\")));
+        assert!(!entry_visible(false, true, r"C:\Users\.conda", Some(r"C:\Users\other")));
+        assert!(entry_visible(true, true, r"C:\Users\.conda", None));
+        assert!(entry_visible(false, false, r"C:\Users\visible", None));
+    }
+}
 #[cfg(all(test, windows))]
 mod hidden_tests {
     use super::*;
@@ -486,8 +519,9 @@ mod hidden_tests {
             .collect::<Vec<_>>();
         unsafe { SetFileAttributesW(PCWSTR(wide.as_ptr()), FILE_ATTRIBUTE_HIDDEN) }.unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
-        assert_eq!(list_with_hidden(&root, &cancel, false).unwrap().1.len(), 1);
-        assert_eq!(list_with_hidden(&root, &cancel, true).unwrap().1.len(), 2);
+        assert_eq!(list_with_hidden(&root, &cancel, false, None).unwrap().1.len(), 1);
+        assert_eq!(list_with_hidden(&root, &cancel, false, Some(&path)).unwrap().1.len(), 2);
+        assert_eq!(list_with_hidden(&root, &cancel, true, None).unwrap().1.len(), 2);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

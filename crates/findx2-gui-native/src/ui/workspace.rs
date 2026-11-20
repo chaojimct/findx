@@ -216,6 +216,7 @@ pub(super) struct Workspace {
     pub(in crate::ui) selected_rows: std::collections::BTreeSet<usize>,
     pub(in crate::ui) selected: Option<usize>,
     pending_hit: Option<SearchHitDto>,
+    reveal_focus: Option<String>,
     history: History,
     pub(in crate::ui) cache: HashMap<String, (Vec<SearchHitDto>, bool)>,
     list_generation: u64,
@@ -375,6 +376,7 @@ impl Workspace {
             selected_rows: Default::default(),
             selected: None,
             pending_hit: None,
+            reveal_focus: None,
             history: History::default(),
             cache: HashMap::new(),
             list_generation: 0,
@@ -917,7 +919,14 @@ impl MainWindow {
         if self.workspace.suspend_preview {
             return;
         }
-        if !self.ensure_selection_identity(cx) {
+        let Some(identity_hit) = self.active_workspace_hit() else {
+            self.identity_key = None;
+            self.selected_identity = None;
+            self.pause_preview();
+            cx.notify();
+            return;
+        };
+        if !self.ensure_selection_identity(&identity_hit, cx) {
             if self.identity_pending { self.freeze_preview(); } else { self.pause_preview(); }
             cx.notify();
             return;
@@ -1323,7 +1332,15 @@ impl MainWindow {
             cx.notify();
             return;
         }
-        if let Some((rows, cap)) = self.workspace.cache.get(&key(&path)).cloned() {
+        let reveal = self.workspace.reveal_focus.clone().filter(|focus| {
+            Path::new(focus).parent().is_some_and(|parent| key(parent) == key(&path))
+        });
+        if reveal.is_some() {
+            self.workspace.reveal_focus = None;
+            self.clear_directory_filter(cx);
+        }
+        if reveal.is_none()
+            && let Some((rows, cap)) = self.workspace.cache.get(&key(&path)).cloned() {
             self.workspace.listing = false;
             self.workspace.status = format!(
                 "{} 项{}，已保留目录上下文",
@@ -1341,10 +1358,12 @@ impl MainWindow {
         self.freeze_preview();
         let cancel = self.workspace.list_cancel.clone();
         let show_hidden = self.workspace.show_hidden;
+        let reveal_path = reveal.as_ref().map(PathBuf::from);
+        let announce_locate = reveal.is_some();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    browser::list_with_hidden(&path, &cancel, show_hidden).map(
+                    browser::list_with_hidden(&path, &cancel, show_hidden, reveal_path.as_deref()).map(
                         |(path, mut rows, cap)| {
                             for h in &mut rows {
                                 h.path = display_path(Path::new(&h.path));
@@ -1364,10 +1383,12 @@ impl MainWindow {
                         this.workspace.location = PathBuf::from(display_path(&path));
                         this.update_location_input(cx);
                         this.remember_directory(cx);
-                        if this.workspace.cache.len() >= 4 {
-                            this.workspace.cache.clear();
+                        if !announce_locate {
+                            if this.workspace.cache.len() >= 4 {
+                                this.workspace.cache.clear();
+                            }
+                            this.workspace.cache.insert(key(&path), (rows.clone(), cap));
                         }
-                        this.workspace.cache.insert(key(&path), (rows.clone(), cap));
                         this.workspace.status = format!(
                             "{} 项{}，双击目录进入",
                             rows.len(),
@@ -1378,7 +1399,13 @@ impl MainWindow {
                             }
                         );
                         if this.workspace.mode != ViewMode::Search {
+                            let missing = focus.as_ref().is_some_and(|focus| {
+                                !rows.iter().any(|row| key(Path::new(&row.path)) == key(Path::new(focus)))
+                            });
                             this.set_workspace_rows(rows, focus, false, cx);
+                            if announce_locate && missing {
+                                this.transient_file_notice("无法定位：目标不在该目录中".into(), cx);
+                            }
                         } else {
                             this.workspace.selected_rows.clear();
                             this.workspace.rows = rows;
@@ -1392,6 +1419,9 @@ impl MainWindow {
                         this.workspace.rows_epoch = None;
                         this.pause_preview();
                         this.workspace.status = format!("目录读取失败：{e}");
+                        if announce_locate {
+                            this.transient_file_notice("无法定位：上级目录不存在或无法访问".into(), cx);
+                        }
                     },
                 };
                 cx.notify();
@@ -1525,10 +1555,38 @@ impl MainWindow {
     }
     pub(super) fn workspace_reveal(&mut self, cx: &mut Context<Self>) {
         if let Some(h) = self.active_workspace_hit() {
-            let p = PathBuf::from(&h.path);
-            let parent = p.parent().unwrap_or(Path::new("C:\\")).to_path_buf();
-            self.workspace_navigate(parent, ViewMode::Directory, Some(h.path), true, cx);
+            self.reveal_in_directory(&h, cx);
+        } else {
+            self.transient_file_notice("无法定位：没有选中的文件".into(), cx);
         }
+    }
+    pub(super) fn reveal_in_directory(&mut self, hit: &SearchHitDto, cx: &mut Context<Self>) {
+        let Some(parent) = crate::interaction_logic::locate_parent(&hit.path) else {
+            self.transient_file_notice("无法定位：没有上级目录".into(), cx);
+            return;
+        };
+        self.workspace.reveal_focus = Some(hit.path.clone());
+        self.workspace_navigate(PathBuf::from(parent), ViewMode::Directory, Some(hit.path.clone()), true, cx);
+    }
+    pub(super) fn workspace_open_hit(&mut self, hit: SearchHitDto, cx: &mut Context<Self>) {
+        if self.workspace.mode == ViewMode::Usage {
+            self.workspace_enter(cx);
+            return;
+        }
+        if hit.is_directory {
+            self.workspace_navigate(hit.path.into(), ViewMode::Directory, None, true, cx);
+        } else {
+            self.activate_system_file(hit, cx);
+        }
+    }
+    fn clear_directory_filter(&mut self, cx: &mut Context<Self>) {
+        self.workspace.filter_cancel.store(true, Ordering::Release);
+        self.workspace.filter_generation = self.workspace.filter_generation.wrapping_add(1);
+        self.workspace.filter_text.clear();
+        let input = self.workspace.filter_input.clone();
+        let _ = self.workspace.window.update(cx, move |_, window, cx| {
+            input.update(cx, |input, cx| input.set_value(String::new(), window, cx));
+        });
     }
     pub(super) fn workspace_enter(&mut self, cx: &mut Context<Self>) {
         if self.workspace.mode == ViewMode::Usage {
@@ -2274,13 +2332,11 @@ impl MainWindow {
     pub(in crate::ui) fn begin_workspace_operation(
         &mut self,
         action: FileAction,
+        hit: SearchHitDto,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(hit) = self.active_workspace_hit() else {
-            return;
-        };
-        if !self.ensure_selection_identity(cx) {
+        if !self.ensure_selection_identity(&hit, cx) {
             self.workspace.status = "正在核对身份，请稍后重试；不可用项需刷新后重新选择。".into();
             self.file_actions.summary = self.workspace.status.clone();
             cx.notify();
@@ -2442,7 +2498,7 @@ impl MainWindow {
             .ghost()
             .icon(IconName::Settings)
             .accessibility_label("设置")
-            .tooltip("设置 · Ctrl+,")
+            .tooltip("设置（Ctrl+,）")
             .w(px(36.))
             .h(px(32.))
             .mr_2()
@@ -2614,7 +2670,9 @@ impl MainWindow {
                             .on_click(move |_, w, cx| {
                                 e.update(cx, |this, cx| {
                                     this.workspace.show_actions = false;
-                                    this.begin_workspace_operation(action, w, cx);
+                                    if let Some(hit) = this.active_workspace_hit() {
+                                        this.begin_workspace_operation(action, hit, w, cx);
+                                    }
                                 })
                             })
                     }),
@@ -2738,7 +2796,7 @@ impl MainWindow {
             .border_t_1()
             .border_color(tokens.border)
             .child(div().text_sm().child(format!(
-                    "{} · {}",
+                    "{}  {}",
                     action.label(),
                     self.workspace
                         .source

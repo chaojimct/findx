@@ -57,6 +57,47 @@ mod tests {
 pub fn file_commands_blocked(editor_focus: bool, composing: bool, modal: bool) -> bool {
     editor_focus || composing || modal
 }
+
+/// Rows a context-menu action may use. A menu click keeps the rows captured
+/// when the menu opened, even if focus has returned to the search box.
+/// Keyboard shortcuts still honor the editor guard and the live selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextResolution<T> {
+    Ignored,
+    Blank,
+    Rows(Vec<T>),
+}
+
+pub fn resolve_context_rows<T: Clone>(
+    menu_snapshot: Option<(bool, Vec<T>)>,
+    editor_focused: bool,
+    scope_current: bool,
+    live_rows: Vec<T>,
+) -> ContextResolution<T> {
+    if let Some((blank, rows)) = menu_snapshot {
+        return if blank {
+            ContextResolution::Blank
+        } else {
+            ContextResolution::Rows(rows)
+        };
+    }
+    if editor_focused || !scope_current {
+        ContextResolution::Ignored
+    } else {
+        ContextResolution::Rows(live_rows)
+    }
+}
+
+/// Parent directory for 「定位所在目录」. The directory filter is always cleared
+/// so a stale Files filter cannot hide the target.
+pub fn locate_parent(path: &str) -> Option<String> {
+    let path = path.trim();
+    let parent = std::path::Path::new(path).parent()?;
+    if parent.as_os_str().is_empty() {
+        return None;
+    }
+    Some(parent.to_string_lossy().into_owned())
+}
 #[cfg(test)]
 mod shortcut_safety_tests {
     use super::*;
@@ -73,6 +114,32 @@ mod shortcut_safety_tests {
             }
         }
         assert!(file_commands_blocked(false, true, false));
+    }
+
+    #[test]
+    fn menu_snapshot_survives_search_focus_and_a_stale_live_selection() {
+        let snap = vec!["C:\\Users\\a.pdf"];
+        let resolved = resolve_context_rows(Some((false, snap.clone())), true, false, Vec::<&str>::new());
+        assert_eq!(resolved, ContextResolution::Rows(snap));
+        assert_eq!(
+            resolve_context_rows(Some((true, vec!["ignored"])), true, true, vec!["live"]),
+            ContextResolution::Blank
+        );
+        assert_eq!(
+            resolve_context_rows::<&str>(None, true, true, vec!["live"]),
+            ContextResolution::Ignored
+        );
+        assert_eq!(
+            resolve_context_rows(None, false, true, vec!["live"]),
+            ContextResolution::Rows(vec!["live"])
+        );
+        let file = std::path::Path::new("Users").join("chaoj").join("report.pdf");
+        let parent = std::path::Path::new("Users").join("chaoj");
+        assert_eq!(
+            locate_parent(&file.to_string_lossy()).as_deref(),
+            Some(parent.to_string_lossy().as_ref())
+        );
+        assert!(locate_parent("report.pdf").is_none());
     }
 }
 

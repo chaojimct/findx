@@ -1,11 +1,11 @@
 use super::*;
 impl MainWindow {
-    pub(super) fn ensure_selection_identity(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(hit) = self.active_workspace_hit() else {
-            self.identity_key = None;
-            self.selected_identity = None;
-            return false;
-        };
+    pub(super) fn ensure_selection_identity(
+        &mut self,
+        hit: &SearchHitDto,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let hit = hit.clone();
         let key = workspace::preview_stamp(&hit.path, hit.size, hit.mtime);
         if self.identity_key.as_ref() == Some(&key) {
             return self.selected_identity.is_some()
@@ -49,8 +49,8 @@ impl MainWindow {
                     Ok(stamp) => {
                         this.selected_identity = Some(stamp);
                         this.preview_active_selection(cx);
-                        if let Some(dialog) = this.file_actions.pending_shell.take() {
-                            this.open_shell_dialog(dialog, cx);
+                        if let Some((dialog, hit)) = this.file_actions.pending_shell.take() {
+                            this.open_shell_dialog(hit, dialog, cx);
                         }
                         if let Some(hit) = this.pending_open.take() {
                             this.activate_system_file(hit, cx);
@@ -74,7 +74,7 @@ impl MainWindow {
         if self.run_pending.is_some() {
             return;
         }
-        if !self.ensure_selection_identity(cx) {
+        if !self.ensure_selection_identity(&hit, cx) {
             if self.identity_pending {
                 self.pending_open = Some(hit);
             }
