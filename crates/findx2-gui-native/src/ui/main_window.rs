@@ -1492,7 +1492,7 @@ impl MainWindow {
                     .id("pdf-page-counter")
                     .role(gpui_kit::accesskit::Role::Label)
                     .aria_label(format!(
-                        "PDF 第 {} / {} 页 · {}",
+                        "PDF 第 {} / {} 页，{}",
                         page + 1,
                         self.pdf_count,
                         if self.preview.pdf.is_some() {
@@ -1766,7 +1766,7 @@ impl MainWindow {
                 let mut col = v_flex().w_full().px_3().py_2().gap_2();
                 if let Some(enc) = &self.preview.text_encoding {
                     let cap = if self.preview.truncated {
-                        format!("{enc} · 仅显示开头部分")
+                        format!("{enc}，仅显示开头部分")
                     } else {
                         enc.clone()
                     };

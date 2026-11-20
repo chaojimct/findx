@@ -155,7 +155,7 @@ impl BrowserWindow {
                                 i.set_value(path.to_string_lossy().into_owned(), window, cx)
                             });
                             this.status = format!(
-                                "{} 项{} · 双击目录进入；选中文件可预览",
+                                "{} 项{}，双击目录进入；选中文件可预览",
                                 rows.len(),
                                 if cap {
                                     "（达到 100000 项安全上限）"

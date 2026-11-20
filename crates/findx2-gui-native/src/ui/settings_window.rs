@@ -1721,7 +1721,7 @@ impl SettingsWindow {
             ),
             format!("最近状态：{}", s.status_checked),
             "服务版本：接口未提供".into(),
-            format!("索引：{}", s.index_status.summary),
+            crate::status_logic::diagnostic_index_line(&s.index_status.summary),
             format!("错误：{}", s.last_error.as_deref().unwrap_or("无")),
             format!("设置文件：{}", prefs::settings_path().display()),
             format!("管道名称：{}", self.settings.pipe_name),

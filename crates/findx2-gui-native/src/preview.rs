@@ -178,9 +178,119 @@ pub fn classify_path(path: &str, is_directory: bool) -> PreviewClass {
         PreviewClass::Image
     } else if is_text_ext(&ext) {
         PreviewClass::Text
+    } else if is_known_binary_ext(&ext) {
+        PreviewClass::Binary
     } else {
+        // Extensionless and unknown extensions are decided from a bounded prefix.
         PreviewClass::Binary
     }
+}
+
+pub fn needs_content_sniff(ext: &str) -> bool {
+    !(is_image_ext(ext) || is_text_ext(ext) || is_known_binary_ext(ext))
+}
+
+pub fn is_known_binary_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "exe"
+            | "dll"
+            | "sys"
+            | "msi"
+            | "com"
+            | "scr"
+            | "ocx"
+            | "cpl"
+            | "drv"
+            | "zip"
+            | "7z"
+            | "rar"
+            | "tar"
+            | "gz"
+            | "bz2"
+            | "xz"
+            | "tgz"
+            | "cab"
+            | "iso"
+            | "img"
+            | "mp3"
+            | "mp4"
+            | "avi"
+            | "mkv"
+            | "mov"
+            | "flac"
+            | "wav"
+            | "wma"
+            | "wmv"
+            | "aac"
+            | "ogg"
+            | "webm"
+            | "m4a"
+            | "m4v"
+            | "mpg"
+            | "mpeg"
+            | "db"
+            | "sqlite"
+            | "sqlite3"
+            | "mdb"
+            | "accdb"
+            | "pdf"
+            | "doc"
+            | "xls"
+            | "ppt"
+            | "docx"
+            | "xlsx"
+            | "pptx"
+            | "rtf"
+            | "ttf"
+            | "otf"
+            | "woff"
+            | "woff2"
+            | "class"
+            | "pyc"
+            | "o"
+            | "obj"
+            | "lib"
+            | "so"
+            | "dylib"
+            | "wasm"
+            | "lnk"
+            | "pdb"
+            | "ilk"
+            | "bin"
+    )
+}
+
+pub const SNIFF_BYTES: usize = 8192;
+
+/// Empty files and readable text prefixes are text. NUL and dense control bytes are binary.
+/// UTF-16 BOM is text even though it contains NUL.
+pub fn sniff_text_prefix(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF])
+        || bytes.starts_with(&[0xFF, 0xFE])
+        || bytes.starts_with(&[0xFE, 0xFF])
+    {
+        return true;
+    }
+    if looks_binary(bytes) {
+        return false;
+    }
+    let sample = &bytes[..bytes.len().min(1024)];
+    let controls = sample
+        .iter()
+        .filter(|b| **b < 0x20 && !matches!(**b, b'\t' | b'\n' | b'\r' | 0x0c))
+        .count();
+    if sample.len() >= 8 && controls * 20 > sample.len() {
+        return false;
+    }
+    if std::str::from_utf8(sample).is_ok() {
+        return true;
+    }
+    let (_, _, had_errors) = encoding_rs::GBK.decode(sample);
+    !had_errors
 }
 
 pub fn is_image_ext(ext: &str) -> bool {
@@ -263,7 +373,7 @@ pub fn format_meta_line(meta: &PreviewMeta) -> String {
     if meta.mtime != 0 {
         parts.push(format_time(meta.mtime));
     }
-    parts.join(" · ")
+    parts.join("  ")
 }
 
 pub fn io_error_message(err: &std::io::Error, path: &str) -> String {
@@ -334,7 +444,7 @@ pub fn load_preview_with_options(
             Ok(client) => {
                 state.native = Some(client);
                 state.kind = PreviewKind::NativeOffice;
-                state.message = Some("系统预览处理器 · 实际版式由已安装应用提供".into());
+                state.message = Some("系统预览处理器，实际版式由已安装应用提供".into());
                 return state;
             }
             Err(e) => native_error = Some(e),
@@ -384,7 +494,7 @@ pub fn load_preview_with_options(
                         height,
                     });
                     state.image_note = Some(format!(
-                        "PDF · 第 {} / {count} 页",
+                        "PDF 第 {} / {count} 页",
                         options.page.min(count.saturating_sub(1)) + 1
                     ));
                 }
@@ -398,9 +508,9 @@ pub fn load_preview_with_options(
                     text
                 });
                 state.text_encoding = Some(if ext == "rtf" {
-                    "RTF 文本摘录 · 非版式预览".into()
+                    "RTF 文本摘录，非版式预览".into()
                 } else {
-                    "OOXML 文本摘录 · 非版式预览；不执行宏/外链/公式".into()
+                    "OOXML 文本摘录，非版式预览；不执行宏/外链/公式".into()
                 });
                 state.message = None;
                 if let Some(reason) = native_error {
@@ -434,6 +544,22 @@ pub fn load_preview_with_options(
         },
         PreviewClass::Text => match load_text(&path_buf) {
             Ok(text) => apply_text(&mut state, text),
+            Err(err) => apply_error(&mut state, err),
+        },
+        PreviewClass::Binary if needs_content_sniff(&ext) => match sniff_regular_file(&path_buf) {
+            Ok(true) => match load_text(&path_buf) {
+                Ok(text) => {
+                    if let Some(meta) = state.meta.as_mut() {
+                        meta.kind_label = "文本".into();
+                    }
+                    apply_text(&mut state, text);
+                }
+                Err(err) => apply_error(&mut state, err),
+            },
+            Ok(false) => {
+                state.kind = PreviewKind::Unsupported;
+                state.message = Some("暂不支持此格式的内容预览".into());
+            }
             Err(err) => apply_error(&mut state, err),
         },
         PreviewClass::Binary => match file_len_or_size(&path_buf, size) {
@@ -551,6 +677,33 @@ struct LoadedText {
     encoding: String,
     truncated: bool,
     file_len: u64,
+}
+
+fn sniff_regular_file(path: &Path) -> Result<bool, String> {
+    let display = path.display().to_string();
+    let link = fs::symlink_metadata(path).map_err(|err| io_error_message(&err, &display))?;
+    let meta = if link.file_type().is_symlink() {
+        let target = fs::metadata(path).map_err(|err| io_error_message(&err, &display))?;
+        if !target.is_file() {
+            return Err(format!("无法预览此链接目标：{display}"));
+        }
+        target
+    } else if link.is_file() {
+        link
+    } else {
+        return Err(format!("不是可预览的普通文件：{display}"));
+    };
+    let file_len = meta.len();
+    if file_len == 0 {
+        return Ok(true);
+    }
+    let mut file = File::open(path).map_err(|err| io_error_message(&err, &display))?;
+    let mut buf = vec![0u8; SNIFF_BYTES.min(file_len as usize)];
+    let n = file
+        .read(&mut buf)
+        .map_err(|err| io_error_message(&err, &display))?;
+    buf.truncate(n);
+    Ok(sniff_text_prefix(&buf))
 }
 
 fn load_text(path: &Path) -> Result<LoadedText, String> {
@@ -724,6 +877,39 @@ mod tests {
         assert!(looks_binary(b"MZ\0\0"));
         assert!(!looks_binary(b"hello text"));
         assert!(!looks_binary(&[0xFF, 0xFE, 0x61, 0x00]));
+    }
+
+    #[test]
+    fn extensionless_and_unknown_text_is_sniffed_and_nul_is_rejected() {
+        assert!(needs_content_sniff(""));
+        assert!(needs_content_sniff("token"));
+        assert!(!needs_content_sniff("png"));
+        assert!(!needs_content_sniff("exe"));
+        assert!(!needs_content_sniff("pdf"));
+        assert!(sniff_text_prefix(b""));
+        assert!(sniff_text_prefix(b"aau_token"));
+        assert!(sniff_text_prefix(&[0xFF, 0xFE, b'a', 0, b'b', 0]));
+        assert!(sniff_text_prefix("你好".as_bytes()));
+        let gbk = encoding_rs::GBK.encode("配置文件").0;
+        assert!(sniff_text_prefix(&gbk));
+        assert!(!sniff_text_prefix(b"MZ\0\0binary"));
+        let dir = std::env::temp_dir().join("findx-native-sniff-tests");
+        let _ = fs::create_dir_all(&dir);
+        let token = dir.join("aau_token");
+        fs::write(&token, b"public-token").unwrap();
+        let state = load_preview(1, "aau_token", &token.to_string_lossy(), 12, 0, false);
+        assert_eq!(state.kind, PreviewKind::Text);
+        assert_eq!(state.text.as_deref(), Some("public-token"));
+        assert_eq!(state.meta.as_ref().map(|m| m.kind_label.as_str()), Some("文本"));
+        let empty = dir.join("empty-file");
+        fs::write(&empty, b"").unwrap();
+        let state = load_preview(1, "empty-file", &empty.to_string_lossy(), 0, 0, false);
+        assert_eq!(state.kind, PreviewKind::Text);
+        let bin = dir.join("blob.unknown");
+        fs::write(&bin, b"abc\0def").unwrap();
+        let state = load_preview(1, "blob.unknown", &bin.to_string_lossy(), 7, 0, false);
+        assert_eq!(state.kind, PreviewKind::Unsupported);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

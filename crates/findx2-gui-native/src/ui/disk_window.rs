@@ -76,7 +76,7 @@ impl DiskWindow {
         self.scan = None;
         self.detail = None;
         self.status = "扫描在后台进行，搜索窗口保持独立可用…".into();
-        cx.spawn(async move|this,cx|{let result=cx.background_spawn(async move{disk_usage::scan(&path,cancel,p,Limits::default())}).await;this.update(cx,|this,cx|{if this.generation!=gen_id{return;}this.busy=false;match result{Ok(s)=>{this.status=format!("{} · {} 个路径 · {} 秒 · 硬链接去重 {} · 跳过链接/挂载/离线 {} · 错误 {} · 未知占用 {}",if s.cancelled{"已取消，部分结果"}else if s.partial{"部分扫描（不是全盘结论）"}else{"目录扫描完成"},s.nodes.len(),s.elapsed.as_secs(),s.hardlinks,s.skipped_links,s.errors,s.unknown);this.current=0;this.scan=Some(s);},Err(e)=>this.status=format!("扫描失败：{e}")};cx.notify();}).ok();}).detach();
+        cx.spawn(async move|this,cx|{let result=cx.background_spawn(async move{disk_usage::scan(&path,cancel,p,Limits::default())}).await;this.update(cx,|this,cx|{if this.generation!=gen_id{return;}this.busy=false;match result{Ok(s)=>{this.status=format!("{}，{} 个路径，{} 秒，硬链接去重 {}，跳过链接/挂载/离线 {}，错误 {}，未知占用 {}",if s.cancelled{"已取消，部分结果"}else if s.partial{"部分扫描（不是全盘结论）"}else{"目录扫描完成"},s.nodes.len(),s.elapsed.as_secs(),s.hardlinks,s.skipped_links,s.errors,s.unknown);this.current=0;this.scan=Some(s);},Err(e)=>this.status=format!("扫描失败：{e}")};cx.notify();}).ok();}).detach();
         cx.notify();
     }
 }
@@ -102,7 +102,7 @@ impl Render for DiskWindow {
         if let Some(s) = &self.scan {
             let node = &s.nodes[self.current];
             title = format!(
-                "{} · 逻辑 {} · 实际占用 {}",
+                "{}，逻辑 {}，实际占用 {}",
                 node.path.display(),
                 format_size(node.logical, false),
                 format_size(node.allocated, false)
@@ -161,7 +161,7 @@ impl Render for DiskWindow {
                                 .w_full()
                                 .text_ellipsis()
                                 .whitespace_nowrap()
-                                .child(label.replace('\n', " · ")),
+                                .child(label.replace('\n', "，")),
                         )
                         .on_click(move |_, _, cx| {
                             e.update(cx, |this, cx| {
@@ -185,15 +185,15 @@ impl Render for DiskWindow {
                     Button::new(SharedString::from(format!("disk-node-{i}")))
                         .ghost()
                         .label(format!(
-                            "{} · {}{}{}",
+                            "{}，{}{}{}",
                             n.path.file_name().unwrap_or_default().to_string_lossy(),
                             format_size(n.allocated, false),
                             if n.hardlink_duplicate {
-                                " · 硬链接重复计 0"
+                                "，硬链接重复计 0"
                             } else {
                                 ""
                             },
-                            if n.uncertain { " · 占用未知" } else { "" }
+                            if n.uncertain { "，占用未知" } else { "" }
                         ))
                         .on_click(move |_, _, cx| {
                             e.update(cx, |this, cx| {
@@ -215,17 +215,17 @@ impl Render for DiskWindow {
             if let Some(i) = self.detail {
                 let n = &s.nodes[i];
                 detail = format!(
-                    "{}\n逻辑 {} · 实际占用 {}{}{}",
+                    "{}\n逻辑 {}，实际占用 {}{}{}",
                     n.path.display(),
                     format_size(n.logical, false),
                     format_size(n.allocated, false),
                     if n.hardlink_duplicate {
-                        " · 硬链接已在其他路径计入"
+                        "，硬链接已在其他路径计入"
                     } else {
                         ""
                     },
                     if n.uncertain {
-                        " · 实际占用未知，非零占用保证"
+                        "，实际占用未知，非零占用保证"
                     } else {
                         ""
                     }
@@ -240,7 +240,7 @@ impl Render for DiskWindow {
  .child(div().flex_shrink_0().p_2().text_sm().child(title))
  .child(h_flex().flex_1().min_h_0().items_stretch().w_full().child(tree).child(div().id("disk-child-list").w(px(340.)).h_full().flex_shrink_0().overflow_y_scrollbar().child(list)))
  .child(div().flex_shrink_0().p_2().text_xs().child(detail))
- .child(div().flex_shrink_0().p_2().text_xs().child(if self.busy{format!("扫描中 · 已读 {} 项 / {} 目录 · 实际占用累计 {} · 同卷、不跟随链接；最多 500000 项 / 300 秒",self.progress.entries.load(Ordering::Relaxed),self.progress.directories.load(Ordering::Relaxed),format_size(self.progress.allocated.load(Ordering::Relaxed),false))}else{self.status.clone()}))
+ .child(div().flex_shrink_0().p_2().text_xs().child(if self.busy{format!("扫描中，已读 {} 项 / {} 目录，实际占用累计 {}，同卷、不跟随链接；最多 500000 项 / 300 秒",self.progress.entries.load(Ordering::Relaxed),self.progress.directories.load(Ordering::Relaxed),format_size(self.progress.allocated.load(Ordering::Relaxed),false))}else{self.status.clone()}))
     }
 }
 pub fn open(cx: &mut App) {

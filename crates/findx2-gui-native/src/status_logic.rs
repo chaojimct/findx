@@ -12,6 +12,16 @@ pub fn count_label(n: u64) -> String {
     format!("索引 {} 项", format_zh_int(n))
 }
 
+/// Diagnostics already titles the row. Do not prefix another 索引 when the
+/// summary itself starts with that word.
+pub fn diagnostic_index_line(summary: &str) -> String {
+    if summary.starts_with("索引") {
+        summary.to_string()
+    } else {
+        format!("索引：{summary}")
+    }
+}
+
 fn format_zh_int(n: u64) -> String {
     // 与 toLocaleString("zh-CN") 一样用逗号分组即可。
     let s = n.to_string();
@@ -45,11 +55,11 @@ pub fn summarize_status(resp: &IpcResponse, enable_metadata_backfill: bool) -> I
         } => {
             if *loading {
                 let stage = loading_stage.as_deref().unwrap_or("").trim();
-                let summary = "索引 · 加载中".to_string();
+                let summary = "索引加载中".to_string();
                 let detail = if !stage.is_empty() {
-                    Some(format!("索引: 加载中 · {stage}"))
+                    Some(format!("索引加载中：{stage}"))
                 } else if let Some(secs) = loading_elapsed_secs {
-                    Some(format!("索引: 加载中（已 {secs}s）· 完成后自动可用"))
+                    Some(format!("索引加载中（已 {secs}s），完成后自动可用"))
                 } else {
                     None
                 };
@@ -63,12 +73,12 @@ pub fn summarize_status(resp: &IpcResponse, enable_metadata_backfill: bool) -> I
             {
                 if is_watch_degraded(err) {
                     return IndexStatusView {
-                        summary: format!("{base} · 实时监控已降级"),
+                        summary: format!("{base}，实时监控已降级"),
                         detail: Some(err.to_string()),
                     };
                 }
                 return IndexStatusView {
-                    summary: format!("{base} · 有警告"),
+                    summary: format!("{base}，有警告"),
                     detail: Some(err.to_string()),
                 };
             }
@@ -78,14 +88,14 @@ pub fn summarize_status(resp: &IpcResponse, enable_metadata_backfill: bool) -> I
                 .filter(|s| !s.is_empty())
             {
                 return IndexStatusView {
-                    summary: format!("{base} · 有警告"),
+                    summary: format!("{base}，有警告"),
                     detail: Some(err.to_string()),
                 };
             }
             if !metadata_ready {
                 if !enable_metadata_backfill {
                     return IndexStatusView {
-                        summary: format!("{base} · 元数据回填已关闭"),
+                        summary: format!("{base}，元数据回填已关闭"),
                         detail: Some("元数据回填已关闭，可在设置中开启。".into()),
                     };
                 }
@@ -94,7 +104,7 @@ pub fn summarize_status(resp: &IpcResponse, enable_metadata_backfill: bool) -> I
                         .round()
                         .clamp(0.0, 100.0) as u32;
                     return IndexStatusView {
-                        summary: format!("{base} · 元数据回填 {pct}%"),
+                        summary: format!("{base}，元数据回填 {pct}%"),
                         detail: Some(format!(
                             "已回填 {} / {}。",
                             format_zh_int(*backfill_done),
@@ -103,7 +113,7 @@ pub fn summarize_status(resp: &IpcResponse, enable_metadata_backfill: bool) -> I
                     };
                 }
                 return IndexStatusView {
-                    summary: format!("{base} · 元数据回填中"),
+                    summary: format!("{base}，元数据回填中"),
                     detail: None,
                 };
             }
@@ -266,10 +276,16 @@ mod tests {
             tombstone_count: None,
         };
         let v = summarize_status(&resp, true);
-        assert_eq!(v.summary, "索引 · 加载中");
+        assert_eq!(v.summary, "索引加载中");
         assert_eq!(
             v.detail.as_deref(),
-            Some("索引: 加载中 · 解析条目（3/8 阶段）")
+            Some("索引加载中：解析条目（3/8 阶段）")
+        );
+        assert_eq!(diagnostic_index_line(&v.summary), "索引加载中");
+        assert!(!diagnostic_index_line("索引 4,270,379 项，有警告").contains('·'));
+        assert_eq!(
+            diagnostic_index_line("索引 4,270,379 项，有警告"),
+            "索引 4,270,379 项，有警告"
         );
     }
 
@@ -318,7 +334,7 @@ mod tests {
         assert_eq!(kept, prev);
         assert!(!kept.summary.contains("加载中"));
         let first = apply_status(None, &contention, true);
-        assert_eq!(first.summary, "索引 · 加载中");
+        assert_eq!(first.summary, "索引加载中");
     }
 
 }

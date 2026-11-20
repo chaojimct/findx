@@ -37,20 +37,20 @@ impl Cached {
     pub fn label(&self) -> String {
         let source = match self.source {
             Source::Measured => "本地批量实测",
-            Source::Memory => "内存缓存 · 未验证新鲜度",
-            Source::Snapshot => "持久快照 · 未验证新鲜度",
+            Source::Memory => "内存缓存，未验证新鲜度",
+            Source::Snapshot => "持久快照，未验证新鲜度",
         };
         format!(
-            "{source} · 扫描时点 {}（本地）{}",
+            "{source}，扫描时点 {}（本地）{}",
             crate::search_logic::format_time(self.captured),
             if self.scan.is_legacy_entry_truncation() {
-                " · 旧的条目或时间上限截断结果，请手动重新扫描"
+                "，旧的条目或时间上限截断结果，请手动重新扫描"
             } else if self.scan.memory_limit_reached {
-                " · 达到内存预算的部分结果，请缩小范围或在高级选项中提高内存上限后手动重扫"
+                "，达到内存预算的部分结果，请缩小范围或在高级选项中提高内存上限后手动重扫"
             } else if self.scan.alloc_failed {
-                " · 系统内存不足，已保留已测部分"
+                "，系统内存不足，已保留已测部分"
             } else if self.scan.partial {
-                " · 部分结果"
+                "，部分结果"
             } else {
                 ""
             }
