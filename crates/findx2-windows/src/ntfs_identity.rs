@@ -138,40 +138,92 @@ pub(crate) fn check(h:HANDLE,expected:Epoch)->Result<(),E>{
  Ok(())
 }
 #[cfg(windows)]
-pub(crate) fn absent(data:HANDLE,hint:HANDLE,id:u64,expected:Epoch)->Result<bool,E>{
-    check(data,expected)?;
-    let ordinal=(id&INDEX_MASK) as i64;let mut bytes=vec![0u8;12+expected.volume.record_bytes as usize];let mut got=0;
-    unsafe{DeviceIoControl(data,FSCTL_GET_NTFS_FILE_RECORD,Some((&ordinal as *const i64).cast()),8,Some(bytes.as_mut_ptr().cast()),bytes.len() as u32,Some(&mut got),None)}.map_err(|e|E::Retry(format!("MFT query unavailable: {e}; cursor retained")))?;
+fn read_record(h:HANDLE,ordinal:u64,record_bytes:u32)->Result<Vec<u8>,E>{
+    let key=(ordinal&INDEX_MASK) as i64;
+    let mut bytes=vec![0u8;12+record_bytes as usize];
+    let mut got=0u32;
+    unsafe{DeviceIoControl(h,FSCTL_GET_NTFS_FILE_RECORD,Some((&key as *const i64).cast()),8,Some(bytes.as_mut_ptr().cast()),bytes.len() as u32,Some(&mut got),None)}
+        .map_err(|e|E::Retry(format!("MFT query unavailable: {e}; cursor retained")))?;
     if got as usize>bytes.len(){return Err("MFT output length exceeded bound".into());}
-    let view=&bytes[..got as usize];
-    let c=claim(id,expected.volume,view)?;
-    let base=crate::ntfs_witness::base_ordinal(view).map_err(|reason|E::Retry(format!("{reason}; cursor retained")))?;
-    // FSCTL returns the nearest in-use ordinal <= requested. A lower in-use
-    // record is absence proof only after an independent check. Base files are
-    // reopened on the access-0 id hint (not the DASD/GENERIC_READ handle).
-    // Reserved metadata and extension records are not OpenFileById targets; a
-    // second record read must return the same ordinal, sequence and base.
-    let candidate_ordinal=crate::ntfs_witness::frn_ordinal(c.candidate);
-    let candidate_sequence=crate::ntfs_witness::frn_sequence(c.candidate);
-    if !crate::ntfs_witness::direct_open_witness(candidate_ordinal, candidate_sequence, base) {
-        let slot = candidate_ordinal as i64;
+    bytes.truncate(got as usize);
+    Ok(bytes)
+}
+#[cfg(windows)]
+fn header_of(record_bytes:u32,bytes:&[u8])->Result<crate::ntfs_witness::RecordHeader,E>{
+    crate::ntfs_witness::parse_record_header(record_bytes,bytes).map_err(|reason|E::Retry(format!("{reason}; cursor retained")))
+}
+#[cfg(windows)]
+/// Three bounded header reads. `Ok(None)` means the id is not an in-use extension
+/// of the requested sequence. An error retains the cursor. This never reports absence.
+pub(crate) fn extension_target(h:HANDLE,id:u64,expected:Epoch)->Result<Option<crate::ntfs_witness::ExtensionTarget>,E>{
+    check(h,expected)?;
+    let size=expected.volume.record_bytes;
+    let first=read_record(h,id,size)?;
+    let claimed=claim(id,expected.volume,&first).map_err(|reason|E::Retry(format!("{reason}; cursor retained")))?;
+    let record=header_of(size,&first)?;
+    if crate::ntfs_witness::frn_ordinal(claimed.candidate)!=record.ordinal
+        || crate::ntfs_witness::frn_sequence(claimed.candidate)!=record.sequence
+        || record.base.raw==0
+        || record.ordinal!=crate::ntfs_witness::frn_ordinal(id)
+        || record.sequence!=crate::ntfs_witness::frn_sequence(id)
+    {
+        return Ok(None);
+    }
+    let again=read_record(h,record.ordinal,size)?;
+    let again_header=header_of(size,&again)?;
+    let base_bytes=read_record(h,record.base.ordinal,size)?;
+    let _base_claim=claim(record.base.raw,expected.volume,&base_bytes).map_err(|reason|E::Retry(format!("{reason}; cursor retained")))?;
+    let base_header=header_of(size,&base_bytes)?;
+    let reread=read_record(h,record.ordinal,size)?;
+    let reread_header=header_of(size,&reread)?;
+    let target=crate::ntfs_witness::corroborated_extension(id,record,again_header,base_header,reread_header)
+        .map_err(|reason|E::Retry(format!("{reason}; frn={id:#x} base_raw={:#x}; cursor retained",record.base.raw)))?;
+    check(h,expected)?;
+    Ok(target)
+}
+#[cfg(windows)]
+pub(crate) fn absent(h:HANDLE,id:u64,expected:Epoch)->Result<bool,E>{
+    check(h,expected)?;
+    let bytes=read_record(h,id,expected.volume.record_bytes)?;
+    let c=claim(id,expected.volume,&bytes)?;
+    let base=crate::ntfs_witness::parse_base_reference(&bytes).map_err(|reason|E::Retry(format!("{reason}; cursor retained")))?;
+    // The requested id still names this in-use extension. OpenFileById cannot
+    // open it, and that failure is not deletion of this record or of its base.
+    if crate::ntfs_witness::frn_ordinal(c.candidate)==crate::ntfs_witness::frn_ordinal(id)
+        && crate::ntfs_witness::frn_sequence(c.candidate)==crate::ntfs_witness::frn_sequence(id)
+        && base.raw!=0
+    {
+        return Err(E::Retry(format!(
+            "in-use extension is not absence frn={id:#x} base_raw={:#x} low48={:#x} high16={}; cursor retained",
+            base.raw, base.ordinal, base.sequence
+        )));
+    }
+    // FSCTL returns the nearest in-use ordinal <= requested. Decoded kernel
+    // records can have stale USA tails outside used bytes. Never relax that into
+    // a naked lower-record proof: independently reopen its COMPLETE sequence FRN
+    // and verify handle identity/volume; no resident attribute body is consumed.
+    // Reserved metadata (ordinal < 16, including $MFT) is not a valid OpenFileById
+    // target. A second record read must return the same full FRN before a strictly
+    // lower slot can prove absence.
+    if !crate::ntfs_witness::witness_openable(c.candidate) {
+        let ordinal = crate::ntfs_witness::frn_ordinal(c.candidate) as i64;
         let mut bytes2 = vec![0u8; 12 + expected.volume.record_bytes as usize];
         let mut got2 = 0u32;
-        unsafe { DeviceIoControl(data, FSCTL_GET_NTFS_FILE_RECORD, Some((&slot as *const i64).cast()), 8, Some(bytes2.as_mut_ptr().cast()), bytes2.len() as u32, Some(&mut got2), None) }
-            .map_err(|e| { let code = e.code().0 as u32; E::Retry(format!("{}; witness reread failed: {e}", crate::ntfs_witness::witness_failure(c.candidate, base, code & 0xffff, code))) })?;
+        unsafe { DeviceIoControl(h, FSCTL_GET_NTFS_FILE_RECORD, Some((&ordinal as *const i64).cast()), 8, Some(bytes2.as_mut_ptr().cast()), bytes2.len() as u32, Some(&mut got2), None) }
+            .map_err(|e| E::Retry(format!("{}; reserved witness reread failed: {e}", crate::ntfs_witness::witness_failure(c.candidate, 0, e.code().0 as u32))))?;
         if got2 as usize > bytes2.len() { return Err("MFT output length exceeded bound".into()); }
-        let (again_ordinal, again_sequence, again_base) = crate::ntfs_witness::parse_witness_header(expected.volume.record_bytes, &bytes2[..got2 as usize])
-            .map_err(|reason| E::Retry(format!("{}; {reason}", crate::ntfs_witness::witness_failure(c.candidate, base, 0, 0))))?;
-        crate::ntfs_witness::unopened_witness_corroborates(id, c.candidate, again_ordinal, again_sequence, base, again_base)
-            .map_err(|reason| E::Retry(format!("{}; {reason}", crate::ntfs_witness::witness_failure(c.candidate, base, 0, 0))))?;
-        if !c.absent {
-            return Err(E::Retry(format!("{}; unopened witness is not absence proof", crate::ntfs_witness::witness_failure(c.candidate, base, 0, 0))));
+        let (again_ordinal, again_sequence) = crate::ntfs_witness::parse_reserved_record(expected.volume.record_bytes, &bytes2[..got2 as usize])
+            .map_err(|reason| E::Retry(format!("{}; {reason}", crate::ntfs_witness::witness_failure(c.candidate, 0, 0))))?;
+        let proved = crate::ntfs_witness::reserved_record_corroborates(id, c.candidate, again_ordinal, again_sequence)
+            .map_err(|reason| E::Retry(format!("{}; {reason}", crate::ntfs_witness::witness_failure(c.candidate, 0, 0))))?;
+        if proved != c.absent {
+            return Err(E::Retry(format!("{}; reserved witness disagreed with the first record", crate::ntfs_witness::witness_failure(c.candidate, 0, 0))));
         }
-        check(data, expected)?;
-        return Ok(true);
+        check(h, expected)?;
+        return Ok(proved);
     }
-    let opened=super::ntfs_namespace::open_file_by_id_diagnostic(hint,c.candidate).map_err(|e|{
-        let message=crate::ntfs_witness::witness_failure(c.candidate,base,e.win32,e.native);
+    let opened=super::ntfs_namespace::open_file_by_id_diagnostic(h,c.candidate).map_err(|e|{
+        let message=crate::ntfs_witness::witness_failure(c.candidate,e.win32,e.native);
         tracing::warn!("{message}");
         E::Retry(message)
     })?;
@@ -179,7 +231,7 @@ pub(crate) fn absent(data:HANDLE,hint:HANDLE,id:u64,expected:Epoch)->Result<bool
     queried.map_err(|e|E::Retry(format!("MFT witness metadata unavailable: {e}")))?;
     let actual=(info.nFileIndexHigh as u64)<<32|info.nFileIndexLow as u64;
     let result=corroborate(&c,expected.volume,Some((actual,info.dwVolumeSerialNumber)))?;
-    check(data,expected)?;Ok(result)
+    check(h,expected)?;Ok(result)
 }
 #[cfg(test)] mod ntfs_identity_tests {
     use super::*;
