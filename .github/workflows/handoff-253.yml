@@ -1,7 +1,5 @@
 name: Isolated 2.5.3 handoff verification
 on:
-  push:
-    branches: [cursor/service-ux-uac-94f1]
   workflow_dispatch:
 permissions:
   contents: read
