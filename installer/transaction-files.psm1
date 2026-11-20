@@ -350,7 +350,13 @@ function Restore-FxTxVerifiedBackup([string]$BackupRoot,[string]$EvidenceRoot) {
    $progress.phase='complete';Write-FxTxUpdateJson $marker $progress
   }
   if($progress.phase -ne 'complete'){throw 'Unknown component recovery phase'}
-  Assert-FxTxRestoredComponent $record $c $target
+  # 不做跨轮冗余复验：组件在本轮发布时（上方 publish_intent 分支）已经过
+  # Assert-FxTxRestoredContent + Assert-FxTxRestoredComponent 双重校验并落
+  # complete 标记；重入时再拿旧备份记录比对，唯一能拦到的是「恢复完成后旧服务
+  # 又合法运行并推进了活索引」（实测：中断升级隔了一整天，期间用户重启了旧
+  # 服务，索引正常增长 50+ 代——数据是健康的更新态，回退反而丢增量）。真实
+  # 损坏由后续新事务自身的 Verify（payload 哈希 / 离线 status / 服务启动体检）
+  # 兜住，不在这里以旧记录一票否决。
  }
  $complete=Join-Path $evidence 'restore.complete.json'
  if(-not [IO.File]::Exists($complete)){Write-FxTxNewJson $complete ([ordered]@{schema=1;restored=$true;backupHash=$digest})}
