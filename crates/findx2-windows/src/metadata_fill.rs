@@ -9,7 +9,8 @@
 //!   避免每条 entry 一次 `CreateFile`；
 //! - 任务粒度 = `threads × CHUNKS_PER_THREAD`，再夹下限避免太细；
 //! - 进度通过回调透出，便于 service 把 `(done, total)` 推给 IPC；
-//! - 取消通过 `Arc<AtomicBool>`，任意时刻 set true 后剩余 chunk 立即跳过。
+//! - 取消通过 `Arc<AtomicBool>`。已经进入 `OpenFileById` 的那一次调用不会被打断，
+//!   也没有时间上限；标志只在下一次打开之前检查。块还没开始时直接跳过，不再 `CreateFileW`。
 
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -54,7 +55,8 @@ pub type MetaUpdate = (usize, u64, u64, u64);
 /// - `indices`：要回填的下标集合（在 `file_ids` 上），允许稀疏。
 /// - `progress`：每完成若干条调用一次（`(done, total)`），主要给 service IPC 用；
 ///    传 `None` 则只打 `progress!` 日志。
-/// - `cancel`：传 `Some` 后，外部 set true 即刻跳过剩余块。
+/// - `cancel`：传 `Some` 后，下一次 `OpenFileById` 之前若已置位就不再打开。
+///   当前这次内核调用会跑完；函数返回前不会释放仍被任务读取的缓冲区。
 ///
 /// 返回所有成功取到 metadata 的更新，乱序；失败的 entry 直接丢弃（极少数 reparse / 破坏文件）。
 #[cfg(windows)]
@@ -96,7 +98,7 @@ pub fn fill_metadata_by_id_pooled(
         .par_chunks(chunk_sz)
         .map(|chunk| {
             if let Some(c) = cancel.as_ref() {
-                if c.load(Ordering::Relaxed) {
+                if c.load(Ordering::Acquire) {
                     return Vec::new();
                 }
             }
@@ -135,13 +137,11 @@ pub fn fill_metadata_by_id_pooled(
             };
 
             let mut out = Vec::with_capacity(chunk.len());
-            for (i, &idx) in chunk.iter().enumerate() {
-                // 每隔较多条目检查一次 cancel，避免 atomic load 频率太高。
-                if i & 0xFF == 0 {
-                    if let Some(c) = cancel.as_ref() {
-                        if c.load(Ordering::Relaxed) {
-                            break;
-                        }
+            for &idx in chunk.iter() {
+                // 只在下一次打开前观察取消。正在内核里的 OpenFileById 不会被打断。
+                if let Some(c) = cancel.as_ref() {
+                    if c.load(Ordering::Acquire) {
+                        break;
                     }
                 }
                 let frn = file_ids[idx];

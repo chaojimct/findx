@@ -7,6 +7,7 @@ mod load_state;
 mod startup_compact;
 mod shutdown;
 mod runtime_lifecycle;
+mod stat_queue;
 mod usage_fixture;
 mod watch_health;
 
