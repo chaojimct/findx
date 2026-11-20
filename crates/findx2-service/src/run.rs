@@ -381,8 +381,10 @@ pub(crate) fn run_foreground(
     // 换入（merge 的 +dir_base 平移会为每卷产生自父根），全部完成后索引即为新格式，
     // 最后一卷的 rebuild_volume 内置 enable_usage 重试自然成功。期间旧索引持续服务，
     // 冻结协议保证重建窗口的事件由 frozen 游标回放，零丢失。个别卷失败（如移动盘
-    // 不在线）只保留旧数据并留状态提示，下次启动自动重试（部分升级后 roots 仍对不上
+    // 不在线）只保留旧数据并记日志，下次启动自动重试（部分升级后 roots 仍对不上
     // 卷数，legacy 标志继续置位）。
+    // 注意：进度**不得**写 watch_error——Status.healthy 按 watch 位图汇总，任何卷带
+    // error 都会把 healthy 打成 false，安装器 Verify 的 Wait-NewServiceReady 门会超时。
     if engine.index_store().legacy_global_scope && !flags.no_watch {
         let letters: Vec<char> = {
             let g = engine.index_store();
@@ -402,24 +404,23 @@ pub(crate) fn run_foreground(
         std::thread::Builder::new()
             .name("legacy-index-upgrade".into())
             .spawn(move || {
+                // 20s 启动宽限：避开安装器 Verify 的就绪窗口（Wait-NewServiceReady 会
+                // 轮询 Status；重建期间不可设置 watch_error——healthy 按位图汇总，
+                // 任何卷带 error 都会把 healthy 打成 false，安装器 12s 门必超时）。
+                // 进度只走日志，不打扰 healthy / 代数回执校验。
+                std::thread::sleep(std::time::Duration::from_secs(20));
                 let mut ok = 0usize;
                 for letter in letters {
-                    crate::watch_health::set_watch_error(
-                        letter,
-                        Some("旧版索引拓扑升级中：MFT 重扫本卷（搜索走旧数据不受影响）…".into()),
+                    info!(
+                        "卷 {letter} 旧拓扑升级：MFT 重扫开始（搜索走旧数据不受影响）…"
                     );
                     match rebuild_volume(&eng, letter, &idx) {
                         Ok(()) => {
                             ok += 1;
-                            crate::watch_health::set_watch_error(letter, None);
                             info!("卷 {letter} 拓扑升级完成");
                         }
                         Err(e) => {
                             error!("卷 {letter} 拓扑升级失败: {e:#}（保留旧数据，下次启动重试）");
-                            crate::watch_health::set_watch_error(
-                                letter,
-                                Some(format!("旧拓扑升级失败: {e}；下次启动重试")),
-                            );
                         }
                     }
                 }
