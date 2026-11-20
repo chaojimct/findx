@@ -324,13 +324,15 @@ try {
       }
     }
   }
-  if ($result.trayQuitVerified) {
-    $sealTx = New-Tx
-    $seal = Start-OwnedPrepare $sealTx $app 20 'backup'
-    Assert ($seal.process.WaitForExit(180000)) 'Post-quit lease seal hung'
-    $seal.process.Refresh()
-    $sealOutcome = Read-Outcome $sealTx
-    Assert ($sealOutcome.state -eq 'rolled_back') ('Lease was not terminal before the fixture: ' + $sealOutcome.failure)
+  if ($result.trayWindow) {
+    if ($result.trayQuitVerified) {
+      $sealTx = New-Tx
+      $seal = Start-OwnedPrepare $sealTx $app 20 'backup'
+      Assert ($seal.process.WaitForExit(180000)) 'Post-quit lease seal hung'
+      $seal.process.Refresh()
+      $sealOutcome = Read-Outcome $sealTx
+      Assert ($sealOutcome.state -eq 'rolled_back') ('Lease was not terminal before the fixture: ' + $sealOutcome.failure)
+    }
     $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
     if (-not (Test-Path -LiteralPath $iscc)) {
       choco install innosetup -y --no-progress
@@ -373,7 +375,7 @@ try {
       }
     }
   } else {
-    $limits.Add('Fixture installer was not run because the published tray quit was not verified on this runner.')
+    $limits.Add('Fixture installer was not run because the published 2.5.3 window did not appear.')
   }
   Assert (-not (Get-Service -Name 'FindX2Search' -ErrorAction SilentlyContinue)) 'Production service appeared'
   Assert (-not (Get-Service -Name $service -ErrorAction SilentlyContinue)) 'Isolated test service was registered'
