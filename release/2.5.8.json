@@ -1,8 +1,54 @@
 {
   "version": "2.5.8",
   "baseline": "2.5.7",
-  "channel": "local-candidate",
-  "publish_ready": false,
+  "channel": "stable",
+  "publish_ready": true,
   "windows_gui": "native",
-  "gates": []
+  "gates": [
+    {
+      "id": "installer-live-handoff-from-2.5.5",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "ps51-encoding-and-packaged-helpers",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "post-upgrade-search-paths-and-watch-health",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "strict-protocol2-stop-receipt",
+      "priority": "P1",
+      "required": false,
+      "passed": false
+    },
+    {
+      "id": "legacy-gui-in-app-download-entry",
+      "priority": "P2",
+      "required": false,
+      "passed": false
+    },
+    {
+      "id": "macos-linux-real-device-acceptance",
+      "priority": "P2",
+      "required": false,
+      "passed": false
+    }
+  ],
+  "engine_binary_baseline": "Incremental installer/fix release on the 2.5.7 baseline (c02e48fe + 3fa74d95 RequestQuit helper-set fix). Official GitHub Release artifacts are produced by the existing release.yml CI rebuild on tag v2.5.8, not the local accepted setup bytes.",
+  "gate_evidence": "release/2.5.8.md",
+  "limitations": [
+    "metadata_ready remains false after the accepted live upgrade",
+    "SCM stop Win32 1066 / specific 1 is accepted partial save, not a strict protocol2 receipt",
+    "Old GUI in-app check-update/download-full-installer path was not tested; live acceptance used a direct installer launch",
+    "macOS and Linux packages in this release are CI-only, not real-device accepted",
+    "Official CI packages are a new rebuild and are not byte-identical to the local dist-t247 setup"
+  ]
 }
