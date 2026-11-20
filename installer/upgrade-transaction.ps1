@@ -5,7 +5,7 @@ param(
  [Parameter(Mandatory=$true)][string]$TransactionRoot,
  [string]$InstallRoot,[string]$DataRoot,[string]$NativeConfigRoot,[string]$LegacyConfigRoot,
  [string]$ServiceName='FindX2Search',[string]$PipeName='findx2',[string]$ExpectedVersion,
- [int]$InstallService=0,[int]$TimeoutSeconds=12,[int]$AddPath=0,[string]$UninstallKey,[string]$GroupRoot,[string]$DesktopRoot,[int]$CreateGroup=0,
+ [int]$InstallService=0,[int]$TimeoutSeconds=12,[int]$ServiceStopSeconds=0,[int]$AddPath=0,[string]$UninstallKey,[string]$GroupRoot,[string]$DesktopRoot,[int]$CreateGroup=0,
  [string]$TestVolumeImage='',
  [switch]$TestBuild,[switch]$QuitReporter,[string]$QuitReport,[ValidateSet('none','backup','health','stop-timeout','interrupt-after-copy','post-platform')][string]$Fault='none'
 )
@@ -497,7 +497,9 @@ function Invoke-Rollback {
    $candidate=Get-ExactService
    if($candidate -and $candidate.State -ne 'Stopped'){
     $proof=Join-Path $TransactionRoot 'candidate-rollback-stop';$null=[IO.Directory]::CreateDirectory($proof)
-    $null=Invoke-FxTxPreparedServiceStop -ServiceName $script:s.serviceName -PipeName $script:s.pipeName -Image (Join-Path $script:s.roots.app 'findx2-service.exe') -Index (Join-Path $script:s.roots.data 'index.bin') -Cli (Join-Path $script:s.roots.app 'findx2.exe') -ExpectedVersion $script:s.expectedVersion -Evidence $proof -TimeoutSeconds $script:s.timeoutSeconds -OnState {param($Handoff) $script:s.terminalHandoff=$Handoff;Save-State}
+    $scm=[int]$script:s.timeoutSeconds
+    if(@($script:s.PSObject.Properties.Name) -contains 'serviceStopSeconds' -and [int]$script:s.serviceStopSeconds -gt 0){$scm=[int]$script:s.serviceStopSeconds}
+    $null=Invoke-FxTxPreparedServiceStop -ServiceName $script:s.serviceName -PipeName $script:s.pipeName -Image (Join-Path $script:s.roots.app 'findx2-service.exe') -Index (Join-Path $script:s.roots.data 'index.bin') -Cli (Join-Path $script:s.roots.app 'findx2.exe') -ExpectedVersion $script:s.expectedVersion -Evidence $proof -TimeoutSeconds $script:s.timeoutSeconds -ScmTimeoutSeconds $scm -OnState {param($Handoff) $script:s.terminalHandoff=$Handoff;Save-State}
    }
   }
   # Each installer phase is a NEW PS process. Audit-aware verification must be
@@ -549,7 +551,8 @@ try{
   if(Test-Path -LiteralPath (Join-Path $TransactionRoot 'journal.json')){throw 'Unfinished/existing transaction requires recovery, not overwrite'}
   if(Test-Path -LiteralPath $TransactionRoot){throw 'Transaction root must be new; prior evidence retained'}
   Set-FxTxPrivateDirectory $TransactionRoot
-  $script:s=[pscustomobject]@{schema=2;installerOwner=$null;state='created';roots=[pscustomobject]$roots;serviceName=$ServiceName;pipeName=$PipeName;expectedVersion=$ExpectedVersion;installService=($InstallService -eq 1);timeoutSeconds=$TimeoutSeconds;testVolume='C:';ownedTestVolume=$false;testBuild=[bool]$TestBuild;fault=$Fault;platform=$null;backupVerified=$false;createdService=$false;candidateServiceStarted=$false;terminalHandoff=$null;original=[pscustomobject]@{serviceExists=$false;serviceRunning=$false;guiRunning=$false;guiStopped=$false;guiExitRequested=$false;serviceCommand='';serviceStartMode=''};error=''}
+  $effectiveScm=if($ServiceStopSeconds -gt 0){$ServiceStopSeconds}else{$TimeoutSeconds}
+  $script:s=[pscustomobject]@{schema=2;installerOwner=$null;state='created';roots=[pscustomobject]$roots;serviceName=$ServiceName;pipeName=$PipeName;expectedVersion=$ExpectedVersion;installService=($InstallService -eq 1);timeoutSeconds=$TimeoutSeconds;serviceStopSeconds=$effectiveScm;testVolume='C:';ownedTestVolume=$false;testBuild=[bool]$TestBuild;fault=$Fault;platform=$null;backupVerified=$false;createdService=$false;candidateServiceStarted=$false;terminalHandoff=$null;original=[pscustomobject]@{serviceExists=$false;serviceRunning=$false;guiRunning=$false;guiStopped=$false;guiExitRequested=$false;serviceCommand='';serviceStartMode=''};error=''}
   $script:lock=[IO.File]::Open((Join-Path $TransactionRoot 'phase.lock'),'OpenOrCreate','ReadWrite','None')
   if($TestVolumeImage){
    if(-not $TestBuild){throw 'Test volume is forbidden in production'}
@@ -578,14 +581,17 @@ try{
    if($owners.Count -ne 1 -or $owners[0] -ne $me){throw 'Original user profile cannot be verified in this session; no profile or running application changed'}
   }
   foreach($p in $roots.Values){if([IO.Path]::GetPathRoot($p) -ine [IO.Path]::GetPathRoot($TransactionRoot)){throw 'Cross-volume atomic recovery is unsupported; refused before replacement'}}
-  if($script:s.original.serviceRunning){
-   # Old252 still fails version/typed protocol BEFORE stop. New engine must
-   # provide an authenticated exact terminal receipt plus real offline validation.
-   if($script:s.testBuild -and $script:s.fault -eq 'stop-timeout'){Stop-ExactService;throw 'Expected isolated stop-timeout fixture did not time out'}
-   $null=Invoke-FxTxPreparedServiceStop -ServiceName $ServiceName -PipeName $PipeName -Image (Join-Path $roots.app 'findx2-service.exe') -Index (Join-Path $roots.data 'index.bin') -Cli (Join-Path $roots.app 'findx2.exe') -ExpectedVersion $ExpectedVersion -Evidence $TransactionRoot -TimeoutSeconds $TimeoutSeconds -OnState {param($Handoff) $script:s.terminalHandoff=$Handoff;Save-State}
-
-  }
+  # Quit the installed GUI before touching the service. 2.5.5 uses the shipped
+  # tray caption; quitting does not itself stop the index service.
   Request-NormalGuiExit
+  if($script:s.original.serviceRunning){
+   # --version only proves this image is findx2-service. It is not a protocol2
+   # receipt and is not compared to the installer version. Authenticated
+   # capabilities choose the strict receipt. Source errors or metadata that is
+   # not ready use the accepted SCM save and stay marked as not protocol2.
+   if($script:s.testBuild -and $script:s.fault -eq 'stop-timeout'){Stop-ExactService;throw 'Expected isolated stop-timeout fixture did not time out'}
+   $null=Invoke-FxTxPreparedServiceStop -ServiceName $ServiceName -PipeName $PipeName -Image (Join-Path $roots.app 'findx2-service.exe') -Index (Join-Path $roots.data 'index.bin') -Cli (Join-Path $roots.app 'findx2.exe') -ExpectedVersion $ExpectedVersion -Evidence $TransactionRoot -TimeoutSeconds $TimeoutSeconds -ScmTimeoutSeconds $effectiveScm -OnState {param($Handoff) $script:s.terminalHandoff=$Handoff;Save-State}
+  }
   Enable-FxTxFullSecurity
   Set-State 'quiesced'
   $links=@();if($CreateGroup -eq 1){$links+=@(Join-Path $GroupRoot 'FindX.lnk');$links+=@(Join-Path $GroupRoot '卸载 FindX.lnk')};if($DesktopRoot){$links+=@(Join-Path $DesktopRoot 'FindX.lnk')}

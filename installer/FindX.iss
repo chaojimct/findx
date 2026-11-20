@@ -270,6 +270,8 @@ begin
     if ExpandConstant('{param:TXIMAGE|}') <> '' then
       Args := Args + ' -TestVolumeImage ' + TxQuote(ExpandConstant('{param:TXIMAGE|}')) + ' -TimeoutSeconds 20'
     else Args := Args + ' -TimeoutSeconds 3';
+#else
+    Args := Args + ' -ServiceStopSeconds 180';
 #endif
   end;
   Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Args, '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0);

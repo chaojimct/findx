@@ -49,7 +49,7 @@ function AssertPlatformRestored($snapshot){
 function Assert($condition,[string]$reason){if(-not $condition){throw $reason}}
 function Hash([string]$p){return (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash}
 function Write-NativeResults {
- [ordered]@{scope=$(if($EngineCandidate){'actual ISS exact rebuilt2.5.3 engine/GUI source+hash manifest; real running engine and published252 refusal; synthetic service ONLY for legacy stop-timeout'}else{'historical GUI-only fixture; not new engine acceptance'});cases=@($rows.ToArray());passed=@($rows | Where-Object{$_.passed}).Count;failed=@($rows | Where-Object{-not $_.passed}).Count;payloadSourceCommit=$PayloadSourceCommit;installerSourceCommit=$env:GITHUB_SHA;requestedCases=@($cases);candidateGUIIntegrated=$true;candidateGuiSha256=(Hash (Join-Path $CandidatePayload 'FindX.exe'));productionTouched=$false} | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 (Join-Path $base 'results.json')
+ [ordered]@{scope=$(if($EngineCandidate){'actual ISS exact rebuilt engine/GUI source+hash manifest; real running engine and published252 refusal; synthetic service for unsafe image refusal and stop-timeout'}else{'historical GUI-only fixture; not new engine acceptance'});cases=@($rows.ToArray());passed=@($rows | Where-Object{$_.passed}).Count;failed=@($rows | Where-Object{-not $_.passed}).Count;payloadSourceCommit=$PayloadSourceCommit;installerSourceCommit=$env:GITHUB_SHA;requestedCases=@($cases);candidateGUIIntegrated=$true;candidateGuiSha256=(Hash (Join-Path $CandidatePayload 'FindX.exe'));productionTouched=$false} | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 (Join-Path $base 'results.json')
 }
 $hostSource=@'
 using System;
@@ -87,7 +87,7 @@ foreach($case in $cases){
   Assert ((Hash (Join-Path $stage 'FindX.exe')) -eq (Hash (Join-Path $CandidatePayload 'FindX.exe'))) 'Candidate copy changed'
   # Create a real small public index with the UNCHANGED published engine, no watch/backfill/host.
   $owned=Join-Path $root 'owned public fixture';$null=[IO.Directory]::CreateDirectory($owned);[IO.File]::WriteAllText((Join-Path $owned 'owned.txt'),'installer safety fixture')
-  if($case -in @('new-service-ipc','new-service-health-rollback') -or $isRunningNew -or ($EngineCandidate -and $case -eq 'legacy-running-refusal')){
+  if($case -in @('new-service-ipc','new-service-health-rollback') -or $isRunningNew){
    # --no-watch deliberately reports healthy=false in the published252engine.
    # Positive readiness therefore uses real USN ONLY on a new guarded tiny VHD.
    $ownedVolumeImage=Join-Path $root 'owned-health.vhd'
@@ -119,14 +119,14 @@ foreach($case in $cases){
    [IO.File]::WriteAllBytes((Join-Path $app 'FindX.installed'),[byte[]](0x31,13,10));$oldGui=Hash (Join-Path $app 'FindX.exe')
   }
   if($case -in @('published252-stopped-service','legacy-running-refusal','stop-timeout') -or $isRunningNew){
-   if($case -eq 'stop-timeout' -or ($case -eq 'legacy-running-refusal' -and -not $EngineCandidate)){Copy-Item -LiteralPath $fixtureHost -Destination (Join-Path $app 'findx2-service.exe') -Force}
+   if($case -eq 'stop-timeout' -or $case -eq 'legacy-running-refusal'){Copy-Item -LiteralPath $fixtureHost -Destination (Join-Path $app 'findx2-service.exe') -Force}
    $command='"'+(Join-Path $app 'findx2-service.exe')+'" --service --index "'+(Join-Path $data 'index.bin')+'" --pipe '+$pipe
-   if($isRunningNew -or ($EngineCandidate -and $case -eq 'legacy-running-refusal')){$command+=' --volume '+$volume+' --no-everything-ipc --save-interval-secs 1'}
+   if($isRunningNew){$command+=' --volume '+$volume+' --no-everything-ipc --save-interval-secs 1'}
    $null=New-Service -Name $service -BinaryPathName $command -StartupType Manual;$created=$true
    $null=New-ItemProperty -Path ('HKLM:\SYSTEM\CurrentControlSet\Services\'+$service) -Name Environment -PropertyType MultiString -Value @('ProgramData='+(Join-Path $root 'programdata'))
    if($case -in @('legacy-running-refusal','stop-timeout') -or $isRunningNew){if($case -eq 'stop-timeout'){[IO.File]::WriteAllText((Join-Path $data 'index.bin.hold-stop'),'hold')};Start-Service $service;$originalServicePid=[int](Get-CimInstance Win32_Service -Filter ("Name='"+$service+"'")).ProcessId}
   }
-  if($isRunningNew -or ($EngineCandidate -and $case -eq 'legacy-running-refusal')){
+  if($isRunningNew){
    $until=[DateTime]::UtcNow.AddSeconds(45);$ready=$false
    do{try{$st=Read-FxTxServiceStatus $pipe $originalServicePid;$ready=(-not $st.loading -and $st.healthy -and $st.entry_count -gt 0 -and (-not $isRunningNew -or $st.metadata_ready))}catch{};if(-not $ready){[Threading.Thread]::Sleep(100)}}while(-not $ready -and [DateTime]::UtcNow -lt $until)
    Assert $ready 'Actual source engine never reached real watched IPC readiness'

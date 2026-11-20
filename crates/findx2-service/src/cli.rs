@@ -86,6 +86,12 @@ mod version_probe_tests {
     fn version_probe_exits_during_argument_parsing_without_loading_or_watching() {
         let error=Cli::try_parse_from(["findx2-service", "--version"]).unwrap_err();
         assert_eq!(error.kind(),clap::error::ErrorKind::DisplayVersion);
-        assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+        assert!(crate::parse_failure_is_probe(error.kind()));
+        let version=env!("CARGO_PKG_VERSION");
+        let rendered=error.to_string();
+        let line=rendered.lines().next().unwrap().trim();
+        assert_eq!(line, format!("findx2-service {version}"));
+        let bad=Cli::try_parse_from(["findx2-service", "--not-a-real-flag"]).unwrap_err();
+        assert!(!crate::parse_failure_is_probe(bad.kind()));
     }
 }

@@ -34,6 +34,13 @@ use clap::Parser;
 /// 与 GUI 超时提示一致：进程启动失败或 run_foreground 返回 Err 时写入，便于无控制台时排查。
 pub(crate) const SERVICE_LAST_ERROR_FILENAME: &str = "findx2-service-last-error.txt";
 
+pub(crate) fn parse_failure_is_probe(kind: clap::error::ErrorKind) -> bool {
+    matches!(
+        kind,
+        clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+    )
+}
+
 // Isolated foreground fixtures must not write the formal service diagnostic file,
 // including parse/startup failures before RunFlags exist.
 fn startup_error_path() -> std::path::PathBuf {
@@ -80,6 +87,11 @@ fn try_main() -> anyhow::Result<()> {
     let cli = match cli::Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
+            if parse_failure_is_probe(e.kind()) {
+                // --version / --help 在参数解析阶段退出，不是启动失败。
+                // 写入正式诊断文件会把版本号伪装成上次运行错误。
+                e.exit();
+            }
             let path = startup_error_path();
             let text = format!("{e}");
             let _ = std::fs::write(&path, &text);
