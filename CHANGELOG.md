@@ -1,3 +1,26 @@
+## [2.5.6] - 2026-11-20
+
+相对已发布的 v2.5.5。源提交固定为 `3ea903c9235bb5f2391ba2123ffd6bdee6ef1b13`。这里只记录该范围内已经落地的修复，实时监视并未修好。
+
+### 修复
+
+- Everything：已经能搜索的索引，不再因为元数据未完成而被报成未加载。空库、加载、回填和管道超时分开处理，SDK 查询布局保持不变。
+- 状态争用：索引写锁暂时拿不到时，保留上一份已发布的可搜索状态，不再把条数、游标和卷号报成 0。监视出错时 healthy 仍为假；元数据未完成时也不改成已完成。
+- NTFS 身份：事件要的是序号 6，而当前槽位已经是序号 9 的扩展记录时，不再打开这条记录，也不把基文件当成这次事件的新身份。正在使用的扩展记录不再当成缺失；基引用不一致时保留当前基文件。
+- 目录事件：日志里已经有目录名和父项时，打开被拒绝不再让整批游标停住。序号 5 的基文件保持不动。
+- 界面与安装交接：新界面接收正常退出消息，应用内更新在 UAC 确认前保持运行。旧界面改为点托盘里的正常退出；安装锁被占用时拒绝安装，并且不删除已有文件。
+
+自 v2.5.5 到这个源提交，没有单独的定位预览改动。
+
+### 已知限制
+
+- 实时监视的增量追赶仍然很慢：约 5 分钟消化 115 万条 USN，还落后约 6.08 亿条。新建、重命名、删除的新文件还没有通过验收。
+- 元数据阶段 41346 未验证、不完整。这和监视是否健康不是同一件事。
+- 首次冷加载可能看到 0 条状态。已发布快照之后的 9 次采样没有再看到这种假 0。有一次搜索约 9 秒，后来一次约 118 毫秒，这不是延迟保证。
+- 本机 Windows 服务曾用该源跑过约 430 万条（服务哈希前缀 b59fb0d3）。两段 MFT 见证通过，healthy 为真且没有错误。基线 SDK 查询的 5 条路径还在，vsix 基线的 2 条路径还在。
+- uTools 插件界面没有看到。只确认了与 SDK 相同的默认 `FindWindowA(NULL)` 窗口发现，以及 loaded=1 时查询可用。
+- 没有 macOS 界面验收，也没有整卷验收。
+
 ## 2.5.3 (candidate, publication gates still closed)
 
 - Integrate the tested native Usage refinements: stable depth preference, click-selected absolute-path Inspector and bounded children, compact details, indexed sibling menus with fixed heading, toolbar icons, consistent classification, responsive resize/hit geometry and interruptible spatial navigation.
