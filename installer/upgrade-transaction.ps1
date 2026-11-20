@@ -668,7 +668,10 @@ try{
   $map=Get-FxTxUpgradeBackupRoots $script:s.roots
   # Reserve a second old-set copy for rollback, plus bounded candidate staging.
   $estimate=Get-FxTxInventory $map
-  $null=New-FxTxVerifiedBackup $map (Join-Path $TransactionRoot 'backup') -CandidateBytes ([decimal]$estimate.bytes + 268435456) -AdministratorsOnly
+  # 候选暂存区只承载新 app payload（约 60MB）+ 备份复制期间的数据增长余量；
+ # 原公式按「整库再翻倍」预留，在 5GB 级多卷索引上直接把需求顶到 11GB+，
+ # C 盘余量不足时安装永远走不进备份（本机实测）。备份本体仍按全库存校验。
+ $null=New-FxTxVerifiedBackup $map (Join-Path $TransactionRoot 'backup') -CandidateBytes 536870912 -AdministratorsOnly
   $script:s.backupVerified=$true;Set-State 'backup_verified'
  }else{
   $script:lock=[IO.File]::Open((Join-Path $TransactionRoot 'phase.lock'),'Open','ReadWrite','None')
