@@ -273,35 +273,40 @@ mod tests {
     }
 
     #[test]
-    fn live_in_use_extension_is_not_absence_and_keeps_the_full_base_reference() {
-        // Installed C: record 0x9000000085571: in use, flags 1, record 0x85571,
-        // base low 48 bits 0x85567. The probe masked off the high 16 bits, so
-        // this test supplies an explicit sequence and requires it to survive.
+    fn live_extension_seq5_file_parent_retains() {
+        // Second elevated probe at ce831ac. rawBase is the eight bytes
+        // 67-55-08-00-00-00-05-00. The base record is sequence 5, flags 1.
         const REQUESTED: u64 = 0x0009_0000_0008_5571;
-        const BASE_RAW: u64 = (4 << 48) | 0x85567;
-        let ext = header(0x85571, 9, 1, BASE_RAW);
-        let base = header(0x85567, 4, 3, 0);
+        let base_raw = u64::from_le_bytes([0x67, 0x55, 0x08, 0x00, 0x00, 0x00, 0x05, 0x00]);
+        assert_eq!(base_raw, 0x0005_0000_0008_5567);
+        let ext = header(0x85571, 9, 1, base_raw);
+        let base = header(0x85567, 5, 1, 0);
         let found = corroborated_extension(REQUESTED, ext, ext, base, ext).unwrap().unwrap();
-        assert_eq!(found.base, BASE_RAW);
-        assert!(found.base_is_dir);
-        assert_eq!(extension_action(IdRole::Parent, Some(found), false), ExtensionAction::Retarget(BASE_RAW));
-        assert_eq!(extension_action(IdRole::Delete, Some(found), false), ExtensionAction::Drop);
+        assert_eq!(found.base, base_raw);
+        assert!(!found.base_is_dir);
         assert_eq!(
-            extension_action(IdRole::File, Some(found), true),
-            ExtensionAction::Retarget(BASE_RAW)
+            extension_action(IdRole::Parent, Some(found), false),
+            ExtensionAction::Retain("in-use extension parent is not a directory")
         );
+        assert_eq!(extension_action(IdRole::Delete, Some(found), false), ExtensionAction::Drop);
         assert_eq!(
             extension_action(IdRole::File, Some(found), false),
             ExtensionAction::Retain("in-use extension file name is not a base hardlink")
         );
-        let file_base = header(0x85567, 4, 1, 0);
-        let file = corroborated_extension(REQUESTED, ext, ext, file_base, ext).unwrap().unwrap();
-        assert!(!file.base_is_dir);
         assert_eq!(
-            extension_action(IdRole::Parent, Some(file), false),
-            ExtensionAction::Retain("in-use extension parent is not a directory")
+            extension_action(IdRole::File, Some(found), true),
+            ExtensionAction::Retarget(base_raw)
         );
-        assert_eq!(extension_action(IdRole::Metadata, Some(file), false), ExtensionAction::Retarget(BASE_RAW));
+        assert_eq!(extension_action(IdRole::Metadata, Some(found), false), ExtensionAction::Retarget(base_raw));
+        // A directory base is a different record, not this live file.
+        let dir_raw = (5u64 << 48) | 0x10;
+        let dir_ext = header(0x20, 1, 1, dir_raw);
+        let dir_base = header(0x10, 5, 3, 0);
+        let dir = corroborated_extension((1u64 << 48) | 0x20, dir_ext, dir_ext, dir_base, dir_ext)
+            .unwrap()
+            .unwrap();
+        assert!(dir.base_is_dir);
+        assert_eq!(extension_action(IdRole::Parent, Some(dir), false), ExtensionAction::Retarget(dir_raw));
         // Same low 48 bits with a different sequence is not the same reference.
         let drifted = header(0x85571, 9, 1, 0x85567);
         assert!(corroborated_extension(REQUESTED, ext, drifted, base, ext).is_err());
@@ -327,15 +332,15 @@ mod tests {
         bytes[12..16].copy_from_slice(b"FILE");
         bytes[12 + 16..12 + 18].copy_from_slice(&9u16.to_le_bytes());
         bytes[12 + 22..12 + 24].copy_from_slice(&1u16.to_le_bytes());
-        bytes[12 + 0x20..12 + 0x28].copy_from_slice(&BASE_RAW.to_le_bytes());
+        bytes[12 + 0x20..12 + 0x28].copy_from_slice(&base_raw.to_le_bytes());
         bytes[12 + 44..12 + 48].copy_from_slice(&0x85571u32.to_le_bytes());
         let parsed = parse_record_header(1024, &bytes).unwrap();
         assert_eq!(parsed.sequence, 9);
         assert_eq!(parsed.flags, 1);
         assert_eq!(parsed.ordinal, 0x85571);
-        assert_eq!(parsed.base.raw, BASE_RAW);
+        assert_eq!(parsed.base.raw, base_raw);
         assert_eq!(parsed.base.ordinal, 0x85567);
-        assert_eq!(parsed.base.sequence, 4);
+        assert_eq!(parsed.base.sequence, 5);
     }
 
     #[test]
