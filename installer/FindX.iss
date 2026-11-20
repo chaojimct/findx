@@ -99,6 +99,7 @@ Name: "postlaunch";   Description: "安装完成后启动 FindX";               
 [Files]
 Source: "{#PublishDir}\FindX.installed"; DestDir: "{app}"; Flags: ignoreversion; Components: main
 Source: "{#PublishDir}\stage-manifest.json"; DestDir: "{app}"; DestName: "payload-manifest.json"; Flags: ignoreversion; Components: main
+Source: "stop-mode.ps1"; Flags: dontcopy
 Source: "transaction-files.psm1"; Flags: dontcopy
 Source: "transaction-platform.psm1"; Flags: dontcopy
 Source: "transaction-receipt.psm1"; Flags: dontcopy
@@ -319,6 +320,7 @@ begin
 #else
   TxRoot := ExpandConstant('{commonappdata}\FindX-upgrades\') + GetDateTimeString('yyyymmddhhnnsszzz', #0, #0) ;
 #endif
+  ExtractTemporaryFile('stop-mode.ps1');
   ExtractTemporaryFile('transaction-files.psm1');
   ExtractTemporaryFile('transaction-platform.psm1');
   ExtractTemporaryFile('transaction-receipt.psm1');

@@ -1,4 +1,4 @@
-# Shared by the OFFICIAL transaction, native CI and no other privileged fallback.
+﻿# Shared by the OFFICIAL transaction, native CI and no other privileged fallback.
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'stop-mode.ps1')

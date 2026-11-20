@@ -11,10 +11,28 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
-Add-Type -AssemblyName System.ServiceProcess
-Import-Module (Join-Path $PSScriptRoot 'transaction-files.psm1') -Force -Global
-Import-Module (Join-Path $PSScriptRoot 'transaction-platform.psm1') -Force -Global
-Import-Module (Join-Path $PSScriptRoot 'transaction-receipt.psm1') -Force -Global
+function Write-FxTxBootstrapFailure($Record){
+ # Runs before any transaction directory exists. Keep the original exception;
+ # a later generic dialog is how 22:53 lost this parse error.
+ $message=[string]$Record.Exception.Message
+ if(-not $message){$message=[string]$Record}
+ $detail=$Record|Out-String
+ $utf8=[Text.UTF8Encoding]::new($false)
+ try{
+  if($TransactionRoot -and -not [IO.Directory]::Exists($TransactionRoot)){[void][IO.Directory]::CreateDirectory($TransactionRoot)}
+  if($TransactionRoot -and [IO.Directory]::Exists($TransactionRoot)){
+   [IO.File]::WriteAllText((Join-Path $TransactionRoot 'failure.txt'),$message,$utf8)
+   [IO.File]::WriteAllText((Join-Path $TransactionRoot 'failure.detail.txt'),$detail,$utf8)
+   [IO.File]::WriteAllText((Join-Path $TransactionRoot 'reason.code'),'bootstrap',$utf8)
+  }
+ }catch{}
+}
+try{
+ Add-Type -AssemblyName System.ServiceProcess
+ Import-Module (Join-Path $PSScriptRoot 'transaction-files.psm1') -Force -Global
+ Import-Module (Join-Path $PSScriptRoot 'transaction-platform.psm1') -Force -Global
+ Import-Module (Join-Path $PSScriptRoot 'transaction-receipt.psm1') -Force -Global
+}catch{ Write-FxTxBootstrapFailure $_; exit 1 }
 $script:s=$null; $script:lock=$null; $script:reasonCode=''; $script:quitReporter=[bool]$QuitReporter
 function Save-State {
  if($script:quitReporter){return}
