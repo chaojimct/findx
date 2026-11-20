@@ -15,6 +15,7 @@ public static class FxWitness {
     public const uint BACKUP = 0x02000000;
     public const uint REPARSE = 0x00200000;
     public const uint READ_ATTR = 0x80;
+    public const uint GENERIC_READ = 0x80000000;
     public const uint FSCTL_RECORD = 0x00090068;
     [StructLayout(LayoutKind.Sequential)]
     public struct Desc {
@@ -46,6 +47,8 @@ public static class FxWitness {
     public static extern bool DeviceIoControl(IntPtr h, uint code, byte[] input, uint inLen, byte[] output, uint outLen, out uint returned, IntPtr ov);
     [DllImport("kernel32")]
     public static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32")]
+    public static extern void SetLastError(uint error);
     [DllImport("ntdll")]
     public static extern int RtlGetLastNtStatus();
     public static bool Invalid(IntPtr h) { return h == IntPtr.Zero || h == new IntPtr(-1); }
@@ -61,12 +64,16 @@ function Try-OpenById([IntPtr]$Hint, [uint64]$Id) {
     $desc.Size = 24
     $desc.Type = 0
     $desc.FileId = [int64]$Id
+    [FxWitness]::SetLastError(0)
     $opened = [FxWitness]::OpenFileById($Hint, [ref]$desc, [FxWitness]::READ_ATTR, [FxWitness]::SHARE, [IntPtr]::Zero, ([FxWitness]::BACKUP -bor [FxWitness]::REPARSE))
+    $ok = -not [FxWitness]::Invalid($opened)
+    if ($ok) {
+        [void][FxWitness]::CloseHandle($opened)
+        return [pscustomobject]@{ ok = $true; win32 = 0; ntstatus = "0x00000000" }
+    }
     $win32 = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
     $nt = [FxWitness]::RtlGetLastNtStatus()
-    $ok = -not [FxWitness]::Invalid($opened)
-    if ($ok) { [void][FxWitness]::CloseHandle($opened); $win32 = 0 }
-    [pscustomobject]@{ ok = $ok; win32 = $win32; ntstatus = ("0x{0:x8}" -f ($nt -band 0xffffffff)) }
+    [pscustomobject]@{ ok = $false; win32 = $win32; ntstatus = ("0x{0:x8}" -f ($nt -band 0xffffffff)) }
 }
 $letter = $Volume.TrimEnd('\').TrimEnd(':').ToUpperInvariant()
 $knownPath = Join-Path $env:SystemRoot "System32\ntdll.dll"
@@ -79,7 +86,7 @@ $knownFrn = ([uint64]$info.IndexHigh -shl 32) -bor [uint64]$info.IndexLow
 $device = "\\.\$letter`:"
 $root = "$letter`:\"
 $hints = @(
-    @{ name = "dasd-generic-read"; path = $device; access = 0x80000000 },
+    @{ name = "dasd-generic-read"; path = $device; access = [FxWitness]::GENERIC_READ },
     @{ name = "dasd-access-0"; path = $device; access = 0 },
     @{ name = "dasd-read-attributes"; path = $device; access = [FxWitness]::READ_ATTR },
     @{ name = "root-read-attributes"; path = $root; access = [FxWitness]::READ_ATTR }
@@ -99,9 +106,13 @@ foreach ($hint in $hints) {
     $rows += [pscustomobject]@{ hint = $hint.name; openedHint = $true; hintWin32 = 0; known = $knownTry; target = $targetTry }
 }
 $record = $null
-$data = Open-ReadOnly $device 0x80000000
+$data = Open-ReadOnly $device ([FxWitness]::GENERIC_READ)
+$baseFollow = $null
 if ($null -ne $data -and $Frn -ne 0) {
-    $ordinal = $Frn -band 0xffffffffffff
+    $ordinalBytes = [BitConverter]::GetBytes([uint64]$Frn)
+    $ordinalBytes[6] = 0
+    $ordinalBytes[7] = 0
+    $ordinal = [BitConverter]::ToUInt64($ordinalBytes, 0)
     $input = [BitConverter]::GetBytes([int64]$ordinal)
     $output = New-Object byte[] 4108
     $got = 0
@@ -110,9 +121,49 @@ if ($null -ne $data -and $Frn -ne 0) {
         $sig = [Text.Encoding]::ASCII.GetString($output, 12, 4)
         $seq = [BitConverter]::ToUInt16($output, 12 + 16)
         $flags = [BitConverter]::ToUInt16($output, 12 + 22)
-        $base = [BitConverter]::ToUInt64($output, 12 + 32) -band 0xffffffffffff
+        $rawBase = New-Object byte[] 8
+        [Array]::Copy($output, 12 + 32, $rawBase, 0, 8)
+        $high16 = [BitConverter]::ToUInt16($rawBase, 6)
+        $lowBytes = New-Object byte[] 8
+        [Array]::Copy($rawBase, 0, $lowBytes, 0, 6)
+        $low48 = [BitConverter]::ToUInt64($lowBytes, 0)
         $slot = [BitConverter]::ToUInt32($output, 12 + 44)
-        $record = [pscustomobject]@{ signature = $sig; sequence = $seq; flags = $flags; base = ("0x{0:x}" -f $base); recordNumber = $slot; bytes = $got }
+        $record = [pscustomobject]@{
+            signature = $sig
+            sequence = $seq
+            flags = $flags
+            rawBase = ([BitConverter]::ToString($rawBase))
+            referenceLow48 = ("0x{0:x}" -f $low48)
+            referenceHigh16 = $high16
+            recordNumber = $slot
+            bytes = $got
+        }
+        if ($high16 -ne 0 -and $low48 -ne 0 -and $low48 -ne [uint64]$slot) {
+            $baseInput = [BitConverter]::GetBytes([int64]$low48)
+            $baseOutput = New-Object byte[] 4108
+            $baseGot = 0
+            $baseOk = [FxWitness]::DeviceIoControl($data, [FxWitness]::FSCTL_RECORD, $baseInput, 8, $baseOutput, $baseOutput.Length, [ref]$baseGot, [IntPtr]::Zero)
+            $fullBytes = [BitConverter]::GetBytes([uint64]$low48)
+            $hiBytes = [BitConverter]::GetBytes([uint16]$high16)
+            $fullBytes[6] = $hiBytes[0]
+            $fullBytes[7] = $hiBytes[1]
+            $baseOpen = Try-OpenById $data ([BitConverter]::ToUInt64($fullBytes, 0))
+            if ($baseOk -and $baseGot -ge 60) {
+                $baseRaw = New-Object byte[] 8
+                [Array]::Copy($baseOutput, 12 + 32, $baseRaw, 0, 8)
+                $baseFollow = [pscustomobject]@{
+                    readOnly = $true
+                    signature = [Text.Encoding]::ASCII.GetString($baseOutput, 12, 4)
+                    sequence = [BitConverter]::ToUInt16($baseOutput, 12 + 16)
+                    flags = [BitConverter]::ToUInt16($baseOutput, 12 + 22)
+                    rawBase = ([BitConverter]::ToString($baseRaw))
+                    recordNumber = [BitConverter]::ToUInt32($baseOutput, 12 + 44)
+                    open = $baseOpen
+                }
+            } else {
+                $baseFollow = [pscustomobject]@{ readOnly = $true; fsctlWin32 = [Runtime.InteropServices.Marshal]::GetLastWin32Error(); open = $baseOpen }
+            }
+        }
     } else {
         $record = [pscustomobject]@{ fsctlWin32 = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
     }
@@ -127,5 +178,6 @@ $result = [pscustomobject]@{
     requestedFrn = if ($Frn -eq 0) { $null } else { ("0x{0:x}" -f $Frn) }
     matrix = $rows
     record = $record
+    baseFollow = $baseFollow
 }
 $result | ConvertTo-Json -Depth 6
