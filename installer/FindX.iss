@@ -65,7 +65,11 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 WizardStyle=modern
 SetupLogging=yes
-CloseApplications=no
+; CloseApplications：安装复制期若 GUI 被外部重新拉起（中断尝试的 restart 标志、
+; 用户手动打开——本机实测 02:17），Inno 的占用重试对话框在 /VERYSILENT 下默认
+; Abort，一次成功的 Prepare 被流实例杀掉。开启后 RestartManager 在复制前静默关闭。
+CloseApplications=yes
+CloseApplicationsFilter=FindX.exe
 RestartApplications=no
 UninstallDisplayName={#MyAppName}
 ; 本脚本相对路径以 installer/ 为基准

@@ -577,7 +577,13 @@ function Invoke-Rollback {
     [IO.File]::WriteAllText((Join-Path $TransactionRoot 'rollback-external-service-stop.txt'),('state='+$original.State),[Text.UTF8Encoding]::new($false))
    }
   }
-  if(@(Get-InstalledGui).Count){throw 'Candidate GUI still active; retained backup, refusing unsafe restore'}
+  if(@(Get-InstalledGui).Count){
+   # 候选 GUI 在回滚窗口被外部重新拉起（中断尝试的 DeinitializeSetup 会按 restart
+   # 标志重启原 GUI；用户也可能手动打开——本机实测让回滚永远无法收尾）。先试一次
+   # 优雅退出，仍活着才拒绝。
+   try{ $null=Invoke-GuiQuitAttempts }catch{}
+   if(@(Get-InstalledGui).Count){throw 'Candidate GUI still active; retained backup, refusing unsafe restore'}
+  }
   if($script:s.createdService){
    $v=Get-ExactService
    if($v){& "$env:SystemRoot\System32\sc.exe" delete $script:s.serviceName | Out-Null;if($LASTEXITCODE){throw 'Cannot remove this transaction service'}}
