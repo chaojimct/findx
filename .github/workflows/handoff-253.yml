@@ -1,0 +1,36 @@
+name: Isolated 2.5.3 handoff verification
+on:
+  push:
+    branches: [cursor/service-ux-uac-94f1]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  handoff:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - shell: powershell
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - name: Windows PowerShell 5.1 BOM parse and isolated unit
+        shell: powershell
+        run: ./scripts/test-installer-handoff-encoding.ps1
+      - name: Source contract
+        shell: powershell
+        run: python scripts/test_installer_handoff.py
+      - name: Published 2.5.3 process, locks, and fixture handoff
+        shell: powershell
+        run: ./scripts/test-installer-handoff-ci.ps1
+      - name: Evidence
+        if: always()
+        shell: powershell
+        run: |
+          $path = Join-Path $env:RUNNER_TEMP 'handoff-evidence\result.json'
+          if (Test-Path -LiteralPath $path) { Get-Content -LiteralPath $path -Raw | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: handoff-253-evidence
+          path: ${{ runner.temp }}/handoff-evidence/**
+          retention-days: 14

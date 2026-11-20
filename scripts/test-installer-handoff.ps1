@@ -1,5 +1,6 @@
-# Isolated handoff unit. This is NOT production Windows acceptance of shipped 2.5.3.
+﻿# Isolated handoff unit. This is NOT production Windows acceptance of shipped 2.5.3.
 # It does not touch ProgramData, services, setup, or a running FindX.
+# Keep this file UTF-8 with BOM. Windows PowerShell 5.1 on ACP936 cannot parse it otherwise.
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $path=Join-Path $PSScriptRoot '..\installer\upgrade-transaction.ps1'

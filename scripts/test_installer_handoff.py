@@ -60,6 +60,19 @@ class InstallerHandoffContract(unittest.TestCase):
         self.assertIn("不要删除锁文件", ISS)
         self.assertIn("recover-and-continue", PS1)
 
+    def test_windows_powershell_51_scripts_keep_a_utf8_bom(self):
+        # Windows PowerShell 5.1 decodes a BOM-less UTF-8 script as the
+        # system ANSI code page. ACP936 then fails to parse the Chinese text.
+        required = (
+            "installer/upgrade-transaction.ps1",
+            "scripts/test-installer-handoff.ps1",
+            "scripts/test-installer-handoff-ci.ps1",
+        )
+        for rel in required:
+            raw = (ROOT / rel).read_bytes()
+            self.assertTrue(raw.startswith(b"\xef\xbb\xbf"), rel)
+            self.assertNotIn("\ufeff", raw.decode("utf-8-sig"))
+
 
 if __name__ == "__main__":
     unittest.main()
