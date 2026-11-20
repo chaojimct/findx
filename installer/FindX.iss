@@ -280,12 +280,37 @@ begin
   end;
 end;
 
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+function TxFailureMessage: String;
 var
-  FailureText: AnsiString;
+  Code, Text: AnsiString;
+  Kind: String;
+begin
+  Result := '升级没有开始，安装内容未改动。';
+  Kind := '';
+  if LoadStringFromFile(TxRoot + '\reason.code', Code) then Kind := Trim(String(Code));
+  if Kind = 'legacy-save-unconfirmed' then
+    Result := '请先正常退出 FindX、停止旧服务后重试。旧版无保存回执，本次未改动。'
+  else if Kind = 'gui-quit-unavailable' then
+    Result := '未能让已安装的 FindX 正常退出。请从托盘选择「退出 FindX（不停止索引服务）」后重新安装。本次未改动。'
+  else if Kind = 'gui-settings-open' then
+    Result := '请先关闭「FindX 设置」窗口后再安装。本次未改动。'
+  else if Kind = 'upgrade-lock-held' then
+    Result := '上一次升级仍在收尾，安装锁被占用。请稍后再试，不要删除锁文件。本次未改动。'
+  else if Kind = 'upgrade-owner-live' then
+    Result := '已有安装程序正在升级 FindX，请等待它结束后再试。本次未改动。'
+  else if Kind = 'upgrade-foreign' then
+    Result := '中断的升级属于其他用户或安装目录，已保留现场。本次未改动。'
+  else if Kind = 'upgrade-recover-failed' then
+    Result := '中断的升级没能安全回滚，已保留现场。本次未改动。'
+  else if LoadStringFromFile(TxRoot + '\failure.txt', Text) then
+    Result := Copy(UTF8Decode(Text), 1, 240);
+  Result := Result + #13#10 + '日志: ' + TxRoot;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
-  if TxStarted then begin Result := 'Upgrade transaction already attempted; see retained evidence.'; Exit; end;
+  if TxStarted then begin Result := '这次安装已经尝试过升级。现场已保留，请查看日志后重试。'; Exit; end;
 #ifdef TxTestBuild
   if GetEnv('GITHUB_ACTIONS') <> 'true' then begin Result := 'Test build runs only on the isolated CI runner.'; Exit; end;
   TxRoot := ExpandConstant('{param:TXROOT|}');
@@ -299,16 +324,9 @@ begin
   TxStarted := True;
   TxPrepared := TxCall('Prepare');
   if not TxPrepared then begin
-    Result := 'Safe upgrade preparation failed. Nothing was force-stopped. Evidence: ' + TxRoot;
-    if FileExists(TxRoot + '\reason.code') then begin
-      Result := '请先正常退出 FindX、停止旧服务后重试。旧版无保存回执，本次未改动。日志: ' + TxRoot;
-    end;
+    Result := TxFailureMessage;
 #ifndef TxTestBuild
-    { MsgBox, unlike SuppressibleMsgBox, remains visible with /SUPPRESSMSGBOXES.
-      Every preparation refusal must be visible, not only legacy-service ACK refusal. }
-    FailureText := '';
-    if LoadStringFromFile(TxRoot + '\failure.txt', FailureText) then
-      Result := Result + #13#10 + Copy(UTF8Decode(FailureText), 1, 4096);
+    { MsgBox stays visible under /SUPPRESSMSGBOXES. Show one short sentence, never a stack. }
     if WizardSilent then MsgBox(Result, mbError, MB_OK);
 #endif
   end;
@@ -322,10 +340,10 @@ begin
 #ifdef TxTestBuild
     if ExpandConstant('{param:TXFAULT|none}') = 'interrupt-after-copy' then TxTestExitProcess(73);
 #endif
-    if not TxCall('Verify') then RaiseException('Upgrade health failed; transaction rollback required. Evidence: ' + TxRoot);
+    if not TxCall('Verify') then RaiseException('升级校验未通过，已要求回滚。日志: ' + TxRoot);
     { PATH remains selected behavior, but runs before commit; registration/Run rollback
       values, types and security are captured before replacement. }
-    if not TxCall('Commit') then RaiseException('Upgrade transaction commit failed. Evidence: ' + TxRoot);
+    if not TxCall('Commit') then RaiseException('升级提交失败。日志: ' + TxRoot);
     TxCommitted := True;
   end;
 end;

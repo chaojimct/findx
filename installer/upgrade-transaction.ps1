@@ -1,13 +1,13 @@
 ﻿# Called by the official Inno script. No force-stop or process-name termination.
 [CmdletBinding()]
 param(
- [Parameter(Mandatory=$true)][ValidateSet('Prepare','Verify','Commit','Rollback')][string]$Phase,
+ [Parameter(Mandatory=$true)][ValidateSet('Prepare','Verify','Commit','Rollback','RequestQuit')][string]$Phase,
  [Parameter(Mandatory=$true)][string]$TransactionRoot,
  [string]$InstallRoot,[string]$DataRoot,[string]$NativeConfigRoot,[string]$LegacyConfigRoot,
  [string]$ServiceName='FindX2Search',[string]$PipeName='findx2',[string]$ExpectedVersion,
  [int]$InstallService=0,[int]$TimeoutSeconds=12,[int]$AddPath=0,[string]$UninstallKey,[string]$GroupRoot,[string]$DesktopRoot,[int]$CreateGroup=0,
  [string]$TestVolumeImage='',
- [switch]$TestBuild,[ValidateSet('none','backup','health','stop-timeout','interrupt-after-copy','post-platform')][string]$Fault='none'
+ [switch]$TestBuild,[switch]$QuitReporter,[string]$QuitReport,[ValidateSet('none','backup','health','stop-timeout','interrupt-after-copy','post-platform')][string]$Fault='none'
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
@@ -15,8 +15,9 @@ Add-Type -AssemblyName System.ServiceProcess
 Import-Module (Join-Path $PSScriptRoot 'transaction-files.psm1') -Force -Global
 Import-Module (Join-Path $PSScriptRoot 'transaction-platform.psm1') -Force -Global
 Import-Module (Join-Path $PSScriptRoot 'transaction-receipt.psm1') -Force -Global
-$script:s=$null; $script:lock=$null
+$script:s=$null; $script:lock=$null; $script:reasonCode=''; $script:quitReporter=[bool]$QuitReporter
 function Save-State {
+ if($script:quitReporter){return}
  $temp=Join-Path $TransactionRoot ('journal.'+[guid]::NewGuid().ToString('N')+'.tmp')
  $bytes=[Text.UTF8Encoding]::new($false).GetBytes(($script:s | ConvertTo-Json -Depth 60))
  $f=[IO.File]::Open($temp,'CreateNew','Write','None'); try{$f.Write($bytes,0,$bytes.Length);$f.Flush($true)}finally{$f.Dispose()}
@@ -33,39 +34,124 @@ function Test-InstallerOwnerAlive($Owner) {
  $p=Get-Process -Id $Owner.pid -ErrorAction SilentlyContinue
  return $p -and $p.StartTime.ToUniversalTime().Ticks -eq [long]$Owner.startTicks
 }
+function Open-ExclusiveFile([string]$Path){
+ # PowerShell wraps a sharing violation as MethodInvocationException. Only an
+ # IOException means the file is busy. Never delete it and never kill the owner.
+ try{return [IO.File]::Open($Path,'OpenOrCreate','ReadWrite','None')}catch{
+  $ex=$_.Exception
+  while($ex){ if($ex -is [IO.IOException]){ return $null }; $ex=$ex.InnerException }
+  throw
+ }
+}
+function Open-PhaseLock([string]$Root){ return Open-ExclusiveFile (Join-Path $Root 'phase.lock') }
+function Resolve-UpgradeLease {
+ param([string]$State,[bool]$OwnerAlive,[bool]$SameIdentity,[bool]$LockBusy)
+ if($State -in @('committed','rolled_back')){return 'replace'}
+ if(-not $SameIdentity){return 'refuse-foreign'}
+ if($OwnerAlive){return 'refuse-live-owner'}
+ if($LockBusy){return 'refuse-lock-held'}
+ return 'recover-and-continue'
+}
+function Get-LeaseRefusalMessage([string]$Action){
+ switch($Action){
+  'refuse-foreign' {return '中断的升级属于其他用户或安装目录，已保留现场。本次未改动。'}
+  'refuse-live-owner' {return '已有安装程序正在升级 FindX，请等待它结束后再试。本次未改动。'}
+  'refuse-lock-held' {return '上一次升级仍在收尾，安装锁被占用。请稍后再试，不要删除锁文件。本次未改动。'}
+  'recover-failed' {return '中断的升级没能安全回滚，已保留现场。本次未改动。'}
+  default {return '升级准备已停止。本次未改动。'}
+ }
+}
+function Set-LeaseReason([string]$Action){
+ switch($Action){
+  'refuse-foreign' {$script:reasonCode='upgrade-foreign'}
+  'refuse-live-owner' {$script:reasonCode='upgrade-owner-live'}
+  'refuse-lock-held' {$script:reasonCode='upgrade-lock-held'}
+  'recover-failed' {$script:reasonCode='upgrade-recover-failed'}
+  'gui-quit' {$script:reasonCode='gui-quit-unavailable'}
+  'gui-settings' {$script:reasonCode='gui-settings-open'}
+ }
+}
+function Get-ShippedQuitContract {
+ [pscustomobject]@{
+  trayCaption='退出 FindX（不停止索引服务）'
+  normalQuitMessage='FindX.Native.NormalQuit.v1'
+  trayMessage='FindX.Native.Tray.v1'
+  settingsTitle='FindX 设置'
+  mainTitle='FindX'
+  published252='392CEA03063D4B1AC57E62D5EDCBA45291FFE36E16C49BAD472298D2B51C9A02'
+ }
+}
+function Get-NormalQuitPlan([string]$ProductVersion,[string]$ImageHash){
+ $contract=Get-ShippedQuitContract
+ $steps=New-Object System.Collections.Generic.List[string]
+ if($ProductVersion -eq '2.5.2' -and $ImageHash -eq $contract.published252){$steps.Add('legacy-252-close');return @($steps)}
+ if($ProductVersion -ne '2.5.2'){$steps.Add('normal-quit-message');$steps.Add('shipped-tray-menu')}
+ if($steps.Count -eq 0){$steps.Add('refuse')}
+ return @($steps)
+}
+function Find-QuitMenuIndex([string[]]$Items){
+ $want=(Get-ShippedQuitContract).trayCaption
+ $hits=@()
+ for($i=0;$i -lt @($Items).Count;$i++){ if([string]$Items[$i] -ceq $want){ $hits+=$i } }
+ if($hits.Count -ne 1){ return -1 }
+ return [int]$hits[0]
+}
+function Get-MenuActivationKeys([int]$Index){
+ if($Index -lt 0){ throw 'no quit item' }
+ $keys=New-Object System.Collections.Generic.List[string]
+ for($i=0;$i -le $Index;$i++){ $keys.Add('DOWN') }
+ $keys.Add('RETURN')
+ return @($keys)
+}
 function Enter-InstallerLease {
  $leasePath=Join-Path $script:leaseStore 'active.json'
- $guard=[IO.File]::Open((Join-Path $script:leaseStore 'active.lock'),'OpenOrCreate','ReadWrite','None')
+ $guard=Open-ExclusiveFile (Join-Path $script:leaseStore 'active.lock')
+ if(-not $guard){ Set-LeaseReason 'refuse-lock-held'; throw (Get-LeaseRefusalMessage 'refuse-lock-held') }
  try {
   $me=Get-InstallerOwner
+  $savedNew=$script:s
   if([IO.File]::Exists($leasePath)){
    $lease=Get-Content -LiteralPath $leasePath -Raw -Encoding UTF8 | ConvertFrom-Json
-   if($lease.schema -ne 1){throw 'Unknown active transaction schema; prior evidence retained'}
+   if($lease.schema -ne 1){Set-LeaseReason 'recover-failed'; throw (Get-LeaseRefusalMessage 'recover-failed')}
    $oldRoot=Get-FxTxPath $lease.root;Assert-FxTxPrivateDirectory $oldRoot
    $journal=Join-Path $oldRoot 'journal.json'
-   if(-not [IO.File]::Exists($journal) -or (Get-Item -LiteralPath $journal).Length -gt 67108864){throw 'Active transaction has no complete bounded journal; no replacement'}
+   if(-not [IO.File]::Exists($journal) -or (Get-Item -LiteralPath $journal).Length -gt 67108864){Set-LeaseReason 'recover-failed'; throw (Get-LeaseRefusalMessage 'recover-failed')}
    $old=Get-Content -LiteralPath $journal -Raw -Encoding UTF8 | ConvertFrom-Json
-   if($old.schema -ne 2){throw 'Unsupported interrupted transaction; no replacement'}
-   if($old.state -notin @('committed','rolled_back')){
-    if(Test-InstallerOwnerAlive $lease.owner){throw 'Another installer still owns this product transaction'}
-    if($lease.owner.sid -cne $me.sid -or $old.roots.app -ine $script:s.roots.app){throw 'Interrupted transaction belongs to a different user/install root; retained, not guessed'}
-    $oldLock=[IO.File]::Open((Join-Path $oldRoot 'phase.lock'),'Open','ReadWrite','None')
+   if($old.schema -ne 2){Set-LeaseReason 'recover-failed'; throw (Get-LeaseRefusalMessage 'recover-failed')}
+   $oldLock=$null
+   $action='replace'
+   if([string]$old.state -notin @('committed','rolled_back')){
+    $same=([string]$lease.owner.sid -ceq [string]$me.sid) -and ([string]$old.roots.app -ieq [string]$script:s.roots.app)
+    $alive=Test-InstallerOwnerAlive $lease.owner
+    $oldLock=Open-PhaseLock $oldRoot
+    $action=Resolve-UpgradeLease ([string]$old.state) ([bool]$alive) ([bool]$same) ($null -eq $oldLock)
+   }
+   if($action -eq 'recover-and-continue'){
+    $recovered=$false
+    $requested=$TransactionRoot
     try{
-     # A dead setup can leave a still-live helper: its phase lock prevents racing it.
-     $requested=$TransactionRoot
      $TransactionRoot=$oldRoot;$script:s=$old;$script:s.installerOwner=$me
      Write-FxTxUpdateJson $leasePath ([ordered]@{schema=1;root=$oldRoot;owner=$me})
      Save-State;Invoke-Rollback
+     if([string]$script:s.state -ne 'rolled_back'){Set-LeaseReason 'recover-failed'; throw (Get-LeaseRefusalMessage 'recover-failed')}
      $restart=Join-Path $oldRoot 'restart-original-user-gui.flag'
-     $TransactionRoot=$requested;$script:s=$null
      if([IO.File]::Exists($restart)){[IO.File]::Copy($restart,(Join-Path $requested 'restart-original-user-gui.flag'),$false)}
-     throw 'Previous interrupted upgrade was recovered and verified. No new upgrade was installed; run Setup again.'
-    }finally{$oldLock.Dispose()}
-   }
+     $recovered=$true
+    }finally{
+     if($oldLock){$oldLock.Dispose()}
+     $TransactionRoot=$requested
+     if(-not $recovered){$script:s=$savedNew}
+    }
+    $script:s=$savedNew
+   }elseif($action -ne 'replace'){
+    if($oldLock){$oldLock.Dispose()}
+    Set-LeaseReason $action
+    throw (Get-LeaseRefusalMessage $action)
+   }elseif($oldLock){$oldLock.Dispose()}
   }
   $script:s.installerOwner=$me;Save-State
   Write-FxTxUpdateJson $leasePath ([ordered]@{schema=1;root=$TransactionRoot;owner=$me})
- }finally{$guard.Dispose()}
+ }finally{if($guard){$guard.Dispose()}}
 }
 function Assert-InstallerLease {
  $lease=Get-Content -LiteralPath (Join-Path $script:leaseStore 'active.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -157,54 +243,187 @@ function Request-Legacy252NormalClose($Target) {
   if(-not $fresh){break}
   if($fresh.CreationDate -ne $Target.CreationDate -or $fresh.SessionId -ne $Target.SessionId -or
      -not $fresh.ExecutablePath -or -not $fresh.ExecutablePath.Equals($image,[StringComparison]::OrdinalIgnoreCase)){
-   throw 'Legacy GUI instance/session/path changed; refusing normal-close request'
+   throw '已安装的 FindX 进程已变化，拒绝关闭。本次未改动。'
   }
   $process.Refresh()
   $window=$process.MainWindowHandle.ToInt64()
   if($window -ne 0 -and -not $sent.ContainsKey($window)){
    $script:s.original.guiExitRequested=$true;Save-State
-   if(-not $process.CloseMainWindow()){throw 'Legacy GUI did not accept normal window close; close its windows manually'}
+   if(-not $process.CloseMainWindow()){throw '已安装的 FindX 没有接受正常关闭。请手动关闭窗口后重试。本次未改动。'}
    $sent[$window]=$true
   }
   Start-Sleep -Milliseconds 100
  }
- if(-not $process.WaitForExit(100)){throw 'Legacy GUI normal-close timeout; no force/hide/process-name fallback'}
- if($process.ExitCode -ne 0){throw ('Legacy GUI crashed during normal close; installation unchanged, exit='+$process.ExitCode)}
+ if(-not $process.WaitForExit(100)){throw '已安装的 FindX 没有在限时内退出。本次未改动，不会强制结束。'}
+ if($process.ExitCode -ne 0){throw ('已安装的 FindX 在关闭时异常退出，安装内容未改动。代码='+$process.ExitCode)}
  return $true
 }
-function Request-NormalGuiExit {
- $targets=Get-InstalledGui
- if(-not $targets.Count){return}
- Add-Type -AssemblyName UIAutomationClient
- Add-Type -AssemblyName UIAutomationTypes
- foreach($target in $targets){
-  $condition=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty,[int]$target.ProcessId)
-  $windows=[Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Children,$condition)
-  $invoked=$false
-  foreach($window in $windows){
-   foreach($name in @('退出','Quit','Exit')){
-    $matches=$window.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,$name))
-    if($matches.Count -eq 1 -and $matches[0].Current.IsEnabled){
-     $pattern=$null
-     if($matches[0].TryGetCurrentPattern([Windows.Automation.InvokePattern]::Pattern,[ref]$pattern)){$script:s.original.guiExitRequested=$true;Save-State;$pattern.Invoke();$invoked=$true;break}
-    }
+function Enable-FxTxGuiQuit {
+ if('FxTxGuiQuit' -as [type]){return}
+ Add-Type -ReferencedAssemblies Accessibility -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using Accessibility;
+public static class FxTxGuiQuit {
+  public delegate bool CB(IntPtr h, IntPtr p);
+  [DllImport("user32.dll")] static extern bool EnumWindows(CB c, IntPtr l);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out int p);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder b, int n);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder b, int n);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern uint RegisterWindowMessage(string s);
+  [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+  [DllImport("oleacc.dll")] static extern int AccessibleObjectFromWindow(IntPtr h, uint id, ref Guid g, [MarshalAs(UnmanagedType.Interface)] out object o);
+  static IntPtr Menu(int pid){ IntPtr found=IntPtr.Zero; EnumWindows((h,l)=>{ int id; GetWindowThreadProcessId(h,out id); if(id==pid){ var b=new StringBuilder(100); GetClassName(h,b,100); if(b.ToString()=="#32768") found=h; } return true; }, IntPtr.Zero); return found; }
+  public static int CountTitle(int pid, string title){ int n=0; EnumWindows((h,l)=>{ int id; GetWindowThreadProcessId(h,out id); if(id==pid){ var b=new StringBuilder(260); GetWindowText(h,b,260); if(b.ToString()==title) n++; } return true; }, IntPtr.Zero); return n; }
+  public static IntPtr FindTitle(int pid, string title){ IntPtr found=IntPtr.Zero; int n=0; EnumWindows((h,l)=>{ int id; GetWindowThreadProcessId(h,out id); if(id==pid){ var b=new StringBuilder(260); GetWindowText(h,b,260); if(b.ToString()==title){ found=h; n++; } } return true; }, IntPtr.Zero); return n==1?found:IntPtr.Zero; }
+  public static bool PostRegistered(IntPtr owner, string name){ uint msg=RegisterWindowMessage(name); return owner!=IntPtr.Zero && msg!=0 && PostMessage(owner,msg,IntPtr.Zero,IntPtr.Zero); }
+  public static void Cancel(IntPtr owner){ if(owner!=IntPtr.Zero) PostMessage(owner,0x1F,IntPtr.Zero,IntPtr.Zero); }
+  public static int ActivateTrayQuit(int pid, IntPtr owner, string trayMessage, string caption, int waitMs){
+    if(owner==IntPtr.Zero) return 3;
+    uint msg=RegisterWindowMessage(trayMessage);
+    if(msg==0 || !PostMessage(owner,msg,new IntPtr(1),new IntPtr(0x7B))) return 3;
+    IntPtr menu=IntPtr.Zero; var start=DateTime.UtcNow;
+    while((DateTime.UtcNow-start).TotalMilliseconds<waitMs){ menu=Menu(pid); if(menu!=IntPtr.Zero) break; System.Threading.Thread.Sleep(40); }
+    if(menu==IntPtr.Zero){ PostMessage(owner,0x1F,IntPtr.Zero,IntPtr.Zero); return 1; }
+    Guid g=new Guid("618736e0-3c3d-11cf-810c-00aa00389b71"); object o;
+    if(AccessibleObjectFromWindow(menu,0xFFFFFFFC,ref g,out o)!=0 || o==null){ PostMessage(owner,0x1F,IntPtr.Zero,IntPtr.Zero); return 2; }
+    var a=(IAccessible)o;
+    string name=""; try{ name=(string)a.get_accName(2); }catch{ name=""; }
+    if(a.accChildCount!=2 || name!=caption){ PostMessage(owner,0x1F,IntPtr.Zero,IntPtr.Zero); return 2; }
+    a.accDoDefaultAction(2);
+    return 0;
+  }
+}
+public static class FxTxUserProcess {
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct STARTUPINFO { public int cb; public string r,d,t; public int x,y,xs,ys,xc,yc,f,fl; public short sw,r2; public IntPtr res,si,so,se; }
+  [StructLayout(LayoutKind.Sequential)] struct PROCESS_INFORMATION { public IntPtr hProcess,hThread; public int pid,tid; }
+  [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr OpenProcess(uint a, bool i, int pid);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr h);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr p, uint a, out IntPtr t);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool DuplicateTokenEx(IntPtr t, uint a, IntPtr s, int level, int type, out IntPtr d);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool CreateProcessWithTokenW(IntPtr token, int logon, string app, StringBuilder cmd, int flags, IntPtr env, string dir, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+  public static int Start(int explorerPid, string exe, string args){
+    IntPtr proc=OpenProcess(0x0400|0x1000,false,explorerPid);
+    if(proc==IntPtr.Zero) throw new InvalidOperationException("无法打开当前用户桌面进程。请从托盘退出 FindX 后重试。本次未改动。");
+    try{
+      IntPtr token; if(!OpenProcessToken(proc,0x0002|0x0008,out token)) throw new InvalidOperationException("无法读取当前用户令牌。请从托盘退出 FindX 后重试。本次未改动。");
+      try{
+        IntPtr primary; uint access=0x0001|0x0002|0x0008|0x0080|0x0100;
+        if(!DuplicateTokenEx(token,access,IntPtr.Zero,2,1,out primary)) throw new InvalidOperationException("无法复制当前用户令牌。请从托盘退出 FindX 后重试。本次未改动。");
+        try{
+          var si=new STARTUPINFO(); si.cb=Marshal.SizeOf(typeof(STARTUPINFO)); PROCESS_INFORMATION pi;
+          var cmd=new StringBuilder("\""+exe+"\" "+args);
+          if(!CreateProcessWithTokenW(primary,0,exe,cmd,0x08000000|0x00000400,IntPtr.Zero,null,ref si,out pi)) throw new InvalidOperationException("无法在当前用户会话中请求退出。请从托盘退出 FindX 后重试。本次未改动。");
+          int pid=pi.pid; CloseHandle(pi.hProcess); CloseHandle(pi.hThread); return pid;
+        }finally{ CloseHandle(primary); }
+      }finally{ CloseHandle(token); }
+    }finally{ CloseHandle(proc); }
+  }
+}
+'@
+}
+function Test-FxTxElevated {
+ $principal=New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+ return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+function Test-GuiStillSame($Target){
+ $fresh=Get-CimInstance Win32_Process -Filter ('ProcessId='+$Target.ProcessId) -ErrorAction SilentlyContinue
+ if(-not $fresh){return $false}
+ if($fresh.CreationDate -ne $Target.CreationDate -or $fresh.SessionId -ne $Target.SessionId){ throw 'FindX 进程在退出过程中被替换，已停止安装。本次未改动。' }
+ $image=Join-Path $script:s.roots.app 'FindX.exe'
+ if(-not $fresh.ExecutablePath -or -not $fresh.ExecutablePath.Equals($image,[StringComparison]::OrdinalIgnoreCase)){ throw 'FindX 进程路径已变化，已停止安装。本次未改动。' }
+ return $true
+}
+function Wait-GuiExit($Target,[datetime]$Until){
+ do { if(-not (Test-GuiStillSame $Target)){ return $true }; if([DateTime]::UtcNow -ge $Until){ return $false }; Start-Sleep -Milliseconds 80 } while($true)
+}
+function Invoke-GuiQuitAttempts {
+ $deadline=[DateTime]::UtcNow.AddSeconds([Math]::Max(3,[int]$script:s.timeoutSeconds))
+ $contract=Get-ShippedQuitContract
+ Enable-FxTxGuiQuit
+ foreach($target in @(Get-InstalledGui)){
+  if(-not (Test-GuiStillSame $target)){ continue }
+  if([FxTxGuiQuit]::CountTitle([int]$target.ProcessId,$contract.settingsTitle) -gt 0){ Set-LeaseReason 'gui-settings'; throw '请先关闭「FindX 设置」窗口后再安装。本次未改动。' }
+  $image=Join-Path $script:s.roots.app 'FindX.exe'
+  $version=(Get-Item -LiteralPath $image).VersionInfo.ProductVersion
+  $hash=(Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash
+  $owner=[FxTxGuiQuit]::FindTitle([int]$target.ProcessId,$contract.mainTitle)
+  $done=$false
+  foreach($step in @(Get-NormalQuitPlan $version $hash)){
+   if([DateTime]::UtcNow -ge $deadline){ break }
+   if($step -eq 'normal-quit-message'){
+    if($owner -ne [IntPtr]::Zero){ [void][FxTxGuiQuit]::PostRegistered($owner,$contract.normalQuitMessage) }
+    $slice=[DateTime]::UtcNow.AddSeconds(2); if($slice -gt $deadline){$slice=$deadline}
+    if(Wait-GuiExit $target $slice){$done=$true;break}
+   }elseif($step -eq 'shipped-tray-menu'){
+    if($owner -eq [IntPtr]::Zero){ continue }
+    $remain=[int][Math]::Max(1,($deadline-[DateTime]::UtcNow).TotalMilliseconds)
+    $code=[FxTxGuiQuit]::ActivateTrayQuit([int]$target.ProcessId,$owner,$contract.trayMessage,$contract.trayCaption,[Math]::Min(3000,$remain))
+    if($code -eq 0 -and (Wait-GuiExit $target $deadline)){$done=$true;break}
+    [FxTxGuiQuit]::Cancel($owner)
+   }elseif($step -eq 'legacy-252-close'){
+    if(Request-Legacy252NormalClose $target){$done=$true;break}
    }
-   if($invoked){break}
   }
-  if(-not $invoked){
-   # The original target may have exited while UIA was enumerating; don't use a
-   # stale PID, claim a requested quit, or close a replacement process.
-   $current=@(Get-InstalledGui | Where-Object {$_.ProcessId -eq $target.ProcessId})
-   if(-not $current.Count){continue}
-   if($current.Count -ne 1 -or $current[0].CreationDate -ne $target.CreationDate -or $current[0].SessionId -ne $target.SessionId){throw 'GUI instance changed during quit discovery; installation unchanged'}
-   $invoked=Request-Legacy252NormalClose $target
-  }
-  if(-not $invoked){throw 'Installed GUI has no supported normal Quit entry available; close all its windows normally and retry; installation unchanged'}
-  $until=[DateTime]::UtcNow.AddSeconds($script:s.timeoutSeconds)
-  while((Get-Process -Id $target.ProcessId -ErrorAction SilentlyContinue) -and [DateTime]::UtcNow -lt $until){Start-Sleep -Milliseconds 100}
-  if(Get-Process -Id $target.ProcessId -ErrorAction SilentlyContinue){throw 'GUI did not exit normally; no close/hide/force fallback'}
-  $script:s.original.guiStopped=$true;Save-State
+  if(-not $done){ if(-not $script:reasonCode){ Set-LeaseReason 'gui-quit' }; throw '已安装的 FindX 没有完成正常退出。请从托盘选择「退出 FindX（不停止索引服务）」后重试。本次未改动。' }
  }
+ return [pscustomobject]@{exited=$true;requested=$true;reason='';detail='exited'}
+}
+function New-FxTxMediumWorkspace {
+ # ProgramData\FindX-upgrades is private to the elevated installer, and a High
+ # integrity copy cannot be read by the medium user. The quit helper therefore
+ # runs from a Medium copy under the same user's LocalAppData.
+ $local=[Environment]::GetFolderPath('LocalApplicationData')
+ if(-not $local){ Set-LeaseReason 'gui-quit'; throw '找不到当前用户的本地目录，不能代为退出 FindX。请从托盘退出后重试。本次未改动。' }
+ $work=Join-Path (Join-Path $local 'Temp') ('findx-quit-' + [guid]::NewGuid().ToString('N'))
+ $null=[IO.Directory]::CreateDirectory($work)
+ foreach($name in @('upgrade-transaction.ps1','transaction-files.psm1','transaction-platform.psm1','transaction-receipt.psm1')){
+  [IO.File]::Copy((Join-Path $PSScriptRoot $name),(Join-Path $work $name),$false)
+ }
+ $icacls=Join-Path $env:SystemRoot 'System32\icacls.exe'
+ & $icacls $work '/setintegritylevel' '(OI)(CI)M' '/T' | Out-Null
+ if($LASTEXITCODE){ Set-LeaseReason 'gui-quit'; throw '无法把退出请求放到当前用户可读取的位置。请从托盘退出 FindX 后重试。本次未改动。' }
+ return $work
+}
+function Start-FxTxOriginalUser([string]$Exe,[string]$Arguments){
+ if(-not (Test-FxTxElevated)){ return Start-Process -FilePath $Exe -ArgumentList $Arguments -PassThru -WindowStyle Hidden }
+ Enable-FxTxGuiQuit
+ $session=(Get-Process -Id $PID).SessionId
+ $me=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+ $explorer=@(Get-CimInstance Win32_Process -Filter "Name='explorer.exe' AND SessionId=$session" | Where-Object { (Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid).Sid -eq $me })
+ if($explorer.Count -ne 1){ Set-LeaseReason 'gui-quit'; throw '找不到唯一的当前用户桌面进程，不能代为退出 FindX。请从托盘退出后重试。本次未改动。' }
+ $childPid=[FxTxUserProcess]::Start([int]$explorer[0].ProcessId,$Exe,$Arguments)
+ return Get-Process -Id $childPid
+}
+function Request-NormalGuiExit {
+ if(-not (Get-InstalledGui).Count){return}
+ if($InstallRoot -match '"' -or $TransactionRoot -match '"'){ Set-LeaseReason 'gui-quit'; throw '安装路径含有引号，已拒绝代为退出。请从托盘退出 FindX 后重试。本次未改动。' }
+ if(-not (Test-FxTxElevated)){ Invoke-GuiQuitAttempts | Out-Null; $script:s.original.guiExitRequested=$true; $script:s.original.guiStopped=$true; Save-State; return }
+ $work=$null
+ try{
+  $work=New-FxTxMediumWorkspace
+  $reportPath=Join-Path $work 'gui-quit.json'
+  $exe=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  $childArgs='-NoProfile -NonInteractive -WindowStyle Hidden -File "'+(Join-Path $work 'upgrade-transaction.ps1')+'" -Phase RequestQuit -QuitReporter -TransactionRoot "'+$TransactionRoot+'" -InstallRoot "'+$script:s.roots.app+'" -TimeoutSeconds '+[int]$script:s.timeoutSeconds+' -QuitReport "'+$reportPath+'"'
+  $child=Start-FxTxOriginalUser $exe $childArgs
+  $budget=[Math]::Max(5,[int]$script:s.timeoutSeconds)+8
+  if(-not $child.WaitForExit($budget*1000)){
+   try{ if(-not $child.HasExited){ $child.Kill() } }catch{}
+   Set-LeaseReason 'gui-quit'
+   throw '请求 FindX 正常退出超时。请从托盘选择「退出 FindX（不停止索引服务）」后重试。本次未改动。'
+  }
+  $report=$null
+  if([IO.File]::Exists($reportPath)){
+   try{ $report=Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8 | ConvertFrom-Json }catch{ $report=$null }
+   try{ [IO.File]::Copy($reportPath,(Join-Path $TransactionRoot 'gui-quit.json'),$true) }catch{}
+  }
+  if($report -and $report.reason){ $script:reasonCode=[string]$report.reason }
+  if($child.ExitCode -eq 0 -and $report -and $report.exited){ $script:s.original.guiExitRequested=$true; $script:s.original.guiStopped=$true; Save-State; return }
+  if(-not $script:reasonCode){ Set-LeaseReason 'gui-quit' }
+  $detail=if($report -and $report.detail){[string]$report.detail}else{'已安装的 FindX 没有完成正常退出。请从托盘选择「退出 FindX（不停止索引服务）」后重试。本次未改动。'}
+  throw $detail
+ }finally{ if($work){ Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue } }
 }
 function Verify-PayloadAndIndex {
  $path=Join-Path $script:s.roots.app 'payload-manifest.json'
@@ -303,6 +522,17 @@ function Invoke-Rollback {
  }
  if($script:s.platform){Restore-FxTxPlatform $script:s.platform (Join-Path $TransactionRoot 'failed-shortcuts')}
  Restore-OriginalRuntime; Set-State 'rolled_back'
+}
+if($Phase -eq 'RequestQuit'){
+ $root=Get-FxTxPath $InstallRoot
+ $script:s=[pscustomobject]@{timeoutSeconds=[Math]::Max(3,$TimeoutSeconds);roots=[pscustomobject]@{app=$root};original=[pscustomobject]@{guiExitRequested=$false;guiStopped=$false;guiRunning=$true}}
+ $payload=[ordered]@{exited=$false;requested=$false;reason='';detail=''}
+ $code=2
+ try { $payload=Invoke-GuiQuitAttempts; $code=0 } catch { $payload.detail=$_.Exception.Message; $payload.reason=[string]$script:reasonCode; $payload.requested=$true }
+ $dest=$QuitReport
+ if(-not $dest){ $dir=Get-FxTxPath $TransactionRoot; if([IO.Directory]::Exists($dir)){ $dest=Join-Path $dir 'gui-quit.json' } }
+ if($dest){ [IO.File]::WriteAllText($dest,($payload|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false)) }
+ exit $code
 }
 try{
  $TransactionRoot=Get-FxTxPath $TransactionRoot
@@ -442,12 +672,21 @@ try{
  }
  exit 0
 }catch{
- $message=$_.Exception.ToString()
+ $raw=$_.Exception.ToString()
+ $message=[string]$_.Exception.Message
+ if($raw -match 'Legacy running service'){ $script:reasonCode='legacy-save-unconfirmed' }
+ if($message -match 'being used by another process|正由另一进程使用|另一个进程'){ if(-not $script:reasonCode){ $script:reasonCode='upgrade-lock-held' }; $message=(Get-LeaseRefusalMessage 'refuse-lock-held') }
+ if($message -match 'MethodInvocationException|RuntimeException|^\s*at ' -or $message.Length -gt 240){ $message='升级准备失败。安装内容未改动。请查看日志后重试。' }
  if($script:s){
   $script:s.error=$message
-  try{Save-State;if($Phase -eq 'Prepare'){Invoke-Rollback}}catch{$message+='; recovery also refused: '+$_.Exception.Message}
+  try{Save-State;if($Phase -eq 'Prepare'){Invoke-Rollback}}catch{$message+=' 回滚也未完成，现场已保留。' }
  }
- if([IO.Directory]::Exists($TransactionRoot)){[IO.File]::WriteAllText((Join-Path $TransactionRoot 'failure.txt'),$message);if($message -match 'Legacy running service'){[IO.File]::WriteAllText((Join-Path $TransactionRoot 'reason.code'),'legacy-save-unconfirmed')}}
+ if([IO.Directory]::Exists($TransactionRoot)){
+  $utf8=[Text.UTF8Encoding]::new($false)
+  [IO.File]::WriteAllText((Join-Path $TransactionRoot 'failure.txt'),$message,$utf8)
+  [IO.File]::WriteAllText((Join-Path $TransactionRoot 'failure.detail.txt'),$raw,$utf8)
+  if($script:reasonCode){ [IO.File]::WriteAllText((Join-Path $TransactionRoot 'reason.code'),$script:reasonCode,$utf8) }
+ }
  Write-Error $message -ErrorAction Continue
  exit 1
 }finally{if($script:lock){$script:lock.Dispose()}}
