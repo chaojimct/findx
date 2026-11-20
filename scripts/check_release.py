@@ -18,12 +18,19 @@ def validate(root=ROOT, expected=None, require_ready=False):
     if not re.search(r'#define MyAppVersion "'+re.escape(version)+'"',iss): errors.append('installer version mismatch')
     native=tomllib.loads((root/'crates/findx2-gui-native/Cargo.toml').read_text(encoding='utf8'))
     if 'pinyin' not in native['features']['default']: errors.append('native default pinyin disabled')
-    plan=json.loads((root/'release'/f'{version}.json').read_text(encoding='utf8'))
-    if plan['version'] != version or plan['windows_gui'] != 'native': errors.append('release plan version/backend mismatch')
-    if require_ready:
-        blocked=[g['id'] for g in plan['gates'] if g['required'] and not g['passed']]
-        if not plan['publish_ready']: errors.append('publish_ready=false: local candidate only')
-        errors.extend('unpassed upgrade gate: '+g for g in blocked)
+    # 2.5.3 is the sealed payload: its plan and gates stay mandatory.
+    # 2.5.4 and later tags build from this source. They must not require
+    # release/<version>.json or the 2.5.3 seal lock.
+    plan_path=root/'release'/f'{version}.json'
+    if plan_path.exists():
+        plan=json.loads(plan_path.read_text(encoding='utf8'))
+        if plan['version'] != version or plan['windows_gui'] != 'native': errors.append('release plan version/backend mismatch')
+        if require_ready:
+            blocked=[g['id'] for g in plan['gates'] if g['required'] and not g['passed']]
+            if not plan['publish_ready']: errors.append('publish_ready=false: local candidate only')
+            errors.extend('unpassed upgrade gate: '+g for g in blocked)
+    elif version == '2.5.3':
+        errors.append('sealed 2.5.3 release plan is missing')
     return version,errors
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--expected-version');p.add_argument('--require-ready',action='store_true');a=p.parse_args()

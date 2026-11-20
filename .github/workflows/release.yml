@@ -345,6 +345,18 @@ jobs:
           merge-multiple: true
           path: dist
 
+      - name: Write SHA256SUMS for the fresh build
+        if: needs.meta.outputs.version != '2.5.3'
+        run: |
+          set -euo pipefail
+          cd dist
+          : > SHA256SUMS.txt
+          while IFS= read -r -d '' f; do
+            sha256sum "$f" >> SHA256SUMS.txt
+          done < <(find . -type f ! -name SHA256SUMS.txt -printf '%P\0' | sort -z)
+          test -s SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: Create GitHub Release
         if: needs.meta.outputs.version != '2.5.3'
         uses: softprops/action-gh-release@v2
