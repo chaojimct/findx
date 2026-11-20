@@ -11,6 +11,8 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
+# Must stay identical to installer/FindX.iss Source/ExtractTemporaryFile helper set.
+$script:FxTxPackagedHelpers=@('stop-mode.ps1','transaction-files.psm1','transaction-platform.psm1','transaction-receipt.psm1','upgrade-transaction.ps1')
 function Write-FxTxBootstrapFailure($Record){
  # Runs before any transaction directory exists. Keep the original exception;
  # a later generic dialog is how 22:53 lost this parse error.
@@ -24,6 +26,18 @@ function Write-FxTxBootstrapFailure($Record){
    [IO.File]::WriteAllText((Join-Path $TransactionRoot 'failure.txt'),$message,$utf8)
    [IO.File]::WriteAllText((Join-Path $TransactionRoot 'failure.detail.txt'),$detail,$utf8)
    [IO.File]::WriteAllText((Join-Path $TransactionRoot 'reason.code'),'bootstrap',$utf8)
+  }
+ }catch{}
+ try{
+  if($QuitReport){
+   $qdir=[IO.Path]::GetDirectoryName($QuitReport)
+   if($qdir -and [IO.Directory]::Exists($qdir)){
+    [IO.File]::WriteAllText((Join-Path $qdir 'failure.txt'),$message,$utf8)
+    [IO.File]::WriteAllText((Join-Path $qdir 'failure.detail.txt'),$detail,$utf8)
+    [IO.File]::WriteAllText((Join-Path $qdir 'reason.code'),'bootstrap',$utf8)
+    $payload=[ordered]@{exited=$false;requested=$false;reason='bootstrap';detail=$message}
+    [IO.File]::WriteAllText($QuitReport,($payload|ConvertTo-Json -Compress),$utf8)
+   }
   }
  }catch{}
 }
@@ -396,8 +410,11 @@ function New-FxTxMediumWorkspace {
  if(-not $local){ Set-LeaseReason 'gui-quit'; throw '找不到当前用户的本地目录，不能代为退出 FindX。请从托盘退出后重试。本次未改动。' }
  $work=Join-Path (Join-Path $local 'Temp') ('findx-quit-' + [guid]::NewGuid().ToString('N'))
  $null=[IO.Directory]::CreateDirectory($work)
- foreach($name in @('upgrade-transaction.ps1','transaction-files.psm1','transaction-platform.psm1','transaction-receipt.psm1')){
-  [IO.File]::Copy((Join-Path $PSScriptRoot $name),(Join-Path $work $name),$false)
+ foreach($name in $script:FxTxPackagedHelpers){
+  $src=Join-Path $PSScriptRoot $name
+  if(-not [IO.File]::Exists($src)){ Set-LeaseReason 'gui-quit'; throw ('退出助手缺少已打包文件: '+$name) }
+  [IO.File]::Copy($src,(Join-Path $work $name),$false)
+  if(-not [IO.File]::Exists((Join-Path $work $name))){ Set-LeaseReason 'gui-quit'; throw ('退出助手未能复制: '+$name) }
  }
  $icacls=Join-Path $env:SystemRoot 'System32\icacls.exe'
  & $icacls $work '/setintegritylevel' '(OI)(CI)M' '/T' | Out-Null
@@ -431,15 +448,24 @@ function Request-NormalGuiExit {
    Set-LeaseReason 'gui-quit'
    throw '请求 FindX 正常退出超时。请从托盘选择「退出 FindX（不停止索引服务）」后重试。本次未改动。'
   }
+  $exitCode=[int]$child.ExitCode
+  try{ [IO.File]::WriteAllText((Join-Path $TransactionRoot 'gui-quit-helper.exit'),([string]$exitCode),[Text.UTF8Encoding]::new($false)) }catch{}
+  foreach($name in @('gui-quit.json','failure.txt','failure.detail.txt','reason.code')){
+   $src=Join-Path $work $name
+   if([IO.File]::Exists($src)){ try{ [IO.File]::Copy($src,(Join-Path $TransactionRoot $name),$true) }catch{} }
+  }
   $report=$null
   if([IO.File]::Exists($reportPath)){
    try{ $report=Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8 | ConvertFrom-Json }catch{ $report=$null }
-   try{ [IO.File]::Copy($reportPath,(Join-Path $TransactionRoot 'gui-quit.json'),$true) }catch{}
   }
   if($report -and $report.reason){ $script:reasonCode=[string]$report.reason }
-  if($child.ExitCode -eq 0 -and $report -and $report.exited){ $script:s.original.guiExitRequested=$true; $script:s.original.guiStopped=$true; Save-State; return }
+  if($exitCode -eq 0 -and $report -and $report.exited){ $script:s.original.guiExitRequested=$true; $script:s.original.guiStopped=$true; Save-State; return }
   if(-not $script:reasonCode){ Set-LeaseReason 'gui-quit' }
-  $detail=if($report -and $report.detail){[string]$report.detail}else{'已安装的 FindX 没有完成正常退出。请从托盘选择「退出 FindX（不停止索引服务）」后重试。本次未改动。'}
+  $detail=$null
+  if($report -and $report.detail){ $detail=[string]$report.detail }
+  elseif([IO.File]::Exists((Join-Path $work 'failure.txt'))){ $detail=[IO.File]::ReadAllText((Join-Path $work 'failure.txt')) }
+  if(-not $detail){ $detail='已安装的 FindX 没有完成正常退出。请从托盘选择「退出 FindX（不停止索引服务）」后重试。本次未改动。' }
+  if($exitCode -ne 0){ $detail=($detail+' (quit helper exit '+[string]$exitCode+')') }
   throw $detail
  }finally{ if($work){ Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue } }
 }
