@@ -253,11 +253,15 @@ function Restore-OriginalRuntime {
  }
  $v=Get-ExactService
  if($script:s.original.serviceRunning -and $v -and $v.State -ne 'Running'){throw 'Original service is still transitioning; runtime recovery not confirmed'}
- if($script:s.original.guiRunning -and $script:s.original.guiExitRequested -and (Get-InstalledGui).Count -eq 0){[IO.File]::WriteAllText((Join-Path $TransactionRoot 'restart-original-user-gui.flag'),(Join-Path $script:s.roots.app 'FindX.exe'))}
+ if($script:s.original.guiRunning -and $script:s.original.guiExitRequested -and @(Get-InstalledGui).Count -eq 0){[IO.File]::WriteAllText((Join-Path $TransactionRoot 'restart-original-user-gui.flag'),(Join-Path $script:s.roots.app 'FindX.exe'))}
 }
 function Get-InstalledGui {
  $path=Join-Path $script:s.roots.app 'FindX.exe'
- return ,@(Get-CimInstance Win32_Process -Filter "Name='FindX.exe'" | Where-Object {$_.ExecutablePath -and $_.ExecutablePath.Equals($path,[StringComparison]::OrdinalIgnoreCase)})
+ # 不要用 ,@(...) 包装：空结果时它会变成「含一个空数组的单元素数组」，.Count 恒为 1
+ # 骗过所有空值检查，foreach 拿到空数组后对 .ProcessId 的访问在 StrictMode 下抛
+ # 「在此对象上找不到属性」（本机实测：无 GUI 运行时安装直接 Preparation 失败）。
+ # 调用方一律用 @(Get-InstalledGui) 包裹后再取 .Count / 迭代。
+ return @(Get-CimInstance Win32_Process -Filter "Name='FindX.exe'" | Where-Object {$_.ExecutablePath -and $_.ExecutablePath.Equals($path,[StringComparison]::OrdinalIgnoreCase)})
 }
 function Request-Legacy252NormalClose($Target) {
  # The shipped 2.5.2 native GUI has no tray/Quit menu. Its last normal window
@@ -432,7 +436,7 @@ function Start-FxTxOriginalUser([string]$Exe,[string]$Arguments){
  return Get-Process -Id $childPid
 }
 function Request-NormalGuiExit {
- if(-not (Get-InstalledGui).Count){return}
+ if(@(Get-InstalledGui).Count -eq 0){return}
  if($InstallRoot -match '"' -or $TransactionRoot -match '"'){ Set-LeaseReason 'gui-quit'; throw '安装路径含有引号，已拒绝代为退出。请从托盘退出 FindX 后重试。本次未改动。' }
  if(-not (Test-FxTxElevated)){ Invoke-GuiQuitAttempts | Out-Null; $script:s.original.guiExitRequested=$true; $script:s.original.guiStopped=$true; Save-State; return }
  $work=$null
@@ -573,7 +577,7 @@ function Invoke-Rollback {
     [IO.File]::WriteAllText((Join-Path $TransactionRoot 'rollback-external-service-stop.txt'),('state='+$original.State),[Text.UTF8Encoding]::new($false))
    }
   }
-  if((Get-InstalledGui).Count){throw 'Candidate GUI still active; retained backup, refusing unsafe restore'}
+  if(@(Get-InstalledGui).Count){throw 'Candidate GUI still active; retained backup, refusing unsafe restore'}
   if($script:s.createdService){
    $v=Get-ExactService
    if($v){& "$env:SystemRoot\System32\sc.exe" delete $script:s.serviceName | Out-Null;if($LASTEXITCODE){throw 'Cannot remove this transaction service'}}
@@ -637,7 +641,7 @@ try{
   Save-State;Enter-InstallerLease
   $svc=Get-ExactService
   if($svc){$script:s.original.serviceExists=$true;$script:s.original.serviceRunning=($svc.State -eq 'Running');$script:s.original.serviceCommand=$svc.PathName;$script:s.original.serviceStartMode=$svc.StartMode;if($svc.State -notin @('Running','Stopped')){throw 'Service in transition; unchanged'}}
-  $script:s.original.guiRunning=((Get-InstalledGui).Count -gt 0); Save-State
+  $script:s.original.guiRunning=((@(Get-InstalledGui).Count) -gt 0); Save-State
   if(-not $script:s.testBuild){
    $me=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;$session=(Get-Process -Id $PID).SessionId
    $owners=@(Get-CimInstance Win32_Process -Filter "Name='explorer.exe' AND SessionId=$session" | ForEach-Object {(Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid).Sid} | Sort-Object -Unique)
@@ -736,7 +740,7 @@ try{
    Set-State 'health_verified'
   }elseif($Phase -eq 'Commit'){
    if($script:s.state -ne 'health_verified'){throw 'Cannot commit without verified health'}
-   Set-State 'committed';if($script:s.original.guiRunning -and $script:s.original.guiExitRequested -and (Get-InstalledGui).Count -eq 0){[IO.File]::WriteAllText((Join-Path $TransactionRoot 'restart-original-user-gui.flag'),(Join-Path $script:s.roots.app 'FindX.exe'))}
+   Set-State 'committed';if($script:s.original.guiRunning -and $script:s.original.guiExitRequested -and @(Get-InstalledGui).Count -eq 0){[IO.File]::WriteAllText((Join-Path $TransactionRoot 'restart-original-user-gui.flag'),(Join-Path $script:s.roots.app 'FindX.exe'))}
   }else{Invoke-Rollback}
  }
  exit 0
