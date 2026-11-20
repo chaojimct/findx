@@ -659,8 +659,10 @@ fn friendly_service_error(err: String) -> String {
 #[cfg(windows)]
 fn is_elevated() -> bool {
     use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TokenElevation};
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, TOKEN_QUERY};
+    use windows::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     unsafe {
         let mut token = windows::Win32::Foundation::HANDLE::default();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
@@ -671,7 +673,7 @@ fn is_elevated() -> bool {
         let ok = GetTokenInformation(
             token,
             TokenElevation,
-            Some(&mut elevation as *mut TOKEN_ELEVATION as *mut _),
+            Some((&mut elevation as *mut TOKEN_ELEVATION).cast::<std::ffi::c_void>()),
             std::mem::size_of::<TOKEN_ELEVATION>() as u32,
             &mut returned,
         );
@@ -741,10 +743,8 @@ fn read_elevated_result(path: &Path, exit: u32) -> Result<String, String> {
 #[cfg(windows)]
 fn shell_runas(exe: &Path, params: &str) -> Result<u32, u32> {
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{
-        GetExitCodeProcess, WaitForSingleObject, WAIT_OBJECT_0,
-    };
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
     use windows::Win32::UI::Shell::{
         SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
         ShellExecuteExW,
