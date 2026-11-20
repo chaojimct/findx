@@ -542,6 +542,12 @@ fn run() -> Result<()> {
                             sync_fetch_one(&volume, file_id, file_id_128, &mut store);
                             dirty = true;
                         }
+                        findx2_windows::UsnWatchMsg::StatBatch { items } => {
+                            for (file_id, file_id_128) in items {
+                                sync_fetch_one(&volume, file_id, file_id_128, &mut store);
+                            }
+                            dirty = true;
+                        }
                         findx2_windows::UsnWatchMsg::Checkpoint {
                             journal_id,
                             next_usn,

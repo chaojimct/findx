@@ -47,6 +47,11 @@ pub enum UsnWatchMsg {
         file_id: u64,
         file_id_128: Option<[u8; 16]>,
     },
+    /// Every metadata hint from one journal read. One message, so the reader is
+    /// not woken once per record before it can fetch the next block.
+    StatBatch {
+        items: Vec<(u64, Option<[u8; 16]>)>,
+    },
     /// 每次 READ 成功后回写 `VolumeState.last_usn` / `usn_journal_id`
     Checkpoint {
         journal_id: u64,
@@ -883,8 +888,12 @@ fn publish_watch_batch(
         next_usn,
     })
     .map_err(|_| findx2_core::Error::Platform("watch receiver closed".into()))?;
-    for msg in stats {
-        tx.send(msg)
+    if !stats.is_empty() {
+        let items = stats.into_iter().filter_map(|msg| match msg {
+            UsnWatchMsg::StatRefresh { file_id, file_id_128 } => Some((file_id, file_id_128)),
+            _ => None,
+        }).collect();
+        tx.send(UsnWatchMsg::StatBatch { items })
             .map_err(|_| findx2_core::Error::Platform("watch receiver closed".into()))?;
     }
     tx.send(UsnWatchMsg::Checkpoint {
@@ -906,6 +915,10 @@ mod publish_tests {
                 file_id_128: None,
             },
             UsnWatchMsg::Event(ChangeEvent::Delete { file_id: 7 }),
+            UsnWatchMsg::StatRefresh {
+                file_id: 8,
+                file_id_128: None,
+            },
         ];
         publish_watch_batch(messages, 9, 20, &tx).unwrap();
         assert!(matches!(
@@ -918,7 +931,7 @@ mod publish_tests {
         ));
         assert!(matches!(
             rx.recv().unwrap(),
-            UsnWatchMsg::StatRefresh { file_id: 7, .. }
+            UsnWatchMsg::StatBatch { items } if items == vec![(7, None), (8, None)]
         ));
         assert!(matches!(
             rx.recv().unwrap(),

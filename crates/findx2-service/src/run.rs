@@ -65,6 +65,25 @@ fn is_volume_frozen(letter: char) -> bool {
 type StatWork=(Option<[u8;16]>,Option<crate::runtime_lifecycle::Activity>,u64);
 type StatMessage=(u64,Option<[u8;16]>,Option<crate::runtime_lifecycle::Reservation>,u64);
 
+/// Queue one metadata hint without waiting for `OpenFileById`.
+/// `false` means the bounded stat queue is full: this hint stays unknown and
+/// the journal cursor must still advance. A disconnected worker is an error.
+fn offer_stat(tx:&std::sync::mpsc::SyncSender<StatMessage>,engine:&Arc<SearchEngine>,volume:u8,file_id:u64,file_id_128:Option<[u8;16]>)->anyhow::Result<bool>{
+    if file_id_128.is_some_and(|id| id[8..].iter().any(|&b| b != 0)) {
+        anyhow::bail!("full 128-bit stat binding unresolved; refusing low64 alias");
+    }
+    engine.mark_metadata_dirty(volume, file_id);
+    let queued=crate::runtime_lifecycle::reserve(engine,"queued-stat").map_err(anyhow::Error::msg)?.map(|p|p.require_result());
+    match tx.try_send((file_id,file_id_128,queued,engine.metadata_epoch())) {
+        Ok(())=>Ok(true),
+        Err(std::sync::mpsc::TrySendError::Full((_,_,mut work,_)))=>{
+            if let Some(reservation)=work.as_mut(){reservation.success();}
+            Ok(false)
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(_))=>Err(anyhow::anyhow!("stat worker unavailable; metadata remains unknown")),
+    }
+}
+
 fn spawn_stat_worker(
     engine: Arc<SearchEngine>,
     volume_device_path: String,
@@ -889,16 +908,22 @@ fn usn_watch_loop(
                     file_id,
                     file_id_128,
                 } => {
-                    // 路由给后台 stat worker（watch 线程永不 stat）；发送失败（worker 退出）
-                    // 则丢弃——下次同文件变更会重新排队，极端下靠全量重建兜底。
                     dirty_count += flush_pending(&mut pending)?;
-                    if file_id_128.is_some_and(|id| id[8..].iter().any(|&b| b != 0)) {
-                        anyhow::bail!("full 128-bit stat binding unresolved; refusing low64 alias");
+                    let _ = offer_stat(&stat_tx, &engine, volume_letter, file_id, file_id_128)?;
+                }
+                findx2_windows::UsnWatchMsg::StatBatch { items } => {
+                    dirty_count += flush_pending(&mut pending)?;
+                    // 队列满以后仍把本批标成未知，但不打开文件、不挡住下一次日志读取。
+                    let mut room = true;
+                    for (file_id, file_id_128) in items {
+                        if room {
+                            room = offer_stat(&stat_tx, &engine, volume_letter, file_id, file_id_128)?;
+                        } else if file_id_128.is_some_and(|id| id[8..].iter().any(|&b| b != 0)) {
+                            anyhow::bail!("full 128-bit stat binding unresolved; refusing low64 alias");
+                        } else {
+                            engine.mark_metadata_dirty(volume_letter, file_id);
+                        }
                     }
-                    engine.mark_metadata_dirty(volume_letter, file_id);
-                    stat_tx.send((file_id, file_id_128, crate::runtime_lifecycle::reserve(&engine,"queued-stat").map_err(anyhow::Error::msg)?.map(|p|p.require_result()),engine.metadata_epoch())).map_err(|_| {
-                        anyhow::anyhow!("stat worker unavailable; metadata remains unknown")
-                    })?;
                 }
                 findx2_windows::UsnWatchMsg::Checkpoint {
                     journal_id,
@@ -1439,6 +1464,26 @@ mod tests {
     fn queued(e:&findx2_core::SearchEngine)->std::collections::HashMap<u64,super::StatWork>{
         let work=crate::runtime_lifecycle::reserve(e,"queued-stat").unwrap().map(|p|p.require_result().activate());
         [(10,(None,work,e.metadata_epoch()))].into_iter().collect()
+    }
+    #[test]
+    fn full_stat_queue_returns_without_waiting_or_recording_a_failure() {
+        let (d, e, o) = stat_fixture();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let first = crate::runtime_lifecycle::reserve(&e, "queued-stat").unwrap().map(|p| p.require_result());
+        tx.try_send((10u64, None, first, e.metadata_epoch())).unwrap();
+        let started = std::time::Instant::now();
+        assert!(!super::offer_stat(&tx, &e, b'F', 10, None).unwrap());
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert!(o.retained_errors().is_empty());
+        match rx.try_recv() {
+            Ok((10, None, mut work, _)) => { if let Some(r) = work.as_mut() { r.success(); } }
+            Ok((id, _, _, _)) => panic!("saturated queue returned a different file id {id}"),
+            Err(_) => panic!("saturated queue dropped the first hint"),
+        }
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        drop(o);
+        std::fs::remove_dir_all(d).unwrap();
     }
     #[test]fn stat_settlement_authoritative_delete_and_replaced_epoch_do_not_fake_failure(){
         for replace in [false,true]{let(d,e,o)=stat_fixture();let mut p=queued(&e);
