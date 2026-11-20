@@ -552,7 +552,7 @@ impl UsageRuntime {
             while child != NIL {
                 if self.dirs[child as usize].active() && {
                     let n=&self.dirs[child as usize];
-                    let bytes=if n.owner_entry!=NIL {g.name_bytes(&g.entries[n.owner_entry as usize])} else {let d=&g.dirs[child as usize];&g.names_buf[d.name_offset as usize..d.name_offset as usize+d.name_len as usize]};
+                    let bytes=if n.owner_entry!=NIL {g.name_bytes(&g.entries[n.owner_entry as usize])} else {let d=&g.dirs[child as usize];g.names_buf.get(d.name_offset as usize..d.name_offset as usize+d.name_len as usize).unwrap_or(b"")};
                     String::from_utf8_lossy(bytes).eq_ignore_ascii_case(part)
                 } {
                     found = Some(child);

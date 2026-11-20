@@ -747,6 +747,7 @@ pub fn load_index_bin_with_progress(
         cjk_names: RoaringBitmap::new(),
         excluded_dirs: Vec::new(),
         mutation_log: None,
+        legacy_global_scope: false,
     };
     // 拼音候选剪枝位图：并行扫一遍名字（1.15M 条目 ~10ms，8.5M ~100ms），之后 USN 增量维护。
     on_phase(LoadPhase::CjkBitmap);

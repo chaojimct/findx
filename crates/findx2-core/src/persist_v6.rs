@@ -396,6 +396,7 @@ fn assemble_v6_store(
         cjk_names: RoaringBitmap::new(),
         excluded_dirs,
         mutation_log: None,
+        legacy_global_scope: false,
     };
     store.rebuild_scoped_identity_maps()?;
     store.rebuild_cjk_bitmap();

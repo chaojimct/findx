@@ -508,6 +508,14 @@ pub struct IndexStore {
     /// `Some(vec)` = service 常驻期间记录每次变更，commit 时回放进分段文件后由调用方 drain。
     /// `ext_filter` / `deleted` 位图不进日志——v6 从 `entries.attrs` + 名字重建，二者是纯派生数据。
     pub mutation_log: Option<Vec<Mutation>>,
+    /// 2.4.x 及更早的**多卷**库没有自父卷根：顶层目录 `parent_idx==0` 哨兵（0 同时是
+    /// `dirs[0]` 的真实下标，无法区分），卷根是建库条目而不在 `dirs` 表；历史卷重建还会让
+    /// `first_entry_idx` 扫描段与目录表错位——scope 无法从拓扑 / 段落可靠推导。
+    /// [`IndexStore::rebuild_scoped_identity_maps`] 检测到这种库时置位本标志：身份表保持
+    /// 加载器建好的 slot-0 全局表（与既有「compatibility imports 用 slot 0」约定一致），
+    /// `entry_on_volume` / `dir_on_volume` 走 slot-0 直通并跳过依赖脏扫描段的所属卷校验，
+    /// USN 增量解析复刻 2.4.x 全局表语义。运行时临时字段，**不持久化**，每次加载重判。
+    pub legacy_global_scope: bool,
 }
 
 /// v6 增量持久化的单条变更记录。
@@ -732,7 +740,12 @@ impl IndexStore {
     pub fn name_bytes(&self, e: &FileEntry) -> &[u8] {
         let o = e.name_offset as usize;
         let n = e.n_len as usize;
-        &self.names_buf[o..o + n]
+        // v6 撕裂读防护：service 常驻写库时，另一个进程（CLI status / 安装器 Verify）可能
+        // 读到「分段文件已应用新一批 pwrite、manifest 仍是旧代」的组合——改名是 names 追加 +
+        // 原地替换条目记录，被替换条目的 name_offset 会指到按旧 manifest 截断之后的位置。
+        // 越界按损坏条目降级为空名（实测 3/8.9M 量级，下次加载/提交自愈），
+        // 不能让一次只读校验把整个进程炸掉。
+        self.names_buf.get(o..o + n).unwrap_or(&[])
     }
 
     /// case-insensitive 名字匹配的栈缓冲：
@@ -743,8 +756,9 @@ impl IndexStore {
     #[inline]
     pub fn name_lower_into<'a>(&self, e: &FileEntry, out: &'a mut [u8; 256]) -> NameLowerCow<'a> {
         let o = e.name_offset as usize;
-        let n = e.n_len as usize;
-        let src = &self.names_buf[o..o + n];
+        // 撕裂读防护同 name_bytes：以实际可取的字节数为准（损坏条目退化为空/截断名）。
+        let src = self.names_buf.get(o..o + e.n_len as usize).unwrap_or(&[]);
+        let n = src.len();
         if n <= out.len() {
             for (dst, &b) in out[..n].iter_mut().zip(src.iter()) {
                 *dst = b.to_ascii_lowercase();
@@ -1698,6 +1712,11 @@ impl IndexStore {
         if let Some(idx) = self.frn_to_entry.get_scoped(frn, slot) {
             return Some(idx);
         }
+        // 2.4.x 多卷旧库：身份全在 slot 0 全局表，跳过所属卷校验（旧库扫描段因历史卷重建
+        // 错位，belongs 校验会误拒；2.4.x 本就是无校验的全局表语义）。
+        if self.legacy_global_scope {
+            return self.frn_to_entry.get_scoped(frn, 0);
+        }
         // Compatibility imports used slot 0 for unscoped identities. Do not
         // call get(): it linearly scans the entire incremental overlay on every
         // scoped miss (including every new FRN while holding the store writer).
@@ -1708,6 +1727,11 @@ impl IndexStore {
         let slot = self.volume_slot_of(letter)?;
         if let Some(idx) = self.dir_index.get_scoped(frn, slot) {
             return Some(idx);
+        }
+        // 2.4.x 多卷旧库：同 entry_on_volume 的 slot-0 直通（volume_letter_u8_for_dir
+        // 在 legacy_global_scope 下恒 None，若不直通这里会全数误拒）。
+        if self.legacy_global_scope {
+            return self.dir_index.get_scoped(frn, 0);
         }
         // A file FRN is normally absent from the directory map; this miss is
         // hot in every watch event. Legacy fallback must also be a keyed lookup.
@@ -2109,6 +2133,10 @@ impl IndexStore {
 
     /// 从目录 idx 查找所属的卷（递归向上直到找到根目录或匹配的卷）
     fn volume_for_dir_idx(&self, dir_idx:u32)->Option<&VolumeState>{
+        // 2.4.x 多卷旧库的父链会坍缩到 dirs[0]（parent_idx==0 恰等于自身下标的巧合自父），
+        // 有真名而非合成根；在此返回 None 让调用方（volume_for_entry_by_parent 等）退回
+        // segment 兜底，保持与 2.4.x 相同的卷判定行为，避免把 D:/C: 条目全判成第一卷。
+        if self.legacy_global_scope{return None;}
         let root=self.dir_root_idx(dir_idx);
         let d=self.dirs.get(root as usize)?;
         if d.parent_idx!=root && d.name_len!=0{return None;}
@@ -2123,7 +2151,23 @@ impl IndexStore {
     pub(crate) fn rebuild_scoped_identity_maps(&mut self)->crate::Result<()> {
         if self.volumes.len()<=1{return Ok(());}
         let roots:Vec<_>=self.dirs.iter().enumerate().filter(|(i,d)|d.parent_idx as usize==*i).map(|(i,_)|i).collect();
-        if roots.len()!=self.volumes.len(){return Err(crate::Error::Persist("ambiguous multi-volume root topology".into()));}
+        if roots.len()!=self.volumes.len(){
+            // 2.4.x 及更早的多卷库没有自父卷根：顶层目录 parent_idx==0 哨兵（0 同时是 dirs[0]
+            // 的真实下标，无法与「dirs[0] 的子目录」区分），卷根是建库条目而不在 dirs 表；且
+            // 历史卷重建（remove_volume_entries + 追加合并）会让 first_entry_idx 扫描段与目录表
+            // 错位——本机实测 131 万目录的 2.4.10 库：唯一「自父根」是 dirs[0] 的下标巧合，
+            // 跨段共享目录 3.8 万、父链走不到任何根的目录 67 万，拓扑 / 段落推导均不可靠。
+            // 此时退回 2.4.x 全局表语义：加载器已按 slot 0 建好 dir_index / frn_to_entry
+            // （push_unsorted 即 slot 0，与「compatibility imports」同一约定），保持原样并置
+            // legacy_global_scope，让 entry_on_volume / dir_on_volume 直通 slot 0、跳过依赖
+            // 脏扫描段的所属卷校验。跨卷 FRN 撞号与 2.4.x 同概率（实测可用多年）；
+            // scope 本就是加载期临时数据，新引擎写出的库（merge +dir_base 产生自父根）仍走
+            // 下方严格路径，互不影响。
+            self.legacy_global_scope=true;
+            crate::progress!("多卷旧版索引：身份表按 2.4.x 全局模式挂载（slot 0，无逐卷 scope）");
+            return Ok(());
+        }
+        self.legacy_global_scope=false;
         let mut scopes=vec![u32::MAX;self.dirs.len()];
         for (slot,&root) in roots.iter().enumerate(){scopes[root]=slot as u32;}
         for start in 0..self.dirs.len(){
@@ -2698,6 +2742,7 @@ impl IndexBuilder {
             cjk_names: RoaringBitmap::new(),
             excluded_dirs: Vec::new(),
             mutation_log: None,
+            legacy_global_scope: false,
         };
         store.rebuild_cjk_bitmap();
         Ok(store)
@@ -2841,6 +2886,7 @@ pub fn merge_index_stores(stores: Vec<IndexStore>) -> crate::Result<IndexStore> 
         cjk_names: RoaringBitmap::new(),
         excluded_dirs: Vec::new(),
         mutation_log: None,
+        legacy_global_scope: false,
     };
     store.rebuild_cjk_bitmap();
     Ok(store)
