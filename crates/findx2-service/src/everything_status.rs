@@ -51,6 +51,78 @@ pub(crate) struct SdkFlags {
     pub file_info_indexed: isize,
 }
 
+/// Last index view that was actually read. A contended writer must not replace it
+/// with an empty loading snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResidentIndex {
+    pub entry_count: u64,
+    pub dir_count: u64,
+    pub last_usn: u64,
+    pub journal_id: u64,
+    pub volume_letter: Option<char>,
+    pub metadata_ready: bool,
+    pub tombstone_count: u64,
+    pub drive_mask: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LockedStatus {
+    pub loading: bool,
+    pub entry_count: u64,
+    pub dir_count: u64,
+    pub last_usn: u64,
+    pub journal_id: u64,
+    pub volume_letter: Option<char>,
+    pub metadata_ready: bool,
+    pub backfill_done: u64,
+    pub backfill_total: u64,
+    pub healthy: bool,
+    pub tombstone_count: Option<u64>,
+    pub drive_mask: u32,
+}
+
+/// No resident snapshot yet: the process is still loading, and zeros mean that.
+/// After a real snapshot exists, lock contention keeps those counts, stays
+/// searchable, and still reports the current watch health. It does not mark
+/// metadata complete.
+pub(crate) fn status_when_index_locked(
+    previous: Option<&ResidentIndex>,
+    backfill_done: u64,
+    backfill_total: u64,
+    watch_ok: bool,
+) -> LockedStatus {
+    match previous {
+        None => LockedStatus {
+            loading: true,
+            entry_count: 0,
+            dir_count: 0,
+            last_usn: 0,
+            journal_id: 0,
+            volume_letter: None,
+            metadata_ready: false,
+            backfill_done,
+            backfill_total,
+            healthy: watch_ok,
+            tombstone_count: None,
+            drive_mask: 0,
+        },
+        Some(prev) => LockedStatus {
+            loading: false,
+            entry_count: prev.entry_count,
+            dir_count: prev.dir_count,
+            last_usn: prev.last_usn,
+            journal_id: prev.journal_id,
+            volume_letter: prev.volume_letter,
+            metadata_ready: prev.metadata_ready,
+            backfill_done,
+            backfill_total,
+            healthy: watch_ok,
+            tombstone_count: Some(prev.tombstone_count),
+            drive_mask: prev.drive_mask,
+        },
+    }
+}
+
 pub(crate) fn drive_mask_from_letters(letters: impl IntoIterator<Item = u8>) -> u32 {
     let mut mask = 0u32;
     for letter in letters {
@@ -489,6 +561,40 @@ mod tests {
     }
 
     #[test]
+    fn contended_lock_keeps_the_searchable_snapshot_and_watch_health() {
+        let previous = ResidentIndex {
+            entry_count: 4_337_248,
+            dir_count: 585_701,
+            last_usn: 97_173_513_536,
+            journal_id: 134_249_285_381_003_141,
+            volume_letter: Some('C'),
+            metadata_ready: false,
+            tombstone_count: 167_713,
+            drive_mask: 1 << 2,
+        };
+        let locked = status_when_index_locked(Some(&previous), 2_390_813, 3_575_219, false);
+        assert!(!locked.loading);
+        assert_eq!(locked.entry_count, previous.entry_count);
+        assert_eq!(locked.last_usn, previous.last_usn);
+        assert_eq!(locked.journal_id, previous.journal_id);
+        assert_eq!(locked.volume_letter, Some('C'));
+        assert!(!locked.metadata_ready);
+        assert!(!locked.healthy);
+        assert_eq!(locked.backfill_done, 2_390_813);
+        let snap = snapshot_from_status(Some(StatusParts {
+            loading: locked.loading,
+            metadata_ready: locked.metadata_ready,
+            backfill_done: locked.backfill_done,
+            backfill_total: locked.backfill_total,
+            drive_mask: locked.drive_mask,
+            volume_letter: locked.volume_letter,
+        }));
+        assert_eq!(sdk_flags(snap, false), SdkFlags { loaded: 1, busy: 1, file_info_indexed: 0 });
+        let cold = status_when_index_locked(None, 0, 0, true);
+        assert!(cold.loading && cold.entry_count == 0 && cold.last_usn == 0 && cold.journal_id == 0 && cold.volume_letter.is_none());
+        assert_eq!(sdk_flags(snapshot_from_status(Some(parts(cold.loading, cold.metadata_ready, cold.backfill_done, cold.backfill_total, cold.drive_mask))), false).loaded, 0);
+    }
+
     fn empty_ready_loading_backfill_and_offline_stay_distinct() {
         let empty = sdk_flags(snapshot_from_status(Some(parts(false, true, 0, 0, 0))), false);
         assert_eq!(empty, SdkFlags { loaded: 1, busy: 0, file_info_indexed: 1 });

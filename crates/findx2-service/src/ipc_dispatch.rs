@@ -1,11 +1,16 @@
 //! JSON IPC 请求处理（命名管道与 Unix socket 共用）。
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use findx2_core::{QueryParser, SearchEngine, SearchOptions};
 use findx2_ipc::{IpcRequest, IpcResponse};
 
 pub(crate) type EngineSlot = Arc<RwLock<Option<Arc<SearchEngine>>>>;
+
+fn resident_index() -> &'static Mutex<Option<crate::everything_status::ResidentIndex>> {
+    static SLOT: OnceLock<Mutex<Option<crate::everything_status::ResidentIndex>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
 
 pub(crate) fn checkpoint_error_snapshot() -> Option<String> {
     #[cfg(windows)]
@@ -147,14 +152,28 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                     } else {
                         backfill
                     };
+                    let volume_letter = vol
+                        .filter(|v| v.volume_letter != 0)
+                        .map(|v| v.volume_letter as char);
+                    let drive_mask = crate::everything_status::drive_mask_from_letters(
+                        g.volumes.iter().map(|v| v.volume_letter),
+                    );
+                    *resident_index().lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::everything_status::ResidentIndex {
+                        entry_count: g.entry_count() as u64,
+                        dir_count: g.dirs.len() as u64,
+                        last_usn: vol.map(|v| v.last_usn).unwrap_or(0),
+                        journal_id: vol.map(|v| v.usn_journal_id).unwrap_or(0),
+                        volume_letter,
+                        metadata_ready: g.metadata_ready,
+                        tombstone_count: g.deleted.len() as u64,
+                        drive_mask,
+                    });
                     IpcResponse::StatusResult {
                         entry_count: g.entry_count() as u64,
                         dir_count: g.dirs.len() as u64,
                         last_usn: vol.map(|v| v.last_usn).unwrap_or(0),
                         journal_id: vol.map(|v| v.usn_journal_id).unwrap_or(0),
-                        volume_letter: vol
-                            .filter(|v| v.volume_letter != 0)
-                            .map(|v| v.volume_letter as char),
+                        volume_letter,
                         healthy: crate::watch_health::watch_error_summary().is_none(),
                         metadata_ready: g.metadata_ready,
                         backfill_done,
@@ -172,32 +191,37 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                             backfill_error
                         },
                         tombstone_count: Some(g.deleted.len() as u64),
-                        indexed_drive_mask: crate::everything_status::drive_mask_from_letters(
-                            g.volumes.iter().map(|v| v.volume_letter),
-                        ),
+                        indexed_drive_mask: drive_mask,
                     }
                 }
                 None => {
+                    let watch_error = crate::watch_health::watch_error_summary();
+                    let locked = crate::everything_status::status_when_index_locked(
+                        resident_index().lock().unwrap_or_else(|e| e.into_inner()).as_ref(),
+                        backfill.0,
+                        backfill.1,
+                        watch_error.is_none(),
+                    );
                     let l = crate::load_state::snapshot();
                     IpcResponse::StatusResult {
-                        entry_count: 0,
-                        dir_count: 0,
-                        last_usn: 0,
-                        journal_id: 0,
-                        volume_letter: None,
-                        healthy: crate::watch_health::watch_error_summary().is_none(),
-                        metadata_ready: false,
-                        backfill_done: backfill.0,
-                        backfill_total: backfill.1,
-                        loading: true,
-                        loading_stage: l.as_ref().map(|s| crate::load_state::progress_line_of(s)),
-                        loading_elapsed_secs: l.as_ref().map(|s| s.started.elapsed().as_secs()),
-                        loading_phase_done: l.as_ref().map(|s| s.phases_done),
-                        loading_phase_total: l.as_ref().map(|s| s.phases_total),
-                        watch_error: crate::watch_health::watch_error_summary(),
+                        entry_count: locked.entry_count,
+                        dir_count: locked.dir_count,
+                        last_usn: locked.last_usn,
+                        journal_id: locked.journal_id,
+                        volume_letter: locked.volume_letter,
+                        healthy: locked.healthy,
+                        metadata_ready: locked.metadata_ready,
+                        backfill_done: locked.backfill_done,
+                        backfill_total: locked.backfill_total,
+                        loading: locked.loading,
+                        loading_stage: if locked.loading { l.as_ref().map(|s| crate::load_state::progress_line_of(s)) } else { None },
+                        loading_elapsed_secs: if locked.loading { l.as_ref().map(|s| s.started.elapsed().as_secs()) } else { None },
+                        loading_phase_done: if locked.loading { l.as_ref().map(|s| s.phases_done) } else { None },
+                        loading_phase_total: if locked.loading { l.as_ref().map(|s| s.phases_total) } else { None },
+                        watch_error,
                         backfill_error,
-                        tombstone_count: None,
-                        indexed_drive_mask: 0,
+                        tombstone_count: locked.tombstone_count,
+                        indexed_drive_mask: locked.drive_mask,
                     }
                 }
             }
@@ -348,7 +372,7 @@ mod usage_tests {
             .build_from_raw(vec![], vec![root], true)
             .unwrap();
         let e = Arc::new(SearchEngine::new(g));
-        let slot: EngineSlot = Arc::new(RwLock::new(Some(e)));
+        let slot: EngineSlot = Arc::new(RwLock::new(Some(Arc::clone(&e))));
         crate::watch_health::set_watch_error('Z', Some("parent identity missing; batch not committed".into()));
         match process_request(&slot, IpcRequest::Status) {
             IpcResponse::StatusResult { healthy, watch_error, .. } => {
@@ -358,10 +382,20 @@ mod usage_tests {
             other => panic!("unexpected {other:?}"),
         }
         crate::watch_health::set_watch_error('Z', None);
-        match process_request(&slot, IpcRequest::Status) {
-            IpcResponse::StatusResult { healthy, watch_error, .. } => {
+        let published = match process_request(&slot, IpcRequest::Status) {
+            IpcResponse::StatusResult { healthy, watch_error, entry_count, last_usn, journal_id, volume_letter, metadata_ready, .. } => {
                 assert!(healthy, "Status.healthy must clear when watch errors are cleared");
                 assert!(watch_error.is_none());
+                (entry_count, last_usn, journal_id, volume_letter, metadata_ready)
+            }
+            other => panic!("unexpected {other:?}"),
+        };
+        let _write = e.index_store_mut();
+        match process_request(&slot, IpcRequest::Status) {
+            IpcResponse::StatusResult { healthy, loading, entry_count, last_usn, journal_id, volume_letter, metadata_ready, .. } => {
+                assert!(healthy, "a held writer is not a watch failure");
+                assert!(!loading, "a resident index stays published while its writer is busy");
+                assert_eq!((entry_count, last_usn, journal_id, volume_letter, metadata_ready), published);
             }
             other => panic!("unexpected {other:?}"),
         }
