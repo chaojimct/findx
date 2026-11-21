@@ -143,7 +143,7 @@ impl MainWindow {
             .unwrap_or(1)).max(1);
         let empty=items.entries.is_empty();
         let mut menu = menu.scrollable(true).min_w(px(372.)).max_w(px(372.)).max_h(px(312.));
-        if empty {menu=menu.item(PopupMenuItem::label("没有可显示的同级项目"));}
+        if empty {menu=menu.item(PopupMenuItem::label("没有可显示的子项"));}
         for item in items.entries {
             let selected = key(&item.path) == key(current);
             let path = item.path;
@@ -253,26 +253,28 @@ impl MainWindow {
         self.workspace.address_menu = Some(menu);
         cx.notify();
     }
-    fn open_sibling_menu(
+    /// Separator semantics follow Explorer: the chevron after crumb `dir`
+    /// lists the children of `dir` (== the siblings of the next crumb),
+    /// with the next crumb marked selected. The drive list is NOT here;
+    /// it lives on the home chevron (children of home).
+    fn open_child_menu(
         &mut self,
-        path: PathBuf,
+        dir: PathBuf,
+        selected: Option<PathBuf>,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.dismiss_address_menu(cx);
         self.dismiss_file_menu(cx);
-        let Some(parent) = path.parent().map(Path::to_path_buf) else {
-            return;
-        };
         let owner = cx.weak_entity();
         let mode = self.workspace.mode;
-        let current = path.clone();
+        let current = selected.unwrap_or_else(|| dir.clone());
         if mode == ViewMode::Usage && self.workspace.engine_usage {
-            // Usage siblings belong to path.parent(), never to the selected child.
-            // A re-rooted scene need not contain that parent. Read one indexed
-            // directory, not the filesystem and not unbounded descendants.
-            let header=format!("同级  {}",display_path(&parent));
+            // Usage children belong to `dir` itself. A re-rooted scene need
+            // not contain it; read one indexed directory, not the filesystem
+            // and not unbounded descendants.
+            let header=format!("{} 的子项",display_path(&dir));
             let menu=PopupMenu::build(window,cx,|menu,_,_|menu
                 .item(PopupMenuItem::label("正在读取索引…"))
                 .scrollable(true).min_w(px(372.)).max_w(px(372.)).max_h(px(312.)));
@@ -285,8 +287,8 @@ impl MainWindow {
             let cache=self.workspace.usage_page_cache.clone();
             let session=self.session.read(cx);let ipc=session.ipc.clone();let endpoint=session.endpoint.clone();
             cx.spawn(async move|this,cx|{
-                let result=crate::indexed_siblings::load(parent.clone(),expected,cache,cancel.clone(),|after,stamp|{
-                    let ipc=ipc.clone();let endpoint=endpoint.clone();let cancel=cancel.clone();let path=display_path(&parent);
+                let result=crate::indexed_siblings::load(dir.clone(),expected,cache,cancel.clone(),|after,stamp|{
+                    let ipc=ipc.clone();let endpoint=endpoint.clone();let cancel=cancel.clone();let path=display_path(&dir);
                     async move{match ipc.request_cancellable(endpoint,findx2_ipc::IpcRequest::UsageChildren{path,expected:stamp,after,max_bytes:48*1024},cancel).await.map_err(|_|"读取已取消".to_string())??{
                         findx2_ipc::IpcResponse::UsageChildrenResult{page}=>Ok(page),
                         findx2_ipc::IpcResponse::Error{message}=>Err(message),
@@ -311,7 +313,7 @@ impl MainWindow {
         }
         if mode == ViewMode::Usage {
             let entries = self.usage_render_scan()
-                .and_then(|scan|scan.nodes.iter().position(|n|key(&n.path)==key(&parent)).map(|i|(i,scan)))
+                .and_then(|scan|scan.nodes.iter().position(|n|key(&n.path)==key(&dir)).map(|i|(i,scan)))
                 .map(|(i, scan)| {
                     let p = &scan.nodes[i];
                     Siblings {
@@ -339,8 +341,8 @@ impl MainWindow {
                 });
             let menu = PopupMenu::build(window, cx, |menu, _, cx| {
                 let menu = menu.item(PopupMenuItem::label(format!(
-                    "同级  {}",
-                    display_path(&parent)
+                    "{} 的子项",
+                    display_path(&dir)
                 )));
                 match entries {
                     Some(items) => Self::sibling_menu_items(menu, items, None, &current, owner, mode, cx),
@@ -351,7 +353,7 @@ impl MainWindow {
             return;
         }
         let menu = PopupMenu::build(window, cx, |menu, _, _| {
-            menu.item(PopupMenuItem::label("正在读取同级项目…"))
+            menu.item(PopupMenuItem::label("正在读取子目录…"))
         });
         self.install_address_menu(menu.clone(), position, window, cx);
         let generation = self.workspace.address_menu_generation;
@@ -359,7 +361,7 @@ impl MainWindow {
         let cancel = self.workspace.address_menu_cancel.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { navigation::list_siblings(&parent, &cancel) })
+                .background_spawn(async move { navigation::list_siblings(&dir, &cancel) })
                 .await;
             this.update(cx, |this, cx| {
                 if generation != this.workspace.address_menu_generation
@@ -374,7 +376,7 @@ impl MainWindow {
                                 Self::sibling_menu_items(menu, items, None, &current, owner, mode, cx)
                             }
                             Err(_) => menu.item(PopupMenuItem::label(
-                                "无法读取同级项目；请检查权限或磁盘连接",
+                                "无法读取子目录；请检查权限或磁盘连接",
                             )),
                         });
                     })
@@ -384,11 +386,9 @@ impl MainWindow {
         })
         .detach();
     }
-    /// Drive switcher lives on the root breadcrumb chevron. The root has no
-    /// parent, so its former "siblings" menu was permanently disabled and a
-    /// multi-volume machine had no way to leave the current volume from the
-    /// Usage view. This lists every available root and switches in place,
-    /// preserving the current view mode.
+    /// Drive switcher lives on the home chevron (children of home). At home
+    /// no volume is current, so the virtual path is never injected as a
+    /// drive. The switch preserves the current view mode.
     fn open_root_menu(
         &mut self,
         position: Point<Pixels>,
@@ -888,7 +888,8 @@ impl MainWindow {
                     .enumerate()
                     .map(|(visible_index, &index)| {
                         let path = paths[index].clone();
-                        let sibling_path = path.clone();
+                        let dir_path = path.clone();
+                        let next = paths.get(index + 1).cloned();
                         let tooltip = display_path(&path);
                         let width = if index == last {
                             plan.terminal_width
@@ -949,10 +950,7 @@ impl MainWindow {
                                         }
                                     })),
                             )
-                            // In Usage mode the drive switcher lives on the home
-                            // chevron; the volume root itself has no siblings.
-                            .when(self.workspace.mode != ViewMode::Usage || index != 0, |row| {
-                                row.child(
+                            .child(
                                 Button::new(SharedString::from(format!("path-siblings-{index}")))
                                     .ghost()
                                     .w(px(18.))
@@ -960,37 +958,20 @@ impl MainWindow {
                                     .px_0()
                                     .rounded_sm()
                                     .icon(Icon::new(IconName::ChevronRight).size_3())
-                                    .disabled(index != 0 && sibling_path.parent().is_none())
-                                    .accessibility_label(if index == 0 {
-                                        "切换磁盘"
-                                    } else {
-                                        "跳转到同级项目"
-                                    })
-                                    .tooltip(if index == 0 {
-                                        "切换磁盘：C: / D: / E: …"
-                                    } else {
-                                        "跳转到同级项目"
-                                    })
+                                    .accessibility_label("展开子目录")
+                                    .tooltip(format!("{} 的子项", names[index]))
                                     .on_click(cx.listener(
                                         move |this, event: &ClickEvent, window, cx| {
-                                            if index == 0 {
-                                                this.open_root_menu(
-                                                    event.position(),
-                                                    window,
-                                                    cx,
-                                                );
-                                            } else {
-                                                this.open_sibling_menu(
-                                                    sibling_path.clone(),
-                                                    event.position(),
-                                                    window,
-                                                    cx,
-                                                );
-                                            }
+                                            this.open_child_menu(
+                                                dir_path.clone(),
+                                                next.clone(),
+                                                event.position(),
+                                                window,
+                                                cx,
+                                            )
                                         },
                                     )),
                                 )
-                            })
                     }),
             )
             .child(
@@ -1007,3 +988,13 @@ impl MainWindow {
 }
 
 #[cfg(test)]mod sibling_stability_tests{#[test]fn heading_is_outside_scroll_and_selection_never_arms_delayed_auto_scroll(){let nav=include_str!("workspace_navigation.rs");let body=nav.split("fn sibling_menu_items(").nth(1).unwrap().split("fn install_address_menu(").next().unwrap();assert!(!body.contains(".checked(selected)"));assert!(!body.contains("items.partial"));assert!(!body.contains("完整记录请进入父目录"));let ui=include_str!("main_window.rs");assert!(ui.contains("address_menu_header.clone()"));assert!(ui.contains(".h(px(340.))"));assert!(nav.contains("address_menu_header=None"));}}
+
+#[cfg(test)]mod child_menu_tests{#[test]fn chevron_lists_children_of_its_left_crumb(){
+ // Explorer rule: the separator after crumb `dir` lists children of `dir`
+ // (== siblings of the next crumb), never siblings of `dir` itself.
+ let nav=include_str!("workspace_navigation.rs");
+ assert!(nav.contains("fn open_child_menu("));assert!(!nav.contains("fn open_sibling_menu(\n"));
+ assert!(nav.contains("paths.get(index + 1).cloned()"));
+ let body=nav.split("fn open_child_menu(").nth(1).unwrap().split("fn open_root_menu(").next().unwrap();
+ assert!(body.contains("load(dir.clone()"));assert!(body.contains("list_siblings(&dir"));assert!(!body.contains("path.parent()"));
+}}
