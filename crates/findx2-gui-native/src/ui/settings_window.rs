@@ -14,8 +14,8 @@ use gpui_kit::*;
 use crate::prefs;
 use crate::session::AppSession;
 use crate::settings_logic::{
-    CLOSE_DIRTY_MESSAGE, DraftCommit, FindxGuiSettings, UiThemePref, commit_save_interval_secs,
-    commit_search_limit, form_is_dirty,
+    DraftCommit, FindxGuiSettings, UiThemePref, commit_save_interval_secs,
+    commit_search_limit,
 };
 use crate::theme::{FindxTokens, ThemeStyle};
 use crate::ui::update_card::{UpdateCardState, render_update_card};
@@ -86,13 +86,12 @@ pub struct SettingsWindow {
     embedded: bool,
     closing_app: bool,
     style: ThemeStyle,
-    original_style: ThemeStyle,
     session: Entity<AppSession>,
     tab: SettingsTab,
+    // Live truth: every control writes through to the session and disk
+    // immediately. There is no draft/original pair, no save button.
     settings: FindxGuiSettings,
-    original: FindxGuiSettings,
     theme: UiThemePref,
-    original_theme: UiThemePref,
     search_limit: Entity<InputState>,
     save_interval: Entity<InputState>,
     index_path: Entity<InputState>,
@@ -100,11 +99,8 @@ pub struct SettingsWindow {
     service_exe: Entity<InputState>,
     excluded: Entity<TextareaState>,
     hint: SharedString,
-    dirty_tick: u64,
     update: UpdateCardState,
     show_syntax: bool,
-    close_guarded: bool,
-    saving: bool,
     service_snapshot: Option<crate::service_control::Snapshot>,
     service_pending: Option<crate::service_control::Action>,
     service_busy: bool,
@@ -157,17 +153,14 @@ impl SettingsWindow {
             embedded,
             closing_app: false,
             style,
-            original_style: style,
             session,
             tab: if crate::isolation::development_var_os("FINDX_NATIVE_OPEN_ABOUT").is_some() {
                 SettingsTab::About
             } else {
                 SettingsTab::Appearance
             },
-            original: settings.clone(),
             settings,
             theme,
-            original_theme: theme,
             search_limit: search_limit.clone(),
             save_interval: save_interval.clone(),
             index_path: index_path.clone(),
@@ -175,11 +168,8 @@ impl SettingsWindow {
             service_exe: service_exe.clone(),
             excluded: excluded.clone(),
             hint: SharedString::from(""),
-            dirty_tick: 0,
             update: UpdateCardState::new(theme_auto_check_placeholder()),
             show_syntax: false,
-            close_guarded: false,
-            saving: false,
             service_snapshot: None,
             service_pending: None,
             service_busy: false,
@@ -191,14 +181,20 @@ impl SettingsWindow {
         };
         this.update.auto_check = this.settings.auto_check_update;
 
-        let mark_dirty = |this: &mut Self, cx: &mut Context<Self>| {
-            this.dirty_tick = this.dirty_tick.wrapping_add(1);
-            this.sync_text_fields(cx);
-            cx.notify();
-        };
+        // Every text control applies live: valid input persists immediately,
+        // invalid input only raises the hint and never touches saved state.
         for input in [
             this.search_limit.clone(),
             this.save_interval.clone(),
+        ] {
+            this._subscriptions
+                .push(cx.subscribe_in(&input, window, move |this, _, ev, _, cx| {
+                    if let InputEvent::Change = ev {
+                        this.commit_numeric_fields(cx);
+                    }
+                }));
+        }
+        for input in [
             this.index_path.clone(),
             this.pipe_name.clone(),
             this.service_exe.clone(),
@@ -206,7 +202,7 @@ impl SettingsWindow {
             this._subscriptions
                 .push(cx.subscribe_in(&input, window, move |this, _, ev, _, cx| {
                     if let InputEvent::Change = ev {
-                        mark_dirty(this, cx);
+                        this.commit_text_fields(cx);
                     }
                 }));
         }
@@ -217,14 +213,7 @@ impl SettingsWindow {
             cx.subscribe_in(&this.excluded, window, |this, _, ev, _, cx| {
                 if let InputEvent::Change = ev {
                     this.sync_text_fields(cx);
-                    cx.notify();
-                }
-            }),
-        );
-        this._subscriptions.push(
-            cx.subscribe_in(&this.excluded, window, |this, _, ev, _, cx| {
-                if let InputEvent::Change = ev {
-                    this.sync_text_fields(cx);
+                    this.apply_settings(cx);
                     cx.notify();
                 }
             }),
@@ -232,7 +221,7 @@ impl SettingsWindow {
         if !embedded {
             let entity = cx.entity();
             window.on_window_should_close(cx, move |window, cx| {
-                entity.update(cx, |this, cx| this.confirm_close(window, cx))
+                entity.update(cx, |this, cx| this.request_app_close(window, cx))
             });
         }
 
@@ -262,146 +251,68 @@ impl SettingsWindow {
         self.save_interval.read(cx).value().to_string()
     }
 
-    fn is_dirty(&self, cx: &App) -> bool {
-        self.style != self.original_style
-            || form_is_dirty(
-                &self.settings,
-                Some(&self.original),
-                self.theme,
-                self.original_theme,
-                &self.search_limit_text(cx),
-                &self.save_interval_text(cx),
-            )
+    /// Push the live struct into the session and onto disk right away.
+    fn apply_settings(&mut self, cx: &mut App) {
+        let next = self.settings.clone();
+        self.session.update(cx, |session, cx| {
+            session.settings = next;
+            crate::session::persist_settings(session.settings.clone(), cx);
+        });
     }
 
-    fn confirm_close(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.saving || self.service_busy {
-            self.hint = "正在保存或执行服务操作，完成前不能离开设置".into();
-            cx.notify();
-            return false;
-        }
-        if !self.is_dirty(cx) {
-            return true;
-        }
-        self.close_guarded = true;
-        cx.notify();
-        false
-    }
-
-    fn revert_unsaved(&mut self, cx: &mut Context<Self>) {
-        self.settings = self.original.clone();
-        self.theme = self.original_theme;
-        self.style = self.original_style;
+    /// Apply theme + style instantly: session, live UI, and disk, no draft.
+    fn apply_theme_now(&mut self, style: ThemeStyle, theme: UiThemePref, cx: &mut Context<Self>) {
+        self.style = style;
+        self.theme = theme;
         self.session.update(cx, |s, cx| {
+            s.prefs.theme = theme;
+            s.prefs.theme_style = style;
             s.preview_theme = None;
             s.apply_theme(cx);
             cx.notify();
         });
+        crate::session::persist_prefs(self.session.read(cx).prefs.clone(), cx);
         cx.refresh_windows();
-        self.hint = "已丢弃未保存的更改".into();
         cx.notify();
     }
 
-    fn save(&mut self, close_after: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving {
-            return;
-        }
-        self.sync_text_fields(cx);
-        let (limit, interval) = match (
+    /// Numeric fields validate on every keystroke: valid values apply
+    /// instantly, invalid ones only raise the hint (saved state untouched).
+    fn commit_numeric_fields(&mut self, cx: &mut Context<Self>) {
+        match (
             commit_search_limit(&self.search_limit_text(cx)),
             commit_save_interval_secs(&self.save_interval_text(cx)),
         ) {
-            (DraftCommit::Ok(l), DraftCommit::Ok(i)) => (l, i),
+            (DraftCommit::Ok(l), DraftCommit::Ok(i)) => {
+                let changed = self.settings.search_limit != l as u32
+                    || self.settings.save_interval_secs != i;
+                self.settings.search_limit = l as u32;
+                self.settings.save_interval_secs = i;
+                if changed {
+                    self.hint = SharedString::from("");
+                    self.apply_settings(cx);
+                }
+                cx.notify();
+            }
             (DraftCommit::Err(msg), _) | (_, DraftCommit::Err(msg)) => {
                 self.hint = msg.into();
-                self.close_guarded = false;
                 cx.notify();
-                return;
             }
-        };
+        }
+    }
+
+    /// Text fields sync on every keystroke; an illegal pipe name is refused
+    /// with a hint instead of being persisted.
+    fn commit_text_fields(&mut self, cx: &mut Context<Self>) {
+        self.sync_text_fields(cx);
         if crate::isolation::is_production_pipe(&self.settings.pipe_name)
             && !crate::isolation::official_storage()
         {
-            self.hint = "管道名称不可用，请换一个名称后再保存".into();
-            self.close_guarded = false;
+            self.hint = "管道名称不可用，请换一个名称".into();
             cx.notify();
             return;
         }
-        self.settings.search_limit = limit as u32;
-        self.settings.save_interval_secs = interval;
-        self.search_limit
-            .update(cx, |i, cx| i.set_value(limit.to_string(), window, cx));
-        self.save_interval
-            .update(cx, |i, cx| i.set_value(interval.to_string(), window, cx));
-        let next = self.settings.clone();
-        let theme = self.theme;
-        let mut prefs = self.session.read(cx).prefs.clone();
-        prefs.theme = theme;
-        let style = self.style;
-        prefs.theme_style = style;
-        let handle = window.window_handle();
-        self.saving = true;
-        self.hint = "正在保存…".into();
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let saved = next.clone();
-            let local_prefs = prefs.clone();
-            let result = cx
-                .background_spawn(async move {
-                    crate::prefs::save_settings(&saved)?;
-                    crate::prefs::save_prefs(&local_prefs)?;
-                    let text = std::fs::read_to_string(crate::prefs::settings_path())
-                        .map_err(|e| e.to_string())?;
-                    let readback: FindxGuiSettings =
-                        serde_json::from_str(&text).map_err(|e| e.to_string())?;
-                    if readback != saved {
-                        return Err("设置回读与保存内容不一致".into());
-                    }
-                    if crate::prefs::load_prefs().theme != local_prefs.theme
-                        || crate::prefs::load_prefs().theme_style != local_prefs.theme_style
-                    {
-                        return Err("主题回读失败".into());
-                    }
-                    Ok::<(), String>(())
-                })
-                .await;
-            let ok = result.is_ok();
-            this.update(cx, |this, cx| {
-                this.saving = false;
-                this.close_guarded = false;
-                match result {
-                    Ok(()) => {
-                        this.original = next.clone();
-
-                        this.original_theme = theme;
-                        this.original_style = style;
-                        this.session.update(cx, |s, cx| {
-                            s.settings = next;
-                            s.prefs.theme = theme;
-                            s.prefs.theme_style = style;
-                            s.preview_theme = None;
-                            s.apply_theme(cx);
-                            cx.notify();
-                        });
-                        this.hint = "已保存".into();
-                    }
-                    Err(e) => this.hint = format!("保存失败（草稿保留）：{e}").into(),
-                }
-                cx.notify();
-            })
-            .ok();
-            if ok && close_after {
-                let _ = handle.update(cx, |_, w, cx| {
-                    let _ = this.update(cx, |this, cx| this.finish_leave(w, cx));
-                });
-            }
-        })
-        .detach();
-    }
-
-    fn set_theme(&mut self, pref: UiThemePref, cx: &mut Context<Self>) {
-        self.theme = pref;
-        self.preview_theme(cx);
+        self.apply_settings(cx);
         cx.notify();
     }
 
@@ -413,13 +324,8 @@ impl SettingsWindow {
         }
     }
 
-    fn preview_theme(&self, cx: &mut Context<Self>) {
-        self.session.update(cx, |s, cx| {
-            s.preview_theme = Some((self.style, self.theme));
-            s.apply_theme(cx);
-            cx.notify();
-        });
-        cx.refresh_windows();
+    fn set_theme(&mut self, pref: UiThemePref, cx: &mut Context<Self>) {
+        self.apply_theme_now(self.style, pref, cx);
     }
 
     pub fn request_leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -429,15 +335,18 @@ impl SettingsWindow {
 
     pub fn request_app_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.closing_app = true;
-        self.confirm_close(window, cx)
+        // Nothing to confirm: every control already applied. Only an
+        // in-flight service operation holds the page.
+        if self.service_busy {
+            self.hint = "正在执行服务操作，完成前不能离开设置".into();
+            cx.notify();
+            return false;
+        }
+        let _ = window;
+        true
     }
 
     fn finish_leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.session.update(cx, |session, cx| {
-            session.preview_theme = None;
-            session.apply_theme(cx);
-            cx.notify();
-        });
         if self.embedded {
             cx.emit(if self.closing_app {
                 SettingsEvent::CloseApp
@@ -450,9 +359,12 @@ impl SettingsWindow {
     }
 
     fn close_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.confirm_close(window, cx) {
-            self.finish_leave(window, cx);
+        if self.service_busy {
+            self.hint = "正在执行服务操作，完成前不能离开设置".into();
+            cx.notify();
+            return;
         }
+        self.finish_leave(window, cx);
     }
 
     fn restore_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -462,8 +374,16 @@ impl SettingsWindow {
                 .to_string_lossy()
                 .into_owned(),
         );
+        if crate::isolation::official_storage() {
+            // Installed builds are managed by the system service: never
+            // persist a dev pipe or index path over them.
+            self.settings.pipe_name = "findx2".into();
+            self.settings.index_path = crate::isolation::official_index_path()
+                .to_string_lossy()
+                .into_owned();
+        }
         self.theme = UiThemePref::Light;
-        self.style = ThemeStyle::Warm;
+        self.style = ThemeStyle::VSCode;
         for (input, value) in [
             (&self.search_limit, self.settings.search_limit.to_string()),
             (
@@ -479,8 +399,9 @@ impl SettingsWindow {
         self.excluded.update(cx, |i, cx| {
             i.set_value(self.settings.excluded_dirs.join("\n"), window, cx)
         });
-        self.preview_theme(cx);
-        self.hint = "已恢复默认值，保存后生效".into();
+        self.apply_settings(cx);
+        self.apply_theme_now(self.style, self.theme, cx);
+        self.hint = "已恢复默认值".into();
         cx.notify();
     }
 }
@@ -493,7 +414,6 @@ impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = Self::tokens(cx);
         let roots = self.session.read(cx).available_roots.clone();
-        let dirty = self.is_dirty(cx);
         let categories = [
             (SettingsTab::Appearance, "外观"),
             (SettingsTab::Search, "搜索"),
@@ -625,16 +545,8 @@ impl Render for SettingsWindow {
                     .items_center()
                     .border_b_1()
                     .border_color(tokens.border)
-                    .child(div().text_lg().child(title))
-                    .child(
-                        div()
-                            .w(px(72.))
-                            .flex_shrink_0()
-                            .text_xs()
-                            .text_color(tokens.accent)
-                            .child(if dirty { "未保存" } else { "" }),
-                    ),
-            )
+                    .child(div().text_lg().child(title)),
+                )
             .child(
                 div()
                     .id("settings-scroll")
@@ -670,9 +582,6 @@ impl Render for SettingsWindow {
             .when(self.service_pending.is_some(), |view| {
                 view.child(self.render_service_confirm(tokens, cx))
             })
-            .when(self.close_guarded, |view| {
-                view.child(self.render_close_confirm(tokens, cx))
-            })
             .when(self.show_syntax, |view| {
                 view.child(self.render_syntax_help(tokens, cx))
             })
@@ -700,7 +609,7 @@ impl SettingsWindow {
                 settings_card(tokens)
                     .child(section_title("主题风格", tokens))
                     .child(settings_note(
-                        "选择后立即预览，取消或丢弃可还原。",
+                        "选择后立即生效。",
                         tokens,
                     ))
                     .child(h_flex().w_full().gap_3().items_stretch().children(ThemeStyle::ALL.into_iter().map(
@@ -772,9 +681,7 @@ impl SettingsWindow {
                                         ),
                                 )
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.style = style;
-                                    this.preview_theme(cx);
-                                    cx.notify();
+                                    this.apply_theme_now(style, this.theme, cx);
                                 }))
                         },
                     ))),
@@ -818,7 +725,7 @@ impl SettingsWindow {
                 settings_card(tokens)
                     .child(section_title("索引范围", tokens))
                     .child(settings_note(
-                        "勾选要扫描的磁盘。都不勾选时扫描全部磁盘。保存后，在高级维护中重建才会生效。",
+                        "勾选要扫描的磁盘。都不勾选时扫描全部磁盘。重建索引后生效。",
                         tokens,
                     ))
                     .child(v_flex().id("settings-drives-viewport").h(px(drive_rows * 40.)).flex_shrink_0().gap_2().overflow_y_scrollbar()
@@ -844,6 +751,7 @@ impl SettingsWindow {
                             drives.retain(|d| d != &root_key);
                         }
                         this.settings.drives = drives;
+                        this.apply_settings(cx);
                         cx.notify();
                         });
                     }
@@ -867,6 +775,7 @@ impl SettingsWindow {
                     move |checked, _, cx| {
                         entity.update(cx, |this, cx| {
                         this.settings.enable_metadata_backfill = *checked;
+                        this.apply_settings(cx);
                         cx.notify();
                         });
                     }
@@ -881,6 +790,7 @@ impl SettingsWindow {
                     move |checked, _, cx| {
                         entity.update(cx, |this, cx| {
                         this.settings.first_index_full_metadata = *checked;
+                        this.apply_settings(cx);
                         cx.notify();
                         });
                     }
@@ -895,6 +805,7 @@ impl SettingsWindow {
                     move |checked, _, cx| {
                         entity.update(cx, |this, cx| {
                         this.settings.enable_everything_ipc = *checked;
+                        this.apply_settings(cx);
                         cx.notify();
                         });
                     }
@@ -920,7 +831,7 @@ impl SettingsWindow {
                     ),
             )
             .child(settings_note(
-                "保存后，可在高级维护中应用到已安装的服务。",
+                "修改即时保存，可在高级维护中应用到已安装的服务。",
                 tokens,
             ))
         )
@@ -940,6 +851,7 @@ impl SettingsWindow {
                                 move |checked, _, cx| {
                                     entity.update(cx, |this, cx| {
                                         this.settings.pinyin_default = *checked;
+                                        this.apply_settings(cx);
                                         cx.notify();
                                     });
                                 }
@@ -980,7 +892,7 @@ impl SettingsWindow {
                         }),
                 )
                 .child(settings_note(
-                    "保存时须为 1 到 4294967295 的整数，默认 5000。",
+                    "须为 1 到 4294967295 的整数，默认 5000。输入即时生效，无效输入会被忽略并提示。",
                     tokens,
                 ))
         )
@@ -1009,9 +921,6 @@ impl SettingsWindow {
                             this.settings.save_interval_secs = interval;
                             this.settings.enable_metadata_backfill = backfill;
                             this.settings.enable_everything_ipc = everything;
-                            this.original.save_interval_secs = interval;
-                            this.original.enable_metadata_backfill = backfill;
-                            this.original.enable_everything_ipc = everything;
                             this.session.update(cx, |session, _| {
                                 session.settings.save_interval_secs = interval;
                                 session.settings.enable_metadata_backfill = backfill;
@@ -1334,7 +1243,7 @@ impl SettingsWindow {
         let saved = &self.session.read(cx).settings;
         let detail = if action == crate::service_control::Action::ApplyPreferences {
             format!(
-                "将写入已保存选项：落盘 {} 秒，元数据回填 {}，Everything {}。请先保存再应用。",
+                "将写入当前选项：落盘 {} 秒，元数据回填 {}，Everything {}。",
                 saved.save_interval_secs,
                 if saved.enable_metadata_backfill { "开启" } else { "关闭" },
                 if saved.enable_everything_ipc { "开启" } else { "关闭" }
@@ -1368,7 +1277,6 @@ impl SettingsWindow {
     fn persist_auto_check(&mut self, checked: bool, cx: &mut Context<Self>) {
         self.update.auto_check = checked;
         self.settings.auto_check_update = checked;
-        self.original.auto_check_update = checked;
         self.session.update(cx, |session, cx| {
             session.settings.auto_check_update = checked;
             crate::session::persist_settings(session.settings.clone(), cx);
@@ -1638,65 +1546,6 @@ impl SettingsWindow {
             .child(settings_field("服务程序", Input::new(&self.service_exe)))
     }
 
-    fn render_close_confirm(
-        &self,
-        tokens: FindxTokens,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(rgba(0x00000066))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                v_flex()
-                    .w(px(420.))
-                    .max_w_full()
-                    .m_4()
-                    .p_4()
-                    .gap_3()
-                    .rounded_lg()
-                    .bg(tokens.surface_raised)
-                    .border_1()
-                    .border_color(tokens.border)
-                    .child(div().child("设置尚未保存"))
-                    .child(div().text_sm().child(CLOSE_DIRTY_MESSAGE))
-                    .child(
-                        h_flex().h(px(32.)).gap_2().children(
-                            [
-                                ("save-close", "保存并关闭", 112.),
-                                ("discard-close", "丢弃并关闭", 112.),
-                                ("cancel-close", "取消", 88.),
-                            ]
-                            .into_iter()
-                            .map(|(id, label, width)| {
-                                let entity = cx.entity();
-                                Button::new(id).w(px(width)).flex_shrink_0().label(label).disabled(self.saving).on_click(
-                                    move |_, window, cx| {
-                                        entity.update(cx, |this, cx| match id {
-                                            "save-close" => this.save(true, window, cx),
-                                            "discard-close" => {
-                                                this.revert_unsaved(cx);
-                                                this.finish_leave(window, cx);
-                                            }
-                                            _ => {
-                                                this.close_guarded = false;
-                                                this.closing_app = false;
-                                                cx.emit(SettingsEvent::Stay);
-                                                cx.notify();
-                                            }
-                                        })
-                                    },
-                                )
-                            }),
-                        ),
-                    ),
-            )
-    }
-
     fn render_diagnostics(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> impl IntoElement {
         let s = self.session.read(cx);
         let rows = vec![
@@ -1798,32 +1647,9 @@ impl SettingsWindow {
                     .w(px(96.))
                     .flex_shrink_0()
                     .label("恢复默认")
-                    .disabled(self.saving || self.service_busy)
+                    .disabled(self.service_busy)
                     .on_click(cx.listener(|this, _, window, cx| this.restore_defaults(window, cx))),
             )
-            .child({
-                let entity = cx.entity();
-                Button::new("save")
-                    .primary()
-                    .w(px(88.))
-                    .flex_shrink_0()
-                    .label("保存")
-                    .disabled(self.saving)
-                    .on_click(move |_, window, cx| {
-                        entity.update(cx, |this, cx| this.save(false, window, cx));
-                    })
-            })
-            .child({
-                let entity = cx.entity();
-                Button::new("close")
-                    .w(px(112.))
-                    .flex_shrink_0()
-                    .label("取消并返回")
-                    .disabled(self.saving || self.service_busy)
-                    .on_click(move |_, window, cx| {
-                        entity.update(cx, |this, cx| this.close_clicked(window, cx));
-                    })
-            })
     }
 
     fn render_syntax_help(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> impl IntoElement {

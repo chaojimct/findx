@@ -101,6 +101,12 @@ impl AppSession {
         persist_prefs(self.prefs.clone(), cx);
     }
 
+    pub fn set_theme_style(&mut self, style: theme::ThemeStyle, cx: &mut App) {
+        self.prefs.theme_style = style;
+        self.apply_theme(cx);
+        persist_prefs(self.prefs.clone(), cx);
+    }
+
     pub fn set_diag(&mut self, on: bool, cx: &mut App) {
         self.prefs.diag_enabled = on;
         persist_prefs(self.prefs.clone(), cx);

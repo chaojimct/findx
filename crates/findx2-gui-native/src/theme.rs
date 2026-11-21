@@ -6,19 +6,20 @@ use gpui_kit::*;
 use crate::settings_logic::EffectiveTheme;
 use serde::{Deserialize, Serialize};
 
-/// Style is orthogonal to appearance. Old preference files intentionally default to Warm.
+/// Style is orthogonal to appearance. Old preference files without a stored
+/// style fall back to the VS Code look.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ThemeStyle {
-    #[default]
     Warm,
+    #[default]
     VSCode,
     Neutral,
 }
 impl ThemeStyle {
     pub const ALL: [(Self, &'static str); 3] = [
         (Self::Warm, "暖白"),
-        (Self::VSCode, "VS Code"),
+        (Self::VSCode, "蓝白"),
         (Self::Neutral, "中性灰"),
     ];
 }
