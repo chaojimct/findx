@@ -840,6 +840,48 @@ impl MainWindow {
             .map(|&i| paths[i].clone())
             .collect::<Vec<_>>();
         frame
+            .when(self.workspace.mode == ViewMode::Usage, |frame| {
+                frame
+                    .child(
+                        Button::new("home-crumb-nav")
+                            .ghost()
+                            .with_size(gpui_kit::component::Size::XSmall)
+                            .h(px(24.))
+                            .w(px(28.))
+                            .px_0()
+                            .rounded_sm()
+                            .icon(Icon::default().path("icons/house.svg"))
+                            .tooltip("全部磁盘")
+                            .accessibility_label("全部磁盘")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if !is_home_path(&this.workspace.location) {
+                                    this.workspace_navigate(
+                                        PathBuf::from(HOME_PATH),
+                                        ViewMode::Usage,
+                                        None,
+                                        true,
+                                        cx,
+                                    );
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("home-root-menu")
+                            .ghost()
+                            .w(px(18.))
+                            .h(px(24.))
+                            .px_0()
+                            .rounded_sm()
+                            .icon(Icon::new(IconName::ChevronRight).size_3())
+                            .accessibility_label("切换磁盘")
+                            .tooltip("切换磁盘：C: / D: / E: …")
+                            .on_click(cx.listener(
+                                move |this, event: &ClickEvent, window, cx| {
+                                    this.open_root_menu(event.position(), window, cx)
+                                },
+                            )),
+                    )
+            })
             .children(
                 plan.visible
                     .iter()
@@ -907,7 +949,10 @@ impl MainWindow {
                                         }
                                     })),
                             )
-                            .child(
+                            // In Usage mode the drive switcher lives on the home
+                            // chevron; the volume root itself has no siblings.
+                            .when(self.workspace.mode != ViewMode::Usage || index != 0, |row| {
+                                row.child(
                                 Button::new(SharedString::from(format!("path-siblings-{index}")))
                                     .ghost()
                                     .w(px(18.))
@@ -944,7 +989,8 @@ impl MainWindow {
                                             }
                                         },
                                     )),
-                            )
+                                )
+                            })
                     }),
             )
             .child(

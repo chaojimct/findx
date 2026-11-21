@@ -557,12 +557,25 @@ impl MainWindow {
                     .unwrap_or(View::MAX_SCALE);
                 // Indexed usage pages root a fresh subtree at each requested path.
                 // Its root.parent is None even when the LOCATION has an ancestor.
+                // Volume roots drill one level further up: the home overview.
+                let at_home = is_home_path(&self.workspace.location);
+                let volume_root = !at_home
+                    && self.workspace.engine_usage
+                    && self.workspace.mode == ViewMode::Usage
+                    && self.workspace.location.parent().is_none();
                 let boundary = usage_view::wheel_boundary(
                     steps,
                     camera.scale,
                     ceiling,
                     candidate,
-                    self.workspace.location.parent().is_some(),
+                    !at_home
+                        && (self
+                            .workspace
+                            .location
+                            .parent()
+                            .filter(|p| !p.as_os_str().is_empty())
+                            .is_some()
+                            || volume_root),
                 );
                 if let Some(action) =
                     self.workspace

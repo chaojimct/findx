@@ -1010,6 +1010,25 @@ impl MainWindow {
                 if let Some(state) = self.workspace.usage_page.clone() {
                     self.restore_page_context(state, cx);
                 }
+                // First visit defaults to the home overview, not wherever the
+                // file browser happens to stand. A saved usage context or an
+                // existing scene restores through the branch below.
+                if self.workspace.usage_page.is_none()
+                    && self.workspace.usage_scene.is_none()
+                    && self.workspace.scan.is_none()
+                    && self.workspace.engine_usage
+                {
+                    self.workspace_navigate(
+                        PathBuf::from(HOME_PATH),
+                        ViewMode::Usage,
+                        None,
+                        true,
+                        cx,
+                    );
+                    self.preview_active_selection(cx);
+                    cx.notify();
+                    return;
+                }
                 let focus = self.active_workspace_hit().map(|h| h.path);
                 if !self.workspace.suspend_preview && !self.show_scanned_directory(focus, cx) {
                     self.load_usage_cache(cx);
@@ -1514,6 +1533,9 @@ impl MainWindow {
         false
     }
     pub(super) fn workspace_up(&mut self, cx: &mut Context<Self>) {
+        if self.workspace.mode == ViewMode::Usage && is_home_path(&self.workspace.location) {
+            return;
+        }
         if self.workspace.scanning {
             let up = self.workspace.usage_preview.borrow_mut().up();
             if up {
@@ -1536,6 +1558,9 @@ impl MainWindow {
                 self.workspace.mode
             };
             self.workspace_navigate(p, mode, focus, true, cx);
+        } else if self.workspace.mode == ViewMode::Usage && self.workspace.engine_usage {
+            // Volume roots have no filesystem parent; their parent is home.
+            self.workspace_navigate(PathBuf::from(HOME_PATH), ViewMode::Usage, None, true, cx);
         }
     }
     pub(super) fn workspace_refresh(&mut self, cx: &mut Context<Self>) {
@@ -1549,7 +1574,13 @@ impl MainWindow {
             self.run_search(cx);
         } else if self.workspace.mode == ViewMode::Usage {
             // F5/刷新 is an explicit gesture; navigation alone only loads cache.
-            self.start_workspace_scan(true, cx);
+            if is_home_path(&self.workspace.location) {
+                self.workspace.engine_cancel.store(true, Ordering::Release);
+                self.workspace.engine_busy = false;
+                self.load_home_overview(cx);
+            } else {
+                self.start_workspace_scan(true, cx);
+            }
         } else {
             let p = self.workspace.location.clone();
             let focus = self.active_workspace_hit().map(|h| h.path);
@@ -1980,13 +2011,15 @@ impl MainWindow {
         let request_generation = self.workspace.scan_generation;
         let requested = self.workspace.location.clone();
         let roots = self.available_volume_roots(cx);
+        let page_cache = self.workspace.usage_page_cache.clone();
         let session = self.session.read(cx);
         let ipc = session.ipc.clone();
         let endpoint = session.endpoint.clone();
         cx.spawn(async move |this, cx| {
-            let result: Result<crate::disk_usage::Scan, String> = async {
-                let mut volumes = Vec::new();
+            let result: Result<(crate::disk_usage::Scan, usize), String> = async {
+                let mut scans = Vec::new();
                 let mut failed = 0usize;
+                let mut requests = 0usize;
                 let mut first_error: Option<String> = None;
                 for root in &roots {
                     crate::indexed_usage::ensure_not_cancelled(&cancel)?;
@@ -1998,48 +2031,108 @@ impl MainWindow {
                                 path: path.clone(),
                                 expected: None,
                                 after: None,
-                                max_bytes: 2048,
+                                max_bytes: 48 * 1024,
                             },
                             cancel.clone(),
                         )
                         .await
                         .map_err(|_| "全览请求已取消".to_string())??;
-                    match response {
-                        findx2_ipc::IpcResponse::UsageChildrenResult { page } => {
-                            if !page.root.directory {
-                                failed += 1;
-                                continue;
-                            }
-                            volumes.push((
-                                root.clone(),
-                                page.root,
-                                page.watch_error.is_some() || page.metadata_error.is_some(),
-                            ));
-                        }
+                    let page = match response {
+                        findx2_ipc::IpcResponse::UsageChildrenResult { page } => page,
                         findx2_ipc::IpcResponse::Error { message } => {
                             failed += 1;
                             first_error = first_error.or(Some(message));
+                            continue;
                         }
                         _ => {
                             failed += 1;
                             first_error = first_error.or(Some("全览响应不兼容".into()));
+                            continue;
+                        }
+                    };
+                    if !page.root.directory {
+                        failed += 1;
+                        continue;
+                    }
+                    requests += 1;
+                    // Two levels per volume (volume → top dirs): the same
+                    // bounded expansion the per-volume view uses, with its
+                    // conflict/partial handling and verified-page cache.
+                    let fetch = |path: PathBuf,
+                                 after: Option<u32>,
+                                 stamp: (u64, u64)| {
+                        let ipc = ipc.clone();
+                        let endpoint = endpoint.clone();
+                        let cancel = cancel.clone();
+                        async move {
+                            match ipc
+                                .request_cancellable(
+                                    endpoint,
+                                    findx2_ipc::IpcRequest::UsageChildren {
+                                        path: display_path(&path),
+                                        expected: Some(stamp),
+                                        after,
+                                        max_bytes: 48 * 1024,
+                                    },
+                                    cancel,
+                                )
+                                .await
+                                .map_err(|_| "全览子项读取已取消".to_string())??
+                            {
+                                findx2_ipc::IpcResponse::UsageChildrenResult { page } => {
+                                    Ok(page)
+                                }
+                                findx2_ipc::IpcResponse::Error { message } => Err(message),
+                                _ => Err("全览响应不兼容".into()),
+                            }
+                        }
+                    };
+                    match crate::indexed_depth::expand(
+                        &page,
+                        root.clone(),
+                        2,
+                        page_cache.clone(),
+                        cancel.clone(),
+                        fetch,
+                    )
+                    .await
+                    {
+                        Ok(tree) => {
+                            requests += tree.requests;
+                            scans.push(tree.scan);
+                        }
+                        Err(e) if e.contains("取消") || e.contains("cancel") => {
+                            return Err(e)
+                        }
+                        Err(_) => {
+                            // Descendant expansion failed; the volume tile
+                            // itself (authoritative root totals) still shows.
+                            scans.push(crate::indexed_usage::scan_from_page(
+                                &page,
+                                root.clone(),
+                            ));
                         }
                     }
                 }
-                if volumes.is_empty() {
+                if scans.is_empty() {
                     return Err(first_error.unwrap_or_else(|| "无可用磁盘索引".into()));
                 }
                 // Largest first: deterministic treemap before layout sorts.
-                volumes.sort_by(|a, b| b.1.logical.cmp(&a.1.logical));
-                let partial = failed > 0 || volumes.iter().any(|v| v.2);
-                let items: Vec<(PathBuf, findx2_ipc::UsageItemDto)> = volumes
-                    .into_iter()
-                    .map(|(path, item, _)| (path, item))
-                    .collect();
-                Ok(crate::indexed_usage::scan_from_volumes(
-                    PathBuf::from(HOME_PATH),
-                    &items,
-                    partial,
+                scans.sort_by(|a, b| {
+                    b.nodes
+                        .first()
+                        .map(|n| n.logical)
+                        .unwrap_or(0)
+                        .cmp(&a.nodes.first().map(|n| n.logical).unwrap_or(0))
+                });
+                let partial = failed > 0 || scans.iter().any(|s| s.partial);
+                Ok((
+                    crate::indexed_usage::merge_volume_scans(
+                        PathBuf::from(HOME_PATH),
+                        &scans,
+                        partial,
+                    ),
+                    requests,
                 ))
             }
             .await;
@@ -2063,7 +2156,7 @@ impl MainWindow {
                 {
                     return;
                 }
-                let scan = match result {
+                let (scan, requests) = match result {
                     Ok(s) => s,
                     Err(e) => {
                         if this.workspace.usage_pending_from.is_some()
@@ -2089,12 +2182,12 @@ impl MainWindow {
                 this.workspace.scan_stale = scan.partial;
                 let volumes = scan.nodes.len().saturating_sub(1);
                 this.workspace.scan_status = format!(
-                    "全览  {volumes} 个磁盘（索引逻辑合计）；双击磁盘进入，面包屑 > 可切换{}",
-                    if scan.partial {
+                    "全览  {volumes} 个磁盘（索引逻辑合计）；双击磁盘进入，面包屑 > 可切换{partial}\n{requests}次索引读取",
+                    partial = if scan.partial {
                         "；部分磁盘未就绪"
                     } else {
                         ""
-                    }
+                    },
                 );
                 match fallible_usage_lookup(&scan) {
                     Ok(lookup) => this.workspace.scan_lookup = lookup,
@@ -2392,6 +2485,10 @@ impl MainWindow {
         .detach();
     }
     fn load_usage_cache(&mut self, cx: &mut Context<Self>) {
+        if is_home_path(&self.workspace.location) {
+            self.load_home_overview(cx);
+            return;
+        }
         if self.workspace.engine_usage {
             self.load_engine_usage(false, cx);
             return;

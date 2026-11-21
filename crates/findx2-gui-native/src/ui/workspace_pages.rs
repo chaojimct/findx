@@ -262,7 +262,23 @@ impl MainWindow {
                     .disabled(match action {
                         0 => self.workspace.history.back.is_empty(),
                         1 => self.workspace.history.forward.is_empty(),
-                        _ => self.workspace.location.parent().is_none(),
+                        // Volume roots in indexed usage drill up to home.
+                        _ => {
+                            if is_home_path(&self.workspace.location) {
+                                true
+                            } else if self
+                                .workspace
+                                .location
+                                .parent()
+                                .filter(|p| !p.as_os_str().is_empty())
+                                .is_some()
+                            {
+                                false
+                            } else {
+                                !(self.workspace.mode == ViewMode::Usage
+                                    && self.workspace.engine_usage)
+                            }
+                        }
                     })
                     .on_click(cx.listener(move |this, _, _, cx| match action {
                         0 => this.workspace_history(false, cx),
