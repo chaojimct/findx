@@ -158,3 +158,14 @@ fn usage_toolbar_icon_slots_and_depth_value_are_compact_and_stable() {
  let page=include_str!("workspace_pages.rs");let trigger=&page[page.find(r#"Popover::new("usage-facts-popover")"#).unwrap()..];let trigger=&trigger[..trigger.find(".content(").unwrap()];
  assert!(trigger.contains(".open(self.workspace.usage_facts_open)"));assert!(trigger.contains(".on_open_change("));assert!(trigger.contains(".on_mouse_down(MouseButton::Left"));assert!(trigger.contains(".on_click(cx.listener("));assert!(trigger.contains(r#".accessibility_label("详细信息")"#));
 }
+
+#[test]fn home_completion_keeps_published_scene_scan_until_scene_handoff(){
+ // A scope change publishes (scene, scene_scan) atomically at handoff. If a
+ // completion overwrote usage_scene_scan early, the stale scene's tile indices
+ // would be interpreted against the new graph: harmless for 8k-node volumes,
+ // an out-of-bounds panic for the 4-node home scene (observed index 5).
+ let src=include_str!("workspace.rs");
+ let home=src.split("fn load_home_overview").nth(1).unwrap().split("fn load_engine_usage").next().unwrap();
+ assert!(!home.contains("usage_scene_scan=")&&!home.contains("usage_scene_scan ="),"home completion must not touch the published scene scan");
+ assert!(home.contains("usage_scene_key = None"),"home completion must still trigger a scene rebuild");
+}

@@ -2107,7 +2107,10 @@ impl MainWindow {
                 this.workspace.usage_tree_revision =
                     this.workspace.usage_tree_revision.wrapping_add(1);
                 this.workspace.scan = Some(Arc::new(scan));
-                this.workspace.usage_scene_scan = this.workspace.scan.clone();
+                // Keep the published pair intact: usage_scene_scan still names
+                // the scan the stale scene was built from. The scene handoff
+                // swaps both together; swapping early pairs stale tile indices
+                // with the new graph and panics on small scenes like home.
                 this.workspace.usage_scene_key = None;
                 this.workspace.usage_scene_generation += 1;
                 let focus = this.workspace.usage_focus.clone();
