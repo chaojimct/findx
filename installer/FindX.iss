@@ -1,7 +1,8 @@
 ﻿; FindX native Windows Inno Setup (publication blocked until upgrade gates pass)
-; 构建: 1) 在仓库根/ gui 中完成 tauri build --no-bundle
+; 构建: 1) cargo build --release -p findx2-gui-native -p findx2-service -p findx2-cli
+;          （GUI 为原生 GPUI 实现 crates/findx2-gui-native，不再经过 Tauri）
 ;       2) powershell -File installer\stage-inno.ps1
-;       3) iscc /DUpgradeGatesApproved=1 /DMyAppVersion=2.5.8 /DPublishDir=<stage绝对路径> installer\FindX.iss
+;       3) iscc /DUpgradeGatesApproved=1 /DMyAppVersion=2.5.9 /DPublishDir=<stage绝对路径> installer\FindX.iss
 ;       CI 建议再加 /DPublishDir=<仓库>\installer\stage 绝对路径，避免 ISCC 解析不到 stage\*
 ;
 ; 与 v1 的 FindX.iss 类似：多任务（服务注册、PATH、桌面快捷方式、安装后启动），无 .NET 检测。
@@ -13,7 +14,7 @@
 #endif
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.5.8"
+  #define MyAppVersion "2.5.9"
 #endif
 
 #define MyAppName      "FindX"
@@ -31,8 +32,8 @@
 #endif
 ; 与 GUI 内约定一致：存在该文件时首启用 ProgramData 索引 + 服务模式
 #define MyInstalledMarker "FindX.installed"
-; 「随系统启动」在 HKCU\...\Run 下的值名。改这里必须同步改 gui/src-tauri/src/autostart.rs
-; 的 RUN_VALUE_NAME，否则卸载时清不掉。
+; 「随系统启动」在 HKCU\...\Run 下的值名。改这里必须同步改
+; crates/findx2-gui-native/src/autostart.rs 的 RUN_VALUE_NAME，否则卸载时清不掉。
 #define MyRunValueName "FindX"
 
 [Setup]
@@ -73,7 +74,7 @@ CloseApplicationsFilter=FindX.exe
 RestartApplications=no
 UninstallDisplayName={#MyAppName}
 ; 本脚本相对路径以 installer/ 为基准
-SetupIconFile=..\gui\src-tauri\icons\icon.ico
+SetupIconFile=..\assets\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 MinVersion=10.0
 
@@ -112,7 +113,7 @@ Source: "upgrade-transaction.ps1"; Flags: dontcopy
 ; stage 由 stage-inno.ps1 生成。勿用单条 "{#PublishDir}\*"：Inno 编译器要求根目录至少有一个能匹配 * 的文件；
 ; 若仅有子目录（如 resources）而无根层文件，会报 No files found matching ...\stage\*。
 Source: "{#PublishDir}\FindX.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: main
-; resources 目录是可选项：tauri --no-bundle 不一定生成；GUI 运行时不强依赖（CLI/服务通过同目录 current_exe 解析）
+; resources 目录是可选项：不再生成；GUI 运行时不强依赖（CLI/服务通过同目录 current_exe 解析）
 Source: "{#PublishDir}\resources\*"; DestDir: "{app}\resources"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist; Components: main
 Source: "{#PublishDir}\findx2.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: main
 Source: "{#PublishDir}\fx.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: main
@@ -180,7 +181,7 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then begin
     RemoveFromPath(ExpandConstant('{app}'));
-    // 「随系统启动」写的是 HKCU\...\Run 下的 FindX 值（见 gui/src-tauri/src/autostart.rs）。
+    // 「随系统启动」写的是 HKCU\...\Run 下的 FindX 值（见 crates/findx2-gui-native/src/autostart.rs）。
     // 不删的话，卸载后每次登录 Windows 都会去拉起一个已经不存在的 exe，弹找不到文件的错误。
     // RegDeleteValue 对不存在的值返回非 0，但这里是"本来就没开"的正常情况，忽略返回值。
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#MyRunValueName}');

@@ -10,10 +10,8 @@ def validate(root=ROOT, expected=None, require_ready=False):
     for member in workspace['workspace']['members']:
         data=tomllib.loads((root/member/'Cargo.toml').read_text(encoding='utf8'))
         if data['package']['version'] != {'workspace':True}: errors.append(f'{member}: must inherit workspace version')
-    for file in ['gui/package.json','gui/src-tauri/tauri.conf.json']:
-        if json.loads((root/file).read_text(encoding='utf8'))['version'] != version: errors.append(f'{file}: version mismatch')
-    lock=json.loads((root/'gui/package-lock.json').read_text(encoding='utf8'))
-    if lock['version'] != version or lock['packages']['']['version'] != version: errors.append('npm lock root version mismatch')
+    # Tauri removed in 2.5.9 (gui/ deleted): version truth is workspace
+    # Cargo.toml + installer iss default only.
     iss=(root/'installer/FindX.iss').read_text(encoding='utf8')
     if not re.search(r'#define MyAppVersion "'+re.escape(version)+'"',iss): errors.append('installer version mismatch')
     native=tomllib.loads((root/'crates/findx2-gui-native/Cargo.toml').read_text(encoding='utf8'))

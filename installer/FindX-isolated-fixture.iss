@@ -73,7 +73,7 @@ UpdateUninstallLogAppName=no
 UninstallDisplayName={#MyAppName} {#MyAppVersion}
 WizardStyle=modern
 SetupLogging=yes
-SetupIconFile=..\gui\src-tauri\icons\icon.ico
+SetupIconFile=..\assets\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 MinVersion=10.0
 ; Do not restart, do not close running trial/official processes.

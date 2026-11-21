@@ -1,8 +1,7 @@
 # findx2-gui-native
 
 FindX 原生 GPUI 客户端（搜索主窗 + 设置壳 + 主题/折叠/诊断 + 真实预览）。
-
-- 不替换现有 Tauri WebView GUI（`gui/`、`gui/src-tauri` 仍保留）。
+自 2.5.9 起这是唯一的图形界面，旧 Tauri WebView GUI（`gui/`）已删除。
 - **默认隔离运行**：管道名是 `findx2-native-dev`，单独 `--pipe findx2` / `\\.\pipe\findx2` 会被拒绝。
 - **`--live`**：作为只读 IPC 客户端连接现有生产管道 `findx2`。不启动、不重启 `findx2-service`，不写 `ProgramData` 索引，也不做 compact/rebuild/install。
 - 设置和偏好始终写入 `%LOCALAPPDATA%\FindX-native-dev\`（Unix：`$XDG_DATA_HOME/FindX-native-dev`），不读写正式 GUI 的设置文件。
@@ -94,7 +93,7 @@ result or requiring indexing; selecting a real search result returns to normal p
 
 ### Evaluation of the old preview mechanism
 
-Reviewed `gui/src-tauri/src/win_preview.rs` and `gui/src/findx/PreviewPane.tsx`.
+Reviewed the retired Tauri preview (`win_preview.rs` + `PreviewPane.tsx`, removed in 2.5.9).
 The older owned-popup HWND approach is reused, but its global in-process COM state is
 not imported: this implementation isolates handler DLLs/COM calls in a disposable STA
 helper and keeps GPUI callbacks limited to surface geometry. Native Office helper windows follow owner resize and hide with the preview pane;

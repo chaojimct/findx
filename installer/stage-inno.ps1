@@ -2,7 +2,6 @@
 param(
   [string] $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
   [string] $ReleaseDir = "",
-  [ValidateSet("native", "webview")] [string] $Gui = "native",
   [string] $StageDir = "",
   [switch] $PlanOnly
 )
@@ -14,9 +13,9 @@ $version = $versionMatch.Groups[1].Value
 if ($ReleaseDir) {
   $candidates = @([IO.Path]::GetFullPath($ReleaseDir)) # Explicit means strict: never mix another build.
 } else {
-  $candidates = @((Join-Path $RepoRoot 'target\release'),(Join-Path $RepoRoot 'target\x86_64-pc-windows-msvc\release'),(Join-Path $RepoRoot 'gui\target\release'))
+  $candidates = @((Join-Path $RepoRoot 'target\release'),(Join-Path $RepoRoot 'target\x86_64-pc-windows-msvc\release'))
 }
-$guiNames = if ($Gui -eq 'native') { @('findx2-gui-native.exe') } else { @('FindX.exe','findx2-gui.exe') }
+$guiNames = @('findx2-gui-native.exe')
 $rel=$null; $main=$null
 foreach ($candidate in $candidates) {
   foreach ($name in $guiNames) {
@@ -25,7 +24,7 @@ foreach ($candidate in $candidates) {
   }
   if ($rel) { break }
 }
-if (-not $rel) { throw "Missing $Gui GUI in requested build directories; native requires findx2-gui-native.exe (pinyin default feature)." }
+if (-not $rel) { throw "Missing native GUI in requested build directories; requires findx2-gui-native.exe (pinyin default feature)." }
 $files=@(@{source=$main;name='FindX.exe'})
 foreach ($name in @('findx2.exe','fx.exe','findx2-service.exe')) {
   $file=Join-Path $rel $name

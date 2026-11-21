@@ -5,16 +5,6 @@ Thumbs.db
 /target/
 **/*.rs.bk
 
-# Node / frontend
-gui/node_modules/
-gui/dist/
-gui/.vite/
-gui/*.log
-
-# Tauri
-gui/src-tauri/target/
-gui/src-tauri/gen/
-
 # IDE / editor
 .vscode/
 .idea/

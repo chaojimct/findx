@@ -1,7 +1,6 @@
 //! Official in-app updater for the shipped FindX product.
 //!
-//! Channel matches the 2.4.10 Tauri client (`gui/src-tauri/src/app_update.rs`):
-//! `GET https://api.github.com/repos/chaojimct/findx/releases/latest`
+//! Channel matches the retired 2.4.10 client: `GET https://api.github.com/repos/chaojimct/findx/releases/latest`
 //! (non-draft, non-prerelease), compare tag semver, then pick the official
 //! asset for the running platform:
 //! - Windows: `FindX-*-setup.exe`, installed with `ShellExecute` `runas`

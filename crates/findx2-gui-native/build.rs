@@ -5,7 +5,7 @@ fn main() {
         return;
     }
     println!("cargo:rustc-link-arg-bin=findx2-gui-native=/STACK:8388608");
-    println!("cargo:rerun-if-changed=../../gui/src-tauri/icons/icon.ico");
+    println!("cargo:rerun-if-changed=../../assets/icon.ico");
     let version = env::var("CARGO_PKG_VERSION").unwrap();
     let numbers: Vec<_> = version
         .split('.')
@@ -16,7 +16,7 @@ fn main() {
     let numeric = format!("{},{},{},0", numbers[0], numbers[1], numbers[2]);
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let icon = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
-        .join("../../gui/src-tauri/icons/icon.ico")
+        .join("../../assets/icon.ico")
         .canonicalize()
         .unwrap();
     let icon = icon
