@@ -914,6 +914,17 @@ extern "system" {
     ) -> isize;
     fn FlushFileBuffers(h: isize) -> i32;
     fn CloseHandle(h: isize) -> i32;
+    #[allow(dead_code)]
+    fn GetVolumeInformationW(
+        root: *const u16,
+        vol_name: *mut u16,
+        vol_name_len: u32,
+        serial: *mut u32,
+        max_comp_len: *mut u32,
+        fs_flags: *mut u32,
+        fs_name: *mut u16,
+        fs_name_len: u32,
+    ) -> i32;
     fn DeviceIoControl(
         h_device: isize,
         dw_io_control_code: u32,
@@ -983,6 +994,53 @@ mod clone_tests {
         let mut probe = Vec::new();
         File::open(&dst).unwrap().read_to_end(&mut probe).unwrap();
         assert!(probe.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn block_clone_actually_clones_on_ntfs() {
+        let dir = scratch("clone-probe");
+        // 32 MiB patterned file: large enough that a byte copy would be
+        // observable, small enough for a unit test.
+        let mut bytes = Vec::with_capacity(32 << 20);
+        for i in 0..(32 << 20) as u32 {
+            bytes.push((i.wrapping_mul(2654435761) >> 11) as u8);
+        }
+        let src = dir.join("src.dat");
+        std::fs::write(&src, &bytes).unwrap();
+        let dst = dir.join("dst.dat");
+        let r = clone_file_range(&src, &dst, bytes.len() as u64);
+        // NTFS/ReFS: must succeed. Other filesystems: explicit fallback signal.
+        let fs_kind: String = {
+            use std::os::windows::ffi::OsStrExt;
+            let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+            let mut fs_name = [0u16; 32];
+            let ok = unsafe {
+                GetVolumeInformationW(
+                    wide.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    fs_name.as_mut_ptr(),
+                    fs_name.len() as u32,
+                )
+            };
+            if ok == 0 {
+                "unknown".into()
+            } else {
+                String::from_utf16_lossy(&fs_name[..fs_name.iter().position(|&c| c == 0).unwrap_or(0)])
+            }
+        };
+        if fs_kind == "NTFS" || fs_kind == "ReFS" {
+            assert!(r.is_ok(), "block clone must work on {fs_kind}: {r:?}");
+            let back = std::fs::read(&dst).unwrap();
+            assert_eq!(back, bytes);
+        } else {
+            assert!(r.is_err(), "non-cloning FS must report fallback");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
