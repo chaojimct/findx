@@ -145,15 +145,21 @@ fn spawn_trigram_rebuild(engine: Arc<SearchEngine>, index: PathBuf, reason: &'st
             let mut lifecycle=lifecycle.map(|p|p.activate());
             let _guard = guard;
             info!("trigram：后台重建开始（{reason}）");
+            crate::win_service::append_service_log(&format!("trigram 后台重建开始（{reason}）"));
             let t0 = Instant::now();
             let result=engine.rebuild_trigram_sidecar(&index);
             match &result{Ok(())=>crate::runtime_lifecycle::success_optional(&mut lifecycle),Err(e)=>crate::runtime_lifecycle::error_optional(&mut lifecycle,e.to_string())}
             match result {
-                Ok(()) => info!(
-                    "trigram：后台重建完成，耗时 {:.1}s",
-                    t0.elapsed().as_secs_f64()
-                ),
-                Err(e) => error!("trigram：后台重建失败（下一轮再试）: {e}"),
+                Ok(()) => {
+                    let msg = format!("trigram 后台重建完成，耗时 {:.1}s", t0.elapsed().as_secs_f64());
+                    info!("{msg}");
+                    crate::win_service::append_service_log(&msg);
+                }
+                Err(e) => {
+                    let msg = format!("trigram 后台重建失败（下一轮再试）: {e}");
+                    error!("{msg}");
+                    crate::win_service::append_service_log(&msg);
+                }
             }
         });
     if spawned.is_err() {
@@ -166,6 +172,7 @@ fn spawn_trigram_rebuild(engine: Arc<SearchEngine>, index: PathBuf, reason: &'st
 /// 默认 max(条目数/32, 65536)）。未超阈值是常态，检查本身只是一次位图 len 读取。
 fn maybe_rebuild_trigram(engine: &Arc<SearchEngine>, index: &Path) {
     if engine.index_store().tri_pending_overflow() {
+        crate::win_service::append_service_log("trigram 待验证超阈值，触发后台重建");
         spawn_trigram_rebuild(engine.clone(), index.to_path_buf(), "USN 增量超过阈值");
     }
 }

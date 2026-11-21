@@ -159,11 +159,13 @@ fn spawn_final_persist_for_epoch(engine:Arc<SearchEngine>,path:std::path::PathBu
             if epoch.is_some_and(|e| engine.metadata_epoch() != e) { return; }
             delete_overlay_sidecar(&path);
             crate::runtime_lifecycle::success_optional(&mut lifecycle);
-            info!(
+            let msg = format!(
                 "终态落盘：v6 已写盘（写盘耗时 {:?}，全程 {:?}）",
                 t1.elapsed(),
                 t0.elapsed()
             );
+            info!("{msg}");
+            crate::win_service::append_service_log(&msg);
         })
         .ok();
 }
