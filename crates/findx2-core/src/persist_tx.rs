@@ -60,6 +60,37 @@ pub enum PersistFault {
 static FAULT: Mutex<PersistFault> = Mutex::new(PersistFault::None);
 static WRITTEN: Mutex<u64> = Mutex::new(0);
 
+/// Actual on-disk bytes written by the persistence layer (full segment
+/// copies, fresh generations, sidecars). Block-cloned extents and hardlinks
+/// count ZERO here — that is the whole point: it measures what the disk
+/// really felt, as opposed to the logical delta bytes in CommitOutcome.
+thread_local! {
+    static PHYSICAL_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static CLONE_FALLBACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Raw Win32 error of the most recent failed clone attempt (0 = none yet).
+    static LAST_CLONE_ERROR: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+fn note_physical_bytes(n: u64) {
+    PHYSICAL_BYTES.with(|c| c.set(c.get().saturating_add(n)));
+}
+/// Bytes physically written since the last call (resets the counter).
+/// Call on the same thread right after a commit to attribute disk IO.
+pub fn take_commit_physical_bytes() -> u64 {
+    PHYSICAL_BYTES.with(|c| c.replace(0))
+}
+/// How many segment copies fell back from block clone to a full byte copy
+/// since the last call (resets the counter). Nonzero means the FS refused
+/// cloning and the commit paid full price.
+pub fn take_clone_fallbacks() -> u64 {
+    CLONE_FALLBACKS.with(|c| c.replace(0))
+}
+
+/// Raw Win32 error code of the most recent failed clone attempt (0 = none
+/// recorded yet this thread). -1 when the OS did not report a code.
+pub fn take_last_clone_error() -> i32 {
+    LAST_CLONE_ERROR.with(|c| c.replace(0))
+}
+
 fn fault() -> PersistFault {
     if let Ok(v) = std::env::var("FINDX_PERSIST_FAULT") {
         return parse_fault_env(&v);
@@ -481,6 +512,8 @@ fn commit_delta_into(
         metadata_ready: batch.metadata_ready,
         volumes: batch.volumes.iter().map(V6Volume::from).collect(),
     };
+    // Delta pwrites are real disk writes (unlike cloned/linked extents).
+    note_physical_bytes(bytes);
     Ok((files, bytes, has_trigram, tri_snap, manifest))
 }
 
@@ -643,6 +676,7 @@ fn install_trigram(dir: &Path, store: &IndexStore, layout: &V6Layout, files: &mu
 fn write_new_file(dir: &Path, name: &str, bytes: &[u8], files: &mut BTreeMap<String, FileDigest>) -> Result<()> {
     refuse_access(name)?;
     write_new_file_raw(&dir.join(name), bytes)?;
+    note_physical_bytes(bytes.len() as u64);
     files.insert(name.to_string(), FileDigest { size: bytes.len() as u64, crc32: crc32fast::hash(bytes) });
     Ok(())
 }
@@ -692,6 +726,7 @@ fn copy_prefix(src: &Path, dst: &Path, expect_len: u64, name: &str) -> Result<()
         }
         let _ = fs::remove_file(dst);
     }
+    CLONE_FALLBACKS.with(|c| c.set(c.get().saturating_add(1)));
     let mut input = File::open(src).map_err(|e| io_err(e, "open base segment"))?;
     let mut output = File::create(dst).map_err(|e| io_err(e, "create cow file"))?;
     let mut remaining = expect_len;
@@ -703,6 +738,9 @@ fn copy_prefix(src: &Path, dst: &Path, expect_len: u64, name: &str) -> Result<()
         remaining -= chunk as u64;
     }
     output.sync_all().map_err(|e| io_err(e, "sync cow file"))?;
+    // Only the fallback byte copy reaches here; the block-clone path returns
+    // earlier and counts zero physical bytes.
+    note_physical_bytes(expect_len);
     Ok(())
 }
 
@@ -734,30 +772,37 @@ fn clone_file_range(src: &Path, dst: &Path, len: u64) -> Result<()> {
     // Verified against the windows crate (Win32/System/Ioctl):
     // FSCTL_DUPLICATE_EXTENTS_TO_FILE = 623428 (0x98344).
     const FSCTL_DUPLICATE_EXTENTS_TO_FILE: u32 = 623428;
-    let params = DuplicateExtents {
-        FileHandle: src_f.as_raw_handle() as isize,
-        SourceFileOffset: 0,
-        TargetFileOffset: 0,
-        ByteCount: len as i64,
-    };
-    let mut returned = 0u32;
-    let ok = unsafe {
-        DeviceIoControl(
-            dst_f.as_raw_handle() as isize,
-            FSCTL_DUPLICATE_EXTENTS_TO_FILE,
-            &params as *const _ as *const core::ffi::c_void,
-            std::mem::size_of::<DuplicateExtents>() as u32,
-            std::ptr::null_mut(),
-            0,
-            &mut returned,
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        return Err(persist_err(format!(
-            "block clone unsupported ({})",
-            std::io::Error::last_os_error()
-        )));
+    // Clone in bounded pieces: some filesystems reject a single giant extent
+    // request while accepting the same bytes in pieces.
+    const CHUNK: u64 = 64 << 20;
+    let mut off = 0u64;
+    while off < len {
+        let n = (len - off).min(CHUNK);
+        let params = DuplicateExtents {
+            FileHandle: src_f.as_raw_handle() as isize,
+            SourceFileOffset: off as i64,
+            TargetFileOffset: off as i64,
+            ByteCount: n as i64,
+        };
+        let mut returned = 0u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                dst_f.as_raw_handle() as isize,
+                FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+                &params as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<DuplicateExtents>() as u32,
+                std::ptr::null_mut::<core::ffi::c_void>(),
+                0,
+                &mut returned,
+                std::ptr::null_mut::<core::ffi::c_void>(),
+            )
+        };
+        if ok == 0 {
+            let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            LAST_CLONE_ERROR.with(|c| c.set(code));
+            return Err(persist_err(format!("block clone unsupported (os {code})")));
+        }
+        off += n;
     }
     Ok(())
 }

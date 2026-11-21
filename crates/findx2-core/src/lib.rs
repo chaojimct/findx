@@ -38,7 +38,8 @@ pub use persist_v6::{
 };
 pub use persist_tx::{
     clear_persist_fault, generation_dir, generation_disk_bytes, has_published, published_path,
-    read_published, set_persist_fault, PersistFault,
+    read_published, set_persist_fault, take_clone_fallbacks, take_commit_physical_bytes,
+    take_last_clone_error, PersistFault,
 };
 
 pub mod platform;

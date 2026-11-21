@@ -1454,8 +1454,11 @@ fn persist_index_locked(
         match writer(&layout, batch)? {
             CommitOutcome::Delta { applied, bytes, generation } => {
                 tracing::debug!(applied, bytes, generation, "Checkpoint delta IO completed");
+                let phys = findx2_core::take_commit_physical_bytes();
+                let fallback = findx2_core::take_clone_fallbacks();
+                let clone_err = findx2_core::take_last_clone_error();
                 crate::win_service::append_service_log(&format!(
-                    "checkpoint delta: {applied} mutations, {bytes} delta bytes, gen {generation}"
+                    "checkpoint delta: {applied} mutations, {bytes} delta bytes, {phys} disk bytes, clone_fallback={fallback} clone_err={clone_err}, gen {generation}"
                 ));
             }
             CommitOutcome::NeedFull { reason } => {
@@ -1466,7 +1469,8 @@ fn persist_index_locked(
                 let store = engine.index_store();
                 let generation = v6_save_full(&layout, &store).map_err(|e| anyhow::anyhow!("{e:#}"))?;
                 info!(generation, "Checkpoint full snapshot IO completed");
-                crate::win_service::append_service_log(&format!("checkpoint full snapshot done, gen {generation}"));
+                let phys = findx2_core::take_commit_physical_bytes();
+                crate::win_service::append_service_log(&format!("checkpoint full snapshot done, gen {generation}, {phys} disk bytes"));
             }
         }
         Ok(())
