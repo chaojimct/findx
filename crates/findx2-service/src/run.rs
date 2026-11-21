@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, RwLock};
@@ -743,8 +743,9 @@ fn usn_watch_loop(
 
     // 脏计数：累计已 apply 但未提交的 ChangeEvent 条数。
     // 纯 Checkpoint（游标推进但无事件）只更新内存里的 last_usn，不触发落盘。
-    // 提交条件 = 脏数达阈值（忙时及时落盘， bound 崩溃回放量）或间隔到（闲时兜底）。
-    // Coalesced metadata delta cost scales with dirty slots, not total corpus size.
+    // 提交条件见 persist_periodic_checkpoint：忙时阈值 + 全局限速（每提交必全量拷段），
+    // 闲时涓流最多 ~10 分钟一次。Coalesced metadata delta cost scales with
+    // dirty slots, not total corpus size.
     let mut dirty_count: usize = 0;
 
     // Checkpoint coverage is independent of consistency; retries retain dirty state.
@@ -1343,20 +1344,53 @@ fn persist_periodic_checkpoint(
     engine: &Arc<SearchEngine>, path: &Path, dirty_count: &mut usize,
     last_save: &mut Instant, save_every: Duration,
 ) -> anyhow::Result<()> {
-    // A busy desktop produces thousands of USN events per minute; a low
-    // threshold turns every few seconds into a full-segment copy storm
-    // (observed ~1 GB per commit on a 9.8M-entry store). 64K events is still
-    // seconds of journal replay after a crash, while quiet machines keep
-    // flushing on the save-every timer below.
+    // A busy desktop produces thousands of USN events per minute, and every
+    // commit copies FULL segments (~1 GB on a 9.8M-entry store: NTFS does not
+    // implement FSCTL_DUPLICATE_EXTENTS_TO_FILE, so the "block clone" path
+    // always falls back to a byte copy — verified rc=50 on every window).
+    // Watch threads are per-volume but each commit writes the whole store,
+    // so the rate limit must be GLOBAL, not per-thread:
+    // - busy (>= THRESHOLD): at most ~1 commit per BUSY_MIN. Crash replay
+    //   stays bounded (threshold events = seconds of journal replay);
+    // - quiet trickle: at most ~1 commit per IDLE_FLUSH. A crash loses at
+    //   most that much re-derivable progress — the FS itself is the source
+    //   of truth (backfill/watcher re-derive), usage stats are auxiliary.
     const THRESHOLD: usize = 65536;
+    const BUSY_MIN: Duration = Duration::from_secs(120);
+    const IDLE_FLUSH: Duration = Duration::from_secs(600);
     if *dirty_count == 0 && !engine.has_pending_persistence() { return Ok(()); }
-    if *dirty_count < THRESHOLD && last_save.elapsed() < save_every { return Ok(()); }
+    let now = commit_clock_ms();
+    let since_last = now.saturating_sub(last_periodic_commit_ms().load(Ordering::Relaxed));
+    let due = if *dirty_count >= THRESHOLD {
+        since_last >= BUSY_MIN.as_millis() as u64
+    } else {
+        last_save.elapsed() >= save_every && since_last >= IDLE_FLUSH.as_millis() as u64
+    };
+    if !due { return Ok(()); }
     if persist_index(engine, path)? {
         *dirty_count = 0;
         *last_save = Instant::now();
+        last_periodic_commit_ms().store(commit_clock_ms(), Ordering::Relaxed);
         if engine.metadata_ready() { maybe_rebuild_trigram(engine, path); }
     }
     Ok(())
+}
+
+/// Process-wide clock (wall millis) of the last successful periodic commit.
+/// Atomic so per-volume watch threads share one rate limit without a lock.
+fn last_periodic_commit_ms() -> &'static AtomicU64 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    &LAST
+}
+fn commit_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+#[cfg(test)]
+pub(crate) fn reset_periodic_commit_clock() {
+    last_periodic_commit_ms().store(0, Ordering::Relaxed);
 }
 
 #[derive(Default)]
@@ -1735,6 +1769,7 @@ mod tests {
     #[test]
     fn checkpoint_periodic_partial_coverage_preserves_namespace_and_cursor() {
         let (path,engine)=checkpoint_fixture("periodic");
+        super::reset_periodic_commit_clock();
         checkpoint_patch(&engine,456);
         engine.set_backfill_error(Some("80 metadata access errors remain".into()));
         engine.apply_volume_batch(b'C',&[findx2_core::ChangeEvent::Create {entry:RawEntry{file_id:2,file_id_128:None,parent_id:100,name:"public-new.txt".into(),size:123,mtime:0,ctime:0,attrs:0,is_dir:false}}],7,200).unwrap();
@@ -1816,6 +1851,7 @@ mod tests {
     #[test]
     fn checkpoint_disk_failure_does_not_end_watcher_and_retry_is_backed_off() {
         let (path,engine)=checkpoint_fixture("periodic-retry");
+        super::reset_periodic_commit_clock();
         checkpoint_patch(&engine,456);
         findx2_core::set_persist_fault(findx2_core::PersistFault::DiskFull { max_bytes: 16 });
         let mut dirty=2;
@@ -1869,6 +1905,7 @@ mod tests {
     #[test]
     fn checkpoint_busy_keeps_dirty_and_clock_and_does_not_drain() {
         let (path,engine)=checkpoint_fixture("busy");
+        super::reset_periodic_commit_clock();
         checkpoint_patch(&engine,456);
         let guard=super::persist_lock().lock().unwrap_or_else(|e|e.into_inner());
         let mut dirty=5;
@@ -1879,6 +1916,50 @@ mod tests {
         assert!(engine.has_pending_persistence());
         drop(guard);
         assert!(super::persist_index(&engine,&path).unwrap());
+        assert_eq!(restored_size(&path),456);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_idle_trickle_commits_at_most_once_per_idle_flush() {
+        // 30 mutations every ~15s must NOT each become a 1 GB commit: the
+        // second due-timer call right after a commit is skipped by the
+        // global clock, dirty state retained for the next window.
+        let (path,engine)=checkpoint_fixture("idle-throttle");
+        super::reset_periodic_commit_clock();
+        checkpoint_patch(&engine,456);
+        let mut dirty=30;
+        let mut last=std::time::Instant::now()-std::time::Duration::from_secs(3600);
+        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
+        assert_eq!(dirty,0,"first due flush must commit");
+        assert_eq!(restored_size(&path),456);
+        checkpoint_patch(&engine,789);
+        dirty=30;
+        last=std::time::Instant::now()-std::time::Duration::from_secs(3600);
+        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
+        assert_eq!(dirty,30,"back-to-back idle flush must be rate-limited");
+        assert_eq!(restored_size(&path),456,"limited flush must not touch disk");
+        assert!(engine.has_pending_persistence());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_threshold_burst_honors_busy_min_interval() {
+        // Even a 64K+ burst commits at most ~1 per BUSY_MIN: full-segment
+        // copies are per-commit, so batching more mutations per commit is
+        // strictly cheaper in disk bytes.
+        let (path,engine)=checkpoint_fixture("busy-throttle");
+        super::reset_periodic_commit_clock();
+        checkpoint_patch(&engine,456);
+        let mut dirty=70000;
+        let mut last=std::time::Instant::now()-std::time::Duration::from_secs(3600);
+        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
+        assert_eq!(dirty,0,"first over-threshold burst must commit");
+        checkpoint_patch(&engine,789);
+        dirty=70000;
+        last=std::time::Instant::now()-std::time::Duration::from_secs(3600);
+        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
+        assert_eq!(dirty,70000,"immediate second burst must wait out BUSY_MIN");
         assert_eq!(restored_size(&path),456);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }

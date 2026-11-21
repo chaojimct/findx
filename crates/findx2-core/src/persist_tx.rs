@@ -1034,6 +1034,26 @@ mod clone_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Production segments are hundreds of MB; the chunked path must handle
+    /// them, not just the sub-chunk fixtures above.
+    #[test]
+    fn clone_large_file_in_chunks_stays_byte_identical() {
+        let dir = scratch("large");
+        // 200 MB patterned content (several 64 MiB clone windows).
+        let mut bytes = Vec::with_capacity(200 << 20);
+        for i in 0..(200 << 20) as u32 {
+            bytes.push((i.wrapping_mul(2654435761) >> 11) as u8);
+        }
+        let src = dir.join("src.dat");
+        std::fs::write(&src, &bytes).unwrap();
+        let dst = dir.join("dst.dat");
+        copy_prefix(&src, &dst, bytes.len() as u64, "large.dat").unwrap();
+        let back = std::fs::read(&dst).unwrap();
+        assert_eq!(back.len(), bytes.len());
+        assert_eq!(back, bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn empty_prefix_is_created_without_io() {
         let dir = scratch("empty");
@@ -1062,14 +1082,19 @@ mod clone_tests {
         std::fs::write(&src, &bytes).unwrap();
         let dst = dir.join("dst.dat");
         let r = clone_file_range(&src, &dst, bytes.len() as u64);
-        // NTFS/ReFS: must succeed. Other filesystems: explicit fallback signal.
-        let fs_kind: String = {
+        // NOTE: pass the volume ROOT — GetVolumeInformationW on a subdirectory
+        // path fails (returns "unknown" and would silently take the fallback
+        // branch below, proving nothing). The root always resolves.
+        let vol_root: Vec<u16> = {
             use std::os::windows::ffi::OsStrExt;
-            let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+            let root = dir.ancestors().find(|a| a.parent().is_none()).unwrap_or(dir.as_path());
+            root.as_os_str().encode_wide().chain(Some(0)).collect()
+        };
+        let fs_kind: String = {
             let mut fs_name = [0u16; 32];
             let ok = unsafe {
                 GetVolumeInformationW(
-                    wide.as_ptr(),
+                    vol_root.as_ptr(),
                     std::ptr::null_mut(),
                     0,
                     std::ptr::null_mut(),
@@ -1085,12 +1110,188 @@ mod clone_tests {
                 String::from_utf16_lossy(&fs_name[..fs_name.iter().position(|&c| c == 0).unwrap_or(0)])
             }
         };
-        if fs_kind == "NTFS" || fs_kind == "ReFS" {
-            assert!(r.is_ok(), "block clone must work on {fs_kind}: {r:?}");
+        println!("fs_kind={fs_kind}");
+        if fs_kind == "ReFS" {
+            // Block clone is a ReFS feature: must succeed there.
+            assert!(r.is_ok(), "block clone must work on ReFS: {r:?}");
             let back = std::fs::read(&dst).unwrap();
             assert_eq!(back, bytes);
         } else {
-            assert!(r.is_err(), "non-cloning FS must report fallback");
+            // NTFS and everything else: clean fallback signal, byte-identical
+            // via the plain copy path (fallback is the production behavior —
+            // verified rc=50 on every window of real 600 MB segments).
+            assert!(r.is_err(), "non-cloning FS must report fallback, got {r:?}");
+            copy_prefix(&src, &dir.join("dst-fallback.dat"), bytes.len() as u64, "test.dat").unwrap();
+            let back = std::fs::read(&dir.join("dst-fallback.dat")).unwrap();
+            assert_eq!(back, bytes);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    fn clone_file_range_at(src: &Path, dst: &Path, off: u64, len: u64) -> Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        let src_f = File::open(src).map_err(|e| io_err(e, "probe open"))?;
+        let dst_f = File::create(dst).map_err(|e| io_err(e, "probe create"))?;
+        #[repr(C)]
+        struct P { h: isize, s: i64, t: i64, n: i64 }
+        let p = P { h: src_f.as_raw_handle() as isize, s: off as i64, t: off as i64, n: len as i64 };
+        let mut r = 0u32;
+        // Same constant as the production path (verified vs windows crate).
+        const FSCTL_DUP: u32 = 623428;
+        let ok = unsafe {
+            DeviceIoControl(
+                dst_f.as_raw_handle() as isize,
+                FSCTL_DUP,
+                &p as *const P as *const core::ffi::c_void,
+                std::mem::size_of::<P>() as u32,
+                std::ptr::null_mut::<core::ffi::c_void>(),
+                0,
+                &mut r,
+                std::ptr::null_mut::<core::ffi::c_void>(),
+            )
+        };
+        if ok == 0 {
+            return Err(persist_err(format!("rc={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1))));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn clone_file_range_at(_src: &Path, _dst: &Path, _off: u64, _len: u64) -> Result<()> {
+        Err(persist_err("n/a"))
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_same_process_compare() {
+        // Replica of the passing ntfs test AND the failing ladder, back to
+        // back in ONE process: if one passes and the other fails here, the
+        // difference is in the files, not the environment.
+        let fs_kind: String = {
+            use std::os::windows::ffi::OsStrExt;
+            let dir = std::env::temp_dir();
+            let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+            let mut fs_name = [0u16; 32];
+            let ok = unsafe {
+                GetVolumeInformationW(
+                    wide.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    fs_name.as_mut_ptr(),
+                    fs_name.len() as u32,
+                )
+            };
+            if ok == 0 { "unknown".into() } else {
+                String::from_utf16_lossy(&fs_name[..fs_name.iter().position(|&c| c == 0).unwrap_or(0)])
+            }
+        };
+        println!("fs_kind={fs_kind}");
+        // Exact replica of block_clone_actually_clones_on_ntfs.
+        let dir = scratch("clone-probe");
+        let mut bytes = Vec::with_capacity(32 << 20);
+        for i in 0..(32 << 20) as u32 {
+            bytes.push((i.wrapping_mul(2654435761) >> 11) as u8);
+        }
+        let src = dir.join("src.dat");
+        std::fs::write(&src, &bytes).unwrap();
+        let dst = dir.join("dst.dat");
+        let r = clone_file_range(&src, &dst, bytes.len() as u64);
+        println!("replica-32MB: {r:?}");
+        // Ladder file in the same process, seconds later.
+        let s4 = dir.join("s4.dat");
+        let b4: Vec<u8> = (0..(4 << 20) as u32).map(|i| (i.wrapping_mul(2654435761) >> 11) as u8).collect();
+        std::fs::write(&s4, &b4).unwrap();
+        let r4 = clone_file_range(&s4, &dir.join("d4.dat"), b4.len() as u64);
+        println!("same-dir-4MB: {r4:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_hardlink_source_clone() {
+        // Does cloning FROM a hardlinked source fail while the identical
+        // bytes via the original path succeed? Production segments are
+        // hardlinks across generations; TEMP fixtures are not.
+        let dir = scratch("hardlink-src");
+        let mut bytes = Vec::with_capacity(4 << 20);
+        for i in 0..(4 << 20) as u32 {
+            bytes.push((i.wrapping_mul(2654435761) >> 11) as u8);
+        }
+        let src = dir.join("src.dat");
+        std::fs::write(&src, &bytes).unwrap();
+        let link = dir.join("link.dat");
+        std::fs::hard_link(&src, &link).unwrap();
+        let via_orig = clone_file_range(&src, &dir.join("dst-orig.dat"), bytes.len() as u64);
+        println!("clone via original path: {via_orig:?}");
+        let via_link = clone_file_range(&link, &dir.join("dst-link.dat"), bytes.len() as u64);
+        println!("clone via hardlink path: {via_link:?}");
+        // Size ladder in the SAME dir: which sizes clone, which fail?
+        for mb in [1u64, 4, 8, 16, 32, 64] {
+            let n = (mb << 20) as usize;
+            let b: Vec<u8> = (0..n as u32).map(|i| (i.wrapping_mul(2654435761) >> 11) as u8).collect();
+            let s = dir.join(format!("s{mb}.dat"));
+            std::fs::write(&s, &b).unwrap();
+            let r = clone_file_range(&s, &dir.join(format!("d{mb}.dat")), b.len() as u64);
+            println!("size {mb}MiB: {r:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_real_segment_clone() {
+        let dir = std::env::temp_dir().join("findx-clone-probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let gendir = std::path::Path::new("C:/ProgramData/FindX/index.bin.v6/gen");
+        let mut gens: Vec<_> = std::fs::read_dir(gendir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .collect();
+        gens.sort_by_key(|e| e.file_name());
+        // Skip in-progress generations (a fresh gen dir briefly contains
+        // 0-byte segments between File::create and copy completion).
+        let latest = gens
+            .iter()
+            .rev()
+            .map(|e| e.path())
+            .find(|p| {
+                std::fs::metadata(p.join("names.dat"))
+                    .map(|m| m.len() > (1 << 20))
+                    .unwrap_or(false)
+            })
+            .expect("no complete generations");
+        for name in ["names.dat", "entries.dat"] {
+            let src = latest.join(name);
+            let meta = std::fs::metadata(&src).unwrap();
+            println!("src={} len={}", src.display(), meta.len());
+            // Try several window sizes at offset 0: a per-call size cap
+            // shows up as small-OK / large-FAIL on the SAME file.
+            for step in [1u64 << 20, 16u64 << 20, 64u64 << 20] {
+                let dst = dir.join(format!("w0-{step}.dat"));
+                match clone_file_range_at(&src, &dst, 0, step.min(meta.len())) {
+                    Ok(()) => println!("  win={step}: OK dstlen={}", std::fs::metadata(&dst).unwrap().len()),
+                    Err(e) => println!("  win={step}: FAIL {e}"),
+                }
+            }
+            // Then sweep 16 MiB windows over the first 300 MiB to catch
+            // offset-dependent failures (bad clusters, sparse holes).
+            let step: u64 = 16 << 20;
+            let mut off = 0u64;
+            while off < meta.len().min(300 << 20) {
+                let n = (meta.len() - off).min(step);
+                let dst = dir.join(format!("w{off}.dat"));
+                match clone_file_range_at(&src, &dst, off, n) {
+                    Ok(()) => println!("  off={off} len={n}: OK dstlen={}", std::fs::metadata(&dst).unwrap().len()),
+                    Err(e) => println!("  off={off} len={n}: FAIL {e}"),
+                }
+                off += n;
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
