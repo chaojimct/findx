@@ -7,6 +7,17 @@ use findx2_gui_native::mock_backend;
 use findx2_gui_native::ui;
 
 fn main() {
+    // A GUI-subsystem process has nowhere to print a panic. Persist every
+    // panic (message + location + backtrace) so a crash is diagnosable from
+    // the log instead of a silent disappearance.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let trace = std::backtrace::Backtrace::force_capture();
+        let text = format!("FindX GUI panic: {info}\n{trace:?}\n");
+        let path = std::env::temp_dir().join("FindX-gui-panic.log");
+        let _ = std::fs::write(&path, text);
+        previous_hook(info);
+    }));
     let mut raw: Vec<String> = std::env::args().collect();
     if raw.get(1).is_some_and(|s|s=="--installer-health") {
         if raw.len()!=3 { std::process::exit(2); }
