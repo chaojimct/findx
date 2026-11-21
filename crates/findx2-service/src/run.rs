@@ -1273,7 +1273,12 @@ fn persist_periodic_checkpoint(
     engine: &Arc<SearchEngine>, path: &Path, dirty_count: &mut usize,
     last_save: &mut Instant, save_every: Duration,
 ) -> anyhow::Result<()> {
-    const THRESHOLD: usize = 4096;
+    // A busy desktop produces thousands of USN events per minute; a low
+    // threshold turns every few seconds into a full-segment copy storm
+    // (observed ~1 GB per commit on a 9.8M-entry store). 64K events is still
+    // seconds of journal replay after a crash, while quiet machines keep
+    // flushing on the save-every timer below.
+    const THRESHOLD: usize = 65536;
     if *dirty_count == 0 && !engine.has_pending_persistence() { return Ok(()); }
     if *dirty_count < THRESHOLD && last_save.elapsed() < save_every { return Ok(()); }
     if persist_index(engine, path)? {

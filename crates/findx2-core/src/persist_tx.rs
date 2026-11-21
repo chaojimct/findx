@@ -29,7 +29,7 @@ pub const F_TRIGRAM: &str = "trigram.dat";
 const FORMAT: &str = "v6-gen";
 const KEEP_GENERATIONS: u64 = 2;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileDigest {
     pub size: u64,
     pub crc32: u32,
@@ -493,6 +493,15 @@ fn materialize(
             if d.size < expect_len { return Err(persist_err(format!("段 {name} 短于 manifest, need full"))); }
         }
         link_or_copy(&src, &dst, false, name, files)?;
+        // A hardlink shares the base inode, so the base digest still
+        // describes these bytes: skip re-reading hundreds of MB just to
+        // recompute an identical crc32. Only reuse when the sizes line up
+        // exactly; anything else keeps the freshly computed digest.
+        if let Some(d) = base.files.get(name) {
+            if d.size == expect_len {
+                files.insert(name.to_string(), d.clone());
+            }
+        }
         return Ok(None);
     }
     // Copy a committed prefix, never share an inode we will mutate.
@@ -658,12 +667,26 @@ fn link_or_copy(src: &Path, dst: &Path, writable: bool, name: &str, files: &mut 
 
 fn copy_prefix(src: &Path, dst: &Path, expect_len: u64, name: &str) -> Result<()> {
     refuse_access(name)?;
-    let mut input = File::open(src).map_err(|e| io_err(e, "open base segment"))?;
-    let src_len = input.metadata().map_err(|e| io_err(e, "stat base segment"))?.len();
+    let src_len = fs::metadata(src).map_err(|e| io_err(e, "stat base segment"))?.len();
     if src_len < expect_len {
         return Err(persist_err(format!("段 {name} 短于 manifest（{src_len} < {expect_len}），need full")));
     }
     account_write(name, expect_len)?;
+    // Fast path: NTFS/ReFS block clone (copy-on-write, near-zero IO for the
+    // prefix; only the subsequent pwrite deltas touch disk). Any failure —
+    // unsupported FS, sparseness, alignment — falls back to the byte copy.
+    // The length check below keeps a short/partial clone from ever passing
+    // as a valid base.
+    if clone_file_range(src, dst, expect_len).is_ok() {
+        let got = fs::metadata(dst).map_err(|e| io_err(e, "stat cloned segment"))?.len();
+        if got == expect_len {
+            let f = open_rw(dst, name)?;
+            f.sync_all().map_err(|e| io_err(e, "sync cow file"))?;
+            return Ok(());
+        }
+        let _ = fs::remove_file(dst);
+    }
+    let mut input = File::open(src).map_err(|e| io_err(e, "open base segment"))?;
     let mut output = File::create(dst).map_err(|e| io_err(e, "create cow file"))?;
     let mut remaining = expect_len;
     let mut buf = [0u8; 64 * 1024];
@@ -675,6 +698,70 @@ fn copy_prefix(src: &Path, dst: &Path, expect_len: u64, name: &str) -> Result<()
     }
     output.sync_all().map_err(|e| io_err(e, "sync cow file"))?;
     Ok(())
+}
+
+/// Best-effort OS block clone of `len` bytes. Returns Err on any problem;
+/// callers must fall back to a plain copy. Non-Windows always falls back.
+#[cfg(windows)]
+fn clone_file_range(src: &Path, dst: &Path, len: u64) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    if len == 0 {
+        File::create(dst).map_err(|e| io_err(e, "create empty cow file"))?;
+        return Ok(());
+    }
+    let src_f = File::open(src).map_err(|e| io_err(e, "open base segment"))?;
+    let src_len = src_f.metadata().map_err(|e| io_err(e, "stat base segment"))?.len();
+    if src_len < len {
+        return Err(persist_err(format!(
+            "block clone source short ({src_len} < {len})"
+        )));
+    }
+    let dst_f = File::create(dst).map_err(|e| io_err(e, "create cow file"))?;
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct DuplicateExtents {
+        FileHandle: isize,
+        SourceFileOffset: i64,
+        TargetFileOffset: i64,
+        ByteCount: i64,
+    }
+    // CTL_CODE(FILE_DEVICE_FILE_SYSTEM=9, func=44, METHOD_BUFFERED, FILE_ANY_ACCESS).
+    const FSCTL_DUPLICATE_EXTENTS_TO_FILE: u32 = (9 << 16) | (44 << 2);
+    let params = DuplicateExtents {
+        FileHandle: src_f.as_raw_handle() as isize,
+        SourceFileOffset: 0,
+        TargetFileOffset: 0,
+        ByteCount: len as i64,
+    };
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            dst_f.as_raw_handle() as isize,
+            FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+            &params as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<DuplicateExtents>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(persist_err(format!(
+            "block clone unsupported ({})",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn clone_file_range(_src: &Path, _dst: &Path, len: u64) -> Result<()> {
+    if len == 0 {
+        // Zero-length segments still need the file to exist; callers create
+        // it themselves on the fallback path, so report "unsupported" here.
+    }
+    Err(persist_err("block clone unsupported on this platform"))
 }
 
 fn open_rw(path: &Path, name: &str) -> Result<File> {
@@ -826,4 +913,96 @@ extern "system" {
     ) -> isize;
     fn FlushFileBuffers(h: isize) -> i32;
     fn CloseHandle(h: isize) -> i32;
+    fn DeviceIoControl(
+        h_device: isize,
+        dw_io_control_code: u32,
+        lp_in_buffer: *const core::ffi::c_void,
+        n_in_buffer_size: u32,
+        lp_out_buffer: *mut core::ffi::c_void,
+        n_out_buffer_size: u32,
+        lp_bytes_returned: *mut u32,
+        lp_overlapped: *mut core::ffi::c_void,
+    ) -> i32;
+}
+
+#[cfg(test)]
+mod clone_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "findx-clone-{}-{}",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn copy_prefix_is_byte_identical_with_or_without_block_clone() {
+        let dir = scratch("roundtrip");
+        // Patterned content larger than one copy chunk, odd size.
+        let mut bytes = Vec::with_capacity(300_000);
+        for i in 0..300_000u32 {
+            bytes.push((i.wrapping_mul(2654435761) >> 13) as u8);
+        }
+        let src = dir.join("src.dat");
+        std::fs::write(&src, &bytes).unwrap();
+        let dst = dir.join("dst.dat");
+        copy_prefix(&src, &dst, bytes.len() as u64, "test.dat").unwrap();
+        let back = std::fs::read(&dst).unwrap();
+        assert_eq!(back, bytes);
+        // Short manifest must refuse, never truncate silently.
+        assert!(copy_prefix(&src, &dir.join("short.dat"), bytes.len() as u64 + 1, "test.dat").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clone_short_source_is_a_clean_error() {
+        let dir = scratch("short");
+        let src = dir.join("src.dat");
+        std::fs::write(&src, b"12345678").unwrap();
+        // Direct clone of more bytes than exist must fail so the caller
+        // falls back instead of publishing a short segment.
+        assert!(clone_file_range(&src, &dir.join("dst.dat"), 16).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_prefix_is_created_without_io() {
+        let dir = scratch("empty");
+        let src = dir.join("src.dat");
+        std::fs::write(&src, b"").unwrap();
+        let dst = dir.join("dst.dat");
+        copy_prefix(&src, &dst, 0, "empty.dat").unwrap();
+        assert_eq!(std::fs::metadata(&dst).unwrap().len(), 0);
+        let mut probe = Vec::new();
+        File::open(&dst).unwrap().read_to_end(&mut probe).unwrap();
+        assert!(probe.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn digest_reuse_matches_fresh_digest_for_hardlinked_segment() {
+        let dir = scratch("digest");
+        let bytes: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let src = dir.join("seg.dat");
+        {
+            let mut f = File::create(&src).unwrap();
+            f.write_all(&bytes).unwrap();
+            f.sync_all().unwrap();
+        }
+        let dst = dir.join("seg-copy.dat");
+        fs::hard_link(&src, &dst).unwrap();
+        let fresh = digest_file(&dst).unwrap();
+        let base = FileDigest { size: fresh.size, crc32: fresh.crc32 };
+        // Same bytes through the link: reusing the base digest must equal a
+        // fresh read. This is what materialize() now relies on.
+        assert_eq!(base, digest_file(&src).unwrap());
+        assert_eq!(base.size as usize, bytes.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
