@@ -47,7 +47,7 @@ fn backfill_enabled() -> bool {
 /// overlay.put 是 atomic store，无锁；这里大小只影响日志/进度更新粒度。
 const OVERLAY_BATCH: usize = 8_192;
 
-pub(crate) fn spawn_backfill(engine: Arc<SearchEngine>, index_path: std::path::PathBuf) {
+pub(crate) fn spawn_backfill(engine: Arc<SearchEngine>, index_path: std::path::PathBuf, stop: Arc<AtomicBool>) {
     if !backfill_enabled() {
         info!("后台元数据回填已禁用（FINDX2_DISABLE_BACKFILL=1）");
         engine.set_backfill_error(Some(
@@ -73,7 +73,7 @@ pub(crate) fn spawn_backfill(engine: Arc<SearchEngine>, index_path: std::path::P
         .spawn(move || {
             let mut lifecycle=lifecycle.map(|p|p.activate());
             let _guard = BackfillRunningGuard;
-            let result=backfill_loop(engine.clone(),index_path);
+            let result=backfill_loop(engine.clone(),index_path,stop);
             match &result{Ok(())=>crate::runtime_lifecycle::success_optional(&mut lifecycle),Err(e)=>crate::runtime_lifecycle::error_optional(&mut lifecycle,e.to_string())}
             if let Err(e)=result {
                 error!("元数据回填线程退出: {e}");
@@ -436,7 +436,7 @@ fn delete_overlay_sidecar(index_path: &std::path::Path) {
 }
 
 #[cfg(windows)]
-fn backfill_loop(engine:Arc<SearchEngine>,index_path:std::path::PathBuf)->anyhow::Result<()> {
+fn backfill_loop(engine:Arc<SearchEngine>,index_path:std::path::PathBuf,stop:Arc<AtomicBool>)->anyhow::Result<()> {
     use crate::metadata_pipeline::{Limits,ticket_pass};
     use findx2_windows::{DirMetadataReader,fill_metadata_by_id_pooled};
     let epoch=engine.metadata_epoch();
@@ -444,7 +444,7 @@ fn backfill_loop(engine:Arc<SearchEngine>,index_path:std::path::PathBuf)->anyhow
     engine.set_backfill_error(None);engine.set_backfill_total(coverage.unknown as u64);
     let workers=std::thread::available_parallelism().map(|n|n.get()/2).unwrap_or(2).clamp(1,4);
     let limits=Limits{workers,..Limits::default()};
-    let cancel=Arc::new(AtomicBool::new(false));
+    let cancel=stop.clone();
     let dirs=engine.index_store().dirs.len();
     let mut reader:Option<(u8,DirMetadataReader)>=None;
     let mut selected_volume=None;let mut failed_volumes=[false;256];
@@ -452,7 +452,10 @@ fn backfill_loop(engine:Arc<SearchEngine>,index_path:std::path::PathBuf)->anyhow
     // One serial streaming reader keeps observation ordering sound and reserves
     // bounded memory even for a giant directory. File-ID fallback uses a separate
     // bounded IO pool, never Rayon's search pool. No repeated directory rescans.
+    // Shutdown must not wait out a multi-hour backfill: check the stop flag per
+    // directory and resume next start (metadata_ready stays false).
     for di in 0..dirs {
+        if cancel.load(Ordering::Acquire){info!("后台回填被停机请求中断，下次启动继续");return Ok(());}
         let Some((volume,frn))=engine.pending_metadata_directory(epoch,di).map_err(anyhow::Error::msg)? else{continue};
         if failed_volumes[volume as usize]{directory_errors+=1;continue;}
         if selected_volume!=Some(volume){

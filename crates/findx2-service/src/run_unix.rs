@@ -116,7 +116,7 @@ pub(crate) fn run_foreground(
             "元数据回填已关闭（设置或 --no-backfill）；时间与大小筛选可能不准".into(),
         ));
     } else {
-        crate::backfill::spawn_backfill(engine.clone(), index.clone());
+        crate::backfill::spawn_backfill(engine.clone(), index.clone(), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
     }
 
     let volume = normalize_unix_volume(&volume);

@@ -473,7 +473,7 @@ pub(crate) fn run_foreground(
             "元数据回填已关闭（设置或 --no-backfill）；时间与大小筛选可能不准".into(),
         ));
     } else {
-        crate::backfill::spawn_backfill(engine.clone(), index.clone());
+        crate::backfill::spawn_backfill(engine.clone(), index.clone(), stop.clone());
     }
 
     let volumes_watch: Vec<(String, u8)> = {
@@ -560,6 +560,7 @@ pub(crate) fn run_foreground(
         std::thread::sleep(Duration::from_millis(50));
     }
     info!("Shutdown requested; waiting for watch workers without forced termination");
+    crate::win_service::append_service_log("STOP: waiting for watch workers");
     let mut worker_errors = Vec::new();
     for h in usn_handles {
         // Do not detach unfinished writers on a deadline. SCM renews StopPending;
@@ -570,6 +571,7 @@ pub(crate) fn run_foreground(
             Err(_) => worker_errors.push("watch worker panicked during shutdown".into()),
         }
     }
+    crate::win_service::append_service_log("STOP: watch workers joined");
     // An uncertain committed outcome MUST NOT unwind Owner/drop its RAM/fences.
     // A real joined worker failure is permanent until explicit operator recovery;
     // transient receipt/pointer IO is retried while the same sealed RAM lives.
@@ -614,20 +616,29 @@ pub(crate) fn run_foreground(
         error!("{msg}");
         crate::win_service::append_service_log(msg);
     }
-    // A successful IO observation is NOT an upgrade receipt: metadata/backfill/
-    // stat producers still need a shared admission fence and drain in the next step.
-    // Bounded: a dead disk must surface as an honest failure, not a hung STOP.
+    // A successful IO observation is NOT an upgrade receipt, but a plain STOP
+    // carries none either: persist best-effort and leave. Anything still dirty
+    // replays from the USN journal next start. Only genuine IO failure keeps
+    // the process alive with a nonzero exit; a moving target never does.
     let mut persist_tries = 0u32;
     loop {
-        let result = persist_shutdown_best_effort(&engine, &index);
-        match crate::shutdown::require_checkpoint_result(result, || engine.has_pending_persistence()) {
-            Ok(())=>break,
-            Err(e)=>{
-                persist_tries+=1;
-                let msg=format!("STOP PENDING: save failed ({persist_tries}/6), RAM/IPC retained; retrying, NO ACK: {e}");
+        match persist_shutdown_best_effort(&engine, &index) {
+            Ok(_) => {
+                if engine.has_pending_persistence() {
+                    let msg = "STOP: best-effort checkpoint done; newer deltas remain, USN replay covers them";
+                    info!("{msg}");
+                    crate::win_service::append_service_log(msg);
+                }
+                break;
+            }
+            Err(e) => {
+                persist_tries += 1;
+                let msg = format!("STOP PENDING: save failed ({persist_tries}/6), retrying: {e}");
                 error!("{msg}");
                 crate::win_service::append_service_log(&msg);
-                if persist_tries>=6{anyhow::bail!("shutdown checkpoint failed after retries; RAM retained, no ACK: {e}");}
+                if persist_tries >= 6 {
+                    anyhow::bail!("shutdown checkpoint failed after retries: {e:#}");
+                }
                 std::thread::sleep(Duration::from_secs(5));
             }
         }
@@ -1170,7 +1181,8 @@ fn rebuild_volume(
         "单卷重建后边车重建",
     );
     // 合并后 metadata_ready=false（fast 重枚举），必须重新拉起回填；旧 overlay 下标已失效。
-    crate::backfill::spawn_backfill(Arc::clone(engine), index_path.to_path_buf());
+    // 重建线程没有停机标志，传一个永远不会置位的 dummy（与主流程回填语义一致：可中断、可重入）。
+    crate::backfill::spawn_backfill(Arc::clone(engine), index_path.to_path_buf(), Arc::new(AtomicBool::new(false)));
     info!("卷 {letter} 重建完成（frozen={frozen}），恢复增量监听");
     Ok(())
 }
