@@ -358,6 +358,12 @@ fn commit_delta_into(
     for mut_ in &batch.mutations {
         match mut_ {
             Mutation::FullResync => return Err(persist_err("batch 含 FullResync, need full")),
+            // Bounds use the RUNNING cursor (base + pushes already applied in
+            // this commit), not the base counts: a temp file created and
+            // deleted inside one batch window legitimately references an entry
+            // the base generation does not have yet. Judging those against the
+            // base forced a full snapshot on every busy commit. Truly bogus
+            // indices still fail here, and the tail check pins the final shape.
             Mutation::MetadataBatch(patches) => {
                 for (idx, data) in patches {
                     if *idx as usize >= cur_e { return Err(persist_err("metadata batch slot out of bounds, need full")); }
@@ -369,7 +375,7 @@ fn commit_delta_into(
             }
             Mutation::Meta { idx, size, mtime, ctime } => {
                 let idx = *idx as usize;
-                if idx >= m.entry_count { return Err(persist_err(format!("Meta idx {idx} 越界, need full"))); }
+                if idx >= cur_e { return Err(persist_err(format!("Meta idx {idx} 越界, need full"))); }
                 let mut b = [0u8; 16];
                 b[0..8].copy_from_slice(&size.to_le_bytes());
                 b[8..12].copy_from_slice(&mtime.to_le_bytes());
@@ -379,14 +385,14 @@ fn commit_delta_into(
             }
             Mutation::PatchEntry { idx, entry } => {
                 let idx = *idx as usize;
-                if idx >= m.entry_count { return Err(persist_err(format!("PatchEntry idx {idx} 越界, need full"))); }
+                if idx >= cur_e { return Err(persist_err(format!("PatchEntry {idx} 越界, need full"))); }
                 let b = crate::persist::file_entry_to_disk_bytes_v5(entry);
                 pwrite(fe.as_mut().unwrap(), (idx * ENTRY_SIZE) as u64, &b, F_ENTRIES)?;
                 bytes += ENTRY_SIZE as u64;
             }
             Mutation::PatchDir { di, dir } => {
                 let di = *di as usize;
-                if di >= m.dir_count { return Err(persist_err(format!("PatchDir {di} 越界, need full"))); }
+                if di >= cur_d { return Err(persist_err(format!("PatchDir {di} 越界, need full"))); }
                 let b = crate::persist::dir_entry_to_bytes(dir);
                 pwrite(fd.as_mut().unwrap(), (di * DIR_SIZE) as u64, &b, F_DIRS)?;
                 bytes += DIR_SIZE as u64;
@@ -413,7 +419,7 @@ fn commit_delta_into(
             }
             Mutation::RepathFile { idx, entry, name } => {
                 let idx = *idx as usize;
-                if idx >= m.entry_count { return Err(persist_err(format!("RepathFile idx {idx} 越界, need full"))); }
+                if idx >= cur_e { return Err(persist_err(format!("RepathFile idx {idx} 越界, need full"))); }
                 append_name(&mut fn_, entry.name_offset, name, &mut bytes)?;
                 let b = crate::persist::file_entry_to_disk_bytes_v5(entry);
                 pwrite(fe.as_mut().unwrap(), (idx * ENTRY_SIZE) as u64, &b, F_ENTRIES)?;
@@ -421,7 +427,7 @@ fn commit_delta_into(
             }
             Mutation::RepathDir { idx, di, entry, dir, name } => {
                 let (idx, di) = (*idx as usize, *di as usize);
-                if idx >= m.entry_count || di >= m.dir_count { return Err(persist_err(format!("RepathDir {idx}/{di} 越界, need full"))); }
+                if idx >= cur_e || di >= cur_d { return Err(persist_err(format!("RepathDir {idx}/{di} 越界, need full"))); }
                 append_name(&mut fn_, entry.name_offset, name, &mut bytes)?;
                 let eb = crate::persist::file_entry_to_disk_bytes_v5(entry);
                 pwrite(fe.as_mut().unwrap(), (idx * ENTRY_SIZE) as u64, &eb, F_ENTRIES)?;
@@ -1062,6 +1068,89 @@ mod clone_tests {
         // fresh read. This is what materialize() now relies on.
         assert_eq!(base, digest_file(&src).unwrap());
         assert_eq!(base.size as usize, bytes.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Temp-file churn (create + delete inside one commit window) must stay a
+    /// delta. The old base-count bounds check misread the new slot as
+    /// out-of-bounds and forced a full snapshot on every busy commit.
+    #[test]
+    fn same_batch_push_then_patch_commits_as_delta() {
+        use crate::index::FileEntry;
+        use crate::{IndexBuilder, RawEntry, V6Layout};
+        let dir = scratch("churn");
+        let root = dir.join("idx");
+        let layout = V6Layout::for_index(&root);
+        let raw_file = |id: u64, parent: u64, name: &str| RawEntry {
+            file_id: id,
+            file_id_128: None,
+            parent_id: parent,
+            name: name.into(),
+            size: 10,
+            mtime: 1,
+            ctime: 1,
+            attrs: 0,
+            is_dir: false,
+        };
+        let raw_dir = |id: u64, parent: u64, name: &str| RawEntry {
+            file_id: id,
+            file_id_128: None,
+            parent_id: parent,
+            name: name.into(),
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            attrs: 0x10,
+            is_dir: true,
+        };
+        let store = IndexBuilder::new(b'F', 1, 7, 10)
+            .build_from_raw(vec![raw_file(2, 1, "kept.bin")], vec![raw_dir(1, 0, "root")], true)
+            .unwrap();
+        super::save_full_generation(&layout, &store).unwrap();
+        let base_entries = store.entries.len();
+        let base_names = store.names_buf.len();
+        // Simulate one batch window: temp file created, then deleted again.
+        let name = b"tmp.bin".to_vec();
+        let entry = FileEntry {
+            size: 123,
+            mtime: 2,
+            ctime: 2,
+            name_offset: base_names as u32,
+            dir_idx: 0,
+            attrs: 0x20,
+            n_len: name.len() as u16,
+            _pad: 0,
+        };
+        let mut deleted = entry;
+        deleted.attrs |= FileEntry::ATTR_DELETED;
+        let batch = CommitBatch {
+            mutations: vec![
+                Mutation::PushFile { entry, frn: 4242, name: name.clone() },
+                Mutation::PatchEntry { idx: base_entries as u32, entry: deleted },
+            ],
+            entry_count: base_entries + 1,
+            dir_count: store.dirs.len(),
+            names_len: base_names + name.len() + 1,
+            dir_paths_len: store.dir_paths_buf.len(),
+            metadata_ready: store.metadata_ready,
+            volumes: store.volumes.clone(),
+            tri_pending: Default::default(),
+            tri_snap: 0,
+            has_trigram: false,
+        };
+        match super::try_commit_generation(&layout, &batch).unwrap() {
+            CommitOutcome::Delta { applied, bytes, .. } => {
+                assert_eq!(applied, 2);
+                assert!(bytes < 1024, "delta must stay small, got {bytes}");
+            }
+            CommitOutcome::NeedFull { reason } => {
+                panic!("same-batch push+patch must not force a full snapshot: {reason}")
+            }
+        }
+        // The tombstone round-trips through load.
+        let reloaded = crate::persist_v6::v6_load(&layout).unwrap();
+        assert_eq!(reloaded.entries.len(), base_entries + 1);
+        assert_ne!(reloaded.entries[base_entries].attrs & FileEntry::ATTR_DELETED, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
