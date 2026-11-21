@@ -725,8 +725,9 @@ fn clone_file_range(src: &Path, dst: &Path, len: u64) -> Result<()> {
         TargetFileOffset: i64,
         ByteCount: i64,
     }
-    // CTL_CODE(FILE_DEVICE_FILE_SYSTEM=9, func=44, METHOD_BUFFERED, FILE_ANY_ACCESS).
-    const FSCTL_DUPLICATE_EXTENTS_TO_FILE: u32 = (9 << 16) | (44 << 2);
+    // Verified against the windows crate (Win32/System/Ioctl):
+    // FSCTL_DUPLICATE_EXTENTS_TO_FILE = 623428 (0x98344).
+    const FSCTL_DUPLICATE_EXTENTS_TO_FILE: u32 = 623428;
     let params = DuplicateExtents {
         FileHandle: src_f.as_raw_handle() as isize,
         SourceFileOffset: 0,
