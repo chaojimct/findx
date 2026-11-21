@@ -25,7 +25,11 @@ impl MainWindow {
  fn inspector_request(&mut self,seed:Snapshot,cx:&mut Context<Self>){
   let Some(request)=self.workspace.inspector.begin(seed.clone())else{cx.notify();return};
   if !self.workspace.engine_usage||!seed.node().directory{let mut ready=seed;ready.issue=None;self.workspace.inspector.finish(&request,ready);cx.notify();return}
-  let cache=self.workspace.usage_page_cache.clone();let session=self.session.read(cx);let ipc=session.ipc.clone();let endpoint=session.endpoint.clone();let expected=seed.scan.logical_generation;
+  let cache=self.workspace.usage_page_cache.clone();let session=self.session.read(cx);let ipc=session.ipc.clone();let endpoint=session.endpoint.clone();
+  // The home scene aggregates volumes without one runtime generation; its
+  // (0, 0) stamp must never be sent as a server precondition.
+  let home=seed.scan.nodes.first().is_some_and(|n|super::is_home_path(&n.path));
+  let expected=if home{None}else{seed.scan.logical_generation};
   cx.spawn(async move|this,cx|{
    if request.cancel.load(Ordering::Acquire){return}
    let path=display_path(&request.path);let cancel=request.cancel.clone();

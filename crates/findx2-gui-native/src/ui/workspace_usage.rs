@@ -803,7 +803,7 @@ impl MainWindow {
                 scan.nodes.get(i).map(|n| {
                     format!(
                         "{}\n{}  {}{}",
-                        display_path(&n.path),
+                        home_display_name(&n.path),
                         disk_usage::format_bytes(scan.weight(n)),
                         if n.directory { "目录" } else { "文件" },
                         if n.uncertain {

@@ -99,6 +99,22 @@ fn key(p: &Path) -> String {
         .trim_end_matches('\\')
         .to_lowercase()
 }
+/// Home ("此电脑") overview scope: a virtual location above all volumes.
+/// It is never sent to the engine; navigation branches to load_home_overview.
+pub(crate) const HOME_PATH: &str = "findx-home";
+pub(crate) const HOME_LABEL: &str = "此电脑";
+pub(crate) fn is_home_path(p: &Path) -> bool {
+    key(p) == HOME_PATH
+}
+pub(crate) fn home_display_name(p: &Path) -> String {
+    if is_home_path(p) {
+        HOME_LABEL.into()
+    } else {
+        p.file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| display_path(p))
+    }
+}
 fn root_hit(path: &Path) -> SearchHitDto {
     SearchHitDto {
         entry_idx: 0,
@@ -1005,7 +1021,11 @@ impl MainWindow {
     }
     fn update_location_input(&self, cx: &mut Context<Self>) {
         let input = self.workspace.path.clone();
-        let text = display_path(&self.workspace.location);
+        let text = if is_home_path(&self.workspace.location) {
+            HOME_LABEL.into()
+        } else {
+            display_path(&self.workspace.location)
+        };
         let _ = self.workspace.window.update(cx, move |_, w, cx| {
             input.update(cx, |i, cx| i.set_value(text, w, cx))
         });
@@ -1317,7 +1337,11 @@ impl MainWindow {
             self.workspace.engine_generation = None;
             self.workspace.scan_status = "正在读取索引目录（最长 45 秒，可取消）".into();
             self.set_workspace_rows(vec![], None, false, cx);
-            self.load_engine_usage(false, cx);
+            if is_home_path(&self.workspace.location) {
+                self.load_home_overview(cx);
+            } else {
+                self.load_engine_usage(false, cx);
+            }
             cx.notify();
             return;
         }
@@ -1855,10 +1879,18 @@ impl MainWindow {
                 drop(lookup);
             })
             .detach();
-        self.load_engine_usage(false, cx);
+        if is_home_path(&self.workspace.location) {
+            self.load_home_overview(cx);
+        } else {
+            self.load_engine_usage(false, cx);
+        }
         cx.notify();
     }
     pub(super) fn adjust_usage_depth(&mut self, step:isize,cx:&mut Context<Self>) {
+        if is_home_path(&self.workspace.location) {
+            // The overview is always one level (volumes); depth is meaningless here.
+            return;
+        }
         let target=(self.workspace.usage_depth as isize+step).clamp(1,6) as usize;
         if target==self.workspace.usage_depth{return}
         self.workspace.usage_depth=target;
@@ -1874,10 +1906,218 @@ impl MainWindow {
     }
     fn refresh_usage_volume(&mut self,cx:&mut Context<Self>){
         if self.workspace.mode != ViewMode::Usage{return}
+        if is_home_path(&self.workspace.location) {
+            // Capacity for each volume tile fills in gradually, not one virtual path.
+            self.refresh_home_volumes(cx);
+            return;
+        }
         let Some(query)=self.workspace.usage_volume.begin(&self.workspace.location)else{return};
         let path=query.path.clone();
         let worker=cx.background_executor().spawn(async move{crate::usage_volume::query(&path)});
         cx.spawn(async move|this,cx|{let result=worker.await;let _=this.update(cx,|this,cx|{this.workspace.usage_volume.finish(query,result);cx.notify();});}).detach();
+    }
+    /// Volumes for the home overview, in stable sorted order.
+    fn available_volume_roots(&self, cx: &App) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = {
+            let session_roots = self.session.read(cx).available_roots.clone();
+            let list = if session_roots.is_empty() {
+                crate::prefs::list_available_roots()
+            } else {
+                session_roots
+            };
+            list.into_iter().map(PathBuf::from).collect()
+        };
+        roots.sort_by(|a, b| {
+            display_path(a)
+                .to_ascii_lowercase()
+                .cmp(&display_path(b).to_ascii_lowercase())
+        });
+        roots.dedup_by(|a, b| key(a) == key(b));
+        roots
+    }
+    /// System capacity for home tiles fills in gradually: one outstanding OS
+    /// query at most, the rest on later ticks. Never blocks the overview.
+    fn refresh_home_volumes(&mut self, cx: &mut Context<Self>) {
+        if self.workspace.mode != ViewMode::Usage || !is_home_path(&self.workspace.location) {
+            return;
+        }
+        for root in self.available_volume_roots(cx) {
+            if self.workspace.usage_volume.get(&root).is_some() {
+                continue;
+            }
+            let Some(query) = self.workspace.usage_volume.begin(&root) else {
+                return;
+            };
+            let path = query.path.clone();
+            let worker = cx
+                .background_executor()
+                .spawn(async move { crate::usage_volume::query(&path) });
+            cx.spawn(async move |this, cx| {
+                let result = worker.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.workspace.usage_volume.finish(query, result);
+                    cx.notify();
+                });
+            })
+            .detach();
+            return;
+        }
+    }
+    /// Home ("此电脑") overview: one tile per volume root, sized by each
+    /// volume's indexed logical total. One small page per volume (root totals
+    /// only); a volume that fails is skipped and the scene is marked partial.
+    fn load_home_overview(&mut self, cx: &mut Context<Self>) {
+        self.refresh_home_volumes(cx);
+        if self.workspace.engine_busy {
+            return;
+        }
+        self.workspace.engine_busy = true;
+        self.workspace.engine_cancel.store(true, Ordering::Release);
+        self.workspace.engine_cancel = Arc::new(AtomicBool::new(false));
+        let cancel = self.workspace.engine_cancel.clone();
+        self.workspace.scan_generation = self.workspace.scan_generation.wrapping_add(1);
+        let request_started = std::time::Instant::now();
+        let request_generation = self.workspace.scan_generation;
+        let requested = self.workspace.location.clone();
+        let roots = self.available_volume_roots(cx);
+        let session = self.session.read(cx);
+        let ipc = session.ipc.clone();
+        let endpoint = session.endpoint.clone();
+        cx.spawn(async move |this, cx| {
+            let result: Result<crate::disk_usage::Scan, String> = async {
+                let mut volumes = Vec::new();
+                let mut failed = 0usize;
+                let mut first_error: Option<String> = None;
+                for root in &roots {
+                    crate::indexed_usage::ensure_not_cancelled(&cancel)?;
+                    let path = display_path(root);
+                    let response = ipc
+                        .request_cancellable(
+                            endpoint.clone(),
+                            findx2_ipc::IpcRequest::UsageChildren {
+                                path: path.clone(),
+                                expected: None,
+                                after: None,
+                                max_bytes: 2048,
+                            },
+                            cancel.clone(),
+                        )
+                        .await
+                        .map_err(|_| "全览请求已取消".to_string())??;
+                    match response {
+                        findx2_ipc::IpcResponse::UsageChildrenResult { page } => {
+                            if !page.root.directory {
+                                failed += 1;
+                                continue;
+                            }
+                            volumes.push((
+                                root.clone(),
+                                page.root,
+                                page.watch_error.is_some() || page.metadata_error.is_some(),
+                            ));
+                        }
+                        findx2_ipc::IpcResponse::Error { message } => {
+                            failed += 1;
+                            first_error = first_error.or(Some(message));
+                        }
+                        _ => {
+                            failed += 1;
+                            first_error = first_error.or(Some("全览响应不兼容".into()));
+                        }
+                    }
+                }
+                if volumes.is_empty() {
+                    return Err(first_error.unwrap_or_else(|| "无可用磁盘索引".into()));
+                }
+                // Largest first: deterministic treemap before layout sorts.
+                volumes.sort_by(|a, b| b.1.logical.cmp(&a.1.logical));
+                let partial = failed > 0 || volumes.iter().any(|v| v.2);
+                let items: Vec<(PathBuf, findx2_ipc::UsageItemDto)> = volumes
+                    .into_iter()
+                    .map(|(path, item, _)| (path, item))
+                    .collect();
+                Ok(crate::indexed_usage::scan_from_volumes(
+                    PathBuf::from(HOME_PATH),
+                    &items,
+                    partial,
+                ))
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                if crate::isolation::development_var_os("FINDX_NATIVE_USAGE_TRACE").is_some() {
+                    eprintln!("home_completion token={} current={} requested={:?} current_path={:?} cancelled={} error={:?} elapsed_ms={}",request_generation,this.workspace.scan_generation,requested,this.workspace.location,cancel.load(Ordering::Acquire),result.as_ref().err(),request_started.elapsed().as_millis());
+                }
+                if !crate::indexed_usage::request_is_current(
+                    this.workspace.scan_generation,
+                    request_generation,
+                    &this.workspace.location,
+                    &requested,
+                    cancel.load(Ordering::Acquire),
+                ) {
+                    return;
+                }
+                this.workspace.engine_busy = false;
+                if !this.workspace.engine_usage
+                    || this.workspace.mode != ViewMode::Usage
+                    || this.workspace.location != requested
+                {
+                    return;
+                }
+                let scan = match result {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if this.workspace.usage_pending_from.is_some()
+                            || this.workspace.usage_depth_pending
+                        {
+                            this.cancel_engine_usage(cx);
+                        }
+                        this.workspace.scan_stale = true;
+                        this.workspace.scan_status = format!("全览读取失败：{e}");
+                        this.workspace.engine_checked = false;
+                        cx.notify();
+                        return;
+                    }
+                };
+                this.workspace.engine_checked = true;
+                // No single generation covers the aggregate; per-volume reads
+                // below always go out with no precondition.
+                this.workspace.engine_generation = None;
+                this.workspace.engine_next = None;
+                this.workspace.usage_loaded_depth = 1;
+                this.workspace.usage_more_depth = false;
+                this.workspace.usage_blocked_paths = Default::default();
+                this.workspace.scan_stale = scan.partial;
+                let volumes = scan.nodes.len().saturating_sub(1);
+                this.workspace.scan_status = format!(
+                    "全览  {volumes} 个磁盘（索引逻辑合计）；双击磁盘进入，面包屑 > 可切换{}",
+                    if scan.partial {
+                        "；部分磁盘未就绪"
+                    } else {
+                        ""
+                    }
+                );
+                match fallible_usage_lookup(&scan) {
+                    Ok(lookup) => this.workspace.scan_lookup = lookup,
+                    Err(e) => {
+                        this.workspace.scan_status = e;
+                        cx.notify();
+                        return;
+                    }
+                }
+                this.workspace.usage_tree_revision =
+                    this.workspace.usage_tree_revision.wrapping_add(1);
+                this.workspace.scan = Some(Arc::new(scan));
+                this.workspace.usage_scene_scan = this.workspace.scan.clone();
+                this.workspace.usage_scene_key = None;
+                this.workspace.usage_scene_generation += 1;
+                let focus = this.workspace.usage_focus.clone();
+                this.show_scanned_directory(focus, cx);
+                this.workspace.status = "全览显示各盘索引逻辑大小；选中磁盘见右侧系统卷容量".into();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
     fn load_engine_usage(&mut self, next: bool, cx: &mut Context<Self>) {
         self.refresh_usage_volume(cx);

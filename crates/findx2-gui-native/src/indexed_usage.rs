@@ -50,6 +50,80 @@ pub fn scan_from_page(page: &findx2_ipc::UsagePageDto, requested: PathBuf) -> Sc
 pub fn ensure_not_cancelled(cancel:&std::sync::atomic::AtomicBool)->Result<(),String>{
  if cancel.load(std::sync::atomic::Ordering::Acquire){Err("usage request cancelled".into())}else{Ok(())}
 }
+/// Home ("此电脑") overview scene: one tile per volume root, sized by each
+/// volume's indexed logical total. No single engine generation covers the
+/// aggregate, so the stamp is (0, 0): indexed classification without
+/// pretending consistency with any one runtime. Every drill-down, sibling
+/// menu and inspector request re-reads its real volume path with no
+/// precondition, so per-volume freshness never inherits this stamp.
+pub fn scan_from_volumes(home: PathBuf, volumes: &[(PathBuf, findx2_ipc::UsageItemDto)], partial: bool) -> Scan {
+    let convert =
+        |n: &findx2_ipc::UsageItemDto, path: PathBuf, parent: Option<usize>| {
+            disk_usage::Node {
+                path,
+                parent,
+                children: vec![],
+                entries: n.files + n.directories,
+                files: n.files,
+                directories: n.directories,
+                category: 0,
+                own_allocated: 0,
+                directory: n.directory,
+                logical: n.logical,
+                mtime: 0,
+                allocated: 0,
+                hardlink_duplicate: false,
+                uncertain: n.unknown > 0,
+            }
+        };
+    let mut nodes = Vec::with_capacity(volumes.len() + 1);
+    nodes.push(disk_usage::Node {
+        path: home,
+        parent: None,
+        children: (1..=volumes.len()).collect(),
+        entries: 0,
+        files: 0,
+        directories: 0,
+        category: 0,
+        own_allocated: 0,
+        directory: true,
+        logical: 0,
+        mtime: 0,
+        allocated: 0,
+        hardlink_duplicate: false,
+        uncertain: false,
+    });
+    let mut unknown = 0u64;
+    for (path, item) in volumes {
+        nodes.push(convert(item, path.clone(), Some(0)));
+        unknown += item.unknown;
+        let root = &mut nodes[0];
+        root.files += item.files;
+        // Each volume root is itself one directory on top of its subdirectories.
+        root.directories += item.directories + 1;
+        root.entries = root.files + root.directories;
+        root.logical += item.logical;
+        root.uncertain |= item.unknown > 0;
+    }
+    nodes[0].uncertain |= partial;
+    Scan {
+        logical_generation: Some((0, 0)),
+        nodes,
+        errors: 0,
+        skipped_links: 0,
+        hardlinks: 0,
+        unknown,
+        partial,
+        cancelled: false,
+        elapsed: std::time::Duration::ZERO,
+        entry_limit_reached: false,
+        time_limit_reached: false,
+        memory_limit_reached: false,
+        alloc_failed: false,
+        limits: Limits::default(),
+        volume: None,
+    }
+}
 /// One asynchronous GUI batch may skip at most 16 empty continuation pages.
 /// It retains the final continuation on yield; no corpus coverage is truncated.
 pub const MAX_EMPTY_PAGE_HOPS:usize=16;
@@ -191,6 +265,24 @@ mod continuation_tests {
  fn page(next:Option<u32>,children:bool)->findx2_ipc::UsagePageDto {
   let item=findx2_ipc::UsageItemDto{id:0,name:"public".into(),directory:true,logical:1,files:1,directories:1,unknown:0};
   findx2_ipc::UsagePageDto{epoch:1,generation:2,root:item.clone(),children:if children{vec![item]}else{vec![]},next,resident_bytes:0,state:"test".into(),watch_error:None,metadata_error:None}
+ }
+ fn vol(name:&str,logical:u64,files:u64,dirs:u64,unknown:u64)->(PathBuf,findx2_ipc::UsageItemDto){
+  (PathBuf::from(name),findx2_ipc::UsageItemDto{id:1,name:name.into(),directory:true,logical,files,directories:dirs,unknown})
+ }
+ #[test]fn home_scene_aggregates_volume_roots_without_a_runtime_generation(){
+  let s=scan_from_volumes(PathBuf::from("findx-home"),&[vol("C:/",300,3,2,0),vol("D:/",100,1,1,1)],true);
+  assert_eq!(s.nodes.len(),3);
+  assert_eq!(s.logical_generation,Some((0,0)));
+  let root=&s.nodes[0];
+  assert!(root.directory&&root.parent.is_none()&&root.path==PathBuf::from("findx-home"));
+  assert_eq!(root.children,vec![1,2]);
+  assert_eq!((root.logical,root.files,root.directories,root.entries),(400,4,5,9));
+  assert!(root.uncertain&&s.partial);
+  assert_eq!(s.unknown,1);
+  assert_eq!(s.nodes[1].parent,Some(0));
+  assert!(s.nodes[1].directory&&s.nodes[1].path==PathBuf::from("C:/"));
+  let s=scan_from_volumes(PathBuf::from("findx-home"),&[vol("C:/",300,3,2,0)],false);
+  assert!(!s.partial&&!s.nodes[0].uncertain);
  }
  #[test]fn cancelled_batch_cannot_issue_another_page(){
   let cancel=std::sync::atomic::AtomicBool::new(false);ensure_not_cancelled(&cancel).unwrap();

@@ -642,6 +642,27 @@ impl MainWindow {
             .bg(tokens.bg)
             .child(self.navigation_buttons(cx))
             .child(
+                Button::new("usage-home")
+                    .with_size(gpui_kit::component::Size::XSmall)
+                    .ghost()
+                    .icon(Icon::default().path("icons/house.svg"))
+                    .w(px(28.)).h(px(24.)).px_0().flex_shrink_0()
+                    .selected(is_home_path(&self.workspace.location))
+                    .accessibility_label("全部磁盘")
+                    .tooltip("全部磁盘全览：各盘索引逻辑合计，点击磁盘进入")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if !is_home_path(&this.workspace.location) {
+                            this.workspace_navigate(
+                                PathBuf::from(HOME_PATH),
+                                ViewMode::Usage,
+                                None,
+                                true,
+                                cx,
+                            );
+                        }
+                    })),
+            )
+            .child(
                 Button::new("usage-index-source")
                     .with_size(gpui_kit::component::Size::XSmall)
                     .ghost()
@@ -761,7 +782,13 @@ impl MainWindow {
                     .h(px(28.))
                     .w(px(104.))
                     .label("本地实测")
-                    .disabled(self.workspace.scanning || self.workspace.op_busy)
+                    .disabled(self.workspace.scanning || self.workspace.op_busy
+                        || is_home_path(&self.workspace.location))
+                    .tooltip(if is_home_path(&self.workspace.location) {
+                        "全览为虚拟范围，不可实测；双击进入磁盘后再测"
+                    } else {
+                        "本地实测当前目录"
+                    })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.start_workspace_scan(this.scan_node().is_some(), cx)
                     })),
@@ -1002,12 +1029,12 @@ impl MainWindow {
         if let Some((scan,index,visible_root)) = self.inspector_data(selected,root) {
             let root=Some(visible_root);
             let node = &scan.nodes[index];
-            let name = node
-                .path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| display_path(&node.path));
-            let absolute_path=display_path(&node.path);
+            let name = home_display_name(&node.path);
+            let absolute_path=if is_home_path(&node.path) {
+                HOME_LABEL.into()
+            } else {
+                display_path(&node.path)
+            };
             let total = root.map(|i| scan.weight(&scan.nodes[i])).unwrap_or(0);
             let ratio = if total > 0 {
                 scan.weight(node) as f64 / total as f64 * 100.
@@ -1193,7 +1220,14 @@ impl MainWindow {
                         }),
                 );
             }
-            let volume_path=&scan.nodes[root.unwrap_or(0)].path;
+            // At home the foot follows the selected volume tile; the virtual
+            // root itself has no OS capacity.
+            let volume_path= {
+                let root_path=&scan.nodes[root.unwrap_or(0)].path;
+                if is_home_path(root_path) {
+                    selected.and_then(|i|scan.nodes.get(i)).filter(|n|n.parent==Some(root.unwrap_or(0))).map(|n|&n.path).unwrap_or(root_path)
+                } else { root_path }
+            };
             let cached=self.workspace.usage_volume.get(volume_path);
             let value=match cached{Some(Ok(v))=>Some(v),Some(Err(_))=>None,None=>scan.volume.as_ref()};
             foot=foot.child(div().h(px(18.)).min_h(px(18.)).text_xs().font_weight(FontWeight::SEMIBOLD).text_ellipsis().whitespace_nowrap().overflow_hidden().child(value.map(|v|format!("系统卷容量  {}",display_path(&v.root))).unwrap_or_else(||"系统卷容量".into())));

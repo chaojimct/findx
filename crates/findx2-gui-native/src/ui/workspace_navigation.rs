@@ -56,6 +56,18 @@ impl MainWindow {
         let current = self.workspace.location.clone();
         let mode = self.workspace.mode;
         self.workspace.path_error = None;
+        // The home label is virtual: confirming it (or an empty edit) refreshes
+        // the overview instead of failing filesystem validation.
+        if is_home_path(&current)
+            && (draft.trim().is_empty() || draft.trim() == HOME_LABEL)
+        {
+            self.cancel_path_edit(cx);
+            self.workspace.engine_cancel.store(true, Ordering::Release);
+            self.workspace.engine_busy = false;
+            self.load_home_overview(cx);
+            cx.notify();
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move { navigation::validate_directory(&draft, &current) })
@@ -389,18 +401,26 @@ impl MainWindow {
         if roots.is_empty() {
             roots = crate::prefs::list_available_roots();
         }
-        let current = self
-            .workspace
-            .location
-            .ancestors()
-            .last()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| self.workspace.location.clone());
-        if !roots
-            .iter()
-            .any(|p| key(Path::new(p)) == key(&current))
-        {
-            roots.push(display_path(&current));
+        // At home no volume is current: never inject the virtual path as a drive.
+        let current = if is_home_path(&self.workspace.location) {
+            None
+        } else {
+            Some(
+                self.workspace
+                    .location
+                    .ancestors()
+                    .last()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.workspace.location.clone()),
+            )
+        };
+        if let Some(current) = &current {
+            if !roots
+                .iter()
+                .any(|p| key(Path::new(p)) == key(current))
+            {
+                roots.push(display_path(current));
+            }
         }
         roots.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
         roots.dedup_by(|a, b| key(Path::new(a)) == key(Path::new(b)));
@@ -413,7 +433,8 @@ impl MainWindow {
             let count = roots.len();
             for root in roots {
                 let path = PathBuf::from(&root);
-                let selected = key(&path) == key(&current);
+                let selected =
+                    current.as_ref().is_some_and(|c| key(&path) == key(c));
                 let owner = owner.clone();
                 let target = path.clone();
                 menu = menu.item(
@@ -709,6 +730,58 @@ impl MainWindow {
                         .on_click(
                             cx.listener(|this, _, window, cx| this.submit_path_edit(window, cx)),
                         ),
+                )
+                .into_any_element();
+        }
+        // Home ("此电脑") has no filesystem ancestors: a single home crumb
+        // plus the shared drive switcher.
+        if self.workspace.mode == ViewMode::Usage && is_home_path(&self.workspace.location) {
+            return frame
+                .child(
+                    Button::new("home-crumb")
+                        .ghost()
+                        .with_size(gpui_kit::component::Size::XSmall)
+                        .h(px(24.))
+                        .w(px(28.))
+                        .px_0()
+                        .rounded_sm()
+                        .icon(Icon::default().path("icons/house.svg"))
+                        .tooltip("全部磁盘（点击刷新）")
+                        .accessibility_label("全部磁盘")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.workspace_navigate(
+                                PathBuf::from(HOME_PATH),
+                                ViewMode::Usage,
+                                None,
+                                true,
+                                cx,
+                            );
+                        })),
+                )
+                .child(
+                    Button::new("home-siblings")
+                        .ghost()
+                        .w(px(18.))
+                        .h(px(24.))
+                        .px_0()
+                        .rounded_sm()
+                        .icon(Icon::new(IconName::ChevronRight).size_3())
+                        .accessibility_label("切换磁盘")
+                        .tooltip("切换磁盘：C: / D: / E: …")
+                        .on_click(cx.listener(
+                            move |this, event: &ClickEvent, window, cx| {
+                                this.open_root_menu(event.position(), window, cx)
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .id("address-blank-edit")
+                        .flex_1()
+                        .min_w(px(12.))
+                        .h_full()
+                        .cursor_text()
+                        .on_click(cx.listener(|this, _, window, cx| this.begin_path_edit(window, cx))),
                 )
                 .into_any_element();
         }
