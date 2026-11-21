@@ -407,10 +407,10 @@ impl MainWindow {
         let owner = cx.weak_entity();
         let mode = self.workspace.mode;
         let menu = PopupMenu::build(window, cx, move |mut menu, _, _| {
-            menu = menu.item(PopupMenuItem::label("切换磁盘"));
             if roots.is_empty() {
                 return menu.item(PopupMenuItem::label("未发现可用磁盘"));
             }
+            let count = roots.len();
             for root in roots {
                 let path = PathBuf::from(&root);
                 let selected = key(&path) == key(&current);
@@ -438,7 +438,13 @@ impl MainWindow {
                         }),
                 );
             }
-            menu.scrollable(true).max_h(px(320.))
+            // A handful of drives must never show a scrollbar; scrolling is
+            // only enabled for abnormally long drive lists.
+            if count > 10 {
+                menu.scrollable(true).max_h(px(320.))
+            } else {
+                menu
+            }
         });
         self.install_address_menu(menu, position, window, cx);
     }
