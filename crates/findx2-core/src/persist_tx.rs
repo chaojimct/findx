@@ -343,7 +343,7 @@ fn commit_delta_into(
     let mut bytes = 0u64;
     let mut append_name = |f: &mut Option<File>, expect_off: u32, data: &[u8], bytes: &mut u64| -> Result<()> {
         if expect_off as usize != cur_n {
-            return Err(persist_err(format!("v6 names 偏移错位（内存 {expect_off} vs 文件 {cur_n}），need full")));
+            return Err(persist_err(format!("v6 names 偏移错位（内存 {expect_off} vs 文件 {cur_n}；batch names {} vs base {}），need full", batch.names_len, m.names_len)));
         }
         let file = f.as_mut().ok_or_else(|| persist_err("names file missing"))?;
         pwrite(file, cur_n as u64, data, F_NAMES)?;
