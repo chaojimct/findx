@@ -567,24 +567,62 @@ pub(crate) fn run_foreground(
     // A real joined worker failure is permanent until explicit operator recovery;
     // transient receipt/pointer IO is retried while the same sealed RAM lives.
     if !worker_errors.is_empty(){lifecycle.retain_terminal_failure(format!("watch worker shutdown failed: {}",worker_errors.join("; ")));}
-    let prepared=loop{match lifecycle.prepared_stop(){Ok(v)=>break v,Err(e)=>{error!("STOP PENDING: terminal receipt verification failed; sealed RAM retained, no ACK: {e}");std::thread::sleep(Duration::from_secs(1));}}};
+    // Every wait below is bounded and logged. A plain SCM stop carries no
+    // upgrade receipt, so draining can legitimately never finish (backfill /
+    // trigram rebuild hold producer slots for minutes to hours); hanging in
+    // STOP_PENDING forever is strictly worse than exiting with USN replay
+    // pending — the persisted cursor bounds the replay on next start.
+    let mut prepared_tries = 0u32;
+    let prepared=loop{
+        match lifecycle.prepared_stop(){
+            Ok(v)=>break v,
+            Err(e)=>{
+                prepared_tries+=1;
+                let msg=format!("STOP PENDING: terminal receipt check failed ({prepared_tries}/10), sealed RAM retained, no ACK: {e}");
+                error!("{msg}");
+                crate::win_service::append_service_log(&msg);
+                if prepared_tries>=10{break None;}
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    };
     if let Some(receipt)=prepared {
         info!(?receipt,"exact sealed terminal checkpoint retained through normal STOP; process_stopped remains externally observed");
         return Ok(());
     }
-    let _stop_work=loop {
+    let mut drained=false;
+    for attempt in 1..=4u32 {
         match lifecycle.drain_stop(Instant::now()+Duration::from_secs(10)) {
-            Ok(p)=>break p,
-            Err(e)=>{error!("stop pending; RAM retained; runtime not drained: {e}");std::thread::sleep(Duration::from_secs(1));}
+            Ok(_)=>{drained=true;break;}
+            Err(e)=>{
+                let msg=format!("STOP PENDING: runtime not drained ({attempt}/4), RAM retained: {e}");
+                error!("{msg}");
+                crate::win_service::append_service_log(&msg);
+                std::thread::sleep(Duration::from_secs(1));
+            }
         }
-    };
+    }
+    if !drained {
+        let msg="STOP PENDING: proceeding without full drain after ~45s; undrained deltas replay from the USN journal next start";
+        error!("{msg}");
+        crate::win_service::append_service_log(msg);
+    }
     // A successful IO observation is NOT an upgrade receipt: metadata/backfill/
     // stat producers still need a shared admission fence and drain in the next step.
+    // Bounded: a dead disk must surface as an honest failure, not a hung STOP.
+    let mut persist_tries = 0u32;
     loop {
-        let result = persist_shutdown_checkpoint(&engine, &index);
+        let result = persist_shutdown_best_effort(&engine, &index);
         match crate::shutdown::require_checkpoint_result(result, || engine.has_pending_persistence()) {
             Ok(())=>break,
-            Err(e)=>{error!("STOP PENDING: save failed, RAM/IPC retained; retrying, NO ACK: {e}");std::thread::sleep(Duration::from_secs(5));}
+            Err(e)=>{
+                persist_tries+=1;
+                let msg=format!("STOP PENDING: save failed ({persist_tries}/6), RAM/IPC retained; retrying, NO ACK: {e}");
+                error!("{msg}");
+                crate::win_service::append_service_log(&msg);
+                if persist_tries>=6{anyhow::bail!("shutdown checkpoint failed after retries; RAM retained, no ACK: {e}");}
+                std::thread::sleep(Duration::from_secs(5));
+            }
         }
     }
     let runtime_errors=lifecycle.retained_errors();
@@ -1251,6 +1289,19 @@ fn persist_shutdown_checkpoint(engine: &SearchEngine, path: &Path) -> anyhow::Re
     persist_index(engine, path)
 }
 
+/// Best-effort shutdown persist that does NOT require lifecycle admission.
+/// During STOP the admission gate is closed (stop_ingress), so the normal
+/// `persist_index` path would always refuse; and producers still running
+/// (backfill, trigram rebuild) keep appending after the batch is taken —
+/// their deltas replay from the USN journal next start. The writer lock
+/// alone serializes against concurrent checkpoint writers.
+fn persist_shutdown_best_effort(engine: &SearchEngine, path: &Path) -> anyhow::Result<bool> {
+    let _guard = persist_lock().lock().unwrap_or_else(|e| e.into_inner());
+    persist_index_locked(engine, path, |layout, batch| {
+        v6_try_commit(layout, batch).map_err(|e| anyhow::anyhow!("{e:#}"))
+    })
+}
+
 // Disk failures are not namespace failures: keep the watcher alive and retry
 // independently of last successful save. Do not hot-loop full repair on ENOSPC.
 fn persist_periodic_checkpoint_retrying(
@@ -1384,12 +1435,19 @@ fn persist_index_locked(
         match writer(&layout, batch)? {
             CommitOutcome::Delta { applied, bytes, generation } => {
                 tracing::debug!(applied, bytes, generation, "Checkpoint delta IO completed");
+                crate::win_service::append_service_log(&format!(
+                    "checkpoint delta: {applied} mutations, {bytes} delta bytes, gen {generation}"
+                ));
             }
             CommitOutcome::NeedFull { reason } => {
                 info!(%reason, "Checkpoint requires full repair/snapshot");
+                crate::win_service::append_service_log(&format!(
+                    "checkpoint FULL snapshot ({reason})"
+                ));
                 let store = engine.index_store();
                 let generation = v6_save_full(&layout, &store).map_err(|e| anyhow::anyhow!("{e:#}"))?;
                 info!(generation, "Checkpoint full snapshot IO completed");
+                crate::win_service::append_service_log(&format!("checkpoint full snapshot done, gen {generation}"));
             }
         }
         Ok(())
