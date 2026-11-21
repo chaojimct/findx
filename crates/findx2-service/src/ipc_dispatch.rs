@@ -340,10 +340,15 @@ mod usage_tests {
             },
         )
         .unwrap();
-        assert!(matches!(
-            process_request(&slot, req(Some((epoch, generation)))),
-            IpcResponse::Error { .. }
-        ));
+        // A data delta advances the generation; paging within the same epoch
+        // must survive it (live volumes advance the generation thousands of
+        // times per second). The page reports the new generation.
+        match process_request(&slot, req(Some((epoch, generation)))) {
+            IpcResponse::UsageChildrenResult { page } => {
+                assert!(page.generation > generation, "generation must advance with the delta");
+            }
+            _ => panic!("paging with a pre-delta stamp must survive generation churn"),
+        }
         match process_request(&slot, req(None)) {
             IpcResponse::UsageChildrenResult { page } => {
                 assert_eq!(page.root.files, 1);
@@ -352,6 +357,12 @@ mod usage_tests {
             }
             _ => panic!("missing updated page"),
         }
+        // An epoch change (runtime rebuild) is the real invalidation boundary.
+        e.enable_usage(1024 * 1024).unwrap();
+        assert!(matches!(
+            process_request(&slot, req(Some((epoch, generation)))),
+            IpcResponse::Error { .. }
+        ));
     }
 
     #[test]

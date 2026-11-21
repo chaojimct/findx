@@ -588,7 +588,14 @@ pub(crate) fn run_foreground(
         }
     }
     let runtime_errors=lifecycle.retained_errors();
-    if !runtime_errors.is_empty(){anyhow::bail!("saved RAM but runtime source failure remains: {}",runtime_errors.join("; "));}
+    // stat 批次未决（permission/transient/stale）是常态而非损坏：真机上
+    // pagefile/WindowsApps/被锁文件必然 stat 失败，队列按设计保留所有权重试。
+    // 把它计入停机致命错误会让服务永远以非 0 退出（实测：6.5 小时长寿实例
+    // 每次停止都 exit=1），SCM 事件日志全红，升级事务的停止门随之失败。
+    // 未决条目已随 checkpoint 落盘，重启后 stat 队列继续处理，无数据丢失。
+    let fatal_errors:Vec<String>=runtime_errors.iter().filter(|e|!e.contains("stat operations unresolved")).cloned().collect();
+    if !fatal_errors.is_empty(){anyhow::bail!("saved RAM but runtime source failure remains: {}",fatal_errors.join("; "));}
+    if fatal_errors.len()<runtime_errors.len(){info!("retained retryable stat-batch entries persisted with checkpoint; not a shutdown failure");}
     if !worker_errors.is_empty(){anyhow::bail!("saved accepted RAM, but watch shutdown failed: {}",worker_errors.join("; "));}
     info!("Shutdown checkpoint IO complete; NOT a producer-fenced final RAM durability receipt");
     info!(counts=?findx2_windows::metadata_terminal_counts(), "metadata terminal buckets: missing/access/sharing/invalid_id/not_found/other/success");
