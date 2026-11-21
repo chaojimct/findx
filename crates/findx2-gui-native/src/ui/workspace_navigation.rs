@@ -283,7 +283,7 @@ impl MainWindow {
                 }).await;
                 this.update(cx,|this,cx|{
                     if generation!=this.workspace.address_menu_generation||this.workspace.address_menu.is_none()||cancel.load(Ordering::Acquire)||this.workspace.mode!=ViewMode::Usage||!this.workspace.engine_usage{return}
-                    let result=result.and_then(|r|if this.workspace.engine_generation.is_some_and(|g|g!=r.stamp){Err("索引已变化，请重新打开".into())}else{Ok(r)});
+                    let result=result.and_then(|r|if this.workspace.engine_generation.is_some_and(|g|g.0!=r.stamp.0){Err("索引已重载，请重新打开".into())}else{Ok(r)});
                     let _=this.workspace.window.update(cx,|_,window,cx|{
                         menu.update(cx,|menu,cx|menu.rebuild(window,cx,|menu,_,cx|{
                             let menu=menu.scrollable(true).min_w(px(372.)).max_w(px(372.)).max_h(px(312.));
@@ -371,6 +371,76 @@ impl MainWindow {
             .ok();
         })
         .detach();
+    }
+    /// Drive switcher lives on the root breadcrumb chevron. The root has no
+    /// parent, so its former "siblings" menu was permanently disabled and a
+    /// multi-volume machine had no way to leave the current volume from the
+    /// Usage view. This lists every available root and switches in place,
+    /// preserving the current view mode.
+    fn open_root_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_address_menu(cx);
+        self.dismiss_file_menu(cx);
+        let mut roots = self.session.read(cx).available_roots.clone();
+        if roots.is_empty() {
+            roots = crate::prefs::list_available_roots();
+        }
+        let current = self
+            .workspace
+            .location
+            .ancestors()
+            .last()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.workspace.location.clone());
+        if !roots
+            .iter()
+            .any(|p| key(Path::new(p)) == key(&current))
+        {
+            roots.push(display_path(&current));
+        }
+        roots.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+        roots.dedup_by(|a, b| key(Path::new(a)) == key(Path::new(b)));
+        let owner = cx.weak_entity();
+        let mode = self.workspace.mode;
+        let menu = PopupMenu::build(window, cx, move |mut menu, _, _| {
+            menu = menu.item(PopupMenuItem::label("切换磁盘"));
+            if roots.is_empty() {
+                return menu.item(PopupMenuItem::label("未发现可用磁盘"));
+            }
+            for root in roots {
+                let path = PathBuf::from(&root);
+                let selected = key(&path) == key(&current);
+                let owner = owner.clone();
+                let target = path.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(root)
+                        .icon(Icon::default().path("icons/hard-drive.svg"))
+                        .checked(selected)
+                        .on_click(move |_, _, cx| {
+                            owner
+                                .update(cx, |this, cx| {
+                                    this.dismiss_address_menu(cx);
+                                    if key(&target) != key(&this.workspace.location) {
+                                        this.workspace_navigate(
+                                            target.clone(),
+                                            mode,
+                                            None,
+                                            true,
+                                            cx,
+                                        );
+                                    }
+                                })
+                                .ok();
+                        }),
+                );
+            }
+            menu.scrollable(true).max_h(px(320.))
+        });
+        self.install_address_menu(menu, position, window, cx);
     }
     fn open_ancestor_menu(
         &mut self,
@@ -766,16 +836,33 @@ impl MainWindow {
                                     .px_0()
                                     .rounded_sm()
                                     .icon(Icon::new(IconName::ChevronRight).size_3())
-                                    .disabled(sibling_path.parent().is_none())
-                                    .accessibility_label("跳转到同级项目")
+                                    .disabled(index != 0 && sibling_path.parent().is_none())
+                                    .accessibility_label(if index == 0 {
+                                        "切换磁盘"
+                                    } else {
+                                        "跳转到同级项目"
+                                    })
+                                    .tooltip(if index == 0 {
+                                        "切换磁盘：C: / D: / E: …"
+                                    } else {
+                                        "跳转到同级项目"
+                                    })
                                     .on_click(cx.listener(
                                         move |this, event: &ClickEvent, window, cx| {
-                                            this.open_sibling_menu(
-                                                sibling_path.clone(),
-                                                event.position(),
-                                                window,
-                                                cx,
-                                            )
+                                            if index == 0 {
+                                                this.open_root_menu(
+                                                    event.position(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            } else {
+                                                this.open_sibling_menu(
+                                                    sibling_path.clone(),
+                                                    event.position(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
                                         },
                                     )),
                             )

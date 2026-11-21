@@ -7,20 +7,23 @@ pub const MAX_REQUESTS:usize=32;
 pub const MAX_PAGES:usize=64;
 pub const MAX_DIRECTORY_PAGES:usize=16;
 pub const MAX_PATH_BYTES:usize=8*1024*1024;
-type Key=((u64,u64),PathBuf);
+type Key=(u64,PathBuf);
 /// Only complete, verified directories or explicitly closed conflicts are cached.
 /// Opaque service continuation leases NEVER survive into another batch.
 struct Directory {root:Item,children:Arc<Vec<Item>>,conflict:Option<String>}
 #[derive(Default)]
 pub struct PageCache{dirs:VecDeque<(Key,Arc<Directory>)>,items:usize,path_bytes:usize}
-fn equivalent(a:&Item,b:&Item)->bool{a.id==b.id&&a.directory==b.directory&&a.logical==b.logical&&a.files==b.files&&a.directories==b.directories&&a.unknown==b.unknown}
+/// Identity of the directory record, not its live aggregate. Logical totals,
+/// file counts and unknown flags move on every watcher delta; requiring them
+/// to be byte-identical made descendant expansion unusable on busy volumes.
+fn equivalent(a:&Item,b:&Item)->bool{a.id==b.id&&a.directory==b.directory}
 impl PageCache{
  fn has(&self,k:&Key,expected:&Item)->bool{self.dirs.iter().any(|(key,d)|key==k&&equivalent(&d.root,expected))}
  fn get(&mut self,k:&Key,expected:&Item)->Option<Arc<Directory>>{let i=self.dirs.iter().position(|(key,d)|key==k&&equivalent(&d.root,expected))?;let v=self.dirs.remove(i)?;let out=v.1.clone();self.dirs.push_back(v);Some(out)}
  /// Menu reads share the same bounded cache, but first revalidate the parent
  /// identity, metrics and epoch with one authoritative parent page.
- pub(crate) fn menu_get(&mut self,stamp:(u64,u64),path:&std::path::Path,root:&Item)->Option<Arc<Vec<Item>>>{self.get(&(stamp,path.to_path_buf()),root).filter(|d|d.conflict.is_none()).map(|d|d.children.clone())}
- pub(crate) fn menu_put(&mut self,stamp:(u64,u64),path:PathBuf,root:Item,children:Vec<Item>){self.put((stamp,path),Arc::new(Directory{root,children:Arc::new(children),conflict:None}));}
+ pub(crate) fn menu_get(&mut self,stamp:(u64,u64),path:&std::path::Path,root:&Item)->Option<Arc<Vec<Item>>>{self.get(&(stamp.0,path.to_path_buf()),root).filter(|d|d.conflict.is_none()).map(|d|d.children.clone())}
+ pub(crate) fn menu_put(&mut self,stamp:(u64,u64),path:PathBuf,root:Item,children:Vec<Item>){self.put((stamp.0,path),Arc::new(Directory{root,children:Arc::new(children),conflict:None}));}
  fn put(&mut self,k:Key,d:Arc<Directory>){
   if d.children.len()>MAX_NODES{return}
   let bytes=k.1.as_os_str().len();if bytes>MAX_PATH_BYTES{return}
@@ -38,8 +41,8 @@ pub fn data_depth(scan:&Scan)->usize{scan.nodes.iter().enumerate().filter(|(_,n)
 pub async fn expand<F,Fut>(root:&Page,path:PathBuf,depth:usize,cache:Arc<Mutex<PageCache>>,cancel:Arc<AtomicBool>,mut fetch:F)->Result<TreeLoad,String>
 where F:FnMut(PathBuf,Option<u32>,(u64,u64))->Fut,Fut:Future<Output=Result<Page,String>>{
  indexed_usage::ensure_not_cancelled(&cancel)?;
- let stamp=(root.epoch,root.generation);let depth=depth.clamp(1,6);
- {let mut c=cache.lock().map_err(|_|"usage cache poisoned")?;c.dirs.retain(|(k,_)|k.0==stamp);c.items=c.dirs.iter().map(|(_,d)|d.children.len()).sum();c.path_bytes=c.dirs.iter().map(|(k,_)|k.1.as_os_str().len()).sum();}
+ let stamp=(root.epoch,0);let depth=depth.clamp(1,6);
+ {let mut c=cache.lock().map_err(|_|"usage cache poisoned")?;c.dirs.retain(|(k,_)|k.0==stamp.0);c.items=c.dirs.iter().map(|(_,d)|d.children.len()).sum();c.path_bytes=c.dirs.iter().map(|(k,_)|k.1.as_os_str().len()).sum();}
  if root.children.len()+1>MAX_NODES{return Err("indexed root page exceeds GUI node budget".into())}
  if (root.children.len()+1).saturating_mul(path.as_os_str().len()).saturating_add(root.children.iter().map(|c|c.name.len()+1).sum::<usize>())>MAX_PATH_BYTES{return Err("indexed root paths exceed GUI byte budget".into())}
  let mut scan=indexed_usage::scan_from_page(root,path);
@@ -51,12 +54,12 @@ where F:FnMut(PathBuf,Option<u32>,(u64,u64))->Fut,Fut:Future<Output=Result<Page,
   if !leaf_name(&items[i].name){return Err("invalid root child basename".into())}
   if let Some(first)=root_names.insert(items[i].name.clone(),i){blocked.insert(scan.nodes[i].path.clone());scan.nodes[first].uncertain=true;scan.nodes[i].uncertain=true;issue=Some("根目录存在同名不同记录，相关项未展开且不可操作".into());}
  }
- for i in 1..items.len(){if depth>1&&items[i].directory&&items[i].logical>0&&!blocked.contains(&scan.nodes[i].path){let cached=cache.lock().map_err(|_|"usage cache poisoned")?.has(&(stamp,scan.nodes[i].path.clone()),&items[i]);queue.push((std::cmp::Reverse(1usize),cached,items[i].logical,std::cmp::Reverse(scan.nodes[i].path.clone()),i));}}
+ for i in 1..items.len(){if depth>1&&items[i].directory&&items[i].logical>0&&!blocked.contains(&scan.nodes[i].path){let cached=cache.lock().map_err(|_|"usage cache poisoned")?.has(&(stamp.0,scan.nodes[i].path.clone()),&items[i]);queue.push((std::cmp::Reverse(1usize),cached,items[i].logical,std::cmp::Reverse(scan.nodes[i].path.clone()),i));}}
  let mut path_bytes=scan.nodes.iter().map(|n|n.path.as_os_str().len()).sum::<usize>();let started=std::time::Instant::now();
  let mut requests=0;let mut cache_hits=0;let mut visits=0;let mut limited=false;
  while let Some((std::cmp::Reverse(level),_,_,_,parent))=queue.pop(){
   indexed_usage::ensure_not_cancelled(&cancel)?;if level>=depth{continue}
-  let key=(stamp,scan.nodes[parent].path.clone());
+  let key=(stamp.0,scan.nodes[parent].path.clone());
   let cached=cache.lock().map_err(|_|"usage cache poisoned")?.get(&key,&items[parent]);let fresh=cached.is_none();
   let dir=if let Some(d)=cached{cache_hits+=1;d}else{
    let mut after=None;let mut seen=HashSet::new();let mut names:HashMap<String,u32>=HashMap::new();let mut staged=Vec::new();let mut conflict=None;let mut complete=false;let mut staged_bytes=0;let mut directory_budget=false;
@@ -69,7 +72,7 @@ where F:FnMut(PathBuf,Option<u32>,(u64,u64))->Fut,Fut:Future<Output=Result<Page,
      Err(e)=>{indexed_usage::ensure_not_cancelled(&cancel)?;let kind=e.to_ascii_lowercase();if ["generation","epoch","identity","cursor","continuation","代际","身份"].iter().any(|k|kind.contains(k)){return Err(e)}scan.nodes[parent].uncertain=true;limited=true;scan.partial=true;issue=Some(format!("部分目录读取失败：{}\n{}",scan.nodes[parent].path.display(),e));directory_budget=true;break;}
     };
     indexed_usage::ensure_not_cancelled(&cancel)?;
-    if (p.epoch,p.generation)!=stamp{return Err("usage generation changed during descendant expansion; refresh".into())}
+    if p.epoch!=stamp.0{return Err("usage index reloaded during descendant expansion; refresh".into())}
     if !equivalent(&p.root,&items[parent]){return Err("usage directory identity/metrics changed during expansion; refresh".into())}
     if p.watch_error.is_some()||p.metadata_error.is_some(){scan.partial=true;if issue.is_none(){issue=p.watch_error.clone().or_else(||p.metadata_error.clone());}}
     for child in &p.children{
@@ -98,7 +101,7 @@ where F:FnMut(PathBuf,Option<u32>,(u64,u64))->Fut,Fut:Future<Output=Result<Page,
    scan.nodes[parent].children.push(id);items.push(child.clone());levels.push(level+1);
    // Terminal-depth children are published, but can never be expanded in this batch.
    // Do not clone their paths, scan the cache or enqueue/pop thousands of no-op visits.
-   if level+1<depth&&child.directory&&child.logical>0{let cached=cache.lock().map_err(|_|"usage cache poisoned")?.has(&(stamp,child_path.clone()),child);queue.push((std::cmp::Reverse(level+1),cached,child.logical,std::cmp::Reverse(child_path),id));}
+   if level+1<depth&&child.directory&&child.logical>0{let cached=cache.lock().map_err(|_|"usage cache poisoned")?.has(&(stamp.0,child_path.clone()),child);queue.push((std::cmp::Reverse(level+1),cached,child.logical,std::cmp::Reverse(child_path),id));}
   }
   if fresh{cache.lock().map_err(|_|"usage cache poisoned")?.put(key,dir);}
  }
@@ -131,10 +134,16 @@ mod tests{
   let t=expand(&r,"R".into(),3,cache,c,|_,_,_|async{panic!("unchanged refresh must reuse cached descendants")}).await.unwrap();
   assert_eq!(t.requests,0);assert_eq!(t.cache_hits,2);assert_eq!(t.max_depth,3);assert!(!t.more);
  }
- #[tokio::test] async fn generation_identity_and_server_errors_never_publish_mixed_tree(){
-  let(r,a,_)=fixture();
-  for mode in 0..3{
-   let mut a=a.clone();if mode==0{a.generation+=1}else{a.root.id+=1}
+ #[tokio::test] async fn live_generation_drift_is_accepted_but_identity_changes_are_not(){
+  let(r,a,d)=fixture();
+  // Ordinary watch deltas advance the page generation; they must not abort a
+  // descendant read on an actively written volume.
+  let mut live=a.clone();live.generation+=1;
+  let ok=expand(&r,"R".into(),3,Arc::default(),Arc::new(AtomicBool::new(false)),move|path,_,_|{let a=live.clone();let d=d.clone();async move{Ok(if path.ends_with("deep"){d}else{a})}}).await;
+  assert!(ok.is_ok(),"generation drift must not abort expansion: {:?}",ok.err());
+  // A changed record identity or a server-side refusal still aborts.
+  for mode in 1..3{
+   let mut a=a.clone();if mode==1{a.root.id+=1}
    let err=expand(&r,"R".into(),3,Arc::default(),Arc::new(AtomicBool::new(false)),move|_,_,_|{let a=a.clone();async move{if mode==2{Err("generation changed".into())}else{Ok(a)}}}).await.err().unwrap();assert!(!err.is_empty());
   }
  }
@@ -180,10 +189,10 @@ mod tests{
   let t=expand(&root,"R".into(),3,Arc::default(),Arc::new(AtomicBool::new(false)),move|_,after,_|{let p=if after.is_some(){second.clone()}else{first.clone()};async move{Ok(p)}}).await.unwrap();
   assert_eq!(t.scan.nodes.len(),2);assert!(t.scan.nodes[1].children.is_empty());assert_eq!(t.scan.nodes[1].logical,80);assert_eq!(t.blocked.len(),1);
  }
- #[tokio::test] async fn next_generation_does_not_reuse_a_previous_conflict_or_old_children(){
+ #[tokio::test] async fn next_epoch_does_not_reuse_a_previous_conflict_or_old_children(){
   let a=item(2,"A",true,80,2,0);let root=page(item(1,"R",true,80,2,1),vec![a.clone()]);let bad=page(a.clone(),vec![item(4,"dup",false,40,1,0),item(5,"dup",false,40,1,0)]);let cache=Arc::new(Mutex::new(PageCache::default()));
   let t=expand(&root,"R".into(),2,cache.clone(),Arc::new(AtomicBool::new(false)),move|_,_,_|{let p=bad.clone();async move{Ok(p)}}).await.unwrap();assert_eq!(t.blocked.len(),1);
-  let mut root=root;root.generation+=1;let mut good=page(a,vec![item(4,"one",false,40,1,0),item(5,"two",false,40,1,0)]);good.generation+=1;
+  let mut root=root;root.epoch+=1;let mut good=page(a,vec![item(4,"one",false,40,1,0),item(5,"two",false,40,1,0)]);good.epoch+=1;
   let t=expand(&root,"R".into(),2,cache,Arc::new(AtomicBool::new(false)),move|_,_,_|{let p=good.clone();async move{Ok(p)}}).await.unwrap();assert!(t.blocked.is_empty());assert_eq!(t.requests,1);assert_eq!(t.scan.nodes.len(),4);
  }
 }
@@ -239,7 +248,10 @@ pub fn effective_depth(preferred:usize,available:usize)->usize{preferred.clamp(1
   let entered=expand(&a,"C:/roundtrip/A".into(),2,cache.clone(),Arc::new(AtomicBool::new(false)),|_,_,_|async{panic!("valid child root must reuse cached direct descendants")}).await.unwrap();assert_eq!(entered.requests,0);assert_eq!(entered.cache_hits,1);
   let back=expand(&root,"C:/roundtrip".into(),3,cache.clone(),Arc::new(AtomicBool::new(false)),|_,_,_|async{panic!("unchanged return must reuse verified cache")}).await.unwrap();assert_eq!(back.requests,0);assert_eq!(back.cache_hits,2);assert!(same_geometry(&warm.scan,&back.scan));
   let mut changed=root.clone();changed.children[0].id=99;assert!(expand(&changed,"C:/roundtrip".into(),3,cache.clone(),Arc::new(AtomicBool::new(false)),|_,_,_|{let a=a.clone();async move{Ok(a)}}).await.err().unwrap().contains("identity"));
-  let mut changed=root.clone();changed.generation+=1;assert!(expand(&changed,"C:/roundtrip".into(),3,cache.clone(),Arc::new(AtomicBool::new(false)),|_,_,_|{let a=a.clone();async move{Ok(a)}}).await.err().unwrap().contains("generation"));
+  // Watch deltas advance the data generation; the verified cache remains valid.
+  let mut changed=root.clone();changed.generation+=1;assert_eq!(expand(&changed,"C:/roundtrip".into(),3,cache.clone(),Arc::new(AtomicBool::new(false)),|_,_,_|async{panic!("generation drift must reuse verified cache")}).await.unwrap().requests,0);
+  // A runtime reload (epoch) is the real boundary.
+  let mut changed=root.clone();changed.epoch+=1;assert!(expand(&changed,"C:/roundtrip".into(),3,cache.clone(),Arc::new(AtomicBool::new(false)),|_,_,_|{let a=a.clone();async move{Ok(a)}}).await.err().unwrap().contains("reloaded"));
   assert!(expand(&root,"C:/roundtrip".into(),3,cache,Arc::new(AtomicBool::new(true)),|_,_,_|async{panic!("cancelled reuse must not fetch")}).await.is_err());
  }
  #[test] fn navigation_does_not_destroy_bounded_cache_but_resets_available_depth(){let s=include_str!("ui/workspace.rs");assert!(!s.contains("self.workspace.usage_page_cache=Arc::new"));assert!(s.contains("self.workspace.usage_loaded_depth=1"));}

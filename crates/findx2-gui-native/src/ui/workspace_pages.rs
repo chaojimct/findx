@@ -65,26 +65,14 @@ impl MainWindow {
                         .child(self.render_preview(cx))
                 })
                 .into_any_element(),
-            ViewMode::Usage => h_flex()
+            ViewMode::Usage => v_flex()
                 .flex_1()
                 .min_h_0()
+                .min_w_0()
                 .w_full()
-                .items_stretch()
                 .overflow_hidden()
-                // 占用视图同样挂位置侧边栏（含「用户目录」组里的全部盘符）——
-                // 原实现没有侧边栏，多卷机器上用户没有任何切盘入口，
-                // 只能停在本用户目录所在的 C 盘（实测反馈「只能看 C 盘」）。
-                // 点击盘符即设置 workspace.location，占用页按新路径重新查询。
-                .when(sidebar, |view| view.child(self.render_locations(cx)))
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .min_h_0()
-                        .overflow_hidden()
-                        .child(self.render_usage_toolbar(cx))
-                        .child(self.render_workspace_usage(cx)),
-                )
+                .child(self.render_usage_toolbar(cx))
+                .child(self.render_workspace_usage(cx))
                 .into_any_element(),
         }
     }
@@ -527,10 +515,7 @@ impl MainWindow {
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.workspace.sidebar_source = Some((group, key(&path)));
-                // 保留当前视图模式：占用视图里点盘符是「切换占用页到该盘」，
-                // 不是跳去浏览器视图（原硬编码 Directory 让占用页永远困在 C 盘）。
-                let mode = this.workspace.mode;
-                this.workspace_navigate(path.clone(), mode, None, true, cx);
+                this.workspace_navigate(path.clone(), ViewMode::Directory, None, true, cx);
             }))
             .into_any_element()
     }

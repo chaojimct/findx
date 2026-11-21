@@ -400,6 +400,7 @@ pub(crate) fn run_foreground(
         );
         let eng = engine.clone();
         let idx = index.clone();
+        let stop_flag = stop.clone();
         let total = letters.len();
         std::thread::Builder::new()
             .name("legacy-index-upgrade".into())
@@ -411,6 +412,13 @@ pub(crate) fn run_foreground(
                 std::thread::sleep(std::time::Duration::from_secs(20));
                 let mut ok = 0usize;
                 for letter in letters {
+                    // 停机请求优先于升级：合并换入会长期占用写锁，等它自然结束会把
+                    // SCM STOP 拖成数分钟的 StopPending（安装器只能超时拒绝替换）。
+                    // 已完成的卷保留新拓扑，剩余卷下次启动自动重试。
+                    if stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+                        info!("停机请求：中止旧拓扑升级（已完成 {ok}/{total} 卷），剩余卷下次启动重试");
+                        return;
+                    }
                     info!(
                         "卷 {letter} 旧拓扑升级：MFT 重扫开始（搜索走旧数据不受影响）…"
                     );

@@ -87,7 +87,8 @@ pub enum IpcRequest {
         path: String,
         expected: Option<(u64, u64)>,
         /// Opaque server continuation, never a directory/entry index.
-        /// Scoped to path + epoch/generation; an expired lease requires refresh.
+        /// Scoped to path + index epoch; data-generation churn is tolerated,
+        /// an expired lease (epoch changed) requires refresh.
         after: Option<u32>,
         max_bytes: usize,
     },

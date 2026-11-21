@@ -568,8 +568,14 @@ impl UsageRuntime {
     }
     fn page_after(&self, _g:&IndexStore,root:u32,after:Option<u32>)->Result<(Option<u32>,Option<u32>),String>{
         let Some(token)=after else{return Ok((some_if(self.dirs[root as usize].first_dir),some_if(self.dirs[root as usize].first_file)))};
+        // Continuations are scoped to the runtime epoch (index rebuild), NOT to
+        // the fine-grained data generation. The generation advances on every
+        // live watcher delta, so requiring equality here makes any multi-page
+        // read on an actively written volume impossible (real machine: >3000
+        // deltas per 1.5s). Indices remain stable inside one epoch; deleted
+        // nodes are skipped by the active() checks below.
         let cursor=self.page_cursors.get(token as usize%CURSOR_SLOTS).and_then(|c|*c)
-            .filter(|c|c.token==token&&c.epoch==self.epoch&&c.generation==self.generation&&c.root==root)
+            .filter(|c|c.token==token&&c.epoch==self.epoch&&c.root==root)
             .ok_or("usage page cursor expired or outside scope; restart pagination")?;
         Ok((cursor.dir,cursor.file))
     }
@@ -672,7 +678,11 @@ impl SearchEngine {
         if let Some(e) = &r.error { return Err(e.clone()); }
         if r.epoch == 0 { return Err("indexed usage unavailable / initialization required".into()); }
         if after.is_some() && expected.is_none(){return Err("usage cursor requires epoch/generation; restart pagination".into());}
-        if expected.is_some_and(|v| v != (r.epoch, r.generation)) { return Err("usage generation changed; restart page".into()); }
+        // Only an epoch change (usage runtime rebuild/index reload) invalidates a
+        // pagination session. Ordinary watch deltas bump `generation` thousands
+        // of times per second on busy volumes and must never abort paging; the
+        // page itself reports the current generation for display/diagnostics.
+        if expected.is_some_and(|v| v.0 != r.epoch) { return Err("usage epoch changed; restart page".into()); }
         let size_of_file = |idx: usize| self.effective_size(&g, idx);
         let root = r.resolve(&g, path, &size_of_file)?;
         let (mut next_dir, mut next_file) = r.page_after(&g, root, after)?;
@@ -1683,15 +1693,42 @@ mod tests {
         assert!(!e.commit_metadata(t, 1, 0, 0).unwrap());
     }
     #[test]
-    fn volume_identity_and_generation_scope() {
+    fn volume_identity_and_epoch_scope() {
         let e = SearchEngine::new(crate::merge_index_stores(vec![store(b'C'), store(b'D')]).unwrap());
         e.enable_usage(16 * 1024 * 1024).unwrap();
         let p = e.usage_page("C:\\", None, None, 1024).unwrap();
         e.apply_volume_change(b'D', &ChangeEvent::DataOrMeta { file_id: 10, size: Some(999), mtime: None, ctime: None, create_if_missing: None }).unwrap();
         assert_eq!(size(&e), 100);
         assert_eq!(e.usage_page("D:\\", None, None, 1024).unwrap().root.logical, 999);
+        // A data mutation elsewhere bumps the generation but must NOT invalidate
+        // an in-flight pagination session for the same epoch.
+        let after=e.usage_page("C:\\", Some((p.epoch, p.generation)), None, 1024);
+        assert!(after.is_ok(), "generation churn must not abort paging: {after:?}");
+        // A runtime rebuild (new epoch) still invalidates the old session.
+        e.enable_usage(16 * 1024 * 1024).unwrap();
         assert!(e.usage_page("C:\\", Some((p.epoch, p.generation)), None, 1024).is_err());
         assert!(e.usage_page("C:\\leftover", None, None, 1024).is_err());
+    }
+    #[test]
+    fn pagination_survives_live_generation_churn() {
+        let files=(0..300).map(|i|raw(100+i,1,&format!("file-{i}"),1,false)).collect();
+        let g=crate::IndexBuilder::new(b'C',1,7,10).build_from_raw(files,vec![raw(1,0,"root",0,true)],true).unwrap();
+        let e=SearchEngine::new(g);e.enable_usage(16*1024*1024).unwrap();
+        let mut page=e.usage_page("C:/",None,None,1024).unwrap();
+        let stamp=(page.epoch,page.generation);
+        let mut seen=std::collections::HashSet::new();
+        let mut pages=0;
+        loop {
+            for child in &page.children{seen.insert(child.name.clone());}
+            pages+=1;
+            let Some(next)=page.next else{break};
+            // Simulate a busy volume: each delta advances the global generation.
+            e.apply_volume_change(b'C', &ChangeEvent::Create { entry: raw(9000+pages as u64, 1, &format!("live-{pages}"), 1, false) }).unwrap();
+            page=e.usage_page("C:/",Some(stamp),Some(next),1024).unwrap();
+            assert!(pages<200);
+        }
+        assert_eq!(seen.len(),300);
+        assert!(pages>20);
     }
     #[test]
     fn two_volumes_same_frn_are_distinct() {

@@ -53,9 +53,10 @@ pub fn ensure_not_cancelled(cancel:&std::sync::atomic::AtomicBool)->Result<(),St
 /// One asynchronous GUI batch may skip at most 16 empty continuation pages.
 /// It retains the final continuation on yield; no corpus coverage is truncated.
 pub const MAX_EMPTY_PAGE_HOPS:usize=16;
-/// Freshly started services bump the usage generation while a page is in flight.
-/// Retry the directory from page 0 a few times, then stop.
-pub const MAX_GENERATION_RESTARTS: u32 = 3;
+/// Freshly started services bump the usage epoch while a page is in flight.
+/// Retry the directory from page 0 a few times, then stop. Ordinary data
+/// deltas do not invalidate a session any more (see core usage_page).
+pub const MAX_GENERATION_RESTARTS: u32 = 6;
 pub const GENERATION_RESTART_MESSAGE: &str = "索引正在实时更新，请稍后重试";
 
 pub fn is_usage_generation_restart(err: &str) -> bool {
@@ -131,7 +132,9 @@ impl EmptyPageGuard {
  }
  pub fn follow(&mut self,page:&findx2_ipc::UsagePageDto)->Result<Option<u32>,String>{
   let stamp=(page.epoch,page.generation);
-  if self.expected.is_some_and(|e|e!=stamp){return Err("usage generation changed while skipping empty pages; refresh".into())}
+  // Epoch = usage runtime/index rebuild. Data generation churn is expected on
+  // live volumes and must not abort an in-flight page walk.
+  if self.expected.is_some_and(|e|e.0!=stamp.0){return Err("usage index reloaded while skipping empty pages; refresh".into())}
   self.expected=Some(stamp);
   let Some(next)=page.next else{return Ok(None)};
   if self.seen[..self.len].contains(&next){return Err("usage continuation cycle detected; refresh".into())}
@@ -203,7 +206,8 @@ mod continuation_tests {
  #[test]fn cycles_and_generation_changes_are_visible_errors(){
   let mut g=EmptyPageGuard::new(Some((1,2)),Some(3));assert!(g.follow(&page(Some(3),false)).unwrap_err().contains("cycle"));
   let mut g=EmptyPageGuard::new(None,None);g.follow(&page(Some(1),false)).unwrap();g.follow(&page(Some(2),false)).unwrap();assert!(g.follow(&page(Some(1),false)).is_err());
-  let mut p=page(Some(4),false);p.generation=3;assert!(EmptyPageGuard::new(Some((1,2)),None).follow(&p).is_err());
+  let mut p=page(Some(4),false);p.generation=3;assert!(EmptyPageGuard::new(Some((1,2)),None).follow(&p).is_ok(),"generation churn must not abort the walk");
+  let mut p=page(Some(4),false);p.epoch=2;assert!(EmptyPageGuard::new(Some((1,2)),None).follow(&p).is_err(),"epoch change must abort the walk");
  }
  #[test]fn generation_change_restarts_from_page_zero_then_stops(){
   assert!(is_usage_generation_restart("usage generation changed; restart page"));
