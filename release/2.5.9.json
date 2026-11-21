@@ -1,0 +1,71 @@
+{
+  "version": "2.5.9",
+  "baseline": "2.5.8",
+  "channel": "stable",
+  "publish_ready": true,
+  "windows_gui": "native",
+  "gates": [
+    {
+      "id": "installer-live-handoff",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "legacy-2-4-multivolume-index-loads",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "usage-epoch-paging",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "home-overview-three-level",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "explorer-breadcrumb-rule",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "realtime-settings",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "tauri-removed-native-only",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "strict-protocol2-stop-receipt",
+      "priority": "P1",
+      "required": false,
+      "passed": false
+    },
+    {
+      "id": "macos-linux-native-packaging",
+      "priority": "P2",
+      "required": false,
+      "passed": false
+    }
+  ],
+  "engine_binary_baseline": "Incremental fix release on the 2.5.8 baseline. No index-format migration. Official GitHub Release artifacts are produced by the existing release.yml CI rebuild on tag v2.5.9 (Windows native only); they are not byte-identical to the local accepted setup.",
+  "gate_evidence": "release/2.5.9.md",
+  "limitations": [
+    "metadata_ready remains false after the accepted live upgrade",
+    "SCM stop path relies on the rewritten graceful-stop plus stat-batch tolerance; strict protocol2 receipt still not claimed",
+    "macOS and Linux native GUI packages do not exist yet; Tauri dmg/deb/AppImage pipeline was removed with gui/",
+    "Official CI packages are a new rebuild and are not byte-identical to the local accepted setup"
+  ]
+}
