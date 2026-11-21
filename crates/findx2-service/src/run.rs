@@ -309,6 +309,7 @@ pub(crate) fn run_foreground(
         }
     };
     // v6 变更记录从此刻开始：之后的 mark/compact/USN 都会进日志，commit 时回放进分段文件。
+    replay_wal_at_boot(&v6, &mut store);
     store.set_track_mutations(true);
 
     // 合并 CLI 追加的排除目录到 store；并把命中条目一次性打墓碑，避免「sidecar 没改，CLI 临时加目录」时旧数据漏网。
@@ -1309,6 +1310,56 @@ fn persist_shutdown_checkpoint(engine: &SearchEngine, path: &Path) -> anyhow::Re
     persist_index(engine, path)
 }
 
+/// WAL recovery (WAL-1): replay post-generation frames onto a freshly
+/// loaded v6 store, before mutation tracking starts.
+///
+/// Best-effort by design: any replay problem leaves the store exactly as
+/// loaded (clone-and-swap) and boot continues from generation cursors —
+/// the USN journal regenerates the window (idempotent), backfill re-stats
+/// it. A crash loses nothing committed; worst case it redoes the window.
+fn replay_wal_at_boot(layout: &V6Layout, store: &mut findx2_core::IndexStore) {
+    let from_seq = findx2_core::read_published(layout)
+        .ok()
+        .flatten()
+        .map(|ptr| ptr.manifest.wal_seq.saturating_add(1))
+        .unwrap_or(0);
+    let frames = match findx2_core::wal_read_from(&layout.dir, from_seq) {
+        Ok(findx2_core::WalRead::Frames { frames, truncated_tail }) => {
+            if truncated_tail {
+                tracing::warn!("WAL torn tail dropped on boot");
+                crate::win_service::append_service_log("WAL: torn tail dropped on boot");
+            }
+            frames
+        }
+        Err(e) => {
+            tracing::warn!(%e, "WAL unreadable on boot; continuing from generation cursors");
+            crate::win_service::append_service_log(&format!("WAL unreadable on boot ({e}); continuing from generation"));
+            return;
+        }
+    };
+    if frames.is_empty() {
+        return;
+    }
+    match findx2_core::replay_frames_into_store(store, &frames) {
+        Ok(out) if !out.stopped_early => {
+            info!(frames = out.applied_frames, mutations = out.applied_mutations, "WAL replay complete");
+            crate::win_service::append_service_log(&format!(
+                "WAL replay: {} frames, {} mutations", out.applied_frames, out.applied_mutations
+            ));
+        }
+        Ok(out) => {
+            tracing::warn!(seq = out.stop_seq, reason = %out.stop_reason, applied = out.applied_frames, "WAL replay stopped early; resuming from generation cursors");
+            crate::win_service::append_service_log(&format!(
+                "WAL replay stopped at seq {} ({}); resumed from generation", out.stop_seq, out.stop_reason
+            ));
+        }
+        Err(e) => {
+            tracing::warn!(%e, "WAL replay failed; continuing from generation cursors");
+            crate::win_service::append_service_log(&format!("WAL replay failed ({e}); continuing from generation"));
+        }
+    }
+}
+
 /// Best-effort shutdown persist that does NOT require lifecycle admission.
 /// During STOP the admission gate is closed (stop_ingress), so the normal
 /// `persist_index` path would always refuse; and producers still running
@@ -1481,8 +1532,18 @@ fn persist_index_locked(
 ) -> anyhow::Result<bool> {
     let Some(batch) = engine.take_persistence_batch() else { return Ok(true); };
     let mut pending = UnacknowledgedBatch { engine, batch: Some(batch) };
-    let batch = pending.batch.as_ref().unwrap();
     let layout = V6Layout::for_index(path);
+    // WAL-1 durability: fsync-append the drained batch BEFORE folding it
+    // into a generation. Commits are serialized by persist_lock, so this
+    // frame is always the file tail (a failed commit truncates exactly it).
+    let wal_seq = match findx2_core::wal_append(&layout.dir, pending.batch.as_mut().unwrap()) {
+        Ok(seq) => seq,
+        Err(e) => {
+            drop(pending);
+            return Err(anyhow::anyhow!("WAL append failed, batch retained: {e}"));
+        }
+    };
+    let batch = pending.batch.as_ref().unwrap();
     let started = Instant::now();
     let result = (|| -> anyhow::Result<()> {
         match writer(&layout, batch)? {
@@ -1492,7 +1553,7 @@ fn persist_index_locked(
                 let fallback = findx2_core::take_clone_fallbacks();
                 let clone_err = findx2_core::take_last_clone_error();
                 crate::win_service::append_service_log(&format!(
-                    "checkpoint delta: {applied} mutations, {bytes} delta bytes, {phys} disk bytes, clone_fallback={fallback} clone_err={clone_err}, gen {generation}"
+                    "checkpoint delta: {applied} mutations, {bytes} delta bytes, {phys} disk bytes, clone_fallback={fallback} clone_err={clone_err}, wal {wal_seq}, gen {generation}"
                 ));
             }
             CommitOutcome::NeedFull { reason } => {
@@ -1514,6 +1575,14 @@ fn persist_index_locked(
     match result {
         Ok(()) => {
             pending.batch.take(); // acknowledge only after the ENTIRE writer succeeds
+            // The published generation folds everything through wal_seq.
+            // Retention rewrites the file, so trigger it lazily by size;
+            // stale lower-seq frames are filtered by seq on recovery anyway.
+            if findx2_core::wal_file_len(&layout.dir) > (32 << 20) {
+                if let Err(e) = findx2_core::wal_retain_from(&layout.dir, wal_seq + 1) {
+                    tracing::warn!(%e, "WAL retain failed; stale frames replay-harmless on next boot");
+                }
+            }
             health.last_io_success_ms = Some(now);
             health.last_error = None;
             info!(state="io_completed", dirty=engine.has_pending_persistence(),
@@ -1525,6 +1594,13 @@ fn persist_index_locked(
             Ok(true)
         }
         Err(error) => {
+            // The failed batch's frame is the file tail (commits serialized):
+            // cut it so a later recovery never sees a half-folded duplicate.
+            // (NeedFull inside `result` already published via full snapshot,
+            // which covers the WAL tip — only hard errors truncate here.)
+            if let Err(e) = findx2_core::wal_truncate_tail_seq(&layout.dir, wal_seq) {
+                tracing::warn!(%e, wal_seq, "WAL tail truncate failed after commit error");
+            }
             drop(pending); // restore first, including mutations arriving during IO
             health.last_io_failure_ms = Some(now);
             health.last_error = Some(format!("{error:#}"));

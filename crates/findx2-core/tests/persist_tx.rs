@@ -37,6 +37,7 @@ fn batch_of(store: &mut findx2_core::IndexStore) -> CommitBatch {
         tri_pending: store.tri_pending.clone(),
         tri_snap: 0,
         has_trigram: false,
+        wal_seq: 0,
     }
 }
 fn patch_size(store: &mut findx2_core::IndexStore, size: u64) {

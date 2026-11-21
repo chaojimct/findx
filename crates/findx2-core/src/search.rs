@@ -1230,6 +1230,7 @@ impl SearchEngine {
             tri_pending: g.tri_pending.clone(),
             tri_snap,
             has_trigram,
+            wal_seq: 0,
         })
     }
 

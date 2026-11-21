@@ -28,6 +28,7 @@ pub mod meta_overlay;
 pub mod persist;
 pub mod persist_v6;
 pub mod persist_tx;
+pub mod wal;
 
 pub use persist::{
     exclude_sidecar_path, load_exclude_sidecar, load_index_bin, load_index_bin_with_progress,
@@ -40,6 +41,11 @@ pub use persist_tx::{
     clear_persist_fault, generation_dir, generation_disk_bytes, has_published, published_path,
     read_published, set_persist_fault, take_clone_fallbacks, take_commit_physical_bytes,
     take_last_clone_error, PersistFault,
+};
+pub use wal::{
+    pre_lengths, replay_frames_into_store, wal_append, wal_file_len, wal_read_from,
+    wal_retain_from, wal_tip_seq, wal_truncate_tail_seq, PreLengths, ReplayOutcome, WalFrame,
+    WalRead,
 };
 
 pub mod platform;

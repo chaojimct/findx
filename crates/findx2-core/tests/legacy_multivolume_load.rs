@@ -130,6 +130,7 @@ fn write_legacy_flat(root: &std::path::Path) -> V6Manifest {
         names_len: names_buf.len(),
         dir_paths_len: 0,
         metadata_ready: true,
+        wal_seq: 0,
         volumes: vec![
             V6Volume {
                 letter: b'E',

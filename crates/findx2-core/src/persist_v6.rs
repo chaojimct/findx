@@ -130,6 +130,10 @@ pub struct V6Manifest {
     pub dir_paths_len: usize,
     pub metadata_ready: bool,
     pub volumes: Vec<V6Volume>,
+    /// Last WAL frame folded into this generation (0 = pre-WAL / unknown:
+    /// recovery replays everything found).
+    #[serde(default)]
+    pub wal_seq: u64,
 }
 
 /// commit 时调用方（持有 store 锁）一次性快照的提交批。
@@ -149,6 +153,9 @@ pub struct CommitBatch {
     /// `trigram.snapshot_entry_count()`，无边车时为 0（此时不写 pending 边车）。
     pub tri_snap: u32,
     pub has_trigram: bool,
+    /// WAL seq assigned at append time (0 = not yet journaled). Published
+    /// into the generation manifest so recovery knows what is folded.
+    pub wal_seq: u64,
 }
 
 impl CommitBatch {

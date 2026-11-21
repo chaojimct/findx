@@ -718,6 +718,133 @@ impl IndexStore {
         }
     }
 
+    /// WAL recovery: apply one journaled mutation to a freshly loaded store.
+    ///
+    /// Mirrors the live application primitives field-for-field (including
+    /// `deleted` bitmap sync, ext buckets, frn maps, trigram pending) but
+    /// never logs: the caller replays with tracking off. Name-pool order is
+    /// deterministic under sequential replay, so every append asserts the
+    /// recorded offset instead of trusting it blindly.
+    ///
+    /// `FullResync` is rejected here: it cannot be replayed, and the
+    /// orchestrator must stop and resume watchers from generation cursors.
+    pub(crate) fn replay_mutation(&mut self, m: &Mutation) -> Result<(), String> {
+        match m {
+            Mutation::MetadataBatch(items) => {
+                for (idx, b) in items {
+                    let e = self.entries.get_mut(*idx as usize).ok_or_else(|| format!("wal replay: meta idx {idx} OOB"))?;
+                    e.size = u64::from_le_bytes(b[..8].try_into().map_err(|_| "wal replay: bad meta bytes".to_string())?);
+                    e.mtime = u32::from_le_bytes(b[8..12].try_into().map_err(|_| "wal replay: bad meta bytes".to_string())?);
+                    e.ctime = u32::from_le_bytes(b[12..16].try_into().map_err(|_| "wal replay: bad meta bytes".to_string())?);
+                    e._pad = u16::from_le_bytes(b[16..18].try_into().map_err(|_| "wal replay: bad meta bytes".to_string())?);
+                }
+                Ok(())
+            }
+            Mutation::Meta { idx, size, mtime, ctime } => {
+                let e = self.entries.get_mut(*idx as usize).ok_or_else(|| format!("wal replay: meta idx {idx} OOB"))?;
+                e.size = *size;
+                e.mtime = *mtime;
+                e.ctime = *ctime;
+                e.set_metadata_unverified(false);
+                Ok(())
+            }
+            Mutation::PatchEntry { idx, entry } => {
+                if (*idx as usize) >= self.entries.len() {
+                    return Err(format!("wal replay: patch idx {idx} OOB"));
+                }
+                // Rename-via-replace also moves the ext bucket (live parity).
+                let old_eh = self.entries[*idx as usize].ext_hash_u8();
+                let new_eh = entry.ext_hash_u8();
+                if old_eh != new_eh {
+                    self.ext_remove_idx(*idx, old_eh);
+                    self.ext_insert_idx(*idx, new_eh);
+                }
+                self.entries[*idx as usize] = *entry;
+                self.sync_deleted(*idx, entry.is_deleted());
+                Ok(())
+            }
+            Mutation::PatchDir { di, dir } => {
+                let d = self.dirs.get_mut(*di as usize).ok_or_else(|| format!("wal replay: patch di {di} OOB"))?;
+                *d = dir.clone();
+                Ok(())
+            }
+            Mutation::PushFile { entry, frn, name } => {
+                let off = self.append_name(name, true);
+                if off != entry.name_offset {
+                    return Err(format!("wal replay: push order violated (off {off} != {})", entry.name_offset));
+                }
+                let new_idx = self.entries.len() as u32;
+                self.entries.push(*entry);
+                self.ext_insert_idx(new_idx, entry.ext_hash_u8());
+                self.frns.push(*frn);
+                let slot = self.volume_slot_of(self.volume_letter_u8_for_dir(entry.dir_idx).unwrap_or(0)).unwrap_or(0);
+                self.frn_to_entry.insert_scoped(*frn, new_idx, slot);
+                self.note_name_change(new_idx);
+                Ok(())
+            }
+            Mutation::PushDir { entry, frn, dir, name } => {
+                let off = self.append_name(name, true);
+                if off != entry.name_offset || off != dir.name_offset {
+                    return Err("wal replay: push-dir order violated".into());
+                }
+                let di = self.dirs.len() as u32;
+                self.dirs.push(dir.clone());
+                self.dir_path_ranges.push((0, 0));
+                let slot = self.volume_slot_of(self.volume_letter_u8_for_dir(entry.dir_idx).unwrap_or(0)).unwrap_or(0);
+                self.dir_index.insert_scoped(*frn, di, slot);
+                let new_idx = self.entries.len() as u32;
+                self.entries.push(*entry);
+                self.ext_insert_idx(new_idx, entry.ext_hash_u8());
+                self.frns.push(*frn);
+                self.frn_to_entry.insert_scoped(*frn, new_idx, slot);
+                self.note_name_change(new_idx);
+                Ok(())
+            }
+            Mutation::RepathFile { idx, entry, name } => {
+                if (*idx as usize) >= self.entries.len() {
+                    return Err(format!("wal replay: repath idx {idx} OOB"));
+                }
+                let off = self.append_name(name, true);
+                if off != entry.name_offset {
+                    return Err("wal replay: repath order violated".into());
+                }
+                let old_eh = self.entries[*idx as usize].ext_hash_u8();
+                self.ext_remove_idx(*idx, old_eh);
+                self.ext_insert_idx(*idx, entry.ext_hash_u8());
+                self.entries[*idx as usize] = *entry;
+                self.sync_deleted(*idx, entry.is_deleted());
+                self.note_name_change(*idx);
+                Ok(())
+            }
+            Mutation::RepathDir { idx, di, entry, dir, name } => {
+                if (*idx as usize) >= self.entries.len() || (*di as usize) >= self.dirs.len() {
+                    return Err(format!("wal replay: repath dir {idx}/{di} OOB"));
+                }
+                let off = self.append_name(name, true);
+                if off != entry.name_offset || off != dir.name_offset {
+                    return Err("wal replay: repath-dir order violated".into());
+                }
+                let old_eh = self.entries[*idx as usize].ext_hash_u8();
+                self.ext_remove_idx(*idx, old_eh);
+                self.ext_insert_idx(*idx, entry.ext_hash_u8());
+                self.entries[*idx as usize] = *entry;
+                self.sync_deleted(*idx, entry.is_deleted());
+                self.dirs[*di as usize] = dir.clone();
+                self.note_name_change(*idx);
+                Ok(())
+            }
+            Mutation::FullResync => Err("wal replay: FullResync is not replayable".into()),
+        }
+    }
+
+    fn sync_deleted(&mut self, idx: u32, deleted: bool) {
+        if deleted {
+            self.deleted.insert(idx);
+        } else {
+            self.deleted.remove(idx);
+        }
+    }
+
     /// 标记"下次 commit 走全量分段重写"。批量路径（overlay flush、排除目录墓碑）用它，
     /// 避免产生百万条增量记录。
     pub fn mark_full_resync(&mut self) {

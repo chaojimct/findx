@@ -248,6 +248,11 @@ fn save_full_generation_inner(layout: &V6Layout, store: &IndexStore) -> Result<u
         dir_paths_len: store.dir_paths_buf.len(),
         metadata_ready: store.metadata_ready,
         volumes: store.volumes.iter().map(V6Volume::from).collect(),
+        // Full snapshot folds the whole RAM store, including anything
+        // journaled but not yet WAL-appended: cover through the WAL tip.
+        // (A later replay stops on its pre-length guard rather than
+        // duplicating those entries.)
+        wal_seq: crate::wal::wal_tip_seq(&layout.dir),
     };
     publish_generation(layout, dir, manifest, files, has_trigram, tri_snap)?;
     Ok(gen)
@@ -511,6 +516,9 @@ fn commit_delta_into(
         dir_paths_len: batch.dir_paths_len,
         metadata_ready: batch.metadata_ready,
         volumes: batch.volumes.iter().map(V6Volume::from).collect(),
+        // The fold covers exactly this batch: recovery replays frames
+        // with seq > wal_seq. (Set by wal_append at drain time.)
+        wal_seq: batch.wal_seq,
     };
     // Delta pwrites are real disk writes (unlike cloned/linked extents).
     note_physical_bytes(bytes);
@@ -902,7 +910,7 @@ pub fn atomic_rename_replace(from: &Path, to: &Path) -> Result<()> {
     }
 }
 
-fn sync_dir(path: &Path) -> Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -1383,6 +1391,7 @@ mod clone_tests {
             tri_pending: Default::default(),
             tri_snap: 0,
             has_trigram: false,
+            wal_seq: 0,
         };
         match super::try_commit_generation(&layout, &batch).unwrap() {
             CommitOutcome::Delta { applied, bytes, .. } => {

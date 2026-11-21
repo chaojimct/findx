@@ -83,6 +83,7 @@ fn batch_of(store: &mut IndexStore) -> CommitBatch {
         tri_pending: store.tri_pending.clone(),
         tri_snap,
         has_trigram,
+        wal_seq: 0,
     }
 }
 
@@ -296,6 +297,7 @@ fn v6_corrupt_manifest_falls_back_to_v5_and_commit_heals() {
         tri_pending: store2.tri_pending.clone(),
         tri_snap: 0,
         has_trigram: false,
+        wal_seq: 0,
     };
     match v6_try_commit(&layout, &batch).unwrap() {
         CommitOutcome::NeedFull { .. } => {}
