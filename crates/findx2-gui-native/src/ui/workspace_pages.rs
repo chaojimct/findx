@@ -747,21 +747,6 @@ impl MainWindow {
                     })),
             )
             .child(
-                Button::new("usage-advanced-toggle")
-                    .flex_shrink_0()
-                    .ghost()
-                    .icon(IconName::Settings)
-                    .w(px(24.))
-                    .h(px(24.))
-                    .px_0()
-                    .selected(self.workspace.usage_advanced)
-                    .tooltip("扫描预算与减少动态")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.workspace.usage_advanced = !this.workspace.usage_advanced;
-                        cx.notify();
-                    })),
-            )
-            .child(
                 div()
                     .flex_1()
                     .min_w(px(120.))
@@ -810,56 +795,12 @@ impl MainWindow {
             self.workspace.usage_focus.as_ref().and_then(|p|self.workspace.scan_lookup.get(&key(Path::new(p)))).copied(),
         );
         let map = self.render_cached_usage_map(cx);
-        let limits = Limits::memory_profile(self.workspace.usage_memory_profile);
         v_flex()
             .flex_1()
             .min_h_0()
             .min_w_0()
             .w_full()
             .overflow_hidden()
-            .when(self.workspace.usage_advanced, |view| {
-                view.child(
-                    h_flex()
-                        .h(px(28.))
-                        .px_2()
-                        .gap_2()
-                        .flex_shrink_0()
-                        .text_xs()
-                        .border_b_1()
-                        .border_color(tokens.border)
-                        .child(
-                            Button::new("usage-reduce-motion")
-                                .ghost()
-                                .h(px(24.))
-                                .label("减少动态")
-                                .selected(self.session.read(cx).prefs.usage_reduce_motion)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.workspace.usage_transition = None;
-                                    let prefs = this.session.update(cx, |session, cx| {
-                                        session.prefs.usage_reduce_motion = !session.prefs.usage_reduce_motion;
-                                        cx.notify();
-                                        session.prefs.clone()
-                                    });
-                                    crate::session::persist_prefs(prefs, cx);
-                                    cx.notify();
-                                })),
-                        )
-                        .child(div().flex_1())
-                        .child(
-                            Button::new("usage-scan-budget")
-                                .ghost()
-                                .h(px(24.))
-                                .label(format!("上限 {}", limits.label()))
-                                .tooltip("默认遍历到结束或取消。高级选项只改变内存上限（默认 1GiB / 256MiB / 512MiB，含树、lookup 与构建暂存估计，不含 GPUI/GPU 基线），不是条数或分钟档位。超出预算或分配失败会停止并保留已测部分。旧截断快照需手动重扫，不会自动全盘扫描。")
-                                .disabled(self.workspace.scanning)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.workspace.usage_memory_profile =
-                                        (this.workspace.usage_memory_profile + 1) % 3;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-            })
             .child(
                 h_flex()
                     .h(px(22.))
