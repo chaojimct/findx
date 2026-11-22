@@ -28,6 +28,9 @@ pub struct LocalPrefs {
     pub browser_show_hidden: bool,
     #[serde(default)]
     pub browser_column_schema: u8,
+    /// User-defined shortcut overrides: action id -> canonical keystroke.
+    #[serde(default)]
+    pub key_bindings: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub theme: UiThemePref,
     #[serde(default)]
@@ -70,6 +73,7 @@ impl Default for LocalPrefs {
             browser_recent: Vec::new(),
             browser_show_hidden: false,
             browser_column_schema: 0,
+            key_bindings: std::collections::BTreeMap::new(),
             theme: UiThemePref::Light,
             theme_style: crate::theme::ThemeStyle::default(),
             diag_enabled: false,

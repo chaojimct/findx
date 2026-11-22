@@ -274,6 +274,55 @@ fn usage_toolbar_icon_slots_and_depth_value_are_compact_and_stable() {
     assert!(main.contains("ContextOpenInNewTab"), "new-tab action must be declared and routed");
 }
 
+#[test] fn directory_tabs_support_mouse_close_and_strip_double_click() {
+    let src = include_str!("workspace_navigation.rs");
+    let tabs = src
+        .split("pub(super) fn render_directory_tabs")
+        .nth(1)
+        .unwrap()
+        .split("pub(super) fn render_address")
+        .next()
+        .unwrap();
+    assert!(tabs.contains("MouseButton::Middle"), "middle-click must be wired on tabs");
+    assert!(tabs.contains("this.close_directory_tab(index, cx)"),
+        "middle/double click must close that exact tab");
+    // One close-button click plus the two new mouse gestures.
+    assert_eq!(tabs.matches("this.close_directory_tab(index, cx)").count(), 3,
+        "both middle-click and double-click must close, alongside the X button");
+    assert!(tabs.contains(".on_double_click("), "double-click handler must exist");
+    assert!(tabs.contains("this.new_directory_tab(window, cx)"),
+        "double-click on the empty strip must open a new tab");
+    assert!(tabs.contains("cx.stop_propagation()"),
+        "tab handlers must stop the strip-level double-click");
+}
+
+#[test] fn shortcuts_page_is_editable_and_persists_overrides() {
+    let src = include_str!("settings_window.rs");
+    assert!(src.contains("fn render_shortcuts("), "shortcuts tab must be a real editor");
+    assert!(src.contains("crate::keybindings::defs()"),
+        "every rebindable action must be listed");
+    assert!(src.contains("fn begin_capture(") && src.contains("fn save_shortcut("),
+        "capture -> save flow must exist");
+    assert!(src.contains("fn reset_shortcut(") && src.contains("fn reset_all_shortcuts("),
+        "per-item and global reset must exist");
+    assert!(src.contains("crate::keybindings::from_keystroke(&event.keystroke)"),
+        "raw key events must be recorded as canonical bindings");
+    assert!(src.contains("session.set_key_bindings(overrides, cx)"),
+        "edits must persist through the session");
+    assert!(src.contains(".track_focus(&self.capture_focus)"),
+        "capture focus must be tracked so raw key events reach the view");
+
+    let registry = include_str!("../keybindings.rs");
+    assert!(registry.contains("pub fn apply("), "keymap must be reconciled at runtime");
+    assert!(registry.contains("cx.clear_key_bindings()") == false,
+        "clearing the whole keymap would destroy lazily registered component bindings");
+    assert!(registry.contains("Unbind("), "old bindings must be explicitly unbound");
+
+    let main = include_str!("main_window.rs");
+    assert!(main.contains("crate::keybindings::apply(&saved_bindings, cx)"),
+        "saved shortcuts must be applied at startup");
+}
+
 #[test] fn settings_search_lists_matched_items_and_jumps_to_their_tab() {
     // Logic closure: the nav search must search setting *content* via the
     // shared catalog/pinyin filter, list match buttons, and jump to their tab.

@@ -107,6 +107,17 @@ impl AppSession {
         persist_prefs(self.prefs.clone(), cx);
     }
 
+    /// Apply shortcut overrides to the live keymap and persist them.
+    pub fn set_key_bindings(
+        &mut self,
+        overrides: std::collections::BTreeMap<String, String>,
+        cx: &mut App,
+    ) {
+        self.prefs.key_bindings = overrides.clone();
+        crate::keybindings::apply(&overrides, cx);
+        persist_prefs(self.prefs.clone(), cx);
+    }
+
     pub fn set_diag(&mut self, on: bool, cx: &mut App) {
         self.prefs.diag_enabled = on;
         persist_prefs(self.prefs.clone(), cx);

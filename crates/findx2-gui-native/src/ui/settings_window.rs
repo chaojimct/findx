@@ -133,6 +133,12 @@ pub struct SettingsWindow {
     located_label: Option<&'static str>,
     /// 页面进入动画的 id，每个实例唯一（与 workspace 的 page_epoch 同理）。
     enter_epoch: usize,
+    /// 正在等待录入的快捷键 id（快捷键页点击「修改」后设置）。
+    capturing: Option<String>,
+    /// 让 SettingsWindow 根节点可聚焦，录制时接收原始 KeyDown。
+    capture_focus: FocusHandle,
+    /// 快捷键页的即时反馈（冲突 / 取消 / 已保存）。
+    shortcut_hint: String,
     index_path: Entity<InputState>,
     pipe_name: Entity<InputState>,
     service_exe: Entity<InputState>,
@@ -221,6 +227,9 @@ impl SettingsWindow {
             nav_search: nav_search.clone(),
             located_label: None,
             enter_epoch: SETTINGS_ENTER_EPOCH.fetch_add(1, Ordering::Relaxed) as usize,
+            capturing: None,
+            capture_focus: cx.focus_handle(),
+            shortcut_hint: String::new(),
             index_path: index_path.clone(),
             pipe_name: pipe_name.clone(),
             service_exe: service_exe.clone(),
@@ -396,6 +405,85 @@ impl SettingsWindow {
         self.apply_theme_now(self.style, pref, cx);
     }
 
+    // ---- Shortcut editing -------------------------------------------------
+    fn begin_capture(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.capturing = Some(id.to_string());
+        self.shortcut_hint = format!(
+            "正在录入「{}」：请按下新组合键，Esc 取消",
+            crate::keybindings::def(id)
+                .map(|d| d.label)
+                .unwrap_or(id)
+        );
+        self.capture_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn cancel_capture(&mut self, cx: &mut Context<Self>) {
+        self.capturing = None;
+        self.shortcut_hint.clear();
+        cx.notify();
+    }
+
+    fn save_shortcut(
+        &mut self,
+        id: &str,
+        stroke: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(stroke) = stroke else {
+            self.shortcut_hint = "这个按键不能作为快捷键，请换一个（例如 Ctrl+K）".into();
+            self.capturing = None;
+            cx.notify();
+            return;
+        };
+        // Reject keys already owned by another action so a binding never
+        // silently shadows its neighbour.
+        let mut overrides = self.session.read(cx).prefs.key_bindings.clone();
+        overrides.retain(|other, _| other != id);
+        let owner = crate::keybindings::defs().iter().find(|definition| {
+            definition.id != id
+                && crate::keybindings::effective(definition.id, &overrides) == stroke
+        });
+        if let Some(owner) = owner {
+            self.shortcut_hint = format!("「{}」已经在使用 {stroke}", owner.label);
+            self.capturing = None;
+            cx.notify();
+            return;
+        }
+        if crate::keybindings::default_for(id) == stroke {
+            overrides.remove(id);
+            self.shortcut_hint = "已恢复默认快捷键".into();
+        } else {
+            overrides.insert(id.to_string(), stroke.clone());
+            self.shortcut_hint = format!("已保存为 {}", crate::keybindings::display(&stroke));
+        }
+        self.capturing = None;
+        let session = self.session.clone();
+        session.update(cx, |session, cx| session.set_key_bindings(overrides, cx));
+        cx.notify();
+    }
+
+    fn reset_shortcut(&mut self, id: &str, cx: &mut Context<Self>) {
+        let mut overrides = self.session.read(cx).prefs.key_bindings.clone();
+        if overrides.remove(id).is_none() {
+            return;
+        }
+        self.shortcut_hint = "已恢复默认快捷键".into();
+        let session = self.session.clone();
+        session.update(cx, |session, cx| session.set_key_bindings(overrides, cx));
+        cx.notify();
+    }
+
+    fn reset_all_shortcuts(&mut self, cx: &mut Context<Self>) {
+        if self.session.read(cx).prefs.key_bindings.is_empty() {
+            return;
+        }
+        self.shortcut_hint = "所有快捷键已恢复默认".into();
+        let session = self.session.clone();
+        session.update(cx, |session, cx| session.set_key_bindings(Default::default(), cx));
+        cx.notify();
+    }
+
     pub fn request_leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.closing_app = false;
         self.close_clicked(window, cx);
@@ -556,22 +644,7 @@ impl Render for SettingsWindow {
                     tokens,
                 )
                 .into_any_element(),
-            SettingsTab::Shortcuts => self
-                .render_policy(
-                    "快捷键",
-                    &[
-                        ("Ctrl+F", "搜索，或过滤当前目录"),
-                        ("Ctrl+L", "编辑目录地址"),
-                        ("Alt+左 / 右", "当前标签后退或前进"),
-                        ("Alt+上", "上一级目录"),
-                        ("F5", "刷新当前目录"),
-                        ("方向键", "移动选择，Enter 打开"),
-                        ("Ctrl+Enter", "在文件中定位"),
-                        ("Ctrl+,", "打开设置"),
-                    ],
-                    tokens,
-                )
-                .into_any_element(),
+            SettingsTab::Shortcuts => self.render_shortcuts(tokens, cx).into_any_element(),
         };
         let navigation = v_flex()
             .id("settings-navigation")
@@ -765,6 +838,19 @@ impl Render for SettingsWindow {
             .size_full()
             .relative()
             .overflow_hidden()
+            .track_focus(&self.capture_focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                let Some(id) = this.capturing.clone() else {
+                    return;
+                };
+                cx.stop_propagation();
+                if event.keystroke.key.eq_ignore_ascii_case("escape") {
+                    this.cancel_capture(cx);
+                    return;
+                }
+                let stroke = crate::keybindings::from_keystroke(&event.keystroke);
+                this.save_shortcut(&id, stroke, cx);
+            }))
             .bg(tokens.bg)
             .text_color(tokens.text_primary)
             .when(!self.embedded, |view| {
@@ -786,6 +872,136 @@ impl Render for SettingsWindow {
 }
 
 impl SettingsWindow {
+    /// 快捷键页：列出全部可改快捷键，点击「修改」后按键即可重新绑定。
+    fn render_shortcuts(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> AnyElement {
+        let overrides = self.session.read(cx).prefs.key_bindings.clone();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut last_group = "";
+        for definition in crate::keybindings::defs() {
+            if definition.group != last_group {
+                last_group = definition.group;
+                rows.push(
+                    div()
+                        .w_full()
+                        .pt_2()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(tokens.text_tertiary)
+                        .child(definition.group.to_string())
+                        .into_any_element(),
+                );
+            }
+            let id = definition.id;
+            let stroke = crate::keybindings::effective(id, &overrides);
+            let custom = overrides.contains_key(id) && stroke != crate::keybindings::default_for(id);
+            let capturing = self.capturing.as_deref() == Some(id);
+            rows.push(
+                h_flex()
+                    .id(SharedString::from(format!("shortcut-row-{id}")))
+                    .w_full()
+                    .h(px(34.))
+                    .items_center()
+                    .gap_3()
+                    .px_2()
+                    .rounded_md()
+                    .bg(if capturing {
+                        tokens.surface_raised
+                    } else {
+                        tokens.bg
+                    })
+                    .child(
+                        div()
+                            .w(px(184.))
+                            .flex_shrink_0()
+                            .text_sm()
+                            .child(definition.label.to_string()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .bg(tokens.surface_raised)
+                                    .text_xs()
+                                    .text_color(if custom {
+                                        tokens.accent
+                                    } else {
+                                        tokens.text_secondary
+                                    })
+                                    .child(if capturing {
+                                        "请按键…".to_string()
+                                    } else {
+                                        crate::keybindings::display(&stroke)
+                                    }),
+                            ),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("shortcut-edit-{id}")))
+                            .ghost()
+                            .h(px(26.))
+                            .px_2()
+                            .child(if capturing { "取消" } else { "修改" })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if this.capturing.as_deref() == Some(id) {
+                                    this.cancel_capture(cx);
+                                } else {
+                                    this.begin_capture(id, window, cx);
+                                }
+                            })),
+                    )
+                    .when(custom, |row| {
+                        row.child(
+                            Button::new(SharedString::from(format!("shortcut-reset-{id}")))
+                                .ghost()
+                                .h(px(26.))
+                                .px_2()
+                                .child("重置")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.reset_shortcut(id, cx)
+                                })),
+                        )
+                    })
+                    .into_any_element(),
+            );
+        }
+        settings_page()
+            .child(
+                settings_card(tokens)
+                    .child(section_title("快捷键", tokens))
+                    .child(settings_note(
+                        "点击「修改」后按下新组合键即可生效；修改立即保存。",
+                        tokens,
+                    ))
+                    .child(
+                        div()
+                            .id("shortcut-hint")
+                            .min_h(px(20.))
+                            .text_sm()
+                            .text_color(tokens.accent)
+                            .child(self.shortcut_hint.clone()),
+                    )
+                    .child(
+                        Button::new("shortcut-reset-all")
+                            .ghost()
+                            .h(px(28.))
+                            .px_2()
+                            .child("全部恢复默认")
+                            .on_click(cx.listener(|this, _, _, cx| this.reset_all_shortcuts(cx))),
+                    ),
+            )
+            .child(
+                settings_card(tokens)
+                    .w_full()
+                    .overflow_y_scrollbar()
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
     fn render_policy(&self, title: &str, rows: &[(&str, &str)], tokens: FindxTokens) -> AnyElement {
         settings_page()
             .child(

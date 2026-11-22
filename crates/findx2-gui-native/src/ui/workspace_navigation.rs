@@ -524,6 +524,12 @@ impl MainWindow {
                     .h_full()
                     .overflow_x_scroll()
                     .track_scroll(&self.workspace.tab_scroll)
+                    // Double-clicking the empty strip beside the tabs opens a new
+                    // one, matching browser/file-manager muscle memory. Tab-level
+                    // handlers stop propagation so their own double-click wins.
+                    .on_double_click(cx.listener(|this, _, window, cx| {
+                        this.new_directory_tab(window, cx);
+                    }))
                     .children(self.workspace.tabs.iter().enumerate().map(|(index, tab)| {
                         let path = if index == self.workspace.active_tab {
                             &self.workspace.location
@@ -566,6 +572,20 @@ impl MainWindow {
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.select_directory_tab(index, cx)
+                            }))
+                            // Middle-click closes a tab (browser convention).
+                            .on_mouse_down(
+                                MouseButton::Middle,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.close_directory_tab(index, cx);
+                                }),
+                            )
+                            // Double-click closes as well; stop propagation so the
+                            // tab-strip handler above does not open a replacement.
+                            .on_double_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.close_directory_tab(index, cx);
                             }))
                             .child(Icon::new(IconName::Folder).size_3p5().flex_shrink_0())
                             .child(

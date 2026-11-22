@@ -835,6 +835,25 @@ impl MainWindow {
         self.select_directory_tab(self.workspace.tabs.len() - 1, cx);
     }
 
+    /// Ctrl+1..9 / Ctrl+0 select a directory tab by position (0 = last).
+    pub(super) fn select_directory_tab_number(&mut self, number: usize, cx: &mut Context<Self>) {
+        if self.settings_page.is_some() || self.workspace.mode != ViewMode::Directory {
+            return;
+        }
+        let count = self.workspace.tabs.len();
+        if count == 0 {
+            return;
+        }
+        let index = if number == 0 {
+            count - 1
+        } else if number <= count {
+            number - 1
+        } else {
+            return;
+        };
+        self.select_directory_tab(index, cx);
+    }
+
     pub(super) fn directory_tab_shortcut(
         &mut self,
         kind: u8,

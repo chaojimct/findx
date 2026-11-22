@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod ipc;
 pub mod isolation;
+pub mod keybindings;
 pub mod mock_backend;
 pub mod open_path;
 pub mod prefs;

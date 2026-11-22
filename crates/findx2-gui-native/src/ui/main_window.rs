@@ -72,6 +72,17 @@ actions!(
         DirectoryCloseTab,
         DirectoryNextTab,
         DirectoryPreviousTab,
+        DirectoryLastTab,
+        DirectoryTab1,
+        DirectoryTab2,
+        DirectoryTab3,
+        DirectoryTab4,
+        DirectoryTab5,
+        DirectoryTab6,
+        DirectoryTab7,
+        DirectoryTab8,
+        DirectoryTab9,
+        ToggleSidebar,
     ]
 );
 
@@ -95,7 +106,7 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(60);
 
 /// Shared with routing regressions: never add repeat-blind bare activation
 /// actions here; their raw KeyDownEvent path retains the platform held bit.
-fn main_key_bindings() -> Vec<KeyBinding> {
+pub(crate) fn main_key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("shift-f10", ShowFileMenu, Some(FILE_SHORTCUT_CONTEXT)),
         KeyBinding::new("menu", ShowFileMenu, Some(FILE_SHORTCUT_CONTEXT)),
@@ -130,6 +141,26 @@ fn main_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-comma", OpenSettings, Some("FindXMain")),
         KeyBinding::new("escape", NoAction, Some(TABLE_RAW_ESCAPE_CONTEXT)),
         KeyBinding::new("backspace", ParentSelected, Some(FILE_SHORTCUT_CONTEXT)),
+        // Familiar aliases from browsers / VS Code / Explorer. All map to the
+        // same actions, so they inherit the existing action guards.
+        KeyBinding::new("ctrl-n", DirectoryNewTab, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-r", WorkspaceRefresh, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("alt-d", WorkspaceFocusPath, Some("FindXMain")),
+        KeyBinding::new("ctrl-backspace", ParentSelected, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("f1", ToggleCommandPalette, Some("FindXMain")),
+        KeyBinding::new("ctrl-shift-p", ToggleCommandPalette, Some("FindXMain")),
+        KeyBinding::new("ctrl-i", PreviewSelected, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-b", ToggleSidebar, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-0", DirectoryLastTab, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-1", DirectoryTab1, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-2", DirectoryTab2, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-3", DirectoryTab3, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-4", DirectoryTab4, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-5", DirectoryTab5, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-6", DirectoryTab6, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-7", DirectoryTab7, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-8", DirectoryTab8, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-9", DirectoryTab9, Some(FILE_SHORTCUT_CONTEXT)),
     ]
 }
 
@@ -286,6 +317,9 @@ impl MainWindow {
 
     pub fn new(session: Entity<AppSession>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.bind_keys(main_key_bindings());
+        // Saved user shortcuts are applied on top of the factory bindings.
+        let saved_bindings = session.read(cx).prefs.key_bindings.clone();
+        crate::keybindings::apply(&saved_bindings, cx);
 
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索文件…"));
 
@@ -2405,6 +2439,48 @@ impl Render for MainWindow {
             }))
             .on_action(cx.listener(|this, _: &DirectoryPreviousTab, window, cx| {
                 this.directory_tab_shortcut(3, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DirectoryLastTab, _, cx| {
+                this.select_directory_tab_number(0, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DirectoryTab1, _, cx| {
+                this.select_directory_tab_number(1, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DirectoryTab2, _, cx| {
+                this.select_directory_tab_number(2, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DirectoryTab3, _, cx| {
+                this.select_directory_tab_number(3, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DirectoryTab4, _, cx| {
+                this.select_directory_tab_number(4, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DirectoryTab5, _, cx| {
+                this.select_directory_tab_number(5, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DirectoryTab6, _, cx| {
+                this.select_directory_tab_number(6, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DirectoryTab7, _, cx| {
+                this.select_directory_tab_number(7, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DirectoryTab8, _, cx| {
+                this.select_directory_tab_number(8, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DirectoryTab9, _, cx| {
+                this.select_directory_tab_number(9, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                if this.settings_page.is_some() || this.workspace.mode == ViewMode::Search {
+                    return;
+                }
+                let pref = this.session.read(cx).prefs.sidebar_open;
+                let effective = match this.sidebar_force {
+                    Some(ForceState::Show) => true,
+                    Some(ForceState::Hide) => false,
+                    None => pref,
+                };
+                this.toggle_panel(search_logic::PanelKind::Sidebar, effective, cx);
             }))
             .on_action(cx.listener(|this, _: &WorkspaceFocusPath, window, cx| {
                 if this.settings_page.is_some() || this.workspace.mode == ViewMode::Search {
