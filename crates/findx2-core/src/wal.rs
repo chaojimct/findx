@@ -1359,6 +1359,26 @@ mod tests {
     }
 
     #[test]
+    fn mid_file_corruption_is_loud_not_silent() {
+        // A CRC failure in the MIDDLE (followed by parseable frames) is
+        // real corruption, not a torn tail: must error, never silently stop.
+        let dir = scratch("corrupt");
+        let mut b1 = sample_batch();
+        let mut b2 = sample_batch();
+        wal_append(&dir, &mut b1).unwrap();
+        wal_append(&dir, &mut b2).unwrap();
+        let path = wal_path(&dir);
+        let mut buf = std::fs::read(&path).unwrap();
+        // Corrupt one payload byte of the first frame (not its header).
+        let off = HEADER_LEN + 5;
+        buf[off] ^= 0xFF;
+        std::fs::write(&path, &buf).unwrap();
+        let err = wal_read_from(&dir, 1).expect_err("mid-file corruption must fail loudly");
+        assert!(err.contains("mid-file"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn pre_lengths_match_live_store_growth() {
         let batch = sample_batch();
         let pre = pre_lengths(&batch);
