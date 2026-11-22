@@ -1433,11 +1433,13 @@ fn persist_periodic_checkpoint(
 }
 
 /// Fold gating: size-, memory- and time-based. `force` bypasses everything
-/// (FullResync pending, shutdown, tests).
+/// (FullResync pending, shutdown, tests). The reason is logged so the
+/// 1 GB copy stays attributable (size / journal-RAM / staleness / forced).
 fn fold_if_due(
     engine: &Arc<SearchEngine>, path: &Path, dirty_count: &mut usize, force: bool,
 ) -> anyhow::Result<()> {
-    if !force && !fold_due(engine, path, *dirty_count) { return Ok(()); }
+    let Some(reason) = fold_reason(engine, path, *dirty_count, force) else { return Ok(()); };
+    tracing::info!(reason, dirty = *dirty_count, "fold due");
     if persist_index(engine, path)? {
         *dirty_count = 0;
         last_fold_ms().store(commit_clock_ms(), Ordering::Relaxed);
@@ -1451,16 +1453,23 @@ fn fold_if_due(
 /// Quiet trickle folds at FOLD_MAX; there is no minimum spacing because
 /// every trigger resets itself (dirty clears, WAL retains, force is one-shot).
 pub(crate) fn fold_due(engine: &SearchEngine, path: &Path, dirty: usize) -> bool {
+    fold_reason(engine, path, dirty, false).is_some()
+}
+
+fn fold_reason(engine: &SearchEngine, path: &Path, dirty: usize, force: bool) -> Option<&'static str> {
     const FOLD_BYTES: u64 = 256 << 20;
     const FOLD_DIRTY: usize = 1 << 20;
     const FOLD_MAX: Duration = Duration::from_secs(7200);
-    if dirty == 0 && !engine.has_pending_persistence() { return false; }
-    if dirty >= FOLD_DIRTY { return true; }
-    if findx2_core::wal_file_len(&V6Layout::for_index(path).dir) >= FOLD_BYTES { return true; }
-    if last_fold_ms().load(Ordering::Relaxed).saturating_add(FOLD_MAX.as_millis() as u64) <= commit_clock_ms() {
-        return true;
+    if force {
+        return Some("forced(fullresync/shutdown/test)");
     }
-    false
+    if dirty == 0 && !engine.has_pending_persistence() { return None; }
+    if dirty >= FOLD_DIRTY { return Some("journal-ram"); }
+    if findx2_core::wal_file_len(&V6Layout::for_index(path).dir) >= FOLD_BYTES { return Some("wal-size"); }
+    if last_fold_ms().load(Ordering::Relaxed).saturating_add(FOLD_MAX.as_millis() as u64) <= commit_clock_ms() {
+        return Some("staleness");
+    }
+    None
 }
 
 /// Process-wide clock (wall millis) of the last successful fold.

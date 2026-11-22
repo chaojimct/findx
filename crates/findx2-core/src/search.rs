@@ -139,9 +139,9 @@ pub struct SearchEngine {
     /// 失败回滚时恢复到 take 前的值。append-only 单调（除这两处），读-改-写
     /// 只发生在 wal_mutex 下，跨线程可见性用 SeqCst。
     wal_flushed: AtomicUsize,
-    /// WAL 心跳已覆盖的 metadata 脏位图长度（单调，直到 take 清空）。
-    /// 心跳只在位图增长时才重新快照，避免每 5 秒重复 fsync 同一份。
-    meta_covered: AtomicUsize,
+    /// 自上次心跳快照以来新标记的 metadata 槽。心跳只 journal 这一增量
+    /// （幂等重写）；fold（take）时清空。双位图避免每 5 秒重复 fsync 全量。
+    meta_since_hb: parking_lot::Mutex<RoaringBitmap>,
     /// 索引变更计数：任何影响搜索结果集/排序的写入都 +1（USN 增量、回填合并、
     /// metadata_ready 翻转、overlay 写入/清空）。分页查询缓存凭它失效。
     /// trigram 边车重建不 bump——剪枝只影响候选超集，不影响最终命中与排序。
@@ -183,7 +183,7 @@ struct PageBuildStats {
 /// nothing, or fold immediately (unreplayable marker pending).
 pub enum HeartbeatBatch {
     None,
-    Append { batch: crate::CommitBatch, journal_flushed: usize, meta_covered: usize },
+    Append { batch: crate::CommitBatch, journal_flushed: usize },
     ForceFold,
 }
 
@@ -206,7 +206,7 @@ impl SearchEngine {
             metadata_overlay: Arc::new(MetaOverlay::new(entry_count)),
             metadata_drains: AtomicUsize::new(0),
             metadata_dirty: parking_lot::Mutex::new(RoaringBitmap::new()),
-            meta_covered: AtomicUsize::new(0),
+            meta_since_hb: parking_lot::Mutex::new(RoaringBitmap::new()),
             wal_flushed: AtomicUsize::new(0),
             revision: AtomicU64::new(0),
             page_cache: parking_lot::Mutex::new(None),
@@ -236,6 +236,7 @@ impl SearchEngine {
         runtime.error = Some("index epoch changed; usage requires reinitialization".into());
         self.metadata_overlay.clear();
         self.metadata_dirty.lock().clear();
+        self.meta_since_hb.lock().clear();
         *g = store;
         self.bump_revision();
     }
@@ -1215,7 +1216,6 @@ impl SearchEngine {
         let mut g = self.store.write();
         let mut mutations = g.take_mutations();
         self.wal_flushed.store(0, Ordering::SeqCst);
-        self.meta_covered.store(0, Ordering::SeqCst);
         let mut dirty = self.metadata_dirty.lock();
         if !dirty.is_empty() {
             if !mutations.iter().any(|m| matches!(m, crate::index::Mutation::FullResync)) {
@@ -1241,6 +1241,7 @@ impl SearchEngine {
             dirty.clear();
         }
         drop(dirty);
+        self.meta_since_hb.lock().clear();
         if mutations.is_empty() { return None; }
         let (tri_snap, has_trigram) = match g.trigram.as_ref() {
             Some(t) => (t.snapshot_entry_count(), true),
@@ -1270,47 +1271,42 @@ impl SearchEngine {
         let g = self.store.read();
         let flushed = self.wal_flushed.load(Ordering::SeqCst);
         let pending = g.pending_mutation_count();
-        let dirty_len = self.metadata_dirty.lock().len() as usize;
-        let meta_covered = self.meta_covered.load(Ordering::SeqCst);
-        if flushed >= pending && dirty_len <= meta_covered {
+        let meta_pending = self.meta_since_hb.lock().len() as usize;
+        if flushed >= pending && meta_pending == 0 {
             return HeartbeatBatch::None;
         }
         let mut mutations = g.clone_mutations_from(flushed);
         if mutations.iter().any(|m| matches!(m, crate::index::Mutation::FullResync)) {
             return HeartbeatBatch::ForceFold;
         }
-        // Metadata snapshot WITHOUT clearing (take drains; heartbeat peeks).
-        // Idempotent: fixed-offset pwrite of identical bytes on replay.
-        // Metadata snapshot WITHOUT clearing (take drains; heartbeat peeks).
-        // Idempotent: fixed-offset pwrite of identical bytes, safe to repeat
-        // on replay. Only re-snapshot when the bitmap GREW since last time;
-        // the retained frames keep covering the old prefix.
-        let mut meta_snap_len = meta_covered;
-        if dirty_len > meta_covered {
-            let dirty = self.metadata_dirty.lock();
-            if mutations.try_reserve(dirty.len() as usize + 1).is_err() {
+        // Metadata: journal the slots marked since the last successful
+        // heartbeat (peek here; the caller removes exactly the journaled
+        // set on success so concurrent marks are never dropped).
+        // Idempotent fixed-offset pwrite; the fold drains everything anyway.
+        let since = self.meta_since_hb.lock();
+        let meta_pending = since.len() as usize;
+        let mut meta_now = Vec::new();
+        if meta_pending > 0 {
+            if mutations.try_reserve(meta_pending + 1).is_err() {
                 return HeartbeatBatch::ForceFold;
             }
-            let mut patches = Vec::new();
-            if patches.try_reserve(dirty.len() as usize).is_err() {
+            if meta_now.try_reserve_exact(meta_pending).is_err() {
                 return HeartbeatBatch::ForceFold;
             }
-            for idx in dirty.iter() {
+            for idx in since.iter() {
                 if let Some(e) = g.entries.get(idx as usize) {
                     let mut bytes = [0u8; 18];
                     bytes[..8].copy_from_slice(&e.size.to_le_bytes());
                     bytes[8..12].copy_from_slice(&e.mtime.to_le_bytes());
                     bytes[12..16].copy_from_slice(&e.ctime.to_le_bytes());
                     bytes[16..18].copy_from_slice(&e._pad.to_le_bytes());
-                    patches.push((idx, bytes));
+                    meta_now.push((idx, bytes));
                 }
             }
-            // Covered = the bitmap exactly as snapshotted (lock held above).
-            meta_snap_len = dirty.len() as usize;
-            drop(dirty);
-            if !patches.is_empty() {
-                mutations.push(crate::index::Mutation::MetadataBatch(patches));
-            }
+        }
+        drop(since);
+        if !meta_now.is_empty() {
+            mutations.push(crate::index::Mutation::MetadataBatch(meta_now));
         }
         if mutations.is_empty() {
             return HeartbeatBatch::None;
@@ -1335,7 +1331,7 @@ impl SearchEngine {
         // Absolute flushed prefix observed under the same read guard as the
         // clone: advancing to exactly this is lossless (later pushes append
         // after it and are covered next round).
-        HeartbeatBatch::Append { batch, journal_flushed: pending, meta_covered: meta_snap_len }
+        HeartbeatBatch::Append { batch, journal_flushed: pending }
     }
 
     pub fn wal_flushed_count(&self) -> usize {
@@ -1364,14 +1360,26 @@ impl SearchEngine {
     /// take (which drains and resets the same counter) cannot interleave.
     pub fn wal_heartbeat(&self, layout_dir: &std::path::Path) -> std::result::Result<HeartbeatOutcome, String> {
         let _guard = crate::wal::wal_lock();
-        let (mut batch, journal_flushed, meta_covered) = match self.clone_unflushed_batch() {
+        let (mut batch, journal_flushed) = match self.clone_unflushed_batch() {
             HeartbeatBatch::None => return Ok(HeartbeatOutcome::None),
             HeartbeatBatch::ForceFold => return Ok(HeartbeatOutcome::ForceFold),
-            HeartbeatBatch::Append { batch, journal_flushed, meta_covered } => (batch, journal_flushed, meta_covered),
+            HeartbeatBatch::Append { batch, journal_flushed } => (batch, journal_flushed),
         };
         let seq = crate::wal::wal_append_locked(layout_dir, &mut batch)?;
         self.wal_flushed.store(journal_flushed, Ordering::SeqCst);
-        self.meta_covered.store(meta_covered, Ordering::SeqCst);
+        // Remove exactly the journaled slots; concurrent marks survive.
+        let mut covered: Vec<u32> = Vec::new();
+        for m in &batch.mutations {
+            if let crate::index::Mutation::MetadataBatch(items) = m {
+                covered.extend(items.iter().map(|(idx, _)| *idx));
+            }
+        }
+        if !covered.is_empty() {
+            let mut since = self.meta_since_hb.lock();
+            for idx in covered {
+                since.remove(idx);
+            }
+        }
         Ok(HeartbeatOutcome::Appended { seq })
     }
 
@@ -1379,6 +1387,7 @@ impl SearchEngine {
     /// retained during backfill; repeated writes to one slot coalesce in a bitmap.
     pub(crate) fn note_metadata_slot(&self, idx: u32) {
         self.metadata_dirty.lock().insert(idx);
+        self.meta_since_hb.lock().insert(idx);
     }
     pub(crate) fn mirror_metadata_for_persistence(&self, g: &mut IndexStore, idx: usize,
         size: u64, mtime: u64, ctime: u64) -> Result<()> {
@@ -1386,7 +1395,10 @@ impl SearchEngine {
         e.size = size;
         e.mtime = crate::index::filetime_to_unix_secs(mtime);
         e.ctime = crate::index::filetime_to_unix_secs(ctime);
-        if g.mutation_log.is_some() { self.metadata_dirty.lock().insert(idx as u32); }
+        if g.mutation_log.is_some() {
+            self.metadata_dirty.lock().insert(idx as u32);
+            self.meta_since_hb.lock().insert(idx as u32);
+        }
         Ok(())
     }
 
