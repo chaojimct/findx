@@ -1597,6 +1597,27 @@ impl SettingsWindow {
                                     })
                                 })
                         }),
+                    )
+                    .child(
+                        h_flex()
+                            .h(px(36.))
+                            .items_center()
+                            .gap_2()
+                            .child(settings_note(
+                                "复制的内容与上方一致，只是隐去用户名与邮箱；数字和路径保持原样。",
+                                tokens,
+                            ))
+                            .child(
+                                Button::new("copy-diagnostics")
+                                    .ghost()
+                                    .w(px(120.))
+                                    .flex_shrink_0()
+                                    .label("复制诊断")
+                                    .accessibility_label("复制已脱敏的诊断信息")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.copy_diagnostics(cx);
+                                    })),
+                            ),
                     ),
             )
             .child(self.render_storage_fields(tokens))
@@ -1613,6 +1634,61 @@ impl SettingsWindow {
                             .child(s.status_raw.clone()),
                     ),
             )
+    }
+
+    /// Support report: same facts as the rows above, with usernames and e-mail
+    /// addresses removed. The clipboard is the delivery channel so nothing is
+    /// written to disk without the user asking for a file.
+    fn copy_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let s = self.session.read(cx);
+        let mode = if s.mock {
+            "模拟数据"
+        } else if s.official_product {
+            "已安装的索引服务"
+        } else if s.live {
+            "连接到已有服务"
+        } else {
+            "独立配置"
+        };
+        let mut header = crate::diagnostics_bundle::environment(env!("CARGO_PKG_VERSION"));
+        header.push(format!("运行方式: {mode}"));
+        header.push(format!("连接: {}", if s.connected { "已连接" } else { "未连接" }));
+        header.push(format!("连接地址: {}", s.endpoint));
+        header.push(format!("管道名称: {}", self.settings.pipe_name));
+        header.push(format!(
+            "设置文件: {}",
+            prefs::settings_path().display()
+        ));
+        let mut index_lines = vec![
+            crate::status_logic::diagnostic_index_line(&s.index_status.summary),
+            format!("最近状态: {}", s.status_checked),
+            format!("错误: {}", s.last_error.as_deref().unwrap_or("无")),
+        ];
+        if let Some(detail) = s.index_status.detail.clone() {
+            index_lines.push(detail);
+        }
+        if let Some(wal) = s.engine_footer.wal_label() {
+            index_lines.push(format!("WAL: {wal}"));
+        }
+        let raw = s
+            .status_raw
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let generated_at = crate::search_logic::format_time(crate::csv_export::now_unix_secs());
+        let doc = crate::diagnostics_bundle::render(
+            &generated_at,
+            &header,
+            &[
+                crate::diagnostics_bundle::Section { title: "索引状态".into(), lines: index_lines },
+                crate::diagnostics_bundle::Section { title: "原始状态".into(), lines: raw },
+            ],
+        );
+        let home = crate::diagnostics_bundle::home_dir();
+        let doc = crate::diagnostics_bundle::redact(&doc, home.as_deref());
+        cx.write_to_clipboard(ClipboardItem::new_string(doc));
+        self.hint = "已复制诊断信息（已隐去用户名与邮箱）".into();
+        cx.notify();
     }
 
     fn render_footer(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> impl IntoElement {

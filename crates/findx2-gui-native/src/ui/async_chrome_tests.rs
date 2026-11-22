@@ -131,6 +131,26 @@ fn usage_toolbar_width_accounts_for_label_padding_and_address_minimum() {
 }
 
 #[test]
+fn diagnostics_copy_redacts_before_it_reaches_the_clipboard() {
+    let src = include_str!("settings_window.rs");
+    let handler = src
+        .split("fn copy_diagnostics")
+        .nth(1)
+        .unwrap()
+        .split("fn render_footer")
+        .next()
+        .unwrap();
+    let redacted = handler.find("diagnostics_bundle::redact").unwrap();
+    let clipboard = handler.find("write_to_clipboard").unwrap();
+    assert!(redacted < clipboard, "redaction must precede the clipboard write");
+    assert!(handler.contains("diagnostics_bundle::home_dir"));
+    assert!(handler.contains("已隐去用户名与邮箱"));
+    // The button is a plain action: no async state, no extra rows.
+    assert!(src.contains("Button::new(\"copy-diagnostics\")"));
+    assert!(src.contains(".accessibility_label(\"复制已脱敏的诊断信息\")"));
+}
+
+#[test]
 fn export_action_is_disabled_without_results_and_never_blocks_the_pipe() {
     let page = include_str!("workspace_pages.rs");
     let bar = page

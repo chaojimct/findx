@@ -49,6 +49,8 @@ pub mod footer_status;
 
 pub mod csv_export;
 
+pub mod diagnostics_bundle;
+
 pub mod directory_filter;
 
 #[cfg(windows)]
