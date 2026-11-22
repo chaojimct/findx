@@ -51,8 +51,6 @@ pub mod footer_status;
 
 pub mod command_palette;
 
-pub mod detail_pane;
-
 pub mod diagnostics_bundle;
 
 pub mod directory_filter;
