@@ -667,6 +667,7 @@ fn v6_commit_store(v6: &V6Layout, store: &mut IndexStore) -> Result<()> {
         tri_pending: store.tri_pending.clone(),
         tri_snap,
         has_trigram,
+        wal_seq: 0,
     };
     if batch.mutations.is_empty() {
         return Ok(());
