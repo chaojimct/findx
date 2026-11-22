@@ -35,7 +35,8 @@ pub use persist::{
     save_exclude_sidecar, save_index_bin, save_index_zst, write_index_bin, LoadPhase,
 };
 pub use persist_v6::{
-    load_store_auto, v6_load, v6_save_full, v6_try_commit, CommitBatch, CommitOutcome, V6Layout,
+    load_store_auto, v6_load, v6_save_full, v6_save_full_at, v6_try_commit, CommitBatch,
+    CommitOutcome, V6Layout,
 };
 pub use persist_tx::{
     clear_persist_fault, generation_dir, generation_disk_bytes, has_published, published_path,
@@ -43,9 +44,9 @@ pub use persist_tx::{
     take_last_clone_error, PersistFault,
 };
 pub use wal::{
-    pre_lengths, replay_frames_into_store, wal_append, wal_file_len, wal_read_from,
-    wal_retain_from, wal_tip_seq, wal_truncate_tail_seq, PreLengths, ReplayOutcome, WalFrame,
-    WalRead,
+    pre_lengths, replay_frames_into_store, wal_append, wal_current_tip, wal_file_len,
+    wal_read_from, wal_retain_from, wal_truncate_after, wal_truncate_tail_seq, PreLengths,
+    ReplayOutcome, WalFrame, WalRead,
 };
 
 pub mod platform;
@@ -63,7 +64,7 @@ pub use platform::{
     ChangeEvent, ChangeWatcher, CreateIfMissing, RawEntry, VolumeScanner, WatchCursor,
 };
 pub use query::{ParsedQuery, QueryParser, SortField};
-pub use search::{BackfillProgress, SearchEngine, SearchHit, SearchOptions};
+pub use search::{BackfillProgress, HeartbeatBatch, HeartbeatOutcome, SearchEngine, SearchHit, SearchOptions};
 pub use trigram::{
     build_and_save as build_trigram_sidecar, load_pending_sidecar, pending_sidecar_path,
     save_pending_sidecar, tri_sidecar_path, TrigramIndex,

@@ -191,7 +191,15 @@ pub(crate) fn read_legacy_manifest(layout: &V6Layout) -> Result<V6Manifest> {
 }
 
 pub fn v6_save_full(layout: &V6Layout, store: &IndexStore) -> Result<u64> {
-    crate::persist_tx::save_full_generation(layout, store)
+    crate::persist_tx::save_full_generation(layout, store, crate::wal::wal_current_tip(&layout.dir))
+}
+
+/// Full snapshot with an explicit WAL coverage point. Use when the caller
+/// knows exactly what is folded (fold path passes the take tip); the
+/// default above claims the live tip, which is only sound for standalone
+/// snapshots that fold the whole RAM store (boot conversion, CLI rebuilds).
+pub fn v6_save_full_at(layout: &V6Layout, store: &IndexStore, wal_seq: u64) -> Result<u64> {
+    crate::persist_tx::save_full_generation(layout, store, wal_seq)
 }
 
 fn parse_entries(buf: &[u8]) -> Result<Vec<FileEntry>> {

@@ -10,8 +10,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use findx2_core::{
-    load_index_bin_with_progress, v6_load, v6_save_full, v6_try_commit, CommitOutcome,
-    SearchEngine, V6Layout,
+    load_index_bin_with_progress, v6_load, v6_save_full, v6_save_full_at, v6_try_commit,
+    CommitOutcome, SearchEngine, V6Layout,
 };
 use tracing::{error, info};
 
@@ -310,6 +310,9 @@ pub(crate) fn run_foreground(
     };
     // v6 变更记录从此刻开始：之后的 mark/compact/USN 都会进日志，commit 时回放进分段文件。
     replay_wal_at_boot(&v6, &mut store);
+    // Boot is not a fold: the clock starts now so the first periodic ticks
+    // only heartbeat. (A restart backlog folds on size/journal bounds.)
+    stamp_fold_clock();
     store.set_track_mutations(true);
 
     // 合并 CLI 追加的排除目录到 store；并把命中条目一次性打墓碑，避免「sidecar 没改，CLI 临时加目录」时旧数据漏网。
@@ -1395,41 +1398,74 @@ fn persist_periodic_checkpoint(
     engine: &Arc<SearchEngine>, path: &Path, dirty_count: &mut usize,
     last_save: &mut Instant, save_every: Duration,
 ) -> anyhow::Result<()> {
-    // A busy desktop produces thousands of USN events per minute, and every
-    // commit copies FULL segments (~1 GB on a 9.8M-entry store: NTFS does not
-    // implement FSCTL_DUPLICATE_EXTENTS_TO_FILE, so the "block clone" path
-    // always falls back to a byte copy — verified rc=50 on every window).
-    // Watch threads are per-volume but each commit writes the whole store,
-    // so the rate limit must be GLOBAL, not per-thread:
-    // - busy (>= THRESHOLD): at most ~1 commit per BUSY_MIN. Crash replay
-    //   stays bounded (threshold events = seconds of journal replay);
-    // - quiet trickle: at most ~1 commit per IDLE_FLUSH. A crash loses at
-    //   most that much re-derivable progress — the FS itself is the source
-    //   of truth (backfill/watcher re-derive), usage stats are auxiliary.
-    const THRESHOLD: usize = 65536;
-    const BUSY_MIN: Duration = Duration::from_secs(120);
-    const IDLE_FLUSH: Duration = Duration::from_secs(600);
+    // WAL-2: durability and folding are separate cadences.
+    // - heartbeat (cheap, ~5s): fsync the unflushed journal suffix. Crash
+    //   window = seconds, independent of fold cost.
+    // - fold (expensive, ~1 GB full-segment copies): only when the WAL is
+    //   big, the journal is huge, or a long time passed. `save_every`
+    //   survives as a floor for fold spacing (never more often than before),
+    //   but heartbeats always run at 5s regardless.
+    const HEARTBEAT: Duration = Duration::from_secs(5);
     if *dirty_count == 0 && !engine.has_pending_persistence() { return Ok(()); }
-    let now = commit_clock_ms();
-    let since_last = now.saturating_sub(last_periodic_commit_ms().load(Ordering::Relaxed));
-    let due = if *dirty_count >= THRESHOLD {
-        since_last >= BUSY_MIN.as_millis() as u64
-    } else {
-        last_save.elapsed() >= save_every && since_last >= IDLE_FLUSH.as_millis() as u64
-    };
-    if !due { return Ok(()); }
+    let layout = V6Layout::for_index(path);
+    // Heartbeat cadence: fixed 5s, or faster if the operator asked for it.
+    // (`save_every` no longer gates folds — that was the 1 GB-per-commit
+    // storm. It survives as an upper bound on heartbeat spacing.)
+    let hb_every = save_every.min(HEARTBEAT);
+    // 1) Heartbeat first: journal -> WAL (durable in seconds).
+    if last_save.elapsed() >= hb_every {
+        *last_save = Instant::now();
+        match engine.wal_heartbeat(&layout.dir) {
+            Ok(findx2_core::HeartbeatOutcome::None) => {}
+            Ok(findx2_core::HeartbeatOutcome::Appended { seq }) => {
+                tracing::debug!(seq, "WAL heartbeat appended");
+            }
+            Ok(findx2_core::HeartbeatOutcome::ForceFold) => {
+                // Unreplayable marker pending: fold now (commit turns it
+                // into a full snapshot, which converges).
+                return fold_if_due(engine, path, dirty_count, true);
+            }
+            Err(e) => return Err(anyhow::anyhow!("WAL heartbeat failed: {e}")),
+        }
+    }
+    // 2) Fold (take + commit) only when due.
+    fold_if_due(engine, path, dirty_count, false)
+}
+
+/// Fold gating: size-, memory- and time-based. `force` bypasses everything
+/// (FullResync pending, shutdown, tests).
+fn fold_if_due(
+    engine: &Arc<SearchEngine>, path: &Path, dirty_count: &mut usize, force: bool,
+) -> anyhow::Result<()> {
+    if !force && !fold_due(engine, path, *dirty_count) { return Ok(()); }
     if persist_index(engine, path)? {
         *dirty_count = 0;
-        *last_save = Instant::now();
-        last_periodic_commit_ms().store(commit_clock_ms(), Ordering::Relaxed);
+        last_fold_ms().store(commit_clock_ms(), Ordering::Relaxed);
         if engine.metadata_ready() { maybe_rebuild_trigram(engine, path); }
     }
     Ok(())
 }
 
-/// Process-wide clock (wall millis) of the last successful periodic commit.
-/// Atomic so per-volume watch threads share one rate limit without a lock.
-fn last_periodic_commit_ms() -> &'static AtomicU64 {
+/// Pure fold predicate (unit-tested): fold when the WAL is big, the journal
+/// is huge (RAM bound), the maximum staleness is reached, or forced.
+/// Quiet trickle folds at FOLD_MAX; there is no minimum spacing because
+/// every trigger resets itself (dirty clears, WAL retains, force is one-shot).
+pub(crate) fn fold_due(engine: &SearchEngine, path: &Path, dirty: usize) -> bool {
+    const FOLD_BYTES: u64 = 256 << 20;
+    const FOLD_DIRTY: usize = 1 << 20;
+    const FOLD_MAX: Duration = Duration::from_secs(7200);
+    if dirty == 0 && !engine.has_pending_persistence() { return false; }
+    if dirty >= FOLD_DIRTY { return true; }
+    if findx2_core::wal_file_len(&V6Layout::for_index(path).dir) >= FOLD_BYTES { return true; }
+    if last_fold_ms().load(Ordering::Relaxed).saturating_add(FOLD_MAX.as_millis() as u64) <= commit_clock_ms() {
+        return true;
+    }
+    false
+}
+
+/// Process-wide clock (wall millis) of the last successful fold.
+/// Atomic so per-volume watch threads share one fold schedule without a lock.
+fn last_fold_ms() -> &'static AtomicU64 {
     static LAST: AtomicU64 = AtomicU64::new(0);
     &LAST
 }
@@ -1440,8 +1476,14 @@ fn commit_clock_ms() -> u64 {
         .unwrap_or(0)
 }
 #[cfg(test)]
-pub(crate) fn reset_periodic_commit_clock() {
-    last_periodic_commit_ms().store(0, Ordering::Relaxed);
+pub(crate) fn reset_fold_clock() {
+    last_fold_ms().store(0, Ordering::Relaxed);
+}
+
+/// Stamp the fold clock with now (suppress the FOLD_MAX arm: boot, and tests
+/// that exercise the heartbeat path without folding).
+pub(crate) fn stamp_fold_clock() {
+    last_fold_ms().store(commit_clock_ms(), Ordering::Relaxed);
 }
 
 #[derive(Default)]
@@ -1530,19 +1572,14 @@ fn persist_index_locked(
     engine: &SearchEngine, path: &Path,
     writer: impl FnOnce(&V6Layout, &findx2_core::CommitBatch) -> anyhow::Result<CommitOutcome>,
 ) -> anyhow::Result<bool> {
-    let Some(batch) = engine.take_persistence_batch() else { return Ok(true); };
+    // Tip + take are one atomic fold-take (core holds the WAL mutex across
+    // both): a heartbeat append can neither slip between them nor interleave
+    // a drain. batch.wal_seq = tip at take; the commit below folds exactly
+    // that. Heartbeats appended during the commit IO carry higher seqs and
+    // replay later; the pre-length guard keeps recovery exact either way.
+    let Some((wal_seq, flushed_before, batch)) = engine.wal_take_for_fold(&V6Layout::for_index(path).dir) else { return Ok(true); };
     let mut pending = UnacknowledgedBatch { engine, batch: Some(batch) };
     let layout = V6Layout::for_index(path);
-    // WAL-1 durability: fsync-append the drained batch BEFORE folding it
-    // into a generation. Commits are serialized by persist_lock, so this
-    // frame is always the file tail (a failed commit truncates exactly it).
-    let wal_seq = match findx2_core::wal_append(&layout.dir, pending.batch.as_mut().unwrap()) {
-        Ok(seq) => seq,
-        Err(e) => {
-            drop(pending);
-            return Err(anyhow::anyhow!("WAL append failed, batch retained: {e}"));
-        }
-    };
     let batch = pending.batch.as_ref().unwrap();
     let started = Instant::now();
     let result = (|| -> anyhow::Result<()> {
@@ -1562,7 +1599,12 @@ fn persist_index_locked(
                     "checkpoint FULL snapshot ({reason})"
                 ));
                 let store = engine.index_store();
-                let generation = v6_save_full(&layout, &store).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+                // Snapshot coverage = exactly the take tip: the snapshot
+                // folds RAM (a superset of the drained batch), while newer
+                // heartbeat frames stay live and replay later. Claiming more
+                // (the live tip) would skip frames whose content never made
+                // it into the files.
+                let generation = v6_save_full_at(&layout, &store, batch.wal_seq).map_err(|e| anyhow::anyhow!("{e:#}"))?;
                 info!(generation, "Checkpoint full snapshot IO completed");
                 let phys = findx2_core::take_commit_physical_bytes();
                 crate::win_service::append_service_log(&format!("checkpoint full snapshot done, gen {generation}, {phys} disk bytes"));
@@ -1594,13 +1636,15 @@ fn persist_index_locked(
             Ok(true)
         }
         Err(error) => {
-            // The failed batch's frame is the file tail (commits serialized):
-            // cut it so a later recovery never sees a half-folded duplicate.
-            // (NeedFull inside `result` already published via full snapshot,
-            // which covers the WAL tip — only hard errors truncate here.)
-            if let Err(e) = findx2_core::wal_truncate_tail_seq(&layout.dir, wal_seq) {
-                tracing::warn!(%e, wal_seq, "WAL tail truncate failed after commit error");
+            // Roll the WAL back to the take tip: heartbeats appended during
+            // the failed commit covered re-queued journal content; without
+            // truncation the next heartbeat would frame it twice and
+            // recovery would replay duplicates. Then restore the flushed
+            // prefix so the next heartbeat reframes exactly the gap.
+            if let Err(e) = findx2_core::wal_truncate_after(&layout.dir, wal_seq) {
+                tracing::warn!(%e, wal_seq, "WAL truncate-after failed after commit error");
             }
+            engine.wal_advance_flushed(flushed_before);
             drop(pending); // restore first, including mutations arriving during IO
             health.last_io_failure_ms = Some(now);
             health.last_error = Some(format!("{error:#}"));
@@ -1843,9 +1887,9 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_periodic_partial_coverage_preserves_namespace_and_cursor() {
+    fn checkpoint_periodic_heartbeat_then_fold_preserves_namespace_and_cursor() {
         let (path,engine)=checkpoint_fixture("periodic");
-        super::reset_periodic_commit_clock();
+        super::stamp_fold_clock();
         checkpoint_patch(&engine,456);
         engine.set_backfill_error(Some("80 metadata access errors remain".into()));
         engine.apply_volume_batch(b'C',&[findx2_core::ChangeEvent::Create {entry:RawEntry{file_id:2,file_id_128:None,parent_id:100,name:"public-new.txt".into(),size:123,mtime:0,ctime:0,attrs:0,is_dir:false}}],7,200).unwrap();
@@ -1853,11 +1897,28 @@ mod tests {
         assert!(engine.commit_metadata(new_ticket,999,0,0).unwrap());
         let mut dirty=1;
         let mut last=std::time::Instant::now();
+        let layout=findx2_core::V6Layout::for_index(&path);
         super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
         assert_eq!(restored_size(&path),10,"not due must remain unchanged");
+        assert_eq!(dirty,1);
+        // Heartbeat due: journal fsync-appended, NOT folded (gen untouched).
+        super::stamp_fold_clock();
         last-=std::time::Duration::from_secs(31);
         super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
-        assert_eq!(dirty,0);
+        assert_eq!(dirty,1,"heartbeat retains dirty; only a fold clears it");
+        assert_eq!(restored_size(&path),10,"heartbeat must not publish a generation");
+        let frames=findx2_core::wal_read_from(&layout.dir,1).unwrap();
+        match frames {
+            findx2_core::WalRead::Frames { frames, truncated_tail } => {
+                assert!(!truncated_tail);
+                assert_eq!(frames.len(),1,"one heartbeat = one frame");
+                assert_eq!(frames[0].seq,1);
+                assert!(frames[0].batch.mutations.len()>=2);
+            }
+        }
+        // Fold (the old commit path) publishes everything heartbeat-covered.
+        assert!(super::persist_index(&engine,&path).unwrap());
+        assert_eq!(dirty,1,"direct fold does not touch the caller's dirty counter");
         assert_eq!(restored_size(&path),456);
         let restored=findx2_core::v6_load(&findx2_core::V6Layout::for_index(&path)).unwrap();
         assert_eq!(restored.volumes[0].last_usn,200);
@@ -1927,23 +1988,25 @@ mod tests {
     #[test]
     fn checkpoint_disk_failure_does_not_end_watcher_and_retry_is_backed_off() {
         let (path,engine)=checkpoint_fixture("periodic-retry");
-        super::reset_periodic_commit_clock();
+        super::reset_fold_clock();
         checkpoint_patch(&engine,456);
         findx2_core::set_persist_fault(findx2_core::PersistFault::DiskFull { max_bytes: 16 });
-        let mut dirty=2;
-        let mut last=std::time::Instant::now()-std::time::Duration::from_secs(31);
+        // Force a fold via the journal-RAM bound (size/time arms stay quiet
+        // on fixtures); the fold fails on injected DiskFull.
+        let mut dirty=1usize<<20;
+        let mut last=std::time::Instant::now();
         let original=last;
         let mut retry=None;
         super::persist_periodic_checkpoint_retrying(&engine,&path,&mut dirty,&mut last,&mut retry,std::time::Duration::from_secs(30));
         findx2_core::clear_persist_fault();
-        assert_eq!(last,original);assert_eq!(dirty,2);assert!(retry.is_some());
+        assert!(retry.is_some());
+        assert_eq!(dirty,1usize<<20,"failed fold retains dirty");
         assert!(engine.has_pending_persistence());
         super::persist_periodic_checkpoint_retrying(&engine,&path,&mut dirty,&mut last,&mut retry,std::time::Duration::from_secs(30));
-        assert_eq!(last,original,"backoff is separate from the successful-save clock");
-        assert_eq!(restored_size(&path),10);
+        assert_eq!(restored_size(&path),10,"backoff holds the retry, disk untouched");
         retry=Some(std::time::Instant::now()-std::time::Duration::from_secs(1));
         super::persist_periodic_checkpoint_retrying(&engine,&path,&mut dirty,&mut last,&mut retry,std::time::Duration::from_secs(30));
-        assert_eq!(dirty,0);assert!(last>original);assert!(retry.is_none());
+        assert_eq!(dirty,0);assert!(retry.is_none());
         assert_eq!(restored_size(&path),456);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -1981,15 +2044,21 @@ mod tests {
     #[test]
     fn checkpoint_busy_keeps_dirty_and_clock_and_does_not_drain() {
         let (path,engine)=checkpoint_fixture("busy");
-        super::reset_periodic_commit_clock();
+        super::reset_fold_clock();
         checkpoint_patch(&engine,456);
         let guard=super::persist_lock().lock().unwrap_or_else(|e|e.into_inner());
         let mut dirty=5;
         let mut last=std::time::Instant::now()-std::time::Duration::from_secs(31);
-        let before=last;
+        let layout=findx2_core::V6Layout::for_index(&path);
         super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
-        assert_eq!(dirty,5);assert_eq!(last,before);
+        // Heartbeat needs no persist lock: it appends the WAL and retains
+        // dirty. Only the fold defers while the writer is busy.
+        assert_eq!(dirty,5);
         assert!(engine.has_pending_persistence());
+        let frames=findx2_core::wal_read_from(&layout.dir,1).unwrap();
+        match frames {
+            findx2_core::WalRead::Frames { frames, .. } => assert_eq!(frames.len(),1,"heartbeat proceeds under writer lock"),
+        }
         drop(guard);
         assert!(super::persist_index(&engine,&path).unwrap());
         assert_eq!(restored_size(&path),456);
@@ -1997,46 +2066,54 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_idle_trickle_commits_at_most_once_per_idle_flush() {
-        // 30 mutations every ~15s must NOT each become a 1 GB commit: the
-        // second due-timer call right after a commit is skipped by the
-        // global clock, dirty state retained for the next window.
-        let (path,engine)=checkpoint_fixture("idle-throttle");
-        super::reset_periodic_commit_clock();
+    fn checkpoint_heartbeat_appends_without_folding() {
+        // The 5s heartbeat fsyncs the journal; the 1 GB fold stays parked
+        // until size/time/journal bounds trip. Disk generations must not
+        // move on heartbeat ticks.
+        let (path,engine)=checkpoint_fixture("heartbeat-only");
+        super::stamp_fold_clock();
         checkpoint_patch(&engine,456);
         let mut dirty=30;
         let mut last=std::time::Instant::now()-std::time::Duration::from_secs(3600);
+        let layout=findx2_core::V6Layout::for_index(&path);
         super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
-        assert_eq!(dirty,0,"first due flush must commit");
-        assert_eq!(restored_size(&path),456);
-        checkpoint_patch(&engine,789);
-        dirty=30;
-        last=std::time::Instant::now()-std::time::Duration::from_secs(3600);
+        assert_eq!(dirty,30,"heartbeat retains dirty; only a fold clears it");
+        assert_eq!(restored_size(&path),10,"heartbeat must not publish");
+        let frames=findx2_core::wal_read_from(&layout.dir,1).unwrap();
+        match frames {
+            findx2_core::WalRead::Frames { frames, truncated_tail } => {
+                assert!(!truncated_tail);
+                assert_eq!(frames.len(),1);
+                assert_eq!(frames[0].seq,1);
+            }
+        }
+        // Second tick with no new mutations: no second frame.
+        last-=std::time::Duration::from_secs(3600);
         super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
-        assert_eq!(dirty,30,"back-to-back idle flush must be rate-limited");
-        assert_eq!(restored_size(&path),456,"limited flush must not touch disk");
+        let frames=findx2_core::wal_read_from(&layout.dir,1).unwrap();
+        match frames {
+            findx2_core::WalRead::Frames { frames, .. } => assert_eq!(frames.len(),1,"quiet tick appends nothing"),
+        }
         assert!(engine.has_pending_persistence());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
-    fn checkpoint_threshold_burst_honors_busy_min_interval() {
-        // Even a 64K+ burst commits at most ~1 per BUSY_MIN: full-segment
-        // copies are per-commit, so batching more mutations per commit is
-        // strictly cheaper in disk bytes.
-        let (path,engine)=checkpoint_fixture("busy-throttle");
-        super::reset_periodic_commit_clock();
-        checkpoint_patch(&engine,456);
-        let mut dirty=70000;
-        let mut last=std::time::Instant::now()-std::time::Duration::from_secs(3600);
-        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
-        assert_eq!(dirty,0,"first over-threshold burst must commit");
-        checkpoint_patch(&engine,789);
-        dirty=70000;
-        last=std::time::Instant::now()-std::time::Duration::from_secs(3600);
-        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
-        assert_eq!(dirty,70000,"immediate second burst must wait out BUSY_MIN");
-        assert_eq!(restored_size(&path),456);
+    fn fold_due_predicate_matrix() {
+        let (path,engine)=checkpoint_fixture("fold-predicate");
+        // Nothing pending: never due, even with an ancient clock.
+        super::reset_fold_clock();
+        let mut dirty=0;
+        assert!(!super::fold_due(&engine,&path,dirty));
+        // Journal-RAM bound trips immediately (bounds ~100 MB of journal).
+        dirty=1usize<<20;
+        assert!(super::fold_due(&engine,&path,dirty));
+        // Staleness arm: ancient clock + pending work => due.
+        dirty=1;
+        assert!(super::fold_due(&engine,&path,dirty));
+        // Fresh clock + small WAL + small dirty => park the fold.
+        super::stamp_fold_clock();
+        assert!(!super::fold_due(&engine,&path,dirty));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

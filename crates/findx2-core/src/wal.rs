@@ -18,9 +18,11 @@
 //! - Commits are serialized by `persist_lock`, so a failed commit's frame is
 //!   always the file tail and can be truncated exactly.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use roaring::RoaringBitmap;
 
@@ -447,30 +449,62 @@ fn crc_of(seq: u64, pre: &PreLengths, payload: &[u8], len: u32) -> u32 {
     h.finalize()
 }
 
-/// Append one drained batch. Heals a torn tail first (a crash mid-append
-/// leaves garbage the next append must not land behind), then sets
-/// `batch.wal_seq`. fsyncs before returning: once Ok, the batch survives.
+/// Serializes heartbeat appends against fold takes. Lock order is always
+/// `wal_lock` -> store lock -> (fold only) persist lock; heartbeats never
+/// take the persist lock, so no cycle is possible.
+pub(crate) fn wal_lock() -> std::sync::MutexGuard<'static, ()> {
+    static M: OnceLock<Mutex<()>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// In-memory tip per layout dir (WAL file is append-only; rescanning up to
+/// hundreds of MB per heartbeat is not an option). Initialized from disk
+/// once per layout, then advanced under [`wal_lock`].
+fn wal_tips() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static T: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Canonical append entry: lock, ensure tip, append one frame, advance tip.
+/// Returns the assigned seq. Heals a torn tail first (crash mid-append).
+/// Callers set `batch.wal_seq` from the return value where needed.
 pub fn wal_append(layout_dir: &Path, batch: &mut CommitBatch) -> Result<u64, String> {
+    let _guard = wal_lock();
+    wal_append_locked(layout_dir, batch)
+}
+
+/// Same as [`wal_append`], assuming the caller holds [`wal_lock`].
+pub(crate) fn wal_append_locked(layout_dir: &Path, batch: &mut CommitBatch) -> Result<u64, String> {
     let dir = layout_dir.join(WAL_DIR);
     std::fs::create_dir_all(&dir).map_err(|e| format!("wal: mkdir: {e}"))?;
     let path = wal_path(layout_dir);
+    let mut tip = wal_tips().lock().unwrap_or_else(|e| e.into_inner()).get(&path).copied();
     let mut f = OpenOptions::new().read(true).write(true).create(true).open(&path).map_err(|e| format!("wal: open: {e}"))?;
-    // Scan for the tip; truncate any torn tail so the new frame lands on a
-    // clean boundary. Commits are serialized, so no one else appends here.
     let mut buf = Vec::new();
     f.read_to_end(&mut buf).map_err(|e| format!("wal: scan: {e}"))?;
+    // Scan once: find the file tip and any torn tail.
     let mut off = 0usize;
-    let mut tip = 0u64;
+    let mut scanned = 0u64;
     while off < buf.len() {
         match read_frame_at(&buf, off) {
             Ok((frame, next)) => {
-                tip = frame.seq;
+                scanned = frame.seq;
                 off = next;
             }
             Err(_) => break,
         }
     }
+    let mut tip = tip.unwrap_or(scanned);
+    if tip < scanned {
+        // Another writer advanced the file without this process's map
+        // (should not happen under the mutex; trust the file).
+        tip = scanned;
+    }
     if off < buf.len() {
+        // Healed a torn tail: the torn frame's seq is freed for reuse, so
+        // the tip rewinds to the last good frame (gaps would otherwise
+        // accumulate one seq per crash).
+        tip = scanned;
         f.set_len(off as u64).map_err(|e| format!("wal: heal: {e}"))?;
     }
     f.sync_all().map_err(|e| format!("wal: sync: {e}"))?;
@@ -495,6 +529,8 @@ pub fn wal_append(layout_dir: &Path, batch: &mut CommitBatch) -> Result<u64, Str
     frame.extend_from_slice(&crc_of(next, &pre, &payload, len).to_le_bytes());
     f.write_all(&frame).map_err(|e| format!("wal: append: {e}"))?;
     f.sync_all().map_err(|e| format!("wal: sync: {e}"))?;
+    drop(f);
+    wal_tips().lock().unwrap_or_else(|e| e.into_inner()).insert(path, next);
     batch.wal_seq = next;
     Ok(next)
 }
@@ -505,18 +541,85 @@ pub fn wal_file_len(layout_dir: &Path) -> u64 {
     std::fs::metadata(wal_path(layout_dir)).map(|m| m.len()).unwrap_or(0)
 }
 
-/// Highest seq present. 0 when no usable frame exists.
-pub fn wal_tip_seq(layout_dir: &Path) -> u64 {
+/// Highest assigned seq for this layout (in-memory tip; the WAL file is the
+/// durable counterpart). Initialized from disk once per layout.
+pub fn wal_current_tip(layout_dir: &Path) -> u64 {
     let path = wal_path(layout_dir);
-    let Ok(mut f) = File::open(&path) else { return 0 };
+    let mut tips = wal_tips().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tip) = tips.get(&path).copied() {
+        return tip;
+    }
+    let tip = scan_tip(&path);
+    tips.insert(path, tip);
+    tip
+}
+
+/// Drop all frames with `seq > keep_through` (failed-fold rollback: the
+/// re-queued journal will be heartbeat-appended again under fresh seqs).
+pub fn wal_truncate_after(layout_dir: &Path, keep_through: u64) -> Result<(), String> {
+    let _guard = wal_lock();
+    let path = wal_path(layout_dir);
+    let mut buf = Vec::new();
+    match File::open(&path) {
+        Ok(mut f) => {
+            f.read_to_end(&mut buf).map_err(|e| format!("wal: read: {e}"))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("wal: open: {e}")),
+    }
+    let mut off = 0usize;
+    let mut keep_end = 0usize;
+    while off < buf.len() {
+        match read_frame_at(&buf, off) {
+            Ok((frame, next)) => {
+                if frame.seq <= keep_through {
+                    keep_end = next;
+                }
+                off = next;
+            }
+            Err(_) => break,
+        }
+    }
+    // Only truncate the tail region (never punch a hole in the middle):
+    // frames after keep_end must all be > keep_through, else refuse.
+    let mut check = keep_end;
+    while check < buf.len() {
+        match read_frame_at(&buf, check) {
+            Ok((frame, next)) => {
+                if frame.seq <= keep_through {
+                    return Err("wal: non-tail coverage; refusing truncate".into());
+                }
+                check = next;
+            }
+            Err(_) => break, // torn tail beyond keep_end: cut it too
+        }
+    }
+    if keep_end < buf.len() || off < buf.len() {
+        let f = OpenOptions::new().write(true).open(&path).map_err(|e| format!("wal: reopen: {e}"))?;
+        f.set_len(keep_end as u64).map_err(|e| format!("wal: truncate: {e}"))?;
+        f.sync_all().map_err(|e| format!("wal: sync: {e}"))?;
+    }
+    // Re-sync the in-memory tip with the file (a newer tip may have ridden
+    // on truncated frames).
+    let mut tips = wal_tips().lock().unwrap_or_else(|e| e.into_inner());
+    tips.insert(path, scan_tip_at(&buf[..keep_end]));
+    Ok(())
+}
+
+fn scan_tip(path: &Path) -> u64 {
+    let Ok(mut f) = File::open(path) else { return 0 };
     let mut buf = Vec::new();
     if f.read_to_end(&mut buf).is_err() {
         return 0;
     }
+    scan_tip_at(&buf)
+}
+
+fn scan_tip_at(buf: &[u8]) -> u64 {
     let mut off = 0usize;
     let mut tip = 0u64;
     while off < buf.len() {
-        match read_frame_at(&buf, off) {
+        match read_frame_at(buf, off) {
             Ok((frame, next)) => {
                 tip = frame.seq;
                 off = next;

@@ -208,15 +208,15 @@ impl PublicationLease {
             if let Some(g)=PUBLICATION.try_lock_for(std::time::Duration::from_millis(5)){return Ok(Self{_guard:g});}
         }
     }
-    pub(crate) fn save_full(&self,layout:&V6Layout,store:&IndexStore)->Result<u64>{save_full_generation_inner(layout,store)}
+    pub(crate) fn save_full(&self,layout:&V6Layout,store:&IndexStore)->Result<u64>{save_full_generation_inner(layout,store,crate::wal::wal_current_tip(&layout.dir))}
 }
 
-pub fn save_full_generation(layout: &V6Layout, store: &IndexStore) -> Result<u64> {
+pub fn save_full_generation(layout: &V6Layout, store: &IndexStore, wal_seq: u64) -> Result<u64> {
     let _publication=PUBLICATION.lock();
-    save_full_generation_inner(layout,store)
+    save_full_generation_inner(layout,store,wal_seq)
 }
 
-fn save_full_generation_inner(layout: &V6Layout, store: &IndexStore) -> Result<u64> {
+fn save_full_generation_inner(layout: &V6Layout, store: &IndexStore, wal_seq: u64) -> Result<u64> {
     fs::create_dir_all(&layout.dir).map_err(|e| io_err(e, "create v6 dir"))?;
     *WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = 0;
     let gen = next_generation(layout);
@@ -248,11 +248,11 @@ fn save_full_generation_inner(layout: &V6Layout, store: &IndexStore) -> Result<u
         dir_paths_len: store.dir_paths_buf.len(),
         metadata_ready: store.metadata_ready,
         volumes: store.volumes.iter().map(V6Volume::from).collect(),
-        // Full snapshot folds the whole RAM store, including anything
-        // journaled but not yet WAL-appended: cover through the WAL tip.
-        // (A later replay stops on its pre-length guard rather than
-        // duplicating those entries.)
-        wal_seq: crate::wal::wal_tip_seq(&layout.dir),
+        // Full snapshot folds the whole RAM store. Coverage: everything
+        // Caller-supplied coverage: the fold path passes the take tip (only
+        // frames at or below it are folded); standalone snapshots pass the
+        // live tip (they fold the whole RAM store).
+        wal_seq,
     };
     publish_generation(layout, dir, manifest, files, has_trigram, tri_snap)?;
     Ok(gen)
@@ -1360,7 +1360,7 @@ mod clone_tests {
         let store = IndexBuilder::new(b'F', 1, 7, 10)
             .build_from_raw(vec![raw_file(2, 1, "kept.bin")], vec![raw_dir(1, 0, "root")], true)
             .unwrap();
-        super::save_full_generation(&layout, &store).unwrap();
+        super::save_full_generation(&layout, &store, crate::wal::wal_current_tip(&layout.dir)).unwrap();
         let base_entries = store.entries.len();
         let base_names = store.names_buf.len();
         // Simulate one batch window: temp file created, then deleted again.

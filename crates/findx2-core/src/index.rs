@@ -709,6 +709,19 @@ impl IndexStore {
             .unwrap_or(false)
     }
 
+    /// WAL 心跳用：未 drain、不清空，克隆 `[from..]` 段。
+    pub fn clone_mutations_from(&self, from: usize) -> Vec<Mutation> {
+        self.mutation_log
+            .as_ref()
+            .map(|v| v.get(from..).unwrap_or(&[]).to_vec())
+            .unwrap_or_default()
+    }
+
+    /// WAL 心跳用：当前日志长度（内存值，与落盘 seq 无关）。
+    pub fn pending_mutation_count(&self) -> usize {
+        self.mutation_log.as_ref().map(|v| v.len()).unwrap_or(0)
+    }
+
     fn log_mut(&mut self, m: Mutation) {
         if let Some(log) = self.mutation_log.as_mut() {
             // FullResync 已在列时，后续增量无需再记（全量覆盖一切）。
