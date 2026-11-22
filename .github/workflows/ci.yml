@@ -37,7 +37,8 @@ jobs:
           workspaces: ". -> target"
 
       - name: 工作区测试（不含 GUI）
-        run: cargo test --workspace --locked --exclude findx2-gui-native
+        # 串行：并行跑时 temp 目录 + 超时类测试相互抖动（本地已验证：串行全绿，并行随机红）。
+        run: cargo test --workspace --locked --exclude findx2-gui-native -- --test-threads=1
 
       - name: 编译 GUI
         run: cargo check --locked -p findx2-gui-native
