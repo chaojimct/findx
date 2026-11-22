@@ -1440,6 +1440,7 @@ fn fold_if_due(
 ) -> anyhow::Result<()> {
     let Some(reason) = fold_reason(engine, path, *dirty_count, force) else { return Ok(()); };
     tracing::info!(reason, dirty = *dirty_count, "fold due");
+    crate::win_service::append_service_log(&format!("fold due ({reason}), dirty {dirty_count}"));
     if persist_index(engine, path)? {
         *dirty_count = 0;
         last_fold_ms().store(commit_clock_ms(), Ordering::Relaxed);

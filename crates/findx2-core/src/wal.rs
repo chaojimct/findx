@@ -913,7 +913,11 @@ pub fn replay_frames_into_store(
             v.first_entry_idx = bv.first_entry_idx;
         }
         work.metadata_ready = f.batch.metadata_ready;
-        work.tri_pending = f.batch.tri_pending.clone();
+        // Union, never replace: heartbeat frames carry deltas (current -
+        // base); the base generation's pending set stays authoritative for
+        // everything older. Union is superset-safe (extra candidates only
+        // cost verification work, never false negatives).
+        work.tri_pending |= &f.batch.tri_pending;
         out.applied_frames += 1;
     }
     if out.stopped_early {

@@ -142,6 +142,9 @@ pub struct SearchEngine {
     /// 自上次心跳快照以来新标记的 metadata 槽。心跳只 journal 这一增量
     /// （幂等重写）；fold（take）时清空。双位图避免每 5 秒重复 fsync 全量。
     meta_since_hb: parking_lot::Mutex<RoaringBitmap>,
+    /// 上次心跳已发送的 tri_pending 快照。心跳只发增量
+    ///（`current - base`，并集重播安全）；fold/rebuild 后基准过期，下次自动重拍。
+    tri_hb_base: parking_lot::Mutex<RoaringBitmap>,
     /// 索引变更计数：任何影响搜索结果集/排序的写入都 +1（USN 增量、回填合并、
     /// metadata_ready 翻转、overlay 写入/清空）。分页查询缓存凭它失效。
     /// trigram 边车重建不 bump——剪枝只影响候选超集，不影响最终命中与排序。
@@ -207,6 +210,7 @@ impl SearchEngine {
             metadata_drains: AtomicUsize::new(0),
             metadata_dirty: parking_lot::Mutex::new(RoaringBitmap::new()),
             meta_since_hb: parking_lot::Mutex::new(RoaringBitmap::new()),
+            tri_hb_base: parking_lot::Mutex::new(RoaringBitmap::new()),
             wal_flushed: AtomicUsize::new(0),
             revision: AtomicU64::new(0),
             page_cache: parking_lot::Mutex::new(None),
@@ -1242,6 +1246,7 @@ impl SearchEngine {
         }
         drop(dirty);
         self.meta_since_hb.lock().clear();
+        self.tri_hb_base.lock().clear();
         if mutations.is_empty() { return None; }
         let (tri_snap, has_trigram) = match g.trigram.as_ref() {
             Some(t) => (t.snapshot_entry_count(), true),
@@ -1315,6 +1320,14 @@ impl SearchEngine {
             Some(t) => (t.snapshot_entry_count(), true),
             None => (0, false),
         };
+        // tri_pending: journal only the delta since the last heartbeat
+        // (`current - base`, union-replay-safe). Full snapshots ride the
+        // fold batch, never the WAL.
+        let tri_delta = {
+            let base = self.tri_hb_base.lock();
+            let delta = &g.tri_pending - &*base;
+            delta
+        };
         let batch = crate::CommitBatch {
             mutations,
             entry_count: g.entries.len(),
@@ -1323,7 +1336,7 @@ impl SearchEngine {
             dir_paths_len: g.dir_paths_buf.len(),
             metadata_ready: g.metadata_ready,
             volumes: g.volumes.clone(),
-            tri_pending: g.tri_pending.clone(),
+            tri_pending: tri_delta,
             tri_snap,
             has_trigram,
             wal_seq: 0,
@@ -1367,6 +1380,10 @@ impl SearchEngine {
         };
         let seq = crate::wal::wal_append_locked(layout_dir, &mut batch)?;
         self.wal_flushed.store(journal_flushed, Ordering::SeqCst);
+        // Advance the tri delta base to base ∪ delta (never shrink: rebuild
+        // removals stay covered by the union-replay rule, and are never
+        // re-sent). Only after a durable append.
+        *self.tri_hb_base.lock() |= &batch.tri_pending;
         // Remove exactly the journaled slots; concurrent marks survive.
         let mut covered: Vec<u32> = Vec::new();
         for m in &batch.mutations {
