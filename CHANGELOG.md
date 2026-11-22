@@ -10,6 +10,19 @@
 
 本文档记�?**FindX 2.x**（Rust / Tauri / Windows）面向用户的显著变更。版本号�?GUI 安装包、Git 标签 `v*` 对齐�?
 
+## [2.5.10] - 2026-11-22
+
+### 修复
+
+- 服务常态 300MB/s 磁盘写入降为 KB 级心跳 + 偶发整段折叠：每提交全量拷段（NTFS 不支持 block clone）改为 WAL（5 秒 fsync 一次）+ 按大小/时间/日志量触发 fold；同批 push+patch 不再误判全量快照；backfill/停机路径全部收敛到同一提交门。
+- crash 安全：kill -9 级kill后重启自动重播 WAL（已验证 79 帧/872 mutation，标记文件可搜）；seq 回归、mid-file 腐坏、torn tail 均有覆盖。
+- 可配置：`--fold-size-mb`（默认 256）、`--fold-interval-min`（默认 120）、`--fold-dirty-entries`（默认 100 万）；`--save-interval-secs`（默认改 30→5）现为心跳间隔。
+
+### 说明
+
+- 无索引格式迁移：v6 世代文件兼容，WAL 目录为新增；旧版忽略 WAL，新版读旧库直接可用（wal_seq 缺省为 0）。
+- 内存占用无变化（~108B/条，常驻 1.5GB@9.9M）：overlay 稀疏化与 FRN 紧凑化经 10M 规模 bench 验证为负优化/高风险，已放弃，证据见 `crates/findx2-core/examples/overlay_bench.rs`。
+
 ## [2.5.9] - 2026-11-21
 
 ### 移除

@@ -1,0 +1,65 @@
+{
+  "version": "2.5.10",
+  "baseline": "2.5.9",
+  "channel": "stable",
+  "publish_ready": true,
+  "windows_gui": "native",
+  "gates": [
+    {
+      "id": "engine-io-storm-fixed",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "wal-crash-recovery",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "persist-test-suites",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "fold-quiescence-in-prod",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "legacy-2-4-multivolume-index-loads",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "installer-live-handoff",
+      "priority": "P1",
+      "required": false,
+      "passed": false
+    },
+    {
+      "id": "strict-protocol2-stop-receipt",
+      "priority": "P1",
+      "required": false,
+      "passed": false
+    },
+    {
+      "id": "macos-linux-native-packaging",
+      "priority": "P2",
+      "required": false,
+      "passed": false
+    }
+  ],
+  "engine_binary_baseline": "WAL durability + fold scheduling on the 2.5.9 baseline. No index-format migration (v6 generations unchanged; wal/ directory is additive and ignored by older builds). New service CLI switches: --fold-size-mb/--fold-interval-min/--fold-dirty-entries; --save-interval-secs is now the WAL heartbeat cadence (default 30->5). Official GitHub Release artifacts are produced by the existing release.yml CI rebuild on tag v2.5.10 (Windows native only); they are not byte-identical to the local accepted setup.",
+  "gate_evidence": "release/2.5.10.md",
+  "limitations": [
+    "installer live handoff not re-run for 2.5.10 (manual service swaps only); payload manifest updated per swap",
+    "resident memory unchanged (~108B/entry, 1.5GB at 9.9M): overlay sparsification and FRN compaction evaluated and rejected with measurements (see CHANGELOG)",
+    "macOS and Linux native GUI packages do not exist yet",
+    "Official CI packages are a new rebuild and are not byte-identical to the local accepted setup"
+  ]
+}

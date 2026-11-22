@@ -14,7 +14,7 @@
 #endif
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.5.9"
+  #define MyAppVersion "2.5.10"
 #endif
 
 #define MyAppName      "FindX"
