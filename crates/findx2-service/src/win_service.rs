@@ -156,6 +156,11 @@ fn service_main_impl(_arguments: Vec<OsString>) {
         shutdown_file: cli.shutdown_file.clone(),
         fixture_events: None,
         extra_excluded_dirs: cli.exclude_dir.clone(),
+        fold_policy: crate::run::FoldPolicy::from_cli(
+            cli.fold_size_mb,
+            cli.fold_interval_min,
+            cli.fold_dirty_entries,
+        ),
     };
     let runner = {
         let stop_runner = stop.clone();
@@ -244,6 +249,9 @@ pub fn install(
     volume: String,
     pipe: String,
     save_interval_secs: u64,
+    fold_size_mb: u64,
+    fold_interval_min: u64,
+    fold_dirty_entries: usize,
     full_stat: bool,
     max_scan_threads: usize,
     no_everything_ipc: bool,
@@ -269,6 +277,20 @@ pub fn install(
         OsString::from("--save-interval-secs"),
         OsString::from(format!("{save_interval_secs}")),
     ];
+    // Fold knobs only when non-default (keeps the SCM command line readable;
+    // service defaults match the CLI defaults).
+    if fold_size_mb != 256 {
+        launch_arguments.push(OsString::from("--fold-size-mb"));
+        launch_arguments.push(OsString::from(format!("{fold_size_mb}")));
+    }
+    if fold_interval_min != 120 {
+        launch_arguments.push(OsString::from("--fold-interval-min"));
+        launch_arguments.push(OsString::from(format!("{fold_interval_min}")));
+    }
+    if fold_dirty_entries != 1_000_000 {
+        launch_arguments.push(OsString::from("--fold-dirty-entries"));
+        launch_arguments.push(OsString::from(format!("{fold_dirty_entries}")));
+    }
     if full_stat {
         launch_arguments.push(OsString::from("--full-stat"));
     }

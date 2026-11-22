@@ -23,8 +23,24 @@ pub struct Cli {
     #[arg(short, long, default_value = "findx2", global = true)]
     pub pipe: String,
 
-    #[arg(long, default_value_t = 30, global = true)]
+    /// WAL 心跳间隔（秒）：内存变更日志 fsync 落盘的频率，决定 crash
+    /// 最多丢失多少秒的增量（重放幂等，backfill 兜底）。fold（整段拷贝）
+    /// 节奏另见 --fold-*，不受此值影响。
+    #[arg(long, default_value_t = 5, global = true)]
     pub save_interval_secs: u64,
+
+    /// Fold 触发：WAL 攒到多少 MB 才做一次全量整段拷贝（默认 256）。
+    /// 日常只有心跳 KB 写盘；fold 是唯一的 GB 级 IO。
+    #[arg(long, default_value_t = 256, global = true)]
+    pub fold_size_mb: u64,
+
+    /// Fold 触发：最多隔多少分钟 fold 一次（默认 120；0 = 不按时间触发）。
+    #[arg(long, default_value_t = 120, global = true)]
+    pub fold_interval_min: u64,
+
+    /// Fold 触发：内存日志攒到多少条目就 fold（默认 1000000，防 RAM 无限涨）。
+    #[arg(long, default_value_t = 1_000_000, global = true)]
+    pub fold_dirty_entries: usize,
 
     /// 若 index.bin 不存在时自动全量建库：首遍读全量元数据（较慢；时间与大小一上来即准）
     #[arg(long, default_value_t = false, global = true)]

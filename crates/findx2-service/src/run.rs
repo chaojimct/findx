@@ -30,6 +30,42 @@ pub(crate) struct RunFlags {
     pub fixture_events: Option<std::path::PathBuf>,
     /// CLI 注入的排除目录（与 sidecar 里的取并集，由 IndexStore 持有运行时副本）。
     pub extra_excluded_dirs: Vec<String>,
+    /// Fold 调度策略（WAL 心跳之外的整段拷贝触发条件）。
+    pub fold_policy: FoldPolicy,
+}
+
+/// Fold 调度策略：三档触发任一即 fold（take + commit 全量整段拷贝）。
+/// - `fold_bytes`: WAL 攒到这么大（默认 256MB）；
+/// - `fold_max`: 距上次 fold 最久这么长（默认 2h；`Duration::MAX` = 不按时间触发）；
+/// - `fold_dirty`: 内存日志攒到这么多条（默认 1M，防 RAM 无限涨）。
+/// 全是可配开关（`--fold-*`），默认即当前验证过的值。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FoldPolicy {
+    pub fold_bytes: u64,
+    pub fold_max: Duration,
+    pub fold_dirty: usize,
+}
+impl Default for FoldPolicy {
+    fn default() -> Self {
+        Self {
+            fold_bytes: 256 << 20,
+            fold_max: Duration::from_secs(7200),
+            fold_dirty: 1 << 20,
+        }
+    }
+}
+impl FoldPolicy {
+    pub(crate) fn from_cli(size_mb: u64, interval_min: u64, dirty: usize) -> Self {
+        Self {
+            fold_bytes: size_mb.max(1) << 20,
+            fold_max: if interval_min == 0 {
+                Duration::MAX
+            } else {
+                Duration::from_secs(interval_min.saturating_mul(60))
+            },
+            fold_dirty: dirty.max(1),
+        }
+    }
 }
 
 /// 全卷重建冻结集（P0-2 JournalGap 重建协议，按卷独立）。
@@ -557,6 +593,7 @@ pub(crate) fn run_foreground(
                 letter,
                 index_for_watch,
                 save_iv,
+                flags.fold_policy,
                 stop_watch,
             );
             if let Err(e) = &result {
@@ -699,6 +736,7 @@ fn usn_watch_loop(
     volume_letter: u8,
     index_path: PathBuf,
     save_interval_secs: u64,
+    fold_policy: FoldPolicy,
     stop: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let letter = (volume_letter as char).to_ascii_uppercase();
@@ -774,7 +812,7 @@ fn usn_watch_loop(
                              engine: &Arc<SearchEngine>,
                              index_path: &PathBuf| -> anyhow::Result<()> {
         persist_periodic_checkpoint_retrying(engine, index_path, dirty_count, last_save,
-            &mut checkpoint_retry_after, save_every);
+            &mut checkpoint_retry_after, save_every, fold_policy);
         Ok(())
     };
 
@@ -1413,9 +1451,10 @@ fn persist_shutdown_best_effort(engine: &SearchEngine, path: &Path) -> anyhow::R
 fn persist_periodic_checkpoint_retrying(
     engine: &Arc<SearchEngine>, path: &Path, dirty_count: &mut usize,
     last_save: &mut Instant, retry_after: &mut Option<Instant>, save_every: Duration,
+    fold_policy: FoldPolicy,
 ) {
     if retry_after.is_some_and(|next| Instant::now() < next) { return; }
-    match persist_periodic_checkpoint(engine, path, dirty_count, last_save, save_every) {
+    match persist_periodic_checkpoint(engine, path, dirty_count, last_save, save_every, fold_policy) {
         Ok(()) => *retry_after = None,
         Err(error) => {
             *retry_after = Some(Instant::now() + Duration::from_secs(5));
@@ -1428,7 +1467,7 @@ fn persist_periodic_checkpoint_retrying(
 
 fn persist_periodic_checkpoint(
     engine: &Arc<SearchEngine>, path: &Path, dirty_count: &mut usize,
-    last_save: &mut Instant, save_every: Duration,
+    last_save: &mut Instant, save_every: Duration, fold_policy: FoldPolicy,
 ) -> anyhow::Result<()> {
     // WAL-2: durability and folding are separate cadences.
     // - heartbeat (cheap, ~5s): fsync the unflushed journal suffix. Crash
@@ -1455,13 +1494,13 @@ fn persist_periodic_checkpoint(
             Ok(findx2_core::HeartbeatOutcome::ForceFold) => {
                 // Unreplayable marker pending: fold now (commit turns it
                 // into a full snapshot, which converges).
-                return fold_if_due(engine, path, dirty_count, true);
+                return fold_if_due(engine, path, dirty_count, true, fold_policy);
             }
             Err(e) => return Err(anyhow::anyhow!("WAL heartbeat failed: {e}")),
         }
     }
     // 2) Fold (take + commit) only when due.
-    fold_if_due(engine, path, dirty_count, false)
+    fold_if_due(engine, path, dirty_count, false, fold_policy)
 }
 
 /// Fold gating: size-, memory- and time-based. `force` bypasses everything
@@ -1469,8 +1508,9 @@ fn persist_periodic_checkpoint(
 /// 1 GB copy stays attributable (size / journal-RAM / staleness / forced).
 fn fold_if_due(
     engine: &Arc<SearchEngine>, path: &Path, dirty_count: &mut usize, force: bool,
+    fold_policy: FoldPolicy,
 ) -> anyhow::Result<()> {
-    let Some(reason) = fold_reason(engine, path, *dirty_count, force) else { return Ok(()); };
+    let Some(reason) = fold_reason(engine, path, *dirty_count, force, fold_policy) else { return Ok(()); };
     tracing::info!(reason, dirty = *dirty_count, "fold due");
     crate::win_service::append_service_log(&format!("fold due ({reason}), dirty {dirty_count}"));
     if persist_index(engine, path)? {
@@ -1485,21 +1525,18 @@ fn fold_if_due(
 /// is huge (RAM bound), the maximum staleness is reached, or forced.
 /// Quiet trickle folds at FOLD_MAX; there is no minimum spacing because
 /// every trigger resets itself (dirty clears, WAL retains, force is one-shot).
-pub(crate) fn fold_due(engine: &SearchEngine, path: &Path, dirty: usize) -> bool {
-    fold_reason(engine, path, dirty, false).is_some()
+pub(crate) fn fold_due(engine: &SearchEngine, path: &Path, dirty: usize, policy: FoldPolicy) -> bool {
+    fold_reason(engine, path, dirty, false, policy).is_some()
 }
 
-fn fold_reason(engine: &SearchEngine, path: &Path, dirty: usize, force: bool) -> Option<&'static str> {
-    const FOLD_BYTES: u64 = 256 << 20;
-    const FOLD_DIRTY: usize = 1 << 20;
-    const FOLD_MAX: Duration = Duration::from_secs(7200);
+fn fold_reason(engine: &SearchEngine, path: &Path, dirty: usize, force: bool, policy: FoldPolicy) -> Option<&'static str> {
     if force {
         return Some("forced(fullresync/shutdown/test)");
     }
     if dirty == 0 && !engine.has_pending_persistence() { return None; }
-    if dirty >= FOLD_DIRTY { return Some("journal-ram"); }
-    if findx2_core::wal_file_len(&V6Layout::for_index(path).dir) >= FOLD_BYTES { return Some("wal-size"); }
-    if last_fold_ms().load(Ordering::Relaxed).saturating_add(FOLD_MAX.as_millis() as u64) <= commit_clock_ms() {
+    if dirty >= policy.fold_dirty { return Some("journal-ram"); }
+    if findx2_core::wal_file_len(&V6Layout::for_index(path).dir) >= policy.fold_bytes { return Some("wal-size"); }
+    if last_fold_ms().load(Ordering::Relaxed).saturating_add(policy.fold_max.as_millis() as u64) <= commit_clock_ms() {
         return Some("staleness");
     }
     None
@@ -1940,13 +1977,13 @@ mod tests {
         let mut dirty=1;
         let mut last=std::time::Instant::now();
         let layout=findx2_core::V6Layout::for_index(&path);
-        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
+        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30),super::FoldPolicy::default()).unwrap();
         assert_eq!(restored_size(&path),10,"not due must remain unchanged");
         assert_eq!(dirty,1);
         // Heartbeat due: journal fsync-appended, NOT folded (gen untouched).
         super::stamp_fold_clock();
         last-=std::time::Duration::from_secs(31);
-        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
+        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30),super::FoldPolicy::default()).unwrap();
         assert_eq!(dirty,1,"heartbeat retains dirty; only a fold clears it");
         assert_eq!(restored_size(&path),10,"heartbeat must not publish a generation");
         let frames=findx2_core::wal_read_from(&layout.dir,1).unwrap();
@@ -2039,15 +2076,15 @@ mod tests {
         let mut last=std::time::Instant::now();
         let original=last;
         let mut retry=None;
-        super::persist_periodic_checkpoint_retrying(&engine,&path,&mut dirty,&mut last,&mut retry,std::time::Duration::from_secs(30));
+        super::persist_periodic_checkpoint_retrying(&engine,&path,&mut dirty,&mut last,&mut retry,std::time::Duration::from_secs(30),super::FoldPolicy::default());
         findx2_core::clear_persist_fault();
         assert!(retry.is_some());
         assert_eq!(dirty,1usize<<20,"failed fold retains dirty");
         assert!(engine.has_pending_persistence());
-        super::persist_periodic_checkpoint_retrying(&engine,&path,&mut dirty,&mut last,&mut retry,std::time::Duration::from_secs(30));
+        super::persist_periodic_checkpoint_retrying(&engine,&path,&mut dirty,&mut last,&mut retry,std::time::Duration::from_secs(30),super::FoldPolicy::default());
         assert_eq!(restored_size(&path),10,"backoff holds the retry, disk untouched");
         retry=Some(std::time::Instant::now()-std::time::Duration::from_secs(1));
-        super::persist_periodic_checkpoint_retrying(&engine,&path,&mut dirty,&mut last,&mut retry,std::time::Duration::from_secs(30));
+        super::persist_periodic_checkpoint_retrying(&engine,&path,&mut dirty,&mut last,&mut retry,std::time::Duration::from_secs(30),super::FoldPolicy::default());
         assert_eq!(dirty,0);assert!(retry.is_none());
         assert_eq!(restored_size(&path),456);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
@@ -2092,7 +2129,7 @@ mod tests {
         let mut dirty=5;
         let mut last=std::time::Instant::now()-std::time::Duration::from_secs(31);
         let layout=findx2_core::V6Layout::for_index(&path);
-        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
+        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30),super::FoldPolicy::default()).unwrap();
         // Heartbeat needs no persist lock: it appends the WAL and retains
         // dirty. Only the fold defers while the writer is busy.
         assert_eq!(dirty,5);
@@ -2118,7 +2155,7 @@ mod tests {
         let mut dirty=30;
         let mut last=std::time::Instant::now()-std::time::Duration::from_secs(3600);
         let layout=findx2_core::V6Layout::for_index(&path);
-        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
+        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30),super::FoldPolicy::default()).unwrap();
         assert_eq!(dirty,30,"heartbeat retains dirty; only a fold clears it");
         assert_eq!(restored_size(&path),10,"heartbeat must not publish");
         let frames=findx2_core::wal_read_from(&layout.dir,1).unwrap();
@@ -2131,7 +2168,7 @@ mod tests {
         }
         // Second tick with no new mutations: no second frame.
         last-=std::time::Duration::from_secs(3600);
-        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30)).unwrap();
+        super::persist_periodic_checkpoint(&engine,&path,&mut dirty,&mut last,std::time::Duration::from_secs(30),super::FoldPolicy::default()).unwrap();
         let frames=findx2_core::wal_read_from(&layout.dir,1).unwrap();
         match frames {
             findx2_core::WalRead::Frames { frames, .. } => assert_eq!(frames.len(),1,"quiet tick appends nothing"),
@@ -2146,16 +2183,16 @@ mod tests {
         // Nothing pending: never due, even with an ancient clock.
         super::reset_fold_clock();
         let mut dirty=0;
-        assert!(!super::fold_due(&engine,&path,dirty));
+        assert!(!super::fold_due(&engine,&path,dirty,super::FoldPolicy::default()));
         // Journal-RAM bound trips immediately (bounds ~100 MB of journal).
         dirty=1usize<<20;
-        assert!(super::fold_due(&engine,&path,dirty));
+        assert!(super::fold_due(&engine,&path,dirty,super::FoldPolicy::default()));
         // Staleness arm: ancient clock + pending work => due.
         dirty=1;
-        assert!(super::fold_due(&engine,&path,dirty));
+        assert!(super::fold_due(&engine,&path,dirty,super::FoldPolicy::default()));
         // Fresh clock + small WAL + small dirty => park the fold.
         super::stamp_fold_clock();
-        assert!(!super::fold_due(&engine,&path,dirty));
+        assert!(!super::fold_due(&engine,&path,dirty,super::FoldPolicy::default()));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

@@ -107,6 +107,9 @@ fn try_main() -> anyhow::Result<()> {
                 cli.volume.clone(),
                 cli.pipe.clone(),
                 cli.save_interval_secs,
+                cli.fold_size_mb,
+                cli.fold_interval_min,
+                cli.fold_dirty_entries,
                 cli.full_stat,
                 cli.max_scan_threads,
                 cli.no_everything_ipc,
@@ -154,6 +157,11 @@ fn try_main() -> anyhow::Result<()> {
                 shutdown_file: cli.shutdown_file.clone(),
                 fixture_events: cli.fixture_events.clone(),
                 extra_excluded_dirs: cli.exclude_dir,
+                fold_policy: run::FoldPolicy::from_cli(
+                    cli.fold_size_mb,
+                    cli.fold_interval_min,
+                    cli.fold_dirty_entries,
+                ),
             },
             // 控制台模式：无 Ctrl+C 优雅停（journal 重放兜底），传永不置位标志对齐签名。
             run::never_stop_flag(),
