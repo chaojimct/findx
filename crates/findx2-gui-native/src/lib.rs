@@ -10,6 +10,8 @@ pub mod preview;
 pub mod search_logic;
 pub mod session;
 pub mod settings_logic;
+
+pub mod settings_search;
 pub mod status_logic;
 pub mod theme;
 pub mod ui;
