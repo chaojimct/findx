@@ -60,6 +60,7 @@ actions!(
         ContextScope,
         ContextSelectAll,
         ContextAutoFit,
+        ExportResultsCsv,
         WorkspaceBack,
         WorkspaceForward,
         WorkspaceUp,
@@ -122,6 +123,7 @@ fn main_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("end", SelectLastResult, Some(FILE_SHORTCUT_CONTEXT)),
         KeyBinding::new("ctrl-enter", RevealSelected, Some(FILE_SHORTCUT_CONTEXT)),
         KeyBinding::new("ctrl-shift-d", ToggleDiag, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-shift-e", ExportResultsCsv, Some(FILE_SHORTCUT_CONTEXT)),
         KeyBinding::new("ctrl-f", FocusSearch, Some("FindXMain")),
         KeyBinding::new("ctrl-comma", OpenSettings, Some("FindXMain")),
         KeyBinding::new("escape", NoAction, Some(TABLE_RAW_ESCAPE_CONTEXT)),
@@ -2190,6 +2192,11 @@ impl Render for MainWindow {
             )
             .on_action(cx.listener(|this, _: &ContextCopyPath, window, cx| {
                 this.context_action(3, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ExportResultsCsv, _, cx| {
+                if this.workspace.mode == ViewMode::Search {
+                    this.export_results_csv(cx);
+                }
             }))
             .on_action(
                 cx.listener(|this, _: &ContextCopy, window, cx| this.context_action(4, window, cx)),

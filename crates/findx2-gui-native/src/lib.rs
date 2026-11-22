@@ -47,6 +47,8 @@ pub mod indexed_usage;
 
 pub mod footer_status;
 
+pub mod csv_export;
+
 pub mod directory_filter;
 
 #[cfg(windows)]

@@ -175,8 +175,53 @@ impl MainWindow {
         cx.notify();
     }
 
-    pub(super) fn return_global_search(&mut self, cx: &mut Context<Self>) {
-        let Some(saved) = self.global_search.take() else {
+    /// Export the currently published result set to CSV.
+    ///
+    /// The rows are exactly what the table shows: the same filtered hits the
+    /// user is looking at, not the whole index. Nothing is written until the
+    /// platform save dialog returns a path, and a cancelled dialog only
+    /// updates the status line.
+    ///
+    /// The document is rendered before the dialog opens so that a query
+    /// finishing mid-dialog cannot export a different result set than the one
+    /// the user saw when pressing the button.
+    pub(super) fn export_results_csv(&mut self, cx: &mut Context<Self>) {
+        if self.hits.is_empty() {
+            self.search_status = "没有可导出的结果".into();
+            cx.notify();
+            return;
+        }
+        let rows = self.hits.len();
+        let doc = crate::csv_export::render(&self.hits);
+        let dir = crate::csv_export::default_directory();
+        let name = crate::csv_export::suggested_file_name(crate::csv_export::now_unix_secs());
+        let picked = cx.prompt_for_new_path(&dir, Some(&name));
+        self.search_status = format!("选择保存位置…（{rows} 条）").into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let outcome = match picked.await {
+                Ok(Ok(Some(path))) => std::fs::write(&path, doc.as_bytes())
+                    .map(|()| Some(path))
+                    .map_err(|e| format!("写入失败：{e}")),
+                // Cancelled dialogs are not failures.
+                Ok(Ok(None)) => Ok(None),
+                Ok(Err(e)) => Err(format!("无法打开保存对话框：{e}")),
+                Err(_) => Err("保存对话框已关闭".to_string()),
+            };
+            this.update(cx, |this, cx| {
+                this.search_status = match outcome {
+                    Ok(Some(path)) => crate::csv_export::done_message(rows, &path).into(),
+                    Ok(None) => format!("已取消导出（{rows} 条）").into(),
+                    Err(e) => format!("导出失败：{e}").into(),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(super) fn return_global_search(&mut self, cx: &mut Context<Self>) {        let Some(saved) = self.global_search.take() else {
             return;
         };
         self.search_gen = self.search_gen.wrapping_add(1);
