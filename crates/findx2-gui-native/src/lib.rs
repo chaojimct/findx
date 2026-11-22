@@ -47,7 +47,11 @@ pub mod indexed_usage;
 
 pub mod footer_status;
 
+pub mod command_palette;
+
 pub mod csv_export;
+
+pub mod detail_pane;
 
 pub mod diagnostics_bundle;
 
