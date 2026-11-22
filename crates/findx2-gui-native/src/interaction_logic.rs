@@ -88,7 +88,7 @@ pub fn resolve_context_rows<T: Clone>(
     }
 }
 
-/// Parent directory for 「定位所在目录」. The directory filter is always cleared
+/// Parent directory for the in-app 「在目录中定位」 (Ctrl+Enter). The directory filter is always cleared
 /// so a stale Files filter cannot hide the target.
 pub fn locate_parent(path: &str) -> Option<String> {
     let path = path.trim();

@@ -74,14 +74,14 @@ pub fn filter(items: &[SettingsItem], query: &str) -> Vec<SettingsItem> {
                 it.group,
                 it.keywords.join(" ")
             );
-            tokens.iter().enumerate().all(|(i, token)| {
+            tokens.iter().enumerate().all(|(i, _token)| {
                 #[cfg(feature = "pinyin")]
                 {
                     matchers[i].find(haystack.as_str()).is_some()
                 }
                 #[cfg(not(feature = "pinyin"))]
                 {
-                    haystack.to_lowercase().contains(token)
+                    haystack.to_lowercase().contains(_token)
                 }
             })
         })

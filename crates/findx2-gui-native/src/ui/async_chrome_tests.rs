@@ -220,6 +220,41 @@ fn usage_toolbar_icon_slots_and_depth_value_are_compact_and_stable() {
     assert!(!list.contains("export_results"), "CSV export command must stay removed");
 }
 
+#[test] fn settings_page_enter_slide_matches_workspace_and_honours_reduce_motion() {
+    let src = include_str!("settings_window.rs");
+    assert!(src.contains("with_animation("), "settings page must animate on enter");
+    assert!(src.contains("\"settings-enter\""), "animation id must be settings-specific");
+    assert!(src.contains("self.enter_epoch"), "animation id must include per-instance epoch");
+    assert!(src.contains("motion::PAGE_ENTER_MS"), "must reuse the shared 250ms duration");
+    assert!(src.contains("motion::ease_out_cubic"), "must reuse the shared easing");
+    assert!(src.contains("motion::PAGE_ENTER_PX"), "must reuse the shared 32px travel");
+    assert!(src.contains("prefs.reduce_motion"), "must honour the global motion kill-switch");
+    // Enter epoch must be assigned once per instance, not derived from the tab.
+    assert!(src.contains("SETTINGS_ENTER_EPOCH.fetch_add(1"), "epoch must be fresh per page");
+}
+
+#[test] fn settings_nav_search_has_gray_placeholder() {
+    let src = include_str!("settings_window.rs");
+    assert!(src.contains("InputState::new(window, cx).placeholder(\"搜索设置项"),
+        "nav search must show a gray placeholder hint");
+}
+
+#[test] fn file_context_menu_reveals_in_native_file_manager() {
+    let menu = include_str!("file_actions.rs");
+    assert!(menu.contains("\"在文件资源管理器中显示\""),
+        "context menu must use the professional native-manager label");
+    assert!(!menu.contains("\"定位所在目录\""), "old in-app locate label must be gone");
+    assert!(menu.contains("2 if single => self.reveal_in_file_manager(&hits[0], cx)"),
+        "locate action must dispatch to native file-manager reveal");
+
+    let ctx = include_str!("file_context.rs");
+    assert!(ctx.contains("pub(super) fn reveal_in_file_manager"),
+        "native reveal handler must exist");
+    assert!(ctx.contains("crate::open_path::reveal_in_folder"),
+        "must call the existing native reveal implementation");
+    assert!(ctx.contains("background_spawn"), "shell call must run off the render thread");
+}
+
 #[test] fn settings_search_lists_matched_items_and_jumps_to_their_tab() {
     // Logic closure: the nav search must search setting *content* via the
     // shared catalog/pinyin filter, list match buttons, and jump to their tab.

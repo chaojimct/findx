@@ -120,6 +120,31 @@ impl MainWindow {
         })
         .detach();
     }
+    /// 在操作系统文件管理器中显示该项（Windows 资源管理器 / macOS Finder /
+    /// Linux 文件管理器），而不是把应用内视图跳到父目录。Shell 调用必须在后台
+    /// 任务里做，所以走 background_spawn，结果再回到主线程给出提示。
+    pub(super) fn reveal_in_file_manager(&mut self, hit: &SearchHitDto, cx: &mut Context<Self>) {
+        let path = hit.path.clone();
+        self.pause_preview();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { crate::open_path::reveal_in_folder(&path) })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.transient_file_notice("已在文件管理器中显示".into(), cx),
+                    Err(e) => {
+                        this.workspace.status = e.clone();
+                        this.file_actions.summary = e;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub(super) fn render_run_confirmation(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = Self::tokens(cx);
         let name = self

@@ -1,5 +1,7 @@
 use gpui_kit::component::{Icon, IconName};
+use gpui_kit::AnimationExt as _;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
@@ -57,6 +59,10 @@ fn settings_nav_content(icon: Icon, label: &'static str) -> impl IntoElement {
         )
         .child(div().w(px(8.)).flex_shrink_0())
 }
+
+/// Fresh per-instance id so the enter slide replays only when a settings page
+/// is created, not on every tab switch or re-render.
+static SETTINGS_ENTER_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
@@ -125,6 +131,8 @@ pub struct SettingsWindow {
     nav_search: Entity<InputState>,
     /// 搜索结果跳转后定位到的设置项文案，用于内容区顶部反馈。
     located_label: Option<&'static str>,
+    /// 页面进入动画的 id，每个实例唯一（与 workspace 的 page_epoch 同理）。
+    enter_epoch: usize,
     index_path: Entity<InputState>,
     pipe_name: Entity<InputState>,
     service_exe: Entity<InputState>,
@@ -190,7 +198,9 @@ impl SettingsWindow {
                 .default_value(settings.excluded_dirs.join("\n"))
         });
 
-        let nav_search = cx.new(|cx| InputState::new(window, cx));
+        let nav_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("搜索设置项（支持拼音）")
+        });
 
         let mut this = Self {
             embedded,
@@ -210,6 +220,7 @@ impl SettingsWindow {
             save_interval: save_interval.clone(),
             nav_search: nav_search.clone(),
             located_label: None,
+            enter_epoch: SETTINGS_ENTER_EPOCH.fetch_add(1, Ordering::Relaxed) as usize,
             index_path: index_path.clone(),
             pipe_name: pipe_name.clone(),
             service_exe: service_exe.clone(),
@@ -709,6 +720,47 @@ impl Render for SettingsWindow {
                     .p_6()
                     .child(h_flex().w_full().justify_center().child(body)),
             );
+        // Page-enter slide, same feel as the search/files switch: the main area
+        // glides in +32px -> 0 over 250ms ease-out. A per-instance epoch keeps the
+        // animation id stable across re-renders but fresh for each opened page;
+        // the global reduce-motion switch bypasses it entirely.
+        let main_row: AnyElement = if self.session.read(cx).prefs.reduce_motion {
+            h_flex()
+                .w_full()
+                .flex_1()
+                .min_h_0()
+                .items_stretch()
+                .child(navigation)
+                .child(content)
+                .into_any_element()
+        } else {
+            v_flex()
+                .w_full()
+                .flex_1()
+                .min_h_0()
+                .relative()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .flex_1()
+                        .min_h_0()
+                        .items_stretch()
+                        .child(navigation)
+                        .child(content),
+                )
+                .with_animation(
+                    gpui_kit::ElementId::named_usize("settings-enter", self.enter_epoch),
+                    gpui_kit::Animation::new(std::time::Duration::from_millis(
+                        crate::ui::motion::PAGE_ENTER_MS,
+                    ))
+                    .with_easing(crate::ui::motion::ease_out_cubic),
+                    move |el, delta| {
+                        el.left(px(crate::ui::motion::PAGE_ENTER_PX * (1.0 - delta)))
+                            .opacity(delta)
+                    },
+                )
+                .into_any_element()
+        };
         v_flex()
             .size_full()
             .relative()
@@ -722,15 +774,7 @@ impl Render for SettingsWindow {
                     cx,
                 ))
             })
-            .child(
-                h_flex()
-                    .w_full()
-                    .flex_1()
-                    .min_h_0()
-                    .items_stretch()
-                    .child(navigation)
-                    .child(content),
-            )
+            .child(main_row)
             .child(self.render_footer(tokens, cx))
             .when(self.service_pending.is_some(), |view| {
                 view.child(self.render_service_confirm(tokens, cx))

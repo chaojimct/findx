@@ -434,7 +434,7 @@ impl MainWindow {
             )
         })
         .menu_with_icon_and_disabled(
-            "定位所在目录",
+            "在文件资源管理器中显示",
             IconName::FolderOpen,
             Box::new(ContextLocate),
             !single,
@@ -549,7 +549,7 @@ impl MainWindow {
             1 if single && !hits[0].is_directory => {
                 self.open_shell_dialog(hits[0].clone(), crate::open_path::ShellDialog::OpenWith, cx)
             }
-            2 if single => self.reveal_in_directory(&hits[0], cx),
+            2 if single => self.reveal_in_file_manager(&hits[0], cx),
             3 if !hits.is_empty() => {
                 cx.write_to_clipboard(ClipboardItem::new_string(
                     hits.iter()
