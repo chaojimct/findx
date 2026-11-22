@@ -86,7 +86,11 @@ impl MainWindow {
             return body;
         }
         let epoch = self.workspace.page_epoch;
-        div()
+        // This wrapper MUST be a flex column: `body` carries `flex_1()` and only
+        // expands to fill when its parent is a flex container. A plain non-flex
+        // container here collapses `body` to content height and leaves a blank
+        // strip between the page and the status bar.
+        v_flex()
             .relative()
             .size_full()
             .child(body)

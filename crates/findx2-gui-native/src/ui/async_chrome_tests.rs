@@ -201,6 +201,20 @@ fn usage_toolbar_icon_slots_and_depth_value_are_compact_and_stable() {
  assert!(trigger.contains(".open(self.workspace.usage_facts_open)"));assert!(trigger.contains(".on_open_change("));assert!(trigger.contains(".on_mouse_down(MouseButton::Left"));assert!(trigger.contains(".on_click(cx.listener("));assert!(trigger.contains(r#".accessibility_label("详细信息")"#));
 }
 
+#[test] fn page_enter_wrapper_is_flex_column_so_content_fills_height() {
+    // Regression: the page-enter slide must not wrap `body` in a plain `div()`.
+    // `body` carries `flex_1()`; only a flex-column parent lets it expand to the
+    // full available height. A non-flex wrapper collapses it to content height
+    // and leaves a blank strip between the page and the status bar.
+    let src = include_str!("workspace_pages.rs");
+    let start = src.find("let epoch = self.workspace.page_epoch;").unwrap();
+    let wrap = &src[start..src[start..].find(".with_animation(").unwrap() + start];
+    assert!(wrap.contains("v_flex()"), "page-enter wrapper must be v_flex(), got: {wrap}");
+    assert!(!wrap.contains("div()"), "page-enter wrapper must not be a plain div(): {wrap}");
+    assert!(wrap.contains(".size_full()"));
+    assert!(wrap.contains(".child(body)"));
+}
+
 #[test]fn home_completion_keeps_published_scene_scan_until_scene_handoff(){
  // A scope change publishes (scene, scene_scan) atomically at handoff. If a
  // completion overwrote usage_scene_scan early, the stale scene's tile indices
