@@ -1280,7 +1280,6 @@ impl MainWindow {
             crate::command_palette::PaletteCommand { id: "open_settings_index", label: "设置：索引与服务", keywords: &["index", "service"], group: "设置" },
             crate::command_palette::PaletteCommand { id: "open_settings_diagnostics", label: "设置：诊断", keywords: &["diagnostics", "debug"], group: "设置" },
             crate::command_palette::PaletteCommand { id: "toggle_diag", label: "切换诊断浮层", keywords: &["diag", "debug"], group: "视图" },
-            crate::command_palette::PaletteCommand { id: "export_results", label: "导出当前结果", keywords: &["export", "csv"], group: "操作" },
             crate::command_palette::PaletteCommand { id: "workspace_back", label: "后退", keywords: &["back"], group: "导航" },
             crate::command_palette::PaletteCommand { id: "workspace_forward", label: "前进", keywords: &["forward"], group: "导航" },
             crate::command_palette::PaletteCommand { id: "reveal_selected", label: "在目录中定位", keywords: &["reveal", "locate"], group: "文件" },

@@ -201,6 +201,25 @@ fn usage_toolbar_icon_slots_and_depth_value_are_compact_and_stable() {
  assert!(trigger.contains(".open(self.workspace.usage_facts_open)"));assert!(trigger.contains(".on_open_change("));assert!(trigger.contains(".on_mouse_down(MouseButton::Left"));assert!(trigger.contains(".on_click(cx.listener("));assert!(trigger.contains(r#".accessibility_label("详细信息")"#));
 }
 
+#[test] fn every_palette_command_has_an_execution_branch() {
+    // Logic closure: every command offered in the palette must be handled in
+    // run_command_palette_selected, otherwise it silently does nothing.
+    let src = include_str!("main_window.rs");
+    let list = src.split("fn command_palette_commands").nth(1).unwrap()
+        .split("fn run_command_palette_selected").next().unwrap();
+    let run = src.split("fn run_command_palette_selected").nth(1).unwrap()
+        .split("fn toggle_panel").next().unwrap();
+    let ids: Vec<&str> = list.split("id: \"").skip(1)
+        .map(|s| s.split('"').next().unwrap()).collect();
+    assert!(!ids.is_empty(), "palette must offer commands");
+    for id in ids {
+        assert!(run.contains(&format!("\"{id}\" =>")),
+            "palette command '{id}' has no execution branch (dead command)");
+    }
+    // CSV export was explicitly rejected; it must not reappear in the palette.
+    assert!(!list.contains("export_results"), "CSV export command must stay removed");
+}
+
 #[test] fn page_enter_wrapper_is_flex_column_so_content_fills_height() {
     // Regression: the page-enter slide must not wrap `body` in a plain `div()`.
     // `body` carries `flex_1()`; only a flex-column parent lets it expand to the
