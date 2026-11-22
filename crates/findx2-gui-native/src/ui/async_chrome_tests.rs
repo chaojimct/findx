@@ -171,39 +171,6 @@ fn diagnostics_copy_redacts_before_it_reaches_the_clipboard() {
 }
 
 #[test]
-fn export_action_is_disabled_without_results_and_never_blocks_the_pipe() {
-    let page = include_str!("workspace_pages.rs");
-    let bar = page
-        .split("fn render_search_toolbar")
-        .nth(1)
-        .unwrap()
-        .split("pub(super) fn render_directory_table")
-        .next()
-        .unwrap();
-    // The button reflects published results only; it must not read async state.
-    assert!(bar.contains("Button::new(\"export-results-csv\")"));
-    assert!(bar.contains(".disabled(self.hits.is_empty())"));
-    assert!(bar.contains("this.export_results_csv(cx)"));
-    assert!(bar.contains(".accessibility_label(\"导出当前搜索结果\")"));
-    let session = include_str!("search_session.rs");
-    // CSV is rendered before the modal opens, so a completing query cannot
-    // swap the exported set while the dialog is up.
-    let handler = session
-        .split("fn export_results_csv")
-        .nth(1)
-        .unwrap()
-        .split("pub(super) fn return_global_search")
-        .next()
-        .unwrap();
-    let render_at = handler.find("csv_export::render").unwrap();
-    let dialog_at = handler.find("prompt_for_new_path").unwrap();
-    assert!(render_at < dialog_at);
-    // A cancelled dialog is reported as a cancellation, not a failure.
-    assert!(handler.contains("已取消导出"));
-    assert!(handler.contains("没有可导出的结果"));
-}
-
-#[test]
 fn usage_copy_uses_grouping_without_changing_fixed_slots_or_raw_diagnostics() {
     let page=include_str!("workspace_pages.rs");
     let usage=&page[page.find("usage-detail-scroll").unwrap()..];

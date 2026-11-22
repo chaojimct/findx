@@ -188,16 +188,6 @@ impl MainWindow {
                 self.tool_button("search-reveal", "定位", 3, false, cx)
                     .disabled(self.active_workspace_hit().is_none()),
             )
-            .child(
-                Button::new("export-results-csv")
-                    .ghost()
-                    .icon(Icon::default().path("icons/download.svg"))
-                    .label("导出")
-                    .tooltip("导出当前结果到 CSV（Ctrl+Shift+E）")
-                    .accessibility_label("导出当前搜索结果")
-                    .disabled(self.hits.is_empty())
-                    .on_click(cx.listener(|this, _, _, cx| this.export_results_csv(cx))),
-            )
             .child(self.tool_button("search-preview", "预览", 0, preview, cx))
     }
 

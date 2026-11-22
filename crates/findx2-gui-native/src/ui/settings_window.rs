@@ -1712,7 +1712,11 @@ impl SettingsWindow {
             .lines()
             .map(str::to_string)
             .collect::<Vec<_>>();
-        let generated_at = crate::search_logic::format_time(crate::csv_export::now_unix_secs());
+        let now_unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let generated_at = crate::search_logic::format_time(now_unix_secs);
         let doc = crate::diagnostics_bundle::render(
             &generated_at,
             &header,
