@@ -14,6 +14,10 @@ pub struct LocalPrefs {
     pub compatibility_extra: std::collections::BTreeMap<String,serde_json::Value>,
     #[serde(default)]
     pub usage_reduce_motion: bool,
+    /// Global motion kill-switch (page transitions, icon nudges, glides).
+    /// Settings UI binding is follow-up work; honored everywhere motion runs.
+    #[serde(default)]
+    pub reduce_motion: bool,
     #[serde(default = "default_usage_depth")]
     pub usage_preferred_depth: usize,
     #[serde(default)]
@@ -60,6 +64,7 @@ impl Default for LocalPrefs {
             workspace_resume: Default::default(),
             compatibility_extra: Default::default(),
             usage_reduce_motion: false,
+        reduce_motion: false,
             usage_preferred_depth: 3,
             browser_favorites: Vec::new(),
             browser_recent: Vec::new(),

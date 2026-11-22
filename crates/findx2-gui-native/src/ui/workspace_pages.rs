@@ -3,6 +3,7 @@ use super::*;
 use gpui_kit::component::FocusableExt as _;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::AnimationExt as _;
 
 impl MainWindow {
     pub(in super::super) fn render_workspace_page(
@@ -12,7 +13,7 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        match self.workspace.mode {
+        let body: AnyElement = match self.workspace.mode {
             ViewMode::Search => v_flex()
                 .flex_1()
                 .min_h_0()
@@ -74,7 +75,33 @@ impl MainWindow {
                 .child(self.render_usage_toolbar(cx))
                 .child(self.render_workspace_usage(cx))
                 .into_any_element(),
+        };
+        // Page-enter slide (Argus parity, stock GPUI): new mode glides in
+        // +32px -> 0 over 250ms ease-out with full opacity throughout.
+        // A fresh animation id per page_epoch restarts the slide on every
+        // mode switch; same-mode navigation reuses the id (no replay).
+        // `relative` keeps layout stable: only paint offset changes per frame.
+        // Honour the global motion kill-switch (settings UI binding follows).
+        if self.session.read(cx).prefs.reduce_motion {
+            return body;
         }
+        let epoch = self.workspace.page_epoch;
+        div()
+            .relative()
+            .size_full()
+            .child(body)
+            .with_animation(
+                gpui_kit::ElementId::named_usize("page-enter", epoch as usize),
+                gpui_kit::Animation::new(std::time::Duration::from_millis(
+                    crate::ui::motion::PAGE_ENTER_MS,
+                ))
+                .with_easing(crate::ui::motion::ease_out_cubic),
+                move |el, delta| {
+                    el.left(px(crate::ui::motion::PAGE_ENTER_PX * (1.0 - delta)))
+                        .opacity(delta)
+                },
+            )
+            .into_any_element()
     }
 
     pub(super) fn tool_button(

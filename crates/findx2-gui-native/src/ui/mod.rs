@@ -1,5 +1,6 @@
 mod async_publication;
 mod browser_table;
+pub(crate) mod motion;
 pub(super) mod chrome;
 mod file_icon;
 pub mod main_window;

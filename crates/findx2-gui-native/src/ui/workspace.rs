@@ -236,6 +236,9 @@ pub(super) struct Workspace {
     history: History,
     pub(in crate::ui) cache: HashMap<String, (Vec<SearchHitDto>, bool)>,
     list_generation: u64,
+    /// Bumped on every ViewMode change; drives the page-enter slide.
+    /// (Same generation-counter pattern as `list_generation`.)
+    pub(in crate::ui) page_epoch: u64,
     rows_epoch: Option<(u64, u64)>,
     list_cancel: Arc<AtomicBool>,
     pub(super) listing: bool,
@@ -395,6 +398,7 @@ impl Workspace {
             history: History::default(),
             cache: HashMap::new(),
             list_generation: 0,
+        page_epoch: 0,
             rows_epoch: None,
             list_cancel: Arc::new(AtomicBool::new(false)),
             listing: false,
@@ -979,6 +983,15 @@ impl MainWindow {
         self.request_preview(cx);
         cx.notify();
     }
+    /// Single choke point for ViewMode changes: bumps `page_epoch` (drives
+    /// the page-enter slide) only on an actual change, never on same-mode
+    /// re-navigation (path moves must not replay the enter animation).
+    fn set_workspace_mode(&mut self, mode: ViewMode) {
+        if self.workspace.mode != mode {
+            self.workspace.mode = mode;
+            self.workspace.page_epoch = self.workspace.page_epoch.wrapping_add(1);
+        }
+    }
     pub(super) fn workspace_switch(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
         self.workspace.filter_cancel.store(true, Ordering::Release);
         self.workspace.filter_generation = self.workspace.filter_generation.wrapping_add(1);
@@ -996,7 +1009,7 @@ impl MainWindow {
         self.workspace.listing = false;
         self.workspace.operation = None;
         self.workspace.show_actions = false;
-        self.workspace.mode = mode;
+        self.set_workspace_mode(mode);
         match mode {
             ViewMode::Search => self.preview_force = self.workspace.search_preview,
             ViewMode::Directory => {
@@ -1295,7 +1308,7 @@ impl MainWindow {
         self.dismiss_address_menu(cx);
         self.dismiss_file_menu(cx);
         self.workspace.show_actions = false;
-        self.workspace.mode = mode;
+        self.set_workspace_mode(mode);
         self.workspace.pending_hit = pending;
         if mode == ViewMode::Usage
             && key(&self.workspace.location) != key(&path)
@@ -1486,7 +1499,7 @@ impl MainWindow {
             return;
         };
         if route.mode == ViewMode::Search {
-            self.workspace.mode = ViewMode::Search;
+            self.set_workspace_mode(ViewMode::Search);
             self.workspace.operation = None;
             self.preview_active_selection(cx);
         } else {
