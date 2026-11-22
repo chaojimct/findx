@@ -52,6 +52,7 @@ actions!(
         ContextOpen,
         ContextOpenWith,
         ContextLocate,
+        ContextOpenInNewTab,
         ContextCopyPath,
         ContextCopy,
         ContextCut,
@@ -2292,6 +2293,11 @@ impl Render for MainWindow {
             .on_action(
                 cx.listener(|this, _: &ContextLocate, window, cx| {
                     this.context_action(2, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &ContextOpenInNewTab, window, cx| {
+                    this.context_action(11, window, cx)
                 }),
             )
             .on_action(cx.listener(|this, _: &ContextCopyPath, window, cx| {

@@ -235,17 +235,30 @@ fn usage_toolbar_icon_slots_and_depth_value_are_compact_and_stable() {
 
 #[test] fn settings_nav_search_has_gray_placeholder() {
     let src = include_str!("settings_window.rs");
-    assert!(src.contains("InputState::new(window, cx).placeholder(\"搜索设置项"),
-        "nav search must show a gray placeholder hint");
+    assert!(src.contains("InputState::new(window, cx).placeholder(\"搜索设置项…\")"),
+        "nav search must show a short gray placeholder hint that fits the rail");
 }
 
-#[test] fn file_context_menu_reveals_in_native_file_manager() {
+#[test] fn file_context_menu_is_mode_aware_and_can_open_new_tab() {
     let menu = include_str!("file_actions.rs");
+    // 搜索页保留「定位所在目录」；文件页用原生资源管理器显示。
+    assert!(menu.contains("\"定位所在目录\""),
+        "search context menu must keep the in-app parent locate");
     assert!(menu.contains("\"在文件资源管理器中显示\""),
-        "context menu must use the professional native-manager label");
-    assert!(!menu.contains("\"定位所在目录\""), "old in-app locate label must be gone");
+        "directory context menu must use the native-manager label");
+    assert!(menu.contains("self.workspace.mode == ViewMode::Search"),
+        "locate label must be selected by page mode");
+    assert!(menu.contains("2 if single && self.workspace.mode == ViewMode::Search =>"),
+        "search locate branch must be mode-gated");
+    assert!(menu.contains("self.reveal_in_directory(&hits[0], cx)"),
+        "search locate must navigate in-app to the parent directory");
     assert!(menu.contains("2 if single => self.reveal_in_file_manager(&hits[0], cx)"),
-        "locate action must dispatch to native file-manager reveal");
+        "directory locate must dispatch to native file-manager reveal");
+    // 文件页新增「在新标签页中打开」。
+    assert!(menu.contains("\"在新标签页中打开\""), "directory menu must offer open-in-new-tab");
+    assert!(menu.contains("\"在新标签页中打开所在目录\""), "file menu must offer open-parent-in-new-tab");
+    assert!(menu.contains("Box::new(ContextOpenInNewTab)"), "new-tab item must have an action");
+    assert!(menu.contains("11 if single => {"), "new-tab action must have an execution branch");
 
     let ctx = include_str!("file_context.rs");
     assert!(ctx.contains("pub(super) fn reveal_in_file_manager"),
@@ -253,6 +266,12 @@ fn usage_toolbar_icon_slots_and_depth_value_are_compact_and_stable() {
     assert!(ctx.contains("crate::open_path::reveal_in_folder"),
         "must call the existing native reveal implementation");
     assert!(ctx.contains("background_spawn"), "shell call must run off the render thread");
+
+    let ws = include_str!("workspace.rs");
+    assert!(ws.contains("pub(super) fn open_directory_in_new_tab"),
+        "new-tab handler must exist");
+    let main = include_str!("main_window.rs");
+    assert!(main.contains("ContextOpenInNewTab"), "new-tab action must be declared and routed");
 }
 
 #[test] fn settings_search_lists_matched_items_and_jumps_to_their_tab() {

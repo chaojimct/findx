@@ -199,7 +199,7 @@ impl SettingsWindow {
         });
 
         let nav_search = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("搜索设置项（支持拼音）")
+            InputState::new(window, cx).placeholder("搜索设置项…")
         });
 
         let mut this = Self {

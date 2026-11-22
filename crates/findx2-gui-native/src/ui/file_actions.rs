@@ -433,12 +433,35 @@ impl MainWindow {
                 !single,
             )
         })
-        .menu_with_icon_and_disabled(
-            "在文件资源管理器中显示",
-            IconName::FolderOpen,
-            Box::new(ContextLocate),
-            !single,
-        )
+        // 搜索结果不是本机文件树的一部分，「定位所在目录」（跳到应用内父目录）
+        // 才有意义；文件页则是本机路径，交给系统文件管理器更自然。
+        .when(self.workspace.mode == ViewMode::Search, |menu| {
+            menu.menu_with_icon_and_disabled(
+                "定位所在目录",
+                IconName::FolderOpen,
+                Box::new(ContextLocate),
+                !single,
+            )
+        })
+        .when(self.workspace.mode != ViewMode::Search, |menu| {
+            menu.menu_with_icon_and_disabled(
+                "在文件资源管理器中显示",
+                IconName::FolderOpen,
+                Box::new(ContextLocate),
+                !single,
+            )
+        })
+        .when(self.workspace.mode == ViewMode::Directory && single, |menu| {
+            menu.menu_with_icon(
+                if directory {
+                    "在新标签页中打开"
+                } else {
+                    "在新标签页中打开所在目录"
+                },
+                Icon::default().path("icons/folder-plus.svg"),
+                Box::new(ContextOpenInNewTab),
+            )
+        })
         .separator()
         .menu_with_icon("复制路径", IconName::Copy, Box::new(ContextCopyPath))
         .menu_with_icon_and_disabled("复制文件", IconName::Copy, Box::new(ContextCopy), busy)
@@ -549,7 +572,24 @@ impl MainWindow {
             1 if single && !hits[0].is_directory => {
                 self.open_shell_dialog(hits[0].clone(), crate::open_path::ShellDialog::OpenWith, cx)
             }
+            2 if single && self.workspace.mode == ViewMode::Search => {
+                self.reveal_in_directory(&hits[0], cx)
+            }
             2 if single => self.reveal_in_file_manager(&hits[0], cx),
+            11 if single => {
+                let target = if hits[0].is_directory {
+                    PathBuf::from(&hits[0].path)
+                } else {
+                    match crate::interaction_logic::locate_parent(&hits[0].path) {
+                        Some(parent) => PathBuf::from(parent),
+                        None => {
+                            self.transient_file_notice("无法打开：没有上级目录".into(), cx);
+                            return;
+                        }
+                    }
+                };
+                self.open_directory_in_new_tab(target, window, cx);
+            }
             3 if !hits.is_empty() => {
                 cx.write_to_clipboard(ClipboardItem::new_string(
                     hits.iter()

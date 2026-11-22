@@ -779,6 +779,20 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// 右键「在新标签页中打开」：新建一个目录标签并直接导航到目标目录。
+    pub(super) fn open_directory_in_new_tab(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.mode != ViewMode::Directory || self.workspace.tabs.len() >= 12 {
+            return;
+        }
+        self.new_directory_tab(window, cx);
+        self.workspace_navigate(path, ViewMode::Directory, None, true, cx);
+    }
+
     fn new_directory_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel_path_edit(cx);
         self.dismiss_address_menu(cx);
