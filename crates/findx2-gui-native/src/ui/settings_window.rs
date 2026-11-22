@@ -123,6 +123,8 @@ pub struct SettingsWindow {
     search_limit: Entity<InputState>,
     save_interval: Entity<InputState>,
     nav_search: Entity<InputState>,
+    /// 搜索结果跳转后定位到的设置项文案，用于内容区顶部反馈。
+    located_label: Option<&'static str>,
     index_path: Entity<InputState>,
     pipe_name: Entity<InputState>,
     service_exe: Entity<InputState>,
@@ -207,6 +209,7 @@ impl SettingsWindow {
             search_limit: search_limit.clone(),
             save_interval: save_interval.clone(),
             nav_search: nav_search.clone(),
+            located_label: None,
             index_path: index_path.clone(),
             pipe_name: pipe_name.clone(),
             service_exe: service_exe.clone(),
@@ -253,6 +256,16 @@ impl SettingsWindow {
 
         this._subscriptions
             .push(cx.observe(&this.session, |_, _, cx| cx.notify()));
+        // 搜索框改动要重绘左栏（并清掉上一次的定位反馈）：InputState 只通知自己，
+        // 父视图不会自动重绘。
+        this._subscriptions.push(
+            cx.subscribe_in(&this.nav_search, window, |this, _, ev, _, cx| {
+                if let InputEvent::Change = ev {
+                    this.located_label = None;
+                    cx.notify();
+                }
+            }),
+        );
         this._subscriptions.push(
             cx.subscribe_in(&this.excluded, window, |this, _, ev, _, cx| {
                 if let InputEvent::Change = ev {
@@ -459,25 +472,39 @@ impl Render for SettingsWindow {
         let tokens = Self::tokens(cx);
         let roots = self.session.read(cx).available_roots.clone();
         let nav_query = self.nav_search.read(cx).value().to_string();
-        let categories: Vec<(SettingsTab, &'static str)> = [
-            (SettingsTab::Appearance, "外观"),
-            (SettingsTab::Search, "搜索"),
-            (SettingsTab::Files, "文件浏览"),
-            (SettingsTab::Preview, "预览"),
-            (SettingsTab::Index, "索引与服务"),
-            (SettingsTab::Shortcuts, "快捷键"),
-            (SettingsTab::Diagnostics, "诊断"),
-            (SettingsTab::About, "关于"),
-        ]
-        .into_iter()
-        .filter(|(_, label)| {
-            if nav_query.trim().is_empty() {
-                return true;
+        let searching = !nav_query.trim().is_empty();
+        // 搜索命中设置项的内容（文案 / 分组 / 关键词 / 拼音），而不再只匹配 tab 标题。
+        let matched_items: Vec<crate::settings_search::SettingsItem> = if searching {
+            crate::settings_search::filter(
+                &crate::settings_search::all_settings_items(),
+                &nav_query,
+            )
+        } else {
+            Vec::new()
+        };
+        // 搜索时左栏只列命中的设置项，用其所属 tab 去重后给标题栏定位。
+        let categories: Vec<(SettingsTab, &'static str)> = if searching {
+            let mut tabs: Vec<(SettingsTab, &'static str)> = Vec::new();
+            for it in &matched_items {
+                let tab = SettingsTab::from_canonical(it.tab);
+                if !tabs.iter().any(|(t, _)| *t == tab) {
+                    tabs.push((tab, crate::settings_search::tab_label(it.tab)));
+                }
             }
-            let q = nav_query.to_lowercase();
-            label.to_lowercase().contains(&q)
-        })
-        .collect();
+            tabs
+        } else {
+            [
+                (SettingsTab::Appearance, "外观"),
+                (SettingsTab::Search, "搜索"),
+                (SettingsTab::Files, "文件浏览"),
+                (SettingsTab::Preview, "预览"),
+                (SettingsTab::Index, "索引与服务"),
+                (SettingsTab::Shortcuts, "快捷键"),
+                (SettingsTab::Diagnostics, "诊断"),
+                (SettingsTab::About, "关于"),
+            ]
+            .to_vec()
+        };
 
         let title = categories
             .iter()
@@ -569,35 +596,77 @@ impl Render for SettingsWindow {
                     .on_click(cx.listener(|this, _, window, cx| this.request_leave(window, cx))),
             )
             .child(div().h(px(12.)))
-            .when(categories.is_empty(), |v| {
-                v.child(div().text_xs().px_2().py_2().text_color(tokens.text_tertiary).child("无匹配的设置项"))
+            .when(searching, |v| {
+                v.child(
+                    div()
+                        .text_xs()
+                        .px_2()
+                        .py_1()
+                        .text_color(tokens.text_secondary)
+                        .child(format!("匹配的设置项（{}）", matched_items.len())),
+                )
+                .when(matched_items.is_empty(), |v| {
+                    v.child(div().text_xs().px_2().py_2().text_color(tokens.text_tertiary).child("无匹配的设置项"))
+                })
+                .children(matched_items.iter().map(|it| {
+                    let tab_id = it.tab;
+                    let label = it.label;
+                    Button::new(SharedString::from(format!("settings-match-{}", it.id)))
+                        .ghost()
+                        .w_full()
+                        .h(px(32.))
+                        .px_0()
+                        .accessibility_label(label)
+                        .child(settings_nav_content(
+                            Icon::default().path(match tab_id {
+                                "appearance" => "icons/palette.svg",
+                                "search" => "icons/search.svg",
+                                "files" => "icons/folder.svg",
+                                "preview" => "icons/panel-right.svg",
+                                "index" => "icons/database.svg",
+                                "shortcuts" => "icons/keyboard.svg",
+                                "diagnostics" => "icons/activity.svg",
+                                "about" => "icons/info.svg",
+                                _ => "icons/info.svg",
+                            }),
+                            label,
+                        ))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.tab = SettingsTab::from_canonical(tab_id);
+                            this.located_label = Some(label);
+                            this.hint = SharedString::from(format!("已定位到「{}」", label));
+                            cx.notify();
+                        }))
+                }))
             })
-            .children(categories.into_iter().map(|(tab, label)| {
-                Button::new(SharedString::from(format!("settings-category-{label}")))
-                    .ghost()
-                    .w_full()
-                    .h(px(32.))
-                    .px_0()
-                    .accessibility_label(label)
-                    .child(settings_nav_content(
-                        Icon::default().path(match tab {
-                            SettingsTab::Appearance => "icons/palette.svg",
-                            SettingsTab::Search => "icons/search.svg",
-                            SettingsTab::Files => "icons/folder.svg",
-                            SettingsTab::Preview => "icons/panel-right.svg",
-                            SettingsTab::Index => "icons/database.svg",
-                            SettingsTab::Shortcuts => "icons/keyboard.svg",
-                            SettingsTab::Diagnostics => "icons/activity.svg",
-                            SettingsTab::About => "icons/info.svg",
-                        }),
-                        label,
-                    ))
-                    .selected(self.tab == tab)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.tab = tab;
-                        cx.notify();
-                    }))
-            }));
+            .when(!searching, |v| {
+                v.children(categories.into_iter().map(|(tab, label)| {
+                    Button::new(SharedString::from(format!("settings-category-{label}")))
+                        .ghost()
+                        .w_full()
+                        .h(px(32.))
+                        .px_0()
+                        .accessibility_label(label)
+                        .child(settings_nav_content(
+                            Icon::default().path(match tab {
+                                SettingsTab::Appearance => "icons/palette.svg",
+                                SettingsTab::Search => "icons/search.svg",
+                                SettingsTab::Files => "icons/folder.svg",
+                                SettingsTab::Preview => "icons/panel-right.svg",
+                                SettingsTab::Index => "icons/database.svg",
+                                SettingsTab::Shortcuts => "icons/keyboard.svg",
+                                SettingsTab::Diagnostics => "icons/activity.svg",
+                                SettingsTab::About => "icons/info.svg",
+                            }),
+                            label,
+                        ))
+                        .selected(self.tab == tab)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.tab = tab;
+                            cx.notify();
+                        }))
+                }))
+            });
         let content = v_flex()
             .flex_1()
             .min_w_0()
@@ -610,7 +679,26 @@ impl Render for SettingsWindow {
                     .items_center()
                     .border_b_1()
                     .border_color(tokens.border)
-                    .child(div().text_lg().child(title)),
+                    .child(div().text_lg().child(title))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(tokens.text_secondary)
+                            .child(if searching {
+                                match self.located_label {
+                                    Some(l) => SharedString::from(format!(
+                                        "已定位到「{}」，左侧可继续选择其它结果",
+                                        l
+                                    )),
+                                    None => SharedString::from(format!(
+                                        "找到 {} 项设置，点击左侧结果跳转到所在分类",
+                                        matched_items.len()
+                                    )),
+                                }
+                            } else {
+                                SharedString::from("")
+                            }),
+                    ),
                 )
             .child(
                 div()

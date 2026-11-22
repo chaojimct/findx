@@ -220,6 +220,25 @@ fn usage_toolbar_icon_slots_and_depth_value_are_compact_and_stable() {
     assert!(!list.contains("export_results"), "CSV export command must stay removed");
 }
 
+#[test] fn settings_search_lists_matched_items_and_jumps_to_their_tab() {
+    // Logic closure: the nav search must search setting *content* via the
+    // shared catalog/pinyin filter, list match buttons, and jump to their tab.
+    let src = include_str!("settings_window.rs");
+    assert!(src.contains("crate::settings_search::filter("),
+        "nav search must use the content filter, not just tab-title matching");
+    assert!(src.contains("crate::settings_search::all_settings_items()"),
+        "nav search must use the full settings catalog");
+    assert!(src.contains("settings-match-"),
+        "matched settings must be rendered as clickable rail items");
+    assert!(src.contains("this.tab = SettingsTab::from_canonical(tab_id)"),
+        "clicking a match must switch to that setting's tab");
+    assert!(src.contains("this.located_label = Some(label)"),
+        "clicking a match must give visible location feedback");
+    // The old title-only filter must be gone.
+    assert!(!src.contains("label.to_lowercase().contains(&q)"),
+        "title-only filtering must not remain");
+}
+
 #[test] fn page_enter_wrapper_is_flex_column_so_content_fills_height() {
     // Regression: the page-enter slide must not wrap `body` in a plain `div()`.
     // `body` carries `flex_1()`; only a flex-column parent lets it expand to the
