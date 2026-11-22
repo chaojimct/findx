@@ -356,6 +356,101 @@ fn usage_toolbar_icon_slots_and_depth_value_are_compact_and_stable() {
     assert!(wrap.contains(".child(body)"));
 }
 
+#[test] fn sidebar_merges_locations_into_favorites_and_adds_expandable_tree() {
+    let src = include_str!("workspace_pages.rs");
+    let start = src.find("fn render_locations(&self").unwrap();
+    let end = src[start..].find("fn render_usage_toolbar").unwrap() + start;
+    let render = &src[start..end];
+    let compact: String = render.split_whitespace().collect();
+    assert!(!render.contains("render_location_group(\"locations\""),
+        "the separate 位置 group must be gone; known folders are fixed favorites");
+    assert!(!render.contains("\"user\""),
+        "the separate 用户目录 group must be replaced by the 此电脑 tree");
+    assert!(render.contains("render_location_group(\"favorites\", \"收藏夹\""),
+        "favorites must be the top group");
+    assert!(compact.contains("self.workspace.locations"),
+        "built-in known folders must feed the favorites group");
+    assert!(compact.contains("prefs.browser_favorites"),
+        "user favorites must feed the same group");
+    assert!(compact.contains("key(p)==key(&item.2)"),
+        "duplicates between built-in and user favorites must be removed");
+    assert!(render.contains("self.render_tree_group(cx)"),
+        "the expandable 此电脑 tree must sit between favorites and recent");
+    assert!(render.contains("render_location_group(\"recent\", \"最近使用\""),
+        "recent directories must be preserved");
+
+    let active = src
+        .split("fn sidebar_active_group")
+        .nth(1)
+        .unwrap()
+        .split("fn sidebar_header")
+        .next()
+        .unwrap();
+    let compact_active: String = active.split_whitespace().collect();
+    let favorites = compact_active
+        .find("ifself")
+        .unwrap();
+    let fav_end = compact_active[favorites..]
+        .find("returnSome(\"favorites\")")
+        .unwrap();
+    assert!(compact_active[favorites..favorites + fav_end].contains("workspace.locations"),
+        "known folders must now report the favorites group as active");
+    assert!(active.contains("return Some(\"tree\")"),
+        "tree nodes must have their own active group");
+}
+
+#[test] fn sidebar_tree_children_are_loaded_off_thread_with_generation_guards() {
+    let src = include_str!("workspace.rs");
+    let start = src.find("fn load_tree_children").unwrap();
+    let end = src.find("fn toggle_favorite").unwrap();
+    let tree = &src[start..end];
+    assert!(tree.contains("crate::navigation::list_siblings(&path, &cancel)"),
+        "children must come from the existing bounded sibling lister");
+    assert!(tree.contains(".background_spawn("),
+        "filesystem enumeration must never run on the UI thread");
+    assert!(tree.contains("entry.directory"), "only subdirectories belong in the tree");
+    assert!(tree.contains(".take(64)"), "child enumeration must be bounded");
+    assert!(tree.contains("generation != this.workspace.tree_generation"),
+        "stale loads must be discarded");
+    assert!(tree.contains("this.workspace.tree_loading.remove(&k)"),
+        "in-flight state must always be cleared");
+    assert!(tree.contains("fn toggle_tree_node") && tree.contains("tree_expanded.insert"),
+        "chevron must toggle expansion state");
+    assert!(tree.contains("fn refresh_tree") && tree.contains("tree_children.clear()"),
+        "refresh must invalidate the tree cache and reload expanded nodes");
+    assert!(include_str!("workspace.rs").contains("self.tree_cancel.store(true, Ordering::Release);"),
+        "tree loads must be cancelled on drop");
+}
+
+#[test] fn sidebar_context_menu_actions_are_declared_and_routed() {
+    let pages = include_str!("workspace_pages.rs");
+    assert!(pages.contains("SidebarTreeOpenNewTab") && pages.contains("SidebarTreeToggleFavorite"),
+        "sidebar rows must expose both context actions");
+    assert_eq!(pages.matches("this.workspace.sidebar_tree_target = Some(").count(), 2,
+        "both flat rows and tree rows must record the right-click target");
+    assert!(pages.contains("context_menu(self.sidebar_context_menu("),
+        "the shared context-menu builder must be attached to sidebar rows");
+    assert!(pages.contains("加入收藏夹") && pages.contains("从收藏夹移除"),
+        "favorite action must reflect current state");
+
+    let main = include_str!("main_window.rs");
+    let actions = main
+        .split("actions!(")
+        .nth(1)
+        .unwrap()
+        .split(");")
+        .next()
+        .unwrap();
+    assert!(actions.contains("SidebarTreeOpenNewTab") && actions.contains("SidebarTreeToggleFavorite"),
+        "both actions must be registered with GPUI");
+    assert!(main.contains("&SidebarTreeOpenNewTab") && main.contains("open_directory_in_new_tab(path, window, cx)"),
+        "new-tab action must actually open a tab at the target path");
+    assert!(main.contains("&SidebarTreeToggleFavorite") && main.contains("toggle_favorite(path, cx)"),
+        "favorite action must actually update the saved favorites");
+    assert_eq!(main.matches("sidebar_tree_target.take()").count(), 2,
+        "each action must consume the target exactly once");
+}
+
 #[test]fn home_completion_keeps_published_scene_scan_until_scene_handoff(){
  // A scope change publishes (scene, scene_scan) atomically at handoff. If a
  // completion overwrote usage_scene_scan early, the stale scene's tile indices

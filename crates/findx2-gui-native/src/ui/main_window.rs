@@ -83,6 +83,8 @@ actions!(
         DirectoryTab8,
         DirectoryTab9,
         ToggleSidebar,
+        SidebarTreeOpenNewTab,
+        SidebarTreeToggleFavorite,
     ]
 );
 
@@ -2334,6 +2336,16 @@ impl Render for MainWindow {
                     this.context_action(11, window, cx)
                 }),
             )
+            .on_action(cx.listener(|this, _: &SidebarTreeOpenNewTab, window, cx| {
+                if let Some(path) = this.workspace.sidebar_tree_target.take() {
+                    this.open_directory_in_new_tab(path, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SidebarTreeToggleFavorite, _, cx| {
+                if let Some(path) = this.workspace.sidebar_tree_target.take() {
+                    this.toggle_favorite(path, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &ContextCopyPath, window, cx| {
                 this.context_action(3, window, cx)
             }))

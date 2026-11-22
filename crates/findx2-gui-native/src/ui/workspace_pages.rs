@@ -2,7 +2,7 @@
 use super::*;
 use gpui_kit::component::FocusableExt as _;
 use gpui_kit::component::popover::Popover;
-use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu};
 use gpui_kit::AnimationExt as _;
 
 impl MainWindow {
@@ -353,33 +353,36 @@ impl MainWindow {
                 return Some(*group);
             }
         }
+        let session = self.session.read(cx);
         if self
             .workspace
             .locations
             .iter()
             .any(|(_, _, p)| key(p) == current)
-        {
-            return Some("locations");
-        }
-        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
-        if home.as_ref().is_some_and(|p| key(p) == current)
-            || self
-                .session
-                .read(cx)
-                .available_roots
+            || session
+                .prefs
+                .browser_favorites
                 .iter()
                 .any(|p| key(Path::new(p)) == current)
         {
-            return Some("user");
+            return Some("favorites");
         }
-        let prefs = &self.session.read(cx).prefs;
-        if prefs
-            .browser_favorites
-            .iter()
-            .any(|p| key(Path::new(p)) == current)
+        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        if home.as_ref().is_some_and(|p| key(p) == current)
+            || session
+                .available_roots
+                .iter()
+                .any(|p| key(Path::new(p)) == current)
+            || self.workspace.tree_children.values().any(|children| {
+                children
+                    .iter()
+                    .any(|(_, path)| key(path) == current)
+            })
         {
-            Some("favorites")
-        } else if prefs
+            return Some("tree");
+        }
+        if session
+            .prefs
             .browser_recent
             .iter()
             .any(|p| key(Path::new(p)) == current)
@@ -491,6 +494,19 @@ impl MainWindow {
                                 })),
                         )
                     })
+                    .when(group == "tree", |v| {
+                        v.child(
+                            Button::new("refresh-directory-tree")
+                                .ghost()
+                                .w(px(24.))
+                                .h(px(24.))
+                                .px_0()
+                                .icon(IconName::RefreshCw)
+                                .tooltip("刷新文件夹树")
+                                .accessibility_label("刷新文件夹树")
+                                .on_click(cx.listener(|this, _, _, cx| this.refresh_tree(cx))),
+                        )
+                    })
                     .when(group == "recent" && !empty, |v| {
                         v.child(
                             Button::new("clear-recent-directories")
@@ -513,6 +529,22 @@ impl MainWindow {
             )
             .into_any_element()
     }
+    /// One shared context menu for every sidebar row. Right-click records the
+    /// target path first; the actions then consume it through the session focus.
+    fn sidebar_context_menu(
+        &self,
+        favorite_label: Option<&'static str>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let focus = self.focus.clone();
+        move |menu, _, _| {
+            let mut menu = menu.menu("在新标签页中打开", Box::new(SidebarTreeOpenNewTab));
+            if let Some(label) = favorite_label {
+                menu = menu.menu(label, Box::new(SidebarTreeToggleFavorite));
+            }
+            menu.action_context(focus.clone())
+        }
+    }
+
     fn sidebar_item(
         &self,
         group: &'static str,
@@ -520,6 +552,7 @@ impl MainWindow {
         label: String,
         icon: String,
         path: PathBuf,
+        favorite_label: Option<&'static str>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let on = self.sidebar_active_group(cx) == Some(group)
@@ -528,6 +561,7 @@ impl MainWindow {
         // The row background is inset 12px on BOTH edges. Inside: 16px indent,
         // 20px icon slot, a flexible ellipsized text slot, and 16px tail slot.
         let row_width = DIRECTORY_SIDEBAR_WIDTH - 24.;
+        let right_path = path.clone();
         Button::new(SharedString::from(format!("sidebar-{group}-{index}")))
             .ghost()
             .w_full()
@@ -560,17 +594,22 @@ impl MainWindow {
                     )
                     .child(div().w(px(16.)).flex_shrink_0()),
             )
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| {
+                this.workspace.sidebar_tree_target = Some(right_path.clone());
+                cx.stop_propagation();
+            }))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.workspace.sidebar_source = Some((group, key(&path)));
                 this.workspace_navigate(path.clone(), ViewMode::Directory, None, true, cx);
             }))
+            .context_menu(self.sidebar_context_menu(favorite_label))
             .into_any_element()
     }
     fn render_location_group(
         &self,
         group: &'static str,
         title: &'static str,
-        items: Vec<(String, String, PathBuf)>,
+        items: Vec<(String, String, PathBuf, Option<&'static str>)>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = Self::tokens(cx);
@@ -591,8 +630,16 @@ impl MainWindow {
                             items
                                 .into_iter()
                                 .enumerate()
-                                .map(|(i, (label, icon, path))| {
-                                    self.sidebar_item(group, i, label, icon, path, cx)
+                                .map(|(i, (label, icon, path, favorite_label))| {
+                                    self.sidebar_item(
+                                        group,
+                                        i,
+                                        label,
+                                        icon,
+                                        path,
+                                        favorite_label,
+                                        cx,
+                                    )
                                 }),
                         ),
                 )
@@ -616,27 +663,173 @@ impl MainWindow {
             })
             .into_any_element()
     }
-    fn render_locations(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// One row of the Explorer-style folder tree. The chevron loads children
+    /// lazily; the row itself navigates. Right-click uses the shared menu.
+    fn sidebar_tree_item(
+        &self,
+        depth: usize,
+        label: String,
+        icon: String,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = Self::tokens(cx);
-        let prefs = &self.session.read(cx).prefs;
-        let locations = self
-            .workspace
-            .locations
+        let k = key(&path);
+        let expanded = self.workspace.tree_expanded.contains_key(&k);
+        let on = self.sidebar_active_group(cx) == Some("tree")
+            && key(&path) == key(&self.workspace.location);
+        let full = display_path(&path);
+        let right_path = path.clone();
+        let chevron_path = path.clone();
+        let favorite_label = if self
+            .session
+            .read(cx)
+            .prefs
+            .browser_favorites
             .iter()
-            .map(|(name, icon, path)| (name.to_string(), icon.to_string(), path.clone()))
-            .collect();
+            .any(|p| key(Path::new(p)) == k)
+        {
+            Some("从收藏夹移除")
+        } else {
+            Some("加入收藏夹")
+        };
+        let indent = 4. + depth.min(6) as f32 * 12.;
+        let row_width = DIRECTORY_SIDEBAR_WIDTH - 24.;
+        div()
+            .id(SharedString::from(format!("sidebar-tree-{k}")))
+            .w(px(row_width))
+            .h(px(28.))
+            .flex_shrink_0()
+            .rounded_sm()
+            .when(on, |v| v.bg(t.row_selected))
+            .tooltip(move |window, cx| {
+                gpui_kit::component::tooltip::Tooltip::new(full.clone()).build(window, cx)
+            })
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| {
+                this.workspace.sidebar_tree_target = Some(right_path.clone());
+                cx.stop_propagation();
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.workspace.sidebar_source = Some(("tree", key(&path)));
+                this.workspace_navigate(path.clone(), ViewMode::Directory, None, true, cx);
+            }))
+            .context_menu(self.sidebar_context_menu(favorite_label))
+            .child(
+                h_flex()
+                    .w_full()
+                    .h_full()
+                    .items_center()
+                    .child(div().w(px(indent)).flex_shrink_0())
+                    .child(
+                        Button::new(SharedString::from(format!("sidebar-tree-chevron-{k}")))
+                            .ghost()
+                            .w(px(16.))
+                            .h(px(24.))
+                            .px_0()
+                            .flex_shrink_0()
+                            .icon(Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            }).size_3())
+                            .accessibility_label(if expanded { "折叠文件夹" } else { "展开文件夹" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_tree_node(chevron_path.clone(), cx);
+                            })),
+                    )
+                    .child(
+                        h_flex()
+                            .w(px(18.))
+                            .flex_shrink_0()
+                            .justify_center()
+                            .child(Icon::default().path(format!("icons/{icon}.svg")).size_4()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .pl_1()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_sm()
+                            .child(label),
+                    )
+                    .child(div().w(px(8.)).flex_shrink_0()),
+            )
+            .into_any_element()
+    }
+
+    fn sidebar_tree_children(
+        &self,
+        parent: &Path,
+        depth: usize,
+        rows: &mut Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) {
+        if depth >= 8 || !self.workspace.tree_expanded.contains_key(&key(parent)) {
+            return;
+        }
+        let Some(children) = self.workspace.tree_children.get(&key(parent)).cloned() else {
+            return;
+        };
+        if children.is_empty() {
+            rows.push(
+                div()
+                    .pl(px(20. + depth.min(6) as f32 * 12.))
+                    .py_0p5()
+                    .text_xs()
+                    .text_color(Self::tokens(cx).text_tertiary)
+                    .child("（空文件夹）")
+                    .into_any_element(),
+            );
+            return;
+        }
+        for (label, path) in children {
+            rows.push(self.sidebar_tree_item(
+                depth + 1,
+                label,
+                "folder".into(),
+                path.clone(),
+                cx,
+            ));
+            self.sidebar_tree_children(&path, depth + 1, rows, cx);
+        }
+    }
+
+    fn render_tree_group(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = Self::tokens(cx);
+        let collapsed = self.workspace.collapsed_groups.contains("tree");
         let home = std::env::var_os("USERPROFILE")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("C:\\"));
-        let mut user = vec![("主目录".into(), "house".into(), home)];
-        user.extend(
-            self.session
-                .read(cx)
-                .available_roots
-                .iter()
-                .map(|p| (p.clone(), "hard-drive".into(), PathBuf::from(p))),
-        );
-        let path_items = |paths: &Vec<String>, icon: &str| {
+        let roots = { self.session.read(cx).available_roots.clone() };
+        let mut items = vec![("主目录".to_string(), "house".to_string(), home)];
+        for drive in roots {
+            items.push((drive.clone(), "hard-drive".to_string(), PathBuf::from(drive)));
+        }
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (label, icon, path) in items {
+            rows.push(self.sidebar_tree_item(0, label, icon, path.clone(), cx));
+            self.sidebar_tree_children(&path, 0, &mut rows, cx);
+        }
+        v_flex()
+            .w_full()
+            .py_1()
+            .border_b_1()
+            .border_color(t.border_soft)
+            .child(self.sidebar_header("tree", "此电脑", false, cx))
+            .when(!collapsed, |v| v.child(v_flex().w_full().px_1().children(rows)))
+            .into_any_element()
+    }
+
+    fn render_locations(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = Self::tokens(cx);
+        let (fav_paths, recent_paths) = {
+            let prefs = &self.session.read(cx).prefs;
+            (prefs.browser_favorites.clone(), prefs.browser_recent.clone())
+        };
+        let path_items = |paths: &Vec<String>, icon: &str, label: Option<&'static str>| {
             paths
                 .iter()
                 .take(8)
@@ -646,12 +839,26 @@ impl MainWindow {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| display_path(&path));
-                    (name, icon.to_string(), path)
+                    (name, icon.to_string(), path, label)
                 })
-                .collect()
+                .collect::<Vec<_>>()
         };
-        let favorites = path_items(&prefs.browser_favorites, "folder");
-        let recent = path_items(&prefs.browser_recent, "folder-clock");
+        // Windows known folders are fixed favorites, not a separate "位置" group.
+        let mut favorites: Vec<(String, String, PathBuf, Option<&'static str>)> = self
+            .workspace
+            .locations
+            .iter()
+            .map(|(name, icon, path)| {
+                ((*name).to_string(), (*icon).to_string(), path.clone(), None)
+            })
+            .collect();
+        for item in path_items(&fav_paths, "folder", Some("从收藏夹移除")) {
+            if favorites.iter().any(|(_, _, p, _)| key(p) == key(&item.2)) {
+                continue;
+            }
+            favorites.push(item);
+        }
+        let recent = path_items(&recent_paths, "folder-clock", None);
         v_flex()
             .w(px(DIRECTORY_SIDEBAR_WIDTH))
             .h_full()
@@ -667,9 +874,8 @@ impl MainWindow {
                     .min_h_0()
                     .overflow_y_scrollbar()
                     .px_2()
-                    .child(self.render_location_group("locations", "位置", locations, cx))
-                    .child(self.render_location_group("user", "用户目录", user, cx))
                     .child(self.render_location_group("favorites", "收藏夹", favorites, cx))
+                    .child(self.render_tree_group(cx))
                     .child(self.render_location_group("recent", "最近使用", recent, cx)),
             )
     }

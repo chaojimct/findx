@@ -198,6 +198,14 @@ pub(super) struct Workspace {
     locations: Vec<(&'static str, &'static str, PathBuf)>,
     sidebar_source: Option<(&'static str, String)>,
     collapsed_groups: std::collections::HashSet<&'static str>,
+    /// Target of the sidebar tree context menu (right-click records it before the menu opens).
+    pub(super) sidebar_tree_target: Option<PathBuf>,
+    /// Explorer-style folder tree: expanded keys, loaded children, in-flight loads.
+    tree_expanded: HashMap<String, PathBuf>,
+    tree_children: HashMap<String, Vec<(String, PathBuf)>>,
+    tree_loading: std::collections::HashSet<String>,
+    tree_generation: u64,
+    tree_cancel: Arc<AtomicBool>,
     pub(super) mode: ViewMode,
     tabs: Vec<PageContext>,
     active_tab: usize,
@@ -360,6 +368,12 @@ impl Workspace {
             locations: Vec::new(),
             sidebar_source: None,
             collapsed_groups: Default::default(),
+            sidebar_tree_target: None,
+            tree_expanded: Default::default(),
+            tree_children: Default::default(),
+            tree_loading: Default::default(),
+            tree_generation: 0,
+            tree_cancel: Arc::new(AtomicBool::new(false)),
             mode: ViewMode::Search,
             tabs: vec![],
             active_tab: 0,
@@ -512,6 +526,7 @@ impl Drop for Workspace {
         self.list_cancel.store(true, Ordering::Release);
         self.scan_cancel.store(true, Ordering::Release);
         self.op_cancel.store(true, Ordering::Release);
+        self.tree_cancel.store(true, Ordering::Release);
     }
 }
 
@@ -786,9 +801,11 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.workspace.mode != ViewMode::Directory || self.workspace.tabs.len() >= 12 {
+        if self.settings_page.is_some() || self.workspace.tabs.len() >= 12 {
             return;
         }
+        // The sidebar is visible in search mode too; new_directory_tab plus the
+        // explicit Directory navigate below switch the page for us.
         self.new_directory_tab(window, cx);
         self.workspace_navigate(path, ViewMode::Directory, None, true, cx);
     }
@@ -3390,7 +3407,76 @@ impl MainWindow {
             crate::session::persist_prefs(s.prefs.clone(), cx);
         });
     }
-    fn toggle_favorite(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    /// Lazy, cancellable directory enumeration for the Explorer-style sidebar tree.
+    /// Only immediate subdirectories are kept; filesystem work stays off the UI thread.
+    fn load_tree_children(&mut self, k: String, path: PathBuf, cx: &mut Context<Self>) {
+        if self.workspace.tree_children.contains_key(&k)
+            || !self.workspace.tree_loading.insert(k.clone())
+        {
+            return;
+        }
+        let generation = self.workspace.tree_generation;
+        let cancel = self.workspace.tree_cancel.clone();
+        cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_spawn(async move {
+                    let siblings = crate::navigation::list_siblings(&path, &cancel)?;
+                    Ok::<Vec<(String, PathBuf)>, std::io::Error>(
+                        siblings
+                            .entries
+                            .into_iter()
+                            .filter(|entry| entry.directory && !entry.name.starts_with('.'))
+                            .take(64)
+                            .map(|entry| (entry.name, entry.path))
+                            .collect(),
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.workspace.tree_loading.remove(&k);
+                if generation != this.workspace.tree_generation {
+                    return;
+                }
+                this.workspace
+                    .tree_children
+                    .insert(k, loaded.unwrap_or_default());
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn toggle_tree_node(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let k = key(&path);
+        if self.workspace.tree_expanded.remove(&k).is_some() {
+            cx.notify();
+            return;
+        }
+        self.workspace.tree_expanded.insert(k.clone(), path.clone());
+        self.load_tree_children(k, path, cx);
+        cx.notify();
+    }
+
+    fn refresh_tree(&mut self, cx: &mut Context<Self>) {
+        self.workspace.tree_cancel.store(true, Ordering::Release);
+        self.workspace.tree_cancel = Arc::new(AtomicBool::new(false));
+        self.workspace.tree_generation = self.workspace.tree_generation.wrapping_add(1);
+        self.workspace.tree_children.clear();
+        self.workspace.tree_loading.clear();
+        let expanded: Vec<(String, PathBuf)> = self
+            .workspace
+            .tree_expanded
+            .iter()
+            .map(|(k, p)| (k.clone(), p.clone()))
+            .collect();
+        for (k, p) in expanded {
+            self.load_tree_children(k, p, cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn toggle_favorite(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.session.update(cx, |s, cx| {
             let k = key(&path);
             if s.prefs
