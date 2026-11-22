@@ -131,6 +131,26 @@ fn usage_toolbar_width_accounts_for_label_padding_and_address_minimum() {
 }
 
 #[test]
+fn index_tab_shows_live_indexed_locations_not_configured_drives() {
+    let src = include_str!("settings_window.rs");
+    let idx = src
+        .split("fn render_index_tab")
+        .nth(1)
+        .unwrap()
+        .split("fn render_service_tab")
+        .next()
+        .unwrap();
+    assert!(idx.contains("indexed_locations_label"));
+    assert!(idx.contains("id(\"indexed-locations-row\")"));
+    assert!(idx.contains("暂无已索引位置"));
+    // The live label itself parses indexed_drive_mask (with a legacy
+    // volume_letter fallback) in the pure status_logic layer.
+    let logic = include_str!("../status_logic.rs");
+    assert!(logic.contains("indexed_drive_mask"));
+    assert!(logic.contains("fn indexed_locations_label"));
+}
+
+#[test]
 fn diagnostics_copy_redacts_before_it_reaches_the_clipboard() {
     let src = include_str!("settings_window.rs");
     let handler = src

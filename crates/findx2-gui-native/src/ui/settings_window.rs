@@ -729,9 +729,9 @@ impl SettingsWindow {
                         tokens,
                     ))
                     .child(v_flex().id("settings-drives-viewport").h(px(drive_rows * 40.)).flex_shrink_0().gap_2().overflow_y_scrollbar()
-            .when(roots.is_empty(), |this| {
-                this.child(div().text_sm().text_color(tokens.text_tertiary).child("（加载磁盘列表中…）"))
-            })
+                    .when(roots.is_empty(), |this| {
+                        this.child(div().text_sm().text_color(tokens.text_tertiary).child("（加载磁盘列表中…）"))
+                    })
             .children(roots.iter().cloned().map(|root| {
                 let checked = selected.is_empty() || selected.iter().any(|d| d == &root);
                 let root_key = root.clone();
@@ -757,6 +757,31 @@ impl SettingsWindow {
                     }
                 })
             })))
+            )
+            .child(
+                settings_card(tokens)
+                    .child(section_title("已索引位置", tokens))
+                    .child(settings_note(
+                        "状态条持续更新，此处的位置信息来自 service 的最新状态快照；已勾选的磁盘可能尚未完成扫描。",
+                        tokens,
+                    ))
+                    .child({
+                        // The live label, not the configured drives: this is a
+                        // report of what the index actually covers.
+                        let raw = self.session.read(cx).status_raw.clone();
+                        let label =
+                            crate::status_logic::indexed_locations_label(&raw);
+                        div()
+                            .id("indexed-locations-row")
+                            .w_full()
+                            .h(px(24.))
+                            .text_sm()
+                            .text_color(tokens.text_secondary)
+                            .child(match label {
+                                Some(l) => l,
+                                None => "暂无已索引位置".into(),
+                            })
+                    }),
             )
             .child(
                 settings_card(tokens)

@@ -140,6 +140,50 @@ pub fn summarize_status(resp: &IpcResponse, enable_metadata_backfill: bool) -> I
 
 /// try_index_store lock contention returns zeros with loading=true and no stage.
 /// That is not a real reload and must not flip the status bar or Usage layout.
+/// 已索引位置表示：按位掩码 + 旧版 `volume_letter` 合并（bit 0 = A:）。
+/// 老 service 未上报时返回空数组，由调用方决定如何降级。
+pub fn drive_letters(mask: u32, legacy_letter: Option<char>) -> Vec<char> {
+    let mut out: Vec<char> = (0..26u32)
+        .filter(|bit| mask & (1 << bit) != 0)
+        .map(|bit| (b'A' + bit as u8) as char)
+        .collect();
+    if let Some(c) = legacy_letter {
+        let up = c.to_ascii_uppercase();
+        if up.is_ascii_uppercase() && !out.contains(&up) {
+            out.push(up);
+        }
+    }
+    out
+}
+
+/// 从 service 返回的状态 JSON 里提取已索引位置；解析失败返回空。
+pub fn indexed_letters_from_status_json(raw: &str) -> Vec<char> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let mask = v.get("indexed_drive_mask").and_then(|m| m.as_u64()).unwrap_or(0) as u32;
+    let legacy = v
+        .get("volume_letter")
+        .and_then(|l| l.as_str())
+        .and_then(|s| s.chars().next());
+    drive_letters(mask, legacy)
+}
+
+/// 「C: · D:」形式的位置摘要；没有任何位置时返回 `None`。
+pub fn indexed_locations_label(raw: &str) -> Option<String> {
+    let letters = indexed_letters_from_status_json(raw);
+    if letters.is_empty() {
+        return None;
+    }
+    Some(
+        letters
+            .iter()
+            .map(|c| format!("{c}:"))
+            .collect::<Vec<_>>()
+            .join(" · "),
+    )
+}
+
 pub fn is_non_authoritative_status(resp: &IpcResponse) -> bool {
     match resp {
         IpcResponse::StatusResult {
@@ -214,6 +258,31 @@ pub fn disconnected_status(message: &str) -> IndexStatusView {
 mod tests {
     use super::*;
     use findx2_ipc::IpcResponse;
+
+    #[test]
+    fn drive_letters_merges_mask_and_legacy_letter_without_dups() {
+        assert_eq!(drive_letters(0b11, None), vec!['A', 'B']);
+        // A: bit plus legacy volume_letter must not duplicate.
+        assert_eq!(drive_letters(1, Some('A')), vec!['A']);
+        assert_eq!(drive_letters(0, Some('e')), vec!['E']);
+        assert_eq!(drive_letters(0, Some('-')), Vec::<char>::new());
+        // 26 bits is the Windows drive space; extra bits are ignored.
+        assert_eq!(drive_letters(1 << 27, None), Vec::<char>::new());
+    }
+
+    #[test]
+    fn indexed_letters_from_status_json_degrades_on_old_services() {
+        assert!(indexed_letters_from_status_json("not json").is_empty());
+        assert!(indexed_letters_from_status_json("{}").is_empty());
+        // 33 = bits 0 (A) and 5 (F); legacy 'C' adds a third, dedup-free.
+        let new = r#"{"type":"status_result","indexed_drive_mask":33,"volume_letter":"C"}"#;
+        assert_eq!(indexed_letters_from_status_json(new), vec!['A', 'F', 'C']);
+        assert_eq!(
+            indexed_locations_label(new).as_deref(),
+            Some("A: · F: · C:")
+        );
+        assert!(indexed_locations_label("{}").is_none());
+    }
 
     #[test]
     fn stopped_service_is_distinct_from_a_generic_disconnect() {
