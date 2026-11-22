@@ -27,6 +27,8 @@ pub const AUTO_CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const NOTES_LIMIT: usize = 600;
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(200);
 const MIN_SETUP_BYTES: u64 = 1024 * 1024;
+/// Release asset carrying sha256sum lines for the other assets.
+const CHECKSUM_ASSET_NAME: &str = "SHA256SUMS";
 
 /// Official update asset platform. Tests pass this explicitly so Linux CI can
 /// still assert Windows asset picking, and vice versa.
@@ -135,6 +137,9 @@ pub struct UpdateInfo {
     pub has_update: bool,
     pub download_url: Option<String>,
     pub asset_size: Option<u64>,
+    /// Browser URL of the release's `SHA256SUMS` asset, when present. Download
+    /// verifies the installer against this before handing it to the installer.
+    pub checksum_url: Option<String>,
     pub release_notes: Option<String>,
     pub release_page_url: Option<String>,
 }
@@ -149,6 +154,7 @@ impl UpdateInfo {
             has_update: false,
             download_url: None,
             asset_size: None,
+            checksum_url: None,
             release_notes: None,
             release_page_url: None,
         }
@@ -540,6 +546,7 @@ fn error_info(current_version: &str, error: String) -> UpdateInfo {
         has_update: false,
         download_url: None,
         asset_size: None,
+        checksum_url: None,
         release_notes: None,
         release_page_url: None,
     }
@@ -584,6 +591,7 @@ pub fn evaluate_latest_release_for(
             has_update: false,
             download_url: None,
             asset_size: None,
+            checksum_url: None,
             release_notes: None,
             release_page_url: Some(format!(
                 "https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases"
@@ -625,6 +633,7 @@ pub fn evaluate_latest_release_for(
                 has_update: false,
                 download_url: None,
                 asset_size: None,
+                checksum_url: find_checksum_asset_url(&gh.assets),
                 release_notes: truncate_notes(&gh.body),
                 release_page_url: Some(gh.html_url),
             };
@@ -654,6 +663,11 @@ pub fn evaluate_latest_release_for(
         },
         asset_size: if has_update {
             setup.map(|a| a.size)
+        } else {
+            None
+        },
+        checksum_url: if has_update {
+            find_checksum_asset_url(&gh.assets)
         } else {
             None
         },
@@ -706,6 +720,131 @@ pub fn validate_official_asset_url(url: &str, platform: UpdatePlatform) -> Resul
     Ok(asset_name)
 }
 
+/// Whether an asset is the release's checksum manifest. Accepts the plain
+/// name and a `.txt` suffix, case-insensitively.
+pub fn is_checksum_asset_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == CHECKSUM_ASSET_NAME.to_ascii_lowercase()
+        || n == format!("{}.txt", CHECKSUM_ASSET_NAME.to_ascii_lowercase())
+}
+
+/// Locate the checksum manifest among release assets.
+pub fn find_checksum_asset_url(assets: &[GhAsset]) -> Option<String> {
+    assets
+        .iter()
+        .find(|a| is_checksum_asset_name(&a.name))
+        .map(|a| a.browser_download_url.clone())
+}
+
+/// Only accept a checksum manifest served from the official release path.
+/// Reusing the installer's URL rules would reject it (it is not an installer),
+/// so the path/tag checks here mirror those rules for this one fixed filename.
+pub fn validate_checksums_url(url: &str) -> Result<String, String> {
+    let url = url.trim();
+    if !url.starts_with("https://") {
+        return Err("校验和下载地址不是 https 链接，已拒绝。".into());
+    }
+    let release_path = url
+        .strip_prefix("https://github.com/chaojimct/findx/releases/download/")
+        .ok_or("校验和下载地址不属于官方 FindX 发行仓库")?;
+    let (tag, file) = release_path.split_once('/').ok_or("校验和路径无效")?;
+    if tag.is_empty()
+        || file.contains('/')
+        || semver::Version::parse(tag.trim_start_matches('v')).is_err()
+        || !is_checksum_asset_name(file)
+    {
+        return Err("校验和标签/文件名无效".into());
+    }
+    Ok(file.to_string())
+}
+
+/// Extract the expected hex digest for `asset_name` from a sha256sum manifest.
+///
+/// Standard `sha256sum` output is `<64 hex>  <name>` (two spaces) or
+/// `<64 hex> *<name>` (binary marker); the name may be prefixed with `./`.
+/// Matching is on the basename, case-insensitively. Anything that is not a
+/// well-formed 64-hex digest is ignored, so a malformed manifest is treated
+/// as "no checksum available" rather than as a match.
+pub fn parse_sha256sums(text: &str, asset_name: &str) -> Option<String> {
+    let wanted = asset_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(asset_name)
+        .to_ascii_lowercase();
+    for line in text.lines() {
+        let line = line.trim().trim_start_matches('\u{feff}');
+        // Split on the first run of whitespace after the digest.
+        let Some(split) = line.find(char::is_whitespace) else {
+            continue;
+        };
+        let (hash, rest) = line.split_at(split);
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let name = rest
+            .trim_start_matches(char::is_whitespace)
+            .trim_start_matches('*')
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if name == wanted {
+            return Some(hash.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+/// SHA-256 over a byte slice, returned as lowercase hex.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let out = hasher.finalize();
+    let mut s = String::with_capacity(out.len() * 2);
+    for byte in out.iter() {
+        s.push_str(&format!("{byte:02x}"));
+    }
+    s
+}
+
+/// Streamed SHA-256 over a file, so a large installer is never held in memory.
+pub fn sha256_file(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let out = hasher.finalize();
+    let mut s = String::with_capacity(out.len() * 2);
+    for byte in out.iter() {
+        s.push_str(&format!("{byte:02x}"));
+    }
+    Ok(s)
+}
+
+/// Fetch the manifest and return the expected digest for one asset.
+fn fetch_expected_sha256(checksum_url: &str, asset_name: &str) -> Result<String, String> {
+    validate_checksums_url(checksum_url)?;
+    let resp = ureq::get(checksum_url)
+        .set("User-Agent", USER_AGENT_CHECK)
+        .call()
+        .map_err(|e| format!("请求校验和清单失败：{e}"))?;
+    if !(200..300).contains(&resp.status()) {
+        return Err(format!("校验和清单返回 HTTP {}", resp.status()));
+    }
+    let text = resp.into_string().map_err(|e| e.to_string())?;
+    parse_sha256sums(&text, asset_name).ok_or_else(|| {
+        format!("校验和清单里没有安装包 {asset_name} 的记录，拒绝安装。")
+    })
+}
+
 pub fn download_dest_path(asset_name: &str) -> PathBuf {
     std::env::temp_dir()
         .join(format!(
@@ -722,6 +861,7 @@ pub fn download_dest_path(asset_name: &str) -> PathBuf {
 pub fn download_official_setup(
     url: &str,
     expected_size: Option<u64>,
+    checksum_url: Option<&str>,
     mut on_progress: impl FnMut(UpdateProgress),
 ) -> Result<PathBuf, String> {
     let asset_name = validate_setup_download_url(url)?;
@@ -793,6 +933,26 @@ pub fn download_official_setup(
         return Err(format!(
             "下载数据不完整（{downloaded}/{total} B），已删除临时文件。"
         ));
+    }
+    // Size alone is not integrity. When the release published a checksum
+    // manifest, verify the bytes we actually wrote before the installer is
+    // ever allowed to run. A missing/malformed manifest or a mismatch is a
+    // hard failure and the temp file is removed.
+    if let Some(url) = checksum_url {
+        let expected = match fetch_expected_sha256(url, &asset_name) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = std::fs::remove_file(&dest);
+                return Err(e);
+            }
+        };
+        let actual = sha256_file(&dest)?;
+        if !actual.eq_ignore_ascii_case(&expected) {
+            let _ = std::fs::remove_file(&dest);
+            return Err(format!(
+                "安装包校验和不匹配（期望 {expected}，实际 {actual}），已删除临时文件，拒绝安装。"
+            ));
+        }
     }
     on_progress(UpdateProgress {
         downloaded,
@@ -1180,6 +1340,115 @@ fn start_silent_setup_windows(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_hex_matches_known_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn parse_sha256sums_handles_real_formats_and_skips_garbage() {
+        let sums = concat!(
+            "# a comment line with spaces\n",
+            "not-a-hash  FindX-2.5.10-setup.exe\n",
+            " BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD  ",
+            "./FindX-2.5.10-setup.exe\n",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 *FindX-2.5.10-linux-x64.deb\n",
+        );
+        assert_eq!(
+            parse_sha256sums(sums, "FindX-2.5.10-setup.exe").as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        assert_eq!(
+            parse_sha256sums(sums, "other/FindX-2.5.10-linux-x64.deb").as_deref(),
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+        // Basename matching is case-insensitive; missing names yield None.
+        assert!(parse_sha256sums(sums, "FINDX-2.5.10-SETUP.EXE").is_some());
+        assert!(parse_sha256sums(sums, "FindX-2.5.10-mac.dmg").is_none());
+        assert!(parse_sha256sums("", "anything").is_none());
+    }
+
+    #[test]
+    fn checksum_asset_is_recognised_and_url_is_validated() {
+        assert!(is_checksum_asset_name("SHA256SUMS"));
+        assert!(is_checksum_asset_name("sha256sums.txt"));
+        assert!(!is_checksum_asset_name("FindX-2.5.10-setup.exe"));
+
+        let assets = [
+            GhAsset {
+                name: "FindX-2.5.10-setup.exe".into(),
+                browser_download_url: "https://github.com/chaojimct/findx/releases/download/v2.5.10/FindX-2.5.10-setup.exe".into(),
+                size: 1,
+            },
+            GhAsset {
+                name: "SHA256SUMS".into(),
+                browser_download_url: "https://github.com/chaojimct/findx/releases/download/v2.5.10/SHA256SUMS".into(),
+                size: 1,
+            },
+        ];
+        assert_eq!(
+            find_checksum_asset_url(&assets).as_deref(),
+            Some("https://github.com/chaojimct/findx/releases/download/v2.5.10/SHA256SUMS")
+        );
+        assert!(find_checksum_asset_url(&assets[..1]).is_none());
+
+        assert!(validate_checksums_url(
+            "https://github.com/chaojimct/findx/releases/download/v2.5.10/SHA256SUMS"
+        )
+        .is_ok());
+        assert!(validate_checksums_url(
+            "http://github.com/chaojimct/findx/releases/download/v2.5.10/SHA256SUMS"
+        )
+        .is_err());
+        assert!(validate_checksums_url("https://evil.example/SHA256SUMS").is_err());
+        assert!(validate_checksums_url(
+            "https://github.com/chaojimct/findx/releases/download/v2.5.10/FindX-2.5.10-setup.exe"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn release_evaluation_carries_checksum_url_for_updates_only() {
+        let sums = "https://github.com/chaojimct/findx/releases/download/v2.5.10/SHA256SUMS";
+        let setup = "https://github.com/chaojimct/findx/releases/download/v2.5.10/FindX-2.5.10-setup.exe";
+        let body = sample_release(
+            "v2.5.10",
+            &[
+                ("FindX-2.5.10-setup.exe", setup, 42),
+                ("SHA256SUMS", sums, 100),
+            ],
+            false,
+            false,
+        );
+        let info = evaluate_latest_release_for(
+            "2.5.2",
+            200,
+            &body,
+            UpdatePlatform::Windows,
+            LinuxPackageFormat::Unknown,
+        );
+        assert!(info.has_update);
+        assert_eq!(info.checksum_url.as_deref(), Some(sums));
+
+        // No update → no checksum URL (nothing will be downloaded).
+        let current = evaluate_latest_release_for(
+            "2.5.10",
+            200,
+            &body,
+            UpdatePlatform::Windows,
+            LinuxPackageFormat::Unknown,
+        );
+        assert!(!current.has_update);
+        assert!(current.checksum_url.is_none());
+    }
 
     fn sample_release(tag: &str, assets: &[(&str, &str, u64)], draft: bool, pre: bool) -> String {
         let assets_json: Vec<String> = assets

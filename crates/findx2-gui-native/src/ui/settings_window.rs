@@ -1405,6 +1405,13 @@ impl SettingsWindow {
             .info
             .as_ref()
             .and_then(|i| i.asset_size);
+        let checksum_url = self
+            .session
+            .read(cx)
+            .update_state
+            .info
+            .as_ref()
+            .and_then(|i| i.checksum_url.clone());
         self.session.update(cx, |session, cx| {
             session.update_state.busy = true;
             session.update_state.progress = Some(crate::update_logic::UpdateProgress {
@@ -1417,9 +1424,14 @@ impl SettingsWindow {
         let (tx, rx) = std::sync::mpsc::channel();
         cx.spawn(async move |this, cx| {
             let worker = std::thread::spawn(move || {
-                crate::update_logic::download_official_setup(&url, expected, |progress| {
-                    let _ = tx.send(progress);
-                })
+                crate::update_logic::download_official_setup(
+                    &url,
+                    expected,
+                    checksum_url.as_deref(),
+                    |progress| {
+                        let _ = tx.send(progress);
+                    },
+                )
             });
             loop {
                 while let Ok(progress) = rx.try_recv() {
