@@ -173,6 +173,13 @@ pub enum IpcResponse {
         /// 阈值约定见 `IndexStore::should_compact`（≥10 万条目且墓碑比 >25%）。
         #[serde(default)]
         tombstone_count: Option<u64>,
+        /// WAL 未折叠字节数（0 = 无堆积或旧版 service）。GUI 健康条用它回答
+        /// “后台在写什么”：心跳只 append KB 级；持续涨到 fold 阈值才触发整段拷贝。
+        #[serde(default)]
+        wal_bytes: u64,
+        /// 距上次成功 fold 的秒数（`None` = 本进程尚未 fold 或旧版 service）。
+        #[serde(default)]
+        last_fold_secs_ago: Option<u64>,
         /// Bit 0 is A:. Old peers omit it; the host then falls back to `volume_letter`.
         #[serde(default)]
         indexed_drive_mask: u32,

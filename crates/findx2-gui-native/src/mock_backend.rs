@@ -154,6 +154,8 @@ fn handle_request(req: IpcRequest) -> IpcResponse {
             backfill_error: None,
             tombstone_count: Some(0),
             indexed_drive_mask: 0,
+            wal_bytes: 0,
+            last_fold_secs_ago: None,
         },
         IpcRequest::Search {
             query,

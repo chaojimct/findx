@@ -317,6 +317,7 @@ pub(crate) fn run_foreground(
     // v6 优先（增量分段文件）；v5 老库或 v6 损坏时回退 v5 并重建 v6（自愈，一次性全量写）。
     // v5 回退路径保留上游的 load_state 进度上报（千万级库加载要几十秒，Status 不能静默）。
     let v6 = V6Layout::for_index(&index);
+    crate::run::note_index_layout_dir(v6.dir.clone());
     let mut store = match v6_load(&v6) {
         Ok(s) => {
             load_state::note_entry_count(s.entry_count() as u64);
@@ -1433,8 +1434,7 @@ fn replay_wal_at_boot(layout: &V6Layout, store: &mut findx2_core::IndexStore) {
     }
 }
 
-/// Best-effort shutdown persist that does NOT require lifecycle admission.
-/// During STOP the admission gate is closed (stop_ingress), so the normal
+/// Best-effort shutdown persist that does NOT require lifecycle admission./// During STOP the admission gate is closed (stop_ingress), so the normal
 /// `persist_index` path would always refuse; and producers still running
 /// (backfill, trigram rebuild) keep appending after the batch is taken —
 /// their deltas replay from the USN journal next start. The writer lock
@@ -1553,6 +1553,31 @@ fn commit_clock_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Index layout dir captured at boot so the status IPC can report WAL
+/// depth without threading the path through every pipe handler.
+fn index_layout_dir() -> &'static std::sync::Mutex<Option<std::path::PathBuf>> {
+    static DIR: std::sync::OnceLock<std::sync::Mutex<Option<std::path::PathBuf>>> = std::sync::OnceLock::new();
+    DIR.get_or_init(Default::default)
+}
+
+pub(crate) fn note_index_layout_dir(dir: std::path::PathBuf) {
+    *index_layout_dir().lock().unwrap_or_else(|e| e.into_inner()) = Some(dir);
+}
+
+/// (WAL bytes pending fold, seconds since last successful fold or None).
+/// Best-effort: I/O errors report 0 rather than failing the status query.
+pub(crate) fn persistence_health_snapshot() -> (u64, Option<u64>) {
+    let wal_bytes = index_layout_dir()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|dir| findx2_core::wal_file_len(dir))
+        .unwrap_or(0);
+    let age_ms = commit_clock_ms().saturating_sub(last_fold_ms().load(Ordering::Relaxed));
+    let fold_age = (last_fold_ms().load(Ordering::Relaxed) != 0).then_some(age_ms / 1000);
+    (wal_bytes, fold_age)
 }
 #[cfg(test)]
 pub(crate) fn reset_fold_clock() {

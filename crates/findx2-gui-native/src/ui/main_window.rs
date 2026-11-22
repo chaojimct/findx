@@ -2522,17 +2522,44 @@ impl MainWindow {
             )
             .when(self.workspace.mode == ViewMode::Search, |v| {
                 let detail = footer.counts_tooltip();
+                let wal = footer.wal_label();
+                let tip = match &wal {
+                    Some(_) => format!("{detail}\n{}", footer.wal_tooltip()),
+                    None => detail.clone(),
+                };
                 v.child(
-                    div()
-                        .id("footer-index-counts")
-                        .w(px(216.)).text_ellipsis().whitespace_nowrap()
+                    h_flex()
+                        .id("footer-index-health")
+                        .items_center()
+                        .gap_2()
                         .flex_shrink_0()
+                        .overflow_hidden()
                         .text_xs()
+                        .whitespace_nowrap()
                         .tooltip(move |window, cx| {
-                            gpui_kit::component::tooltip::Tooltip::new(detail.clone())
-                                .build(window, cx)
+                            gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
                         })
-                        .child(footer.counts_label()),
+                        .child(
+                            div()
+                                .id("footer-index-counts")
+                                .w(px(216.))
+                                .flex_shrink_0()
+                                .text_ellipsis()
+                                .overflow_hidden()
+                                .child(footer.counts_label()),
+                        )
+                        .when_some(wal, |v, label| {
+                            v.child(
+                                div()
+                                    .id("footer-wal-health")
+                                    .w(px(148.))
+                                    .flex_shrink_0()
+                                    .text_ellipsis()
+                                    .overflow_hidden()
+                                    .opacity(0.85)
+                                    .child(label),
+                            )
+                        }),
                 )
             })
             .when(self.workspace.mode == ViewMode::Search, |v| {

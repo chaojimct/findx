@@ -19,6 +19,8 @@ fn shared_footer_async_polls_cannot_insert_activity_button() {
     assert!(footer.contains(".disabled(!self.workspace.scanning)"));
     assert!(footer.contains(".w(px(216.))"));
     assert!(footer.contains(".w(px(156.))"));
+    // WAL 健康段自带定宽，出现/消失不得挤动左侧统计与右侧状态按钮。
+    assert!(footer.contains(".w(px(148.))"));
     // The true engine warning is retained, not hidden by this layout correction.
     assert!(footer.contains("footer.warning()")); assert!(footer.contains("footer.tooltip()"));
 }

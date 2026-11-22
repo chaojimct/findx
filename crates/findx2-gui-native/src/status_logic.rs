@@ -249,6 +249,8 @@ mod tests {
             backfill_error: None,
             tombstone_count: None,
             indexed_drive_mask: 0,
+            wal_bytes: 0,
+            last_fold_secs_ago: None,
         };
         let v = summarize_status(&resp, true);
         assert_eq!(v.summary, "索引 1,234,567 项");
@@ -276,6 +278,8 @@ mod tests {
             backfill_error: None,
             tombstone_count: None,
             indexed_drive_mask: 0,
+            wal_bytes: 0,
+            last_fold_secs_ago: None,
         };
         let v = summarize_status(&resp, true);
         assert_eq!(v.summary, "索引加载中");
@@ -312,6 +316,8 @@ mod tests {
             backfill_error: None,
             tombstone_count: Some(1),
             indexed_drive_mask: 0,
+            wal_bytes: 0,
+            last_fold_secs_ago: None,
         };
         let prev = summarize_status(&ready, true);
         let contention = IpcResponse::StatusResult {
@@ -333,6 +339,8 @@ mod tests {
             backfill_error: None,
             tombstone_count: None,
             indexed_drive_mask: 0,
+            wal_bytes: 0,
+            last_fold_secs_ago: None,
         };
         let kept = apply_status(Some(&prev), &contention, true);
         assert_eq!(kept, prev);

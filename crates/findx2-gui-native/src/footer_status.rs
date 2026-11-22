@@ -10,6 +10,10 @@ pub struct Snapshot {
     pub watching: bool,
     pub watch_error: Option<String>,
     pub metadata_error: Option<String>,
+    /// WAL 未折叠字节数（0 = 无堆积或旧版 service）。
+    pub wal_bytes: u64,
+    /// 距上次成功 fold 的秒数（None = 本进程尚未 fold 或旧版 service）。
+    pub last_fold_secs_ago: Option<u64>,
 }
 #[derive(Clone, Debug, Default)]
 pub struct EngineFooter {
@@ -29,6 +33,30 @@ pub fn grouped(n: u64) -> String {
         out.push(c)
     }
     out
+}
+
+/// 紧凑字节数（状态栏用）：`0B` / `12.3KB` / `4.5MB`。
+pub fn format_bytes_cn(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    if n < KB {
+        format!("{n}B")
+    } else if n < MB {
+        format!("{:.1}KB", n as f64 / KB as f64)
+    } else {
+        format!("{:.1}MB", n as f64 / MB as f64)
+    }
+}
+
+/// 相对时间（状态栏用）：`刚刚` / `N分钟前` / `N小时前`。
+pub fn format_ago_cn(secs: u64) -> String {
+    if secs < 60 {
+        "刚刚".to_string()
+    } else if secs < 3600 {
+        format!("{}分钟前", secs / 60)
+    } else {
+        format!("{}小时前", secs / 3600)
+    }
 }
 impl EngineFooter {
     pub fn set_source(&mut self, endpoint: &str) {
@@ -55,6 +83,8 @@ impl EngineFooter {
                 journal_id,
                 watch_error,
                 backfill_error,
+                wal_bytes,
+                last_fold_secs_ago,
                 ..
             }) => {
                 self.connected = true;
@@ -70,6 +100,8 @@ impl EngineFooter {
                     watching: *last_usn > 0 && *journal_id > 0,
                     watch_error: watch_error.clone(),
                     metadata_error: backfill_error.clone(),
+                    wal_bytes: *wal_bytes,
+                    last_fold_secs_ago: *last_fold_secs_ago,
                 });
             }
             Ok(IpcResponse::Error { message }) => {
@@ -161,6 +193,29 @@ impl EngineFooter {
         format!(
             "{freshness}总项数包含文件和目录，已扣除删除项；当前服务尚不能准确拆分文件数和目录数。"
         )
+    }
+
+    /// WAL 健康段（Argus vitals band 的 FindX 版）：回答“后台在写什么”。
+    /// `None` = 老版 service（未上报）或 WAL 为空且从未 fold —— 此时不显示，
+    /// 状态栏保持原样。
+    pub fn wal_label(&self) -> Option<String> {
+        let s = self.last.as_ref()?;
+        if !self.connected || self.error.is_some() {
+            return None;
+        }
+        let fold = match s.last_fold_secs_ago {
+            None if s.wal_bytes == 0 => return None,
+            None => "fold 未发生".to_string(),
+            Some(secs) => format!("fold {}", format_ago_cn(secs)),
+        };
+        Some(format!("WAL {} · {fold}", format_bytes_cn(s.wal_bytes)))
+    }
+
+    pub fn wal_tooltip(&self) -> String {
+        "WAL（write-ahead log）攒改动，心跳每 5 秒 fsync 一次（KB 级）；\
+        攒到 256MB / 2 小时 / 100 万条日志才做一次全量整段拷贝（fold）。\
+        磁盘写入常态应接近 0；若 fold 频繁发生，说明有大批量变更或阈值被调低。"
+            .to_string()
     }
     pub fn tooltip(&self) -> String {
         if !self.connected {
@@ -292,6 +347,34 @@ mod tests {
         assert!(!f.counts_label().contains("C:"));
         assert!(f.counts_tooltip().contains("文件和目录"));
     }
+
+    #[test]
+    fn wal_label_hidden_for_legacy_engines_without_wal() {
+        let mut f = EngineFooter::default();
+        f.observe(&Ok(status(500, 80)));
+        assert_eq!(f.wal_label(), None);
+        assert!(f.wal_tooltip().contains("fold"));
+    }
+
+    #[test]
+    fn wal_label_shows_bytes_and_fold_age() {
+        assert_eq!(format_bytes_cn(0), "0B");
+        assert_eq!(format_bytes_cn(512), "512B");
+        assert_eq!(format_bytes_cn(2048), "2.0KB");
+        assert_eq!(format_bytes_cn(3_145_728), "3.0MB");
+        assert_eq!(format_ago_cn(5), "刚刚");
+        assert_eq!(format_ago_cn(125), "2分钟前");
+        assert_eq!(format_ago_cn(7200), "2小时前");
+        let mut f = EngineFooter::default();
+        let mut s = status(500, 80);
+        if let IpcResponse::StatusResult { wal_bytes, last_fold_secs_ago, .. } = &mut s {
+            *wal_bytes = 3_145_728;
+            *last_fold_secs_ago = Some(125);
+        }
+        f.observe(&Ok(s));
+        assert_eq!(f.wal_label().as_deref(), Some("WAL 3.0MB · fold 2分钟前"));
+    }
+
     #[test]
     fn natural_change_fixture_create_delete_rename_is_visible() {
         let mut f = EngineFooter::default();

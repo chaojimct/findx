@@ -120,6 +120,8 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                 backfill_error: None,
                 tombstone_count: None,
                 indexed_drive_mask: 0,
+                wal_bytes: 0,
+                last_fold_secs_ago: None,
             }
         }
         (IpcRequest::Search { .. }, None) => IpcResponse::Error {
@@ -168,6 +170,7 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                         tombstone_count: g.deleted.len() as u64,
                         drive_mask,
                     });
+                    let (wal_bytes, last_fold_secs_ago) = crate::run::persistence_health_snapshot();
                     IpcResponse::StatusResult {
                         entry_count: g.entry_count() as u64,
                         dir_count: g.dirs.len() as u64,
@@ -192,6 +195,8 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                         },
                         tombstone_count: Some(g.deleted.len() as u64),
                         indexed_drive_mask: drive_mask,
+                        wal_bytes,
+                        last_fold_secs_ago,
                     }
                 }
                 None => {
@@ -203,6 +208,8 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                         watch_error.is_none(),
                     );
                     let l = crate::load_state::snapshot();
+                    // WAL depth doesn't need the store lock; report it even on the fallback path.
+                    let (wal_bytes, last_fold_secs_ago) = crate::run::persistence_health_snapshot();
                     IpcResponse::StatusResult {
                         entry_count: locked.entry_count,
                         dir_count: locked.dir_count,
@@ -222,6 +229,8 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                         backfill_error,
                         tombstone_count: locked.tombstone_count,
                         indexed_drive_mask: locked.drive_mask,
+                        wal_bytes,
+                        last_fold_secs_ago,
                     }
                 }
             }
