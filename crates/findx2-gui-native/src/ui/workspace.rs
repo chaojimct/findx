@@ -17,6 +17,7 @@ use crate::{
 };
 use gpui_kit::base::InteractiveElementExt as _;
 use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::AnimationExt as _;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -24,6 +25,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 pub(super) const DIRECTORY_SIDEBAR_WIDTH: f32 = 184.;
@@ -2883,12 +2885,33 @@ impl MainWindow {
                         let active = self.settings_page.is_none() && self.workspace.mode == mode;
                         div()
                             .h_full()
+                            .relative()
                             .border_b_2()
-                            .border_color(if active {
-                                tokens.accent
-                            } else {
-                                tokens.surface
-                            })
+                            .border_color(tokens.surface)
+                            .child(
+                                // Animated active indicator: crossfades in/out on
+                                // mode switch (each button animates its own bar,
+                                // so no geometry measurement is needed and a
+                                // mid-transition re-switch restarts cleanly).
+                                div()
+                                    .absolute()
+                                    .bottom(px(0.))
+                                    .left(px(0.))
+                                    .right(px(0.))
+                                    .h(px(2.))
+                                    .bg(tokens.accent)
+                                    .with_animation(
+                                        gpui_kit::ElementId::named_usize(
+                                            "mode-ind",
+                                            (mode as u8 as usize) * 2 + usize::from(active),
+                                        ),
+                                        gpui_kit::Animation::new(Duration::from_millis(200))
+                                            .with_easing(crate::ui::motion::ease_out_cubic),
+                                        move |el, delta| {
+                                            el.opacity(if active { delta } else { 1.0 - delta })
+                                        },
+                                    ),
+                            )
                             .child(
                                 Button::new(SharedString::from(format!("mode-{label}")))
                                     .ghost()
