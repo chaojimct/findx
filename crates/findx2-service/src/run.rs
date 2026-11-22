@@ -231,6 +231,21 @@ pub(crate) fn run_foreground(
     // Different pipe names cannot open the same index in another new-engine process.
     let _index_owner=acquire_index_owner(&index)?;
 
+    // Crash tracer: a panic in a service process otherwise vanishes (SCM only
+    // reports "terminated unexpectedly"). Leave the payload + location in the
+    // service log so the next boot explains the last death.
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info.payload();
+        let text = payload.downcast_ref::<String>().cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_else(|| "unknown panic payload".to_string());
+        let mut msg = format!("PANIC: {text}");
+        if let Some(loc) = info.location() {
+            msg.push_str(&format!(" @ {}:{}", loc.file(), loc.line()));
+        }
+        crate::win_service::append_service_log(&msg);
+    }));
+
     // 关键：管道在 load_index_bin 之前就开起来。
     // 大索引（千万级）反序列化要十几秒甚至几十秒，旧顺序下 GUI / IPC 会一直撞「管道超时」。
     // 现在改为：先挂 EngineSlot（None）→ 起 pipe 线程 → 加载索引 → 注入 Some(engine)。
@@ -1321,11 +1336,28 @@ fn persist_shutdown_checkpoint(engine: &SearchEngine, path: &Path) -> anyhow::Re
 /// the USN journal regenerates the window (idempotent), backfill re-stats
 /// it. A crash loses nothing committed; worst case it redoes the window.
 fn replay_wal_at_boot(layout: &V6Layout, store: &mut findx2_core::IndexStore) {
-    let from_seq = findx2_core::read_published(layout)
+    let manifest_seq = findx2_core::read_published(layout)
         .ok()
         .flatten()
-        .map(|ptr| ptr.manifest.wal_seq.saturating_add(1))
+        .map(|ptr| ptr.manifest.wal_seq)
         .unwrap_or(0);
+    // Seq regression guard: seqs are file-local but the manifest watermark
+    // is global. If the file was ever emptied (old retain) and seqs
+    // restarted, new frames fall below the watermark and a plain
+    // `wal_seq+1` filter would skip them all. Fall back to replay-from-0;
+    // the pre-length guard arbitrates (stops at the first gap instead of
+    // double-applying). Current retain keeps a tip anchor, so this path
+    // only triggers on pre-anchor WALs.
+    let file_tip = findx2_core::wal_current_tip(&layout.dir);
+    let from_seq = if file_tip < manifest_seq && findx2_core::wal_file_len(&layout.dir) > 0 {
+        tracing::warn!(file_tip, manifest_seq, "WAL seq regression: replaying from 0, pre-chain arbitrates");
+        crate::win_service::append_service_log(&format!(
+            "WAL seq regression (tip {file_tip} < gen {manifest_seq}): replaying from 0"
+        ));
+        0
+    } else {
+        manifest_seq.saturating_add(1)
+    };
     let frames = match findx2_core::wal_read_from(&layout.dir, from_seq) {
         Ok(findx2_core::WalRead::Frames { frames, truncated_tail }) => {
             if truncated_tail {

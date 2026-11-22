@@ -720,16 +720,27 @@ fn read_frame_at(buf: &[u8], off: usize) -> Result<(WalFrame, usize), String> {
 
 /// Drop all frames with `seq < keep_from` by rewriting the file. Called
 /// after a generation covering those frames is published.
+///
+/// Never empties a non-empty file: the newest frame is always retained as a
+/// tip anchor. Otherwise a later process restart would rescan an empty file,
+/// restart seqs from 1, and all new frames would fall BELOW the manifest's
+/// global coverage watermark -- invisible to recovery. (Seqs are file-local;
+/// the watermark is global. The anchor keeps them comparable. The anchor
+/// frame itself is skipped by seq filter on recovery.)
 pub fn wal_retain_from(layout_dir: &Path, keep_from: u64) -> Result<(), String> {
     let path = wal_path(layout_dir);
-    if keep_from <= 1 || !path.is_file() {
-        if keep_from > 1 && path.is_file() {
-            // Fall through to rewrite (possibly to empty).
+    if !path.is_file() {
+        return Ok(());
+    }
+    let WalRead::Frames { mut frames, .. } = wal_read_from(layout_dir, keep_from)?;
+    if frames.is_empty() {
+        let WalRead::Frames { frames: all, .. } = wal_read_from(layout_dir, 1)?;
+        if let Some(newest) = all.into_iter().next_back() {
+            frames.push(newest);
         } else {
             return Ok(());
         }
     }
-    let WalRead::Frames { frames, .. } = wal_read_from(layout_dir, keep_from)?;
     let dir = layout_dir.join(WAL_DIR);
     let tmp = dir.join("wal.compact.tmp");
     {
@@ -1056,6 +1067,31 @@ mod tests {
     }
 
     #[test]
+    fn retain_never_empties_the_file_tip_anchor_survives_restarts() {
+        // Regression: retain used to rewrite an empty file when everything
+        // was folded. The next process then rescanned tip=0, restarted seqs
+        // from 1, and all new frames fell below the manifest's global
+        // coverage watermark -- invisible to recovery, silently lost on crash.
+        let dir = scratch("anchor");
+        let mut b1 = sample_batch();
+        let mut b2 = sample_batch();
+        wal_append(&dir, &mut b1).unwrap();
+        wal_append(&dir, &mut b2).unwrap();
+        // Fold everything: retain drops folded frames but keeps the tip.
+        wal_retain_from(&dir, 3).unwrap();
+        let WalRead::Frames { frames, .. } = wal_read_from(&dir, 1).unwrap();
+        assert_eq!(frames.len(), 1, "tip anchor retained");
+        assert_eq!(frames[0].seq, 2);
+        // A fresh tip init (new process) must continue from the anchor,
+        // not restart at 1.
+        wal_tips().lock().unwrap().remove(&wal_path(&dir));
+        let mut b3 = sample_batch();
+        let s3 = wal_append(&dir, &mut b3).unwrap();
+        assert_eq!(s3, 3, "seqs stay comparable to the manifest watermark");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn replay_matches_live_store_exactly() {
         use crate::index::IndexBuilder;
         use crate::RawEntry;
@@ -1158,6 +1194,168 @@ mod tests {
         assert!(out2.stopped_early);
         assert!(out2.stop_reason.contains("length gap") || out2.stop_reason.contains("FullResync"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Offline crash-recovery rehearsal on REAL data: load the published gen
+    /// and replay EVERYTHING in the WAL (ignoring coverage), verifying the
+    /// pre-chain accepts a prefix and stops exactly where it must.
+    /// This is what a kill -9 + reboot would do, minus the kill.
+    #[test]
+    #[ignore]
+    fn probe_prod_replay_all() {
+        let layout = crate::V6Layout::for_index(std::path::Path::new(r"C:\ProgramData\FindX\index.bin"));
+        let mut store = crate::persist_tx::load_current(&layout).expect("load gen");
+        let WalRead::Frames { frames, truncated_tail } = wal_read_from(&layout.dir, 0).expect("wal read");
+        println!("wal frames={} truncated_tail={truncated_tail}", frames.len());
+        let out = replay_frames_into_store(&mut store, &frames).expect("replay must not hard-fail");
+        println!(
+            "replayed={} stopped_early={} stop_seq={} reason={} entries={} names={}",
+            out.applied_frames, out.stopped_early, out.stop_seq, out.stop_reason,
+            store.entries.len(), store.names_buf.len(),
+        );
+    }
+
+    /// Dump production WAL frame headers (seq, mutations, bytes). Manual:
+    /// `cargo test -p findx2-core --lib probe_prod_wal_dump -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_prod_wal_dump() {
+        let layout = crate::V6Layout::for_index(std::path::Path::new(r"C:\ProgramData\FindX\index.bin"));
+        let WalRead::Frames { frames, truncated_tail } = wal_read_from(&layout.dir, 0).expect("wal read");
+        println!("total_frames={} truncated_tail={truncated_tail}", frames.len());
+        for (i, f) in frames.iter().enumerate() {
+            if i < 5 || i + 5 >= frames.len() {
+                let payload = encode_batch(&f.batch);
+                println!("seq={} mutations={} payload={} pre=({}/{}/{})",
+                    f.seq, f.batch.mutations.len(), payload.len(),
+                    f.pre.entries, f.pre.dirs, f.pre.names);
+            } else if i == 5 {
+                println!("... ({} frames omitted)", frames.len() - 10);
+            }
+        }
+    }
+
+    /// Full boot-chain probe on REAL data: load + replay all WAL frames +
+    /// engine + usage + dirty heartbeat. Replicates service boot; any panic
+    /// here is the boot crash.
+    #[test]
+    #[ignore]
+    fn probe_prod_bootchain() {
+        let layout = crate::V6Layout::for_index(std::path::Path::new(r"C:\ProgramData\FindX\index.bin"));
+        let mut store = crate::persist_tx::load_current(&layout).expect("load gen");
+        println!("loaded {} entries", store.entries.len());
+        let from_seq = crate::read_published(&layout)
+            .ok()
+            .flatten()
+            .map(|ptr| ptr.manifest.wal_seq.saturating_add(1))
+            .unwrap_or(0);
+        let frames = match crate::wal_read_from(&layout.dir, from_seq).expect("wal read") {
+            crate::WalRead::Frames { frames, truncated_tail } => {
+                println!("frames={} truncated_tail={truncated_tail}", frames.len());
+                frames
+            }
+        };
+        let out = crate::replay_frames_into_store(&mut store, &frames).expect("replay");
+        println!("replayed={} stopped={}", out.applied_frames, out.stopped_early);
+        let engine = crate::SearchEngine::new(store);
+        engine.enable_usage(2 * 1024 * 1024 * 1024).unwrap();
+        println!("engine+usage ok");
+        {
+            let mut g = engine.index_store_mut();
+            g.set_track_mutations(true);
+            let raw = crate::RawEntry {
+                file_id: u64::MAX - 7, file_id_128: None, parent_id: 0,
+                name: "probe-bootchain-xyz.txt".into(), size: 1,
+                mtime: 1_700_000_000, ctime: 1_700_000_001, attrs: 0x20, is_dir: false,
+            };
+            g.append_file_entry(&raw);
+            engine.note_metadata_slot(5);
+        }
+        match engine.wal_heartbeat(&layout.dir) {
+            Ok(o) => println!("heartbeat ok: {o:?}"),
+            Err(e) => println!("heartbeat soft-fail: {e}"),
+        }
+        // And a fold (take + commit) like the first periodic fold would do.
+        let batch = engine.wal_take_for_fold(&layout.dir);
+        println!("take: {}", batch.map(|(s, f, b)| format!("tip={s} flushed={f} muts={}", b.mutations.len())).unwrap_or_else(|| "none".into()));
+    }
+
+    /// Heartbeat probe against the REAL production store: loads the gen,
+    /// builds an engine, and runs one wal_heartbeat. Catches heartbeat
+    /// panics on real data before they reach the service.
+    #[test]
+    #[ignore]
+    fn probe_prod_heartbeat() {
+        let layout = crate::V6Layout::for_index(std::path::Path::new(r"C:\ProgramData\FindX\index.bin"));
+        let store = crate::persist_tx::load_current(&layout).expect("load gen");
+        println!("loaded {} entries", store.entries.len());
+        let engine = crate::SearchEngine::new(store);
+        engine.enable_usage(2 * 1024 * 1024 * 1024).unwrap();
+        // Simulate a dirty journal + dirty bitmap like backfill would.
+        {
+            let mut g = engine.index_store_mut();
+            g.set_track_mutations(true);
+            let raw = crate::RawEntry {
+                file_id: u64::MAX - 7,
+                file_id_128: None,
+                parent_id: 0,
+                name: "probe-heartbeat-xyz.txt".into(),
+                size: 123,
+                mtime: 1_700_000_000,
+                ctime: 1_700_000_001,
+                attrs: 0x20,
+                is_dir: false,
+            };
+            g.append_file_entry(&raw);
+            engine.note_metadata_slot(1);
+            engine.note_metadata_slot(2);
+        }
+        // Data-dependent part only (clone + encode); file append needs
+        // SYSTEM rights on the production WAL, which the test user lacks.
+        match engine.clone_unflushed_batch() {
+            crate::HeartbeatBatch::None => println!("nothing to journal (unexpected)"),
+            crate::HeartbeatBatch::ForceFold => println!("force-fold (unexpected here)"),
+            crate::HeartbeatBatch::Append { batch, journal_flushed } => {
+                let payload = super::encode_batch(&batch);
+                println!("heartbeat batch: {} mutations journal_flushed={} payload={} bytes tri_pending={}",
+                    batch.mutations.len(), journal_flushed, payload.len(), batch.tri_pending.len());
+            }
+        }
+        match engine.wal_heartbeat(&layout.dir) {
+            Ok(outcome) => println!("heartbeat ok: {outcome:?}"),
+            Err(e) => println!("heartbeat soft-fail (no crash): {e}"),
+        }
+    }
+
+    /// Boot-sequence probe against the REAL production data dir. Run manually:
+    /// `cargo test -p findx2-core --lib probe_prod_replay -- --ignored --nocapture`
+    /// Catches boot-crashing replay bugs (and OOM) before they reach the service.
+    #[test]
+    #[ignore]
+    fn probe_prod_replay() {
+        let layout = crate::V6Layout::for_index(std::path::Path::new(r"C:\ProgramData\FindX\index.bin"));
+        assert!(layout.dir.is_dir(), "no production v6 dir");
+        let t0 = std::time::Instant::now();
+        let mut store = crate::persist_tx::load_current(&layout).expect("load gen");
+        println!("loaded {} entries in {:?}", store.entries.len(), t0.elapsed());
+        let from_seq = crate::read_published(&layout)
+            .ok()
+            .flatten()
+            .map(|ptr| ptr.manifest.wal_seq.saturating_add(1))
+            .unwrap_or(0);
+        println!("gen wal_seq base: {from_seq}");
+        let frames = match crate::wal_read_from(&layout.dir, from_seq).expect("wal read") {
+            crate::WalRead::Frames { frames, truncated_tail } => {
+                println!("frames={} truncated_tail={truncated_tail}", frames.len());
+                frames
+            }
+        };
+        let out = crate::replay_frames_into_store(&mut store, &frames).expect("replay must not fail hard");
+        println!(
+            "replay: applied={} stopped_early={} stop_seq={} reason={}",
+            out.applied_frames, out.stopped_early, out.stop_seq, out.stop_reason
+        );
+        println!("store now: entries={} names={}", store.entries.len(), store.names_buf.len());
     }
 
     #[test]

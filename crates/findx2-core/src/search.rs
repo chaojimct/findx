@@ -191,6 +191,7 @@ pub enum HeartbeatBatch {
 }
 
 /// Outcome of [`SearchEngine::wal_heartbeat`].
+#[derive(Debug)]
 pub enum HeartbeatOutcome {
     None,
     Appended { seq: u64 },
