@@ -44,6 +44,8 @@ actions!(
         ParentSelected,
         RevealSelected,
         ToggleDiag,
+        ToggleCommandPalette,
+        DismissCommandPalette,
         FocusSearch,
         OpenSettings,
         ShowFileMenu,
@@ -123,6 +125,7 @@ fn main_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-enter", RevealSelected, Some(FILE_SHORTCUT_CONTEXT)),
         KeyBinding::new("ctrl-shift-d", ToggleDiag, Some(FILE_SHORTCUT_CONTEXT)),
         KeyBinding::new("ctrl-f", FocusSearch, Some("FindXMain")),
+        KeyBinding::new("ctrl-k", ToggleCommandPalette, Some("FindXMain")),
         KeyBinding::new("ctrl-comma", OpenSettings, Some("FindXMain")),
         KeyBinding::new("escape", NoAction, Some(TABLE_RAW_ESCAPE_CONTEXT)),
         KeyBinding::new("backspace", ParentSelected, Some(FILE_SHORTCUT_CONTEXT)),
@@ -147,6 +150,11 @@ pub struct MainWindow {
     workspace: Workspace,
     settings_page: Option<Entity<super::settings_window::SettingsWindow>>,
     settings_pending_mode: Option<ViewMode>,
+    settings_pending_tab: Option<String>,
+    // Command palette overlay state.
+    command_palette_open: bool,
+    command_palette_query: Entity<InputState>,
+    command_palette_selected: usize,
     preview_resize: Option<(f32, f32)>,
     actual_preview_width: f32,
     table: Entity<TableState<ResultsTable>>,
@@ -198,17 +206,34 @@ pub struct MainWindow {
 
 impl MainWindow {
     fn open_settings_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_page_at(None, window, cx)
+    }
+
+    fn open_settings_page_at(&mut self, tab: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        let tab = tab.map(str::to_string).or_else(|| self.settings_pending_tab.take());
         self.cancel_path_edit(cx);
         self.dismiss_address_menu(cx);
         self.dismiss_file_menu(cx);
         if self.settings_page.is_some() {
+            // Already open: just switch the tab.
+            if let Some(tab) = tab {
+                if let Some(page) = self.settings_page.clone() {
+                    let t = tab.to_string();
+                    page.update(cx, |p, cx| {
+                        p.tab = super::settings_window::SettingsTab::from_canonical(&t);
+                        cx.notify();
+                    });
+                }
+            }
             return;
         }
         self.pause_preview();
         self.workspace.show_actions = false;
         let session = self.session.clone();
-        let page =
-            cx.new(|cx| super::settings_window::SettingsWindow::new_embedded(session, window, cx));
+        let tab_for_page = tab.clone();
+        let page = cx.new(|cx| {
+            super::settings_window::SettingsWindow::new_embedded_at(session, window, cx, tab_for_page.as_deref())
+        });
         self._subscriptions.push(
             cx.subscribe_in(&page, window, |this, _, event, window, cx| {
                 use super::settings_window::SettingsEvent;
@@ -308,6 +333,7 @@ impl MainWindow {
         let mut workspace = Workspace::new(browser_widths, window, cx);
         workspace.usage_depth = session.read(cx).prefs.usage_preferred_depth.clamp(1,6);
         workspace.show_hidden = session.read(cx).prefs.browser_show_hidden;
+        let command_palette_query = cx.new(|cx| InputState::new(window, cx));
         let mut this = Self {
             #[cfg(windows)]
             tray: None,
@@ -326,6 +352,10 @@ impl MainWindow {
             workspace,
             settings_page: None,
             settings_pending_mode: None,
+            settings_pending_tab: None,
+            command_palette_open: false,
+            command_palette_query: command_palette_query.clone(),
+            command_palette_selected: 0,
             preview_resize: None,
             actual_preview_width: PREVIEW_DEFAULT_WIDTH_PX,
             table: table.clone(),
@@ -405,6 +435,19 @@ impl MainWindow {
             }));
 
         this.subscribe_results_table(table.clone(), cx);
+        let palette_q = command_palette_query.clone();
+        this._subscriptions.push(cx.subscribe_in(&palette_q, window, |this, _, ev, window, cx| {
+            match ev {
+                gpui_kit::component::input::InputEvent::Change => {
+                    this.command_palette_selected = 0;
+                    cx.notify();
+                }
+                gpui_kit::component::input::InputEvent::PressEnter { .. } => {
+                    this.run_command_palette_selected(window, cx);
+                }
+                _ => {}
+            }
+        }));
         let session_for_appearance = session.clone();
         this._subscriptions
             .push(window.observe_window_appearance(move |window, cx| {
@@ -1215,6 +1258,70 @@ impl MainWindow {
             session.set_diag(next, cx);
         });
         cx.notify();
+    }
+
+    fn toggle_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_page.is_some() {
+            return;
+        }
+        self.command_palette_open = !self.command_palette_open;
+        if self.command_palette_open {
+            self.command_palette_selected = 0;
+            self.command_palette_query.update(cx, |q, cx| q.set_value(String::new(), window, cx));
+            window.focus(&self.command_palette_query.read(cx).focus_handle(cx), cx);
+        }
+        cx.notify();
+    }
+
+    fn command_palette_commands(&self) -> Vec<crate::command_palette::PaletteCommand> {
+        vec![
+            crate::command_palette::PaletteCommand { id: "focus_search", label: "聚焦搜索框", keywords: &["search", "find"], group: "导航" },
+            crate::command_palette::PaletteCommand { id: "open_settings", label: "打开设置", keywords: &["settings", "preferences"], group: "导航" },
+            crate::command_palette::PaletteCommand { id: "open_settings_index", label: "设置：索引与服务", keywords: &["index", "service"], group: "设置" },
+            crate::command_palette::PaletteCommand { id: "open_settings_diagnostics", label: "设置：诊断", keywords: &["diagnostics", "debug"], group: "设置" },
+            crate::command_palette::PaletteCommand { id: "toggle_diag", label: "切换诊断浮层", keywords: &["diag", "debug"], group: "视图" },
+            crate::command_palette::PaletteCommand { id: "export_results", label: "导出当前结果", keywords: &["export", "csv"], group: "操作" },
+            crate::command_palette::PaletteCommand { id: "workspace_back", label: "后退", keywords: &["back"], group: "导航" },
+            crate::command_palette::PaletteCommand { id: "workspace_forward", label: "前进", keywords: &["forward"], group: "导航" },
+            crate::command_palette::PaletteCommand { id: "reveal_selected", label: "在目录中定位", keywords: &["reveal", "locate"], group: "文件" },
+        ]
+    }
+
+    fn run_command_palette_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.command_palette_query.read(cx).value().to_string();
+        let cmds = self.command_palette_commands();
+        let matches = crate::command_palette::filter(&cmds, &query);
+        let idx = self.command_palette_selected.min(matches.len().saturating_sub(1));
+        let Some(m) = matches.get(idx) else {
+            self.command_palette_open = false;
+            cx.notify();
+            return;
+        };
+        let id = m.command.id;
+        self.command_palette_open = false;
+        cx.notify();
+        match id {
+            "focus_search" => {
+                if self.workspace.mode == ViewMode::Directory {
+                    self.focus_directory_filter(window, cx);
+                } else {
+                    self.workspace_switch(ViewMode::Search, cx);
+                    window.focus(&self.search.read(cx).focus_handle(cx), cx);
+                }
+            }
+            "open_settings" => self.open_settings_page(window, cx),
+            "open_settings_index" => self.open_settings_page_at(Some("index"), window, cx),
+            "open_settings_diagnostics" => self.open_settings_page_at(Some("diagnostics"), window, cx),
+            "toggle_diag" => self.toggle_diag(cx),
+            "workspace_back" => {
+                if !self.text_edit_active(window, cx) { self.workspace_history(false, cx); }
+            }
+            "workspace_forward" => {
+                if !self.text_edit_active(window, cx) { self.workspace_history(true, cx); }
+            }
+            "reveal_selected" => self.reveal_selected(cx),
+            _ => {}
+        }
     }
 
     fn toggle_panel(
@@ -2338,6 +2445,15 @@ impl Render for MainWindow {
             }))
             .on_action(cx.listener(|this, _: &RevealSelected, _, cx| this.reveal_selected(cx)))
             .on_action(cx.listener(|this, _: &ToggleDiag, _, cx| this.toggle_diag(cx)))
+            .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
+                this.toggle_command_palette(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DismissCommandPalette, _, cx| {
+                if this.command_palette_open {
+                    this.command_palette_open = false;
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 if this.settings_page.is_some() {
                     return;
@@ -2372,7 +2488,10 @@ impl Render for MainWindow {
                 .when(self.has_file_activity(), |view| {
                     view.child(self.render_file_activity(cx))
                 })
-                .child(self.render_status_bar(&index_view, cx))
+                .when(self.command_palette_open, |view| {
+                view.child(self.render_command_palette(window, cx))
+            })
+            .child(self.render_status_bar(&index_view, cx))
                 .when(self.workspace.show_actions, |view| {
                     view.child(self.render_workspace_actions(cx))
                 })
@@ -2422,6 +2541,104 @@ impl Render for MainWindow {
 }
 
 impl MainWindow {
+    fn render_command_palette(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let tokens = Self::tokens(cx);
+        let query = self.command_palette_query.read(cx).value().to_string();
+        let cmds = self.command_palette_commands();
+        let matches = crate::command_palette::filter(&cmds, &query);
+        let selected = self.command_palette_selected.min(matches.len().saturating_sub(1));
+        let list: Vec<AnyElement> = matches
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let is_sel = i == selected;
+                div()
+                    .id(SharedString::from(format!("cp-{}", m.command.id)))
+                    .w_full()
+                    .h(px(32.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_md()
+                    .when(is_sel, |d| d.bg(tokens.accent))
+                    .child(div().text_xs().text_color(tokens.text_tertiary).child(m.command.group))
+                    .child(div().text_sm().child(m.command.label))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.command_palette_selected = i;
+                        this.run_command_palette_selected(window, cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "escape" => {
+                        this.command_palette_open = false;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                    "up" => {
+                        if this.command_palette_selected > 0 {
+                            this.command_palette_selected -= 1;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }
+                    "down" => {
+                        let q = this.command_palette_query.read(cx).value().to_string();
+                        let cmds = this.command_palette_commands();
+                        let n = crate::command_palette::filter(&cmds, &q).len();
+                        if this.command_palette_selected + 1 < n {
+                            this.command_palette_selected += 1;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }
+                    "enter" => {
+                        this.run_command_palette_selected(window, cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000066))
+            .child(
+                v_flex()
+                    .w(px(420.))
+                    .max_h(px(480.))
+                    .bg(tokens.surface)
+                    .border_1()
+                    .border_color(tokens.border)
+                    .rounded_lg()
+                    .shadow_lg()
+                    .p_3()
+                    .gap_2()
+                    .child(Input::new(&self.command_palette_query).w_full().h(px(34.)))
+                    .child(
+                        div()
+                            .id("cp-list")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scrollbar()
+                            .children(if list.is_empty() {
+                                vec![div().text_sm().text_color(tokens.text_tertiary).child("无匹配命令").into_any_element()]
+                            } else {
+                                list
+                            }),
+                    )
+                    .child(div().text_xs().text_color(tokens.text_tertiary).child("↑↓ 选择 · Enter 执行 · Esc 关闭")),
+            )
+            .into_any_element()
+    }
+
     fn render_status_bar(&self, index: &IndexStatusView, cx: &mut Context<Self>) -> AnyElement {
         let tokens = Self::tokens(cx);
         if self.workspace.mode == ViewMode::Directory {

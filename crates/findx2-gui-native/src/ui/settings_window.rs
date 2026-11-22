@@ -59,7 +59,7 @@ fn settings_nav_content(icon: Icon, label: &'static str) -> impl IntoElement {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SettingsTab {
+pub enum SettingsTab {
     Appearance,
     Files,
     Preview,
@@ -68,6 +68,34 @@ enum SettingsTab {
     Index,
     Search,
     Diagnostics,
+}
+
+impl SettingsTab {
+    pub fn from_canonical(tab: &str) -> Self {
+        match crate::settings_search::canonical_tab(tab) {
+            "appearance" => Self::Appearance,
+            "files" => Self::Files,
+            "preview" => Self::Preview,
+            "shortcuts" => Self::Shortcuts,
+            "about" => Self::About,
+            "index" => Self::Index,
+            "search" => Self::Search,
+            "diagnostics" => Self::Diagnostics,
+            _ => Self::Appearance,
+        }
+    }
+    pub fn canonical(self) -> &'static str {
+        match self {
+            Self::Appearance => "appearance",
+            Self::Files => "files",
+            Self::Preview => "preview",
+            Self::Shortcuts => "shortcuts",
+            Self::About => "about",
+            Self::Index => "index",
+            Self::Search => "search",
+            Self::Diagnostics => "diagnostics",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -87,13 +115,14 @@ pub struct SettingsWindow {
     closing_app: bool,
     style: ThemeStyle,
     session: Entity<AppSession>,
-    tab: SettingsTab,
+    pub tab: SettingsTab,
     // Live truth: every control writes through to the session and disk
     // immediately. There is no draft/original pair, no save button.
     settings: FindxGuiSettings,
     theme: UiThemePref,
     search_limit: Entity<InputState>,
     save_interval: Entity<InputState>,
+    nav_search: Entity<InputState>,
     index_path: Entity<InputState>,
     pipe_name: Entity<InputState>,
     service_exe: Entity<InputState>,
@@ -113,7 +142,7 @@ pub struct SettingsWindow {
 
 impl SettingsWindow {
     pub fn new(session: Entity<AppSession>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::new_inner(session, false, window, cx)
+        Self::new_inner(session, false, window, cx, None)
     }
 
     pub fn new_embedded(
@@ -121,7 +150,16 @@ impl SettingsWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_inner(session, true, window, cx)
+        Self::new_embedded_at(session, window, cx, None)
+    }
+
+    pub fn new_embedded_at(
+        session: Entity<AppSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        initial_tab: Option<&str>,
+    ) -> Self {
+        Self::new_inner(session, true, window, cx, initial_tab)
     }
 
     fn new_inner(
@@ -129,6 +167,7 @@ impl SettingsWindow {
         embedded: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
+        initial_tab: Option<&str>,
     ) -> Self {
         let style = session.read(cx).prefs.theme_style;
         let (settings, theme) = session.read_with(cx, |s, _| (s.settings.clone(), s.prefs.theme));
@@ -149,12 +188,16 @@ impl SettingsWindow {
                 .default_value(settings.excluded_dirs.join("\n"))
         });
 
+        let nav_search = cx.new(|cx| InputState::new(window, cx));
+
         let mut this = Self {
             embedded,
             closing_app: false,
             style,
             session,
-            tab: if crate::isolation::development_var_os("FINDX_NATIVE_OPEN_ABOUT").is_some() {
+            tab: if let Some(t) = initial_tab {
+                SettingsTab::from_canonical(t)
+            } else if crate::isolation::development_var_os("FINDX_NATIVE_OPEN_ABOUT").is_some() {
                 SettingsTab::About
             } else {
                 SettingsTab::Appearance
@@ -163,6 +206,7 @@ impl SettingsWindow {
             theme,
             search_limit: search_limit.clone(),
             save_interval: save_interval.clone(),
+            nav_search: nav_search.clone(),
             index_path: index_path.clone(),
             pipe_name: pipe_name.clone(),
             service_exe: service_exe.clone(),
@@ -414,7 +458,8 @@ impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = Self::tokens(cx);
         let roots = self.session.read(cx).available_roots.clone();
-        let categories = [
+        let nav_query = self.nav_search.read(cx).value().to_string();
+        let categories: Vec<(SettingsTab, &'static str)> = [
             (SettingsTab::Appearance, "外观"),
             (SettingsTab::Search, "搜索"),
             (SettingsTab::Files, "文件浏览"),
@@ -423,7 +468,17 @@ impl Render for SettingsWindow {
             (SettingsTab::Shortcuts, "快捷键"),
             (SettingsTab::Diagnostics, "诊断"),
             (SettingsTab::About, "关于"),
-        ];
+        ]
+        .into_iter()
+        .filter(|(_, label)| {
+            if nav_query.trim().is_empty() {
+                return true;
+            }
+            let q = nav_query.to_lowercase();
+            label.to_lowercase().contains(&q)
+        })
+        .collect();
+
         let title = categories
             .iter()
             .find(|(tab, _)| *tab == self.tab)
@@ -494,6 +549,13 @@ impl Render for SettingsWindow {
             .border_color(tokens.border)
             .child(div().text_lg().px_2().py_3().child("设置"))
             .child(
+                div().px_2().pb_2().child(
+                    Input::new(&self.nav_search)
+                        .w_full()
+                        .h(px(30.)),
+                ),
+            )
+            .child(
                 Button::new("settings-back")
                     .ghost()
                     .w_full()
@@ -507,6 +569,9 @@ impl Render for SettingsWindow {
                     .on_click(cx.listener(|this, _, window, cx| this.request_leave(window, cx))),
             )
             .child(div().h(px(12.)))
+            .when(categories.is_empty(), |v| {
+                v.child(div().text_xs().px_2().py_2().text_color(tokens.text_tertiary).child("无匹配的设置项"))
+            })
             .children(categories.into_iter().map(|(tab, label)| {
                 Button::new(SharedString::from(format!("settings-category-{label}")))
                     .ghost()
