@@ -93,6 +93,8 @@ pub(crate) fn run_foreground(
         let mut g = slot.write().map_err(|e| anyhow::anyhow!("{e}"))?;
         *g = Some(engine.clone());
     }
+    // 内容索引：存在则挂载 + 增量跟随；不存在则 `content:` 自动走慢路径。
+    crate::content_index::init(&index, engine.clone());
     #[cfg(target_os = "macos")]
     if let Some(note) = findx2_macos::take_scan_note() {
         set_watch_error_id("macos", Some(note));

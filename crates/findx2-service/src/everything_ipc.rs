@@ -515,6 +515,7 @@ fn do_search(
     // 发来的简拼如 mctjl 需走 lita 拼音路径；查询串里 `;en` / `;np` 仍可通过 ParsedQuery 关闭拼音。
     let opt = SearchOptions {
         allow_pinyin: true,
+        content: crate::content_index::content_opt(),
         ..Default::default()
     };
     let (hits, _total) = engine.search(&pq, &opt).ok()?;

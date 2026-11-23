@@ -64,7 +64,7 @@ pub use platform::{
     ChangeEvent, ChangeWatcher, CreateIfMissing, RawEntry, VolumeScanner, WatchCursor,
 };
 pub use query::{ParsedQuery, QueryParser, SortField};
-pub use search::{BackfillProgress, HeartbeatBatch, HeartbeatOutcome, SearchEngine, SearchHit, SearchOptions};
+pub use search::{BackfillProgress, ContentSearch, HeartbeatBatch, HeartbeatOutcome, SearchEngine, SearchHit, SearchOptions, CONTENT_FAST_CAP, volume_key_for};
 pub use trigram::{
     build_and_save as build_trigram_sidecar, load_pending_sidecar, pending_sidecar_path,
     save_pending_sidecar, tri_sidecar_path, TrigramIndex,

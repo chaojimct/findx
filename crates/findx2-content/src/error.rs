@@ -16,6 +16,12 @@ impl From<tantivy::TantivyError> for Error {
     }
 }
 
+impl From<Error> for findx2_core::Error {
+    fn from(e: Error) -> Self {
+        findx2_core::Error::Persist(format!("内容索引: {e}"))
+    }
+}
+
 impl From<tantivy::query::QueryParserError> for Error {
     fn from(e: tantivy::query::QueryParserError) -> Self {
         Error::Index(e.to_string())

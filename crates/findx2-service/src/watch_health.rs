@@ -49,6 +49,8 @@ impl NamespaceGate {
         let result=match binding{Some((epoch,serial))=>engine.apply_volume_batch_bound(volume,events,journal_id,next_usn,epoch,serial),None=>engine.apply_volume_batch(volume,events,journal_id,next_usn)};
         match result {
             Ok(()) => {
+                // 内容增量跟随（apply 成功后，热路径只做轻量提取）。
+                crate::content_index::notify_applied(volume, events);
                 set_watch_error(volume as char, engine.has_pending_namespace(volume).then(||
                     format!("missing-parent namespace events pending; durable cursor pinned for restart replay; {}", engine.pending_namespace_diagnostics(volume))));
                 Ok(())

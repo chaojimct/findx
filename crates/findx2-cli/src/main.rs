@@ -4,9 +4,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(windows)]
 use findx2_core::SearchHit;
 use findx2_core::{
-    load_store_auto, save_index_bin, v6_save_full, ParsedQuery, QueryParser, Result, SearchEngine,
-    SearchOptions, V6Layout,
+    load_store_auto, save_index_bin, v6_save_full, ContentSearch, ParsedQuery, QueryParser,
+    Result, SearchEngine, SearchOptions, V6Layout,
 };
+use std::sync::Arc;
 /// Windows 常驻才用的增量提交类型（Watch/回填）：Unix/macOS 下 Watch 命令不存在，
 /// 这些导入只在 Windows 生效，避免非 Windows 构建报 unused_imports。
 #[cfg(windows)]
@@ -68,6 +69,16 @@ enum Commands {
         /// 输出列（默认全部）
         #[arg(long, value_delimiter = ',', alias = "cols")]
         columns: Option<Vec<OutColumn>>,
+    },
+    /// 构建/重建全文内容索引（`<index>.content/`），供 `content:` 查询加速；
+    /// 不存在时 `content:` 自动回退旧慢路径（逐文件读）。
+    ContentIndex {
+        /// index.bin 路径
+        #[arg(short, long, default_value = "index.bin")]
+        index: std::path::PathBuf,
+        /// 删除旧内容索引后全量重建
+        #[arg(long, default_value_t = false)]
+        rebuild: bool,
     },
     /// 显示索引元信息
     Status {
@@ -235,26 +246,20 @@ fn run() -> Result<()> {
             let pq: ParsedQuery = QueryParser::parse(&query)?;
             let parse_us = t_parse.elapsed().as_micros();
             let engine = SearchEngine::new(store);
+            // 内容索引存在则 `content:` 走 tantivy 快路径，否则过滤器内回退慢路径。
+            let opt = SearchOptions {
+                allow_pinyin: pinyin,
+                content: open_content_opt(&index),
+                ..Default::default()
+            };
             // 预热一次，避免线程池/页缓存冷启动算到第一次的耗时里。
-            let _ = engine.search(
-                &pq,
-                &SearchOptions {
-                    allow_pinyin: pinyin,
-                    ..Default::default()
-                },
-            )?;
+            let _ = engine.search(&pq, &opt)?;
             let mut samples: Vec<u128> = Vec::with_capacity(5);
             let mut last_total: u32 = 0;
             let mut last_hits_len: usize = 0;
             for _ in 0..5 {
                 let t = std::time::Instant::now();
-                let (h, total) = engine.search(
-                    &pq,
-                    &SearchOptions {
-                        allow_pinyin: pinyin,
-                        ..Default::default()
-                    },
-                )?;
+                let (h, total) = engine.search(&pq, &opt)?;
                 samples.push(t.elapsed().as_micros());
                 last_total = total;
                 last_hits_len = h.len();
@@ -273,13 +278,7 @@ fn run() -> Result<()> {
                 last_hits_len,
                 last_total,
             );
-            let (hits, total) = engine.search(
-                &pq,
-                &SearchOptions {
-                    allow_pinyin: pinyin,
-                    ..Default::default()
-                },
-            )?;
+            let (hits, total) = engine.search(&pq, &opt)?;
             if json {
                 println!(
                     "{}",
@@ -332,13 +331,12 @@ fn run() -> Result<()> {
                             let mut pq: ParsedQuery = QueryParser::parse(&query)?;
                             pq.limit = limit.min(8192) as u32;
                             let engine = SearchEngine::new(store);
-                            let (h, _t) = engine.search(
-                                &pq,
-                                &SearchOptions {
-                                    allow_pinyin: pinyin,
-                                    ..Default::default()
-                                },
-                            )?;
+                            let opt = SearchOptions {
+                                allow_pinyin: pinyin,
+                                content: open_content_opt(&idx),
+                                ..Default::default()
+                            };
+                            let (h, _t) = engine.search(&pq, &opt)?;
                             h
                         } else {
                             return Err(e);
@@ -358,6 +356,9 @@ fn run() -> Result<()> {
                 });
                 print_table(&hits, &cols);
             }
+        }
+        Commands::ContentIndex { index, rebuild } => {
+            build_content_index(&index, rebuild)?;
         }
         Commands::Status { index } => {
             // v6 优先（service 常驻后 index.bin 主文件不再更新，读 v6 才准）。
@@ -384,6 +385,20 @@ fn run() -> Result<()> {
                     v.usn_journal_id,
                     v.last_usn
                 );
+            }
+            let cdir = findx2_content::content_dir_for(&index);
+            if cdir.join("meta.json").is_file() {
+                match findx2_content::open_or_create(&cdir) {
+                    Ok(c) => println!(
+                        "内容索引: {}（{} docs，schema v{}）",
+                        cdir.display(),
+                        c.num_docs(),
+                        findx2_content::SCHEMA_VERSION
+                    ),
+                    Err(e) => println!("内容索引: {}（打开失败: {e}）", cdir.display()),
+                }
+            } else {
+                println!("内容索引: 未建（`findx2 content-index` 构建后 `content:` 走倒排加速）");
             }
         }
         Commands::Compact { index, dry_run } => {
@@ -687,6 +702,75 @@ fn v6_commit_store(v6: &V6Layout, store: &mut IndexStore) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// 内容索引存在则打开并装入 `SearchOptions::content`（`content:` 快路径），
+/// 否则 None（过滤器内回退逐文件慢路径）。打开失败只告警，不阻断搜索。
+fn open_content_opt(index: &std::path::Path) -> Option<Arc<dyn ContentSearch>> {
+    match findx2_content::open_if_exists(index) {
+        Some(c) => Some(Arc::new(c)),
+        None => None,
+    }
+}
+
+/// 全量构建 `<index>.content/`（循环逻辑在 findx2-content::build_from_store，CLI 只管打日志）。
+fn build_content_index(index: &std::path::Path, rebuild: bool) -> Result<()> {
+    use findx2_content::{build_from_store, content_dir_for};
+    let t0 = std::time::Instant::now();
+    let store = load_store_auto(index)?;
+    let cdir = content_dir_for(index);
+    if rebuild && cdir.exists() {
+        eprintln!("[content] --rebuild：删除旧索引 {}", cdir.display());
+    }
+    let st = build_from_store(&store, &cdir, rebuild, |s| {
+        eprintln!(
+            "[content] 扫描 {} / 抽取 {} / 跳过 {} / 失败 {}（{:.1}s）",
+            s.scanned,
+            s.extracted,
+            s.skipped,
+            s.failed,
+            t0.elapsed().as_secs_f64()
+        );
+    })?;
+    let dir_bytes = dir_size(&cdir);
+    println!(
+        "内容索引构建完成：扫描 {} 文件，抽取 {}（{:.2} MB 原文），跳过 {}，失败 {}；\
+         索引 {} docs / {:.2} MB（体积比 {:.1}%），耗时 {:.1}s → {}",
+        st.scanned,
+        st.extracted,
+        st.bytes as f64 / 1048576.0,
+        st.skipped,
+        st.failed,
+        st.docs,
+        dir_bytes as f64 / 1048576.0,
+        if st.bytes == 0 {
+            0.0
+        } else {
+            dir_bytes as f64 * 100.0 / st.bytes as f64
+        },
+        t0.elapsed().as_secs_f64(),
+        cdir.display(),
+    );
+    Ok(())
+}
+
+fn dir_size(dir: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(m) = ent.metadata() {
+                total += m.len();
+            }
+        }
+    }
+    total
 }
 
 fn print_table(hits: &[findx2_core::SearchHit], cols: &[OutColumn]) {

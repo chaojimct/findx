@@ -261,6 +261,7 @@ pub(crate) fn search_ipc(
             &pq,
             &SearchOptions {
                 allow_pinyin: pinyin,
+                content: crate::content_index::content_opt(),
                 ..Default::default()
             },
             offset,

@@ -2,7 +2,7 @@
 
 use std::io::Write;
 
-use findx2_content::{extract_text, open_or_create, DocMeta};
+use findx2_content::{doc_key, extract_text, open_or_create, DocMeta};
 
 fn write_txt(dir: &std::path::Path, name: &str, data: &[u8]) -> std::path::PathBuf {
     let p = dir.join(name);
@@ -72,7 +72,7 @@ fn m0_roundtrip_zh_en_with_snippet() {
     assert_eq!(idx.num_docs(), 2);
 
     // 删除。
-    idx.delete_by_frn(1000).unwrap();
+    idx.delete_by_frn("C:", 1000).unwrap();
     idx.commit().unwrap();
     assert_eq!(idx.num_docs(), 1);
     assert!(idx.search("全文搜索", 10).unwrap().is_empty());

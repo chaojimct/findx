@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 findx2-core = { path = "../findx2-core", features = ["pinyin"] }
+findx2-content = { path = "../findx2-content" }
 findx2-ipc = { path = "../findx2-ipc" }
 serde_json = "1"
 thiserror = "1"

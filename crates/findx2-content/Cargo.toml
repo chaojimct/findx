@@ -9,9 +9,13 @@ description = "findx2 全文内容索引 M0 PoC：文本抽取 + tantivy 倒排�
 tantivy = "0.27"
 tantivy-jieba = "0.21"
 encoding_rs = "0.8"
+findx2-core = { path = "../findx2-core" }
 parking_lot = "0.12"
+pdf-extract = "0.8"
+quick-xml = "0.37"
 thiserror = "1"
 memmap2 = "0.9"
+zip = "2"
 
 [dev-dependencies]
 tempfile = "3"

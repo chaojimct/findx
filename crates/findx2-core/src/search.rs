@@ -68,13 +68,45 @@ impl Default for PinyinMatchMode {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct SearchOptions {
     /// 总开关；false 时 `pinyin_match_mode` 直接被忽略。
     /// service 端从 GUI 设置/`findx2.config.json` 读取，默认 true。
     pub allow_pinyin: bool,
     /// 拼音匹配触发策略，详见 `PinyinMatchMode`。仅在 `allow_pinyin=true` 时生效。
     pub pinyin_match_mode: PinyinMatchMode,
+    /// 内容倒排（由 findx2-content 实现，core 保持 tantivy-free；None = 走旧慢路径）。
+    /// `Debug/Clone` 手动实现（见文件尾），避免要求 trait 对象实现它们。
+    pub content: Option<std::sync::Arc<dyn ContentSearch>>,
+}
+
+/// 内容倒排查询接口：给定 tantivy 查询串，返回命中的 `(volume_id, frn)`。
+/// 映射到 entry_idx 由 `filter_content` 经 `frn_to_entry.get_scoped` 完成。
+pub trait ContentSearch: Send + Sync {
+    fn search_content(&self, query: &str, limit: usize) -> Result<Vec<(String, u64)>>;
+}
+
+impl std::fmt::Debug for SearchOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchOptions")
+            .field("allow_pinyin", &self.allow_pinyin)
+            .field("pinyin_match_mode", &self.pinyin_match_mode)
+            .field("content", &self.content.is_some())
+            .finish()
+    }
+}
+
+/// 内容快路径单次最多取回的倒排命中数（防 `content:` 单谓词时 TopDocs 爆炸）。
+pub const CONTENT_FAST_CAP: usize = 50_000;
+
+/// 卷归一化键：`volume_id` 为空的老库按槽位合成，保证建库侧与查询侧一致。
+/// 内容索引的 `(volume_id, frn)` 两边都走这个函数，绝不直接用原始串。
+pub fn volume_key_for(volume_id: &str, slot: usize) -> String {
+    if volume_id.is_empty() {
+        format!("slot{slot}")
+    } else {
+        volume_id.to_owned()
+    }
 }
 
 /// 顶层 build 一次的拼音 matcher 切片类型。
@@ -940,7 +972,7 @@ impl SearchEngine {
         }
 
         if q.content_substring.is_some() || q.utf8content_substring.is_some() {
-            hits = filter_content(store, &hits, q)?;
+            hits = filter_content(store, &hits, q, opt)?;
         }
 
         Ok(hits)
@@ -2970,7 +3002,12 @@ fn filter_dupe(store: &IndexStore, hits: &[u32], kind: &str) -> Result<Vec<u32>>
     }
 }
 
-fn filter_content(store: &IndexStore, hits: &[u32], q: &ParsedQuery) -> Result<Vec<u32>> {
+fn filter_content(
+    store: &IndexStore,
+    hits: &[u32],
+    q: &ParsedQuery,
+    opt: &SearchOptions,
+) -> Result<Vec<u32>> {
     let needle_opt = q
         .content_substring
         .as_ref()
@@ -2978,11 +3015,44 @@ fn filter_content(store: &IndexStore, hits: &[u32], q: &ParsedQuery) -> Result<V
     let Some(ns) = needle_opt else {
         return Ok(hits.to_vec());
     };
+    // 快路径：内容倒排已建 → tantivy 查 (volume_id, frn) → 映射 entry_idx → 求交。
+    // 其它谓词（path:/ext: 等）已在调用前过滤，hits 即交集定义域。
+    if let Some(cs) = opt.content.as_ref() {
+        let cap = hits.len().min(CONTENT_FAST_CAP);
+        if cap == 0 {
+            return Ok(vec![]);
+        }
+        let matches = cs.search_content(ns, cap)?;
+        let slot_of: HashMap<&str, u32> = store
+            .volumes
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (v.volume_id.as_str(), i as u32))
+            .collect();
+        let mut set = HashSet::with_capacity(matches.len());
+        for (vol, frn) in &matches {
+            // 建库侧存的是归一化键；老库 volume_id 为空时按槽位合成键回查。
+            let slot = slot_of.get(vol.as_str()).copied().or_else(|| {
+                vol.strip_prefix("slot")
+                    .and_then(|s| s.parse::<u32>().ok())
+            });
+            if let Some(slot) = slot {
+                if let Some(idx) = store.frn_to_entry.get_scoped(*frn, slot) {
+                    set.insert(idx);
+                }
+            }
+        }
+        return Ok(hits.iter().filter(|i| set.contains(i)).copied().collect());
+    }
     // 超过此大小的文件跳过内容搜索，避免内存爆炸和长时间阻塞
     const MAX_CONTENT_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
     let low = ns.to_ascii_lowercase();
     let mut out = Vec::new();
     for &idx in hits {
+        // 目录没有文本内容；不可读文件跳过（权限/占用），绝不让单个文件失败整个查询。
+        if store.entries[idx as usize].is_dir_entry() {
+            continue;
+        }
         let p = store.entry_display_path(idx as usize)?;
         let path = std::path::Path::new(&p);
         // 先检查文件大小，超限直接跳过
@@ -2991,7 +3061,9 @@ fn filter_content(store: &IndexStore, hits: &[u32], q: &ParsedQuery) -> Result<V
             Err(_) => continue,
             _ => {}
         }
-        let data = std::fs::read(path).map_err(|e| crate::Error::Platform(e.to_string()))?;
+        let Ok(data) = std::fs::read(path) else {
+            continue;
+        };
         let text = String::from_utf8_lossy(&data);
         if text.to_ascii_lowercase().contains(&low) {
             out.push(idx);
