@@ -15,6 +15,31 @@ pub struct Snapshot {
     /// 距上次成功 fold 的秒数（None = 本进程尚未 fold 或旧版 service）。
     pub last_fold_secs_ago: Option<u64>,
 }
+/// 索引统计悬浮卡的结构化内容（富文本 tooltip 用，替代裸字符串拼接）。
+#[derive(Clone, Debug)]
+pub struct IndexTooltip {
+    /// 更新频率说明，如“约每 2 秒刷新”。
+    pub freshness: String,
+    /// WAL 当前状态行（`wal_label`），`None` 时不显示后台写入段。
+    pub wal_state: Option<String>,
+    /// 需要注意的问题（监听异常/不健康），`None` 时不显示该段。
+    pub alert: Option<String>,
+    /// 正在跑的后台任务说明（扫描中等），`None` 时不显示该段。
+    pub scan: Option<String>,
+}
+
+/// 监听失败原因归纳（与 `tooltip()` 共用一套文案，改一处两处生效）。
+fn watch_error_reason(e: &str) -> &'static str {
+    if e.contains("internal namespace resolution") || e.contains("bound unlink identity") {
+        "已删除文件的身份核对失败；为避免漏处理变更，已保留变更记录读取位置。这不等同于当前用户缺少管理员权限"
+    } else if e.contains("拒绝访问") || e.contains("Access is denied") || e.contains("os error 5") {
+        "读取被系统拒绝（原因尚未确认）"
+    } else if e.contains("journal") || e.contains("日志") {
+        "文件变更记录读取失败"
+    } else {
+        "文件变更监听失败"
+    }
+}
 #[derive(Clone, Debug, Default)]
 pub struct EngineFooter {
     pub source: Option<String>,
@@ -195,6 +220,35 @@ impl EngineFooter {
         )
     }
 
+    /// 结构化悬浮卡数据（替代裸字符串拼接，供富文本 tooltip 用）。
+    /// `None` = 未连接/无快照，此时调用方保留旧的纯文本提示。
+    pub fn index_tooltip(&self) -> Option<IndexTooltip> {
+        if !self.connected || self.error.is_some() || self.last.is_none() {
+            return None;
+        }
+        let freshness = if self.busy {
+            "本次刷新暂忙，保留上次统计"
+        } else {
+            "约每 2 秒刷新"
+        };
+        let s = self.last.as_ref()?;
+        let alert = if let Some(e) = &s.watch_error {
+            Some(format!(
+                "{}，列表可能不再及时更新。请检查服务状态后重试。",
+                watch_error_reason(e)
+            ))
+        } else if !s.healthy {
+            Some("文件变更监听异常，列表可能不再及时更新；请检查服务状态后重试。".into())
+        } else {
+            None
+        };
+        Some(IndexTooltip {
+            freshness: freshness.into(),
+            wal_state: self.wal_label(),
+            alert,
+            scan: None,
+        })
+    }
     /// WAL 健康段（Argus vitals band 的 FindX 版）：回答“后台在写什么”。
     /// `None` = 老版 service（未上报）或 WAL 为空且从未 fold —— 此时不显示，
     /// 状态栏保持原样。
@@ -238,18 +292,7 @@ impl EngineFooter {
             return "正在加载文件列表，完成后即可搜索。".into();
         }
         if let Some(e) = &s.watch_error {
-            let reason = if e.contains("internal namespace resolution") || e.contains("bound unlink identity") {
-                "已删除文件的身份核对失败；为避免漏处理变更，已保留变更记录读取位置。这不等同于当前用户缺少管理员权限"
-            } else if e.contains("拒绝访问")
-                || e.contains("Access is denied")
-                || e.contains("os error 5")
-            {
-                "读取被系统拒绝（原因尚未确认）"
-            } else if e.contains("journal") || e.contains("日志") {
-                "文件变更记录读取失败"
-            } else {
-                "文件变更监听失败"
-            };
+            let reason = watch_error_reason(e);
             return format!("{reason}，列表可能不再及时更新。请检查服务状态后重试。");
         }
         if !s.healthy {

@@ -865,6 +865,8 @@ impl MainWindow {
         self.freeze_preview();
         self.loading = true;
         self.search_status = "搜索中…".into();
+        // 新查询覆盖旧的操作反馈（陈旧的位置/身份警告不再 relevant）。
+        self.file_actions.summary.clear();
         let old_generation = self.search_gen;
         self.search_gen = self.search_gen.wrapping_add(1);
         let generation = self.search_gen;
@@ -2806,6 +2808,169 @@ impl MainWindow {
             .into_any_element()
     }
 
+    /// 悬浮卡片共用小件：标题 / 键值行 / 正文行（深浅主题靠透明度区分，不写死颜色）。
+    fn tip_title(text: &str) -> Div {
+        div()
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(text.to_string())
+    }
+    fn tip_kv(label: &str, value: String) -> Div {
+        h_flex()
+            .gap_2()
+            .items_start()
+            .child(
+                div()
+                    .w(px(52.))
+                    .flex_shrink_0()
+                    .text_xs()
+                    .opacity(0.65)
+                    .child(label.to_string()),
+            )
+            .child(div().flex_1().min_w_0().text_xs().child(value))
+    }
+    fn tip_note(text: String) -> Div {
+        div().flex_1().min_w_0().text_xs().child(text)
+    }
+    /// “已索引 N 项”悬浮卡：标题 + 键值行 + 任务/告警/WAL 段（替代裸字符串拼接）。
+    /// Tooltip 容器自带 popover 底/边框/阴影，这里只管内容排版；
+    /// 颜色全部继承容器，层级靠字号/透明度区分，保证深浅主题都可用。
+    /// `warn` 为告警标题色（调用方从主题取）。
+    fn index_tooltip_card(tip: crate::footer_status::IndexTooltip, warn: Hsla) -> impl IntoElement {
+        v_flex()
+            .max_w(px(340.))
+            .gap_1()
+            .p_1()
+            .child(Self::tip_title("索引统计"))
+            .child(Self::tip_kv(
+                "统计范围",
+                "全部已索引位置，不代表已扫描所有磁盘".into(),
+            ))
+            .child(Self::tip_kv("更新频率", tip.freshness.clone()))
+            .child(Self::tip_kv(
+                "统计口径",
+                "含文件和目录，已扣删除项；尚不能拆分文件数和目录数".into(),
+            ))
+            .when_some(tip.scan.clone(), |v, scan| {
+                v.child(Self::tip_title("后台任务"))
+                    .child(Self::tip_note(scan))
+            })
+            .when_some(tip.alert.clone(), |v, alert| {
+                v.child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(warn)
+                        .child("需要注意"),
+                )
+                .child(Self::tip_note(alert))
+            })
+            .when_some(tip.wal_state.clone(), |v, state| {
+                v.child(Self::tip_title("后台写入（WAL）"))
+                    .child(Self::tip_kv("当前状态", state))
+                    .child(
+                        div()
+                            .text_xs()
+                            .opacity(0.8)
+                            .child("心跳 5 秒 fsync（KB 级）；256MB / 2 小时 / 100 万条做一次 fold；常态写入应接近 0"),
+                    )
+            })
+    }
+
+    /// 占用页悬浮卡：扫描管线的多行诊断串按已知行式分类展示。
+    /// 生产方字符串保持原样（测试与日志不受影响），未知行按正文直排。
+    fn usage_tooltip_card(scan: String, warn: Hsla) -> impl IntoElement {
+        let mut title = "占用详情".to_string();
+        let mut scope: Vec<String> = Vec::new();
+        let mut quality: Vec<String> = Vec::new();
+        let mut monitor: Vec<String> = Vec::new();
+        let mut generation: Option<String> = None;
+        let mut probe: Vec<String> = Vec::new();
+        let mut incomplete = false;
+        let mut english: Vec<String> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        for (i, raw) in scan.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if i == 0
+                && (line == "索引逻辑"
+                    || line == "索引可能滞后"
+                    || line == "缓存可能过期"
+                    || line.starts_with("正在")
+                    || line.starts_with("目录读取失败"))
+            {
+                title = line.to_string();
+                continue;
+            }
+            if line.starts_with("当前分页") || line.starts_with("当前层完整") {
+                scope.push(line.to_string());
+            } else if line.starts_with("元数据待验") {
+                quality.push(line.to_string());
+            } else if line.starts_with("监控") {
+                monitor.push(line.to_string());
+            } else if line.len() < 20
+                && line.starts_with('g')
+                && line[1..].chars().all(|c| c.is_ascii_digit())
+            {
+                generation = Some(line.to_string());
+            } else if line.contains("显示") && line.contains("请求") {
+                probe.push(line.to_string());
+            } else if line.ends_with("节点") {
+                probe.push(line.to_string());
+            } else if line.contains("次读取") {
+                probe.push(line.to_string());
+            } else if line.starts_with("后代数据未完整") {
+                incomplete = true;
+            } else if line.is_ascii() {
+                english.push(line.to_string());
+            } else {
+                notes.push(line.to_string());
+            }
+        }
+        let mut v = v_flex().max_w(px(360.)).gap_1().p_1();
+        v = v.child(Self::tip_title(&title));
+        if !scope.is_empty() {
+            v = v.child(Self::tip_note(scope.join("；")));
+        }
+        if !quality.is_empty() || !monitor.is_empty() {
+            let mut parts = quality;
+            parts.extend(monitor);
+            v = v.child(Self::tip_kv("数据质量", parts.join("；")));
+        }
+        if let Some(g) = generation {
+            v = v.child(Self::tip_kv("代数", g));
+        }
+        if !probe.is_empty() {
+            v = v.child(Self::tip_kv("探测", probe.join(" · ")));
+        }
+        if incomplete {
+            v = v.child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(warn)
+                    .child("后代数据未完整（有界预算/错误）"),
+            );
+        }
+        for n in notes {
+            v = v.child(Self::tip_note(n));
+        }
+        if !english.is_empty() {
+            v = v.child(Self::tip_title("原始详情（诊断）"));
+            v = v.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .opacity(0.65)
+                    .child(english.join("\n")),
+            );
+        }
+        v
+    }
+
     fn render_status_bar(&self, index: &IndexStatusView, cx: &mut Context<Self>) -> AnyElement {
         let tokens = Self::tokens(cx);
         if self.workspace.mode == ViewMode::Directory {
@@ -2898,88 +3063,101 @@ impl MainWindow {
                     .flex_1()
                     .min_w_0()
                     .text_ellipsis()
-                    .tooltip(move |window, cx| {
-                        gpui_kit::component::tooltip::Tooltip::new(left_detail.clone())
-                            .build(window, cx)
+                    .tooltip({
+                        let warn_color = tokens.warning;
+                        move |window, cx| {
+                            let tip_text = left_detail.clone();
+                            // 占用页的悬浮提示是扫描管线的多行诊断串：按已知行式
+                            // 分类成卡片（生产方字符串原样保留，测试与日志不受影响）。
+                            let card = if tip_text.lines().count() > 1 {
+                                Some(tip_text.clone())
+                            } else {
+                                None
+                            };
+                            match card.clone() {
+                                Some(t) => gpui_kit::component::tooltip::Tooltip::element(
+                                    move |_, _| Self::usage_tooltip_card(t.clone(), warn_color),
+                                )
+                                .build(window, cx),
+                                None => {
+                                    gpui_kit::component::tooltip::Tooltip::new(tip_text).build(window, cx)
+                                }
+                            }
+                        }
                     })
                     .child(left),
             )
-            .when(self.workspace.mode == ViewMode::Search, |v| {
-                let detail = footer.counts_tooltip();
-                let wal = footer.wal_label();
-                let tip = match &wal {
-                    Some(_) => format!("{detail}\n{}", footer.wal_tooltip()),
-                    None => detail.clone(),
-                };
-                v.child(
-                    h_flex()
-                        .id("footer-index-health")
-                        .items_center()
-                        .gap_2()
-                        .flex_shrink_0()
-                        .overflow_hidden()
-                        .text_xs()
-                        .whitespace_nowrap()
-                        .tooltip(move |window, cx| {
-                            gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-                        })
-                        .child(
-                            div()
-                                .id("footer-index-counts")
-                                .w(px(216.))
-                                .flex_shrink_0()
-                                .text_ellipsis()
-                                .overflow_hidden()
-                                .child(footer.counts_label()),
-                        )
-                        .when_some(wal, |v, label| {
-                            v.child(
-                                div()
-                                    .id("footer-wal-health")
-                                    .w(px(148.))
-                                    .flex_shrink_0()
-                                    .text_ellipsis()
-                                    .overflow_hidden()
-                                    .opacity(0.85)
-                                    .child(label),
-                            )
-                        }),
-                )
-            })
-            .when(self.workspace.mode == ViewMode::Search, |v| {
-                v.child(
-                    Button::new("background-scan-status")
-                        .ghost().icon(IconName::ChartPie)
-                        .w(px(28.)).h(px(24.)).px_0().flex_shrink_0()
-                        .accessibility_label("查看后台扫描")
-                        .disabled(!self.workspace.scanning)
-                        .tooltip(if self.workspace.scanning { self.workspace_scan_status() }
-                            else { "没有后台扫描".into() })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.workspace_switch(ViewMode::Usage, cx)
-                        })),
-                )
-            })
             .child(
-                Button::new("workspace-index-status")
-                    .ghost()
-                    .icon(Icon::default().path(if footer.warning() {
-                        "icons/circle-alert.svg"
-                    } else if footer.needs_details() {
-                        "icons/info.svg"
-                    } else {
-                        "icons/circle-check.svg"
-                    }))
-                    .w(px(108.)).flex_shrink_0()
-                    .label(footer.label())
+                div()
+                    .id("workspace-index-status")
+                    .accessibility_id("engine-status-pill")
+                    .aria_label("引擎状态和索引统计")
                     .h(px(24.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .rounded_md()
+                    .whitespace_nowrap()
+                    .text_xs()
                     .text_color(if footer.warning() {
                         tokens.warning
                     } else {
                         tokens.text_secondary
                     })
-                    .tooltip(footer.tooltip())
-                    .accessibility_label("引擎状态和索引统计"),
+                    .hover(|s| s.bg(tokens.surface))
+                    .child(
+                        Icon::default()
+                            .path(if footer.warning() {
+                                "icons/circle-alert.svg"
+                            } else if footer.needs_details() {
+                                "icons/info.svg"
+                            } else {
+                                "icons/circle-check.svg"
+                            })
+                            .w(px(14.))
+                            .h(px(14.)),
+                    )
+                    .child(if self.workspace.mode == ViewMode::Search {
+                        // 计数与状态并入同一钮：之前是“计数 + WAL 文 + 扫描图标 + 状态钮”四个元素。
+                        // WAL 文案已并入悬浮卡；扫描中时标签直接体现，点击跳占用页（原小图标按钮的行为）。
+                        let counts = footer.counts_label();
+                        if self.workspace.scanning {
+                            format!("正在扫描 · {counts}")
+                        } else {
+                            format!("{counts} · {}", footer.label())
+                        }
+                    } else {
+                        footer.label()
+                    })
+                    .tooltip({
+                        let tip_text = footer.tooltip();
+                        let mut card = footer.index_tooltip();
+                        if let Some(t) = card.as_mut() {
+                            if self.workspace.scanning {
+                                t.scan = Some(self.workspace_scan_status());
+                            }
+                        }
+                        let warn = tokens.warning;
+                        move |window, cx| {
+                            let tip_text = tip_text.clone();
+                            match card.clone() {
+                                Some(t) => gpui_kit::component::tooltip::Tooltip::element(
+                                    move |_, _| Self::index_tooltip_card(t.clone(), warn),
+                                )
+                                .build(window, cx),
+                                None => {
+                                    gpui_kit::component::tooltip::Tooltip::new(tip_text).build(window, cx)
+                                }
+                            }
+                        }
+                    })
+                    .when(self.workspace.scanning, |v| {
+                        v.on_click(cx.listener(|this, _, _, cx| {
+                            this.workspace_switch(ViewMode::Usage, cx)
+                        }))
+                    }),
             )
             .into_any_element()
     }
