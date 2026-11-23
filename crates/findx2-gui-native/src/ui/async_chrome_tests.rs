@@ -101,14 +101,20 @@ fn update_async_status_and_progress_have_permanent_reserved_rows() {
         "unsupported materials must be disabled up front, not fail silently");
     assert!(settings.contains("已回退纯色"),
         "a degraded switch must say so in the hint");
-    assert!(settings.contains("cx.windows()") && settings.contains(".update(cx, |_, window, _|"),
-        "DWM state lives per HWND: constructors alone only cover new windows");
+    // No cross-window loop: a window taken for dispatch cannot be updated
+    // from another handler, so each window converges its own HWND in render.
+    assert!(!settings.contains("cx.windows()"),
+        "material must not enumerate windows from a dispatch handler");
+    assert!(settings.contains("applied_material: None")
+        && settings.contains("self.applied_material != Some(material)"),
+        "settings window must converge its own backdrop in render");
     assert!(settings.contains("apply_to_window(window, material, dark)"),
-        "material switch must reach the DWM applier with the theme tint");
+        "render convergence must reach the DWM applier with the theme tint");
 
     let main = include_str!("main_window.rs");
-    assert!(main.contains("apply_to_window(window, material, dark)"),
-        "main window must start with the saved backdrop before first paint");
+    assert!(main.contains("applied_material: None")
+        && main.contains("self.applied_material != Some(material)"),
+        "main window must converge its own backdrop in render, not via handles");
     assert!(main.contains(".when(solid_root, |v| v.bg(tokens.bg))"),
         "main root must skip its opaque background for materials");
 

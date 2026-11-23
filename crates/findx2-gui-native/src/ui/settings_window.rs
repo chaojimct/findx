@@ -129,6 +129,8 @@ pub struct SettingsWindow {
     theme: UiThemePref,
     material: crate::window_material::WindowMaterial,
     material_opacity: Entity<SliderState>,
+    /// See `MainWindow::applied_material`: render converges the backdrop.
+    applied_material: Option<crate::window_material::WindowMaterial>,
     search_limit: Entity<InputState>,
     save_interval: Entity<InputState>,
     nav_search: Entity<InputState>,
@@ -189,15 +191,8 @@ impl SettingsWindow {
         initial_tab: Option<&str>,
     ) -> Self {
         let style = session.read(cx).prefs.theme_style;
+        let material = session.read(cx).prefs.window_material;
         let (settings, theme) = session.read_with(cx, |s, _| (s.settings.clone(), s.prefs.theme));
-        // New OS windows start with the saved backdrop before first paint.
-        let (material, dark) = session.read_with(cx, |s, _| {
-            (
-                s.prefs.window_material,
-                s.effective_theme().is_dark(),
-            )
-        });
-        crate::window_material::apply_to_window(window, material, dark);
         let search_limit = cx
             .new(|cx| InputState::new(window, cx).default_value(settings.search_limit.to_string()));
         let save_interval = cx.new(|cx| {
@@ -244,6 +239,7 @@ impl SettingsWindow {
             theme,
             material,
             material_opacity: material_opacity.clone(),
+            applied_material: None,
             search_limit: search_limit.clone(),
             save_interval: save_interval.clone(),
             nav_search: nav_search.clone(),
@@ -460,50 +456,24 @@ impl SettingsWindow {
         crate::session::persist_prefs(self.session.read(cx).prefs.clone(), cx);
     }
 
-    /// Apply a backdrop instantly to every open window: session, live DWM
-    /// state, and disk, no draft. Mirrors `apply_theme_now`.
+    /// Switch the saved material: session, theme, and disk, no draft.
+    /// Every open window converges itself on its next render (see
+    /// `applied_material`): a cross-window update cannot touch a window
+    /// mid-dispatch, so the loop over handles is gone. Mirrors
+    /// `apply_theme_now`.
     fn set_material(
         &mut self,
         material: crate::window_material::WindowMaterial,
         cx: &mut Context<Self>,
     ) {
         self.material = material;
-        let dark = self
-            .session
-            .read_with(cx, |s, _| s.effective_theme().is_dark());
         self.session.update(cx, |s, cx| {
             s.prefs.window_material = material;
             s.apply_theme(cx);
             cx.notify();
         });
         crate::session::persist_prefs(self.session.read(cx).prefs.clone(), cx);
-        // Backdrops live per HWND: constructors only cover newly opened
-        // windows, so re-apply to every live one here.
-        let handles = cx.windows();
-        crate::window_material::trace(&format!(
-            "set_material {material:?}: updating {} window(s)",
-            handles.len()
-        ));
-        let mut effective = material;
-        for handle in handles {
-            match handle.update(cx, |_, window, _| {
-                crate::window_material::apply_to_window(window, material, dark)
-            }) {
-                Ok(applied) => {
-                    crate::window_material::trace(&format!(
-                        "window updated -> {applied:?}"
-                    ));
-                    if applied != material {
-                        effective = applied;
-                    }
-                }
-                Err(e) => {
-                    crate::window_material::trace(&format!("window update FAILED: {e:?}"));
-                    effective = crate::window_material::WindowMaterial::Solid;
-                }
-            }
-        }
-        if effective != material {
+        if !crate::window_material::os_support().supports(material) {
             self.hint = SharedString::from(format!(
                 "当前系统不支持「{}」，已回退纯色。",
                 material.label()
@@ -676,6 +646,19 @@ fn theme_auto_check_placeholder() -> bool {
 
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Same convergence as the main window (see
+        // `MainWindow::applied_material`): render runs inside this window,
+        // so it can always touch its own HWND.
+        let (material, dark) = self.session.read_with(cx, |s, _| {
+            (
+                s.prefs.window_material,
+                s.effective_theme().is_dark(),
+            )
+        });
+        if self.applied_material != Some(material) {
+            self.applied_material =
+                Some(crate::window_material::apply_to_window(window, material, dark));
+        }
         let tokens = Self::tokens(cx);
         let roots = self.session.read(cx).available_roots.clone();
         let nav_query = self.nav_search.read(cx).value().to_string();

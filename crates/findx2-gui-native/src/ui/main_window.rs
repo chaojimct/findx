@@ -225,6 +225,10 @@ pub struct MainWindow {
     page_error: bool,
     _page_task: Option<Task<()>>,
     session: Entity<AppSession>,
+    /// Backdrop actually applied to this window's HWND. Render converges
+    /// it toward prefs: cross-window updates cannot touch a window that is
+    /// mid-dispatch, so each window reconciles itself.
+    applied_material: Option<crate::window_material::WindowMaterial>,
     search: Entity<InputState>,
     search_scope: Option<std::path::PathBuf>,
     global_search: Option<SearchSnapshot>,
@@ -348,14 +352,8 @@ impl MainWindow {
 
     pub fn new(session: Entity<AppSession>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.bind_keys(main_key_bindings());
-        // New OS windows start with the saved backdrop before first paint.
-        let (material, dark) = session.read_with(cx, |s, _| {
-            (
-                s.prefs.window_material,
-                s.effective_theme().is_dark(),
-            )
-        });
-        crate::window_material::apply_to_window(window, material, dark);
+        // The first render converges the saved backdrop (see
+        // `applied_material`); that single mechanism owns DWM state.
         // Saved user shortcuts are applied on top of the factory bindings.
         let saved_bindings = session.read(cx).prefs.key_bindings.clone();
         crate::keybindings::apply(&saved_bindings, cx);
@@ -437,6 +435,7 @@ impl MainWindow {
             page_error: false,
             _page_task: None,
             session: session.clone(),
+            applied_material: None,
             search: search.clone(),
             search_scope: None,
             global_search: None,
@@ -2169,6 +2168,20 @@ selectedIndex={}  results={}\n\
 
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Each window converges its own backdrop: a cross-window update
+        // cannot touch a window mid-dispatch (its state is taken out of the
+        // map), but render always runs inside its own window. DWM is only
+        // touched when prefs actually changed.
+        let (material, dark) = self.session.read_with(cx, |s, _| {
+            (
+                s.prefs.window_material,
+                s.effective_theme().is_dark(),
+            )
+        });
+        if self.applied_material != Some(material) {
+            self.applied_material =
+                Some(crate::window_material::apply_to_window(window, material, dark));
+        }
         if crate::installer_health::active() {
             let session=self.session.read(cx);
             crate::installer_health::rendered(window,session.prefs.clone(),session.settings.clone());
