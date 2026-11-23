@@ -1,0 +1,17 @@
+[package]
+name = "findx2-content"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "findx2 全文内容索引 M0 PoC：文本抽取 + tantivy 倒排（与文件名索引解耦）"
+
+[dependencies]
+tantivy = "0.27"
+tantivy-jieba = "0.21"
+encoding_rs = "0.8"
+parking_lot = "0.12"
+thiserror = "1"
+memmap2 = "0.9"
+
+[dev-dependencies]
+tempfile = "3"

@@ -8,6 +8,7 @@ members = [
     "crates/findx2-macos",
     "crates/findx2-ipc",
     "crates/findx2-service",
+    "crates/findx2-content",
     "crates/findx2-gui-native",
 ]
 
