@@ -592,6 +592,7 @@ impl MainWindow {
                                 div()
                                     .flex_1()
                                     .min_w_0()
+                                    .whitespace_nowrap()
                                     .text_size(px(12.))
                                     .text_ellipsis()
                                     .overflow_hidden()

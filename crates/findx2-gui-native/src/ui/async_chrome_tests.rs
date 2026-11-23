@@ -294,6 +294,9 @@ fn usage_toolbar_icon_slots_and_depth_value_are_compact_and_stable() {
         "double-click on the empty strip must open a new tab");
     assert!(tabs.contains("cx.stop_propagation()"),
         "tab handlers must stop the strip-level double-click");
+    assert!(tabs.contains(".whitespace_nowrap()") && tabs.contains(".text_ellipsis()"),
+        "tab titles must never wrap (e.g. the trailing 's' in Documents) - \
+         ellipsis alone does not stop line breaking");
 }
 
 #[test] fn shortcuts_page_is_editable_and_persists_overrides() {
