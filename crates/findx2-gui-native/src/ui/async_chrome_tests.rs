@@ -82,6 +82,21 @@ fn update_async_status_and_progress_have_permanent_reserved_rows() {
         "appearance tab must render one button per material");
     assert!(settings.contains("fn set_material"),
         "switching must persist + repaint + re-apply to every live window");
+    // The full-window root background would cover any backdrop, so it is
+    // only painted for solid; inner panes keep their own backgrounds.
+    // (Whitespace-compacted: working copies check out CRLF.)
+    let compact_settings: String = settings.split_whitespace().collect();
+    assert!(compact_settings.contains("Solid,|v|v.bg(tokens.bg)"),
+        "settings root must skip its opaque background for materials");
+    // Opacity slider: drag repaints live, release persists.
+    assert!(settings.contains("material_opacity: Entity<SliderState>"),
+        "slider state must live on the settings view");
+    assert!(settings.contains("Slider::new(&self.material_opacity)"),
+        "appearance card must render the opacity slider");
+    assert!(settings.contains("SliderEvent::Change") && settings.contains("SliderEvent::Release"),
+        "drags repaint live, only releases touch the disk");
+    assert!(mat.contains("clamp_opacity"),
+        "slider range must be clamped to a usable band");
     assert!(settings.contains(".disabled(!support.supports(material))"),
         "unsupported materials must be disabled up front, not fail silently");
     assert!(settings.contains("已回退纯色"),
@@ -94,14 +109,16 @@ fn update_async_status_and_progress_have_permanent_reserved_rows() {
     let main = include_str!("main_window.rs");
     assert!(main.contains("apply_to_window(window, material, dark)"),
         "main window must start with the saved backdrop before first paint");
+    assert!(main.contains(".when(solid_root, |v| v.bg(tokens.bg))"),
+        "main root must skip its opaque background for materials");
 
     let session = include_str!("../session.rs");
     assert!(session.contains("apply_material_translucency"),
         "theme application must add translucent chrome for materials");
     let theme = include_str!("../theme.rs");
-    assert!(theme.contains("c.title_bar = dim(")
-        && theme.contains("c.sidebar = dim(")
-        && theme.contains("c.status_bar = dim("),
+    assert!(theme.contains("c.title_bar = set(")
+        && theme.contains("c.sidebar = set(")
+        && theme.contains("c.status_bar = set("),
         "only frame surfaces go translucent; content stays opaque");
     assert!(theme.contains("cfg!(windows)"),
         "without a compositor backdrop the alpha would only dull colors");

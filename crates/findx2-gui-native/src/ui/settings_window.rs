@@ -9,6 +9,7 @@ use gpui_kit::component::switch::Switch;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::slider::{Slider, SliderEvent, SliderState, SliderValue};
 use gpui_kit::component::{Disableable as _, Selectable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -127,6 +128,7 @@ pub struct SettingsWindow {
     settings: FindxGuiSettings,
     theme: UiThemePref,
     material: crate::window_material::WindowMaterial,
+    material_opacity: Entity<SliderState>,
     search_limit: Entity<InputState>,
     save_interval: Entity<InputState>,
     nav_search: Entity<InputState>,
@@ -216,6 +218,15 @@ impl SettingsWindow {
         let nav_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder("搜索设置项…")
         });
+        let saved_opacity =
+            crate::window_material::clamp_opacity(session.read(cx).prefs.material_opacity);
+        let material_opacity = cx.new(|_| {
+            SliderState::new()
+                .min(25.)
+                .max(100.)
+                .step(1.)
+                .default_value(saved_opacity * 100.)
+        });
 
         let mut this = Self {
             embedded,
@@ -232,6 +243,7 @@ impl SettingsWindow {
             settings,
             theme,
             material,
+            material_opacity: material_opacity.clone(),
             search_limit: search_limit.clone(),
             save_interval: save_interval.clone(),
             nav_search: nav_search.clone(),
@@ -296,6 +308,15 @@ impl SettingsWindow {
                 }
             }),
         );
+        // Opacity drags repaint live; only the release touches the disk.
+        this._subscriptions.push(cx.subscribe_in(
+            &this.material_opacity,
+            window,
+            |this, _, event: &SliderEvent, _, cx| match event {
+                SliderEvent::Change(value) => this.preview_opacity(*value, cx),
+                SliderEvent::Release(value) => this.commit_opacity(*value, cx),
+            },
+        ));
         this._subscriptions.push(
             cx.subscribe_in(&this.excluded, window, |this, _, ev, _, cx| {
                 if let InputEvent::Change = ev {
@@ -413,6 +434,30 @@ impl SettingsWindow {
 
     fn set_theme(&mut self, pref: UiThemePref, cx: &mut Context<Self>) {
         self.apply_theme_now(self.style, pref, cx);
+    }
+
+    /// Slider drags repaint the chrome live; only the release writes to disk.
+    fn preview_opacity(&mut self, value: SliderValue, cx: &mut Context<Self>) {
+        let SliderValue::Single(percent) = value else {
+            return;
+        };
+        let opacity = crate::window_material::clamp_opacity(percent / 100.);
+        if (opacity - self.session.read(cx).prefs.material_opacity).abs() < f32::EPSILON
+        {
+            return;
+        }
+        self.session.update(cx, |s, cx| {
+            s.prefs.material_opacity = opacity;
+            s.apply_theme(cx);
+            cx.notify();
+        });
+        cx.refresh_windows();
+        cx.notify();
+    }
+
+    fn commit_opacity(&mut self, value: SliderValue, cx: &mut Context<Self>) {
+        self.preview_opacity(value, cx);
+        crate::session::persist_prefs(self.session.read(cx).prefs.clone(), cx);
     }
 
     /// Apply a backdrop instantly to every open window: session, live DWM
@@ -901,7 +946,10 @@ impl Render for SettingsWindow {
                 let stroke = crate::keybindings::from_keystroke(&event.keystroke);
                 this.save_shortcut(&id, stroke, cx);
             }))
-            .bg(tokens.bg)
+            .when(
+                self.material == crate::window_material::WindowMaterial::Solid,
+                |v| v.bg(tokens.bg),
+            )
             .text_color(tokens.text_primary)
             .when(!self.embedded, |view| {
                 view.child(crate::ui::chrome::title_bar(
@@ -1196,6 +1244,28 @@ impl SettingsWindow {
                                     }))
                                 }),
                         ))
+                        .child(
+                            h_flex().gap_2().items_center().child(
+                                div().text_sm().text_color(tokens.text_secondary).child(
+                                    "背景不透明度",
+                                ),
+                            )
+                            .child(Slider::new(&self.material_opacity).flex_1().disabled(
+                                self.material
+                                    == crate::window_material::WindowMaterial::Solid,
+                            ))
+                            .child(
+                                div().w(px(44.)).text_sm().text_color(tokens.text_primary).child(
+                                    format!(
+                                        "{}%",
+                                        match self.material_opacity.read(cx).value() {
+                                            SliderValue::Single(v) => v as i32,
+                                            SliderValue::Range(_, end) => end as i32,
+                                        }
+                                    ),
+                                ),
+                            ),
+                        )
                         .child(settings_note(self.material.note(), tokens))
                         .child(settings_note(
                             if support.supports(

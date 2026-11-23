@@ -2252,6 +2252,12 @@ impl Render for MainWindow {
             client.surface.set_suppressed(!allowed);
         }
 
+        // A backdrop material needs the final pixel to stay translucent: the
+        // full-window root background is only painted for the solid material.
+        // Inner panes keep their own backgrounds (opaque content, dimmed
+        // chrome), so only the frame shows the backdrop through.
+        let solid_root = self.session.read(cx).prefs.window_material
+            == crate::window_material::WindowMaterial::Solid;
         v_flex()
             .id("findx-main")
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -2350,7 +2356,7 @@ impl Render for MainWindow {
                 }),
             )
             .overflow_hidden()
-            .bg(tokens.bg)
+            .when(solid_root, |v| v.bg(tokens.bg))
             .text_color(tokens.text_primary)
             .on_action(cx.listener(|this, _: &WorkspaceBack, window, cx| {
                 if !this.text_edit_active(window, cx) {

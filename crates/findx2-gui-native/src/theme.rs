@@ -322,26 +322,28 @@ pub fn apply_findx_style(style: ThemeStyle, appearance: EffectiveTheme, cx: &mut
 /// is a no-op: without a compositor backdrop the alpha would only dull colors.
 pub fn apply_material_translucency(
     material: crate::window_material::WindowMaterial,
+    opacity: f32,
     cx: &mut App,
 ) {
     if !(cfg!(windows) && material.translucent_chrome()) {
         return;
     }
-    fn dim(color: Hsla, keep: f32) -> Hsla {
+    let alpha = crate::window_material::clamp_opacity(opacity);
+    fn set(color: Hsla, alpha: f32) -> Hsla {
         Hsla {
-            a: (color.a * keep).clamp(0.0, 1.0),
+            a: (color.a * alpha).clamp(0.0, 1.0),
             ..color
         }
     }
     cx.update_global::<FindxTokens, _>(|t, _| {
-        t.title_bar = dim(t.title_bar, 0.55);
-        t.surface = dim(t.surface, 0.72);
+        t.title_bar = set(t.title_bar, alpha);
+        t.surface = set(t.surface, alpha);
     });
     Theme::update(cx, |theme| {
         let c = &mut theme.colors;
-        c.title_bar = dim(c.title_bar, 0.55);
-        c.sidebar = dim(c.sidebar, 0.72);
-        c.status_bar = dim(c.status_bar, 0.72);
+        c.title_bar = set(c.title_bar, alpha);
+        c.sidebar = set(c.sidebar, alpha);
+        c.status_bar = set(c.status_bar, alpha);
     });
 }
 

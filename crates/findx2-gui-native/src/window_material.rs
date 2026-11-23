@@ -124,6 +124,16 @@ fn os_build_number() -> Option<u32> {
     }
 }
 
+/// Chrome translucency for backdrop materials, shared by the settings slider
+/// and the theme hook. Solid ignores it entirely.
+pub fn clamp_opacity(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.25, 1.0)
+    } else {
+        0.7
+    }
+}
+
 /// Backdrop material of a top-level window. Stored in prefs; old files
 /// without the field deserialize to [`WindowMaterial::Solid`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,14 +233,40 @@ mod windows_impl {
     }
 
     fn set_attr(hwnd: HWND, attr: i32, value: u32) -> bool {
-        unsafe {
+        let result = unsafe {
             DwmSetWindowAttribute(
                 hwnd,
                 DWMWINDOWATTRIBUTE(attr),
                 &value as *const _ as *const _,
                 std::mem::size_of_val(&value) as u32,
             )
-            .is_ok()
+        };
+        let ok = result.is_ok();
+        eprintln!(
+            "[material] DwmSetWindowAttribute hwnd={:?} attr={} value={} ok={} err={:?}",
+            hwnd,
+            attr,
+            value,
+            ok,
+            result.err()
+        );
+        ok
+    }
+
+    fn read_backdrop(hwnd: HWND) -> String {
+        use windows::Win32::Graphics::Dwm::DwmGetWindowAttribute;
+        let mut value: u32 = 0xFFFF_FFFF;
+        let result = unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWINDOWATTRIBUTE(ATTR_SYSTEMBACKDROP),
+                &mut value as *mut _ as *mut _,
+                std::mem::size_of_val(&value) as u32,
+            )
+        };
+        match result {
+            Ok(()) => format!("ok=true value={}", value),
+            Err(e) => format!("ok=false err={:?} value={}", e, value),
         }
     }
 
@@ -307,9 +343,31 @@ mod windows_impl {
     /// Returns the material that actually stuck; anything unsupported
     /// degrades to solid so the UI can say so instead of failing silently.
     pub fn apply(window: &Window, material: Material, dark: bool) -> Material {
-        use super::{OsBackdropSupport, probe_os_support};
+        let effective = apply_inner(window, material, dark);
+        if let Some(hwnd) = hwnd_of(window) {
+            eprintln!(
+                "[material] effective={:?} readback=[{}]",
+                effective,
+                read_backdrop(hwnd)
+            );
+        }
+        effective
+    }
+
+    fn apply_inner(window: &Window, material: Material, dark: bool) -> Material {
+        use super::probe_os_support;
         let support = probe_os_support();
+        eprintln!(
+            "[material] apply requested={:?} dark={} build={} sys={} micafx={} legacy={}",
+            material,
+            dark,
+            support.build,
+            support.system_backdrop,
+            support.mica_effect,
+            support.legacy_acrylic
+        );
         let Some(hwnd) = hwnd_of(window) else {
+            eprintln!("[material] no HWND, staying solid");
             return Material::Solid;
         };
         // Skip calls the OS cannot honor; every remaining setter below is
@@ -428,6 +486,15 @@ mod tests {
         ] {
             assert!(win11_22h2.supports(material));
         }
+    }
+
+    #[test]
+    fn opacity_clamp_keeps_chrome_usable() {
+        assert_eq!(clamp_opacity(0.7), 0.7);
+        assert_eq!(clamp_opacity(0.0), 0.25);
+        assert_eq!(clamp_opacity(2.0), 1.0);
+        assert_eq!(clamp_opacity(f32::NAN), 0.7);
+        assert_eq!(clamp_opacity(f32::INFINITY), 0.7);
     }
 
     #[test]

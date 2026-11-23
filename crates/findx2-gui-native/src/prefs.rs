@@ -55,12 +55,19 @@ pub struct LocalPrefs {
     pub last_official_update_check_unix: i64,
     #[serde(default)]
     pub window_material: crate::window_material::WindowMaterial,
+    /// Chrome translucency for backdrop materials, 0.25..=1.0. Solid ignores it.
+    #[serde(default = "default_material_opacity")]
+    pub material_opacity: f32,
 }
 
 fn default_usage_depth()->usize{3}
 
 fn default_true() -> bool {
     true
+}
+
+fn default_material_opacity() -> f32 {
+    0.7
 }
 
 impl Default for LocalPrefs {
@@ -88,6 +95,7 @@ impl Default for LocalPrefs {
             browser_column_widths: None,
             last_official_update_check_unix: 0,
             window_material: crate::window_material::WindowMaterial::default(),
+            material_opacity: default_material_opacity(),
         }
     }
 }
