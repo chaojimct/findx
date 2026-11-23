@@ -32,6 +32,43 @@ fn update_async_status_and_progress_have_permanent_reserved_rows() {
     assert!(src.contains("id(\"update-status\").h(px(20.))"));
     assert!(src.contains("id(\"update-progress\").h(px(20.))"));
     assert!(src.contains(".w(px(192.))"));
+    // The bar row itself is permanent; only the fill is conditional.
+    assert!(src.contains("id(\"update-progress-bar\")"));
+    assert!(src.contains(".h(px(12.))"));
+    assert!(src.contains("Progress::new(\"update-progress-fill\")"));
+}
+
+#[test] fn update_install_is_observable_and_honest() {
+    let logic = include_str!("../update_logic.rs");
+    // P2: the installer must show its own progress window, never go fully dark.
+    assert!(logic.contains("/SILENT /SUPPRESSMSGBOXES /NORESTART"));
+    assert!(!logic.contains("VERYSILENT"),
+        "VERYSILENT hides the installer window; install progress would be invisible again");
+    // P1: fire-and-forget ShellExecuteW is gone; the GUI waits on the process.
+    assert!(!logic.contains("ShellExecuteW("),
+        "launch must return a process handle via ShellExecuteExW");
+    assert!(logic.contains("ShellExecuteExW") && logic.contains("SEE_MASK_NOCLOSEPROCESS"),
+        "installer launch must hand back a waitable process");
+    assert!(logic.contains("WaitForSingleObject") && logic.contains("GetExitCodeProcess"),
+        "the GUI must observe installer exit instead of guessing");
+    assert!(logic.contains("run_setup_and_wait") && logic.contains("SetupOutcome"),
+        "stages and terminal states must be explicit, not a static hint");
+    assert!(logic.contains("SETUP_ROLLBACK_EXIT_CODE") && logic.contains("installed_version_matches"),
+        "exit 80 is rollback-not-success; exit 0 still needs the version flip");
+    assert!(logic.contains("InstallStage::Launching") && logic.contains("InstallStage::Running")
+        && logic.contains("InstallStage::Verifying"),
+        "installing card must narrate launch/running/verify");
+
+    let pages = include_str!("settings_window.rs");
+    assert!(pages.contains("run_setup_and_wait") && pages.contains("SETUP_WAIT_TIMEOUT"),
+        "install must wait on a bounded budget, never kill the installer");
+    assert!(pages.contains("SetupOutcome::Committed") && pages.contains("SetupOutcome::RolledBack")
+        && pages.contains("SetupOutcome::Failed") && pages.contains("SetupOutcome::Timeout"),
+        "every terminal state needs its own hint, not one static line");
+
+    let card = include_str!("update_card.rs");
+    assert!(card.contains(".loading("),
+        "install bar must be indeterminate: Inno owns the copy loop");
 }
 #[test]
 fn settings_identification_keeps_permanent_rows_and_diagnostics_viewport() {

@@ -21,9 +21,9 @@ use crate::settings_logic::{
 };
 use crate::theme::{FindxTokens, ThemeStyle};
 use crate::ui::update_card::{UpdateCardState, render_update_card};
-use crate::update_logic::{
-    UpdatePhase, derive_update_phase, should_auto_check, start_silent_setup,
-};
+use crate::update_logic::{UpdatePhase, derive_update_phase, should_auto_check};
+#[cfg(not(windows))]
+use crate::update_logic::start_silent_setup;
 
 // A changing hint uses one reserved line; the complete text remains accessible
 // by tooltip instead of wrapping and moving the controls beneath it.
@@ -1907,42 +1907,111 @@ impl SettingsWindow {
         };
         self.session.update(cx, |s, _| {
             s.update_state.busy = true;
+            s.update_state.install_stage =
+                Some(crate::update_logic::InstallStage::Launching);
         });
         self.hint = "正在安装更新；请确认系统提权提示。取消会保留当前安装。".into();
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move { start_silent_setup(std::path::Path::new(&path)) })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.session.update(cx, |s, _| {
-                    s.update_state.busy = false;
+        #[cfg(windows)]
+        {
+            use crate::update_logic::{SETUP_WAIT_TIMEOUT, SetupOutcome, run_setup_and_wait};
+            let expected = self
+                .session
+                .read(cx)
+                .update_state
+                .info
+                .as_ref()
+                .and_then(|i| i.latest_version.clone())
+                .unwrap_or_default();
+            let (tx, rx) = std::sync::mpsc::channel();
+            cx.spawn(async move |this, cx| {
+                let worker = std::thread::spawn(move || {
+                    run_setup_and_wait(
+                        std::path::Path::new(&path),
+                        &expected,
+                        |stage| {
+                            let _ = tx.send(stage);
+                        },
+                        SETUP_WAIT_TIMEOUT,
+                    )
                 });
+                loop {
+                    while let Ok(stage) = rx.try_recv() {
+                        let _ = this.update(cx, |this, cx| {
+                            this.session.update(cx, |session, cx| {
+                                session.update_state.install_stage = Some(stage);
+                                cx.notify();
+                            });
+                        });
+                    }
+                    if worker.is_finished() {
+                        break;
+                    }
+                    cx.background_spawn(async {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    })
+                    .await;
+                }
+                let outcome = worker
+                    .join()
+                    .unwrap_or_else(|_| SetupOutcome::Failed("安装线程异常退出。".into()));
+                let _ = this.update(cx, |this, cx| {
+                    this.session.update(cx, |s, _| {
+                        s.update_state.busy = false;
+                        s.update_state.install_stage = None;
+                    });
+                    // Note: in the normal path the elevated installer asks
+                    // this GUI to exit before copying files, so these hints
+                    // are mostly seen on fast failures (UAC declined, Prepare
+                    // refusal, rollback). Completion restarts the new build.
+                    this.hint = match outcome {
+                        SetupOutcome::Committed => {
+                            "安装完成如未自动重启请手动重新打开 FindX。".into()
+                        }
+                        SetupOutcome::RolledBack => {
+                            "安装已回滚本次未改动可重试或手动安装。".into()
+                        }
+                        SetupOutcome::Failed(e) => format!("安装未完成：{e}").into(),
+                        SetupOutcome::Timeout => {
+                            "安装程序仍在运行请在安装程序窗口中确认完成。".into()
+                        }
+                    };
+                    cx.notify();
+                });
+            })
+            .detach();
+            return;
+        }
+        #[cfg(not(windows))]
+        {
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_spawn(async move {
+                        start_silent_setup(std::path::Path::new(&path))
+                    })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.session.update(cx, |s, _| {
+                        s.update_state.busy = false;
+                        s.update_state.install_stage = None;
+                    });
                 match result {
                     Ok(()) => {
-                        #[cfg(unix)]
-                        {
-                            let launch = if cfg!(target_os = "macos") {
-                                std::process::Command::new("/usr/bin/open")
-                                    .args(["-n", "/Applications/FindX.app"])
-                                    .spawn()
-                            } else {
-                                std::process::Command::new("/opt/FindX/FindX").spawn()
-                            };
-                            match launch {
-                                Ok(_) => cx.quit(),
-                                Err(e) => {
-                                    this.hint = format!(
-                                        "更新已安装，但重新启动失败：{e}。请手动重新打开 FindX。"
-                                    )
-                                    .into();
-                                }
+                        let launch = if cfg!(target_os = "macos") {
+                            std::process::Command::new("/usr/bin/open")
+                                .args(["-n", "/Applications/FindX.app"])
+                                .spawn()
+                        } else {
+                            std::process::Command::new("/opt/FindX/FindX").spawn()
+                        };
+                        match launch {
+                            Ok(_) => cx.quit(),
+                            Err(e) => {
+                                this.hint = format!(
+                                    "更新已安装，但重新启动失败：{e}。请手动重新打开 FindX。"
+                                )
+                                .into();
                             }
-                        }
-                        #[cfg(windows)]
-                        {
-                            this.hint =
-                                "已启动安装程序，请确认 UAC；安装器完成后重新打开应用。".into();
                         }
                     }
                     Err(e) => {
@@ -1953,6 +2022,7 @@ impl SettingsWindow {
             });
         })
         .detach();
+        }
     }
 
     fn render_about(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> impl IntoElement {

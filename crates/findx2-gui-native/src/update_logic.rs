@@ -3,8 +3,10 @@
 //! Channel matches the retired 2.4.10 client: `GET https://api.github.com/repos/chaojimct/findx/releases/latest`
 //! (non-draft, non-prerelease), compare tag semver, then pick the official
 //! asset for the running platform:
-//! - Windows: `FindX-*-setup.exe`, installed with `ShellExecute` `runas`
-//!   `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`
+//! - Windows: `FindX-*-setup.exe`, launched with `ShellExecuteEx` `runas`
+//!   `/SILENT /SUPPRESSMSGBOXES /NORESTART` so Inno shows its own file-copy
+//!   progress window; the GUI additionally waits on the installer process and
+//!   reports launch/running/verify stages on the About card.
 //! - Linux: `FindX-*-linux-x64.deb` (preferred when the current install is a
 //!   `.deb`) or `FindX-*-linux-x64.tar.gz`, installed with `pkexec`/`sudo`
 //! - macOS: `FindX-*-macos-aarch64.dmg` or `FindX-*-macos-x64.dmg`, copied
@@ -22,7 +24,19 @@ pub const GITHUB_REPO: &str = "findx";
 pub const LATEST_API_URL: &str = "https://api.github.com/repos/chaojimct/findx/releases/latest";
 pub const USER_AGENT_CHECK: &str = "FindX2-GUI-UpdateCheck";
 pub const USER_AGENT_DOWNLOAD: &str = "FindX2-GUI-UpdateDownload";
-pub const SILENT_SETUP_ARGS: &str = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART";
+/// Inno flags for an in-app update. `/SILENT` keeps the
+/// installer's own progress window visible so the file-copy phase is no
+/// longer a black box; message boxes stay suppressed and no reboot happens.
+pub const SILENT_SETUP_ARGS: &str = "/SILENT /SUPPRESSMSGBOXES /NORESTART";
+/// Exit code the FindX installer reports when the upgrade transaction was
+/// started but not committed (rolled back, nothing changed). Mirrors
+/// `GetCustomSetupExitCode` in `installer/FindX.iss`; never treat it as success.
+pub const SETUP_ROLLBACK_EXIT_CODE: u32 = 80;
+/// Registry value name holding the installed version under the uninstall key.
+pub const UNINSTALL_DISPLAY_VERSION: &str = "DisplayVersion";
+/// Uninstall registry key (without the `HKLM\...\Uninstall\` prefix) of the
+/// official FindX product. Used to confirm a version flip after setup exits.
+pub const FINDX_UNINSTALL_KEY: &str = "{7E8A9B0C-1D2E-3F4A-5B6C-7D8E9F0A1B2C}_is1";
 pub const AUTO_CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const NOTES_LIMIT: usize = 600;
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(200);
@@ -168,12 +182,41 @@ pub struct UpdateProgress {
     pub percent: f32,
 }
 
+/// Observable stage of the install phase. The elevated transaction root is
+/// intentionally unreadable from this medium-integrity process, so stages
+/// come from the installer process itself (launched / still running /
+/// exited and being verified), never from polling private transaction files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallStage {
+    Launching,
+    Running,
+    Verifying,
+}
+
+impl InstallStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Launching => "已启动安装程序等待系统提权确认…",
+            Self::Running => "正在安装请不要关闭安装程序窗口…",
+            Self::Verifying => "安装程序已退出正在确认安装结果…",
+        }
+    }
+
+    /// Determinate progress is impossible here (Inno owns the copy loop),
+    /// so the card shows an indeterminate bar for every install stage.
+    pub fn bar_percent(self) -> Option<f32> {
+        let _ = self;
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct OfficialUpdateState {
     pub busy: bool,
     pub info: Option<UpdateInfo>,
     pub progress: Option<UpdateProgress>,
     pub downloaded_path: Option<String>,
+    pub install_stage: Option<InstallStage>,
 }
 
 pub fn updater_allowed(official_product: bool) -> bool {
@@ -233,6 +276,13 @@ pub fn format_asset_size(bytes: u64) -> String {
     }
 }
 
+/// Progress bar for the About update card. `percent` is `None` for an
+/// indeterminate (loading) bar, `Some(0..=100)` for a determinate one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CardProgressBar {
+    pub percent: Option<f32>,
+}
+
 /// View-model for the About update card. Official and isolated copy are
 /// decided here so tests can assert enablement without driving GPUI.
 #[derive(Debug, Clone, PartialEq)]
@@ -246,6 +296,7 @@ pub struct UpdateCardModel {
     pub auto_check_label: String,
     pub status: Option<String>,
     pub progress_text: Option<String>,
+    pub progress_bar: Option<CardProgressBar>,
 }
 
 pub fn update_card_model(
@@ -266,6 +317,7 @@ pub fn update_card_model(
             auto_check_label: "自动检查更新".into(),
             status: None,
             progress_text: None,
+            progress_bar: None,
         };
     }
     let phase = derive_update_phase(
@@ -275,7 +327,7 @@ pub fn update_card_model(
         state.downloaded_path.as_deref(),
     );
     let mut body =
-        "从 GitHub Releases 检查正式版本，下载 FindX 安装包后以管理员权限静默安装。".to_string();
+        "从 GitHub Releases 检查正式版本，下载 FindX 安装包后以管理员权限安装（会显示安装程序进度窗口）。".to_string();
     let mut status = phase.label().map(|s| s.to_string());
     if let Some(info) = state.info.as_ref() {
         if let Some(err) = info.error.as_ref() {
@@ -304,14 +356,28 @@ pub fn update_card_model(
             }
         }
     }
-    let progress_text = state.progress.as_ref().map(|p| {
-        format!(
-            "已下载 {} / {}（{:.0}%）",
-            format_asset_size(p.downloaded),
-            format_asset_size(p.total),
-            p.percent
-        )
-    });
+    // During install the stale 100% download text would be misleading; the
+    // install stage owns the progress line instead.
+    let (progress_text, progress_bar) = if matches!(phase, UpdatePhase::Installing) {
+        let text = state
+            .install_stage
+            .map(|s| s.label().to_string())
+            .unwrap_or_else(|| "正在安装…".into());
+        (Some(text), Some(CardProgressBar { percent: None }))
+    } else {
+        let text = state.progress.as_ref().map(|p| {
+            format!(
+                "已下载 {} / {}（{:.0}%）",
+                format_asset_size(p.downloaded),
+                format_asset_size(p.total),
+                p.percent
+            )
+        });
+        let bar = state.progress.as_ref().map(|p| CardProgressBar {
+            percent: Some(p.percent.clamp(0.0, 100.0)),
+        });
+        (text, bar)
+    };
     let missing_platform_asset = matches!(phase, UpdatePhase::Available)
         && state
             .info
@@ -336,6 +402,7 @@ pub fn update_card_model(
         auto_check_label: "自动检查更新".into(),
         status,
         progress_text,
+        progress_bar,
     }
 }
 
@@ -1190,10 +1257,213 @@ pub fn macos_install_plan(path: &Path) -> Result<InstallPlan, String> {
     })
 }
 
+/// Outcome of waiting on the elevated installer process (Windows only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupOutcome {
+    /// Installer exited 0 and the uninstall entry reports the new version.
+    Committed,
+    /// Installer exited with [`SETUP_ROLLBACK_EXIT_CODE`]: rolled back,
+    /// nothing was changed.
+    RolledBack,
+    /// Launch failed, the installer exited non-zero, or the installed
+    /// version did not flip to the expected one.
+    Failed(String),
+    /// Still running past the wait budget. The installer is never killed;
+    /// the user finishes in the installer's own progress window.
+    Timeout,
+}
+
+/// How long the GUI waits on the installer process before it stops watching.
+/// Copy + Verify/Commit of a ~100MB payload takes a few minutes; 15 minutes
+/// covers slow disks while UAC left unconfirmed still resolves as Timeout.
+#[cfg(windows)]
+pub const SETUP_WAIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Whether the registered uninstall entry already reports `expected`.
+/// Read-only (`KEY_READ`); never touches transaction state.
+#[cfg(windows)]
+pub fn installed_version_matches(expected: &str) -> bool {
+    read_installed_display_version().is_some_and(|v| v.trim() == expected.trim())
+}
+
+#[cfg(windows)]
+fn read_installed_display_version() -> Option<String> {
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+    };
+    use windows::core::PCWSTR;
+    let sub: Vec<u16> = format!(
+        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{FINDX_UNINSTALL_KEY}"
+    )
+    .encode_utf16()
+    .chain(Some(0))
+    .collect();
+    let mut hkey = Default::default();
+    let rc = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(sub.as_ptr()),
+            None,
+            KEY_READ,
+            &mut hkey,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return None;
+    }
+    let name: Vec<u16> = UNINSTALL_DISPLAY_VERSION
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let mut ty = REG_SZ;
+    let mut size: u32 = 0;
+    let rc = unsafe {
+        RegQueryValueExW(
+            hkey,
+            PCWSTR(name.as_ptr()),
+            None,
+            Some(&mut ty),
+            None,
+            Some(&mut size),
+        )
+    };
+    if rc != ERROR_SUCCESS || size == 0 || size > 256 {
+        let _ = unsafe { RegCloseKey(hkey) };
+        return None;
+    }
+    let mut buf = vec![0u8; size as usize];
+    let rc = unsafe {
+        RegQueryValueExW(
+            hkey,
+            PCWSTR(name.as_ptr()),
+            None,
+            Some(&mut ty),
+            Some(buf.as_mut_ptr()),
+            Some(&mut size),
+        )
+    };
+    let _ = unsafe { RegCloseKey(hkey) };
+    if rc != ERROR_SUCCESS {
+        return None;
+    }
+    buf.truncate(size as usize);
+    let wide: Vec<u16> = buf
+        .chunks_exact(2)
+        .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16(&wide)
+        .ok()
+        .map(|s| s.trim_end_matches('\0').to_string())
+}
+
+/// Launch the setup with `runas`, wait on its process, and confirm the
+/// version flip. All blocking work runs on the caller's (worker) thread;
+/// `report` is invoked for stage transitions. The installer window itself
+/// (`/SILENT`) shows Inno's file-copy progress in parallel.
+#[cfg(windows)]
+pub fn run_setup_and_wait(
+    path: &Path,
+    expected_version: &str,
+    mut report: impl FnMut(InstallStage),
+    timeout: Duration,
+) -> SetupOutcome {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+    use windows::Win32::UI::Shell::{
+        SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+        ShellExecuteExW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::PCWSTR;
+
+    report(InstallStage::Launching);
+    let p = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !p.exists() {
+        return SetupOutcome::Failed(format!("安装包不存在：{}", p.display()));
+    }
+    if p.extension().map(|e| e.to_ascii_lowercase()) != Some("exe".into()) {
+        return SetupOutcome::Failed("只允许启动 .exe 安装包。".into());
+    }
+    let size = match std::fs::metadata(&p).map(|m| m.len()) {
+        Ok(size) => size,
+        Err(e) => return SetupOutcome::Failed(e.to_string()),
+    };
+    if size < MIN_SETUP_BYTES {
+        return SetupOutcome::Failed(format!("安装包大小异常（{size} B），拒绝执行。"));
+    }
+    if !expected_version.is_empty() && installed_version_matches(expected_version) {
+        return SetupOutcome::Failed(format!(
+            "已安装版本已是 {expected_version}无需重复安装。"
+        ));
+    }
+    let file: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+    let verb: Vec<u16> = "runas".encode_utf16().chain(Some(0)).collect();
+    // Inno setup.exe takes its flags as a single lpParameters string.
+    let params: Vec<u16> = SILENT_SETUP_ARGS.encode_utf16().chain(Some(0)).collect();
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR(params.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    if let Err(error) = unsafe { ShellExecuteExW(&mut info) } {
+        // Includes UAC declined: the shell reports the failure, nothing ran.
+        return SetupOutcome::Failed(format!(
+            "无法启动安装程序（Win32 错误 {}）若取消了提权确认则未开始安装。",
+            error.code().0
+        ));
+    }
+    let handle = info.hProcess;
+    if handle.is_invalid() {
+        return SetupOutcome::Failed("安装程序未能返回进程句柄。".into());
+    }
+    report(InstallStage::Running);
+    // Wait in slices so an over-long install ends our watch, never the install.
+    let deadline = std::time::Instant::now() + timeout;
+    let exit_code: Option<u32> = loop {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break None;
+        }
+        let slice_ms = remaining.as_millis().min(1000) as u32;
+        if unsafe { WaitForSingleObject(handle, slice_ms) } == WAIT_OBJECT_0 {
+            let mut code = 1u32;
+            let _ = unsafe { GetExitCodeProcess(handle, &mut code) };
+            break Some(code);
+        }
+    };
+    let _ = unsafe { CloseHandle(handle) };
+    let Some(code) = exit_code else {
+        return SetupOutcome::Timeout;
+    };
+    if code == SETUP_ROLLBACK_EXIT_CODE {
+        return SetupOutcome::RolledBack;
+    }
+    if code != 0 {
+        return SetupOutcome::Failed(format!("安装程序退出码 {code}本次未改动。"));
+    }
+    report(InstallStage::Verifying);
+    if expected_version.is_empty() || installed_version_matches(expected_version) {
+        SetupOutcome::Committed
+    } else {
+        SetupOutcome::Failed("安装程序已退出但已安装版本号未变化请检查安装程序窗口。".into())
+    }
+}
+
 pub fn start_silent_setup(path: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
-        start_silent_setup_windows(path)
+        // Windows updates go through run_setup_and_wait so the About card can
+        // report launch/running/verify stages; this entry stays for Unix.
+        let _ = path;
+        Err("Windows 更新请走 run_setup_and_wait（带安装进度等待）。".into())
     }
     #[cfg(target_os = "linux")]
     {
@@ -1298,43 +1568,6 @@ fn start_silent_setup_macos(path: &Path) -> Result<(), String> {
             status.code()
         ))
     }
-}
-
-#[cfg(windows)]
-fn start_silent_setup_windows(path: &Path) -> Result<(), String> {
-    use windows::Win32::UI::Shell::ShellExecuteW;
-    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    use windows::core::{HSTRING, w};
-
-    let p = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if !p.exists() {
-        return Err(format!("安装包不存在：{}", p.display()));
-    }
-    if p.extension().map(|e| e.to_ascii_lowercase()) != Some("exe".into()) {
-        return Err("只允许启动 .exe 安装包。".into());
-    }
-    let size = std::fs::metadata(&p).map_err(|e| e.to_string())?.len();
-    if size < MIN_SETUP_BYTES {
-        return Err(format!("安装包大小异常（{size} B），拒绝执行。"));
-    }
-    let cwd = p
-        .parent()
-        .map(|d| d.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    let file = HSTRING::from(p.as_os_str());
-    let params = HSTRING::from(SILENT_SETUP_ARGS);
-    let dir = HSTRING::from(cwd.as_os_str());
-    let rc = unsafe { ShellExecuteW(None, w!("runas"), &file, &params, &dir, SW_SHOWNORMAL) };
-    // >32 means the shell accepted runas. That is not proof the user already
-    // confirmed UAC, so this process stays up. The elevated installer asks the
-    // installed GUI, including shipped 2.5.3, to take its normal quit path.
-    if rc.0 as usize <= 32 {
-        return Err(format!(
-            "无法启动安装程序（ShellExecute 返回 {}）。若取消了 UAC，则未开始安装。",
-            rc.0 as usize
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1955,5 +2188,100 @@ mod followup_safety_tests {
             UpdatePhase::Installing
         );
         assert!(!update_card_model(true, "2.5.2", &state, true).button_enabled);
+    }
+
+    #[test]
+    fn install_stage_labels_are_human_readable_and_indeterminate() {
+        for stage in [
+            InstallStage::Launching,
+            InstallStage::Running,
+            InstallStage::Verifying,
+        ] {
+            assert!(!stage.label().is_empty());
+            assert_eq!(stage.bar_percent(), None);
+        }
+        // Launching must mention elevation: that is the only user action.
+        assert!(InstallStage::Launching.label().contains("提权"));
+        assert!(InstallStage::Running.label().contains("安装程序窗口"));
+    }
+
+    #[test]
+    fn installing_card_shows_stage_not_stale_download_text() {
+        let state = OfficialUpdateState {
+            busy: true,
+            downloaded_path: Some("/fixture/package".into()),
+            progress: Some(UpdateProgress {
+                downloaded: 10,
+                total: 10,
+                percent: 100.0,
+            }),
+            install_stage: Some(InstallStage::Running),
+            ..Default::default()
+        };
+        let model = update_card_model(true, "2.5.2", &state, true);
+        assert_eq!(
+            model.progress_text.as_deref(),
+            Some(InstallStage::Running.label())
+        );
+        // Indeterminate: Inno owns the copy loop, no honest percent exists.
+        assert_eq!(model.progress_bar, Some(CardProgressBar { percent: None }));
+        // Without a stage yet, Installing still shows a generic line + bar.
+        let mut bare = state.clone();
+        bare.install_stage = None;
+        let bare_model = update_card_model(true, "2.5.2", &bare, true);
+        assert!(bare_model.progress_text.is_some());
+        assert_eq!(
+            bare_model.progress_bar,
+            Some(CardProgressBar { percent: None })
+        );
+    }
+
+    #[test]
+    fn downloading_card_shows_determinate_bar() {
+        let state = OfficialUpdateState {
+            busy: true,
+            progress: Some(UpdateProgress {
+                downloaded: 5,
+                total: 10,
+                percent: 50.0,
+            }),
+            ..Default::default()
+        };
+        let model = update_card_model(true, "2.5.2", &state, true);
+        assert_eq!(
+            model.progress_bar,
+            Some(CardProgressBar {
+                percent: Some(50.0)
+            })
+        );
+        assert!(model.progress_text.is_some_and(|t| t.contains("50%")));
+    }
+
+    #[test]
+    fn idle_and_current_cards_have_no_progress_bar() {
+        let idle = OfficialUpdateState::default();
+        assert_eq!(
+            update_card_model(true, "2.5.2", &idle, true).progress_bar,
+            None
+        );
+        let current = OfficialUpdateState {
+            info: Some(UpdateInfo::current_only("2.5.2")),
+            ..Default::default()
+        };
+        assert_eq!(
+            update_card_model(true, "2.5.2", &current, true).progress_bar,
+            None
+        );
+    }
+
+    #[test]
+    fn silent_setup_args_show_progress_window_and_stay_noninteractive() {
+        // Exact match: any fully-silent flag would hide the installer's own
+        // progress window, and the source-scan regression pins the absence.
+        assert_eq!(
+            SILENT_SETUP_ARGS,
+            "/SILENT /SUPPRESSMSGBOXES /NORESTART"
+        );
+        assert_eq!(SETUP_ROLLBACK_EXIT_CODE, 80);
     }
 }
