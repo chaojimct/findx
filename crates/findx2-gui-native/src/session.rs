@@ -38,13 +38,13 @@ impl AppSession {
             prefs.diag_enabled = true;
         }
         let settings = prefs::load_settings(
-            if opts.official_product {
+            if opts.official_product && cfg!(unix) {
                 "findx2"
             } else {
                 "findx2-native-dev"
             },
-            (if opts.official_product {
-                crate::isolation::official_index_path()
+            (if opts.official_product && cfg!(unix) {
+                crate::isolation::official_data_dir().join("index.bin")
             } else {
                 crate::isolation::isolated_index_path()
             })

@@ -3,6 +3,7 @@
 #[cfg(windows)]
 mod full_index_build;
 mod metadata_fill;
+mod mft_identity;
 mod mft;
 mod mft_read;
 mod nt_dir_query;
@@ -38,5 +39,10 @@ mod ntfs_namespace;
 mod ntfs_identity;
 
 #[cfg(windows)]
-pub use ntfs_namespace::NtfsUnlinkResolver;
-#[cfg(windows)] pub use ntfs_namespace::NamespaceResolveError;
+pub use ntfs_namespace::{
+    is_retryable_namespace_error, NamespaceResolveError, NtfsUnlinkResolver,
+};
+#[cfg(windows)]
+pub use ntfs_namespace::{DiagFileIdError, open_file_by_id_diagnostic_raw};
+#[cfg(all(windows, test))]
+pub(crate) use ntfs_namespace::inspect_identity_for_test;

@@ -22,9 +22,9 @@ use crate::settings_logic::{
 };
 use crate::theme::{FindxTokens, ThemeStyle};
 use crate::ui::update_card::{UpdateCardState, render_update_card};
-use crate::update_logic::{UpdatePhase, derive_update_phase, should_auto_check};
-#[cfg(not(windows))]
-use crate::update_logic::start_silent_setup;
+use crate::update_logic::{
+    UpdatePhase, derive_update_phase, should_auto_check, start_silent_setup,
+};
 
 // A changing hint uses one reserved line; the complete text remains accessible
 // by tooltip instead of wrapping and moving the controls beneath it.
@@ -1295,7 +1295,11 @@ impl SettingsWindow {
                         "勾选要扫描的磁盘。都不勾选时扫描全部磁盘。重建索引后生效。",
                         tokens,
                     ))
-                    .child(v_flex().id("settings-drives-viewport").h(px(drive_rows * 40.)).flex_shrink_0().gap_2().overflow_y_scrollbar()
+                    .child(div()
+                        .text_sm()
+                        .text_color(tokens.text_secondary)
+                        .child("勾选要扫描的盘。一个都不勾 = 全盘，与命令行默认一致。这些范围草稿只写入 native-dev；要改变正式索引范围，请先保存后到「服务模式」确认重建（重建使用正式排除规则，不使用这里的草稿）。"))
+                    .child(v_flex().id("settings-drives-viewport").h(px(128.)).flex_shrink_0().gap_2().overflow_y_scrollbar()
                     .when(roots.is_empty(), |this| {
                         this.child(div().text_sm().text_color(tokens.text_tertiary).child("（加载磁盘列表中…）"))
                     })
@@ -1324,6 +1328,13 @@ impl SettingsWindow {
                     }
                 })
             })))
+            )
+            .child(section_title("排除目录", tokens))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(tokens.text_secondary)
+                    .child("每行一个完整路径。规则只写入隔离设置；正式重建以服务目录中的 index.bin.exclude.json 为准。"),
             )
             .child(
                 settings_card(tokens)
@@ -1391,7 +1402,7 @@ impl SettingsWindow {
             .child(
                 Checkbox::new("everything-ipc")
                     .checked(self.settings.enable_everything_ipc)
-                    .label("兼容 Everything 搜索")
+                    .label("启用 Everything IPC（仅 Windows；Unix 不提供此接口）")
                     .on_change({
                     let entity = cx.entity();
                     move |checked, _, cx| {
@@ -1421,6 +1432,12 @@ impl SettingsWindow {
                             .flex_shrink_0()
                             .child(Input::new(&self.save_interval)),
                     ),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(tokens.text_secondary)
+                    .child("服务选项需保存后在「服务模式」确认应用。Unix 写入当前用户服务配置并恢复原运行状态；维护会保留完整备份。Windows 使用 SCM。扫描范围/索引路径草稿不会改写正式服务。"),
             )
             .child(settings_note(
                 "修改即时保存，可在高级维护中应用到已安装的服务。",
@@ -1600,7 +1617,8 @@ impl SettingsWindow {
             .as_ref()
             .map(|s| service_state_label(&s.state))
             .unwrap_or("未检测到服务");
-        settings_card(tokens)
+        v_flex().gap_3().w_full()
+            .child(settings_card(tokens)
             .child(section_title("索引服务", tokens))
             .child(
                 h_flex()
@@ -1691,7 +1709,24 @@ impl SettingsWindow {
                     );
                 },
             ))
-            .child(settings_async_line("service-hint".into(), self.service_hint.clone()))
+            .child(settings_async_line("service-hint".into(), self.service_hint.clone())))
+            .child(section_title("管理已安装的正式 FindX 服务",tokens))
+            .child(div().text_sm().child("只管理身份核对通过的正式平台服务；不会按进程名称批量终止，也不会注册另一套开发服务。操作前确认，执行后回读。"))
+            .child({
+                let path=self.service_snapshot.as_ref().map(|s|s.path_name.clone()).unwrap_or_default();
+                settings_async_line("service-path".into(), path)
+            })
+            .child({
+                let options=self.service_snapshot.as_ref()
+                    .and_then(|s|crate::service_control::official_runtime_options(s).ok())
+                    .map(|(interval,backfill,everything)|format!("正式服务当前选项（注册命令行）：落盘 {interval} 秒，元数据回填 {}，Everything {}",if backfill{"开启"}else{"关闭"},if everything{"开启"}else{"关闭"}))
+                    .unwrap_or_default();
+                settings_async_line("service-options".into(), options)
+            })
+            .child({let entity=cx.entity();Button::new("refresh-service").label("刷新服务状态").disabled(self.service_busy).on_click(move|_,_,cx|entity.update(cx,|this,cx|this.refresh_service(cx)))})
+            .child(h_flex().gap_2().flex_wrap().children([Action::Start,Action::Stop,Action::Auto,Action::Manual,Action::GuiAutoOn,Action::GuiAutoOff,Action::Compact,Action::Rebuild,Action::ApplyPreferences].into_iter().map(|action|{let entity=cx.entity();Button::new(SharedString::from(action.label())).label(action.label()).disabled(self.service_busy||self.service_snapshot.is_none()||(cfg!(unix)&&!self.session.read(cx).official_product)).on_click(move|_,_,cx|entity.update(cx,|this,cx|{this.service_pending=Some(action);cx.notify();}))})))
+            .child(div().text_sm().text_color(tokens.warning).child("维护先停止已核对的服务并完整备份，在副本上运行安装版 CLI，校验成功后替换，保留旧库并恢复原运行状态。缺少明确扫描范围或排除规则未知时拒绝重建。Unix 使用当前用户服务权限；Windows 需要 SCM/管理员权限。"))
+            .child(div().text_sm().child("此页只操作身份核对通过的平台服务/登录启动。Unix 隔离入口禁用正式服务操作。范围/路径草稿不会覆盖正式服务；注册命令行是服务参数真源。"))
     }
 
     fn render_maintenance(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1832,38 +1867,23 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let action = self.service_pending.unwrap();
-        let saved = &self.session.read(cx).settings;
-        let detail = if action == crate::service_control::Action::ApplyPreferences {
-            format!(
-                "将写入当前选项：落盘 {} 秒，元数据回填 {}，Everything {}。",
-                saved.save_interval_secs,
-                if saved.enable_metadata_backfill { "开启" } else { "关闭" },
-                if saved.enable_everything_ipc { "开启" } else { "关闭" }
-            )
-        } else {
-            self.service_snapshot
-                .as_ref()
-                .map(|s| format!("服务 {}，状态 {}", s.name, service_state_label(&s.state)))
-                .unwrap_or_default()
-        };
-        div().absolute().inset_0().occlude().bg(rgba(0x00000088)).flex().items_center().justify_center().child(v_flex().w(px(440.)).max_w_full().m_4().p_4().gap_3().rounded_lg().bg(tokens.surface_raised)
-            .child(div().h(px(24.)).flex_shrink_0().child(format!("确认{}？", action.label())))
-            .child(div().id("service-confirm-body").h(px(72.)).flex_shrink_0().overflow_y_scrollbar().text_sm().child(detail))
-            .child(div().h(px(20.)).flex_shrink_0().text_sm().text_ellipsis().text_color(tokens.text_secondary).child("执行期间搜索会暂时不可用。备份会保留在索引旁边。"))
-            .child(h_flex().h(px(32.)).gap_2().child({
-                let entity = cx.entity();
-                Button::new("confirm-service").primary().w(px(112.)).label("确认执行").on_click(move |_, _, cx| {
-                    entity.update(cx, |this, cx| this.begin_service_action(action, cx));
-                })
-            }).child({
-                let entity = cx.entity();
-                Button::new("cancel-service").w(px(88.)).label("取消").on_click(move |_, _, cx| {
-                    entity.update(cx, |this, cx| {
-                        this.service_pending = None;
-                        cx.notify();
-                    });
-                })
-            })))
+        let target = self
+            .service_snapshot
+            .as_ref()
+            .map(|s| {
+                format!(
+                    "目标：{} · PID {} · {}\n{}",
+                    s.name, s.process_id, s.state, s.path_name
+                )
+            })
+            .unwrap_or_default();
+        div().absolute().inset_0().occlude().bg(rgba(0x00000088)).flex().items_center().justify_center().child(v_flex().w(px(520.)).max_w_full().m_4().p_4().gap_3().rounded_lg().bg(tokens.surface_raised)
+            .child(div().child(format!("确认{}？",action.label())))
+            .child(div().text_sm().child(target))
+            .when(action==crate::service_control::Action::ApplyPreferences,|v|{let saved=&self.session.read(cx).settings;let official=self.service_snapshot.as_ref().and_then(|s|crate::service_control::official_runtime_options(s).ok()).map(|(i,b,e)|format!("正式服务当前：落盘 {i} 秒，回填 {}，Everything {}",if b{"开启"}else{"关闭"},if e{"开启"}else{"关闭"})).unwrap_or_else(||"无法解析正式服务当前选项".into());v.child(div().text_sm().child(official)).child(div().text_sm().child(format!("将写入已保存选项：落盘 {} 秒，元数据回填 {}，Everything {}。请先在设置中保存再应用。不迁移开发索引/管道/路径。Unix 应用时恢复原运行状态；Windows 下次启动生效。",saved.save_interval_secs,if saved.enable_metadata_backfill{"开启"}else{"关闭"},if saved.enable_everything_ipc{"开启"}else{"关闭"})))})
+            .child(div().text_sm().child("此操作真正影响正式 FindX。停止/维护期间搜索将不可用。备份可能占用大量磁盘空间；过程失败会明确报告。没有自动删除备份。"))
+            .child(h_flex().gap_2().child({let e=cx.entity();Button::new("confirm-service").label("确认执行").on_click(move|_,_,cx|e.update(cx,|this,cx|{let Some(expected)=this.service_snapshot.clone()else{return;};this.service_pending=None;this.service_busy=true;this.service_hint="正在执行正式服务操作，请勿关闭窗口…".into();cx.notify();let saved_preferences=this.session.read(cx).settings.clone();cx.spawn(async move|this,cx|{let result=cx.background_spawn(async move{crate::service_control::execute(action,expected,saved_preferences)}).await;this.update(cx,|this,cx|{this.service_busy=false;this.hint=match result{Ok(m)=>m.into(),Err(e)=>format!("操作失败：{e}").into()};this.refresh_service(cx);cx.notify();}).ok();}).detach();}))})
+            .child({let e=cx.entity();Button::new("cancel-service").label("取消操作").on_click(move|_,_,cx|e.update(cx,|this,cx|{this.service_pending=None;cx.notify();}))})))
     }
 
     fn persist_auto_check(&mut self, checked: bool, cx: &mut Context<Self>) {
@@ -2061,111 +2081,42 @@ impl SettingsWindow {
         };
         self.session.update(cx, |s, _| {
             s.update_state.busy = true;
-            s.update_state.install_stage =
-                Some(crate::update_logic::InstallStage::Launching);
         });
         self.hint = "正在安装更新；请确认系统提权提示。取消会保留当前安装。".into();
         cx.notify();
-        #[cfg(windows)]
-        {
-            use crate::update_logic::{SETUP_WAIT_TIMEOUT, SetupOutcome, run_setup_and_wait};
-            let expected = self
-                .session
-                .read(cx)
-                .update_state
-                .info
-                .as_ref()
-                .and_then(|i| i.latest_version.clone())
-                .unwrap_or_default();
-            let (tx, rx) = std::sync::mpsc::channel();
-            cx.spawn(async move |this, cx| {
-                let worker = std::thread::spawn(move || {
-                    run_setup_and_wait(
-                        std::path::Path::new(&path),
-                        &expected,
-                        |stage| {
-                            let _ = tx.send(stage);
-                        },
-                        SETUP_WAIT_TIMEOUT,
-                    )
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { start_silent_setup(std::path::Path::new(&path)) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.session.update(cx, |s, _| {
+                    s.update_state.busy = false;
                 });
-                loop {
-                    while let Ok(stage) = rx.try_recv() {
-                        let _ = this.update(cx, |this, cx| {
-                            this.session.update(cx, |session, cx| {
-                                session.update_state.install_stage = Some(stage);
-                                cx.notify();
-                            });
-                        });
-                    }
-                    if worker.is_finished() {
-                        break;
-                    }
-                    cx.background_spawn(async {
-                        std::thread::sleep(std::time::Duration::from_millis(300));
-                    })
-                    .await;
-                }
-                let outcome = worker
-                    .join()
-                    .unwrap_or_else(|_| SetupOutcome::Failed("安装线程异常退出。".into()));
-                let _ = this.update(cx, |this, cx| {
-                    this.session.update(cx, |s, _| {
-                        s.update_state.busy = false;
-                        s.update_state.install_stage = None;
-                    });
-                    // Note: in the normal path the elevated installer asks
-                    // this GUI to exit before copying files, so these hints
-                    // are mostly seen on fast failures (UAC declined, Prepare
-                    // refusal, rollback). Completion restarts the new build.
-                    this.hint = match outcome {
-                        SetupOutcome::Committed => {
-                            "安装完成如未自动重启请手动重新打开 FindX。".into()
-                        }
-                        SetupOutcome::RolledBack => {
-                            "安装已回滚本次未改动可重试或手动安装。".into()
-                        }
-                        SetupOutcome::Failed(e) => format!("安装未完成：{e}").into(),
-                        SetupOutcome::Timeout => {
-                            "安装程序仍在运行请在安装程序窗口中确认完成。".into()
-                        }
-                    };
-                    cx.notify();
-                });
-            })
-            .detach();
-            return;
-        }
-        #[cfg(not(windows))]
-        {
-            cx.spawn(async move |this, cx| {
-                let result = cx
-                    .background_spawn(async move {
-                        start_silent_setup(std::path::Path::new(&path))
-                    })
-                    .await;
-                let _ = this.update(cx, |this, cx| {
-                    this.session.update(cx, |s, _| {
-                        s.update_state.busy = false;
-                        s.update_state.install_stage = None;
-                    });
                 match result {
                     Ok(()) => {
-                        let launch = if cfg!(target_os = "macos") {
-                            std::process::Command::new("/usr/bin/open")
-                                .args(["-n", "/Applications/FindX.app"])
-                                .spawn()
-                        } else {
-                            std::process::Command::new("/opt/FindX/FindX").spawn()
-                        };
-                        match launch {
-                            Ok(_) => cx.quit(),
-                            Err(e) => {
-                                this.hint = format!(
-                                    "更新已安装，但重新启动失败：{e}。请手动重新打开 FindX。"
-                                )
-                                .into();
+                        #[cfg(unix)]
+                        {
+                            let launch = if cfg!(target_os = "macos") {
+                                std::process::Command::new("/usr/bin/open")
+                                    .args(["-n", "/Applications/FindX.app"])
+                                    .spawn()
+                            } else {
+                                std::process::Command::new("/opt/FindX/FindX").spawn()
+                            };
+                            match launch {
+                                Ok(_) => cx.quit(),
+                                Err(e) => {
+                                    this.hint = format!(
+                                        "更新已安装，但重新启动失败：{e}。请手动重新打开 FindX。"
+                                    )
+                                    .into();
+                                }
                             }
+                        }
+                        #[cfg(windows)]
+                        {
+                            this.hint =
+                                "已启动安装程序，请确认 UAC；安装器完成后重新打开应用。".into();
                         }
                     }
                     Err(e) => {
@@ -2176,7 +2127,6 @@ impl SettingsWindow {
             });
         })
         .detach();
-        }
     }
 
     fn render_about(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2251,28 +2201,24 @@ impl SettingsWindow {
             "窗口较窄时，预览和侧栏会自动收起，也可以手动展开。".into(),
             "这里只读取状态，不会改动索引。".into(),
         ];
-        settings_page()
+        v_flex()
+            .w_full()
+            .gap_3()
+            .child(section_title("只读运行诊断", tokens))
+            .children(rows.into_iter().enumerate().map(|(i,r)| settings_async_line(format!("runtime-diagnostic-{i}").into(), r)))
+            .child({
+                let session = self.session.clone();
+                Checkbox::new("main-diagnostics")
+                    .checked(s.prefs.diag_enabled)
+                    .label("显示主窗诊断浮层（立即生效，Ctrl+Shift+D）")
+                    .on_change(move |on, _, cx| {
+                        session.update(cx, |s, cx| {
+                            s.set_diag(*on, cx);
+                            cx.notify();
+                        })
+                    })
+            })
             .child(
-                settings_card(tokens)
-                    .child(section_title("运行状态", tokens))
-                    .children(rows.into_iter().enumerate().map(|(i, r)| {
-                        settings_async_line(format!("runtime-diagnostic-{i}").into(), r)
-                    }))
-                    .child(
-                        h_flex().h(px(36.)).items_center().child({
-                            let session = self.session.clone();
-                            Checkbox::new("main-diagnostics")
-                                .checked(s.prefs.diag_enabled)
-                                .label("在主窗口显示诊断浮层")
-                                .on_change(move |on, _, cx| {
-                                    session.update(cx, |s, cx| {
-                                        s.set_diag(*on, cx);
-                                        cx.notify();
-                                    })
-                                })
-                        }),
-                    )
-                    .child(
                         h_flex()
                             .h(px(36.))
                             .items_center()
@@ -2291,23 +2237,18 @@ impl SettingsWindow {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.copy_diagnostics(cx);
                                     })),
-                            ),
-                    ),
+                            )
+            )
+            .child(section_title("原始 Status 响应（每 2 秒更新）", tokens))
+            .child(
+                div()
+                    .id("raw-status-viewport").h(px(192.)).flex_shrink_0().overflow_y_scrollbar()
+                    .text_xs()
+                    .p_3()
+                    .bg(tokens.surface)
+                    .child(s.status_raw.clone()),
             )
             .child(self.render_storage_fields(tokens))
-            .child(
-                settings_card(tokens)
-                    .child(section_title("原始状态", tokens))
-                    .child(settings_note("每 2 秒刷新一次。", tokens))
-                    .child(
-                        div()
-                            .id("raw-status-viewport").h(px(192.))
-                            .flex_shrink_0()
-                            .overflow_y_scrollbar()
-                            .text_xs()
-                            .child(s.status_raw.clone()),
-                    ),
-            )
     }
 
     /// Support report: same facts as the rows above, with usernames and e-mail

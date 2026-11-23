@@ -115,7 +115,6 @@ mod shortcut_safety_tests {
         }
         assert!(file_commands_blocked(false, true, false));
     }
-
     #[test]
     fn menu_snapshot_survives_search_focus_and_a_stale_live_selection() {
         let snap = vec!["C:\\Users\\a.pdf"];

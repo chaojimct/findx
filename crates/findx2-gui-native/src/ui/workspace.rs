@@ -264,6 +264,7 @@ pub(super) struct Workspace {
     inspector: crate::usage_inspector::State,
     inspector_pin: Option<(crate::usage_inspector::Source,crate::disk_usage::Node)>,
     side_buttons: [bool;2],
+    usage_advanced: bool,
     engine_usage: bool,
     engine_busy: bool,
     engine_cancel: Arc<AtomicBool>,
@@ -429,6 +430,7 @@ impl Workspace {
             inspector: crate::usage_inspector::State::default(),
             inspector_pin: None,
             side_buttons: [false;2],
+            usage_advanced: false,
             engine_usage: true,
             engine_busy: false,
             engine_cancel: Arc::new(AtomicBool::new(false)),
@@ -2851,6 +2853,9 @@ impl MainWindow {
             ) {
                 return label.into();
             }
+        }
+        if self.workspace.engine_usage && self.workspace.scan_status.starts_with("目录读取失败：") {
+            return if self.workspace.engine_busy{"上次目录读取失败，正在重试；详情保留诊断"}else{"目录读取失败，保留原画面；详见提示"}.into();
         }
         if self.workspace.engine_usage {
             crate::footer_status::compact_usage(

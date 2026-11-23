@@ -146,10 +146,10 @@ pub fn save_settings(settings: &FindxGuiSettings) -> Result<(), String> {
     if crate::isolation::is_production_pipe(&settings.pipe_name)
         && !crate::isolation::official_storage()
     {
-        return Err("管道名称不可用，请换一个名称后再保存。".into());
+        return Err("拒绝把管道名保存为生产默认 findx2。请使用隔离管道名。".into());
     }
     if crate::isolation::official_storage() && settings.pipe_name != "findx2" {
-        return Err("已安装版本的连接由系统管理，不能在这里修改。".into());
+        return Err("正式 Unix GUI 的连接固定为 findx2；隔离运行请使用显式 --pipe。".into());
     }
     let path = settings_path();
     if let Some(parent) = path.parent() {

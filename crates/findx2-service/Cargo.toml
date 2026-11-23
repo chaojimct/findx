@@ -23,6 +23,9 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rayon = "1.10"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 findx2-macos = { path = "../findx2-macos" }
 

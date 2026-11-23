@@ -53,6 +53,65 @@ fn annotate(err:NamespaceResolveError,role:&str,frn:u64,explicit:Option<&ChangeE
  let ctx=failure_context(role,frn,explicit,events,pending);
  match err{NamespaceResolveError::Retry(s)=>NamespaceResolveError::Retry(format!("{s};{ctx}")),NamespaceResolveError::Unsafe(s)=>NamespaceResolveError::Unsafe(format!("{s};{ctx}")),NamespaceResolveError::EpochChanged(s)=>NamespaceResolveError::EpochChanged(format!("{s};{ctx}"))}
 }
+
+/// A live file observation is admitted only after native full-FRN, volume and
+/// journal checks. It is not inferred from an open error or an old pathname.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+struct NamespaceScope { volume:u8, serial:u32, journal:u64 }
+#[derive(Clone,Debug)]
+struct LiveFileObservation { scope:NamespaceScope, id:u64, metadata:(u64,u64,u64,u32), links:Vec<OrdinaryLink> }
+fn live_pending_placement(event:&ChangeEvent, expected:NamespaceScope, observed:&LiveFileObservation, known_parent:impl Fn(u64)->bool, known_identity:bool)->Result<Option<ChangeEvent>,String>{
+ let ChangeEvent::CreatePending{file_id,file_id_128,is_dir:false,..}=event else{return Ok(None)};
+ if file_id_128.is_some_and(|id|id[8..].iter().any(|&b|b!=0)){return Err("full 128-bit parked identity unresolved; cursor retained".into());}
+ if observed.scope!=expected || observed.id!=*file_id{return Err("parked live identity/scope mismatch; cursor retained".into());}
+ let (size,mtime,ctime,attrs)=observed.metadata;
+ if attrs&16!=0{return Err("parked file changed type; cursor retained".into());}
+ // No known current link means remain parked, not absent/deleted. The current
+ // directory may be created by a later journal batch; never invent its lineage.
+ let Some(link)=observed.links.iter().find(|link|known_parent(link.parent))else{return Ok(None)};
+ if known_identity {Ok(Some(ChangeEvent::Rename{file_id:*file_id,new_parent_id:link.parent,new_name:link.name.clone()}))}
+ else {Ok(Some(ChangeEvent::Create{entry:findx2_core::RawEntry{file_id:*file_id,file_id_128:*file_id_128,parent_id:link.parent,name:link.name.clone(),size,mtime,ctime,attrs,is_dir:false}}))}
+}
+fn reconcile_live_pending(pending:&[ChangeEvent],expected:NamespaceScope,internal_parent:Option<u64>,mut observe:impl FnMut(u64)->Result<LiveFileObservation,String>,known_parent:impl Fn(u64)->bool,known_identity:impl Fn(u64)->bool)->Result<Vec<ChangeEvent>,String>{
+ let mut seen=Vec::new();let mut result=Vec::new();seen.try_reserve(pending.len().min(64)).map_err(|_|"parked recovery allocation failed; cursor retained")?;
+ for event in pending.iter().take(64){
+  let ChangeEvent::CreatePending{file_id,parent_id,is_dir:false,..}=event else{continue};
+  if internal_parent==Some(*parent_id)||seen.contains(file_id){continue}seen.push(*file_id);
+  let observation=match observe(*file_id){Ok(value)=>value,Err(error)=>{tracing::debug!(file_id,error=%error,"live parked observation unavailable; original record retained");continue;}};
+  if let Some(placement)=live_pending_placement(event,expected,&observation,&known_parent,known_identity(*file_id))?{result.try_reserve(1).map_err(|_|"parked recovery output allocation failed; cursor retained")?;result.push(placement);}
+ }
+ Ok(result)
+}
+/// A complete live-link observation with no indexed parent is a dependency,
+/// not a fatal identity error. Keep the original internal event in the bounded
+/// orphan transaction until a later journal parent makes a real link resolvable.
+/// None never means success/absence and must never acknowledge a cursor.
+fn place_bound_links(binding:UnlinkBinding,volume:u8,serial:u32,journal:u64,event:&ChangeEvent,links:&mut [OrdinaryLink],known_parent:impl Fn(u64)->bool)->Result<Option<Vec<ChangeEvent>>,String>{
+ if binding.volume!=volume || binding.serial!=serial || binding.journal!=journal{return Err("internal namespace binding epoch/volume mismatch; cursor retained".into());}
+ if !links.is_empty(){
+  let Some(chosen)=links.iter().position(|link|known_parent(link.parent))else{return Ok(None)};
+  links.swap(0,chosen);
+ }
+ rewrite_bound_event(binding,volume,serial,journal,event,Some(links)).map(Some)
+}
+
+/// Only used after the exact internal parent and volume/journal binding are
+/// verified. Access denied is NOT evidence of an absent/deleted identity.
+fn bound_identity_open_failure(id:u64, code:u32, native:Option<u32>, detail:&str)->Result<Vec<OrdinaryLink>,String> {
+    // Last-NTSTATUS is diagnostic only: even the retry classification NEVER
+    // proves absence, deletes an identity, or acknowledges a journal cursor.
+    if code==5 && native==Some(0xc0000056) {
+        return Err(format!("bound unlink identity temporarily delete-pending: FRN={id:#x}; {detail}; original batch retained"));
+    }
+    match code {
+        2|3|1168 => Ok(Vec::new()),
+        _ => Err(format!("bound unlink identity metadata unavailable: OpenFileById FRN={id:#x}, win32={code}: {detail}; identity absence not proven; cursor retained")),
+    }
+}
+/// Narrow retry marker produced only by the verified internal-parent resolver.
+pub fn is_retryable_namespace_error(error:&str)->bool {
+    error.starts_with("bound unlink identity temporarily delete-pending:")
+}
 /// Binding is constructed only after volume/journal/FRN and canonical metadata verification.
 fn rewrite_bound_event(binding:UnlinkBinding,volume:u8,serial:u32,journal:u64,event:&ChangeEvent,ordinary:Option<&[OrdinaryLink]>) -> Result<Vec<ChangeEvent>,String> {
     if binding.volume!=volume || binding.serial!=serial || binding.journal!=journal {return Err("internal namespace binding epoch/volume mismatch; cursor retained".into());}
@@ -185,6 +244,31 @@ mod windows_resolver {
  #[repr(C)] struct IoStatus { status:usize, information:usize }
  #[link(name="ntdll")]
  extern "system" { fn NtQueryInformationFile(handle:HANDLE,ios:*mut IoStatus,buffer:*mut u8,length:u32,class:u32)->i32; }
+ pub struct FileIdOpenError {pub win32:u32,pub last_ntstatus:u32}
+ impl FileIdOpenError {pub fn is_transient_delete_pending(&self)->bool{self.win32==5 && self.last_ntstatus==0xc0000056}}
+ #[link(name="ntdll")]
+ unsafe extern "system" {fn RtlGetLastNtStatus()->i32;}
+ /// Capture the native thread status immediately after the Win32 open fails,
+ /// before formatting/logging can make unrelated native calls. Diagnostic only:
+ /// no error is reclassified as absence and no privileges are changed.
+ pub fn open_file_by_id_diagnostic(hint:HANDLE,id:u64)->Result<HANDLE,FileIdOpenError> {
+   let mut d=FILE_ID_DESCRIPTOR::default();d.dwSize=size_of::<FILE_ID_DESCRIPTOR>() as u32;d.Type=FileIdType;d.Anonymous.FileId=id as i64;
+   match unsafe{OpenFileById(hint,&d,0,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,None,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT)} {
+     Ok(h)=>Ok(h),Err(e)=>{let native=unsafe{RtlGetLastNtStatus()} as u32;Err(FileIdOpenError{win32:e.code().0 as u32 & 0xffff,last_ntstatus:native})}
+   }
+ }
+ #[cfg(test)]
+ pub fn inspect_identity_for_test(volume:HANDLE,id:u64)->Result<String,String>{
+  let h=open_file_by_id_diagnostic(volume,id).map_err(|e|format!("open failed win32={} ntstatus={:#010x}",e.win32,e.last_ntstatus))?;
+  let result=(||{let mut info=BY_HANDLE_FILE_INFORMATION::default();unsafe{GetFileInformationByHandle(h,&mut info)}.map_err(|e|e.to_string())?;
+   let actual=(info.nFileIndexHigh as u64)<<32|info.nFileIndexLow as u64;if actual!=id{return Err("full identity mismatch".into());}
+   let mut path=vec![0u16;32768];let n=unsafe{GetFinalPathNameByHandleW(h,&mut path,FILE_NAME_NORMALIZED)}as usize;let name=if n>0 && n<path.len(){String::from_utf16_lossy(&path[..n])}else{"<path unavailable>".into()};
+   let mut buffer=vec![0u8;65536];let mut ios=IoStatus{status:0,information:0};let status=unsafe{NtQueryInformationFile(h,&mut ios,buffer.as_mut_ptr(),buffer.len()as u32,46)};
+   let links=if status>=0 && ios.information<=buffer.len(){format!("{:?}",parse_hardlink_records(&buffer[..ios.information],0))}else{format!("hardlink metadata status={status:#x}")};
+   Ok(format!("id={id:#x} serial={} attrs={:#x} path={name:?} links={links}",info.dwVolumeSerialNumber,info.dwFileAttributes))
+  })();unsafe{let _=CloseHandle(h);}result
+ }
+
  pub struct NtfsUnlinkResolver { handle:HANDLE,volume:u8,serial:u32,journal:u64,epoch:crate::ntfs_identity::Epoch,bound:Option<UnlinkBinding>, last_metadata:Option<(u64,u64,u64,u32)> }
  impl Drop for NtfsUnlinkResolver {fn drop(&mut self){unsafe{let _=CloseHandle(self.handle);}}}
  impl NtfsUnlinkResolver {
@@ -195,7 +279,7 @@ mod windows_resolver {
    let epoch=match checked{Ok(e)=>e,Err(e)=>{unsafe{let _=CloseHandle(handle);}return Err(e)}};
    Ok(Self{handle,volume,serial,journal,epoch,bound:None,last_metadata:None})
   }
-  fn open_id(&self,id:u64)->Result<HANDLE,FileIdOpenError>{super::open_file_by_id_diagnostic(self.handle,id)}
+  fn open_id(&self,id:u64)->Result<HANDLE,super::FileIdOpenError>{super::open_file_by_id_diagnostic(self.handle,id)}
   /// `Ok(None)` when the id opens or the failure is not an in-use extension.
   /// `Ok(Some)` is a corroborated base. Errors retain the cursor and are not absence.
   fn extension_after_open_failure(&mut self,id:u64)->Result<Option<crate::ntfs_witness::ExtensionTarget>,NamespaceResolveError>{
@@ -205,6 +289,7 @@ mod windows_resolver {
     Err(_)=>Ok(None),
    }
   }
+
   fn bind_candidate(&mut self,parent:u64)->Result<(),NamespaceResolveError>{
    let cached=self.bound.is_some_and(|b|b.parent==parent);
    let handle=match super::open_file_by_id_access(self.handle,parent,windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES.0){Ok(h)=>h,Err(e)=>{
@@ -400,6 +485,11 @@ mod windows_resolver {
  }
 }
 #[cfg(windows)]pub use windows_resolver::NtfsUnlinkResolver;
+#[cfg(windows)]pub use windows_resolver::{
+    FileIdOpenError as DiagFileIdError,
+    open_file_by_id_diagnostic as open_file_by_id_diagnostic_raw,
+};
+#[cfg(all(windows, test))]pub(crate) use windows_resolver::inspect_identity_for_test;
 #[cfg(test)]
 mod tests {
  use super::*;

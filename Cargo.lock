@@ -2060,6 +2060,7 @@ dependencies = [
  "findx2-linux",
  "findx2-macos",
  "findx2-windows",
+ "libc",
  "rayon",
  "serde_json",
  "thiserror 1.0.69",

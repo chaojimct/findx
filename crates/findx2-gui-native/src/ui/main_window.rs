@@ -2829,8 +2829,8 @@ impl MainWindow {
                 .bg(tokens.surface)
                 .text_xs()
                 .text_color(tokens.text_secondary)
-                .child(div().w(px(220.)).flex_shrink_0().text_ellipsis().child(if selected > 0 {
-                    format!("已选择 {selected} 个，共 {count} 个")
+                .child(div().w(px(200.)).flex_shrink_0().text_ellipsis().child(if selected > 0 {
+                    format!("{selected} 个项目已选择 · 共 {count} 个项目")
                 } else {
                     format!("{count} 个项目")
                 }))
@@ -2970,7 +2970,7 @@ impl MainWindow {
                     } else {
                         "icons/circle-check.svg"
                     }))
-                    .w(px(156.)).flex_shrink_0()
+                    .w(px(108.)).flex_shrink_0()
                     .label(footer.label())
                     .h(px(24.))
                     .text_color(if footer.warning() {

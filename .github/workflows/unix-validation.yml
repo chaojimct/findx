@@ -1,0 +1,71 @@
+name: Native Unix validation (no publish)
+on:
+  workflow_dispatch:
+  workflow_call:
+permissions:
+  contents: read
+concurrency:
+  group: unix-validation-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  macos:
+    if: github.ref == 'refs/heads/feat/native-gui-gpui'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Native tests (Darwin, not cross-compiled)
+        run: cargo test --locked -p findx2-macos && cargo test --locked -p findx2-gui-native --lib && cargo test --locked -p findx2-service
+      - name: Build native app and DMG (no signing credentials)
+        run: bash installer/macos/pack-macos.sh --version 2.5.2 --out "$GITHUB_WORKSPACE/dist"
+      - name: Verify real DMG and app binaries
+        run: |
+          set -eu
+          mp=$(mktemp -d)
+          trap 'hdiutil detach "$mp" || true; rmdir "$mp" || true' EXIT
+          (cd dist && shasum -a 256 -c *.sha256)
+          hdiutil verify dist/*.dmg
+          hdiutil attach -nobrowse -readonly -mountpoint "$mp" dist/*.dmg
+          for binary in FindX findx2 fx findx2-service; do
+            file "$mp/FindX.app/Contents/MacOS/$binary"
+            lipo "$mp/FindX.app/Contents/MacOS/$binary" -verify_arch "$(uname -m)"
+            xcrun vtool -show-build "$mp/FindX.app/Contents/MacOS/$binary"
+          done
+          ls -lR "$mp/FindX.app"
+          test -f "$mp/FindX.app/Contents/MacOS/FindX.installed"
+          test "$(readlink "$mp/Applications")" = /Applications
+          "$mp/FindX.app/Contents/MacOS/FindX" --version
+          "$mp/FindX.app/Contents/MacOS/findx2" --version
+          "$mp/FindX.app/Contents/MacOS/findx2-service" --version
+          plutil -lint "$mp/FindX.app/Contents/Info.plist"
+          plutil -lint "$mp/FindX.app/Contents/Resources/com.findx.findx2.plist"
+          plutil -p "$mp/FindX.app/Contents/Info.plist"
+          plutil -p "$mp/FindX.app/Contents/Resources/com.findx.findx2.plist"
+      - name: Tiny fixture only - native engine, GUI session IPC, FSEvents, graceful restart
+        run: |
+          set -eu
+          cargo build --release --locked -p findx2-gui-native --example unix_fixture_probe
+          mp=$(mktemp -d)
+          fixture=$(mktemp -d /tmp/findx-native-fixture-XXXXXX)
+          cleanup() {
+            test ! -f "$fixture/work/result.json" || cp "$fixture/work/result.json" dist/tiny-engine-fixture.json
+            test ! -f "$fixture/work/service.log" || cp "$fixture/work/service.log" dist/tiny-engine-fixture.log
+            hdiutil detach "$mp" || true
+            rmdir "$mp" || true
+          }
+          trap cleanup EXIT
+          hdiutil attach -nobrowse -readonly -mountpoint "$mp" dist/*.dmg
+          python3 scripts/test_unix_engine_fixture.py --service "$mp/FindX.app/Contents/MacOS/findx2-service" --gui-probe "$GITHUB_WORKSPACE/target/release/examples/unix_fixture_probe" --work "$fixture/work"
+      # Actions-run validation artifacts; repository access rules apply. No Release/tag.
+      - uses: actions/upload-artifact@v4
+        if: always() && !cancelled()
+        with:
+          name: native-${{ matrix.os }}-validation-only
+          path: dist/*
+          retention-days: 7

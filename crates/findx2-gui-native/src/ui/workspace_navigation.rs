@@ -297,7 +297,7 @@ impl MainWindow {
                 }).await;
                 this.update(cx,|this,cx|{
                     if generation!=this.workspace.address_menu_generation||this.workspace.address_menu.is_none()||cancel.load(Ordering::Acquire)||this.workspace.mode!=ViewMode::Usage||!this.workspace.engine_usage{return}
-                    let result=result.and_then(|r|if this.workspace.engine_generation.is_some_and(|g|g.0!=r.stamp.0){Err("索引已重载，请重新打开".into())}else{Ok(r)});
+                    let result=result.and_then(|r|if this.workspace.engine_generation.is_some_and(|g|g!=r.stamp){Err("索引已变化，请重新打开".into())}else{Ok(r)});
                     let _=this.workspace.window.update(cx,|_,window,cx|{
                         menu.update(cx,|menu,cx|menu.rebuild(window,cx,|menu,_,cx|{
                             let menu=menu.scrollable(true).min_w(px(372.)).max_w(px(372.)).max_h(px(312.));

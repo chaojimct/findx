@@ -97,7 +97,7 @@ pub fn isolated_data_dir() -> std::path::PathBuf {
 // path helpers below instead of changing process-global HOME/XDG variables.
 static OFFICIAL_STORAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn configure_storage(official: bool) {
-    OFFICIAL_STORAGE.store(official, std::sync::atomic::Ordering::Relaxed);
+    OFFICIAL_STORAGE.store(official && cfg!(unix), std::sync::atomic::Ordering::Relaxed);
 }
 pub fn official_storage() -> bool {
     OFFICIAL_STORAGE.load(std::sync::atomic::Ordering::Relaxed)
@@ -386,7 +386,7 @@ mod tests {
                 &roots
             ));
             assert!(!is_official_install_exe_with_roots(
-                std::path::Path::new(r"C:\FindX-example\project\target\t159\FindX.exe"),
+                std::path::Path::new(r"C:\Users\chaoj\dev\tools\findx\target\t159\FindX.exe"),
                 &roots
             ));
             assert!(!is_official_install_exe_with_roots(

@@ -69,7 +69,6 @@ pub mod usage_volume;
 pub mod usage_presentation;
 
 pub mod usage_motion;
-
 pub mod installer_health;
 pub mod gui_quit;
 

@@ -39,6 +39,16 @@ pub(crate) fn watch_error_summary() -> Option<String> {
 #[derive(Default)]
 pub(crate) struct NamespaceGate { pub blocked: bool }
 impl NamespaceGate {
+    /// Resolution is an all-or-nothing prefix of apply. Never let a later
+    /// checkpoint acknowledge an identity lookup that failed before mutation.
+    pub fn prepare(&mut self, volume:u8, prepared:Result<Vec<findx2_core::ChangeEvent>,String>)->Result<Vec<findx2_core::ChangeEvent>,String> {
+        if self.blocked {return Err("namespace fenced; explicit restart/recovery required".into());}
+        prepared.map_err(|error| {
+            self.blocked=true;
+            let message=format!("internal namespace resolution failed; cursor retained: {error}");
+            set_watch_error(volume as char,Some(message.clone()));message
+        })
+    }
     pub fn apply(&mut self, engine: &findx2_core::SearchEngine, volume: u8,
         events: &[findx2_core::ChangeEvent], journal_id: u64, next_usn: u64) -> Result<(), String> {
         if self.blocked { return Err("namespace fenced; explicit restart/recovery required".into()); }

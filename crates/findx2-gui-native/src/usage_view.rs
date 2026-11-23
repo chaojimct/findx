@@ -1863,7 +1863,7 @@ mod stable_presentation_tests {
   use findx2_ipc::{UsageItemDto as I,UsagePageDto as P};
   let item=|id,name:String,logical,dirs|I{id,name,directory:true,logical,files:0,directories:dirs,unknown:0};
   let p=P{epoch:7,generation:11,root:item(1,"dev".into(),64000,6464),children:(0..64).map(|i|item(2+i,format!("project-{i:03}"),1000,100)).collect(),next:None,resident_bytes:0,state:"scene CPU equivalence".into(),watch_error:None,metadata_error:None};
-  let mut s=crate::indexed_usage::scan_from_page(&p,"C:/Users/example/dev".into());
+  let mut s=crate::indexed_usage::scan_from_page(&p,"C:/Users/chaoj/dev".into());
   for i in 1..65{for j in 0..100{let mut n=s.nodes[i].clone();n.parent=Some(i);n.children.clear();n.logical=10;n.entries=0;n.directories=0;n.path=n.path.join(if j==0{"AppData".into()}else if j==1{"node_modules".into()}else{format!("folder-{j:03}")});let id=s.nodes.len();s.nodes.push(n);s.nodes[i].children.push(id);}}
   s
  }

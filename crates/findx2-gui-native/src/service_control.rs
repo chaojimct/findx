@@ -860,7 +860,10 @@ fn execute_linux(
         Action::ApplyPreferences => return unix_apply_preferences(current, preferences),
         Action::Compact | Action::Rebuild => return maintenance(action, current),
     }
-    Ok(completed(action))
+    Ok(format!(
+        "{}完成；systemd 用户服务已回读验证",
+        action.label()
+    ))
 }
 
 fn linux_systemctl(args: &[&str]) -> Result<String, String> {
@@ -898,7 +901,7 @@ fn execute_macos(
         Action::ApplyPreferences => return unix_apply_preferences(current, preferences),
         Action::Compact | Action::Rebuild => return maintenance(action, current),
     }
-    Ok(completed(action))
+    Ok(format!("{}完成；LaunchAgent 已执行", action.label()))
 }
 
 #[cfg(target_os = "macos")]

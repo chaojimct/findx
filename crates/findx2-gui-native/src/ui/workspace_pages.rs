@@ -1042,6 +1042,21 @@ impl MainWindow {
                     })),
             )
             .child(
+                Button::new("usage-advanced-toggle")
+                    .flex_shrink_0()
+                    .ghost()
+                    .icon(IconName::Settings)
+                    .w(px(24.))
+                    .h(px(24.))
+                    .px_0()
+                    .selected(self.workspace.usage_advanced)
+                    .tooltip("扫描预算与减少动态")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.workspace.usage_advanced = !this.workspace.usage_advanced;
+                        cx.notify();
+                    })),
+            )
+            .child(
                 div()
                     .flex_1()
                     .min_w(px(120.))
