@@ -348,6 +348,14 @@ impl MainWindow {
 
     pub fn new(session: Entity<AppSession>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.bind_keys(main_key_bindings());
+        // New OS windows start with the saved backdrop before first paint.
+        let (material, dark) = session.read_with(cx, |s, _| {
+            (
+                s.prefs.window_material,
+                s.effective_theme().is_dark(),
+            )
+        });
+        crate::window_material::apply_to_window(window, material, dark);
         // Saved user shortcuts are applied on top of the factory bindings.
         let saved_bindings = session.read(cx).prefs.key_bindings.clone();
         crate::keybindings::apply(&saved_bindings, cx);

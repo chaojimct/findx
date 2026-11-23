@@ -111,6 +111,7 @@ pub fn all_settings_items() -> Vec<SettingsItem> {
         // 外观
         item("theme_style", "appearance", "主题风格", "主题风格", &["theme", "主题", "风格", "外观", "样式", "light", "dark"]),
         item("ui_mode", "appearance", "明暗模式", "明暗模式", &["theme", "浅色", "深色", "跟随系统", "light", "dark", "system"]),
+        item("window_material", "appearance", "窗口材质", "窗口材质", &["material", "mica", "acrylic", "亚克力", "云母", "材质", "背景", "透明", "毛玻璃", "backdrop"]),
         // 搜索
         item("pinyin_default", "search", "默认拼音匹配", "搜索", &["pinyin", "拼音", "全拼", "简拼"]),
         item("search_limit", "search", "结果上限", "搜索", &["limit", "max", "results", "条数"]),

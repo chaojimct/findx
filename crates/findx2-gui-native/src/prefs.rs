@@ -53,6 +53,8 @@ pub struct LocalPrefs {
     pub browser_column_widths: Option<[f32; 4]>,
     #[serde(default)]
     pub last_official_update_check_unix: i64,
+    #[serde(default)]
+    pub window_material: crate::window_material::WindowMaterial,
 }
 
 fn default_usage_depth()->usize{3}
@@ -85,6 +87,7 @@ impl Default for LocalPrefs {
             browser_fit_columns: true,
             browser_column_widths: None,
             last_official_update_check_unix: 0,
+            window_material: crate::window_material::WindowMaterial::default(),
         }
     }
 }

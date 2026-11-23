@@ -126,6 +126,7 @@ pub struct SettingsWindow {
     // immediately. There is no draft/original pair, no save button.
     settings: FindxGuiSettings,
     theme: UiThemePref,
+    material: crate::window_material::WindowMaterial,
     search_limit: Entity<InputState>,
     save_interval: Entity<InputState>,
     nav_search: Entity<InputState>,
@@ -187,6 +188,14 @@ impl SettingsWindow {
     ) -> Self {
         let style = session.read(cx).prefs.theme_style;
         let (settings, theme) = session.read_with(cx, |s, _| (s.settings.clone(), s.prefs.theme));
+        // New OS windows start with the saved backdrop before first paint.
+        let (material, dark) = session.read_with(cx, |s, _| {
+            (
+                s.prefs.window_material,
+                s.effective_theme().is_dark(),
+            )
+        });
+        crate::window_material::apply_to_window(window, material, dark);
         let search_limit = cx
             .new(|cx| InputState::new(window, cx).default_value(settings.search_limit.to_string()));
         let save_interval = cx.new(|cx| {
@@ -222,6 +231,7 @@ impl SettingsWindow {
             },
             settings,
             theme,
+            material,
             search_limit: search_limit.clone(),
             save_interval: save_interval.clone(),
             nav_search: nav_search.clone(),
@@ -403,6 +413,34 @@ impl SettingsWindow {
 
     fn set_theme(&mut self, pref: UiThemePref, cx: &mut Context<Self>) {
         self.apply_theme_now(self.style, pref, cx);
+    }
+
+    /// Apply a backdrop instantly to every open window: session, live DWM
+    /// state, and disk, no draft. Mirrors `apply_theme_now`.
+    fn set_material(
+        &mut self,
+        material: crate::window_material::WindowMaterial,
+        cx: &mut Context<Self>,
+    ) {
+        self.material = material;
+        let dark = self
+            .session
+            .read_with(cx, |s, _| s.effective_theme().is_dark());
+        self.session.update(cx, |s, cx| {
+            s.prefs.window_material = material;
+            s.apply_theme(cx);
+            cx.notify();
+        });
+        crate::session::persist_prefs(self.session.read(cx).prefs.clone(), cx);
+        // Backdrops live per HWND: constructors only cover newly opened
+        // windows, so re-apply to every live one here.
+        for handle in cx.windows() {
+            let _ = handle.update(cx, |_, window, _| {
+                crate::window_material::apply_to_window(window, material, dark);
+            });
+        }
+        cx.refresh_windows();
+        cx.notify();
     }
 
     // ---- Shortcut editing -------------------------------------------------
@@ -1121,6 +1159,36 @@ impl SettingsWindow {
                     ))
                     .child(settings_note("跟随系统时，外观会随系统切换。", tokens))
             )
+            // Backdrop materials are a Windows-only DWM feature; other
+            // platforms keep the solid theme background.
+            .when(cfg!(windows), |v| {
+                v.child(
+                    settings_card(tokens)
+                        .child(section_title("窗口材质", tokens))
+                        .child(h_flex().gap_2().children(
+                            crate::window_material::WindowMaterial::ALL
+                                .into_iter()
+                                .map(|(material, label)| {
+                                    Button::new(SharedString::from(format!(
+                                        "window-material-{label}"
+                                    )))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h(px(32.))
+                                    .label(label)
+                                    .selected(self.material == material)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_material(material, cx)
+                                    }))
+                                }),
+                        ))
+                        .child(settings_note(self.material.note(), tokens))
+                        .child(settings_note(
+                            "亚克力与云母需要 Windows 11；不受支持的系统自动回退纯色。切换立即生效。",
+                            tokens,
+                        )),
+                )
+            })
     }
 
     fn render_index_tab(

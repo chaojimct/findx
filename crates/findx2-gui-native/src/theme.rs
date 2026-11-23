@@ -315,6 +315,36 @@ pub fn apply_findx_style(style: ThemeStyle, appearance: EffectiveTheme, cx: &mut
     cx.set_global(t);
 }
 
+/// Translucent chrome for backdrop materials. Runs right after
+/// [`apply_findx_style`]; solid leaves every computed color untouched.
+/// Only the window frame (title bar / sidebar / status bar) goes translucent —
+/// content, text and controls stay opaque for readability. Off Windows this
+/// is a no-op: without a compositor backdrop the alpha would only dull colors.
+pub fn apply_material_translucency(
+    material: crate::window_material::WindowMaterial,
+    cx: &mut App,
+) {
+    if !(cfg!(windows) && material.translucent_chrome()) {
+        return;
+    }
+    fn dim(color: Hsla, keep: f32) -> Hsla {
+        Hsla {
+            a: (color.a * keep).clamp(0.0, 1.0),
+            ..color
+        }
+    }
+    cx.update_global::<FindxTokens, _>(|t, _| {
+        t.title_bar = dim(t.title_bar, 0.55);
+        t.surface = dim(t.surface, 0.72);
+    });
+    Theme::update(cx, |theme| {
+        let c = &mut theme.colors;
+        c.title_bar = dim(c.title_bar, 0.55);
+        c.sidebar = dim(c.sidebar, 0.72);
+        c.status_bar = dim(c.status_bar, 0.72);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

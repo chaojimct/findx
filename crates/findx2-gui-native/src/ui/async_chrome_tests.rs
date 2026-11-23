@@ -38,6 +38,67 @@ fn update_async_status_and_progress_have_permanent_reserved_rows() {
     assert!(src.contains("Progress::new(\"update-progress-fill\")"));
 }
 
+#[test] fn window_material_picker_is_wired_end_to_end() {
+    let mat = include_str!("../window_material.rs");
+    for variant in ["Solid", "Mica", "MicaAlt", "AcrylicThin", "AcrylicStandard"] {
+        assert!(mat.contains(variant), "missing material variant {variant}");
+    }
+    for label in ["纯色", "云母", "云母 Alt", "标准亚克力", "轻薄亚克力"] {
+        assert!(mat.contains(label), "missing material label {label}");
+    }
+    // DWM attribute numbers are stable ABI; gpui-pre-windows only covers
+    // SYSTEMBACKDROP on 22621+, so the module probes both attributes itself.
+    assert!(mat.contains("38") && mat.contains("1029"),
+        "must drive SYSTEMBACKDROP_TYPE with a MICA_EFFECT fallback");
+    assert!(mat.contains("SetWindowCompositionAttribute"),
+        "tinted acrylics go through the legacy composition path");
+    assert!(mat.contains("set_background_appearance"),
+        "renderer clear (opaque vs transparent) must follow the material");
+    assert!(mat.contains("WindowBackgroundAppearance::Opaque")
+        && mat.contains("WindowBackgroundAppearance::MicaBackdrop")
+        && mat.contains("WindowBackgroundAppearance::MicaAltBackdrop")
+        && mat.contains("WindowBackgroundAppearance::Transparent"),
+        "every material needs its renderer-clear mode");
+    assert!(mat.contains("apply_to_window"));
+    assert!(mat.contains("not(windows)"),
+        "off Windows the whole thing must be a no-op");
+
+    let prefs = include_str!("../prefs.rs");
+    assert!(prefs.contains("pub window_material:"),
+        "material must persist in LocalPrefs");
+    assert!(prefs.contains("window_material: crate::window_material::WindowMaterial::default()"),
+        "old prefs files without the field must load as solid");
+
+    let settings = include_str!("settings_window.rs");
+    assert!(settings.contains("window-material-"),
+        "appearance tab must render one button per material");
+    assert!(settings.contains("fn set_material"),
+        "switching must persist + repaint + re-apply to every live window");
+    assert!(settings.contains("cx.windows()") && settings.contains("handle.update(cx,"),
+        "DWM state lives per HWND: constructors alone only cover new windows");
+    assert!(settings.contains("apply_to_window(window, material, dark)"),
+        "material switch must reach the DWM applier with the theme tint");
+
+    let main = include_str!("main_window.rs");
+    assert!(main.contains("apply_to_window(window, material, dark)"),
+        "main window must start with the saved backdrop before first paint");
+
+    let session = include_str!("../session.rs");
+    assert!(session.contains("apply_material_translucency"),
+        "theme application must add translucent chrome for materials");
+    let theme = include_str!("../theme.rs");
+    assert!(theme.contains("c.title_bar = dim(")
+        && theme.contains("c.sidebar = dim(")
+        && theme.contains("c.status_bar = dim("),
+        "only frame surfaces go translucent; content stays opaque");
+    assert!(theme.contains("cfg!(windows)"),
+        "without a compositor backdrop the alpha would only dull colors");
+
+    let search = include_str!("../settings_search.rs");
+    assert!(search.contains("\"window_material\""),
+        "the picker must be findable from settings search");
+}
+
 #[test] fn update_install_is_observable_and_honest() {
     let logic = include_str!("../update_logic.rs");
     // P2: the installer must show its own progress window, never go fully dark.

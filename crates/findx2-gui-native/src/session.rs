@@ -93,6 +93,9 @@ impl AppSession {
             .map(|(style, _)| style)
             .unwrap_or(self.prefs.theme_style);
         theme::apply_findx_style(style, self.effective_theme(), cx);
+        // Backdrop materials need translucent chrome to show through; solid
+        // keeps the computed palette untouched.
+        theme::apply_material_translucency(self.prefs.window_material, cx);
     }
 
     pub fn set_theme_pref(&mut self, pref: UiThemePref, cx: &mut App) {

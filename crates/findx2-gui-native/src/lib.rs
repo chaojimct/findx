@@ -18,6 +18,8 @@ pub mod theme;
 pub mod ui;
 pub mod update_logic;
 
+pub mod window_material;
+
 pub mod document_preview;
 
 pub mod preview_worker;
