@@ -1,0 +1,65 @@
+{
+  "version": "2.5.11",
+  "baseline": "2.5.10",
+  "channel": "stable",
+  "publish_ready": true,
+  "windows_gui": "native",
+  "gates": [
+    {
+      "id": "engine-io-storm-fixed",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "wal-crash-recovery",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "persist-test-suites",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "fold-quiescence-in-prod",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "legacy-2-4-multivolume-index-loads",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "installer-live-handoff",
+      "priority": "P1",
+      "required": false,
+      "passed": false
+    },
+    {
+      "id": "strict-protocol2-stop-receipt",
+      "priority": "P1",
+      "required": false,
+      "passed": false
+    },
+    {
+      "id": "macos-linux-native-packaging",
+      "priority": "P2",
+      "required": false,
+      "passed": false
+    }
+  ],
+  "engine_binary_baseline": "No engine/service change since 2.5.10: all 2.5.11 commits are GUI-only (crates/findx2-gui-native) plus a CI serial-test tweak. No index-format migration (v6 generations unchanged; wal/ directory additive). Official GitHub Release artifacts are produced by the existing release.yml CI rebuild on tag v2.5.11 (Windows native only); they are not byte-identical to any local build.",
+  "gate_evidence": "release/2.5.11.md",
+  "limitations": [
+    "installer live handoff not re-run for 2.5.11 (in-app update path changed to /SILENT + process wait; first live-matrix run happens on user machines, rollback semantics unchanged and covered by exit-80 unit/source-scan regressions)",
+    "in-app update progress verified by unit + source-scan regressions and build only; no new-version round-trip executed locally (would replace the installed product)",
+    "macOS and Linux native GUI packages do not exist yet",
+    "Official CI packages are a new rebuild and are not byte-identical to any local build"
+  ]
+}
