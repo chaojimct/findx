@@ -434,10 +434,22 @@ impl SettingsWindow {
         crate::session::persist_prefs(self.session.read(cx).prefs.clone(), cx);
         // Backdrops live per HWND: constructors only cover newly opened
         // windows, so re-apply to every live one here.
+        let mut effective = material;
         for handle in cx.windows() {
-            let _ = handle.update(cx, |_, window, _| {
-                crate::window_material::apply_to_window(window, material, dark);
-            });
+            let applied = handle
+                .update(cx, |_, window, _| {
+                    crate::window_material::apply_to_window(window, material, dark)
+                })
+                .unwrap_or(material);
+            if applied != material {
+                effective = applied;
+            }
+        }
+        if effective != material {
+            self.hint = SharedString::from(format!(
+                "当前系统不支持「{}」，已回退纯色。",
+                material.label()
+            ));
         }
         cx.refresh_windows();
         cx.notify();
@@ -1162,6 +1174,7 @@ impl SettingsWindow {
             // Backdrop materials are a Windows-only DWM feature; other
             // platforms keep the solid theme background.
             .when(cfg!(windows), |v| {
+                let support = crate::window_material::os_support();
                 v.child(
                     settings_card(tokens)
                         .child(section_title("窗口材质", tokens))
@@ -1177,6 +1190,7 @@ impl SettingsWindow {
                                     .h(px(32.))
                                     .label(label)
                                     .selected(self.material == material)
+                                    .disabled(!support.supports(material))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.set_material(material, cx)
                                     }))
@@ -1184,7 +1198,13 @@ impl SettingsWindow {
                         ))
                         .child(settings_note(self.material.note(), tokens))
                         .child(settings_note(
-                            "亚克力与云母需要 Windows 11；不受支持的系统自动回退纯色。切换立即生效。",
+                            if support.supports(
+                                crate::window_material::WindowMaterial::Mica,
+                            ) {
+                                "切换立即生效；亚克力在壁纸上最明显。"
+                            } else {
+                                "当前系统仅支持亚克力与纯色；云母需要 Windows 11。"
+                            },
                             tokens,
                         )),
                 )

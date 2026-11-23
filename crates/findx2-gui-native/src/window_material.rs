@@ -16,6 +16,114 @@
 
 use serde::{Deserialize, Serialize};
 
+/// What the running OS can actually do. Probed once from ntdll
+/// `RtlGetVersion` (no new crate features needed) and cached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OsBackdropSupport {
+    /// Windows build number, e.g. 22621.
+    pub build: u32,
+    /// `DWMWA_MICA_EFFECT` (Windows 11 21H2 / 22000+).
+    pub mica_effect: bool,
+    /// `DWMWA_SYSTEMBACKDROP_TYPE` (22H2 / 22621+).
+    pub system_backdrop: bool,
+    /// `SetWindowCompositionAttribute` acrylic (Win10 1803 / 17134+).
+    pub legacy_acrylic: bool,
+}
+
+/// Cached OS capability probe for the settings picker. Off Windows
+/// everything reports unsupported (the card itself is Windows-gated).
+pub fn os_support() -> OsBackdropSupport {
+    #[cfg(windows)]
+    {
+        probe_os_support()
+    }
+    #[cfg(not(windows))]
+    {
+        OsBackdropSupport::for_build(0)
+    }
+}
+
+impl OsBackdropSupport {
+    pub fn for_build(build: u32) -> Self {
+        Self {
+            build,
+            mica_effect: build >= 22000,
+            system_backdrop: build >= 22621,
+            legacy_acrylic: build >= 17134,
+        }
+    }
+
+    /// Unsupported options are disabled in the picker instead of failing
+    /// silently after the click.
+    pub fn supports(self, material: WindowMaterial) -> bool {
+        match material {
+            WindowMaterial::Solid => true,
+            WindowMaterial::Mica | WindowMaterial::MicaAlt => self.mica_effect,
+            WindowMaterial::AcrylicThin | WindowMaterial::AcrylicStandard => {
+                self.legacy_acrylic
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn probe_os_support() -> OsBackdropSupport {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CACHED_BUILD: AtomicU32 = AtomicU32::new(0);
+    let build = CACHED_BUILD.load(Ordering::Relaxed);
+    if build != 0 {
+        return OsBackdropSupport::for_build(build);
+    }
+    let build = os_build_number().unwrap_or(0);
+    if build != 0 {
+        CACHED_BUILD.store(build, Ordering::Relaxed);
+    }
+    OsBackdropSupport::for_build(build)
+}
+
+/// Raw build number via ntdll, bypassing the deprecated version helpers.
+#[cfg(windows)]
+fn os_build_number() -> Option<u32> {
+    use windows::core::PCSTR;
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+
+    #[repr(C)]
+    struct OsVersionInfo {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform: u32,
+        csd: [u16; 128],
+    }
+    unsafe {
+        type FnTy = unsafe extern "system" fn(*mut OsVersionInfo) -> i32;
+        let ntdll =
+            GetModuleHandleA(PCSTR::from_raw(c"ntdll.dll".as_ptr() as *const u8)).ok()?;
+        if ntdll.is_invalid() {
+            return None;
+        }
+        let proc = GetProcAddress(
+            ntdll,
+            PCSTR::from_raw(c"RtlGetVersion".as_ptr() as *const u8),
+        )?;
+        let get: FnTy = std::mem::transmute(proc);
+        let mut info = OsVersionInfo {
+            size: std::mem::size_of::<OsVersionInfo>() as u32,
+            major: 0,
+            minor: 0,
+            build: 0,
+            platform: 0,
+            csd: [0; 128],
+        };
+        if get(&mut info) == 0 && info.build != 0 {
+            Some(info.build)
+        } else {
+            None
+        }
+    }
+}
+
 /// Backdrop material of a top-level window. Stored in prefs; old files
 /// without the field deserialize to [`WindowMaterial::Solid`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,16 +177,23 @@ impl WindowMaterial {
     }
 }
 
-/// Apply a material to one top-level window. Safe to call on any platform;
-/// off Windows it is a no-op. `dark` picks the acrylic tint.
-pub fn apply_to_window(window: &gpui_kit::Window, material: WindowMaterial, dark: bool) {
+/// Apply a material to one top-level window and return what actually stuck
+/// (unsupported materials degrade to [`WindowMaterial::Solid`]). Safe to
+/// call on any platform; off Windows it is a no-op. `dark` picks the
+/// acrylic tint.
+pub fn apply_to_window(
+    window: &gpui_kit::Window,
+    material: WindowMaterial,
+    dark: bool,
+) -> WindowMaterial {
     #[cfg(windows)]
     {
-        windows_impl::apply(window, material, dark);
+        windows_impl::apply(window, material, dark)
     }
     #[cfg(not(windows))]
     {
-        let _ = (window, material, dark);
+        let _ = (window, dark);
+        material
     }
 }
 
@@ -189,44 +304,72 @@ mod windows_impl {
         (alpha as u32) << 24 | (b as u32) << 16 | (g as u32) << 8 | r as u32
     }
 
-    pub fn apply(window: &Window, material: Material, dark: bool) {
+    /// Returns the material that actually stuck; anything unsupported
+    /// degrades to solid so the UI can say so instead of failing silently.
+    pub fn apply(window: &Window, material: Material, dark: bool) -> Material {
+        use super::{OsBackdropSupport, probe_os_support};
+        let support = probe_os_support();
         let Some(hwnd) = hwnd_of(window) else {
-            return;
+            return Material::Solid;
         };
+        // Skip calls the OS cannot honor; every remaining setter below is
+        // still checked, so a lie here only costs a fallback, never a hang.
         match material {
             Material::Solid => {
                 window.set_background_appearance(WindowBackgroundAppearance::Opaque);
                 set_attr(hwnd, ATTR_SYSTEMBACKDROP, BACKDROP_NONE);
                 legacy_accent(hwnd, 0, 0);
+                Material::Solid
             }
             Material::Mica => {
                 window.set_background_appearance(WindowBackgroundAppearance::MicaBackdrop);
                 // gpui-pre-windows only drives SYSTEMBACKDROP on 22621+; the
                 // MICA_EFFECT fallback covers 22000+, then solid.
-                if !set_attr(hwnd, ATTR_SYSTEMBACKDROP, BACKDROP_MICA)
-                    && !set_attr(hwnd, ATTR_MICA_EFFECT, 1)
-                {
+                let ok = (support.system_backdrop
+                    && set_attr(hwnd, ATTR_SYSTEMBACKDROP, BACKDROP_MICA))
+                    || (support.mica_effect && set_attr(hwnd, ATTR_MICA_EFFECT, 1));
+                if ok {
+                    Material::Mica
+                } else {
                     window.set_background_appearance(WindowBackgroundAppearance::Opaque);
+                    Material::Solid
                 }
             }
             Material::MicaAlt => {
                 window.set_background_appearance(WindowBackgroundAppearance::MicaAltBackdrop);
-                if !set_attr(hwnd, ATTR_SYSTEMBACKDROP, BACKDROP_MICA_ALT)
-                    && !set_attr(hwnd, ATTR_MICA_EFFECT, 1)
-                {
+                let ok = (support.system_backdrop
+                    && set_attr(hwnd, ATTR_SYSTEMBACKDROP, BACKDROP_MICA_ALT))
+                    || (support.mica_effect && set_attr(hwnd, ATTR_MICA_EFFECT, 1));
+                if ok {
+                    Material::MicaAlt
+                } else {
                     window.set_background_appearance(WindowBackgroundAppearance::Opaque);
+                    Material::Solid
                 }
             }
             Material::AcrylicThin => {
+                if !support.legacy_acrylic {
+                    window.set_background_appearance(WindowBackgroundAppearance::Opaque);
+                    return Material::Solid;
+                }
                 window.set_background_appearance(WindowBackgroundAppearance::Transparent);
                 legacy_accent(hwnd, 4, argb(0x55, gray_tint(dark)));
+                Material::AcrylicThin
             }
             Material::AcrylicStandard => {
                 window.set_background_appearance(WindowBackgroundAppearance::Transparent);
                 // Prefer the real system acrylic; the tinted legacy path is
                 // the fallback for older builds.
-                if !set_attr(hwnd, ATTR_SYSTEMBACKDROP, BACKDROP_ACRYLIC) {
+                if support.system_backdrop
+                    && set_attr(hwnd, ATTR_SYSTEMBACKDROP, BACKDROP_ACRYLIC)
+                {
+                    Material::AcrylicStandard
+                } else if support.legacy_acrylic {
                     legacy_accent(hwnd, 4, argb(0xA6, gray_tint(dark)));
+                    Material::AcrylicStandard
+                } else {
+                    window.set_background_appearance(WindowBackgroundAppearance::Opaque);
+                    Material::Solid
                 }
             }
         }
@@ -251,6 +394,40 @@ mod tests {
         assert!(WindowMaterial::MicaAlt.translucent_chrome());
         assert!(WindowMaterial::AcrylicThin.translucent_chrome());
         assert!(WindowMaterial::AcrylicStandard.translucent_chrome());
+    }
+
+    #[test]
+    fn support_matrix_follows_windows_build_numbers() {
+        // Below Win10 1803: solid only.
+        let ancient = OsBackdropSupport::for_build(17133);
+        assert!(ancient.supports(WindowMaterial::Solid));
+        assert!(!ancient.supports(WindowMaterial::AcrylicThin));
+        assert!(!ancient.supports(WindowMaterial::AcrylicStandard));
+        assert!(!ancient.supports(WindowMaterial::Mica));
+        assert!(!ancient.supports(WindowMaterial::MicaAlt));
+        // Win10 1803+: legacy acrylic joins.
+        let win10 = OsBackdropSupport::for_build(19045);
+        assert!(win10.supports(WindowMaterial::AcrylicThin));
+        assert!(win10.supports(WindowMaterial::AcrylicStandard));
+        assert!(!win10.supports(WindowMaterial::Mica));
+        assert!(!win10.supports(WindowMaterial::MicaAlt));
+        // Win11 21H2: Mica effect, still no SYSTEMBACKDROP_TYPE.
+        let win11_21h2 = OsBackdropSupport::for_build(22000);
+        assert!(win11_21h2.supports(WindowMaterial::Mica));
+        assert!(win11_21h2.supports(WindowMaterial::MicaAlt));
+        assert!(!win11_21h2.system_backdrop);
+        // Win11 22H2+: everything.
+        let win11_22h2 = OsBackdropSupport::for_build(22621);
+        assert!(win11_22h2.system_backdrop);
+        for material in [
+            WindowMaterial::Solid,
+            WindowMaterial::Mica,
+            WindowMaterial::MicaAlt,
+            WindowMaterial::AcrylicThin,
+            WindowMaterial::AcrylicStandard,
+        ] {
+            assert!(win11_22h2.supports(material));
+        }
     }
 
     #[test]

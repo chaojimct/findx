@@ -62,6 +62,14 @@ fn update_async_status_and_progress_have_permanent_reserved_rows() {
     assert!(mat.contains("apply_to_window"));
     assert!(mat.contains("not(windows)"),
         "off Windows the whole thing must be a no-op");
+    // Silent fallbacks are a bug magnet: support is probed, surfaced in the
+    // picker, and reported when a switch degrades.
+    assert!(mat.contains("OsBackdropSupport") && mat.contains("RtlGetVersion"),
+        "OS capability must be probed from ntdll, never assumed");
+    assert!(mat.contains("fn supports("),
+        "each material must declare whether this OS can honor it");
+    assert!(mat.contains("-> Material"),
+        "apply must return what actually stuck so the UI can report fallback");
 
     let prefs = include_str!("../prefs.rs");
     assert!(prefs.contains("pub window_material:"),
@@ -74,7 +82,11 @@ fn update_async_status_and_progress_have_permanent_reserved_rows() {
         "appearance tab must render one button per material");
     assert!(settings.contains("fn set_material"),
         "switching must persist + repaint + re-apply to every live window");
-    assert!(settings.contains("cx.windows()") && settings.contains("handle.update(cx,"),
+    assert!(settings.contains(".disabled(!support.supports(material))"),
+        "unsupported materials must be disabled up front, not fail silently");
+    assert!(settings.contains("已回退纯色"),
+        "a degraded switch must say so in the hint");
+    assert!(settings.contains("cx.windows()") && settings.contains(".update(cx, |_, window, _|"),
         "DWM state lives per HWND: constructors alone only cover new windows");
     assert!(settings.contains("apply_to_window(window, material, dark)"),
         "material switch must reach the DWM applier with the theme tint");
