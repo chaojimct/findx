@@ -38,6 +38,7 @@ pub fn tab_label(tab: &str) -> &'static str {
         "shortcuts" => "快捷键",
         "diagnostics" => "诊断",
         "about" => "关于",
+        "content" => "全文",
         _ => "设置",
     }
 }
@@ -147,6 +148,16 @@ pub fn all_settings_items() -> Vec<SettingsItem> {
         item("service_boot", "index", "服务开机自启", "索引服务", &["autostart", "开机", "自启", "boot"]),
         item("service_login", "index", "登录时自动启动 FindX", "索引服务", &["autostart", "登录", "启动"]),
         item("maintenance", "index", "高级维护", "高级维护", &["maintenance", "压缩", "重建", "备份", "compact", "rebuild"]),
+        // 全文内容索引
+        item("content_status", "content", "全文索引状态", "全文索引状态", &["content", "全文", "索引", "状态", "status", "docs"]),
+        item("content_build", "content", "构建/重建/清空内容索引", "全文索引状态", &["content", "全文", "构建", "重建", "清空", "build", "rebuild"]),
+        item("content_enable", "content", "启用全文搜索", "查询行为", &["content", "全文", "启用", "enable"]),
+        item("content_mode", "content", "默认搜索模式", "查询行为", &["content", "全文", "模式", "文件名", "混合", "mode"]),
+        item("content_snippet", "content", "命中摘要", "查询行为", &["content", "全文", "摘要", "snippet", "预览"]),
+        item("content_mix_limit", "content", "混合模式内容上限", "查询行为", &["content", "全文", "混合", "上限", "limit"]),
+        item("content_scope", "content", "索引范围与类型", "索引范围", &["content", "全文", "范围", "office", "pdf", "代码", "上限", "mb"]),
+        item("content_follow", "content", "增量跟随", "高级", &["content", "全文", "增量", "跟随", "incremental"]),
+        item("content_commit", "content", "提交节流", "高级", &["content", "全文", "提交", "commit", "节流"]),
         // 诊断
         item("diag_runtime", "diagnostics", "运行状态", "运行状态", &["status", "版本", "连接", "错误"]),
         item("diag_overlay", "diagnostics", "在主窗口显示诊断浮层", "运行状态", &["overlay", "浮层", "诊断"]),
@@ -186,6 +197,7 @@ pub fn canonical_tab(tab: &str) -> &'static str {
     match tab.trim().to_lowercase().as_str() {
         "appearance" | "theme" | "外观" => "appearance",
         "search" | "搜索" => "search",
+        "content" | "全文" | "fulltext" | "全文索引" | "全文搜索" => "content",
         "files" | "file" | "文件" => "files",
         "preview" | "预览" => "preview",
         "index" | "索引" => "index",
@@ -241,7 +253,7 @@ mod tests {
             assert!(ids.insert(it.id), "duplicate settings id: {}", it.id);
             assert!(!it.label.is_empty(), "empty label for {}", it.id);
         }
-        for tab in ["appearance", "search", "files", "preview", "index", "shortcuts", "diagnostics", "about"] {
+        for tab in ["appearance", "search", "files", "preview", "index", "content", "shortcuts", "diagnostics", "about"] {
             assert!(all.iter().any(|it| it.tab == tab), "no settings catalog for tab {tab}");
         }
     }

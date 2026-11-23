@@ -214,6 +214,7 @@ impl BrowserWindow {
                         false,
                         cancel,
                     )
+                    .await
                 })
                 .await;
             this.update(cx, |this, cx| {

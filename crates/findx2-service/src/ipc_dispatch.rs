@@ -28,6 +28,8 @@ pub(crate) fn req_kind_label(r: &IpcRequest) -> &'static str {
         IpcRequest::Ping => "Ping",
         IpcRequest::Status => "Status",
         IpcRequest::Search { .. } => "Search",
+        IpcRequest::ContentBuild { .. } => "ContentBuild",
+        IpcRequest::ContentCancel => "ContentCancel",
     }
 }
 
@@ -122,6 +124,17 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                 indexed_drive_mask: 0,
                 wal_bytes: 0,
                 last_fold_secs_ago: None,
+                // 索引还没加载：内容状态未知（GUI 按缺省/未知处理）。
+                content_state: String::new(),
+                content_docs: 0,
+                content_bytes: 0,
+                content_scanned: 0,
+                content_extracted: 0,
+                content_skipped: 0,
+                content_failed: 0,
+                content_error: None,
+                content_detail: String::new(),
+                content_entry_total: 0,
             }
         }
         (IpcRequest::Search { .. }, None) => IpcResponse::Error {
@@ -148,6 +161,7 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
             let backfill_error = eng.backfill_error_snapshot();
             match eng.try_index_store() {
                 Some(g) => {
+                    let cs = crate::content_index::status_snapshot();
                     let vol = g.volumes.first();
                     let (backfill_done, backfill_total) = if g.metadata_ready {
                         (0u64, 0u64)
@@ -197,6 +211,16 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                         indexed_drive_mask: drive_mask,
                         wal_bytes,
                         last_fold_secs_ago,
+                        content_state: cs.state.to_string(),
+                        content_docs: cs.docs,
+                        content_bytes: cs.bytes,
+                        content_scanned: cs.scanned,
+                        content_extracted: cs.extracted,
+                        content_skipped: cs.skipped,
+                        content_failed: cs.failed,
+                        content_error: cs.error,
+                        content_detail: cs.detail,
+                        content_entry_total: cs.entry_total,
                     }
                 }
                 None => {
@@ -210,6 +234,7 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                     let l = crate::load_state::snapshot();
                     // WAL depth doesn't need the store lock; report it even on the fallback path.
                     let (wal_bytes, last_fold_secs_ago) = crate::run::persistence_health_snapshot();
+                    let cs = crate::content_index::status_snapshot();
                     IpcResponse::StatusResult {
                         entry_count: locked.entry_count,
                         dir_count: locked.dir_count,
@@ -231,9 +256,30 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                         indexed_drive_mask: locked.drive_mask,
                         wal_bytes,
                         last_fold_secs_ago,
+                        content_state: cs.state.to_string(),
+                        content_docs: cs.docs,
+                        content_bytes: cs.bytes,
+                        content_scanned: cs.scanned,
+                        content_extracted: cs.extracted,
+                        content_skipped: cs.skipped,
+                        content_failed: cs.failed,
+                        content_error: cs.error,
+                        content_detail: cs.detail,
+                        content_entry_total: cs.entry_total,
                     }
                 }
             }
+        }
+        (IpcRequest::ContentBuild { rebuild }, _) => {
+            match crate::content_index::start_build(rebuild) {
+                Ok(_) => IpcResponse::Pong,
+                Err(message) => IpcResponse::Error { message },
+            }
+        }
+        (IpcRequest::ContentCancel, _) => {
+            // 幂等：无构建在跑也是 Pong，GUI 只管轮询 Status 看状态。
+            crate::content_index::cancel_build();
+            IpcResponse::Pong
         }
     }
 }
@@ -270,20 +316,38 @@ pub(crate) fn search_ipc(
         .map_err(|e| e.to_string())?;
     let search_us = t_search.elapsed().as_micros() as u64;
     let t_format = std::time::Instant::now();
-    let dtos: Vec<findx2_ipc::SearchHitDto> = hits
-        .into_iter()
+    let mut dtos: Vec<findx2_ipc::SearchHitDto> = hits
+        .iter()
         .map(|h| {
             findx2_ipc::SearchHitDto {
                 entry_idx: h.entry_idx,
-                name: h.name,
-                path: h.path,
+                name: h.name.clone(),
+                path: h.path.clone(),
                 size: h.size,
                 mtime: h.mtime,
                 is_directory: h.is_directory,
-                name_highlight: h.name_highlight,
+                name_highlight: h.name_highlight.clone(),
+                snippet: String::new(),
             }
         })
         .collect();
+    // 含 content: 谓词时给当页前 N 个填 snippet（有界成本，超出的行后面懒取）。
+    if pq.content_substring.is_some() || pq.utf8content_substring.is_some() {
+        let idxs: Vec<u32> = hits.iter().map(|h| h.entry_idx).collect();
+        let map = crate::content_index::snippets_for(
+            &engine,
+            query,
+            &idxs,
+            crate::content_index::SNIPPET_PER_PAGE,
+        );
+        if !map.is_empty() {
+            for (h, dto) in hits.iter().zip(dtos.iter_mut()) {
+                if let Some(s) = map.get(&h.entry_idx) {
+                    dto.snippet = s.clone();
+                }
+            }
+        }
+    }
     let format_us = t_format.elapsed().as_micros() as u64;
     let elapsed_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
     findx2_core::progress!(

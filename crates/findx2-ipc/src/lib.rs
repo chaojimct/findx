@@ -76,6 +76,14 @@ pub enum IpcRequest {
         #[serde(default)]
         offset: usize,
     },
+    /// 全文内容索引构建（`<index>.content/`）：service 后台线程执行，不停服。
+    /// 已在构建 → Error；`rebuild=true` 删旧全量重建，否则复用追加。
+    ContentBuild {
+        #[serde(default)]
+        rebuild: bool,
+    },
+    /// 取消正在进行的 `ContentBuild`（无构建在跑 → Pong 空操作）。
+    ContentCancel,
     /// Negotiation only. Missing/unknown versions must never imply prepare support.
     UpgradeCapabilities { protocol_version: u32 },
     PrepareStop { protocol_version: u32, expected_instance: String, request_nonce: String, index_identity: String, timeout_ms: u64 },
@@ -106,6 +114,22 @@ fn default_pinyin() -> bool {
 
 fn default_metadata_ready() -> bool {
     true
+}
+
+/// 全文内容索引状态（`StatusResult.content_state` 取值）。
+/// - `missing`：未建，`content:` 走慢速逐文件；
+/// - `building`：后台构建中（进度见 content_scanned 等）；
+/// - `ready`：可用 + 增量跟随中；
+/// - `stale`：过期（schema/文件名索引/范围变化），仍可搜，建议重建；
+/// - `failed`：构建失败（保留旧索引，`content_error` 看原因）；
+/// - `disabled`：增量跟随被关闭且未建。
+pub mod content_state {
+    pub const MISSING: &str = "missing";
+    pub const BUILDING: &str = "building";
+    pub const READY: &str = "ready";
+    pub const STALE: &str = "stale";
+    pub const FAILED: &str = "failed";
+    pub const DISABLED: &str = "disabled";
 }
 
 /// 服务端 → 客户端的响应。
@@ -183,6 +207,38 @@ pub enum IpcResponse {
         /// Bit 0 is A:. Old peers omit it; the host then falls back to `volume_letter`.
         #[serde(default)]
         indexed_drive_mask: u32,
+        /// 全文内容索引状态（见 `content_state` 模块）。缺省 "" = 老版 service 未上报。
+        #[serde(default)]
+        content_state: String,
+        /// 内容索引文档数（`ready`/`stale`/`failed` 时有效）。
+        #[serde(default)]
+        content_docs: u64,
+        /// 内容索引目录体积（字节，打开/构建完成时刷新）。
+        #[serde(default)]
+        content_bytes: u64,
+        /// 本次（或上次）构建进度：已扫描文件名索引条目数。
+        #[serde(default)]
+        content_scanned: u64,
+        /// 本次（或上次）构建进度：已抽取入倒排的文件数。
+        #[serde(default)]
+        content_extracted: u64,
+        /// 本次（或上次）构建进度：跳过（不支持类型/超限/空文件）数。
+        #[serde(default)]
+        content_skipped: u64,
+        /// 本次（或上次）构建进度：抽取/入库失败数。
+        #[serde(default)]
+        content_failed: u64,
+        /// 全文索引异常说明（构建失败原因 / 增量丢批提示 / 过期原因）。
+        /// `None` = 无异常。`#[serde(default)]` 保持与旧版 service 的兼容。
+        #[serde(default)]
+        content_error: Option<String>,
+        /// 全文索引状态细节（Stale 原因 / 构建备注，`ready` 时为空）。
+        /// 缺省 "" = 老版 service 未上报。
+        #[serde(default)]
+        content_detail: String,
+        /// 文件名索引总条目数（构建进度 `content_scanned / content_entry_total` 即百分比）。
+        #[serde(default)]
+        content_entry_total: u64,
     },
     UpgradeCapabilitiesResult {
         protocol_version: u32,
@@ -225,6 +281,11 @@ pub struct SearchHitDto {
     /// 文件名高亮：Unicode 标量字符下标 [start, end)，与 `findx2-core` 搜索/拼音匹配一致
     #[serde(default)]
     pub name_highlight: Vec<[u32; 2]>,
+    /// 全文命中摘要（tantivy snippet HTML，`<b>` 标命中词；GUI 侧去标签展示）。
+    /// 只在含 `content:` 谓词的搜索中对当页前 N 个命中填充，其余为空串。
+    /// 缺省 "" = 老版 service 未上报。
+    #[serde(default)]
+    pub snippet: String,
 }
 
 #[cfg(test)]
@@ -263,6 +324,69 @@ mod tests {
                 assert_eq!(limit, 500);
             }
             _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn content_protocol_roundtrip_and_old_peer_compat() {
+        // 新请求往返。
+        for req in [
+            IpcRequest::ContentBuild { rebuild: false },
+            IpcRequest::ContentBuild { rebuild: true },
+            IpcRequest::ContentCancel,
+        ] {
+            let j = serde_json::to_string(&req).unwrap();
+            let back: IpcRequest = serde_json::from_str(&j).unwrap();
+            match (&req, &back) {
+                (IpcRequest::ContentBuild { rebuild: a }, IpcRequest::ContentBuild { rebuild: b }) => {
+                    assert_eq!(a, b);
+                }
+                (IpcRequest::ContentCancel, IpcRequest::ContentCancel) => {}
+                _ => panic!("content request roundtrip mismatch: {j}"),
+            }
+        }
+        // 老 service 的 Status（无 content_* 字段）按缺省值解析。
+        let old: IpcResponse = serde_json::from_str(
+            r#"{"type":"status_result","entry_count":7,"healthy":true}"#,
+        )
+        .unwrap();
+        match old {
+            IpcResponse::StatusResult {
+                content_state,
+                content_docs,
+                content_error,
+                content_detail,
+                content_entry_total,
+                ..
+            } => {
+                assert!(content_state.is_empty());
+                assert_eq!(content_docs, 0);
+                assert!(content_error.is_none());
+                assert!(content_detail.is_empty());
+                assert_eq!(content_entry_total, 0);
+            }
+            _ => panic!(),
+        }
+        // 老 service 的命中（无 snippet）按空串解析。
+        let hit: SearchHitDto = serde_json::from_str(
+            r#"{"entry_idx":1,"name":"a.txt","path":"C:\\a.txt","size":3,"mtime":4}"#,
+        )
+        .unwrap();
+        assert!(hit.snippet.is_empty());
+        assert!(hit.name_highlight.is_empty());
+        // 状态常量互斥且稳定（GUI/脚本可直接比字符串）。
+        let states = [
+            content_state::MISSING,
+            content_state::BUILDING,
+            content_state::READY,
+            content_state::STALE,
+            content_state::FAILED,
+            content_state::DISABLED,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for s in states {
+            assert!(!s.is_empty());
+            assert!(seen.insert(s), "content_state 重复: {s}");
         }
     }
 }

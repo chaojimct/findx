@@ -17,8 +17,9 @@ use gpui_kit::*;
 use crate::prefs;
 use crate::session::AppSession;
 use crate::settings_logic::{
-    DraftCommit, FindxGuiSettings, UiThemePref, commit_save_interval_secs,
-    commit_search_limit,
+    ContentDefaultMode, DraftCommit, FindxGuiSettings, UiThemePref, commit_content_commit_docs,
+    commit_content_commit_secs, commit_content_max_file_mb, commit_content_mix_limit,
+    commit_save_interval_secs, commit_search_limit,
 };
 use crate::theme::{FindxTokens, ThemeStyle};
 use crate::ui::update_card::{UpdateCardState, render_update_card};
@@ -74,6 +75,7 @@ pub enum SettingsTab {
     About,
     Index,
     Search,
+    Content,
     Diagnostics,
 }
 
@@ -87,6 +89,7 @@ impl SettingsTab {
             "about" => Self::About,
             "index" => Self::Index,
             "search" => Self::Search,
+            "content" => Self::Content,
             "diagnostics" => Self::Diagnostics,
             _ => Self::Appearance,
         }
@@ -100,6 +103,7 @@ impl SettingsTab {
             Self::About => "about",
             Self::Index => "index",
             Self::Search => "search",
+            Self::Content => "content",
             Self::Diagnostics => "diagnostics",
         }
     }
@@ -133,6 +137,10 @@ pub struct SettingsWindow {
     applied_material: Option<crate::window_material::WindowMaterial>,
     search_limit: Entity<InputState>,
     save_interval: Entity<InputState>,
+    content_max_file: Entity<InputState>,
+    content_mix_limit: Entity<InputState>,
+    content_commit_docs: Entity<InputState>,
+    content_commit_secs: Entity<InputState>,
     nav_search: Entity<InputState>,
     /// 搜索结果跳转后定位到的设置项文案，用于内容区顶部反馈。
     located_label: Option<&'static str>,
@@ -155,6 +163,7 @@ pub struct SettingsWindow {
     service_pending: Option<crate::service_control::Action>,
     service_busy: bool,
     service_advanced: bool,
+    content_advanced: bool,
     service_hint: String,
     autostart_enabled: bool,
     autostart_supported: bool,
@@ -197,6 +206,18 @@ impl SettingsWindow {
             .new(|cx| InputState::new(window, cx).default_value(settings.search_limit.to_string()));
         let save_interval = cx.new(|cx| {
             InputState::new(window, cx).default_value(settings.save_interval_secs.to_string())
+        });
+        let content_max_file = cx.new(|cx| {
+            InputState::new(window, cx).default_value(settings.content_max_file_mb.to_string())
+        });
+        let content_mix_limit = cx.new(|cx| {
+            InputState::new(window, cx).default_value(settings.content_mix_limit.to_string())
+        });
+        let content_commit_docs = cx.new(|cx| {
+            InputState::new(window, cx).default_value(settings.content_commit_docs.to_string())
+        });
+        let content_commit_secs = cx.new(|cx| {
+            InputState::new(window, cx).default_value(settings.content_commit_secs.to_string())
         });
         let index_path =
             cx.new(|cx| InputState::new(window, cx).default_value(settings.index_path.clone()));
@@ -242,6 +263,10 @@ impl SettingsWindow {
             applied_material: None,
             search_limit: search_limit.clone(),
             save_interval: save_interval.clone(),
+            content_max_file: content_max_file.clone(),
+            content_mix_limit: content_mix_limit.clone(),
+            content_commit_docs: content_commit_docs.clone(),
+            content_commit_secs: content_commit_secs.clone(),
             nav_search: nav_search.clone(),
             located_label: None,
             enter_epoch: SETTINGS_ENTER_EPOCH.fetch_add(1, Ordering::Relaxed) as usize,
@@ -259,6 +284,7 @@ impl SettingsWindow {
             service_pending: None,
             service_busy: false,
             service_advanced: false,
+            content_advanced: false,
             service_hint: "正在读取服务状态".into(),
             autostart_enabled: false,
             autostart_supported: true,
@@ -271,6 +297,10 @@ impl SettingsWindow {
         for input in [
             this.search_limit.clone(),
             this.save_interval.clone(),
+            this.content_max_file.clone(),
+            this.content_mix_limit.clone(),
+            this.content_commit_docs.clone(),
+            this.content_commit_secs.clone(),
         ] {
             this._subscriptions
                 .push(cx.subscribe_in(&input, window, move |this, _, ev, _, cx| {
@@ -355,6 +385,22 @@ impl SettingsWindow {
         self.save_interval.read(cx).value().to_string()
     }
 
+    fn content_max_file_text(&self, cx: &App) -> String {
+        self.content_max_file.read(cx).value().to_string()
+    }
+
+    fn content_mix_limit_text(&self, cx: &App) -> String {
+        self.content_mix_limit.read(cx).value().to_string()
+    }
+
+    fn content_commit_docs_text(&self, cx: &App) -> String {
+        self.content_commit_docs.read(cx).value().to_string()
+    }
+
+    fn content_commit_secs_text(&self, cx: &App) -> String {
+        self.content_commit_secs.read(cx).value().to_string()
+    }
+
     /// Push the live struct into the session and onto disk right away.
     fn apply_settings(&mut self, cx: &mut App) {
         let next = self.settings.clone();
@@ -386,19 +432,43 @@ impl SettingsWindow {
         match (
             commit_search_limit(&self.search_limit_text(cx)),
             commit_save_interval_secs(&self.save_interval_text(cx)),
+            commit_content_max_file_mb(&self.content_max_file_text(cx)),
+            commit_content_mix_limit(&self.content_mix_limit_text(cx)),
+            commit_content_commit_docs(&self.content_commit_docs_text(cx)),
+            commit_content_commit_secs(&self.content_commit_secs_text(cx)),
         ) {
-            (DraftCommit::Ok(l), DraftCommit::Ok(i)) => {
+            (
+                DraftCommit::Ok(l),
+                DraftCommit::Ok(i),
+                DraftCommit::Ok(mb),
+                DraftCommit::Ok(mix),
+                DraftCommit::Ok(docs),
+                DraftCommit::Ok(secs),
+            ) => {
                 let changed = self.settings.search_limit != l as u32
-                    || self.settings.save_interval_secs != i;
+                    || self.settings.save_interval_secs != i
+                    || self.settings.content_max_file_mb != mb
+                    || self.settings.content_mix_limit != mix as u32
+                    || self.settings.content_commit_docs != docs
+                    || self.settings.content_commit_secs != secs;
                 self.settings.search_limit = l as u32;
                 self.settings.save_interval_secs = i;
+                self.settings.content_max_file_mb = mb;
+                self.settings.content_mix_limit = mix as u32;
+                self.settings.content_commit_docs = docs;
+                self.settings.content_commit_secs = secs;
                 if changed {
                     self.hint = SharedString::from("");
                     self.apply_settings(cx);
                 }
                 cx.notify();
             }
-            (DraftCommit::Err(msg), _) | (_, DraftCommit::Err(msg)) => {
+            (DraftCommit::Err(msg), _, _, _, _, _)
+            | (_, DraftCommit::Err(msg), _, _, _, _)
+            | (_, _, DraftCommit::Err(msg), _, _, _)
+            | (_, _, _, DraftCommit::Err(msg), _, _)
+            | (_, _, _, _, DraftCommit::Err(msg), _)
+            | (_, _, _, _, _, DraftCommit::Err(msg)) => {
                 self.hint = msg.into();
                 cx.notify();
             }
@@ -624,6 +694,22 @@ impl SettingsWindow {
                 &self.save_interval,
                 self.settings.save_interval_secs.to_string(),
             ),
+            (
+                &self.content_max_file,
+                self.settings.content_max_file_mb.to_string(),
+            ),
+            (
+                &self.content_mix_limit,
+                self.settings.content_mix_limit.to_string(),
+            ),
+            (
+                &self.content_commit_docs,
+                self.settings.content_commit_docs.to_string(),
+            ),
+            (
+                &self.content_commit_secs,
+                self.settings.content_commit_secs.to_string(),
+            ),
             (&self.index_path, self.settings.index_path.clone()),
             (&self.pipe_name, self.settings.pipe_name.clone()),
             (&self.service_exe, self.settings.service_exe_path.clone()),
@@ -633,6 +719,7 @@ impl SettingsWindow {
         self.excluded.update(cx, |i, cx| {
             i.set_value(self.settings.excluded_dirs.join("\n"), window, cx)
         });
+        self.content_advanced = false;
         self.apply_settings(cx);
         self.apply_theme_now(self.style, self.theme, cx);
         self.hint = "已恢复默认值".into();
@@ -689,6 +776,7 @@ impl Render for SettingsWindow {
                 (SettingsTab::Files, "文件浏览"),
                 (SettingsTab::Preview, "预览"),
                 (SettingsTab::Index, "索引与服务"),
+                (SettingsTab::Content, "全文"),
                 (SettingsTab::Shortcuts, "快捷键"),
                 (SettingsTab::Diagnostics, "诊断"),
                 (SettingsTab::About, "关于"),
@@ -709,6 +797,7 @@ impl Render for SettingsWindow {
                 .child(self.render_index_tab(&roots, tokens, cx))
                 .child(self.render_maintenance(tokens, cx))
                 .into_any_element(),
+            SettingsTab::Content => self.render_content_tab(tokens, cx).into_any_element(),
             SettingsTab::About => self.render_about(tokens, cx).into_any_element(),
             SettingsTab::Diagnostics => self.render_diagnostics(tokens, cx).into_any_element(),
             SettingsTab::Files => self
@@ -799,6 +888,7 @@ impl Render for SettingsWindow {
                                 "files" => "icons/folder.svg",
                                 "preview" => "icons/panel-right.svg",
                                 "index" => "icons/database.svg",
+                                "content" => "icons/file-text.svg",
                                 "shortcuts" => "icons/keyboard.svg",
                                 "diagnostics" => "icons/activity.svg",
                                 "about" => "icons/info.svg",
@@ -829,6 +919,7 @@ impl Render for SettingsWindow {
                                 SettingsTab::Files => "icons/folder.svg",
                                 SettingsTab::Preview => "icons/panel-right.svg",
                                 SettingsTab::Index => "icons/database.svg",
+                                SettingsTab::Content => "icons/file-text.svg",
                                 SettingsTab::Shortcuts => "icons/keyboard.svg",
                                 SettingsTab::Diagnostics => "icons/activity.svg",
                                 SettingsTab::About => "icons/info.svg",
@@ -945,6 +1036,14 @@ impl Render for SettingsWindow {
             .when(
                 self.material == crate::window_material::WindowMaterial::Solid,
                 |v| v.bg(tokens.bg),
+            )
+            .when(
+                self.material != crate::window_material::WindowMaterial::Solid,
+                // Non-solid roots need their own translucent base: otherwise
+                // gaps between cards show raw glass (alpha 0, ignores the
+                // opacity slider) while cards are milky. surface follows
+                // the slider via apply_material_translucency.
+                |v| v.bg(tokens.surface),
             )
             .text_color(tokens.text_primary)
             .when(!self.embedded, |view| {
@@ -1505,6 +1604,314 @@ impl SettingsWindow {
                     tokens,
                 ))
         )
+    }
+
+    /// 全文内容索引页签：状态与维护 / 查询行为 / 范围与限额 / 高级。
+    ///
+    /// 状态读取与构建执行接线后续（service StatusResult/content IPC），本期只落配置项：
+    /// 数字框输入即时校验保存，开关即时生效，维护按钮置灰并明示后续。
+    fn render_content_tab(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> impl IntoElement {
+        settings_page()
+            .child(self.render_content_status(tokens, cx))
+            .child(self.render_content_query(tokens, cx))
+            .child(self.render_content_scope(tokens, cx))
+            .child(self.render_content_advanced(tokens, cx))
+    }
+
+    fn content_dir_label(&self) -> String {
+        format!("{}.content", self.settings.index_path)
+    }
+
+    fn render_content_status(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> impl IntoElement {
+        let _ = cx;
+        settings_card(tokens)
+            .child(section_title("全文索引状态", tokens))
+            .child(settings_note(
+                "内容倒排与文件名索引独立存放；schema v1，多卷 key 隔离。未建时 content: 查询走慢速逐文件。",
+                tokens,
+            ))
+            .child(settings_kv("索引目录", &self.content_dir_label(), tokens))
+            .child(settings_kv(
+                "状态",
+                "读取接线后续（service Status 透出 docs/体积后此处显示就绪与否）",
+                tokens,
+            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .child(Button::new("content-build").label("构建索引").disabled(true))
+                    .child(Button::new("content-rebuild").label("重建").disabled(true))
+                    .child(Button::new("content-clear").label("清空").disabled(true)),
+            )
+            .child(settings_note(
+                "构建/重建/清空执行接线后续，本期只保存配置项。",
+                tokens,
+            ))
+    }
+
+    fn render_content_query(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> impl IntoElement {
+        let mode = self.settings.content_default_mode;
+        settings_card(tokens)
+            .child(section_title("查询行为", tokens))
+            .child(self.service_switch_row(
+                "content-enabled",
+                "启用全文搜索",
+                "关闭后搜索页隐藏全文入口；已建索引与增量跟随不受影响",
+                self.settings.content_enabled,
+                false,
+                tokens,
+                cx,
+                |this, on, cx| {
+                    this.settings.content_enabled = *on;
+                    this.apply_settings(cx);
+                    cx.notify();
+                },
+            ))
+            .child(
+                h_flex()
+                    .h(px(36.))
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(160.))
+                            .flex_shrink_0()
+                            .text_sm()
+                            .child("默认搜索模式"),
+                    )
+                    .children(
+                        [
+                            ContentDefaultMode::Name,
+                            ContentDefaultMode::Content,
+                            ContentDefaultMode::Mix,
+                        ]
+                        .into_iter()
+                        .map(|m| {
+                            let entity = cx.entity();
+                            Button::new(SharedString::from(format!(
+                                "content-mode-{}",
+                                m.as_str()
+                            )))
+                            .w(px(80.))
+                            .flex_shrink_0()
+                            .label(m.label())
+                            .selected(mode == m)
+                            .on_click(move |_, _, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.settings.content_default_mode = m;
+                                    this.apply_settings(cx);
+                                    cx.notify();
+                                });
+                            })
+                        }),
+                    ),
+            )
+            .child(settings_note(
+                "文件名：只搜文件名；全文：只搜内容，保留类型/时间/大小过滤；混合：两者并集。",
+                tokens,
+            ))
+            .child(self.service_switch_row(
+                "content-snippet",
+                "命中摘要",
+                "结果表第二行与预览窗显示命中上下文",
+                self.settings.content_snippet,
+                false,
+                tokens,
+                cx,
+                |this, on, cx| {
+                    this.settings.content_snippet = *on;
+                    this.apply_settings(cx);
+                    cx.notify();
+                },
+            ))
+            .child(
+                h_flex()
+                    .h(px(36.))
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .w(px(160.))
+                            .flex_shrink_0()
+                            .text_sm()
+                            .child("混合模式内容上限"),
+                    )
+                    .child(
+                        div()
+                            .w(px(140.))
+                            .flex_shrink_0()
+                            .child(Input::new(&self.content_mix_limit)),
+                    ),
+            )
+            .child(settings_note(
+                "1 到 100000 的整数，默认 200。输入即时生效，无效输入会被忽略并提示。",
+                tokens,
+            ))
+    }
+
+    fn render_content_scope(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> impl IntoElement {
+        settings_card(tokens)
+            .child(section_title("索引范围与限额", tokens))
+            .child(settings_note(
+                "范围跟随「索引与服务」页的磁盘勾选与排除目录；内容库从同一文件名索引全量构建。",
+                tokens,
+            ))
+            .child(
+                h_flex()
+                    .h(px(36.))
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .w(px(160.))
+                            .flex_shrink_0()
+                            .text_sm()
+                            .child("单文件上限（MB）"),
+                    )
+                    .child(
+                        div()
+                            .w(px(140.))
+                            .flex_shrink_0()
+                            .child(Input::new(&self.content_max_file)),
+                    ),
+            )
+            .child(settings_note(
+                "1 到 512 的整数 MB，默认 20；超限与空文件跳过。",
+                tokens,
+            ))
+            .child(self.service_switch_row(
+                "content-office",
+                "抽取 Office 文档",
+                "docx / xlsx / pptx（纯 Rust 解析）",
+                self.settings.content_index_office,
+                false,
+                tokens,
+                cx,
+                |this, on, cx| {
+                    this.settings.content_index_office = *on;
+                    this.apply_settings(cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.service_switch_row(
+                "content-pdf",
+                "抽取 PDF",
+                "扫描版与损坏文件自动跳过",
+                self.settings.content_index_pdf,
+                false,
+                tokens,
+                cx,
+                |this, on, cx| {
+                    this.settings.content_index_pdf = *on;
+                    this.apply_settings(cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.service_switch_row(
+                "content-code",
+                "抽取代码文件",
+                "80+ 代码/配置文件扩展名",
+                self.settings.content_index_code,
+                false,
+                tokens,
+                cx,
+                |this, on, cx| {
+                    this.settings.content_index_code = *on;
+                    this.apply_settings(cx);
+                    cx.notify();
+                },
+            ))
+            .child(settings_note(
+                "另支持 txt/md/csv/log 等纯文本；老 doc/xls、压缩包内文件、图片 OCR 跳过。",
+                tokens,
+            ))
+    }
+
+    fn render_content_advanced(
+        &self,
+        tokens: FindxTokens,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        settings_card(tokens)
+            .child(
+                h_flex().h(px(36.)).items_center().justify_between().child(section_title(
+                    "高级",
+                    tokens,
+                )).child({
+                    let entity = cx.entity();
+                    Button::new("content-advanced")
+                        .ghost()
+                        .w(px(112.))
+                        .flex_shrink_0()
+                        .selected(self.content_advanced)
+                        .label(if self.content_advanced { "收起" } else { "展开" })
+                        .on_click(move |_, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.content_advanced = !this.content_advanced;
+                                cx.notify();
+                            });
+                        })
+                }),
+            )
+            .when(self.content_advanced, |card| {
+                card.child(self.service_switch_row(
+                    "content-follow",
+                    "增量跟随",
+                    "service 常驻时文件变更自动更新内容索引；关闭则只保留已建快照",
+                    self.settings.content_follow_incremental,
+                    false,
+                    tokens,
+                    cx,
+                    |this, on, cx| {
+                        this.settings.content_follow_incremental = *on;
+                        this.apply_settings(cx);
+                        cx.notify();
+                    },
+                ))
+                .child(
+                    h_flex()
+                        .h(px(36.))
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .w(px(160.))
+                                .flex_shrink_0()
+                                .text_sm()
+                                .child("攒批文档数"),
+                        )
+                        .child(
+                            div()
+                                .w(px(140.))
+                                .flex_shrink_0()
+                                .child(Input::new(&self.content_commit_docs)),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .h(px(36.))
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .w(px(160.))
+                                .flex_shrink_0()
+                                .text_sm()
+                                .child("攒批间隔（秒）"),
+                        )
+                        .child(
+                            div()
+                                .w(px(140.))
+                                .flex_shrink_0()
+                                .child(Input::new(&self.content_commit_secs)),
+                        ),
+                )
+                .child(settings_note(
+                    "增量线程按文档数或间隔 commit；改动需应用到服务后生效。",
+                    tokens,
+                ))
+            })
     }
 
     fn refresh_service(&mut self, cx: &mut Context<Self>) {

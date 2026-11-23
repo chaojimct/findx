@@ -80,6 +80,7 @@ fn main() {
             "[demo] 扫描 {} / 抽取 {} / 跳过 {} / 失败 {}",
             s.scanned, s.extracted, s.skipped, s.failed
         );
+        true
     })
     .unwrap();
     println!("[demo] 内容索引：{st:?} → {}", cdir.display());

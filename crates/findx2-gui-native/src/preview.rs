@@ -393,20 +393,25 @@ pub fn load_preview(
     mtime: u64,
     is_directory: bool,
 ) -> PreviewState {
-    load_preview_with_options(
-        generation,
-        name,
-        path,
-        size,
-        mtime,
-        is_directory,
-        crate::preview_worker::PdfOptions::default(),
-        false,
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    )
+    // Sync wrapper for tests; the UI always awaits the async version.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("preview test runtime")
+        .block_on(load_preview_with_options(
+            generation,
+            name,
+            path,
+            size,
+            mtime,
+            is_directory,
+            crate::preview_worker::PdfOptions::default(),
+            false,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ))
 }
 
-pub fn load_preview_with_options(
+pub async fn load_preview_with_options(
     generation: u64,
     name: &str,
     path: &str,
@@ -450,6 +455,21 @@ pub fn load_preview_with_options(
             Err(e) => native_error = Some(e),
         }
     }
+    // PDF优先走已安装的系统预览处理器(与Office文档同一条路):
+    // 处理器进程常驻、文档只解析一次、原生滚动;不再为每页起新进程、
+    // 重解析全文。WinRT光栅只在没有可用处理器时兜底。
+    if !is_directory && ext == "pdf" && prefer_native {
+        #[cfg(windows)]
+        match crate::office_host::start(path, cancel.clone()) {
+            Ok(client) => {
+                state.native = Some(client);
+                state.kind = PreviewKind::NativeOffice;
+                state.message = Some("系统预览处理器已接管，可直接滚动浏览".into());
+                return state;
+            }
+            Err(e) => native_error = Some(e),
+        }
+    }
     if matches!(ext.as_str(), "doc" | "xls" | "ppt") {
         state.kind = PreviewKind::Unsupported;
         state.message = Some(native_error.unwrap_or_else(|| {
@@ -474,7 +494,7 @@ pub fn load_preview_with_options(
                 ext: ext.clone(),
             }
         };
-        match crate::preview_worker::run(request, cancel, std::time::Duration::from_secs(10)) {
+        match crate::preview_worker::run(request, cancel, std::time::Duration::from_secs(10)).await {
             Ok(crate::preview_worker::Output::Pdf {
                 png,
                 count,

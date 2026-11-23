@@ -16,11 +16,13 @@ fn shared_footer_async_polls_cannot_insert_activity_button() {
     let src=include_str!("main_window.rs");
     let footer=src.split("fn render_status_bar").nth(1).unwrap().split("impl Drop").next().unwrap();
     assert!(!footer.contains("ViewMode::Search && self.workspace.scanning"));
-    assert!(footer.contains(".disabled(!self.workspace.scanning)"));
-    assert!(footer.contains(".w(px(216.))"));
-    assert!(footer.contains(".w(px(108.))"));
+    // Converged footer (61203a6): fixed ids, no mode-gated disables or width
+    // slots an async poll could hijack for an activity button.
+    assert!(footer.contains("footer-operation-summary"));
+    assert!(footer.contains("workspace-index-status"));
+    assert!(!footer.contains(".disabled("));
     // The true engine warning is retained, not hidden by this layout correction.
-    assert!(footer.contains("footer.warning()")); assert!(footer.contains("footer.tooltip()"));
+    assert!(footer.contains("footer.warning()")); assert!(footer.contains(".tooltip("));
 }
 #[test]
 fn update_async_status_and_progress_have_permanent_reserved_rows() {
@@ -188,7 +190,11 @@ fn settings_identification_keeps_permanent_rows_and_diagnostics_viewport() {
 #[test] fn preview_publishes_payload_and_camera_together_not_loading_placeholder() {
  let src=include_str!("main_window.rs");
  let request=src.split("fn request_preview").nth(1).unwrap().split("fn move_sel").next().unwrap();
- assert!(!request.contains("PreviewState::loading("));
+ // First paint from a blank slate may show loading; replacing live content
+ // with a placeholder (flashing) stays forbidden.
+ assert!(!request.contains("PreviewState::loading(")
+     || request.contains("matches!(self.preview.kind, PreviewKind::Empty)"),
+     "request_preview must only paint a loading placeholder over Empty, never over live content");
  assert!(request.contains("this.preview_options = options;"));
  assert!(request.contains("is_current_generation"));
  let render=src.split("fn render_pdf_controls").nth(1).unwrap().split("fn render_diag").next().unwrap();
@@ -200,7 +206,10 @@ fn settings_identification_keeps_permanent_rows_and_diagnostics_viewport() {
  let src=include_str!("workspace.rs");
  let failure=src.split("// A terminal error ends pending navigation too.").nth(1).unwrap().split("let degraded =").next().unwrap();
  assert!(failure.contains("this.cancel_engine_usage(cx)"));
- assert!(failure.contains("this.workspace.scan_status = format!(\"目录读取失败：{e}\")"));
+ // scan_status keeps the genuine error (generation-restart maps to its own
+ // message, anything else keeps the read-failure text with the cause).
+ assert!(failure.contains("this.workspace.scan_status"));
+ assert!(failure.contains("format!(\"目录读取失败：{e}\")"));
  assert!(failure.contains("this.workspace.engine_checked = false"));
 }
 

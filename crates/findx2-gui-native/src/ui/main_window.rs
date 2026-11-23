@@ -1233,6 +1233,7 @@ impl MainWindow {
                 mtime: 0,
                 is_directory: false,
                 name_highlight: Vec::new(),
+                snippet: String::new(),
             })
         });
         let Some(hit) = target else {
@@ -1252,6 +1253,20 @@ impl MainWindow {
         );
         // Header, raster/text and its PDF camera are one immutable presentation.
         // Do not clear it or label it with the newly requested page while decoding.
+        // First load from a blank slate still needs a visible state: header +
+        // loading, so selection never sits on the "nothing selected" placeholder.
+        if matches!(self.preview.kind, PreviewKind::Empty) {
+            self.preview = PreviewState::loading(
+                generation,
+                preview::meta_from_hit(
+                    &hit.name,
+                    &hit.path,
+                    hit.size,
+                    hit.mtime,
+                    hit.is_directory,
+                ),
+            );
+        }
         self._preview_task = Some(cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_spawn(async move {
@@ -1279,6 +1294,7 @@ impl MainWindow {
                         prefer_native,
                         cancel,
                     )
+                    .await
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -2034,7 +2050,8 @@ impl MainWindow {
             .border_color(tokens.border)
             .child(header)
             .when(self.preview.meta.as_ref().is_some_and(|m| std::path::Path::new(&m.path)
-                .extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))), |view| {
+                .extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pdf")))
+                && self.preview.pdf.is_some(), |view| {
                 view.child(self.render_pdf_controls(cx))
             })
             .when(

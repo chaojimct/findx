@@ -320,6 +320,16 @@ mod tests {
             indexed_drive_mask: 0,
             wal_bytes: 0,
             last_fold_secs_ago: None,
+            content_state: String::new(),
+            content_docs: 0,
+            content_bytes: 0,
+            content_scanned: 0,
+            content_extracted: 0,
+            content_skipped: 0,
+            content_failed: 0,
+            content_error: None,
+            content_detail: String::new(),
+            content_entry_total: 0,
         };
         let v = summarize_status(&resp, true);
         assert_eq!(v.summary, "索引 1,234,567 项");
@@ -349,6 +359,16 @@ mod tests {
             indexed_drive_mask: 0,
             wal_bytes: 0,
             last_fold_secs_ago: None,
+            content_state: String::new(),
+            content_docs: 0,
+            content_bytes: 0,
+            content_scanned: 0,
+            content_extracted: 0,
+            content_skipped: 0,
+            content_failed: 0,
+            content_error: None,
+            content_detail: String::new(),
+            content_entry_total: 0,
         };
         let v = summarize_status(&resp, true);
         assert_eq!(v.summary, "索引加载中");
@@ -387,6 +407,16 @@ mod tests {
             indexed_drive_mask: 0,
             wal_bytes: 0,
             last_fold_secs_ago: None,
+            content_state: String::new(),
+            content_docs: 0,
+            content_bytes: 0,
+            content_scanned: 0,
+            content_extracted: 0,
+            content_skipped: 0,
+            content_failed: 0,
+            content_error: None,
+            content_detail: String::new(),
+            content_entry_total: 0,
         };
         let prev = summarize_status(&ready, true);
         let contention = IpcResponse::StatusResult {
@@ -410,6 +440,16 @@ mod tests {
             indexed_drive_mask: 0,
             wal_bytes: 0,
             last_fold_secs_ago: None,
+            content_state: String::new(),
+            content_docs: 0,
+            content_bytes: 0,
+            content_scanned: 0,
+            content_extracted: 0,
+            content_skipped: 0,
+            content_failed: 0,
+            content_error: None,
+            content_detail: String::new(),
+            content_entry_total: 0,
         };
         let kept = apply_status(Some(&prev), &contention, true);
         assert_eq!(kept, prev);

@@ -13,6 +13,7 @@ path = "src/main.rs"
 findx2-core = { path = "../findx2-core", features = ["pinyin"] }
 findx2-content = { path = "../findx2-content" }
 findx2-ipc = { path = "../findx2-ipc" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 tracing = "0.1"

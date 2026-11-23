@@ -79,6 +79,46 @@ impl EffectiveTheme {
     }
 }
 
+/// 全文搜索默认模式：搜索页全文开关的初始值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentDefaultMode {
+    /// 只搜文件名（现有行为）。
+    #[default]
+    Name,
+    /// 只搜文件内容（`content:` 替换文件名谓词，不过滤名）。
+    Content,
+    /// 两次查询 union（文件名命中 + 内容命中并集）。
+    Mix,
+}
+
+impl ContentDefaultMode {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "name" => Some(Self::Name),
+            "content" => Some(Self::Content),
+            "mix" => Some(Self::Mix),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Content => "content",
+            Self::Mix => "mix",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Name => "文件名",
+            Self::Content => "全文",
+            Self::Mix => "混合",
+        }
+    }
+}
+
 /// 与现有 GUI 设置字段对齐，但只落在隔离目录，不写正式 GUI 配置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,6 +149,40 @@ pub struct FindxGuiSettings {
     pub auto_start_app: bool,
     #[serde(default = "default_true")]
     pub auto_check_update: bool,
+    // ---- 全文内容索引（独立 ContentSearch 倒排，见 docs/CONTENT-SEARCH-M1.md）----
+    /// GUI 总开关：关 = 搜索页隐藏全文入口（service 侧增量跟随不受影响）。
+    #[serde(default = "default_true")]
+    pub content_enabled: bool,
+    /// 搜索页全文开关的初始模式。
+    #[serde(default)]
+    pub content_default_mode: ContentDefaultMode,
+    /// 结果表第二行 + 预览窗显示命中摘要。
+    #[serde(default = "default_true")]
+    pub content_snippet: bool,
+    /// 混合模式下内容侧取回上限（防 TopDocs 爆炸）。
+    #[serde(default = "default_content_mix_limit")]
+    pub content_mix_limit: u32,
+    /// 单文件抽取上限（MB），映射 tantivy 建库侧 MAX_EXTRACT_BYTES。
+    #[serde(default = "default_content_max_file_mb")]
+    pub content_max_file_mb: u64,
+    /// 建库是否抽取 Office（docx/xlsx/pptx）。
+    #[serde(default = "default_true")]
+    pub content_index_office: bool,
+    /// 建库是否抽取 PDF。
+    #[serde(default = "default_true")]
+    pub content_index_pdf: bool,
+    /// 建库是否抽取代码扩展名（80+ 白名单）。
+    #[serde(default = "default_true")]
+    pub content_index_code: bool,
+    /// service 是否挂载内容索引增量跟随。
+    #[serde(default = "default_true")]
+    pub content_follow_incremental: bool,
+    /// 增量线程攒批 commit 的文档数阈值。
+    #[serde(default = "default_content_commit_docs")]
+    pub content_commit_docs: u64,
+    /// 增量线程攒批 commit 的时间阈值（秒）。
+    #[serde(default = "default_content_commit_secs")]
+    pub content_commit_secs: u64,
 }
 
 fn default_true() -> bool {
@@ -116,6 +190,22 @@ fn default_true() -> bool {
 }
 
 fn default_save_interval() -> u64 {
+    30
+}
+
+fn default_content_mix_limit() -> u32 {
+    200
+}
+
+fn default_content_max_file_mb() -> u64 {
+    20
+}
+
+fn default_content_commit_docs() -> u64 {
+    500
+}
+
+fn default_content_commit_secs() -> u64 {
     30
 }
 
@@ -138,6 +228,17 @@ impl FindxGuiSettings {
             save_interval_secs: 30,
             auto_start_app: false,
             auto_check_update: false,
+            content_enabled: true,
+            content_default_mode: ContentDefaultMode::Name,
+            content_snippet: true,
+            content_mix_limit: default_content_mix_limit(),
+            content_max_file_mb: default_content_max_file_mb(),
+            content_index_office: true,
+            content_index_pdf: true,
+            content_index_code: true,
+            content_follow_incremental: true,
+            content_commit_docs: default_content_commit_docs(),
+            content_commit_secs: default_content_commit_secs(),
         }
     }
 }
@@ -177,6 +278,64 @@ pub fn commit_save_interval_secs(text: &str) -> DraftCommit {
         Ok(value) if value >= 1 => DraftCommit::Ok(value),
         _ => DraftCommit::Err("落盘间隔必须是不小于 1 的整数秒。"),
     }
+}
+
+fn commit_u64_in(text: &str, lo: u64, hi: u64, empty_msg: &'static str, range_msg: &'static str) -> DraftCommit {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return DraftCommit::Err(empty_msg);
+    }
+    if !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return DraftCommit::Err(range_msg);
+    }
+    match trimmed.parse::<u64>() {
+        Ok(value) if (lo..=hi).contains(&value) => DraftCommit::Ok(value),
+        _ => DraftCommit::Err(range_msg),
+    }
+}
+
+/// 全文单文件上限（MB）：1..=512，映射建库侧 MAX_EXTRACT_BYTES。
+pub fn commit_content_max_file_mb(text: &str) -> DraftCommit {
+    commit_u64_in(
+        text,
+        1,
+        512,
+        "单文件上限还是空的。保存前请填写 1 到 512 的整数 MB。",
+        "单文件上限须在 1 到 512 MB 之间。",
+    )
+}
+
+/// 混合模式内容侧取回上限：1..=100000。
+pub fn commit_content_mix_limit(text: &str) -> DraftCommit {
+    commit_u64_in(
+        text,
+        1,
+        100_000,
+        "混合上限还是空的。保存前请填写 1 到 100000 的整数。",
+        "混合上限须在 1 到 100000 之间。",
+    )
+}
+
+/// 增量攒批 commit 文档数：1..=1000000。
+pub fn commit_content_commit_docs(text: &str) -> DraftCommit {
+    commit_u64_in(
+        text,
+        1,
+        1_000_000,
+        "提交文档数还是空的。保存前请填写不小于 1 的整数。",
+        "提交文档数须在 1 到 1000000 之间。",
+    )
+}
+
+/// 增量攒批 commit 时间（秒）：不小于 1。
+pub fn commit_content_commit_secs(text: &str) -> DraftCommit {
+    commit_u64_in(
+        text,
+        1,
+        3_600,
+        "提交间隔还是空的。保存前请填写不小于 1 的整数秒。",
+        "提交间隔须在 1 到 3600 秒之间。",
+    )
 }
 
 /// 数字框在保存前只改草稿。主题即时预览，所以脏标记必须把草稿和主题算进去。
@@ -271,6 +430,51 @@ mod tests {
             commit_save_interval_secs("0"),
             DraftCommit::Err(_)
         ));
+    }
+
+    #[test]
+    fn content_numeric_bounds() {
+        assert_eq!(commit_content_max_file_mb("20"), DraftCommit::Ok(20));
+        assert!(matches!(commit_content_max_file_mb(""), DraftCommit::Err(_)));
+        assert!(matches!(commit_content_max_file_mb("0"), DraftCommit::Err(_)));
+        assert!(matches!(commit_content_max_file_mb("513"), DraftCommit::Err(_)));
+        assert_eq!(commit_content_mix_limit("200"), DraftCommit::Ok(200));
+        assert!(matches!(commit_content_mix_limit("0"), DraftCommit::Err(_)));
+        assert_eq!(commit_content_commit_docs("500"), DraftCommit::Ok(500));
+        assert!(matches!(commit_content_commit_docs("0"), DraftCommit::Err(_)));
+        assert_eq!(commit_content_commit_secs("30"), DraftCommit::Ok(30));
+        assert!(matches!(commit_content_commit_secs("0"), DraftCommit::Err(_)));
+        assert!(matches!(commit_content_commit_secs("3601"), DraftCommit::Err(_)));
+    }
+
+    #[test]
+    fn content_settings_default_and_back_compat() {
+        let s = sample();
+        assert!(s.content_enabled);
+        assert_eq!(s.content_default_mode, ContentDefaultMode::Name);
+        assert!(s.content_snippet);
+        assert_eq!(s.content_mix_limit, 200);
+        assert_eq!(s.content_max_file_mb, 20);
+        assert!(s.content_index_office && s.content_index_pdf && s.content_index_code);
+        assert!(s.content_follow_incremental);
+        assert_eq!(s.content_commit_docs, 500);
+        assert_eq!(s.content_commit_secs, 30);
+        // 老配置（无全文键）照常解析，全文走默认值。
+        let old = serde_json::json!({
+            "indexPath": "index.bin",
+            "volume": "",
+            "pipeName": "findx2-native-dev",
+            "serviceExePath": "",
+            "searchLimit": 5000u32,
+            "pinyinDefault": true
+        });
+        let s: FindxGuiSettings = serde_json::from_value(old).unwrap();
+        assert!(s.content_enabled);
+        assert_eq!(s.content_default_mode, ContentDefaultMode::Name);
+        assert_eq!(s.content_max_file_mb, 20);
+        // 模式解析。
+        assert_eq!(ContentDefaultMode::parse("mix"), Some(ContentDefaultMode::Mix));
+        assert_eq!(ContentDefaultMode::parse("nope"), None);
     }
 
     #[test]

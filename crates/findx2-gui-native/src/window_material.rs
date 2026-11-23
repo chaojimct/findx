@@ -223,6 +223,50 @@ pub fn apply_to_window(
     }
 }
 
+/// Root-surface plugin that removes the opaque base gpui-component paints
+/// under every window.
+///
+/// `gpui-component`'s `WindowState` plugin refines each window root surface
+/// with `.bg(cx.theme().tokens.background)` — opaque white in light themes.
+/// That full-window opaque quad sits below our element tree and forces the
+/// final pixel alpha to 1, so no DWM backdrop (Mica/Acrylic) can ever show
+/// through even when the renderer clears transparent and our chrome panels
+/// are translucent. Registered after `gpui_kit::init` (which registers
+/// `WindowState`), so this refinement wins. Windows-only: other platforms
+/// keep the component base as their window background.
+pub struct GlassRoot;
+
+impl gpui_kit::Render for GlassRoot {
+    fn render(
+        &mut self,
+        _: &mut gpui_kit::Window,
+        _: &mut gpui_kit::Context<Self>,
+    ) -> impl gpui_kit::IntoElement {
+        gpui_kit::div()
+    }
+}
+
+impl gpui_kit::base::RootPlugin for GlassRoot {
+    fn style(
+        &self,
+        surface: &mut gpui_kit::Stateful<gpui_kit::Div>,
+        _window: &mut gpui_kit::Window,
+        _cx: &mut gpui_kit::App,
+    ) {
+        #[cfg(windows)]
+        {
+            use gpui_kit::{Refineable as _, Styled as _};
+            surface.style().refine(
+                &gpui_kit::StyleRefinement::default().bg(gpui_kit::transparent_black()),
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = surface;
+        }
+    }
+}
+
 #[cfg(windows)]
 mod windows_impl {
     use super::WindowMaterial as Material;
@@ -336,7 +380,13 @@ mod windows_impl {
                 data: &mut policy as *mut _ as *mut _,
                 count: std::mem::size_of::<AccentPolicy>(),
             };
-            let _ = set(hwnd, &mut data);
+            let ok = unsafe { set(hwnd, &mut data) };
+            super::trace(&format!(
+                "legacy_accent hwnd={hwnd:?} state={state} argb={gradient:#010x} ok={} last_error={:?}",
+                ok.as_bool(),
+                unsafe { windows::Win32::Foundation::GetLastError() },
+            ));
+            let _ = ok;
         }
     }
 
@@ -388,11 +438,13 @@ mod windows_impl {
             Material::Mica => {
                 window.set_background_appearance(WindowBackgroundAppearance::MicaBackdrop);
                 // gpui-pre-windows only drives SYSTEMBACKDROP on 22621+; the
-                // MICA_EFFECT fallback covers 22000+, then solid.
+                // MICA_EFFECT fallback covers 22000+, then solid. Clear any
+                // WCA accent so it cannot shadow the system backdrop.
                 let ok = (support.system_backdrop
                     && set_attr(hwnd, ATTR_SYSTEMBACKDROP, BACKDROP_MICA))
                     || (support.mica_effect && set_attr(hwnd, ATTR_MICA_EFFECT, 1));
                 if ok {
+                    legacy_accent(hwnd, 0, 0);
                     Material::Mica
                 } else {
                     window.set_background_appearance(WindowBackgroundAppearance::Opaque);
@@ -405,6 +457,7 @@ mod windows_impl {
                     && set_attr(hwnd, ATTR_SYSTEMBACKDROP, BACKDROP_MICA_ALT))
                     || (support.mica_effect && set_attr(hwnd, ATTR_MICA_EFFECT, 1));
                 if ok {
+                    legacy_accent(hwnd, 0, 0);
                     Material::MicaAlt
                 } else {
                     window.set_background_appearance(WindowBackgroundAppearance::Opaque);
@@ -412,13 +465,28 @@ mod windows_impl {
                 }
             }
             Material::AcrylicThin => {
-                if !support.legacy_acrylic {
-                    window.set_background_appearance(WindowBackgroundAppearance::Opaque);
-                    return Material::Solid;
-                }
                 window.set_background_appearance(WindowBackgroundAppearance::Transparent);
-                legacy_accent(hwnd, 4, argb(0x55, gray_tint(dark)));
-                Material::AcrylicThin
+                // Prefer the real system acrylic (DWMWA_SYSTEMBACKDROP_TYPE):
+                // the legacy SetWindowCompositionAttribute path has no
+                // redirection bitmap to act on in DirectComposition windows
+                // (WS_EX_NOREDIRECTIONBITMAP), so on Win11 it returns success
+                // but shows nothing. Legacy stays as the fallback for older
+                // builds, where the lighter 0x55 tint keeps the "thin" look.
+                if support.system_backdrop
+                    && set_attr(hwnd, ATTR_SYSTEMBACKDROP, BACKDROP_ACRYLIC)
+                {
+                    // A lingering WCA accent policy (GPUI sets state=2 for
+                    // Transparent above) can shadow the system backdrop on
+                    // composition windows: leave no accent behind.
+                    legacy_accent(hwnd, 0, 0);
+                    Material::AcrylicThin
+                } else if support.legacy_acrylic {
+                    legacy_accent(hwnd, 4, argb(0x55, gray_tint(dark)));
+                    Material::AcrylicThin
+                } else {
+                    window.set_background_appearance(WindowBackgroundAppearance::Opaque);
+                    Material::Solid
+                }
             }
             Material::AcrylicStandard => {
                 window.set_background_appearance(WindowBackgroundAppearance::Transparent);
@@ -427,6 +495,8 @@ mod windows_impl {
                 if support.system_backdrop
                     && set_attr(hwnd, ATTR_SYSTEMBACKDROP, BACKDROP_ACRYLIC)
                 {
+                    // Same accent shadowing note as AcrylicThin above.
+                    legacy_accent(hwnd, 0, 0);
                     Material::AcrylicStandard
                 } else if support.legacy_acrylic {
                     legacy_accent(hwnd, 4, argb(0xA6, gray_tint(dark)));

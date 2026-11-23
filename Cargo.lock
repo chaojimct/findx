@@ -1934,7 +1934,7 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
 name = "findx2-cli"
-version = "2.5.11"
+version = "2.5.12"
 dependencies = [
  "chrono",
  "clap",
@@ -1954,7 +1954,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-content"
-version = "2.5.11"
+version = "2.5.12"
 dependencies = [
  "encoding_rs",
  "findx2-core",
@@ -1971,7 +1971,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-core"
-version = "2.5.11"
+version = "2.5.12"
 dependencies = [
  "chrono",
  "crc32fast",
@@ -1995,7 +1995,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-gui-native"
-version = "2.5.11"
+version = "2.5.12"
 dependencies = [
  "encoding_rs",
  "findx2-ipc",
@@ -2022,7 +2022,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-ipc"
-version = "2.5.11"
+version = "2.5.12"
 dependencies = [
  "serde",
  "serde_json",
@@ -2030,7 +2030,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-linux"
-version = "2.5.11"
+version = "2.5.12"
 dependencies = [
  "findx2-core",
  "libc",
@@ -2040,7 +2040,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-macos"
-version = "2.5.11"
+version = "2.5.12"
 dependencies = [
  "findx2-core",
  "libc",
@@ -2049,7 +2049,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-service"
-version = "2.5.11"
+version = "2.5.12"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2062,6 +2062,7 @@ dependencies = [
  "findx2-windows",
  "libc",
  "rayon",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
@@ -2073,7 +2074,7 @@ dependencies = [
 
 [[package]]
 name = "findx2-windows"
-version = "2.5.11"
+version = "2.5.12"
 dependencies = [
  "findx2-core",
  "rayon",

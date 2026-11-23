@@ -94,6 +94,7 @@ fn hit(
         mtime,
         is_directory,
         name_highlight: highlight.to_vec(),
+        snippet: String::new(),
     }
 }
 
@@ -135,6 +136,9 @@ fn handle_request(req: IpcRequest) -> IpcResponse {
             message: "mock backend does not support indexed usage".into(),
         },
         IpcRequest::Ping => IpcResponse::Pong,
+        IpcRequest::ContentBuild { .. } | IpcRequest::ContentCancel => IpcResponse::Error {
+            message: "mock backend does not support content indexing".into(),
+        },
         IpcRequest::Status => IpcResponse::StatusResult {
             entry_count: 8,
             dir_count: 2,
@@ -156,6 +160,16 @@ fn handle_request(req: IpcRequest) -> IpcResponse {
             indexed_drive_mask: 0,
             wal_bytes: 0,
             last_fold_secs_ago: None,
+        content_state: String::new(),
+        content_docs: 0,
+        content_bytes: 0,
+        content_scanned: 0,
+        content_extracted: 0,
+        content_skipped: 0,
+        content_failed: 0,
+        content_error: None,
+        content_detail: String::new(),
+        content_entry_total: 0,
         },
         IpcRequest::Search {
             query,

@@ -198,8 +198,48 @@ impl ContentIndex {
         Ok(out)
     }
 
+    /// 按 upsert/delete 键批量取 snippet（service 搜索装配用）。
+    ///
+    /// 返回 `key → snippet HTML`；找不到或无命中的 key 缺席（调用方回退空串）。
+    /// `cap` 截断输入规模，防大页 full-scan。只生成命中的 snippet，
+    /// 不做全表 TopDocs（页内任意 doc 都可取，不限前 5）。
+    pub fn snippets_for_keys(
+        &self,
+        query_text: &str,
+        keys: &[u64],
+        cap: usize,
+    ) -> Result<std::collections::HashMap<u64, String>> {
+        use std::collections::HashMap;
+        let mut out = HashMap::new();
+        if keys.is_empty() || cap == 0 {
+            return Ok(out);
+        }
+        self.reader.reload()?;
+        let searcher = self.reader.searcher();
+        let qp = QueryParser::for_index(searcher.index(), vec![self.fields.body]);
+        let query = qp.parse_query(query_text).map_err(Error::from)?;
+        let snippet_gen = SnippetGenerator::create(&searcher, &*query, self.fields.body)?;
+        for key in keys.iter().take(cap) {
+            let tq = tantivy::query::TermQuery::new(
+                Term::from_field_u64(self.fields.key, *key),
+                IndexRecordOption::Basic,
+            );
+            let top = searcher.search(&tq, &TopDocs::with_limit(1).order_by_score())?;
+            let Some((_, addr)) = top.first() else {
+                continue;
+            };
+            let doc: tantivy::TantivyDocument = searcher.doc(*addr)?;
+            let html = snippet_gen.snippet_from_doc(&doc).to_html();
+            if !html.is_empty() {
+                out.insert(*key, html);
+            }
+        }
+        Ok(out)
+    }
+
     /// 返回按 BM25 排序的 (volume_id, frn, score, snippet)。
     pub fn search(&self, query_text: &str, limit: usize) -> Result<Vec<ContentHit>> {
+        self.reader.reload()?;
         self.reader.reload()?;
         let searcher = self.reader.searcher();
         let qp = QueryParser::for_index(searcher.index(), vec![self.fields.body]);

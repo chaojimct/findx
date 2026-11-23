@@ -11,7 +11,9 @@ pub mod index;
 pub mod office;
 pub mod build;
 
-pub use build::{build_from_store, BuildStats};
+pub use build::{
+    build_from_plan, build_from_store, build_vols, plan_range_from_store, BuildStats, PlanItem,
+};
 pub use error::Error;
 pub use extract::{extract_text, should_extract, ExtractedText, SUPPORTED_EXTENSIONS};
 pub use index::{

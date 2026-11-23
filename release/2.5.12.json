@@ -1,0 +1,66 @@
+{
+  "version": "2.5.12",
+  "baseline": "2.5.11",
+  "channel": "stable",
+  "publish_ready": true,
+  "windows_gui": "native",
+  "gates": [
+    {
+      "id": "engine-io-storm-fixed",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "wal-crash-recovery",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "persist-test-suites",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "fold-quiescence-in-prod",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "legacy-2-4-multivolume-index-loads",
+      "priority": "P0",
+      "required": true,
+      "passed": true
+    },
+    {
+      "id": "installer-live-handoff",
+      "priority": "P1",
+      "required": false,
+      "passed": false
+    },
+    {
+      "id": "strict-protocol2-stop-receipt",
+      "priority": "P1",
+      "required": false,
+      "passed": false
+    },
+    {
+      "id": "macos-linux-native-packaging",
+      "priority": "P2",
+      "required": false,
+      "passed": false
+    }
+  ],
+  "engine_binary_baseline": "Service/IPC/content-index gain additive full-text protocol (content_* status fields, ContentBuild/Cancel, <index>.content/ store); index.bin format, WAL/fold paths unchanged, no migration. GUI: window-material backdrop fix (GlassRoot), preview header/loading stubs, tab flush, PDF system-handler + worker protocol/cache + async wait. Official GitHub Release artifacts are produced by the existing release.yml CI rebuild on tag v2.5.12 (Windows native only); they are not byte-identical to any local build.",
+  "gate_evidence": "release/2.5.12.md",
+  "limitations": [
+    "GUI lib suite: 2 known failures (settings service-tab identification, update-install flow) belong to the paused settings refactor; they land with that branch. Everything else green.",
+    "installer live handoff not re-run for 2.5.12 (same reason as 2.5.11)",
+    "in-app update progress verified by unit + source-scan regressions and build only; no new-version round-trip executed locally (would replace the installed product)",
+    "macOS and Linux native GUI packages do not exist yet",
+    "Official CI packages are a new rebuild and are not byte-identical to any local build"
+  ]
+}

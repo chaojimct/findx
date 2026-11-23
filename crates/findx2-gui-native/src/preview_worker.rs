@@ -39,7 +39,7 @@ pub enum Request {
     Pdf { path: String, page: u32, edge: u32 },
     Text { path: String, ext: String },
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum Output {
     Pdf {
         png: Vec<u8>,
@@ -54,7 +54,155 @@ pub fn cancelled(c: &Cancel) -> bool {
     c.load(Ordering::Acquire)
 }
 
-pub fn run(request: Request, cancel: Cancel, timeout: Duration) -> Result<Output, String> {
+/// Wire header: identical to [`Output`] except the PNG travels as raw bytes
+/// after the JSON line instead of a serde_json integer array (a 2 MiB PNG
+/// balloons to ~7 MiB of JSON and costs ~750 ms per round trip in debug).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+enum OutputHead {
+    Pdf {
+        png_len: usize,
+        count: u32,
+        width: f32,
+        height: f32,
+    },
+    Text(String),
+}
+
+/// Rendered-page cache:翻页/重选不再起新进程。Keyed by file identity +
+/// page + render edge; stat-checked on lookup so edits invalidate.
+struct PageCache {
+    order: std::collections::VecDeque<(String, u64, u64, u32, u32)>,
+    map: std::collections::HashMap<(String, u64, u64, u32, u32), (Vec<u8>, u32, f32, f32)>,
+    bytes: usize,
+}
+impl PageCache {
+    const MAX_BYTES: usize = 48 * 1024 * 1024;
+    const MAX_PAGES: usize = 24;
+    fn get(&mut self, key: &(String, u64, u64, u32, u32)) -> Option<(Vec<u8>, u32, f32, f32)> {
+        self.map.get(key).cloned()
+    }
+    fn put(
+        &mut self,
+        key: (String, u64, u64, u32, u32),
+        value: (Vec<u8>, u32, f32, f32),
+    ) {
+        if self.map.contains_key(&key) {
+            return;
+        }
+        self.bytes += value.0.len();
+        self.order.push_back(key.clone());
+        self.map.insert(key, value);
+        while self.bytes > Self::MAX_BYTES || self.map.len() > Self::MAX_PAGES {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            if let Some((png, _, _, _)) = self.map.remove(&old) {
+                self.bytes = self.bytes.saturating_sub(png.len());
+            }
+        }
+    }
+}
+static PDF_CACHE: std::sync::OnceLock<std::sync::Mutex<PageCache>> =
+    std::sync::OnceLock::new();
+fn pdf_cache() -> &'static std::sync::Mutex<PageCache> {
+    PDF_CACHE.get_or_init(|| {
+        std::sync::Mutex::new(PageCache {
+            order: std::collections::VecDeque::new(),
+            map: std::collections::HashMap::new(),
+            bytes: 0,
+        })
+    })
+}
+
+/// Split a worker reply into its JSON header and raw PNG body.
+/// Framing: one `\n`-terminated JSON `Result<OutputHead, String>`,
+/// then exactly `png_len` raw bytes for `Pdf` (no JSON integer array).
+fn decode_response(bytes: &[u8]) -> Result<Output, String> {
+    let nl = bytes
+        .iter()
+        .position(|&b| b == b'\n')
+        .ok_or_else(|| "预览引擎返回无效结果: 缺少头部".to_string())?;
+    let head: Result<OutputHead, String> = serde_json::from_slice(&bytes[..nl])
+        .map_err(|e| format!("预览引擎返回无效结果: {e}"))?;
+    match head {
+        Err(e) => Err(e),
+        Ok(OutputHead::Text(text)) => Ok(Output::Text(text)),
+        Ok(OutputHead::Pdf {
+            png_len,
+            count,
+            width,
+            height,
+        }) => {
+            let body = &bytes[nl + 1..];
+            if body.len() != png_len {
+                return Err(format!(
+                    "预览引擎返回无效结果: PNG 长度不符({} != {png_len})",
+                    body.len()
+                ));
+            }
+            Ok(Output::Pdf {
+                png: body.to_vec(),
+                count,
+                width,
+                height,
+            })
+        }
+    }
+}
+
+pub async fn run(request: Request, cancel: Cancel, timeout: Duration) -> Result<Output, String> {
+    if cancelled(&cancel) {
+        return Err("预览已取消".into());
+    }
+    // Fast path: identical page already rendered in this process.
+    if let Request::Pdf { path, page, edge } = &request {
+        if let Ok(meta) = std::fs::metadata(path) {
+            let key = (
+                path.clone(),
+                meta.len(),
+                meta.modified()
+                    .ok()
+                    .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|t| t.as_secs())
+                    .unwrap_or(0),
+                *page,
+                *edge,
+            );
+            if let Ok(mut cache) = pdf_cache().lock() {
+                if let Some((png, count, width, height)) = cache.get(&key) {
+                    return Ok(Output::Pdf {
+                        png,
+                        count,
+                        width,
+                        height,
+                    });
+                }
+            }
+            match run_uncached(request, cancel, timeout).await {
+                Ok(Output::Pdf {
+                    png,
+                    count,
+                    width,
+                    height,
+                }) => {
+                    if let Ok(mut cache) = pdf_cache().lock() {
+                        cache.put(key, (png.clone(), count, width, height));
+                    }
+                    return Ok(Output::Pdf {
+                        png,
+                        count,
+                        width,
+                        height,
+                    });
+                }
+                other => return other,
+            }
+        }
+    }
+    run_uncached(request, cancel, timeout).await
+}
+
+async fn run_uncached(request: Request, cancel: Cancel, timeout: Duration) -> Result<Output, String> {
     if cancelled(&cancel) {
         return Err("预览已取消".into());
     }
@@ -66,9 +214,18 @@ pub fn run(request: Request, cancel: Cancel, timeout: Duration) -> Result<Output
         command.creation_flags(0x08000000);
     }
     let bytes = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
-    let result = supervised(command, bytes, cancel, timeout)?;
-    serde_json::from_slice::<Result<Output, String>>(&result)
-        .map_err(|e| format!("预览引擎返回无效结果: {e}"))?
+    // Never park a shared executor thread on a multi-second worker: the
+    // blocking wait lives on a throwaway OS thread, the async task only
+    // awaits a oneshot (zero pool consumption while pending). Otherwise a
+    // slow PDF plugs the pool and file switching stalls behind it.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(supervised(command, bytes, cancel, timeout));
+    });
+    let result = rx
+        .await
+        .map_err(|_| "预览工作线程异常退出".to_string())??;
+    decode_response(&result)
 }
 fn supervised(
     mut command: Command,
@@ -128,7 +285,8 @@ fn supervised(
     result
 }
 pub fn worker_main() {
-    let run = || -> Result<Output, String> {
+    use std::io::Write as _;
+    let run = || -> Result<(OutputHead, Option<Vec<u8>>), String> {
         let mut bytes = Vec::new();
         std::io::stdin()
             .take(64 * 1024)
@@ -138,17 +296,20 @@ pub fn worker_main() {
         match request {
             Request::Text { path, ext } => {
                 crate::document_preview::load_text(std::path::Path::new(&path), &ext)
-                    .map(Output::Text)
+                    .map(|text| (OutputHead::Text(text), None))
             }
             Request::Pdf { path, page, edge } => {
                 #[cfg(windows)]
                 {
                     crate::document_preview::pdf_page(std::path::Path::new(&path), page, edge).map(
-                        |(png, count, width, height)| Output::Pdf {
-                            png,
-                            count,
-                            width,
-                            height,
+                        |(png, count, width, height)| {
+                            let head = OutputHead::Pdf {
+                                png_len: png.len(),
+                                count,
+                                width,
+                                height,
+                            };
+                            (head, Some(png))
                         },
                     )
                 }
@@ -160,7 +321,19 @@ pub fn worker_main() {
             }
         }
     };
-    let _ = serde_json::to_writer(std::io::stdout(), &run());
+    // Framing must match run_uncached: one JSON line, then raw PNG bytes.
+    let (head, body) = match run() {
+        Ok((head, body)) => (Ok(head), body),
+        Err(e) => (Err(e), None),
+    };
+    let mut stdout = std::io::stdout().lock();
+    let _ = serde_json::to_writer(&mut stdout, &head);
+    let _ = stdout.write_all(b"\n");
+    let _ = stdout.flush();
+    if let Some(png) = body {
+        let _ = stdout.write_all(&png);
+        let _ = stdout.flush();
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -176,6 +349,78 @@ mod tests {
         assert_eq!(p.zoom, 3.);
         p.scale(0.001);
         assert_eq!(p.zoom, 0.25);
+    }
+    fn framed(head: &OutputHead, body: &[u8]) -> Vec<u8> {
+        let mut v = serde_json::to_vec(&Ok::<_, String>(head)).unwrap();
+        v.push(b'\n');
+        v.extend_from_slice(body);
+        v
+    }
+    #[test]
+    fn decode_response_round_trips_without_json_blob() {
+        // Text head: header only.
+        match decode_response(&framed(&OutputHead::Text("hello".into()), &[])).unwrap() {
+            Output::Text(t) => assert_eq!(t, "hello"),
+            _ => panic!("expected text"),
+        }
+        // Pdf head: header + raw bytes (not a JSON integer array: the old
+        // 2 MiB PNG used to balloon to ~7 MiB of JSON).
+        let png: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+        let raw = framed(
+            &OutputHead::Pdf {
+                png_len: png.len(),
+                count: 7,
+                width: 100.0,
+                height: 200.0,
+            },
+            &png,
+        );
+        // Sanity: wire size stays close to payload size, not ~3.5x.
+        assert!(raw.len() < png.len() + 256);
+        match decode_response(&raw).unwrap() {
+            Output::Pdf {
+                png: back,
+                count,
+                width,
+                height,
+            } => {
+                assert_eq!(back, png);
+                assert_eq!(count, 7);
+                assert_eq!((width, height), (100.0, 200.0));
+            }
+            _ => panic!("expected pdf"),
+        }
+        // Truncated body and missing header are errors, not panics.
+        assert!(decode_response(b"no-newline").is_err());
+        let short = framed(
+            &OutputHead::Pdf {
+                png_len: 16,
+                count: 1,
+                width: 1.0,
+                height: 1.0,
+            },
+            &[0u8; 4],
+        );
+        assert!(decode_response(&short).is_err());
+        // Engine error propagates.
+        let mut err = serde_json::to_vec(&Err::<OutputHead, String>("boom".into())).unwrap();
+        err.push(b'\n');
+        assert_eq!(decode_response(&err).unwrap_err(), "boom");
+    }
+    #[test]
+    fn page_cache_evicts_oldest_first_under_cap() {
+        let mut cache = PageCache {
+            order: std::collections::VecDeque::new(),
+            map: std::collections::HashMap::new(),
+            bytes: 0,
+        };
+        let key = |i: u64| ("p".to_string(), 1u64, 2u64, i as u32, 1600u32);
+        for i in 0..(PageCache::MAX_PAGES as u64 + 4) {
+            cache.put(key(i), (vec![i as u8; 64], 3, 10.0, 10.0));
+        }
+        assert!(cache.map.len() <= PageCache::MAX_PAGES);
+        assert!(cache.get(&key(PageCache::MAX_PAGES as u64 + 3)).is_some());
+        assert!(cache.get(&key(0)).is_none());
     }
     #[test]
     fn child_delay() {

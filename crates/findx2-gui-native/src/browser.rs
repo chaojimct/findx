@@ -90,6 +90,7 @@ pub fn list_with_hidden(
                 .unwrap_or(0),
             is_directory: meta.is_dir(),
             name_highlight: vec![],
+            snippet: String::new(),
         });
     }
     rows.sort_by(|a, b| {

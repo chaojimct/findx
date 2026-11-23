@@ -325,7 +325,7 @@ impl MainWindow {
         h_flex()
             .w_full()
             .h(px(44.))
-            .px_2()
+            .pr_2()
             .gap_2()
             .flex_shrink_0()
             .bg(tokens.bg)

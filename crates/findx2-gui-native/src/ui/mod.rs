@@ -54,6 +54,13 @@ pub fn start(opts: LaunchOptions) {
         .run(move |cx| {
             crate::installer_health::checkpoint("application-run-entered");
             gpui_kit::init(cx);
+            // Must run after init (which registers gpui-component's WindowState
+            // plugin): our surface style is refined later and wins, removing
+            // the opaque white root quad that would block DWM backdrops.
+            gpui_kit::base::Root::register_plugin::<crate::window_material::GlassRoot>(
+                cx,
+                |_, _| crate::window_material::GlassRoot,
+            );
             let dark = matches!(
                 cx.window_appearance(),
                 WindowAppearance::Dark | WindowAppearance::VibrantDark

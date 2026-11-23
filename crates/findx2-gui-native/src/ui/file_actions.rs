@@ -1164,6 +1164,7 @@ mod tests {
                     .as_secs(),
                 is_directory: false,
                 name_highlight: vec![],
+                snippet: String::new(),
             }
         };
         let hits = vec![make_hit(&first), make_hit(&alias)];

@@ -722,15 +722,21 @@ fn build_content_index(index: &std::path::Path, rebuild: bool) -> Result<()> {
     if rebuild && cdir.exists() {
         eprintln!("[content] --rebuild：删除旧索引 {}", cdir.display());
     }
+    // 5 秒打一次日志；返回值恒 true（CLI 无取消源，Ctrl-C 直接杀进程）。
+    let mut last_log = std::time::Instant::now();
     let st = build_from_store(&store, &cdir, rebuild, |s| {
-        eprintln!(
-            "[content] 扫描 {} / 抽取 {} / 跳过 {} / 失败 {}（{:.1}s）",
-            s.scanned,
-            s.extracted,
-            s.skipped,
-            s.failed,
-            t0.elapsed().as_secs_f64()
-        );
+        if last_log.elapsed().as_secs() >= 5 {
+            last_log = std::time::Instant::now();
+            eprintln!(
+                "[content] 扫描 {} / 抽取 {} / 跳过 {} / 失败 {}（{:.1}s）",
+                s.scanned,
+                s.extracted,
+                s.skipped,
+                s.failed,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        true
     })?;
     let dir_bytes = dir_size(&cdir);
     println!(

@@ -511,7 +511,7 @@ impl MainWindow {
             .w_full()
             .h(px(34.))
             .flex_shrink_0()
-            .px_2()
+            .pr_2()
             .gap_1()
             .bg(tokens.surface)
             .border_b_1()

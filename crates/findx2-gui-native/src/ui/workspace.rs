@@ -129,6 +129,7 @@ fn root_hit(path: &Path) -> SearchHitDto {
         mtime: 0,
         is_directory: true,
         name_highlight: vec![],
+        snippet: String::new(),
     }
 }
 
@@ -959,6 +960,7 @@ impl MainWindow {
                     mtime: node.mtime,
                     is_directory: node.directory,
                     name_highlight: vec![],
+                    snippet: String::new(),
                 })
             } else {
                 Some(root_hit(&self.workspace.location))
@@ -996,7 +998,37 @@ impl MainWindow {
             return;
         };
         if !self.ensure_selection_identity(&identity_hit, cx) {
-            if self.identity_pending { self.freeze_preview(); } else { self.pause_preview(); }
+            // A row IS selected: never show the "nothing selected" placeholder.
+            // Identity may still be verifying on a background thread (or have
+            // failed) — show the file header from the index hit plus a state.
+            let meta = preview::meta_from_hit(
+                &identity_hit.name,
+                &identity_hit.path,
+                identity_hit.size,
+                identity_hit.mtime,
+                identity_hit.is_directory,
+            );
+            if self.identity_pending {
+                self.freeze_preview();
+                // freeze keeps previous content to avoid flicker; but with
+                // nothing to keep (first selection), show header + loading.
+                if matches!(self.preview.kind, PreviewKind::Empty) {
+                    let mut stub = PreviewState::loading(self.preview_gen, meta);
+                    stub.message = Some("正在核对文件…".into());
+                    self.preview = stub;
+                }
+            } else {
+                // Identity failed (gone/changed/unreadable): keep the header
+                // so the file info stays visible, explain in the body.
+                let reason = self
+                    .identity_error
+                    .clone()
+                    .unwrap_or_else(|| "无法确认文件状态".into());
+                let mut stub = PreviewState::loading(self.preview_gen, meta);
+                stub.kind = PreviewKind::Error;
+                stub.message = Some(reason);
+                self.preview = stub;
+            }
             cx.notify();
             return;
         }
@@ -1275,6 +1307,7 @@ impl MainWindow {
                     mtime: n.mtime,
                     is_directory: n.directory,
                     name_highlight: vec![],
+                    snippet: String::new(),
                 }
             })
             .collect();

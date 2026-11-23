@@ -54,7 +54,7 @@ fn full_pipeline_index_bin_to_content_search() {
     // CLI content-index 同款调用。
     let store2 = findx2_core::load_store_auto(&index_bin).unwrap();
     let cdir = content_dir_for(&index_bin);
-    let st = build_from_store(&store2, &cdir, false, |_| {}).unwrap();
+    let st = build_from_store(&store2, &cdir, false, |_| true).unwrap();
     assert_eq!(st.extracted, 2, "{st:?}");
     assert_eq!(st.docs, 2);
 
