@@ -59,7 +59,16 @@ pub fn capture(path: &Path) -> Result<FileStamp, String> {
 pub fn revalidate(path: &Path, expected: FileStamp) -> Result<(), String> {
     match capture(path) {
         Ok(actual) if actual == expected => Ok(()),
-        Ok(_) => Err("文件身份或内容已变化；已阻止操作，请刷新后重新选择。".into()),
+        Ok(actual) => {
+            // Opt-in isolated DEV evidence only; never relax equality to clear
+            // a warning or silently refresh the operation's trusted baseline.
+            if std::env::var_os("FINDX_NATIVE_IDENTITY_DIAGNOSTICS").is_some() {
+                eprintln!(
+                    "[file-identity] mismatch path={path:?} expected={expected:?} actual={actual:?}"
+                );
+            }
+            Err("文件身份或内容已变化；已阻止操作，请刷新后重新选择。".into())
+        }
         Err(_) => Err("文件不可访问：可能已删除、权限不足或磁盘已断开。".into()),
     }
 }
@@ -83,9 +92,19 @@ mod tests {
         std::fs::hard_link(&a, &b).unwrap();
         let stamp = capture(&a).unwrap();
         assert_eq!(stamp, capture(&b).unwrap());
+        // Preview/read/focus activity does not change a trusted identity.
+        for _ in 0..8 {
+            assert_eq!(std::fs::read(&a).unwrap(), b"fixture");
+            revalidate(&a, stamp).unwrap();
+        }
         std::fs::remove_file(&a).unwrap();
         std::fs::write(&a, b"fixture").unwrap();
         assert!(revalidate(&a, stamp).is_err());
+        // A changed file must still be rejected; a new explicit selection
+        // can capture a baseline, but an existing operation never refreshes it.
+        let replacement = capture(&a).unwrap();
+        std::fs::write(&a, b"changed length").unwrap();
+        assert!(revalidate(&a, replacement).is_err());
         std::fs::remove_file(&b).unwrap();
         assert!(revalidate(&b, stamp).is_err());
         std::fs::remove_dir_all(d).unwrap();

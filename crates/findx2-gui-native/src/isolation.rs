@@ -220,22 +220,12 @@ pub fn is_official_linux_install_path(exe: &std::path::Path) -> bool {
 
 /// Official macOS install path is `/Applications/FindX.app/Contents/MacOS/FindX`.
 pub fn is_official_macos_install_path(exe: &std::path::Path) -> bool {
-    let comps: Vec<String> = exe
-        .iter()
-        .map(|s| s.to_string_lossy().into_owned())
-        .collect();
-    // ["/", "Applications", "FindX.app", "Contents", "MacOS", "FindX"] has 6 components
-    if comps.len() < 5 {
-        return false;
-    }
-    let n = comps.len();
-    comps[n - 1].eq_ignore_ascii_case("FindX")
-        && comps[n - 2].eq_ignore_ascii_case("MacOS")
-        && comps[n - 3].eq_ignore_ascii_case("Contents")
-        && comps[n - 4].eq_ignore_ascii_case("FindX.app")
-        && comps[n - 5].eq_ignore_ascii_case("Applications")
-        && (n == 6 && (comps[0] == "/" || comps[0].eq_ignore_ascii_case("Applications"))
-            || (n >= 6 && comps[n - 6] == "/"))
+    // This is a Unix install-layout policy, including when tested on Windows.
+    // Host Path::iter represents RootDir as "\\" on Windows, not "/".
+    // Match the exact absolute Unix spelling; never accept a Windows drive,
+    // a relative bundle, or a lookalike Applications directory elsewhere.
+    exe.to_str().is_some_and(|path| path.eq_ignore_ascii_case(
+        "/Applications/FindX.app/Contents/MacOS/FindX"))
 }
 
 /// Program Files roots used to recognize the official install directory.

@@ -647,6 +647,11 @@ enum Prep {
 }
 
 impl SearchEngine {
+    /// Numeric-only read-only capacities; does not initialize, resize, or persist anything.
+    pub fn usage_memory_capacity_stats(&self) -> serde_json::Value {
+        let r=self.usage.lock();
+        serde_json::json!({"dirs_len":r.dirs.len(),"dirs_capacity":r.dirs.capacity(),"dirs_capacity_bytes":r.dirs.capacity()*std::mem::size_of::<DirAgg>(),"file_links_len":r.file_links.len(),"file_links_capacity":r.file_links.capacity(),"file_links_capacity_bytes":r.file_links.capacity()*std::mem::size_of::<FileLinks>(),"freshness_len_bytes":r.freshness.bytes.len(),"freshness_capacity_bytes":r.freshness.bytes.capacity(),"accounted_resident_bytes":r.bytes(),"note":"hash table overhead in accounted total is estimated; vector capacities are exact"})
+    }
     pub fn usage_budget(&self) -> usize { self.usage.lock().budget }
     pub fn usage_available(&self) -> bool {
         let r = self.usage.lock();

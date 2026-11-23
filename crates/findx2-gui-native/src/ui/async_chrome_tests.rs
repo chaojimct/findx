@@ -1,0 +1,142 @@
+//! Render-contract regression tests, not physical/continuous-frame acceptance.
+#[test]
+fn usage_chrome_never_inserts_async_controls_or_duplicates_cancel() {
+    let src=include_str!("workspace_pages.rs");
+    let toolbar=src.split("fn render_usage_toolbar").nth(1).unwrap().split("pub(super) fn render_workspace_usage").next().unwrap();
+    assert!(!toolbar.contains(".when("));
+    assert_eq!(toolbar.matches("Button::new(\"cancel-workspace-scan\")").count(),1);
+    assert!(!toolbar.contains("usage-index-cancel"));
+    for fixed in [".w(px(28.)).h(px(24.))", ".w(px(64.))", ".w(px(104.))", ".w(px(28.)).h(px(28.))"] { assert!(toolbar.contains(fixed), "{fixed}"); }
+    assert!(toolbar.contains("this.cancel_engine_usage(cx)"));
+    assert!(toolbar.contains("this.workspace.scan_cancel.store(true, Ordering::Release)"));
+    assert!(toolbar.contains(".disabled(!(self.workspace.scanning || self.workspace.engine_busy"));
+}
+#[test]
+fn shared_footer_async_polls_cannot_insert_activity_button() {
+    let src=include_str!("main_window.rs");
+    let footer=src.split("fn render_status_bar").nth(1).unwrap().split("impl Drop").next().unwrap();
+    assert!(!footer.contains("ViewMode::Search && self.workspace.scanning"));
+    assert!(footer.contains(".disabled(!self.workspace.scanning)"));
+    assert!(footer.contains(".w(px(216.))"));
+    assert!(footer.contains(".w(px(108.))"));
+    // The true engine warning is retained, not hidden by this layout correction.
+    assert!(footer.contains("footer.warning()")); assert!(footer.contains("footer.tooltip()"));
+}
+#[test]
+fn update_async_status_and_progress_have_permanent_reserved_rows() {
+    let src=include_str!("update_card.rs");
+    assert!(!src.contains(".when_some(model.status"));
+    assert!(!src.contains(".when_some(model.progress_text"));
+    assert!(src.contains("id(\"update-status\").h(px(20.))"));
+    assert!(src.contains("id(\"update-progress\").h(px(20.))"));
+    assert!(src.contains(".w(px(192.))"));
+}
+#[test]
+fn settings_identification_keeps_permanent_rows_and_diagnostics_viewport() {
+    let src=include_str!("settings_window.rs");
+    let service=src.split("fn render_service_tab").nth(1).unwrap().split("fn render_service_confirm").next().unwrap();
+    assert!(!service.contains(".when_some(self.service_snapshot"));
+    for id in ["service-hint", "service-path", "service-options", "autostart-hint"] {assert!(service.contains(id));}
+    assert!(src.contains("id(\"raw-status-viewport\").h(px(192.))"));
+}
+
+#[test] fn tables_retain_until_response_and_terminal_failure_ends_pending() {
+ let src=include_str!("main_window.rs");
+ let start=src.split("fn run_search").nth(1).unwrap().split("let old_generation").next().unwrap();
+ let nonempty=start.split("self.page_loading = false").nth(1).unwrap();
+ assert!(!nonempty.contains("self.hits.clear()"));
+ assert!(nonempty.contains("self.freeze_preview()"));
+ let files=include_str!("workspace.rs");
+ let pending=files.split("self.workspace.listing = true;").nth(1).unwrap().split("let cancel =").next().unwrap();
+ assert!(!pending.contains("rows.clear()")); assert!(pending.contains("freeze_preview"));
+ assert!(files.contains("this.workspace.rows_epoch = None;"));
+ for table in [include_str!("result_table.rs"),include_str!("browser_table.rs")] { assert!(table.contains("painted_event_current")); }
+}
+#[test] fn preview_publishes_payload_and_camera_together_not_loading_placeholder() {
+ let src=include_str!("main_window.rs");
+ let request=src.split("fn request_preview").nth(1).unwrap().split("fn move_sel").next().unwrap();
+ assert!(!request.contains("PreviewState::loading("));
+ assert!(request.contains("this.preview_options = options;"));
+ assert!(request.contains("is_current_generation"));
+ let render=src.split("fn render_pdf_controls").nth(1).unwrap().split("fn render_diag").next().unwrap();
+ assert!(!render.contains("self.pdf_options"));
+ assert!(src.contains("client.surface.set_interactive(self.preview_is_current())"));
+}
+
+#[test] fn usage_terminal_error_rolls_back_published_scope_without_hiding_error() {
+ let src=include_str!("workspace.rs");
+ let failure=src.split("// A terminal error ends pending navigation too.").nth(1).unwrap().split("let degraded =").next().unwrap();
+ assert!(failure.contains("this.cancel_engine_usage(cx)"));
+ assert!(failure.contains("this.workspace.scan_status = format!(\"目录读取失败：{e}\")"));
+ assert!(failure.contains("this.workspace.engine_checked = false"));
+}
+
+#[test]
+fn usage_activation_keeps_map_and_reserves_files_reveal_for_explicit_action() {
+    let src=include_str!("workspace.rs");
+    let handler=src.split("fn select_usage_node(").nth(1).unwrap().split("#[cfg(debug_assertions)]").next().unwrap();
+    assert!(handler.contains("ViewMode::Usage"));
+    assert!(handler.contains("Activation::Preview"));
+    assert!(!handler.contains("self.workspace_reveal(cx)"));
+    assert!(handler.contains("self.preview_active_selection(cx)"));
+    let nav=include_str!("workspace_navigation.rs");
+    let crumb=nav.split("path-crumb-{index}").nth(1).unwrap().split("path-siblings-{index}").next().unwrap();
+    assert!(crumb.contains("this.workspace_navigate("));
+    assert!(crumb.contains("this.workspace.mode"));
+    assert!(!crumb.contains("file_scope_current"));
+}
+#[test]
+fn usage_toolbar_width_accounts_for_label_padding_and_address_minimum() {
+    let src=include_str!("workspace_pages.rs");
+    let toolbar=src.split("fn render_usage_toolbar").nth(1).unwrap().split("pub(super) fn render_workspace_usage").next().unwrap();
+    for id in ["usage-index-source","usage-index-next","usage-reset-compact"] {
+        let b=toolbar.split(&format!("Button::new(\"{id}\")")).nth(1).unwrap().split(".on_click").next().unwrap();
+        assert!(b.contains("Size::XSmall"));assert!(b.contains(if id=="usage-reset-compact" {".px_2()"} else {".px_0()"}));assert!(b.contains(".flex_shrink_0()"));
+    }
+    assert!(toolbar.contains(".min_w(px(120.))"));
+}
+
+#[test] fn actual_cancel_restores_published_scan_even_when_only_depth_data_arrived(){
+ let s=include_str!("workspace.rs");let f=s.split("fn cancel_engine_usage(").nth(1).unwrap().split("fn select_engine_usage_source").next().unwrap();
+ assert!(f.contains("usage_depth_pending || self.workspace.usage_pending_from.is_some()"));
+ assert!(f.contains("cancel_pending_layout"));assert!(f.contains("self.workspace.scan=Some(scan.clone())"));
+ assert!(f.contains("usage_scene_loaded_depth"));assert!(f.contains("usage_scene_blocked_paths.clone()"));
+ let toolbar=include_str!("workspace_pages.rs");assert!(toolbar.contains("|| self.workspace.usage_depth_pending))"));
+}
+
+#[test]fn usage_quality_is_scope_level_without_repeated_unknown_dots_and_capacity_is_fixed(){
+ let paint=include_str!("workspace_usage.rs");assert!(!paint.contains("if d.unknown {"));assert!(paint.contains("usage_presentation::fit_label"));assert!(paint.contains("usage_presentation::label_plan"));
+ let page=include_str!("workspace_pages.rs");assert!(page.contains("usage-quality-summary"));assert!(page.contains(".h(px(126.)).min_h(px(126.)).max_h(px(126.))"));assert!(page.contains("usage_volume.get(volume_path)"));
+ let w=include_str!("workspace.rs");assert!(w.contains("background_executor().spawn(async move{crate::usage_volume::query(&path)})"));
+}
+
+#[test]
+fn usage_copy_uses_grouping_without_changing_fixed_slots_or_raw_diagnostics() {
+    let page=include_str!("workspace_pages.rs");
+    let usage=&page[page.find("usage-detail-scroll").unwrap()..];
+    assert!(!usage.contains('·'));
+    for stable in ["usage-quality-summary", "usage-facts-popover", "usage-facts-scroll", "索引统计范围", "全局连接", ".h(px(126.)).min_h(px(126.)).max_h(px(126.))", "系统未返回容量；不是 0", "卷已用 = 总量 − 系统空闲", "索引时效见连接状态", "scan.unknown", "scan.partial", "scan.errors"] { assert!(page.contains(stable), "missing {stable}"); }
+    assert!(!include_str!("../usage_presentation.rs").contains('·'));
+    assert!(!include_str!("workspace_usage.rs").contains('·'));
+    assert!(include_str!("../footer_status.rs").contains("detail.contains(\"索引逻辑 ·\")"));
+}
+
+#[test]
+fn usage_toolbar_icon_slots_and_depth_value_are_compact_and_stable() {
+    let page=include_str!("workspace_pages.rs");
+    let bar=&page[page.find("fn render_usage_toolbar").unwrap()..page.find("pub(super) fn render_workspace_usage").unwrap()];
+    for label in ["索引逻辑", "下一页", "减少显示层数", "增加显示层数"] { assert!(bar.contains(&format!(".accessibility_label(\"{label}\")"))); }
+    assert!(bar.contains("icons/database.svg"));assert!(bar.contains("icons/list-plus.svg"));
+    assert!(!bar.contains(".label(\"下一页\")"));assert!(!bar.contains(".w(px(76.))"));assert!(!bar.contains(".w(px(72.))"));assert!(!bar.contains(".w(px(30.))"));
+    assert!(bar.contains(".w(px(16.)).flex_shrink_0().text_center().whitespace_nowrap()"));
+    assert!(bar.contains("h_flex().id(\"usage-depth-controls\").flex_shrink_0().gap(px(2.))"));
+    assert!(bar.contains("self.workspace.usage_depth <= 1"));assert!(bar.contains("self.workspace.usage_depth >= 6"));
+    assert!(bar.contains("self.workspace.engine_next.is_none()"));
+    assert!(bar.contains("Button::new(\"cancel-workspace-scan\")"));
+    assert!(!bar.contains(".when(")); // Busy, cancel and paging never remove/insert slots.
+}
+
+#[test]fn usage_facts_trigger_has_one_accessible_activation_path(){
+ let page=include_str!("workspace_pages.rs");let trigger=&page[page.find(r#"Popover::new("usage-facts-popover")"#).unwrap()..];let trigger=&trigger[..trigger.find(".content(").unwrap()];
+ assert!(trigger.contains(".open(self.workspace.usage_facts_open)"));assert!(trigger.contains(".on_open_change("));assert!(trigger.contains(".on_mouse_down(MouseButton::Left"));assert!(trigger.contains(".on_click(cx.listener("));assert!(trigger.contains(r#".accessibility_label("详细信息")"#));
+}

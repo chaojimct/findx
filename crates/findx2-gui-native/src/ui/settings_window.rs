@@ -22,6 +22,16 @@ use crate::update_logic::{
     UpdatePhase, derive_update_phase, should_auto_check, start_silent_setup,
 };
 
+// A changing hint uses one reserved line; the complete text remains accessible
+// by tooltip instead of wrapping and moving the controls beneath it.
+fn settings_async_line(id: SharedString, text: String) -> impl IntoElement {
+    let detail = text.clone();
+    div().id(id).h(px(20.)).flex_shrink_0().min_w_0().text_sm()
+        .whitespace_nowrap().text_ellipsis()
+        .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(detail.clone()).build(window, cx))
+        .child(text)
+}
+
 // Fixed-width content avoids Button's internal centered label changing each row's icon origin.
 fn settings_nav_content(icon: Icon, label: &'static str) -> impl IntoElement {
     h_flex()
@@ -605,9 +615,8 @@ impl Render for SettingsWindow {
                     .border_b_1()
                     .border_color(tokens.border)
                     .child(div().text_lg().child(title))
-                    .when(dirty, |view| {
-                        view.child(div().text_xs().text_color(tokens.accent).child("● 未保存"))
-                    }),
+                    .child(div().w(px(86.)).flex_shrink_0().text_xs().text_color(tokens.accent)
+                        .child(if dirty { "● 未保存" } else { "" })),
             )
             .child(
                 div()
@@ -710,6 +719,7 @@ impl SettingsWindow {
                     .text_color(tokens.text_secondary)
                     .child("勾选要扫描的盘。一个都不勾 = 全盘，与命令行默认一致。这些范围草稿只写入 native-dev；要改变正式索引范围，请先保存后到「服务模式」确认重建（重建使用正式排除规则，不使用这里的草稿）。"),
             )
+            .child(v_flex().id("settings-drives-viewport").h(px(128.)).flex_shrink_0().gap_2().overflow_y_scrollbar()
             .when(roots.is_empty(), |this| {
                 this.child(div().text_sm().text_color(tokens.text_tertiary).child("（加载磁盘列表中…）"))
             })
@@ -736,7 +746,7 @@ impl SettingsWindow {
                         });
                     }
                 })
-            }))
+            })))
             .child(section_title("排除目录", tokens))
             .child(
                 div()
@@ -903,12 +913,19 @@ impl SettingsWindow {
         v_flex().gap_3().w_full()
             .child(section_title("管理已安装的正式 FindX 服务",tokens))
             .child(div().text_sm().child("只管理身份核对通过的正式平台服务；不会按进程名称批量终止，也不会注册另一套开发服务。操作前确认，执行后回读。"))
-            .child(div().text_sm().child(self.service_hint.clone()))
-            .when_some(self.service_snapshot.as_ref(),|v,s|{
-                let options=crate::service_control::official_runtime_options(s).ok().map(|(interval,backfill,everything)|format!("正式服务当前选项（注册命令行）：落盘 {interval} 秒，元数据回填 {}，Everything {}",if backfill{"开启"}else{"关闭"},if everything{"开启"}else{"关闭"}));
-                v.child(div().text_sm().child(s.path_name.clone())).when_some(options,|v,text|v.child(div().text_sm().child(text)))
+            .child(settings_async_line("service-hint".into(), self.service_hint.clone()))
+            .child({
+                let path=self.service_snapshot.as_ref().map(|s|s.path_name.clone()).unwrap_or_default();
+                settings_async_line("service-path".into(), path)
             })
-            .child(div().text_sm().child(self.autostart_hint.clone()))
+            .child({
+                let options=self.service_snapshot.as_ref()
+                    .and_then(|s|crate::service_control::official_runtime_options(s).ok())
+                    .map(|(interval,backfill,everything)|format!("正式服务当前选项（注册命令行）：落盘 {interval} 秒，元数据回填 {}，Everything {}",if backfill{"开启"}else{"关闭"},if everything{"开启"}else{"关闭"}))
+                    .unwrap_or_default();
+                settings_async_line("service-options".into(), options)
+            })
+            .child(settings_async_line("autostart-hint".into(), self.autostart_hint.clone()))
             .child({let entity=cx.entity();Button::new("refresh-service").label("刷新服务状态").disabled(self.service_busy).on_click(move|_,_,cx|entity.update(cx,|this,cx|this.refresh_service(cx)))})
             .child(h_flex().gap_2().flex_wrap().children([Action::Start,Action::Stop,Action::Auto,Action::Manual,Action::GuiAutoOn,Action::GuiAutoOff,Action::Compact,Action::Rebuild,Action::ApplyPreferences].into_iter().map(|action|{let entity=cx.entity();Button::new(SharedString::from(action.label())).label(action.label()).disabled(self.service_busy||self.service_snapshot.is_none()||(cfg!(unix)&&!self.session.read(cx).official_product)).on_click(move|_,_,cx|entity.update(cx,|this,cx|{this.service_pending=Some(action);cx.notify();}))})))
             .child(div().text_sm().text_color(tokens.warning).child("维护先停止已核对的服务并完整备份，在副本上运行安装版 CLI，校验成功后替换，保留旧库并恢复原运行状态。缺少明确扫描范围或排除规则未知时拒绝重建。Unix 使用当前用户服务权限；Windows 需要 SCM/管理员权限。"))
@@ -1357,7 +1374,7 @@ impl SettingsWindow {
             .w_full()
             .gap_3()
             .child(section_title("只读运行诊断", tokens))
-            .children(rows.into_iter().map(|r| div().text_sm().child(r)))
+            .children(rows.into_iter().enumerate().map(|(i,r)| settings_async_line(format!("runtime-diagnostic-{i}").into(), r)))
             .child({
                 let session = self.session.clone();
                 Checkbox::new("main-diagnostics")
@@ -1373,6 +1390,7 @@ impl SettingsWindow {
             .child(section_title("原始 Status 响应（每 2 秒更新）", tokens))
             .child(
                 div()
+                    .id("raw-status-viewport").h(px(192.)).flex_shrink_0().overflow_y_scrollbar()
                     .text_xs()
                     .p_3()
                     .bg(tokens.surface)

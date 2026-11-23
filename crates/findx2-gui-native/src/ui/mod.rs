@@ -1,7 +1,9 @@
+mod async_publication;
 mod browser_table;
 pub(super) mod chrome;
 mod file_icon;
 pub mod main_window;
+mod native_focus;
 mod result_table;
 pub mod settings_window;
 pub mod update_card;
@@ -176,3 +178,6 @@ pub fn open_settings_window(session: Entity<AppSession>, cx: &mut App) {
         Err(err) => eprintln!("findx2-gui-native: failed to open settings: {err:?}"),
     }
 }
+
+#[cfg(test)]
+mod async_chrome_tests;

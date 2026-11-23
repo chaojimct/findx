@@ -594,6 +594,30 @@ pub(crate) fn normalize_pipe_path(pipe: &str) -> String {
 const USN_BATCH_MAX_EVENTS: usize = 4096;
 const USN_BATCH_FLUSH_MS: u64 = 50;
 
+// Shared by nonempty batches and idle checkpoints. A parked live identity must
+// not require an unrelated future file operation before its known placement
+// can be reconciled. NamespaceGate/engine remain the sole cursor admission path.
+fn prepare_namespace_events(engine:&SearchEngine,unlink_resolver:&mut Option<findx2_windows::NtfsUnlinkResolver>,volume_path:&str,volume_letter:u8,events:&[findx2_core::ChangeEvent],journal_id:u64,stop:&AtomicBool)->Result<Option<Vec<findx2_core::ChangeEvent>>,String>{
+crate::namespace_retry::prepare_with_retry(||->Result<Vec<findx2_core::ChangeEvent>,String>{
+                        let (missing,parked)=engine.namespace_recovery_inputs(volume_letter,events);
+                        if missing.is_empty() && unlink_resolver.is_none(){return Ok(events.to_vec());}
+                        if unlink_resolver.is_none(){
+                            let serial={let g=engine.index_store();g.volumes.iter().find(|v|v.volume_letter==volume_letter).ok_or("unlink volume unavailable")?.volume_serial};
+                            *unlink_resolver=Some(findx2_windows::NtfsUnlinkResolver::new(volume_path,volume_letter,serial,journal_id)?);
+                        }
+                        unlink_resolver.as_mut().unwrap().rewrite(events,&parked,&missing,journal_id,|p|engine.namespace_parent_resolvable(volume_letter,p,&events),|id|engine.namespace_identity_live(volume_letter,id))
+                    },findx2_windows::is_retryable_namespace_error,|attempt|{
+                        set_watch_error(volume_letter as char,Some(format!("verified NTFS identity temporarily delete-pending; original batch and durable cursor retained; retry={attempt}")));
+                        // Fixed-size state, capped backoff, stop checked every250ms.
+                        // No channel draining and no acknowledgement during retry.
+                        for _ in 0..attempt.min(8) {
+                            if stop.load(Ordering::SeqCst){return false;}
+                            std::thread::sleep(Duration::from_millis(250));
+                        }
+                        !stop.load(Ordering::SeqCst)
+                    })
+}
+
 fn usn_watch_loop(
     engine: Arc<SearchEngine>,
     volume_path: String,
@@ -765,16 +789,9 @@ fn usn_watch_loop(
                     next_usn,
                 } => {
                     dirty_count += flush_pending(&mut pending)?;
-                    let prepared=(||->Result<Vec<findx2_core::ChangeEvent>,String>{
-                        let (missing,parked)=engine.namespace_recovery_inputs(volume_letter,&events);
-                        if missing.is_empty() && unlink_resolver.is_none(){return Ok(events.clone());}
-                        if unlink_resolver.is_none(){
-                            let serial={let g=engine.index_store();g.volumes.iter().find(|v|v.volume_letter==volume_letter).ok_or("unlink volume unavailable")?.volume_serial};
-                            unlink_resolver=Some(findx2_windows::NtfsUnlinkResolver::new(&volume_path,volume_letter,serial,journal_id)?);
-                        }
-                        unlink_resolver.as_mut().unwrap().rewrite(&events,&parked,&missing,journal_id,|p|engine.namespace_parent_resolvable(volume_letter,p,&events),|id|engine.namespace_identity_live(volume_letter,id))
-                    })();
-                    let events=match prepared{Ok(e)=>e,Err(e)=>{set_watch_error(letter,Some(format!("internal namespace resolution failed; cursor retained: {e}")));namespace_gate.blocked=true;continue;}};
+                    let prepared=prepare_namespace_events(&engine,&mut unlink_resolver,&volume_path,volume_letter,&events,journal_id,&stop);
+                    let prepared=match prepared{Ok(Some(events))=>Ok(events),Ok(None)=>continue,Err(error)=>Err(error)};
+                    let events=match namespace_gate.prepare(volume_letter,prepared){Ok(e)=>e,Err(e)=>{tracing::error!(volume=%letter,journal_id,next_usn,error=%e,"namespace resolution fenced; original batch not acknowledged");continue;}};
                     match namespace_gate.apply(&engine, volume_letter, &events, journal_id, next_usn) {
                         Ok(()) => {
                             set_watch_error(letter, engine.has_pending_namespace(volume_letter).then(||
@@ -820,11 +837,17 @@ fn usn_watch_loop(
                     next_usn,
                 } => {
                     dirty_count += flush_pending(&mut pending)?;
-                    if let Err(e) = namespace_gate.apply(&engine, volume_letter, &[], journal_id, next_usn) {
+                    let recovered=if engine.has_pending_namespace(volume_letter){
+                        let prepared=prepare_namespace_events(&engine,&mut unlink_resolver,&volume_path,volume_letter,&[],journal_id,&stop);
+                        let prepared=match prepared{Ok(Some(events))=>Ok(events),Ok(None)=>continue,Err(error)=>Err(error)};
+                        match namespace_gate.prepare(volume_letter,prepared){Ok(events)=>events,Err(error)=>{tracing::error!(volume=%letter,journal_id,next_usn,error=%error,"idle namespace recovery fenced; checkpoint not acknowledged");continue;}}
+                    }else{Vec::new()};
+                    if let Err(e) = namespace_gate.apply(&engine, volume_letter, &recovered, journal_id, next_usn) {
                         set_watch_error(letter, Some(format!("checkpoint rejected; namespace fenced: {e}")));
                         namespace_gate.blocked = true;
                         continue;
                     }
+                    dirty_count += recovered.len();
                     if engine.has_pending_namespace(volume_letter) {
                         set_watch_error(letter, Some(format!("missing-parent namespace events pending; durable cursor pinned for restart replay; {}", engine.pending_namespace_diagnostics(volume_letter))));
                         continue;
@@ -1283,6 +1306,10 @@ fn persist_index_with(
 
 #[cfg(test)]
 mod tests {
+    fn checkpoint_test_guard()->std::sync::MutexGuard<'static,()> {
+        static LOCK:std::sync::Mutex<()>=std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p|p.into_inner())
+    }
     #[test]
     fn shutdown_marker_publishes_shared_stop_and_releases_fake_watcher() {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -1344,6 +1371,7 @@ mod tests {
 
     #[test]
     fn partial_backfill_shutdown_persists_namespace_cursor_without_claiming_ready() {
+        let _checkpoint=checkpoint_test_guard();
         let dir=std::env::temp_dir().join(format!("findx-partial-shutdown-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&dir).unwrap();let path=dir.join("synthetic.bin");let layout=findx2_core::V6Layout::for_index(&path);
         let mut store=tiny_store(b'C',7,100,"public-file.txt");store.metadata_ready=false;store.set_track_mutations(true);
@@ -1371,6 +1399,28 @@ mod tests {
         engine.enable_usage(16*1024*1024).unwrap();
         (path,engine)
     }
+    #[test]
+    fn observed_deleted_identity_denial_fences_later_batches_and_durable_cursor() {
+        let _checkpoint=checkpoint_test_guard();
+        let _health=crate::watch_health::test_health_guard();
+        let (path,engine)=checkpoint_fixture("t164-denied-identity");
+        let mut gate=crate::watch_health::NamespaceGate::default();
+        let observed="bound unlink identity metadata unavailable: 拒绝访问。 (0x80070005); cursor retained";
+        assert!(gate.prepare(b'C',Err(observed.into())).is_err());
+        assert!(gate.blocked);
+        assert!(crate::watch_health::watch_error_summary().unwrap().contains(observed));
+        for _ in 0..3 {
+            assert!(gate.prepare(b'C',Ok(vec![findx2_core::ChangeEvent::Delete{file_id:1}])).is_err());
+            assert!(gate.apply(&engine,b'C',&[],7,999).is_err());
+        }
+        assert!(super::persist_shutdown_checkpoint(&engine,&path).unwrap());
+        let restored=findx2_core::v6_load(&findx2_core::V6Layout::for_index(&path)).unwrap();
+        assert_eq!(restored.volumes[0].last_usn,100);
+        assert!(restored.entry_on_volume(b'C',1).is_some());
+        assert!(crate::watch_health::watch_error_summary().unwrap().contains(observed));
+        crate::watch_health::set_watch_error('C',None);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
     fn checkpoint_patch(engine: &findx2_core::SearchEngine, size:u64) {
         let ticket=engine.metadata_ticket_by_id(b'C',1).unwrap();
         assert!(engine.commit_metadata(ticket,size,0,0).unwrap());
@@ -1388,6 +1438,7 @@ mod tests {
 
     #[test]
     fn checkpoint_partial_metadata_is_journaled_before_any_overlay_drain() {
+        let _checkpoint=checkpoint_test_guard();
         let (path,engine)=checkpoint_fixture("mirroring");
         checkpoint_patch(&engine,456);
         engine.set_backfill_error(Some("80 metadata access errors remain".into()));
@@ -1404,6 +1455,7 @@ mod tests {
 
     #[test]
     fn checkpoint_periodic_partial_coverage_preserves_namespace_and_cursor() {
+        let _checkpoint=checkpoint_test_guard();
         let (path,engine)=checkpoint_fixture("periodic");
         checkpoint_patch(&engine,456);
         engine.set_backfill_error(Some("80 metadata access errors remain".into()));
@@ -1429,6 +1481,7 @@ mod tests {
 
     #[test]
     fn checkpoint_io_failure_retains_batch_and_concurrent_writes_then_retries() {
+        let _checkpoint=checkpoint_test_guard();
         let (path,engine)=checkpoint_fixture("failure-retry");
         // Real filesystem failure: a required segment is missing. The writer
         // fails after draining; no permission changes or real index are involved.
@@ -1465,6 +1518,7 @@ mod tests {
 
     #[test]
     fn checkpoint_success_does_not_acknowledge_metadata_arriving_during_io() {
+        let _checkpoint=checkpoint_test_guard();
         let (path,engine)=checkpoint_fixture("late-after-snapshot");
         checkpoint_patch(&engine,456);
         assert!(super::persist_index_with(&engine,&path,|layout,batch| {
@@ -1483,6 +1537,7 @@ mod tests {
 
     #[test]
     fn checkpoint_disk_failure_does_not_end_watcher_and_retry_is_backed_off() {
+        let _checkpoint=checkpoint_test_guard();
         let (path,engine)=checkpoint_fixture("periodic-retry");
         checkpoint_patch(&engine,456);
         findx2_core::set_persist_fault(findx2_core::PersistFault::DiskFull { max_bytes: 16 });
@@ -1506,6 +1561,7 @@ mod tests {
 
     #[test]
     fn checkpoint_repeated_metadata_writes_coalesce_and_observation_is_logged() {
+        let _checkpoint=checkpoint_test_guard();
         let (path,engine)=checkpoint_fixture("coalesced");
         for size in 0..10_000 { checkpoint_patch(&engine,size); }
         assert_eq!(engine.pending_metadata_bitmap().0,1);
@@ -1536,6 +1592,7 @@ mod tests {
 
     #[test]
     fn checkpoint_busy_keeps_dirty_and_clock_and_does_not_drain() {
+        let _checkpoint=checkpoint_test_guard();
         let (path,engine)=checkpoint_fixture("busy");
         checkpoint_patch(&engine,456);
         let guard=super::persist_lock().lock().unwrap_or_else(|e|e.into_inner());
@@ -1553,6 +1610,7 @@ mod tests {
 
     #[test]
     fn checkpoint_unwind_requeues_and_does_not_permanently_poison_writer() {
+        let _checkpoint=checkpoint_test_guard();
         let (path,engine)=checkpoint_fixture("unwind");
         checkpoint_patch(&engine,456);
         let unwind=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||{

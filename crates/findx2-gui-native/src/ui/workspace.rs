@@ -1,11 +1,14 @@
 //! Distinct search, directory-tab and usage pages share file identity and explicit actions, not navigation histories.
 //! Filesystem and allocation work never run on the render/input thread.
+use gpui_kit::component::FocusableExt as _;
 #[path = "workspace_navigation.rs"]
 mod navigation_ui;
 #[path = "workspace_pages.rs"]
 mod pages;
 #[path = "workspace_usage.rs"]
 mod usage_ui;
+#[path = "workspace_inspector.rs"]
+mod inspector_ui;
 use super::super::browser_table::{BrowserTable, MIN_WIDTHS as BROWSER_MIN_WIDTHS};
 use super::*;
 use crate::{
@@ -194,11 +197,13 @@ pub(super) struct Workspace {
     path_ime_escape: bool,
     address_focus: FocusHandle,
     pub(super) address_menu: Option<Entity<gpui_kit::component::menu::PopupMenu>>,
+    pub(super) address_menu_header: Option<String>,
     pub(super) address_menu_position: Point<Pixels>,
     address_menu_subscription: Option<Subscription>,
     pub(super) address_menu_token: Option<crate::preview_visibility::MenuToken>,
     address_menu_generation: u64,
     address_menu_cancel: Arc<AtomicBool>,
+    usage_facts_open: bool,
     tab_scroll: ScrollHandle,
     address_width: std::rc::Rc<std::cell::Cell<f32>>,
     pub(super) show_actions: bool,
@@ -213,10 +218,23 @@ pub(super) struct Workspace {
     history: History,
     pub(in crate::ui) cache: HashMap<String, (Vec<SearchHitDto>, bool)>,
     list_generation: u64,
+    rows_epoch: Option<(u64, u64)>,
     list_cancel: Arc<AtomicBool>,
     pub(super) listing: bool,
     window: AnyWindowHandle,
-    usage_depth: usize,
+    pub(super) usage_depth: usize,
+    usage_depth_pending: bool,
+    usage_loaded_depth: usize,
+    usage_more_depth: bool,
+    usage_blocked_paths: std::collections::HashSet<String>,
+    usage_scene_blocked_paths: std::collections::HashSet<String>,
+    usage_scene_loaded_depth: usize,
+    usage_scene_more_depth: bool,
+    usage_volume: crate::usage_volume::State,
+    usage_page_cache: Arc<std::sync::Mutex<crate::indexed_depth::PageCache>>,
+    inspector: crate::usage_inspector::State,
+    inspector_pin: Option<(crate::usage_inspector::Source,crate::disk_usage::Node)>,
+    side_buttons: [bool;2],
     usage_advanced: bool,
     engine_usage: bool,
     engine_busy: bool,
@@ -229,6 +247,8 @@ pub(super) struct Workspace {
     scan: Option<Arc<Scan>>,
     usage_scene: Option<Arc<crate::usage_view::Scene>>,
     usage_scene_scan: Option<Arc<Scan>>,
+    usage_scene_selected: Option<usize>,
+    usage_scene_next: Option<u32>,
     usage_preview: std::cell::RefCell<crate::disktree::scan_preview::Motion>,
     usage_fixture_seen: usize,
     active_scan_root: Option<PathBuf>,
@@ -236,6 +256,8 @@ pub(super) struct Workspace {
     usage_scene_generation: u64,
     usage_layout_inflight: bool,
     usage_pending_from: Option<PathBuf>,
+    usage_pending_direction:i8,
+    usage_pending_history:Option<History>,
     usage_tree_revision: usize,
     usage_camera: crate::usage_view::Camera,
     usage_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
@@ -285,7 +307,7 @@ impl Workspace {
             .unwrap_or_else(|| PathBuf::from("C:\\"));
         let path = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("目录路径 · Ctrl+L")
+                .placeholder("目录路径（Ctrl+L）")
                 .default_value(display_path(&location))
         });
         let filter_input =
@@ -333,11 +355,13 @@ impl Workspace {
             path_ime_escape: false,
             address_focus: cx.focus_handle(),
             address_menu: None,
+            address_menu_header: None,
             address_menu_position: point(px(0.), px(0.)),
             address_menu_subscription: None,
             address_menu_token: None,
             address_menu_generation: 0,
             address_menu_cancel: Arc::new(AtomicBool::new(false)),
+            usage_facts_open: false,
             tab_scroll: ScrollHandle::new(),
             address_width: Default::default(),
             show_actions: false,
@@ -352,10 +376,23 @@ impl Workspace {
             history: History::default(),
             cache: HashMap::new(),
             list_generation: 0,
+            rows_epoch: None,
             list_cancel: Arc::new(AtomicBool::new(false)),
             listing: false,
             window: window.window_handle(),
             usage_depth: 3,
+            usage_depth_pending: false,
+            usage_loaded_depth: 1,
+            usage_more_depth: true,
+            usage_blocked_paths: Default::default(),
+            usage_scene_blocked_paths: Default::default(),
+            usage_scene_loaded_depth: 1,
+            usage_scene_more_depth: true,
+            usage_volume: Default::default(),
+            usage_page_cache: Arc::new(std::sync::Mutex::new(crate::indexed_depth::PageCache::default())),
+            inspector: crate::usage_inspector::State::default(),
+            inspector_pin: None,
+            side_buttons: [false;2],
             usage_advanced: false,
             engine_usage: true,
             engine_busy: false,
@@ -368,6 +405,8 @@ impl Workspace {
             scan: None,
             usage_scene: None,
             usage_scene_scan: None,
+            usage_scene_selected: None,
+            usage_scene_next: None,
             usage_preview: Default::default(),
             usage_fixture_seen: 0,
             active_scan_root: None,
@@ -375,6 +414,8 @@ impl Workspace {
             usage_scene_generation: 0,
             usage_layout_inflight: false,
             usage_pending_from: None,
+            usage_pending_direction:0,
+            usage_pending_history:None,
             usage_tree_revision: 1,
             usage_camera: Default::default(),
             usage_bounds: Default::default(),
@@ -466,12 +507,20 @@ impl MainWindow {
 
         self.subscribe_workspace_table(self.workspace.table.clone(), cx);
         let filter = self.workspace.filter_input.clone();
-        self._subscriptions.push(cx.subscribe_in(&filter,window,|this,_,event:&InputEvent,window,cx|{
-            if matches!(event,InputEvent::Change) && this.workspace.mode==ViewMode::Directory {
-                let composing=this.workspace.filter_input.update(cx,|i,cx|i.marked_text_range(window,cx).is_some());
-                this.directory_filter_changed(composing,cx);
-            }
-        }));
+        self._subscriptions.push(cx.subscribe_in(
+            &filter,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Change) && this.workspace.mode == ViewMode::Directory
+                {
+                    let composing = this
+                        .workspace
+                        .filter_input
+                        .update(cx, |i, cx| i.marked_text_range(window, cx).is_some());
+                    this.directory_filter_changed(composing, cx);
+                }
+            },
+        ));
         let target = self.workspace.target.clone();
         self._subscriptions
             .push(cx.subscribe(&target, |this, _, ev: &InputEvent, cx| {
@@ -533,6 +582,7 @@ impl MainWindow {
                         #[cfg(debug_assertions)]
                         this.usage_fixture_commands(cx);
                         this.workspace.engine_tick = this.workspace.engine_tick.wrapping_add(1);
+                        if this.workspace.engine_tick % 8 == 0 {this.refresh_usage_volume(cx);}
                         if this.workspace.engine_tick % 8 == 0
                             && this.workspace.mode == ViewMode::Usage
                             && this.workspace.engine_usage
@@ -621,7 +671,7 @@ impl MainWindow {
     fn save_page_context(&mut self) {
         let state = self
             .workspace
-            .snapshot(self.preview_force, self.workspace.listing);
+            .snapshot(self.preview_force, self.workspace.listing || !self.file_rows_current(false));
         match self.workspace.mode {
             ViewMode::Directory => self.workspace.tabs[self.workspace.active_tab] = state,
             ViewMode::Usage => self.workspace.usage_page = Some(state),
@@ -641,6 +691,7 @@ impl MainWindow {
         self.workspace.status = state.status;
         self.workspace.filter_text = state.filter.clone();
         self.workspace.listing = false;
+        self.workspace.rows_epoch = (!state.needs_load).then_some((self.workspace.list_generation, self.workspace.filter_generation));
         self.preview_force = state.preview_force;
         self.update_location_input(cx);
         let input = self.workspace.filter_input.clone();
@@ -651,6 +702,9 @@ impl MainWindow {
     }
 
     fn select_directory_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.workspace.inspector.cancel();
+        
+        self.workspace.usage_facts_open=false;
         self.cancel_path_edit(cx);
         self.dismiss_address_menu(cx);
         self.dismiss_file_menu(cx);
@@ -760,7 +814,29 @@ impl MainWindow {
         cx.notify();
     }
 
+    pub(super) fn file_rows_current(&self, search: bool) -> bool {
+        if search { !self.loading && self.search_keyboard.ready(self.search_gen) }
+        else { crate::ui::async_publication::scope_current(self.workspace.rows_epoch,
+            (self.workspace.list_generation, self.workspace.filter_generation), self.workspace.listing) }
+    }
+    pub(in crate::ui) fn row_paint_scope(&self, search: bool) -> Option<(u64,u64)> {
+        self.file_rows_current(search).then_some(if search { (self.search_gen,0) }
+            else { (self.workspace.list_generation,self.workspace.filter_generation) })
+    }
+    pub(super) fn file_scope_current(&self) -> bool {
+        match self.workspace.mode {
+            ViewMode::Search => self.file_rows_current(true),
+            ViewMode::Directory => self.file_rows_current(false),
+            ViewMode::Usage => self.usage_scene_interactive(),
+        }
+    }
     pub(super) fn active_workspace_hit(&self) -> Option<SearchHitDto> {
+        if self.workspace.mode == ViewMode::Directory && !self.file_rows_current(false) { return None; }
+
+        if self.workspace.mode == ViewMode::Search && !self.search_keyboard.ready(self.search_gen) {
+            return None;
+        }
+
         if self.workspace.mode == ViewMode::Search {
             self.selected.and_then(|i| self.hits.get(i).cloned())
         } else if self.workspace.mode == ViewMode::Usage {
@@ -770,7 +846,9 @@ impl MainWindow {
                 .as_ref()
                 .and_then(|path| self.workspace.scan_lookup.get(&key(Path::new(path))))
                 .and_then(|&i| self.workspace.scan.as_ref()?.nodes.get(i))
+                .or_else(||self.workspace.inspector_pin.as_ref().filter(|(source,n)|Some(*source)==self.inspector_source()&&self.workspace.usage_focus.as_ref().is_some_and(|p|key(Path::new(p))==key(&n.path))).map(|(_,n)|n))
             {
+                if self.workspace.usage_blocked_paths.contains(&key(&node.path)) {return None;}
                 Some(SearchHitDto {
                     entry_idx: 0,
                     name: node
@@ -814,7 +892,7 @@ impl MainWindow {
             return;
         }
         if !self.ensure_selection_identity(cx) {
-            self.pause_preview();
+            if self.identity_pending { self.freeze_preview(); } else { self.pause_preview(); }
             cx.notify();
             return;
         }
@@ -835,7 +913,7 @@ impl MainWindow {
             self.preview.meta.as_ref().is_some_and(|m| {
                 preview_stamp(&m.path, m.size, m.mtime) == preview_stamp(&h.path, h.size, h.mtime)
             })
-        }) && !matches!(self.preview.kind, PreviewKind::Empty | PreviewKind::Loading)
+        }) && self.preview_is_current() && !matches!(self.preview.kind, PreviewKind::Empty | PreviewKind::Loading)
         {
             cx.notify();
             return;
@@ -853,10 +931,10 @@ impl MainWindow {
         cx.notify();
     }
     pub(super) fn workspace_switch(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
-        self.workspace.filter_cancel.store(true,Ordering::Release);
-        self.workspace.filter_generation=self.workspace.filter_generation.wrapping_add(1);
+        self.workspace.filter_cancel.store(true, Ordering::Release);
+        self.workspace.filter_generation = self.workspace.filter_generation.wrapping_add(1);
         self.workspace.engine_cancel.store(true, Ordering::Release);
-        self.workspace.engine_busy=false;
+        self.workspace.engine_busy = false;
         self.cancel_path_edit(cx);
         self.dismiss_address_menu(cx);
         self.dismiss_file_menu(cx);
@@ -906,41 +984,78 @@ impl MainWindow {
         allocated: bool,
         cx: &mut Context<Self>,
     ) {
-        self.workspace.filter_cancel.store(true,Ordering::Release);
-        self.workspace.filter_generation=self.workspace.filter_generation.wrapping_add(1);
-        self.workspace.all_rows=Arc::new(rows);
-        if self.workspace.mode==ViewMode::Directory && !self.workspace.filter_text.is_empty() {
-            self.schedule_directory_filter(focus,cx);return;
+        self.workspace.filter_cancel.store(true, Ordering::Release);
+        self.workspace.filter_generation = self.workspace.filter_generation.wrapping_add(1);
+        self.workspace.all_rows = Arc::new(rows);
+        if self.workspace.mode == ViewMode::Directory && !self.workspace.filter_text.is_empty() {
+            self.schedule_directory_filter(focus, cx);
+            return;
         }
-        let rows=self.workspace.all_rows.as_ref().clone();
-        self.apply_workspace_rows(rows,focus,allocated,cx);
+        let rows = self.workspace.all_rows.as_ref().clone();
+        self.apply_workspace_rows(rows, focus, allocated, cx);
     }
-    fn directory_filter_changed(&mut self,composing:bool,cx:&mut Context<Self>) {
-        self.workspace.filter_text=self.workspace.filter_input.read(cx).value().to_string();
-        self.workspace.filter_cancel.store(true,Ordering::Release);
-        self.workspace.filter_generation=self.workspace.filter_generation.wrapping_add(1);
-        if !composing {let focus=self.active_workspace_hit().map(|h|h.path);self.schedule_directory_filter(focus,cx);}
+    fn directory_filter_changed(&mut self, composing: bool, cx: &mut Context<Self>) {
+        self.workspace.filter_text = self.workspace.filter_input.read(cx).value().to_string();
+        self.workspace.filter_cancel.store(true, Ordering::Release);
+        self.workspace.filter_generation = self.workspace.filter_generation.wrapping_add(1);
+        self.freeze_preview();
+        if self.workspace.listing { cx.notify(); return; }
+        if !composing {
+            let focus = self.active_workspace_hit().map(|h| h.path);
+            self.schedule_directory_filter(focus, cx);
+        }
     }
-    fn schedule_directory_filter(&mut self,focus:Option<String>,cx:&mut Context<Self>) {
-        self.workspace.filter_cancel.store(true,Ordering::Release);
-        self.workspace.filter_cancel=Arc::new(AtomicBool::new(false));
-        self.workspace.filter_generation=self.workspace.filter_generation.wrapping_add(1);
-        let generation=self.workspace.filter_generation;
-        let cancel=self.workspace.filter_cancel.clone();
-        let source=self.workspace.all_rows.clone();let work=source.clone();
-        let scope=key(&self.workspace.location);let query=self.workspace.filter_text.clone();
-        cx.spawn(async move |this,cx|{
-            cx.background_executor().timer(Duration::from_millis(80)).await;
-            if cancel.load(Ordering::Acquire){return}
-            let work_cancel=cancel.clone();
-            let rows=cx.background_spawn(async move {crate::directory_filter::filter_rows(&work,&query,&work_cancel)}).await;
-            this.update(cx,|this,cx|{
-                if !crate::directory_filter::can_publish(cancel.load(Ordering::Acquire), generation, this.workspace.filter_generation, this.workspace.mode==ViewMode::Directory, key(&this.workspace.location)==scope, Arc::ptr_eq(&source,&this.workspace.all_rows)){return}
-                if let Some(rows)=rows {let focus=this.active_workspace_hit().map(|h|h.path).or(focus);this.apply_workspace_rows(rows,focus,false,cx);}
-            }).ok();
-        }).detach();
+    fn schedule_directory_filter(&mut self, focus: Option<String>, cx: &mut Context<Self>) {
+        self.workspace.filter_cancel.store(true, Ordering::Release);
+        self.workspace.filter_cancel = Arc::new(AtomicBool::new(false));
+        self.workspace.filter_generation = self.workspace.filter_generation.wrapping_add(1);
+        let generation = self.workspace.filter_generation;
+        let cancel = self.workspace.filter_cancel.clone();
+        let source = self.workspace.all_rows.clone();
+        let work = source.clone();
+        let scope = key(&self.workspace.location);
+        let query = self.workspace.filter_text.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(80))
+                .await;
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
+            let work_cancel = cancel.clone();
+            let rows = cx
+                .background_spawn(async move {
+                    crate::directory_filter::filter_rows(&work, &query, &work_cancel)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if !crate::directory_filter::can_publish(
+                    cancel.load(Ordering::Acquire),
+                    generation,
+                    this.workspace.filter_generation,
+                    this.workspace.mode == ViewMode::Directory,
+                    key(&this.workspace.location) == scope,
+                    Arc::ptr_eq(&source, &this.workspace.all_rows),
+                ) {
+                    return;
+                }
+                if let Some(rows) = rows {
+                    let focus = this.active_workspace_hit().map(|h| h.path).or(focus);
+                    this.apply_workspace_rows(rows, focus, false, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
-    fn apply_workspace_rows(&mut self,rows:Vec<SearchHitDto>,focus:Option<String>,allocated:bool,cx:&mut Context<Self>) {
+    fn apply_workspace_rows(
+        &mut self,
+        rows: Vec<SearchHitDto>,
+        focus: Option<String>,
+        allocated: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace.rows_epoch = Some((self.workspace.list_generation, self.workspace.filter_generation));
         self.workspace.selected = focus.as_ref().and_then(|p| {
             rows.iter()
                 .position(|h| key(Path::new(&h.path)) == key(Path::new(p)))
@@ -967,17 +1082,30 @@ impl MainWindow {
         }
         cx.notify();
     }
-    fn usage_pending_label(&self)->Option<String> {
-        self.workspace.usage_pending_from.as_ref().map(|old| {
-            let state=if self.workspace.engine_busy {"正在读取新目录"}else if self.scan_node().is_some(){"正在排布新目录"}else{"目录切换未完成"};
-            format!("{state} · 当前画面仍为 {}（暂停图块操作）",display_path(old))
-        })
+    // Only the published scene may interpret pointer/inspector indices. Request
+    // state can already name another directory (or generation) while it builds.
+    fn usage_scene_interactive(&self) -> bool {
+        crate::usage_view::presentation_interactive(
+            self.workspace.usage_pending_from.is_some(),
+            self.workspace.usage_scene.as_ref().map(|s|(s.key.scan,s.key.root)),
+            self.workspace.scan.as_ref().and_then(|scan|self.scan_node().map(|root|(self.usage_scan_identity(scan),root))),
+            )
+    }
+    fn usage_inspector_current(&self,rendered:Option<crate::usage_inspector::ActionKey>)->bool{
+        self.usage_scene_interactive()&&rendered.zip(self.inspector_source()).is_some_and(|(key,source)|self.workspace.inspector.accepts(key,source))
     }
     fn usage_render_scan(&self) -> Option<&Arc<Scan>> {
-        self.workspace.usage_scene_scan.as_ref().or(self.workspace.scan.as_ref())
+        self.workspace
+            .usage_scene_scan
+            .as_ref()
+            .or(self.workspace.scan.as_ref())
     }
     fn usage_scan_identity(&self, scan: &Arc<Scan>) -> usize {
-        crate::indexed_usage::scene_identity(self.workspace.engine_usage, self.workspace.usage_tree_revision, Arc::as_ptr(scan) as usize)
+        crate::indexed_usage::scene_identity(
+            self.workspace.engine_usage,
+            self.workspace.usage_tree_revision,
+            Arc::as_ptr(scan) as usize,
+        )
     }
     fn scan_node(&self) -> Option<usize> {
         self.workspace
@@ -1017,15 +1145,15 @@ impl MainWindow {
         let focus = focus.or_else(|| Some(display_path(&scan.nodes[ix].path)));
         self.workspace.usage_focus = focus.clone();
         self.workspace.status = if scan.is_legacy_entry_truncation() {
-            "占用 · 旧的截断结果，请手动重新扫描".into()
+            "占用  旧的截断结果，请手动重新扫描".into()
         } else if scan.memory_limit_reached {
-            "占用 · 达到内存预算的部分结果".into()
+            "占用  达到内存预算的部分结果".into()
         } else if scan.alloc_failed {
-            "占用 · 系统内存不足，已保留已测部分".into()
+            "占用  系统内存不足，已保留已测部分".into()
         } else if scan.partial {
-            "占用 · 部分结果".into()
+            "占用  部分结果".into()
         } else {
-            format!("占用 · {} 个子项", children.len())
+            format!("占用  {} 个子项", children.len())
         };
         self.set_workspace_rows(rows, focus, scan.logical_generation.is_none(), cx);
         true
@@ -1045,15 +1173,20 @@ impl MainWindow {
                     .map(PathBuf::from)
                     .as_deref(),
             ) {
-                if path.canonicalize().ok().is_none_or(|p| !p.starts_with(&root)) {
+                if path
+                    .canonicalize()
+                    .ok()
+                    .is_none_or(|p| !p.starts_with(&root))
+                {
                     return;
                 }
             }
         }
-        self.workspace.filter_cancel.store(true,Ordering::Release);
-        self.workspace.filter_generation=self.workspace.filter_generation.wrapping_add(1);
+        self.workspace.usage_pending_history=None;self.workspace.usage_pending_direction=0;
+        self.workspace.filter_cancel.store(true, Ordering::Release);
+        self.workspace.filter_generation = self.workspace.filter_generation.wrapping_add(1);
         self.workspace.engine_cancel.store(true, Ordering::Release);
-        self.workspace.engine_busy=false;
+        self.workspace.engine_busy = false;
         // A newer location supersedes an in-flight request. Its completion must
         // not strand the new scope behind the previous scope's busy flag.
         if mode == ViewMode::Usage && self.workspace.engine_usage {
@@ -1085,15 +1218,35 @@ impl MainWindow {
                 .as_ref()
                 .is_some_and(|p| key(Path::new(p)) == key(Path::new(&h.path)))
         });
+        self.workspace.inspector.cancel();self.workspace.usage_facts_open=false;
         self.cancel_path_edit(cx);
         self.dismiss_address_menu(cx);
         self.dismiss_file_menu(cx);
         self.workspace.show_actions = false;
         self.workspace.mode = mode;
         self.workspace.pending_hit = pending;
-        if mode==ViewMode::Usage && key(&self.workspace.location)!=key(&path) && self.workspace.usage_pending_from.is_none() {
-            self.workspace.usage_pending_from=self.workspace.usage_scene.as_ref().and_then(|scene|
-                self.workspace.usage_scene_scan.as_ref().and_then(|scan|scan.nodes.get(scene.key.root)).map(|n|n.path.clone()));
+        if mode == ViewMode::Usage
+            && key(&self.workspace.location) != key(&path)
+            && self.workspace.usage_pending_from.is_none()
+        {
+            self.workspace.usage_pending_from =
+                self.workspace.usage_scene.as_ref().and_then(|scene| {
+                    self.workspace
+                        .usage_scene_scan
+                        .as_ref()
+                        .and_then(|scan| scan.nodes.get(scene.key.root))
+                        .map(|n| n.path.clone())
+                });
+        }
+        if key(&self.workspace.location) != key(&path) {
+            self.workspace.usage_loaded_depth=1;
+            
+            self.workspace.usage_depth_pending=false;
+            self.workspace.usage_more_depth=true;
+            // Keep the ONE bounded verified-page cache across roots. Each request
+            // still reads its authoritative root; expand validates epoch/generation
+            // and every cached directory identity/metrics before using its children.
+            // Clearing here made every Back/Up/down drill cold again.
         }
         self.workspace.location = PathBuf::from(display_path(&path));
         self.workspace.operation = None;
@@ -1105,18 +1258,25 @@ impl MainWindow {
             // Retain only the last published immutable frame, explicitly labelled
             // as the previous directory and non-interactive until atomic handoff.
             if self.workspace.usage_pending_from.is_none() {
-                self.workspace.usage_pending_from=self.workspace.usage_scene.as_ref().and_then(|scene|
-                    self.workspace.usage_scene_scan.as_ref().and_then(|scan|scan.nodes.get(scene.key.root)).map(|n|n.path.clone()));
+                self.workspace.usage_pending_from =
+                    self.workspace.usage_scene.as_ref().and_then(|scene| {
+                        self.workspace
+                            .usage_scene_scan
+                            .as_ref()
+                            .and_then(|scan| scan.nodes.get(scene.key.root))
+                            .map(|n| n.path.clone())
+                    });
             }
-            self.workspace.scan_cancel.store(true,Ordering::Release);
-            self.workspace.scanning=false;
-            self.workspace.active_scan_root=None;
-            self.workspace.scan=None;
+            self.workspace.scan_cancel.store(true, Ordering::Release);
+            self.workspace.scanning = false;
+            self.workspace.active_scan_root = None;
+            self.workspace.scan = None;
             self.workspace.scan_lookup.clear();
             self.workspace.usage_scene_key = None;
-            self.workspace.usage_scene_generation = self.workspace.usage_scene_generation.wrapping_add(1);
-            self.workspace.usage_transition = None;
-            self.workspace.usage_frame.borrow_mut().clear();
+            self.workspace.usage_scene_generation =
+                self.workspace.usage_scene_generation.wrapping_add(1);
+            // Pending input is gated by source identity, not by destroying the
+            // painted frame/motion needed for continuous asynchronous handoff.
             self.workspace.usage_hover = None;
             self.workspace.usage_focus = None;
             self.workspace.pending_hit = None;
@@ -1130,7 +1290,7 @@ impl MainWindow {
         }
         if mode == ViewMode::Usage {
             if !self.show_scanned_directory(focus.clone(), cx) {
-                self.workspace.status = "待扫描 · 只有明确开始才会读取占用".into();
+                self.workspace.status = "待扫描，开始后读取占用".into();
                 self.set_workspace_rows(vec![], None, true, cx);
                 self.load_usage_cache(cx);
             }
@@ -1140,7 +1300,7 @@ impl MainWindow {
         if let Some((rows, cap)) = self.workspace.cache.get(&key(&path)).cloned() {
             self.workspace.listing = false;
             self.workspace.status = format!(
-                "{} 项{} · 已保留目录上下文",
+                "{} 项{}，已保留目录上下文",
                 rows.len(),
                 if cap { "（已达安全上限）" } else { "" }
             );
@@ -1149,16 +1309,10 @@ impl MainWindow {
             return;
         }
         self.workspace.listing = true;
-        self.workspace.status = "读取目录中 · 搜索仍可使用".into();
-        self.workspace.rows.clear();
-        self.workspace.all_rows = Arc::new(vec![]);
-        self.workspace.selected_rows.clear();
-        self.workspace.selected = None;
-        self.workspace.table.update(cx, |t, cx| {
-            t.delegate_mut().hits.clear();
-            t.refresh(cx);
-        });
-        self.preview_active_selection(cx);
+        self.workspace.status = "读取目录中，搜索可用".into();
+        // Keep the complete published table/preview until the matching response.
+        // Its list/filter epoch no longer matches, so all row actions are fenced.
+        self.freeze_preview();
         let cancel = self.workspace.list_cancel.clone();
         let show_hidden = self.workspace.show_hidden;
         cx.spawn(async move |this, cx| {
@@ -1189,7 +1343,7 @@ impl MainWindow {
                         }
                         this.workspace.cache.insert(key(&path), (rows.clone(), cap));
                         this.workspace.status = format!(
-                            "{} 项{} · 选中预览，双击目录进入",
+                            "{} 项{}，双击目录进入",
                             rows.len(),
                             if cap {
                                 "（达到 100000 项安全上限）"
@@ -1204,7 +1358,15 @@ impl MainWindow {
                             this.workspace.rows = rows;
                         }
                     }
-                    Err(e) => this.workspace.status = format!("目录读取失败：{e}"),
+                    Err(e) => {
+                        // A terminal failure publishes an empty, non-actionable scope;
+                        // never leave another directory's rows visible indefinitely.
+                        this.workspace.all_rows = Arc::new(Vec::new());
+                        this.apply_workspace_rows(Vec::new(), None, false, cx);
+                        this.workspace.rows_epoch = None;
+                        this.pause_preview();
+                        this.workspace.status = format!("目录读取失败：{e}");
+                    },
                 };
                 cx.notify();
             })
@@ -1233,6 +1395,45 @@ impl MainWindow {
         } else {
             self.workspace_navigate(route.path, route.mode, route.selected, false, cx);
         }
+    }
+    pub(super) fn native_window_handle(&self) -> AnyWindowHandle {
+        self.workspace.window
+    }
+    pub(super) fn file_navigation_focused(&self, window: &Window, cx: &App) -> bool {
+        self.focus.is_focused(window)
+            || self.table.read(cx).focus_handle(cx).is_focused(window)
+            || self
+                .workspace
+                .table
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+            || self.workspace.usage_map_focus.is_focused(window)
+    }
+    /// Keep file commands out of all editors and IME composition, even when
+    /// an Input action bubbles to the window after handling a keystroke.
+    pub(super) fn text_edit_active(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if crate::interaction_logic::file_commands_blocked(
+            false,
+            false,
+            self.settings_page.is_some()
+                || self.workspace.operation.is_some()
+                || self.workspace.editing_path,
+        ) {
+            return true;
+        }
+        for input in [
+            self.search.clone(),
+            self.workspace.path.clone(),
+            self.workspace.filter_input.clone(),
+        ] {
+            let focused = input.read(cx).focus_handle(cx).is_focused(window);
+            let composing = input.update(cx, |i, cx| i.marked_text_range(window, cx).is_some());
+            if crate::interaction_logic::file_commands_blocked(focused, composing, false) {
+                return true;
+            }
+        }
+        false
     }
     pub(super) fn workspace_up(&mut self, cx: &mut Context<Self>) {
         if self.workspace.scanning {
@@ -1312,6 +1513,8 @@ impl MainWindow {
                     .copied()
             }) {
                 self.select_usage_node(index, true, cx);
+            } else if let Some(hit)=self.active_workspace_hit().filter(|h|h.is_directory){
+                self.workspace_navigate(hit.path.into(),ViewMode::Usage,None,true,cx);
             }
             return;
         }
@@ -1329,7 +1532,7 @@ impl MainWindow {
         }
     }
     pub(in crate::ui) fn workspace_select(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if ix >= self.workspace.rows.len() {
+        if !self.file_rows_current(false) || ix >= self.workspace.rows.len() {
             return;
         }
         self.record_single_selection(false, Some(ix));
@@ -1338,6 +1541,7 @@ impl MainWindow {
         self.preview_active_selection(cx);
     }
     pub(super) fn workspace_move_selection(&mut self, key: ResultNavKey, cx: &mut Context<Self>) {
+        if !self.file_rows_current(false) { return; }
         if let Some(ix) =
             move_result_selection(self.workspace.selected, key, self.workspace.rows.len())
         {
@@ -1349,7 +1553,9 @@ impl MainWindow {
         }
     }
     fn select_usage_node(&mut self, index: usize, enter: bool, cx: &mut Context<Self>) {
-        if self.workspace.usage_pending_from.is_some(){return}
+        if !self.usage_scene_interactive() {
+            return;
+        }
 
         let Some(scan) = self.workspace.scan.as_ref() else {
             return;
@@ -1359,11 +1565,18 @@ impl MainWindow {
         };
         let path = display_path(&n.path);
         let directory = n.directory;
+        if enter && self.workspace.usage_blocked_paths.contains(&key(&n.path)) {
+            self.workspace.scan_status="目录身份存在冲突，保留原汇总且未展开；未选择或合并任何冲突记录".into();
+            cx.notify();return;
+        }
         if self.workspace.engine_usage && enter && directory {
             self.workspace_navigate(PathBuf::from(&path), ViewMode::Usage, None, true, cx);
             return;
         }
         self.workspace.usage_focus = Some(path.clone());
+        self.workspace.usage_scene_selected = Some(index);
+        self.workspace.inspector_pin=None;
+        self.inspector_select(index,cx);
         if let Some(ix) = self
             .workspace
             .rows
@@ -1384,7 +1597,8 @@ impl MainWindow {
             }
             crate::usage_view::Activation::Preview => {
                 // Enter and double-click share this path. A map never executes a file.
-                self.workspace_reveal(cx);
+                // Usage activation must stay on the map. Revealing in Files is
+                // an explicit context-menu action, never an implicit preview step.
                 self.preview_force = Some(ForceState::Show);
                 self.preview_active_selection(cx);
             }
@@ -1414,26 +1628,59 @@ impl MainWindow {
         {
             self.workspace.usage_fixture_seen += 1;
             match command {
-                "depth+" => {self.workspace.usage_depth=(self.workspace.usage_depth+1).min(6);cx.notify();},
-                "depth-" => {self.workspace.usage_depth=self.workspace.usage_depth.saturating_sub(1).max(1);cx.notify();},
-                c if c.starts_with("path:") => self.workspace_navigate(PathBuf::from(&c[5..]),ViewMode::Usage,None,true,cx),
-                c if c.starts_with("directory:") => self.workspace_navigate(PathBuf::from(&c[10..]),ViewMode::Directory,None,true,cx),
+                "depth+" => {
+                    self.adjust_usage_depth(1,cx);
+                }
+                "depth-" => {
+                    self.adjust_usage_depth(-1,cx);
+                }
+                c if c.starts_with("path:") => {
+                    self.workspace_navigate(PathBuf::from(&c[5..]), ViewMode::Usage, None, true, cx)
+                }
+                c if c.starts_with("directory:") => self.workspace_navigate(
+                    PathBuf::from(&c[10..]),
+                    ViewMode::Directory,
+                    None,
+                    true,
+                    cx,
+                ),
                 c if c.starts_with("filter:") => {
-                    let input=self.workspace.filter_input.clone();let value=c[7..].to_string();
-                    let _=self.workspace.window.update(cx,move |_,w,cx|input.update(cx,|i,cx|i.set_value(value,w,cx)));
-                    self.directory_filter_changed(false,cx);
-                },
+                    let input = self.workspace.filter_input.clone();
+                    let value = c[7..].to_string();
+                    let _ = self.workspace.window.update(cx, move |_, w, cx| {
+                        input.update(cx, |i, cx| i.set_value(value, w, cx))
+                    });
+                    self.directory_filter_changed(false, cx);
+                }
+                c if c.starts_with("search:") => {
+                    self.workspace_switch(ViewMode::Search,cx);
+                    let input=self.search.clone();let value=c[7..].to_string();
+                    let _=self.workspace.window.update(cx,move|_,w,cx|input.update(cx,|i,cx|i.set_value(value,w,cx)));
+                }
+                "preview-show" => {
+                    self.preview_force=Some(ForceState::Show);
+                    self.preview_active_selection(cx);cx.notify();
+                }
+                "select-first" if self.workspace.mode == ViewMode::Search => {
+                    self.set_selected(Some(0),cx);
+                    self.table.update(cx,|t,cx|t.set_selected_row(0,cx));cx.notify();
+                }
                 "select-first" => {
                     self.workspace_select(0, cx);
-                    self.workspace.table.update(cx, |t,cx| t.set_selected_row(0,cx));
+                    self.workspace
+                        .table
+                        .update(cx, |t, cx| t.set_selected_row(0, cx));
                     cx.notify();
-                },
+                }
                 "select-last" => {
-                    let ix=self.workspace.rows.len().saturating_sub(1);
+                    let ix = self.workspace.rows.len().saturating_sub(1);
                     self.workspace_select(ix, cx);
-                    self.workspace.table.update(cx, |t,cx| {t.set_selected_row(ix,cx);t.scroll_to_row(ix,cx);});
+                    self.workspace.table.update(cx, |t, cx| {
+                        t.set_selected_row(ix, cx);
+                        t.scroll_to_row(ix, cx);
+                    });
                     cx.notify();
-                },
+                }
                 "refresh-directory" => self.workspace_refresh(cx),
                 "zoom" => self.zoom_usage_center(1.3, cx),
                 "reset" => {
@@ -1450,7 +1697,10 @@ impl MainWindow {
                 }
                 "up" => self.workspace_up(cx),
                 "cancel" => {
-                    if self.workspace.engine_usage {self.cancel_engine_usage(cx);continue;}
+                    if self.workspace.engine_usage {
+                        self.cancel_engine_usage(cx);
+                        continue;
+                    }
                     self.workspace.scan_cancel.store(true, Ordering::Release);
                     self.workspace.scan_status = "正在取消；已测部分将保留".into();
                     cx.notify();
@@ -1460,16 +1710,45 @@ impl MainWindow {
             eprintln!("usage_fixture command={command}");
         }
     }
-    fn cancel_engine_usage(&mut self,cx:&mut Context<Self>) {
-        self.workspace.engine_cancel.store(true,Ordering::Release);
-        self.workspace.scan_generation=self.workspace.scan_generation.wrapping_add(1);
-        self.workspace.engine_busy=false;self.workspace.engine_checked=false;
-        if self.workspace.usage_pending_from.is_some() {
-            self.workspace.scan=None;self.workspace.scan_lookup.clear();
-            self.workspace.usage_scene_key=None;
-            self.workspace.usage_scene_generation=self.workspace.usage_scene_generation.wrapping_add(1);
+    fn cancel_engine_usage(&mut self, cx: &mut Context<Self>) {
+        let pending=self.workspace.usage_depth_pending || self.workspace.usage_pending_from.is_some();
+        self.workspace.usage_depth_pending=false;
+        self.workspace.usage_pending_direction=0;
+        
+        self.workspace.engine_cancel.store(true, Ordering::Release);
+        self.workspace.scan_generation = self.workspace.scan_generation.wrapping_add(1);
+        self.workspace.engine_busy = false;
+        self.workspace.engine_checked = false;
+        if pending {
+            if let Some(history)=self.workspace.usage_pending_history.take(){self.workspace.history=history;}
+            crate::usage_view::cancel_pending_layout(&mut self.workspace.usage_scene_generation);
+            if let (Some(scan),Some(scene))=(self.workspace.usage_scene_scan.clone(),self.workspace.usage_scene.clone()) {
+                if let Ok(lookup)=fallible_usage_lookup(&scan) {
+                    self.workspace.location=scan.nodes[scene.key.root].path.clone();
+                    self.workspace.usage_focus=self.workspace.usage_scene_selected.and_then(|i|scan.nodes.get(i)).map(|n|display_path(&n.path));
+                    self.workspace.scan_lookup=lookup;
+                    self.workspace.scan=Some(scan.clone());
+                    self.workspace.usage_tree_revision=scene.key.scan;
+                    self.workspace.usage_scene_key=Some(scene.key.clone());
+                    self.workspace.usage_loaded_depth=self.workspace.usage_scene_loaded_depth;
+                    self.workspace.usage_more_depth=self.workspace.usage_scene_more_depth;
+                    self.workspace.usage_blocked_paths=self.workspace.usage_scene_blocked_paths.clone();
+                    self.workspace.engine_generation=scan.logical_generation;
+                    self.workspace.engine_next=self.workspace.usage_scene_next;
+                    self.workspace.usage_pending_from=None;
+                    self.update_location_input(cx);
+                    self.show_scanned_directory(self.workspace.usage_focus.clone(),cx);
+                }
+            } else {
+                self.workspace.scan=None;
+                self.workspace.scan_lookup.clear();
+                self.workspace.usage_scene_key=None;
+                self.workspace.usage_loaded_depth=1;
+                self.workspace.usage_blocked_paths.clear();
+            }
         }
-        self.workspace.scan_status="已取消索引目录请求；刷新可重试".into();cx.notify();
+        self.workspace.scan_status = "已取消索引目录请求；刷新可重试".into();
+        cx.notify();
     }
     fn select_engine_usage_source(&mut self, cx: &mut Context<Self>) {
         self.workspace.scan_cancel.store(true, Ordering::Release);
@@ -1477,14 +1756,14 @@ impl MainWindow {
         self.workspace.active_scan_root = None;
         self.workspace.scan_generation = self.workspace.scan_generation.wrapping_add(1);
         self.workspace.engine_usage = true;
-        self.workspace.usage_pending_from=None;
+        self.workspace.usage_pending_from = None;
         self.workspace.engine_checked = false;
         self.workspace.engine_busy = false;
         self.workspace.engine_generation = None;
         let old = self.workspace.scan.take();
         let lookup = std::mem::take(&mut self.workspace.scan_lookup);
         self.workspace.usage_scene = None;
-            self.workspace.usage_scene_scan = None;
+        self.workspace.usage_scene_scan = None;
         self.workspace.usage_scene_key = None;
         self.workspace.usage_transition = None;
         self.workspace.usage_scene_generation += 1;
@@ -1497,19 +1776,49 @@ impl MainWindow {
         self.load_engine_usage(false, cx);
         cx.notify();
     }
+    pub(super) fn adjust_usage_depth(&mut self, step:isize,cx:&mut Context<Self>) {
+        let target=(self.workspace.usage_depth as isize+step).clamp(1,6) as usize;
+        if target==self.workspace.usage_depth{return}
+        self.workspace.usage_depth=target;
+        self.session.update(cx,|session,cx|{session.prefs.usage_preferred_depth=target;crate::session::persist_prefs(session.prefs.clone(),cx);});
+        if self.workspace.scanning || !self.workspace.engine_usage || (target<=self.workspace.usage_loaded_depth && !self.workspace.engine_busy){
+            self.workspace.usage_depth_pending=false;cx.notify();return;
+        }
+        self.workspace.usage_depth_pending=true;
+        self.workspace.engine_cancel.store(true,Ordering::Release);
+        self.workspace.engine_busy=false;
+        self.load_engine_usage(false,cx);
+        cx.notify();
+    }
+    fn refresh_usage_volume(&mut self,cx:&mut Context<Self>){
+        if self.workspace.mode != ViewMode::Usage{return}
+        let Some(query)=self.workspace.usage_volume.begin(&self.workspace.location)else{return};
+        let path=query.path.clone();
+        let worker=cx.background_executor().spawn(async move{crate::usage_volume::query(&path)});
+        cx.spawn(async move|this,cx|{let result=worker.await;let _=this.update(cx,|this,cx|{this.workspace.usage_volume.finish(query,result);cx.notify();});}).detach();
+    }
     fn load_engine_usage(&mut self, next: bool, cx: &mut Context<Self>) {
+        self.refresh_usage_volume(cx);
         if self.workspace.engine_busy {
             return;
         }
         self.workspace.engine_busy = true;
         self.workspace.engine_cancel.store(true, Ordering::Release);
-        self.workspace.engine_cancel=Arc::new(AtomicBool::new(false));
-        let cancel=self.workspace.engine_cancel.clone();
+        self.workspace.engine_cancel = Arc::new(AtomicBool::new(false));
+        let cancel = self.workspace.engine_cancel.clone();
         self.workspace.scan_generation = self.workspace.scan_generation.wrapping_add(1);
+        let request_started=std::time::Instant::now();
         let request_generation = self.workspace.scan_generation;
-        if std::env::var_os("FINDX_NATIVE_USAGE_TRACE").is_some() { eprintln!("usage_request start token={} revision={}", request_generation, self.workspace.usage_tree_revision); }
+        if std::env::var_os("FINDX_NATIVE_USAGE_TRACE").is_some() {
+            eprintln!(
+                "usage_request start token={} revision={}",
+                request_generation, self.workspace.usage_tree_revision
+            );
+        }
         let path = display_path(&self.workspace.location);
         let requested = self.workspace.location.clone();
+        let requested_depth=self.workspace.usage_depth.max(self.workspace.usage_loaded_depth);
+        let page_cache=self.workspace.usage_page_cache.clone();
         let session = self.session.read(cx);
         let ipc = session.ipc.clone();
         let endpoint = session.endpoint.clone();
@@ -1558,11 +1867,28 @@ impl MainWindow {
                     };
                     if let Some(next)=guard.follow(&page)? {
                         stamp=Some((page.epoch,page.generation));cursor=Some(next);
-                    } else {return Ok((page,guard.skipped()))}
+                    } else {
+                        let tree=crate::indexed_depth::expand(&page,requested.clone(),requested_depth,page_cache.clone(),cancel.clone(),|path,after,stamp| {
+                            let ipc=ipc.clone();let endpoint=endpoint.clone();let cancel=cancel.clone();
+                            async move {
+                                match ipc.request_cancellable(endpoint,findx2_ipc::IpcRequest::UsageChildren{
+                                    path:display_path(&path),expected:Some(stamp),after,max_bytes:48*1024,
+                                },cancel).await.map_err(|_|"usage descendant request cancelled".to_string())?? {
+                                    findx2_ipc::IpcResponse::UsageChildrenResult{page}=>Ok(page),
+                                    findx2_ipc::IpcResponse::Error{message}=>Err(message),
+                                    _=>Err("incompatible descendant response".into()),
+                                }
+                            }
+                        }).await?;
+                        return Ok((page,guard.skipped(),tree))
+                    }
                 }
             }
             .await;
             this.update(cx, |this, cx| {
+                if std::env::var_os("FINDX_NATIVE_USAGE_TRACE").is_some() {
+                    eprintln!("usage_completion token={} current={} requested={:?} current_path={:?} cancelled={} error={:?} elapsed_ms={}",request_generation,this.workspace.scan_generation,requested,this.workspace.location,cancel.load(Ordering::Acquire),result.as_ref().err(),request_started.elapsed().as_millis());
+                }
                 if !crate::indexed_usage::request_is_current(
                     this.workspace.scan_generation, request_generation,
                     &this.workspace.location, &requested,
@@ -1575,16 +1901,20 @@ impl MainWindow {
                 {
                     return;
                 }
-                let (page,skipped_empty) = match result {
+                let (page,skipped_empty,tree) = match result {
                     Ok(p) => p,
                     Err(e) => {
-                        if e.contains("index loading; usage initializing") {
-                            this.workspace.engine_checked = true;
+                        // A terminal error ends pending navigation too. Reuse the
+                        // cancellation rollback to restore the whole last published
+                        // scene/path/inspector, then retain the genuine error.
+                        if this.workspace.usage_pending_from.is_some() || this.workspace.usage_depth_pending {
+                            this.cancel_engine_usage(cx);
                         }
                         this.workspace.scan_stale = !e.contains("不支持");
-                        this.workspace.scan_status = e;
-                        // Do not hammer a busy/failed engine every two seconds.
-                        // Explicit refresh or navigation can retry.
+                        this.workspace.scan_status = format!("目录读取失败：{e}");
+                        if std::env::var_os("FINDX_NATIVE_USAGE_TRACE").is_some() {
+                            eprintln!("usage_navigation_failed requested={:?} error={}",requested,e);
+                        }
                         this.workspace.engine_checked = false;
                         cx.notify();
                         return;
@@ -1593,10 +1923,10 @@ impl MainWindow {
                 this.workspace.engine_checked = true;
                 // Health can change without a namespace generation: never hide
                 // journal/backfill failures behind the unchanged-tree fast path.
-                let degraded = page.watch_error.is_some() || page.metadata_error.is_some();
+                let degraded = page.watch_error.is_some() || page.metadata_error.is_some() || tree.issue.is_some();
                 this.workspace.scan_stale = degraded;
                 this.workspace.scan_status = format!(
-                    "索引逻辑 · {} · 元数据待验 {} · {} · g{} · {}",
+                    "索引逻辑\n{}\n元数据待验 {}\n{}\ng{}\n{}",
                     if page.next.is_some() {
                         "当前分页，尚有子项"
                     } else {
@@ -1617,27 +1947,29 @@ impl MainWindow {
                 }
                 this.workspace.engine_generation = Some((page.epoch, page.generation));
                 this.workspace.engine_next = page.next;
-                // Generation/unknown ticks must update the badge only. Replacing
-                // the scan graph or clearing the scene key rebuilds the treemap
-                // and flashes the whole page while totals stay the same.
-                if !next
-                    && this.workspace.scan.as_ref().is_some_and(|s| {
-                        crate::indexed_usage::same_layout(s, &requested, &page)
-                    })
-                {
-                    if let Some(scan) = this.workspace.scan.as_mut() {
-                        if let Some(scan) = Arc::get_mut(scan) {
-                            crate::indexed_usage::patch_metrics(scan, &page);
-                        } else {
-                            let mut owned = (**scan).clone();
-                            crate::indexed_usage::patch_metrics(&mut owned, &page);
-                            *scan = Arc::new(owned);
-                        }
+                let published_depth=this.workspace.usage_depth.min(tree.max_depth).max(1);
+                this.workspace.usage_loaded_depth=tree.max_depth;
+                this.workspace.usage_more_depth=tree.more||tree.limited;
+                this.workspace.usage_blocked_paths=tree.blocked.iter().map(|p|key(p)).collect();
+                this.workspace.scan_status.push_str(&format!("\n显示{} / 请求{}\n{}节点\n{}次读取/{}缓存{}",published_depth,this.workspace.usage_depth,tree.scan.nodes.len(),tree.requests,tree.cache_hits,if tree.limited {"\n后代数据未完整（有界预算/错误）"} else {""}));
+                if let Some(issue)=&tree.issue {this.workspace.scan_status.push_str(&format!("\n{issue}"));}
+                if std::env::var_os("FINDX_NATIVE_USAGE_TRACE").is_some(){eprintln!("usage_depth_data requested={} published={} max={} nodes={} reads={} hits={} limited={} more={}",this.workspace.usage_depth,published_depth,tree.max_depth,tree.scan.nodes.len(),tree.requests,tree.cache_hits,tree.limited,tree.more);}
+                // Compare the ENTIRE bounded graph; periodic root-page polling must
+                // not collapse grandchildren or conceal their metric changes.
+                if !next && this.workspace.scan.as_ref().is_some_and(|old|crate::indexed_depth::same_geometry(old,&tree.scan)) {
+                    let interactive=this.usage_scene_interactive();
+                    this.workspace.scan=Some(Arc::new(tree.scan));
+                    if interactive {
+                        this.workspace.usage_scene_scan=this.workspace.scan.clone();
+                        this.workspace.usage_scene_loaded_depth=this.workspace.usage_loaded_depth;
+                        this.workspace.usage_scene_more_depth=this.workspace.usage_more_depth;
+                        this.workspace.usage_scene_blocked_paths=this.workspace.usage_blocked_paths.clone();
                     }
-                    cx.notify();
-                    return;
+                    
+                    this.workspace.usage_depth_pending=false;
+                    cx.notify();return;
                 }
-                let scan = crate::indexed_usage::scan_from_page(&page, requested.clone());
+                let scan=tree.scan;
                 match fallible_usage_lookup(&scan) {
                     Ok(lookup) => this.workspace.scan_lookup = lookup,
                     Err(e) => {
@@ -1647,6 +1979,7 @@ impl MainWindow {
                     }
                 }
                 this.workspace.usage_tree_revision = this.workspace.usage_tree_revision.wrapping_add(1);
+                this.workspace.usage_depth_pending=true;
                 this.workspace.scan = Some(Arc::new(scan));
                 this.workspace.scan_stale = degraded;
                 this.workspace.usage_scene_key = None;
@@ -1654,7 +1987,7 @@ impl MainWindow {
                 let focus = this.workspace.usage_focus.clone();
                 this.show_scanned_directory(focus, cx);
                 this.workspace.status =
-                    "索引逻辑大小 · 非实际占用 · 实时增量/元数据状态见下方".into();
+                    "索引逻辑大小，非实际占用；时效及元数据状态见下方".into();
                 cx.notify();
             })
             .ok();
@@ -1727,10 +2060,10 @@ impl MainWindow {
         .detach();
     }
     pub(super) fn start_workspace_scan(&mut self, force: bool, cx: &mut Context<Self>) {
-        self.workspace.filter_cancel.store(true,Ordering::Release);
-        self.workspace.filter_generation=self.workspace.filter_generation.wrapping_add(1);
+        self.workspace.filter_cancel.store(true, Ordering::Release);
+        self.workspace.filter_generation = self.workspace.filter_generation.wrapping_add(1);
         self.workspace.engine_cancel.store(true, Ordering::Release);
-        self.workspace.engine_busy=false;
+        self.workspace.engine_busy = false;
         if self.workspace.op_busy || self.file_actions.busy || self.workspace.scanning {
             return;
         }
@@ -1780,7 +2113,7 @@ impl MainWindow {
         self.workspace.active_scan_root = Some(path.clone());
         self.workspace.progress = job.progress.clone();
         self.workspace.scanning = true;
-        self.workspace.scan_status = "扫描当前目录 · 搜索可用 · 不跟随链接/挂载".into();
+        self.workspace.scan_status = "扫描当前目录  搜索可用  不跟随链接/挂载".into();
         self.workspace.scan_stale = false;
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -1953,25 +2286,33 @@ impl MainWindow {
     }
 
     pub(super) fn workspace_footer_label(&self) -> String {
-        let detail=self.workspace_scan_status();
+        let detail = self.workspace_scan_status();
+        if self.workspace.engine_usage && self.workspace.scan_status.starts_with("目录读取失败：") {
+            return if self.workspace.engine_busy{"上次目录读取失败，正在重试；详情保留诊断"}else{"目录读取失败，保留原画面；详见提示"}.into();
+        }
         if self.workspace.engine_usage {
-            crate::footer_status::compact_usage(&detail,
-                self.workspace.scan.as_ref().map(|s|s.unknown),
-                self.workspace.scanning,self.workspace.scan_stale)
-        } else {detail}
+            crate::footer_status::compact_usage(
+                &detail,
+                self.workspace.scan.as_ref().map(|s| s.unknown),
+                self.workspace.scanning,
+                self.workspace.scan_stale,
+            )
+        } else {
+            detail
+        }
     }
 
     pub(super) fn workspace_scan_status(&self) -> String {
         if self.workspace.scanning {
             format!(
-                "后台扫描 · {} 路径 · {} 目录 · 已测 {} · 总量未知",
+                "后台扫描  {} 路径  {} 目录  已测 {}  总量未知",
                 self.workspace.progress.entries.load(Ordering::Relaxed),
                 self.workspace.progress.directories.load(Ordering::Relaxed),
                 disk_usage::format_bytes(self.workspace.progress.allocated.load(Ordering::Relaxed))
             )
         } else if self.workspace.scan_stale {
             format!(
-                "{} · {}",
+                "{}\n{}",
                 if self.workspace.engine_usage {
                     "索引可能滞后"
                 } else {
@@ -2202,7 +2543,8 @@ impl MainWindow {
             .flex_shrink_0()
             .cursor_col_resize()
             .bg(tokens.border_soft)
-            .hover(|s| s.bg(tokens.accent))
+            // Keep the generous resize hit target, not a full-height blue stripe.
+            .hover(|s| s.bg(tokens.border_soft.opacity(0.75)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, w, cx| {
@@ -2224,29 +2566,40 @@ impl MainWindow {
             cx.notify();
         }
     }
-    pub(super) fn finish_preview_resize(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn finish_preview_resize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.preview_resize.take().is_some() {
-            let handle = self.workspace.window;
-            let _ = handle.update(cx, |_, w, _| crate::ui::chrome::release_pointer(w));
+            // Use the live event window: re-entering the same WindowHandle here
+            // can fail while it is already borrowed, leaking native capture.
+            crate::ui::chrome::release_pointer(window);
             let prefs = self.session.read(cx).prefs.clone();
             crate::session::persist_prefs(prefs, cx);
             cx.notify();
         }
     }
-    pub(super) fn render_workspace_center(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_workspace_center(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match self.workspace.mode {
             ViewMode::Search => div()
                 .id("search-table-context")
                 .size_full()
-                .child(
+                .child(crate::ui::native_focus::table_frame(
                     DataTable::new(&self.table)
+                        .focus_ring(false)
                         .scrollbar_visible(
                             true,
                             self.table.read(cx).delegate().widths.iter().sum::<f32>()
                                 > self.table_viewport_width + 0.5,
                         )
                         .bordered(false),
-                )
+                    self.table_navigation_focus.visible(
+                        self.table.read(cx).focus_handle(cx).is_focused(window),
+                        window.is_window_active(),
+                    ),
+                    Self::tokens(cx).text_tertiary,
+                ))
                 .context_menu({
                     let owner = cx.weak_entity();
                     move |menu, window, cx| {
@@ -2258,7 +2611,7 @@ impl MainWindow {
                     }
                 })
                 .into_any_element(),
-            ViewMode::Directory => self.render_directory_table(cx),
+            ViewMode::Directory => self.render_directory_table(window, cx),
             ViewMode::Usage => self.render_workspace_usage(cx).into_any_element(),
         }
     }

@@ -50,6 +50,10 @@ pub struct FrnIdxMap {
 }
 
 impl FrnIdxMap {
+    /// Read-only backing-capacity diagnostic; hash table allocator overhead is not exact.
+    pub fn memory_capacity_stats(&self) -> serde_json::Value {
+        serde_json::json!({"sorted_len":self.sorted.len(),"sorted_capacity":self.sorted.capacity(),"sorted_element_bytes":std::mem::size_of::<ScopedIdentity>(),"sorted_capacity_bytes":self.sorted.capacity()*std::mem::size_of::<ScopedIdentity>(),"overlay_len":self.overlay.len(),"overlay_capacity":self.overlay.capacity(),"overlay_allocation_bytes":"not measured"})
+    }
     pub fn new() -> Self {
         Self::default()
     }

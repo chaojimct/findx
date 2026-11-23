@@ -126,6 +126,96 @@ pub struct Scene {
     pub tiles: Vec<SceneTile>,
     pub layout_elapsed: std::time::Duration,
     pub worth_a_look: Vec<(String, String, u64)>,
+    // Immutable bounded adapter, not a filesystem/IPC handle. Retain it so the
+    // FIRST paint at a new canvas size can genuinely reflow, not stretch an old
+    // screenshot or wait for another asynchronous data/scene publication.
+    layout_source: Option<std::sync::Arc<LayoutSource>>,
+}
+#[derive(Clone, Debug)]
+struct LayoutSource {
+    tree: crate::disktree::tree::Node,
+    address: std::collections::HashMap<Vec<usize>, (TileKey, crate::disktree::classify::Category)>,
+    root: SceneTile,
+}
+
+/// Presentation hints come only from the complete lexical directory path.
+/// Nearest explicitly named ancestor wins; files inherit their directory. Do
+/// not infer from whichever children happened to fit a page/depth/node budget.
+/// No filesystem canonicalization, identity rewrite, or reclaimability claim.
+pub fn category_of_path(
+    path: &std::path::Path,
+    directory: bool,
+) -> crate::disktree::classify::Category {
+    use crate::disktree::classify::{Category, category_of_name};
+    let path = path.to_string_lossy().replace('\\', "/");
+    let device = path
+        .strip_prefix("//?/")
+        .or_else(|| path.strip_prefix("//./"));
+    let (text, unc) = match device {
+        Some(text)
+            if text
+                .get(..4)
+                .is_some_and(|p| p.eq_ignore_ascii_case("UNC/")) =>
+        {
+            (&text[4..], true)
+        }
+        Some(text) => (text, false),
+        None => (path.as_str(), path.starts_with("//")),
+    };
+    // A UNC server/share is a volume prefix, not an ancestor directory hint.
+    let skip = if unc { 2 } else { 0 };
+    let mut parts = Vec::new();
+    for part in text.split('/').filter(|p| !p.is_empty()).skip(skip) {
+        match part {
+            "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    if !directory {
+        parts.pop();
+    }
+    let mut category = Category::Other;
+    for part in parts {
+        if let Some(named) = category_of_name(part) {
+            category = named;
+        }
+    }
+    category
+}
+
+impl Scene {
+    /// A detail/viewport change can lay out the SAME immutable bounded adapter.
+    /// Never reuse it for a new data revision, root or topology depth.
+    pub fn relayout(&self, key: SceneKey) -> Option<Self> {
+        if key.scan!=self.key.scan || key.root!=self.key.root || key.depth!=self.key.depth {return None;}
+        self.layout_source.as_ref().map(|source|layout_scene(source.clone(),key,self.worth_a_look.clone()))
+    }
+    /// Cached immutable topology + real layout at the actual canvas viewport.
+    /// The same returned tiles must supply BOTH paint and pointer hitboxes.
+    pub fn reflow(&self, width: u32, height: u32) -> Self {
+        if self.key.width == width && self.key.height == height {
+            return self.clone();
+        }
+        let mut key = self.key.clone();
+        key.width = width;
+        key.height = height;
+        match &self.layout_source {
+            Some(source) => layout_scene(source.clone(), key, self.worth_a_look.clone()),
+            None => Self {
+                key,
+                viewport: Rect {
+                    w: width as f32,
+                    h: height as f32,
+                    ..Default::default()
+                },
+                tiles: vec![],
+                ..self.clone()
+            },
+        }
+    }
 }
 /// Greedily choose each short-side row by worst aspect ratio; zero weights never produce NaN.
 #[cfg(test)]
@@ -228,10 +318,12 @@ impl From<crate::disktree::treemap::Rect> for Rect {
 /// budget. Others only represents a genuine leftover tail of already-attached
 /// smaller children; unread/unknown space is never invented as measured area.
 pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
+    build_scene_impl(scan, key, scan.logical_generation.is_none())
+}
+fn build_scene_impl(scan: &Scan, key: SceneKey, classify_reclaim: bool) -> Scene {
     use crate::disktree::{
         classify,
-        tree::{Metric, Node as TreeNode, NodeKind as Kind},
-        treemap::{self, LayoutOptions, TileKind},
+        tree::{Node as TreeNode, NodeKind as Kind},
     };
     use std::collections::HashMap;
     let started = std::time::Instant::now();
@@ -248,6 +340,7 @@ pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
             tiles: vec![],
             layout_elapsed: started.elapsed(),
             worth_a_look: vec![],
+            layout_source: None,
         };
     }
     let mut address = HashMap::<Vec<usize>, (TileKey, classify::Category)>::new();
@@ -366,23 +459,32 @@ pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
         let more = attach_children(scan, id, node, &mut path, &mut address, &mut budget, false);
         expandable.extend(more);
     }
-    classify::classify(&mut tree);
+    // Logical scenes immediately stamp every category from the complete path
+    // below and never expose reclaimability. Do not first walk/parallel-classify
+    // the same tree for inferred sibling categories/reclaim reasons we discard.
+    if classify_reclaim { classify::classify(&mut tree); }
     fn stamp(
-        node: &TreeNode,
+        node: &mut TreeNode,
         crumbs: &mut Vec<usize>,
         address: &mut HashMap<Vec<usize>, (TileKey, classify::Category)>,
+        scan: &Scan,
     ) {
         if let Some((key, class)) = address.get_mut(crumbs) {
+            node.category = match *key {
+                TileKey::Node(id) => {
+                    category_of_path(&scan.nodes[id].path, scan.nodes[id].directory)
+                }
+                TileKey::Other(_) => classify::Category::Other,
+            };
             *class = node.category;
-            let _ = key;
         }
-        for (i, child) in node.children.iter().enumerate() {
+        for (i, child) in node.children.iter_mut().enumerate() {
             crumbs.push(i);
-            stamp(child, crumbs, address);
+            stamp(child, crumbs, address, scan);
             crumbs.pop();
         }
     }
-    stamp(&tree, &mut Vec::new(), &mut address);
+    stamp(&mut tree, &mut Vec::new(), &mut address, scan);
     let mut worth = Vec::new();
     fn collect_reclaim(node: &TreeNode, worth: &mut Vec<(String, String, u64)>) {
         if let Some(reason) = node.reclaim {
@@ -403,21 +505,7 @@ pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
     worth.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
     worth.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
     worth.truncate(8);
-    let detail = key.detail.max(1) as f32;
-    let options = LayoutOptions {
-        max_depth: key.depth.clamp(1, 6) as u32,
-        max_children: 96,
-        ..Default::default()
-    };
-    let layouts = treemap::layout(
-        &tree,
-        &[],
-        treemap::Rect::new(0., 0., viewport.w * detail, viewport.h * detail),
-        Metric::Bytes,
-        &options,
-    );
-    let mut tiles = Vec::with_capacity(layouts.len().min(1200) + 1);
-    tiles.push(SceneTile {
+    let root = SceneTile {
         key: TileKey::Node(key.root),
         rect: viewport,
         depth: 0,
@@ -426,7 +514,51 @@ pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
         header: None,
         category: scan.nodes[key.root].category,
         class: tree.category,
+    };
+    let source = std::sync::Arc::new(LayoutSource {
+        tree,
+        address,
+        root,
     });
+    layout_scene(source, key, worth)
+}
+
+fn layout_scene(
+    source: std::sync::Arc<LayoutSource>,
+    key: SceneKey,
+    worth: Vec<(String, String, u64)>,
+) -> Scene {
+    use crate::disktree::{
+        classify,
+        tree::Metric,
+        treemap::{self, LayoutOptions, TileKind},
+    };
+    let started = std::time::Instant::now();
+    let viewport = Rect {
+        x: 0.,
+        y: 0.,
+        w: key.width as f32,
+        h: key.height as f32,
+    };
+    let tree = &source.tree;
+    let address = &source.address;
+    let detail = key.detail.max(1) as f32;
+    let options = LayoutOptions {
+        max_depth: key.depth.clamp(1, 6) as u32,
+        max_children: 96,
+        ..Default::default()
+    };
+    let layouts = treemap::layout(
+        tree,
+        &[],
+        treemap::Rect::new(0., 0., viewport.w * detail, viewport.h * detail),
+        Metric::Bytes,
+        &options,
+    );
+    let mut tiles = Vec::with_capacity(layouts.len().min(1200) + 1);
+    let mut root = source.root.clone();
+    root.rect = viewport;
+    tiles.push(root);
     for tile in layouts {
         let (tile_key, class) = match &tile.kind {
             TileKind::Node { crumbs } => address
@@ -442,7 +574,11 @@ pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
             }
         };
         let node = tree.resolve(tile.crumbs());
-        let class = node.map(|n| n.category).unwrap_or(class);
+        let class = if matches!(tile.kind, TileKind::Others { .. }) {
+            classify::Category::Other
+        } else {
+            node.map(|n| n.category).unwrap_or(class)
+        };
         let bytes = match &tile.kind {
             TileKind::Others { count, .. } => {
                 let mut weights = node
@@ -462,8 +598,7 @@ pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
                     .fold(0u64, u64::saturating_add)
             }
             _ => match tile_key {
-                TileKey::Node(i) => scan.weight(&scan.nodes[i]),
-                TileKey::Other(_) => node.map_or(0, |n| n.bytes),
+                TileKey::Node(_) | TileKey::Other(_) => node.map_or(0, |n| n.bytes),
             },
         };
         let tile_key = match tile_key {
@@ -491,6 +626,7 @@ pub fn build_scene(scan: &Scan, key: SceneKey) -> Scene {
         tiles,
         layout_elapsed: started.elapsed(),
         worth_a_look: worth,
+        layout_source: Some(source),
     }
 }
 
@@ -928,6 +1064,69 @@ pub enum SemanticAction {
     Enter(usize),
     Up,
 }
+/// The navigation root is the requested filesystem location, not the root of
+/// the currently materialized (possibly paginated) indexed-usage subtree.
+pub fn wheel_boundary(
+    steps: f32,
+    scale: f32,
+    ceiling: f32,
+    child: Option<usize>,
+    has_parent: bool,
+) -> Option<SemanticAction> {
+    if !steps.is_finite() || !scale.is_finite() {
+        return None;
+    }
+    if steps > 0. && scale >= ceiling - 0.01 {
+        child.map(SemanticAction::Enter)
+    } else if steps < 0. && scale <= 1.001 && has_parent {
+        Some(SemanticAction::Up)
+    } else {
+        None
+    }
+}
+#[cfg(test)]
+mod subtree_wheel_tests {
+    use super::*;
+    #[test]
+    fn subtree_root_can_go_up_and_real_root_cannot() {
+        assert_eq!(
+            wheel_boundary(-1., 1., 4., None, true),
+            Some(SemanticAction::Up)
+        );
+        assert_eq!(wheel_boundary(-1., 1., 4., None, false), None);
+        assert_eq!(wheel_boundary(-1., 2., 4., None, true), None);
+        assert_eq!(
+            wheel_boundary(1., 4., 4., Some(8), true),
+            Some(SemanticAction::Enter(8))
+        );
+        assert_eq!(wheel_boundary(1., 4., 4., None, true), None);
+    }
+    #[test]
+    fn real_wheel_intent_and_gesture_gate_are_symmetric_at_subtree_edges() {
+        for (dy, child, expected) in [
+            (3., Some(8), SemanticAction::Enter(8)),
+            (-3., None, SemanticAction::Up),
+        ] {
+            let (_, dy) = normalized_wheel(0., dy, true);
+            let WheelIntent::Zoom { steps } = wheel_intent(0., dy, false, false, false, false)
+            else {
+                panic!()
+            };
+            let boundary = wheel_boundary(steps, 1., 1., child, true);
+            let mut gate = WheelGate::default();
+            let now = std::time::Instant::now();
+            assert_eq!(gate.evaluate(now, steps, boundary), None);
+            assert_eq!(
+                gate.evaluate(now + std::time::Duration::from_millis(200), steps, boundary),
+                Some(expected)
+            );
+            assert_eq!(
+                gate.evaluate(now + std::time::Duration::from_millis(220), steps, boundary),
+                None
+            );
+        }
+    }
+}
 #[derive(Default)]
 pub struct WheelGate {
     armed: Option<(SemanticAction, std::time::Instant, f32)>,
@@ -942,8 +1141,11 @@ impl WheelGate {
         steps: f32,
         boundary: Option<SemanticAction>,
     ) -> Option<SemanticAction> {
+        self.evaluate_input(now,steps,boundary,false)
+    }
+    pub fn evaluate_input(&mut self,now:std::time::Instant,steps:f32,boundary:Option<SemanticAction>,discrete:bool)->Option<SemanticAction>{
         if self.last_switch.is_some_and(|t| {
-            now.saturating_duration_since(t) < std::time::Duration::from_millis(450)
+            now.saturating_duration_since(t) < std::time::Duration::from_millis(if discrete {160}else{450})
         }) {
             self.armed = None;
             return None;
@@ -959,7 +1161,7 @@ impl WheelGate {
                         < std::time::Duration::from_millis(1400) =>
             {
                 let total = total + steps.abs();
-                if now.saturating_duration_since(started) >= std::time::Duration::from_millis(170)
+                if now.saturating_duration_since(started) >= std::time::Duration::from_millis(if discrete {0}else{170})
                     && total >= 1.3
                 {
                     self.armed = None;
@@ -1287,12 +1489,388 @@ mod indexed_logical_tests {
 
 /// Layout the bounded geometry once to the maximum UI depth. Depth +/- only
 /// changes visibility, so existing tile rectangles and the published scene stay put.
-pub const PRESENTATION_DEPTH:usize=6;
-pub fn visible_at_depth(tile_depth:usize,depth:usize)->bool {tile_depth>0 && tile_depth<=depth.clamp(1,PRESENTATION_DEPTH)}
-pub fn claim_layout(inflight:&mut bool)->bool {if *inflight {false}else{*inflight=true;true}}
-pub fn finish_layout(inflight:&mut bool,issued:u64,current:u64)->bool {*inflight=false;issued==current}
-#[cfg(test)] mod scene_lifecycle_regressions {
+pub const PRESENTATION_DEPTH: usize = 6;
+pub fn visible_at_depth(tile_depth: usize, depth: usize) -> bool {
+    tile_depth > 0 && tile_depth <= depth.clamp(1, PRESENTATION_DEPTH)
+}
+pub fn claim_layout(inflight: &mut bool) -> bool {
+    if *inflight {
+        false
+    } else {
+        *inflight = true;
+        true
+    }
+}
+pub fn finish_layout(inflight: &mut bool, issued: u64, current: u64) -> bool {
+    *inflight = false;
+    issued == current
+}
+#[cfg(test)]
+mod scene_lifecycle_regressions {
+    use super::*;
+    #[test]
+    fn depth_visibility_does_not_mutate_geometry_or_need_a_new_key() {
+        let key = SceneKey {
+            scan: 1,
+            root: 0,
+            depth: PRESENTATION_DEPTH,
+            width: 900,
+            height: 600,
+            detail: 1,
+        };
+        let before = key.clone();
+        for depth in [3, 4, 2, 6, 1, 3] {
+            assert!(visible_at_depth(1, depth));
+            assert!(!visible_at_depth(depth + 1, depth));
+            assert_eq!(key, before);
+        }
+    }
+    #[test]
+    fn rapid_requests_are_single_flight_and_stale_cancelled_results_cannot_publish() {
+        let mut busy = false;
+        assert!(claim_layout(&mut busy));
+        for _ in 0..100 {
+            assert!(!claim_layout(&mut busy));
+        }
+        assert!(!finish_layout(&mut busy, 1, 4));
+        assert!(claim_layout(&mut busy));
+        assert!(finish_layout(&mut busy, 4, 4));
+        assert!(!busy);
+    }
+}
+
+/// Render the published inspector and root as one unit, never indices from a
+/// newer requested graph. Replaced only alongside immutable scene publication.
+pub fn presented_scope(
+    published: Option<(usize, Option<usize>)>,
+    requested_root: Option<usize>,
+    requested_selection: Option<usize>,
+) -> (Option<usize>, Option<usize>) {
+    match published {
+        Some((root, selected)) => (Some(root), selected.or(Some(root))),
+        None => (requested_root, requested_selection.or(requested_root)),
+    }
+}
+pub fn presentation_interactive(
+    pending: bool,
+    published: Option<(usize, usize)>,
+    requested: Option<(usize, usize)>,
+) -> bool {
+    !pending && published.is_some() && published == requested
+}
+#[cfg(test)]
+mod atomic_presentation_tests {
+    use super::*;
+    #[test]
+    fn fast_navigation_and_refresh_retain_entire_published_inspector() {
+        let old = Some((4, Some(9)));
+        for requested in [Some(20), Some(30), Some(4), None] {
+            assert_eq!(
+                presented_scope(old, requested, Some(99)),
+                (Some(4), Some(9))
+            );
+        }
+        assert_eq!(
+            presented_scope(Some((20, None)), Some(20), None),
+            (Some(20), Some(20))
+        );
+    }
+    #[test]
+    fn invisible_pending_or_new_generation_never_enables_old_actions() {
+        assert!(!presentation_interactive(
+            true,
+            Some((10, 4)),
+            Some((10, 4))
+        ));
+        assert!(!presentation_interactive(
+            false,
+            Some((10, 4)),
+            Some((11, 4))
+        ));
+        assert!(!presentation_interactive(
+            false,
+            Some((10, 4)),
+            Some((10, 20))
+        ));
+        assert!(!presentation_interactive(false, None, None));
+        assert!(presentation_interactive(
+            false,
+            Some((11, 20)),
+            Some((11, 20))
+        ));
+    }
+    #[test]
+    fn pending_render_never_inserts_banner_or_replaces_inspector() {
+        let map = include_str!("ui/workspace_usage.rs");
+        let panel = include_str!("ui/workspace_pages.rs");
+        assert!(!map.contains("usage_pending_label()"));
+        assert!(!panel.contains("usage_pending_label()"));
+        assert!(panel.contains("self.inspector_data(selected,root)"));
+        assert!(panel.contains("this.inspector_action(inspector_scope"));
+        assert!(!panel.contains("child(relative_position)"));
+    }
+}
+
+/// Cancel invalidates an issued background layout without declaring its worker
+/// finished. The matching finish_layout call releases single-flight, but cannot publish.
+pub fn cancel_pending_layout(generation: &mut u64) {
+    *generation = generation.wrapping_add(1);
+}
+#[cfg(test)]
+mod late_depth_cancel_tests {
+    use super::*;
+    #[test]
+    fn data_arrived_but_layout_pending_cancel_keeps_published_depth_and_refuses_late_handoff() {
+        let mut generation = 41;
+        let mut busy = false;
+        let published_depth = 2;
+        let requested_depth = 3;
+        assert!(claim_layout(&mut busy));
+        let issued = generation;
+        // New data is staged, not painted; cancellation restores the published model.
+        cancel_pending_layout(&mut generation);
+        assert!(busy);
+        assert!(!claim_layout(&mut busy));
+        let mut shown_depth = published_depth;
+        if finish_layout(&mut busy, issued, generation) {
+            shown_depth = requested_depth;
+        }
+        assert_eq!(shown_depth, 2);
+        assert!(!busy);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn stability_fixture() -> Scan {
+    use crate::disk_usage::{Limits, Node};
+    let rows = [
+        ("C:/Users", None, 2000),
+        ("C:/Users/alice", Some(0), 1900),
+        ("C:/Users/alice/AppData", Some(1), 650),
+        ("C:/Users/alice/AppData/Temp", Some(2), 650),
+        ("C:/Users/alice/dev", Some(1), 900),
+        ("C:/Users/alice/dev/repo", Some(4), 900),
+        ("C:/Users/alice/dev/repo/target", Some(5), 500),
+        ("C:/Users/alice/Documents", Some(1), 200),
+        ("C:/Users/alice/OneDrive", Some(1), 150),
+        ("C:/Users/alice/dev/repo/.git", Some(5), 150),
+        ("C:/Users/alice/dev/repo/node_modules", Some(5), 250),
+        ("C:/Users/Public", Some(0), 100),
+    ];
+    let mut nodes: Vec<Node> = rows
+        .iter()
+        .map(|(path, parent, bytes)| Node {
+            path: (*path).into(),
+            parent: *parent,
+            children: vec![],
+            entries: 1,
+            files: 0,
+            directories: 1,
+            category: 0,
+            own_allocated: 0,
+            directory: true,
+            logical: *bytes,
+            mtime: 0,
+            allocated: *bytes,
+            hardlink_duplicate: false,
+            uncertain: false,
+        })
+        .collect();
+    for i in 0..nodes.len() {
+        if let Some(p) = nodes[i].parent {
+            nodes[p].children.push(i);
+        }
+    }
+    Scan {
+        logical_generation: Some((1, 11)),
+        nodes,
+        errors: 0,
+        skipped_links: 0,
+        hardlinks: 0,
+        unknown: 0,
+        partial: false,
+        cancelled: false,
+        elapsed: std::time::Duration::ZERO,
+        entry_limit_reached: false,
+        time_limit_reached: false,
+        memory_limit_reached: false,
+        alloc_failed: false,
+        limits: Limits::default(),
+        volume: None,
+    }
+}
+
+#[cfg(test)]
+mod stable_presentation_tests {
+    use super::*;
+    use crate::disktree::classify::Category;
+    fn key(root: usize, depth: usize, w: u32, h: u32) -> SceneKey {
+        SceneKey {
+            scan: 1,
+            root,
+            depth,
+            width: w,
+            height: h,
+            detail: 1,
+        }
+    }
+    fn class(scene: &Scene, id: usize) -> Category {
+        scene
+            .tiles
+            .iter()
+            .find(|t| t.key == TileKey::Node(id))
+            .expect("visible fixture object")
+            .class
+    }
+    #[test]
+    fn category_uses_directory_path_not_file_basename_or_volume_prefix() {
+        for (path, dir, want) in [
+            (r"C:\Users\alice\AppData", true, Category::Other),
+            (r"C:\Users\alice\DEV\repo\target", true, Category::Code),
+            (
+                r"C:\Users\alice\dev\repo\node_modules\nested",
+                true,
+                Category::Cache,
+            ),
+            (r"C:\Users\alice\AppData\Temp", true, Category::Cache),
+            (r"C:\Users\alice\AppData\Temp", false, Category::Other),
+            (r"C:\Users\alice\dev\repo\Temp", false, Category::Code),
+            (r"\\dev\code\unknown", true, Category::Other),
+            (r"\\?\UNC\dev\code\unknown", true, Category::Other),
+            (
+                r"\\?\C:\Users\alice\OneDrive - Org\x",
+                true,
+                Category::Synced,
+            ),
+            (r"C:\Users\alice\dev\..\AppData", true, Category::Other),
+        ] {
+            assert_eq!(
+                category_of_path(std::path::Path::new(path), dir),
+                want,
+                "{path}"
+            );
+        }
+    }
+    #[test]
+    fn same_object_category_survives_root_depth_cached_pages_and_descendant_changes() {
+        let scan = stability_fixture();
+        for (id, want) in [
+            (2, Category::Other),
+            (4, Category::Code),
+            (5, Category::Code),
+            (6, Category::Code),
+            (9, Category::Git),
+            (10, Category::Cache),
+        ] {
+            for root in [0, 1, id] {
+                let scene = build_scene(&scan, key(root, 6, 1400, 900));
+                assert_eq!(class(&scene, id), want, "root={root} id={id}");
+                assert_eq!(class(&scene.reflow(1700, 1100), id), want);
+            }
+        }
+        for root in [0, 1, 2] {
+            for depth in [2, 3, 6] {
+                let mut cached = scan.clone();
+                // Same identity/path/aggregate, but child pages not loaded yet.
+                cached.nodes[2].children.clear();
+                cached.nodes[2].parent = None;
+                let scene = build_scene(&cached, key(root, depth, 1400, 900));
+                assert_eq!(
+                    class(&scene, 2),
+                    Category::Other,
+                    "cached root={root} depth={depth}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn viewport_reflow_reuses_topology_reflows_aspect_and_has_current_hit_boundaries() {
+        let scene = build_scene(&stability_fixture(), key(1, 6, 700, 500));
+        for (w, h) in [
+            (1200, 700),
+            (340, 600),
+            (1800, 400),
+            (700, 500),
+            (0, 0),
+            (1, 1),
+        ] {
+            let resized = scene.reflow(w, h);
+            assert!(std::sync::Arc::ptr_eq(
+                scene.layout_source.as_ref().unwrap(),
+                resized.layout_source.as_ref().unwrap()
+            ));
+            assert_eq!(
+                resized.viewport,
+                Rect {
+                    x: 0.,
+                    y: 0.,
+                    w: w as f32,
+                    h: h as f32
+                }
+            );
+            assert_eq!(resized.key.scan, scene.key.scan);
+            assert_eq!(resized.key.root, scene.key.root);
+            assert!(resized.tiles.len() <= 1200);
+            let frame = resized
+                .tiles
+                .iter()
+                .map(|t| (t.key, t.rect, t.header))
+                .collect::<Vec<_>>();
+            assert_eq!(hit_frame(&frame, (w as f32 + 0.1, h as f32 / 2.)), None);
+            for t in resized.tiles.iter().filter(|t| t.depth == 1) {
+                assert!(
+                    t.rect.x >= 0.
+                        && t.rect.y >= 0.
+                        && t.rect.x + t.rect.w <= w as f32 + 0.01
+                        && t.rect.y + t.rect.h <= h as f32 + 0.01
+                );
+                if let Some(header) = t.header {
+                    assert_eq!(
+                        hit_frame(&frame, (header.x + header.w / 2., header.y + header.h / 2.)),
+                        Some(t.key)
+                    );
+                }
+            }
+        }
+        let fresh = build_scene(&stability_fixture(), key(1, 6, 1400, 800));
+        let resized = scene.reflow(1400, 800);
+        assert_eq!(fresh.tiles.len(), resized.tiles.len());
+        for (a, b) in fresh.tiles.iter().zip(&resized.tiles) {
+            assert_eq!(
+                (a.key, a.rect, a.header, a.class),
+                (b.key, b.rect, b.header, b.class)
+            );
+        }
+        let portrait = scene.reflow(400, 1200);
+        assert!(
+            scene
+                .tiles
+                .iter()
+                .any(|a| portrait.tiles.iter().any(|b| a.key == b.key
+                    && a.header.is_some()
+                    && b.header.is_some()
+                    && (a.header.unwrap().h / 500. - b.header.unwrap().h / 1200.).abs() > 0.01)),
+            "real layout keeps font/header pixel height instead of stretching an old frame"
+        );
+    }
+}
+
+#[cfg(test)]mod discrete_wheel_gate_tests{use super::*;#[test]fn real_notches_need_two_events_but_no_trackpad_dwell(){let n=std::time::Instant::now();let mut g=WheelGate::default();let a=Some(SemanticAction::Enter(3));assert_eq!(g.evaluate_input(n,1.,a,true),None);assert_eq!(g.evaluate_input(n+std::time::Duration::from_millis(75),1.,a,true),a);assert_eq!(g.evaluate_input(n+std::time::Duration::from_millis(100),1.,a,true),None);}#[test]fn fractional_touchpad_tail_keeps_original_safety_gate(){let n=std::time::Instant::now();let mut g=WheelGate::default();let a=Some(SemanticAction::Up);assert_eq!(g.evaluate_input(n,0.1,a,false),None);assert_eq!(g.evaluate_input(n+std::time::Duration::from_millis(20),0.1,a,false),None);}}
+
+#[cfg(test)] mod logical_scene_work_regression {
  use super::*;
- #[test]fn depth_visibility_does_not_mutate_geometry_or_need_a_new_key(){let key=SceneKey{scan:1,root:0,depth:PRESENTATION_DEPTH,width:900,height:600,detail:1};let before=key.clone();for depth in [3,4,2,6,1,3]{assert!(visible_at_depth(1,depth));assert!(!visible_at_depth(depth+1,depth));assert_eq!(key,before);}}
- #[test]fn rapid_requests_are_single_flight_and_stale_cancelled_results_cannot_publish(){let mut busy=false;assert!(claim_layout(&mut busy));for _ in 0..100{assert!(!claim_layout(&mut busy));}assert!(!finish_layout(&mut busy,1,4));assert!(claim_layout(&mut busy));assert!(finish_layout(&mut busy,4,4));assert!(!busy);}
+ fn fixture()->crate::disk_usage::Scan{
+  use findx2_ipc::{UsageItemDto as I,UsagePageDto as P};
+  let item=|id,name:String,logical,dirs|I{id,name,directory:true,logical,files:0,directories:dirs,unknown:0};
+  let p=P{epoch:7,generation:11,root:item(1,"dev".into(),64000,6464),children:(0..64).map(|i|item(2+i,format!("project-{i:03}"),1000,100)).collect(),next:None,resident_bytes:0,state:"scene CPU equivalence".into(),watch_error:None,metadata_error:None};
+  let mut s=crate::indexed_usage::scan_from_page(&p,"C:/Users/chaoj/dev".into());
+  for i in 1..65{for j in 0..100{let mut n=s.nodes[i].clone();n.parent=Some(i);n.children.clear();n.logical=10;n.entries=0;n.directories=0;n.path=n.path.join(if j==0{"AppData".into()}else if j==1{"node_modules".into()}else{format!("folder-{j:03}")});let id=s.nodes.len();s.nodes.push(n);s.nodes[i].children.push(id);}}
+  s
+ }
+ fn key()->SceneKey{SceneKey{scan:1,root:0,depth:PRESENTATION_DEPTH,width:800,height:600,detail:1}}
+ fn signature(s:&Scene)->Vec<String>{s.tiles.iter().map(|t|format!("{t:?}")).collect()}
+ #[test] fn skip_discarded_reclaim_walk_preserves_every_logical_tile_class_rect_and_reflow(){let scan=fixture();let old=build_scene_impl(&scan,key(),true);let new=build_scene(&scan,key());assert_eq!(signature(&old),signature(&new));assert!(old.worth_a_look.is_empty());assert!(new.worth_a_look.is_empty());assert_eq!(signature(&old.reflow(1024,670)),signature(&new.reflow(1024,670)));}
+ #[test] fn reused_adapter_matches_cold_detail_layout_and_rejects_other_identity(){let scan=fixture();let source=build_scene(&scan,key());for detail in 1..=5{let mut k=key();k.detail=detail;let fresh=build_scene(&scan,k.clone());let reused=source.relayout(k).unwrap();assert_eq!(signature(&fresh),signature(&reused));}let mut k=key();k.scan+=1;assert!(source.relayout(k).is_none());let mut k=key();k.root+=1;assert!(source.relayout(k).is_none());let mut k=key();k.depth-=1;assert!(source.relayout(k).is_none());}
+ #[test] #[ignore="bounded identical scene/detail before-after, not GUI FPS"]fn profile_same_scene_detail_reuse(){let scan=fixture();let source=build_scene(&scan,key());let mut before=vec![];let mut after=vec![];for _ in 0..12{let mut k=key();k.detail=2;let t=std::time::Instant::now();let a=build_scene(&scan,k.clone());before.push(t.elapsed().as_micros());let t=std::time::Instant::now();let b=source.relayout(k).unwrap();after.push(t.elapsed().as_micros());assert_eq!(signature(&a),signature(&b));}before.sort();after.sort();eprintln!("same_scene_detail nodes=6465 iterations=12 cold_adapter_median_us={} reuse_median_us={} cold_max_us={} reuse_max_us={}",before[6],after[6],before[11],after[11]);}
+ #[test] #[ignore="bounded same-source before/after scene CPU measurement, not GUI FPS"]fn profile_scene_build_complete_worker_cpu(){let scan=fixture();let mut before=vec![];let mut after=vec![];for _ in 0..12{let t=std::time::Instant::now();let a=build_scene_impl(&scan,key(),true);before.push(t.elapsed().as_micros());let t=std::time::Instant::now();let b=build_scene(&scan,key());after.push(t.elapsed().as_micros());assert_eq!(signature(&a),signature(&b));}before.sort();after.sort();eprintln!("scene_total_cpu nodes=6465 iterations=12 old_median_us={} new_median_us={} old_max_us={} new_max_us={}",before[6],after[6],before[11],after[11]);}
 }

@@ -167,11 +167,13 @@ impl EngineFooter {
             return "正在加载文件列表，完成后即可搜索。".into();
         }
         if let Some(e) = &s.watch_error {
-            let reason = if e.contains("拒绝访问")
+            let reason = if e.contains("internal namespace resolution") || e.contains("bound unlink identity") {
+                "已删除文件的身份核对失败；为避免漏处理变更，已保留变更记录读取位置。这不等同于当前用户缺少管理员权限"
+            } else if e.contains("拒绝访问")
                 || e.contains("Access is denied")
                 || e.contains("os error 5")
             {
-                "读取权限不足"
+                "读取被系统拒绝（原因尚未确认）"
             } else if e.contains("journal") || e.contains("日志") {
                 "文件变更记录读取失败"
             } else {
@@ -220,14 +222,15 @@ impl EngineFooter {
 /// Original details stay available in the Usage hover, not in the single-line footer.
 pub fn compact_usage(detail: &str, unknown: Option<u64>, scanning: bool, stale: bool) -> String {
     if detail.contains("超时") {
-        return "读取超时 · 可重试".into();
+        return "读取超时，可重试".into();
     }
-    let has_result=detail.contains("索引逻辑 ·");
+    // Accept original diagnostics and grouped presentation without changing health inference.
+    let has_result=detail.contains("索引逻辑 ·") || detail.contains("索引逻辑\n");
     if !has_result && (detail.contains("失败") || detail.contains("错误") || detail.contains("异常") || detail.contains("不支持") || detail.contains("不可用")) {
-        return "读取异常 · 查看详情".into();
+        return "读取异常，查看详情".into();
     }
     if detail.contains("已取消") || detail.starts_with("取消") {
-        return "已取消 · 保留已读结果".into();
+        return "已取消，保留已读结果".into();
     }
     if scanning || detail.contains("index loading") || detail.starts_with("正在读取") {
         return "正在读取…".into();
@@ -235,11 +238,11 @@ pub fn compact_usage(detail: &str, unknown: Option<u64>, scanning: bool, stale: 
     let mut s = "索引大小".to_string();
     if let Some(n) = unknown {
         if n > 0 {
-            s.push_str(&format!(" · {} 项信息不全", grouped(n)))
+            s.push_str(&format!("  {} 项信息不全", grouped(n)))
         }
     }
     if stale {
-        s.push_str(" · 详情有提示")
+        s.push_str("  详情有提示")
     }
     s
 }
@@ -248,6 +251,22 @@ mod tests {
     use super::*;
     fn status(entries: u64, deleted: u64) -> IpcResponse {
         serde_json::from_value(serde_json::json!({"type":"status_result","entry_count":entries,"dir_count":999999,"tombstone_count":deleted,"healthy":true,"metadata_ready":false,"last_usn":7,"journal_id":9,"backfill_error":"元数据回填遍历完成但仍有 80 条未验证（失败/并发变更）；metadata_ready 保持 false，重启/重建后可重试"})).unwrap()
+    }
+    #[test]
+    fn observed_deleted_identity_failure_keeps_warning_without_admin_claim() {
+        let mut f = EngineFooter::default();
+        let mut s = status(4_649_367, 88_356);
+        if let IpcResponse::StatusResult { healthy, watch_error, .. } = &mut s {
+            *healthy = false;
+            *watch_error = Some("C: internal namespace resolution failed; cursor retained: bound unlink identity metadata unavailable: 拒绝访问。 (0x80070005); cursor retained".into());
+        }
+        f.observe(&Ok(s));
+        assert_eq!(f.label(), "更新异常");
+        assert!(f.warning());
+        assert_eq!(f.last.as_ref().unwrap().live_entries, Some(4_561_011));
+        assert!(f.tooltip().contains("身份核对失败"));
+        assert!(f.tooltip().contains("保留变更记录"));
+        assert!(!f.tooltip().contains("读取权限不足"));
     }
     #[test]
     fn global_entries_are_not_files_or_topology_nodes() {
@@ -294,7 +313,7 @@ mod tests {
         };
         f.observe(&Ok(s.clone()));
         assert_eq!(f.label(), "更新异常");
-        assert!(f.tooltip().contains("权限不足"));
+        assert!(f.tooltip().contains("原因尚未确认"));
         if let IpcResponse::StatusResult { loading, .. } = &mut s {
             *loading = true
         };
@@ -363,7 +382,7 @@ mod tests {
     fn compact_usage_keeps_unknown_and_errors() {
         assert_eq!(
             compact_usage("g123 canonical indexed paths", Some(80), false, true),
-            "索引大小 · 80 项信息不全 · 详情有提示"
+            "索引大小  80 项信息不全  详情有提示"
         );
         assert!(compact_usage("索引请求失败", None, false, true).contains("异常"));
     }
@@ -371,4 +390,19 @@ mod tests {
 
     #[test]fn no_reported_watch_error_is_not_a_read_failure(){assert_eq!(compact_usage("索引逻辑 · 当前层完整 · 监控未报告错误（不代表全量新鲜）",Some(0),false,false),"索引大小");}
 
+}
+
+#[cfg(test)]
+mod usage_copy_tests {
+    use super::compact_usage;
+    #[test]
+    fn grouped_copy_preserves_unknown_health_and_legacy_diagnostics() {
+        for detail in ["索引逻辑 · 当前层完整 · 错误详情保留", "索引逻辑\n当前层完整\n错误详情保留"] {
+            assert_eq!(compact_usage(detail, Some(80), false, true), "索引大小  80 项信息不全  详情有提示");
+        }
+        for (detail, expected) in [("读取超时", "读取超时，可重试"), ("读取失败", "读取异常，查看详情"), ("已取消", "已取消，保留已读结果")] {
+            assert_eq!(compact_usage(detail, Some(80), false, true), expected);
+        }
+        assert_eq!(compact_usage("正在读取索引", None, true, false), "正在读取…");
+    }
 }

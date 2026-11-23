@@ -24,6 +24,8 @@ impl TableDelegate for BrowserTable {
         cx: &mut Context<TableState<Self>>,
     ) -> Stateful<Div> {
         let owner = self.owner.clone();
+        let right_owner = owner.clone();
+        let painted_scope = owner.read_with(cx, |view, _| view.row_paint_scope(false)).ok().flatten();
         let selected = owner
             .read_with(cx, |view, cx| view.context_row_selected(false, row, cx))
             .unwrap_or(false);
@@ -35,8 +37,15 @@ impl TableDelegate for BrowserTable {
             .when(selected, |v| v.bg(tokens.row_selected))
             .on_mouse_down(MouseButton::Left, move |event, _, cx| {
                 let _ = owner.update(cx, |view, cx| {
+                    if !crate::ui::async_publication::painted_event_current(painted_scope, view.row_paint_scope(false)) {
+                        cx.stop_propagation(); return;
+                    }
                     view.selection_pointer(false, row, event.modifiers, cx)
                 });
+            })
+            .on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                let valid=right_owner.read_with(cx,|view,_| crate::ui::async_publication::painted_event_current(painted_scope,view.row_paint_scope(false))).unwrap_or(false);
+                if !valid { cx.stop_propagation(); }
             })
     }
     fn context_menu(

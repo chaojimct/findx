@@ -39,6 +39,9 @@ actions!(
         SelectFirstResult,
         SelectLastResult,
         OpenSelected,
+        PreviewSelected,
+        DismissTransient,
+        ParentSelected,
         RevealSelected,
         ToggleDiag,
         FocusSearch,
@@ -69,13 +72,71 @@ actions!(
     ]
 );
 
+const FILE_SHORTCUT_CONTEXT: &str = "FindXMain && !Input";
+
+// Match the same ancestor depth as GPUI's keymap. `eval` only examines the
+// deepest node; a focused DataTable would otherwise fail FindXMain and make
+// every raw Space/Enter/Escape look like text editing.
+fn file_shortcuts_allowed(contexts: &[gpui_kit::KeyContext]) -> bool {
+    KeyBindingContextPredicate::parse(FILE_SHORTCUT_CONTEXT)
+        .expect("static file shortcut context")
+        .depth_of(contexts)
+        .is_some()
+}
+
+// gpui-component binds Escape at DataTable depth, ahead of the main context.
+// Override only our table; nested text editors/IME remain excluded.
+const TABLE_RAW_ESCAPE_CONTEXT: &str = "(FindXMain > DataTable) && !Input";
 const PAGE_SIZE: usize = 200;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(60);
 
+/// Shared with routing regressions: never add repeat-blind bare activation
+/// actions here; their raw KeyDownEvent path retains the platform held bit.
+fn main_key_bindings() -> Vec<KeyBinding> {
+    vec![
+        KeyBinding::new("shift-f10", ShowFileMenu, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("menu", ShowFileMenu, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-c", ContextCopy, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-x", ContextCut, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-v", ContextPaste, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-shift-c", ContextCopyPath, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("f2", ContextRename, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("alt-enter", ContextProperties, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-a", ContextSelectAll, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("alt-left", WorkspaceBack, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("alt-right", WorkspaceForward, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("alt-up", WorkspaceUp, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-l", WorkspaceFocusPath, Some("FindXMain")),
+        KeyBinding::new("f5", WorkspaceRefresh, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-t", DirectoryNewTab, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-w", DirectoryCloseTab, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-tab", DirectoryNextTab, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new(
+            "ctrl-shift-tab",
+            DirectoryPreviousTab,
+            Some(FILE_SHORTCUT_CONTEXT),
+        ),
+        KeyBinding::new("down", SelectNextResult, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("up", SelectPrevResult, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("home", SelectFirstResult, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("end", SelectLastResult, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-enter", RevealSelected, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-shift-d", ToggleDiag, Some(FILE_SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-f", FocusSearch, Some("FindXMain")),
+        KeyBinding::new("ctrl-comma", OpenSettings, Some("FindXMain")),
+        KeyBinding::new("escape", NoAction, Some(TABLE_RAW_ESCAPE_CONTEXT)),
+        KeyBinding::new("backspace", ParentSelected, Some(FILE_SHORTCUT_CONTEXT)),
+    ]
+}
+
 pub struct MainWindow {
+    #[cfg(windows)]
+    tray: Option<crate::native_tray::Tray>,
+    exit_requested: bool,
     file_actions: FileActions,
     search_selection: std::collections::BTreeSet<usize>,
     focus: FocusHandle,
+    table_navigation_focus: crate::ui::native_focus::TableNavigationFocus,
     identity_key: Option<(String, u64, u64)>,
     identity_generation: u64,
     selected_identity: Option<crate::file_identity::FileStamp>,
@@ -106,6 +167,7 @@ pub struct MainWindow {
     match_total: u32,
     search_status: SharedString,
     search_gen: u64,
+    search_keyboard: crate::interaction_logic::SearchKeyboard,
     status_gen: u64,
     status_inflight: bool,
     preview_diagnostics: bool,
@@ -114,6 +176,7 @@ pub struct MainWindow {
     preview_gen: u64,
     preview_cancel: crate::preview_worker::Cancel,
     pdf_options: crate::preview_worker::PdfOptions,
+    preview_options: crate::preview_worker::PdfOptions,
     pdf_count: u32,
     office_text_only: bool,
     preview_file: Option<String>,
@@ -155,8 +218,15 @@ impl MainWindow {
                         }
                         cx.notify();
                     }
-                    SettingsEvent::CloseApp => window.remove_window(),
+                    SettingsEvent::CloseApp => {
+                        if this.exit_requested {
+                            cx.quit();
+                        } else {
+                            window.remove_window();
+                        }
+                    }
                     SettingsEvent::Stay => {
+                        this.exit_requested = false;
                         this.settings_pending_mode = None;
                         cx.notify();
                     }
@@ -182,35 +252,7 @@ impl MainWindow {
     }
 
     pub fn new(session: Entity<AppSession>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        cx.bind_keys([
-            KeyBinding::new("shift-f10", ShowFileMenu, Some("FindXMain")),
-            KeyBinding::new("menu", ShowFileMenu, Some("FindXMain")),
-            KeyBinding::new("ctrl-c", ContextCopy, Some("FindXMain")),
-            KeyBinding::new("ctrl-x", ContextCut, Some("FindXMain")),
-            KeyBinding::new("ctrl-v", ContextPaste, Some("FindXMain")),
-            KeyBinding::new("ctrl-shift-c", ContextCopyPath, Some("FindXMain")),
-            KeyBinding::new("f2", ContextRename, Some("FindXMain")),
-            KeyBinding::new("alt-enter", ContextProperties, Some("FindXMain")),
-            KeyBinding::new("ctrl-a", ContextSelectAll, Some("FindXMain")),
-            KeyBinding::new("alt-left", WorkspaceBack, Some("FindXMain")),
-            KeyBinding::new("alt-right", WorkspaceForward, Some("FindXMain")),
-            KeyBinding::new("alt-up", WorkspaceUp, Some("FindXMain")),
-            KeyBinding::new("ctrl-l", WorkspaceFocusPath, Some("FindXMain")),
-            KeyBinding::new("f5", WorkspaceRefresh, Some("FindXMain")),
-            KeyBinding::new("ctrl-t", DirectoryNewTab, Some("FindXMain")),
-            KeyBinding::new("ctrl-w", DirectoryCloseTab, Some("FindXMain")),
-            KeyBinding::new("ctrl-tab", DirectoryNextTab, Some("FindXMain")),
-            KeyBinding::new("ctrl-shift-tab", DirectoryPreviousTab, Some("FindXMain")),
-            KeyBinding::new("down", SelectNextResult, Some("FindXMain")),
-            KeyBinding::new("up", SelectPrevResult, Some("FindXMain")),
-            KeyBinding::new("home", SelectFirstResult, Some("FindXMain")),
-            KeyBinding::new("end", SelectLastResult, Some("FindXMain")),
-            KeyBinding::new("enter", OpenSelected, Some("FindXMain")),
-            KeyBinding::new("ctrl-enter", RevealSelected, Some("FindXMain")),
-            KeyBinding::new("ctrl-shift-d", ToggleDiag, Some("FindXMain")),
-            KeyBinding::new("ctrl-f", FocusSearch, Some("FindXMain")),
-            KeyBinding::new("ctrl-comma", OpenSettings, Some("FindXMain")),
-        ]);
+        cx.bind_keys(main_key_bindings());
 
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索文件…"));
 
@@ -257,8 +299,13 @@ impl MainWindow {
             browser_widths
         };
         let mut workspace = Workspace::new(browser_widths, window, cx);
+        workspace.usage_depth = session.read(cx).prefs.usage_preferred_depth.clamp(1,6);
         workspace.show_hidden = session.read(cx).prefs.browser_show_hidden;
         let mut this = Self {
+            #[cfg(windows)]
+            tray: None,
+            exit_requested: false,
+            table_navigation_focus: Default::default(),
             file_actions: FileActions::default(),
             search_selection: Default::default(),
             focus: cx.focus_handle(),
@@ -292,6 +339,7 @@ impl MainWindow {
             match_total: 0,
             search_status: "就绪".into(),
             search_gen: 0,
+            search_keyboard: Default::default(),
             status_gen: 0,
             status_inflight: false,
             preview_diagnostics: false,
@@ -300,6 +348,7 @@ impl MainWindow {
             preview_gen: 0,
             preview_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pdf_options: Default::default(),
+            preview_options: Default::default(),
             pdf_count: 0,
             office_text_only: false,
             preview_file: session.read(cx).preview_file.clone(),
@@ -317,6 +366,28 @@ impl MainWindow {
             _preview_task: None,
         };
 
+        // Observe resolved keystrokes too: Tab can be consumed by SDK actions
+        // before raw capture_key_down handlers are called. Never consume input.
+        let owner_window = window.window_handle();
+        this._subscriptions
+            .push(cx.observe_keystrokes(move |this, event, window, cx| {
+                if window.window_handle() == owner_window
+                    && this.table_navigation_focus.keystroke(&event.keystroke)
+                {
+                    cx.notify();
+                }
+            }));
+        // Complete a splitter drag if activation is lost; do not retain a
+        // captured pointer/resize state when the user switches applications.
+        this._subscriptions
+            .push(cx.observe_window_activation(window, |this, window, cx| {
+                if !window.is_window_active() {
+                    this.finish_preview_resize(window, cx);
+                    this.reset_side_buttons();
+                    this.dismiss_usage_facts();
+                    cx.notify();
+                }
+            }));
         this.subscribe_search_input(search.clone(), window, cx);
         this._subscriptions
             .push(cx.observe(&session, |this, _, cx| {
@@ -348,6 +419,12 @@ impl MainWindow {
         let closing = cx.entity();
         window.on_window_should_close(cx, move |window, cx| {
             closing.update(cx, |this, cx| {
+                // Hiding is not shutdown: retain active work and unsaved settings.
+                #[cfg(windows)]
+                if let Some(tray) = this.tray.as_ref().filter(|t| t.ready()) {
+                    tray.hide();
+                    return false;
+                }
                 if this.cancel_active_batch_before_close(cx) {
                     return false;
                 }
@@ -358,6 +435,45 @@ impl MainWindow {
                 }
             })
         });
+        #[cfg(windows)]
+        {
+            let title = if this.session.read(cx).official_product {
+                "FindX"
+            } else {
+                "FindX — isolated native candidate"
+            };
+            this.tray = crate::native_tray::Tray::new(window, title);
+            if this.tray.is_some() {
+                let handle = window.window_handle();
+                cx.spawn(async move |this,cx| {
+                    loop {
+                        cx.background_executor().timer(Duration::from_millis(100)).await;
+                        let Ok(event)=this.update(cx,|this,_|this.tray.as_ref().and_then(|t|t.event())) else {break};
+                        if let Some(event)=event {
+                            let _=handle.update(cx,|_,window,cx|{
+                                let _=this.update(cx,|this,cx|match event {
+                                    crate::native_tray::Event::Show=>{if let Some(t)=&this.tray{t.show();}window.activate_window();},
+                                    crate::native_tray::Event::Exit=>{
+                                        // A hidden window must reveal cancellation/unsaved prompts.
+                                        if let Some(t)=&this.tray{t.show();}window.activate_window();
+                                        if this.cancel_active_batch_before_close(cx){return;}
+                                        if this.session.read(cx).settings_window.is_some(){
+                                            if let Some(t)=&this.tray{t.show();}
+                                            this.transient_file_notice("请先关闭独立设置窗口，再退出 FindX；索引服务不受影响".into(),cx);return;
+                                        }
+                                        this.exit_requested=true;
+                                        if let Some(page)=this.settings_page.clone(){
+                                            if !page.update(cx,|page,cx|page.request_app_close(window,cx)){return;}
+                                        }
+                                        cx.quit();
+                                    }
+                                });
+                            });
+                        }
+                    }
+                }).detach();
+            }
+        }
         this.init_workspace(window, cx);
         if let Some(path) = crate::isolation::isolated_usage_open_path(
             this.session.read(cx).live,
@@ -372,12 +488,31 @@ impl MainWindow {
         }
         // Read-only live startup route; never enables a filesystem scan.
         if this.session.read(cx).live {
-            if let Some(path)=std::env::var_os("FINDX_NATIVE_LIVE_DIRECTORY_PATH") {
-                this.workspace_navigate(std::path::PathBuf::from(path),ViewMode::Directory,None,true,cx);
+            if let Some(path) = std::env::var_os("FINDX_NATIVE_LIVE_DIRECTORY_PATH") {
+                this.workspace_navigate(
+                    std::path::PathBuf::from(path),
+                    ViewMode::Directory,
+                    None,
+                    true,
+                    cx,
+                );
             }
             if let Some(path) = std::env::var_os("FINDX_NATIVE_LIVE_USAGE_PATH") {
-                this.workspace_navigate(std::path::PathBuf::from(path), ViewMode::Usage, None, true, cx);
+                this.workspace_navigate(
+                    std::path::PathBuf::from(path),
+                    ViewMode::Usage,
+                    None,
+                    true,
+                    cx,
+                );
             }
+        }
+        // Establish a keyboard route on a freshly opened window, before any
+        // pointer click. Otherwise even Ctrl-F has no FindXMain focus context.
+        if this.workspace.mode == ViewMode::Search && this.preview_file.is_none() {
+            window.focus(&this.search.read(cx).focus_handle(cx), cx);
+        } else {
+            window.focus(&this.focus, cx);
         }
         this.schedule_status_poll(cx);
         if this.preview_file.is_some() {
@@ -439,7 +574,12 @@ impl MainWindow {
     }
 
     pub(super) fn search_empty_message(&self, cx: &App) -> String {
-        crate::search_logic::empty_result_label(!self.current_query(cx).trim().is_empty(), self.loading, self.search_status.as_ref()).into()
+        crate::search_logic::empty_result_label(
+            !self.current_query(cx).trim().is_empty(),
+            self.loading,
+            self.search_status.as_ref(),
+        )
+        .into()
     }
     fn current_query(&self, cx: &App) -> String {
         let raw = self.search.read(cx).value().to_string();
@@ -459,6 +599,10 @@ impl MainWindow {
             self.workspace_switch(ViewMode::Search, cx);
         }
         self.search_gen = self.search_gen.wrapping_add(1);
+        self.search_keyboard.invalidate();
+        self.selected = None;
+        self.search_selection.clear();
+        self.freeze_preview();
         let generation = self.search_gen;
         self._search_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
@@ -480,6 +624,7 @@ impl MainWindow {
             self.search_selection.clear();
             self.selected = None;
             self.loading = false;
+            self.search_keyboard.invalidate();
             self.search_status = "就绪".into();
             self.request_preview(cx);
             self.sync_table(true, cx);
@@ -489,17 +634,18 @@ impl MainWindow {
         self.page_loading = false;
         self.page_error = false;
         self._page_task = None;
-        self.hits.clear();
-        self.match_total = 0;
-        self.sync_table(true, cx);
+        // Retain published rows and scroll geometry until this generation completes.
         self.record_reset("重新查询");
         self.search_selection.clear();
         self.selected = None;
-        self.request_preview(cx);
+        self.freeze_preview();
         self.loading = true;
         self.search_status = "搜索中…".into();
+        let old_generation = self.search_gen;
         self.search_gen = self.search_gen.wrapping_add(1);
         let generation = self.search_gen;
+        self.search_keyboard
+            .begin(old_generation, generation, &query);
         let (endpoint, pinyin, limit, ipc) = self.session.read_with(cx, |s, _| {
             (
                 s.endpoint.clone(),
@@ -518,8 +664,10 @@ impl MainWindow {
                     return;
                 }
                 this.loading = false;
+                let mut pending_key = None;
                 match result {
                     Ok(out) => {
+                        pending_key = this.search_keyboard.publish(generation);
                         this.hits = out
                             .hits
                             .into_iter()
@@ -545,6 +693,7 @@ impl MainWindow {
                         };
                     }
                     Err(err) => {
+                        this.search_keyboard.invalidate();
                         this.hits.clear();
                         this.match_total = 0;
                         this.record_reset("查询失败");
@@ -554,7 +703,28 @@ impl MainWindow {
                         this.request_preview(cx);
                     }
                 }
-                this.sync_table(false, cx);
+                this.search_selection.clear();
+                this.selected = None;
+                this.sync_table(true, cx);
+                if pending_key.is_none() { this.request_preview(cx); }
+                if let Some(intent) = pending_key {
+                    let handle = this.native_window_handle();
+                    let owner = cx.weak_entity();
+                    cx.defer(move |cx| {
+                        let _ = handle.update(cx, |_, window, cx| {
+                            let _ = owner.update(cx, |this, cx| {
+                                if this.search_gen == generation
+                                    && this.search_keyboard.ready(generation)
+                                {
+                                    this.apply_search_key(intent, window, cx);
+                                    // Lost focus / new IME composition may reject the queued key.
+                                    // Then publish the legitimate no-selection preview, not old data forever.
+                                    if this.selected.is_none() { this.request_preview(cx); }
+                                }
+                            });
+                        });
+                    });
+                }
                 cx.notify();
             })
             .ok();
@@ -646,7 +816,9 @@ impl MainWindow {
     fn poll_status(&mut self, cx: &mut Context<Self>) {
         // At most one status request. Otherwise the 2s timer can continually
         // supersede a 5s timeout and leave a genuinely offline engine "online".
-        if self.status_inflight { return; }
+        if self.status_inflight {
+            return;
+        }
         self.status_inflight = true;
         self.status_gen = self.status_gen.wrapping_add(1);
         let generation = self.status_gen;
@@ -661,7 +833,8 @@ impl MainWindow {
                 },
             )
         });
-        self.session.update(cx,|s,_|s.engine_footer.set_source(&endpoint));
+        self.session
+            .update(cx, |s, _| s.engine_footer.set_source(&endpoint));
         let rx = ipc.status(endpoint.clone());
         cx.spawn(async move |this, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("IPC 通道已关闭".into()));
@@ -670,7 +843,9 @@ impl MainWindow {
                     return;
                 }
                 this.status_inflight = false;
-                if this.session.read(cx).endpoint!=endpoint {return;}
+                if this.session.read(cx).endpoint != endpoint {
+                    return;
+                }
                 this.session.update(cx, |session, cx| {
                     session.engine_footer.observe(&result);
                     session.connected = session.engine_footer.connected;
@@ -685,7 +860,11 @@ impl MainWindow {
                                     .as_secs(),
                             );
                             session.last_error = None;
-                            session.index_status = status_logic::apply_status(Some(&session.index_status), &resp, backfill);
+                            session.index_status = status_logic::apply_status(
+                                Some(&session.index_status),
+                                &resp,
+                                backfill,
+                            );
                         }
                         Err(err) => {
                             session.connected = false;
@@ -733,13 +912,13 @@ impl MainWindow {
     }
 
     fn set_selected(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
+        if !self.file_rows_current(true) { return; }
         self.record_single_selection(true, index);
         if self.selected != index {
             if index.is_some() {
                 self.preview_file = None;
             }
             self.office_text_only = false;
-            self.pdf_count = 0;
             self.selected = index;
             self.preview_active_selection(cx);
         } else {
@@ -748,6 +927,22 @@ impl MainWindow {
         cx.notify();
     }
 
+    // Cancel pending work without destroying the complete published presentation.
+    fn freeze_preview(&mut self) {
+        self.preview_cancel.store(true, std::sync::atomic::Ordering::Release);
+        self.preview_gen = self.preview_gen.wrapping_add(1);
+        self._preview_task = None;
+        #[cfg(windows)]
+        if let Some(client) = &self.preview.native { client.surface.set_interactive(false); }
+    }
+    fn preview_is_current(&self) -> bool {
+        self.file_scope_current() && !self.identity_pending
+            && self.preview.generation == self.preview_gen
+            && self.preview.meta.as_ref().is_some_and(|meta| {
+                self.active_workspace_hit().map(|h| h.path).or_else(|| self.preview_file.clone())
+                    .is_some_and(|path| path == meta.path)
+            })
+    }
     fn pause_preview(&mut self) {
         self.preview_cancel
             .store(true, std::sync::atomic::Ordering::Release);
@@ -807,23 +1002,8 @@ impl MainWindow {
             workspace::preview_stamp(&hit.path, hit.size, hit.mtime),
             self.pdf_options,
         );
-        let same_path = self
-            .preview
-            .meta
-            .as_ref()
-            .is_some_and(|meta| meta.path == hit.path);
-        let changed_page =
-            self.preview.pdf.is_some() && !self.preview.pdf_frame_matches(&hit.path, options.page);
-        if !same_path {
-            self.pdf_count = 0;
-        }
-        // Never label the old raster as the new PDF page while a worker is decoding.
-        if !same_path || changed_page {
-            self.preview = PreviewState::loading(
-                generation,
-                preview::meta_from_hit(&hit.name, &hit.path, hit.size, hit.mtime, hit.is_directory),
-            );
-        }
+        // Header, raster/text and its PDF camera are one immutable presentation.
+        // Do not clear it or label it with the newly requested page while decoding.
         self._preview_task = Some(cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_spawn(async move {
@@ -858,9 +1038,11 @@ impl MainWindow {
                 {
                     return;
                 }
+                this.preview_options = options;
                 this.pdf_count = loaded.pdf.map(|pdf| pdf.count).unwrap_or(0);
                 if let Some(pdf) = loaded.pdf {
                     this.pdf_options.page = pdf.page;
+                    this.preview_options.page = pdf.page;
                 }
                 this.preview = loaded;
                 cx.notify();
@@ -1103,6 +1285,7 @@ impl MainWindow {
     }
 
     fn pdf_action(&mut self, action: &str, cx: &mut Context<Self>) {
+        if !self.preview_is_current() || self.pdf_count == 0 { return; }
         let previous_page = self.pdf_options.page;
         let previous_edge = if self.pdf_options.fit_width {
             1600u32
@@ -1132,11 +1315,13 @@ impl MainWindow {
         // the page changed or a sharper (or smaller) decode is actually required.
         if self.pdf_options.page != previous_page || edge != previous_edge {
             self.request_preview(cx);
+        } else {
+            self.preview_options = self.pdf_options;
         }
         cx.notify();
     }
     fn render_pdf_controls(&self, cx: &Context<Self>) -> impl IntoElement {
-        let page = self.pdf_options.page;
+        let page = self.preview_options.page;
         h_flex()
             .w_full()
             .flex_shrink_0()
@@ -1168,7 +1353,7 @@ impl MainWindow {
                         .h(px(24.))
                         .px_0()
                         .text_xs()
-                        .disabled(disabled)
+                        .disabled(disabled || !self.preview_is_current())
                         .on_click(move |_, _, cx| e.update(cx, |this, cx| this.pdf_action(id, cx)))
                 }),
             )
@@ -1197,6 +1382,7 @@ impl MainWindow {
                     .map(|(id, _label)| {
                         let e = cx.entity();
                         Button::new(id)
+                            .disabled(!self.preview_is_current())
                             .ghost()
                             .icon(if id == "minus" {
                                 IconName::Minus
@@ -1216,11 +1402,12 @@ impl MainWindow {
             .child({
                 let e = cx.entity();
                 Button::new("fit")
+                    .disabled(!self.preview_is_current())
                     .ghost()
                     .icon(Icon::default().path("icons/move-horizontal.svg"))
                     .tooltip("适应宽度")
                     .accessibility_label("适宽")
-                    .selected(self.pdf_options.fit_width)
+                    .selected(self.preview_options.fit_width)
                     .w(px(22.))
                     .h(px(24.))
                     .px_0()
@@ -1230,6 +1417,7 @@ impl MainWindow {
             .child({
                 let e = cx.entity();
                 Button::new("actual")
+                    .disabled(!self.preview_is_current())
                     .ghost()
                     .icon(Icon::default().path("icons/scan.svg"))
                     .tooltip("恢复 100% 原始大小")
@@ -1247,6 +1435,7 @@ impl MainWindow {
         let tokens = Self::tokens(cx);
         let header = match &self.preview.meta {
             Some(meta) => v_flex()
+                .h(px(56.)).overflow_hidden()
                 .w_full()
                 .min_w_0()
                 .flex_shrink_0()
@@ -1281,7 +1470,7 @@ impl MainWindow {
                         .child(preview::format_meta_line(meta)),
                 )
                 .into_any_element(),
-            None => div().into_any_element(),
+            None => div().h(px(56.)).flex_shrink_0().into_any_element(),
         };
 
         let body: AnyElement = match self.preview.kind {
@@ -1398,10 +1587,10 @@ impl MainWindow {
                 .into_any_element(),
             PreviewKind::Image if self.preview.pdf.is_some() => {
                 let pdf = self.preview.pdf.unwrap();
-                let width = if self.pdf_options.fit_width {
+                let width = if self.preview_options.fit_width {
                     self.actual_preview_width - 24.
                 } else {
-                    pdf.width * self.pdf_options.zoom
+                    pdf.width * self.preview_options.zoom
                 };
                 let height = width * pdf.height / pdf.width.max(1.);
                 div()
@@ -1533,7 +1722,8 @@ impl MainWindow {
             .border_l_1()
             .border_color(tokens.border)
             .child(header)
-            .when(self.pdf_count > 0, |view| {
+            .when(self.preview.meta.as_ref().is_some_and(|m| std::path::Path::new(&m.path)
+                .extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))), |view| {
                 view.child(self.render_pdf_controls(cx))
             })
             .when(
@@ -1563,6 +1753,7 @@ impl MainWindow {
                                     .label(label)
                                     .on_click(move |_, _, cx| {
                                         entity.update(cx, |this, cx| {
+                                            if !this.preview_is_current() { return; }
                                             this.office_text_only = text_only;
                                             this.request_preview(cx);
                                             cx.notify();
@@ -1736,6 +1927,7 @@ impl Render for MainWindow {
         }
         #[cfg(windows)]
         if let Some(client) = &self.preview.native {
+            client.surface.set_interactive(self.preview_is_current());
             let mounted = preview && matches!(self.preview.kind, PreviewKind::NativeOffice);
             let allowed = crate::preview_visibility::surface_allowed(
                 mounted,
@@ -1748,6 +1940,62 @@ impl Render for MainWindow {
 
         v_flex()
             .id("findx-main")
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+                if this.table_navigation_focus.pointer() {
+                    cx.notify();
+                }
+            }))
+            // No bare Space/Enter keymap actions: keymap actions run before raw
+            // handlers and discard is_held. Scoped NoAction also bypasses the
+            // SDK table Escape Cancel; native controls/inputs still win.
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key=="escape" && !this.text_edit_active(window,cx) && this.dismiss_usage_facts(){cx.notify();cx.stop_propagation();return;}
+                use crate::ui::native_focus::{FileKey, FileKeyRoute, route_file_key};
+                if FileKey::parse(&event.keystroke).is_none() {
+                    return;
+                }
+                let allowed = file_shortcuts_allowed(&window.context_stack());
+                let editing = !allowed || this.text_edit_active(window, cx);
+                let file_target = this.file_navigation_focused(window, cx);
+                if std::env::var_os("FINDX_NATIVE_KEY_DIAGNOSTICS").is_some() {
+                    eprintln!("[native-key] key={} held={} editing={} file_focus={} selected={:?} context={:?}",event.keystroke.key,event.is_held,editing,file_target,this.selected,window.context_stack());
+                }
+                match route_file_key(event, editing, file_target) {
+                    FileKeyRoute::Pass => return,
+                    FileKeyRoute::ConsumeRepeat => {}
+                    FileKeyRoute::Dispatch(key) => {
+                        let action: Box<dyn Action> = match key {
+                            FileKey::Preview => Box::new(PreviewSelected),
+                            FileKey::Open => Box::new(OpenSelected),
+                            FileKey::Dismiss => Box::new(DismissTransient),
+                        };
+                        window.dispatch_action(action, cx);
+                    }
+                }
+                cx.stop_propagation();
+            }))
+            .capture_action(cx.listener(|this, _: &gpui_kit::component::input::MoveDown, window, cx| {
+                if this.query_key_allowed(window, cx) {
+                    this.request_search_key(crate::interaction_logic::SearchKeyIntent::Next, window, cx);
+                    cx.stop_propagation();
+                } else { cx.propagate(); }
+            }))
+            .capture_action(cx.listener(|this, _: &gpui_kit::component::input::MoveUp, window, cx| {
+                if this.query_key_allowed(window, cx) {
+                    this.request_search_key(crate::interaction_logic::SearchKeyIntent::Previous, window, cx);
+                    cx.stop_propagation();
+                } else { cx.propagate(); }
+            }))
+            .capture_action(cx.listener(|this, _: &gpui_kit::component::input::Escape, window, cx| {
+                if this.query_key_allowed(window, cx) { this.search_keyboard.cancel(); }
+                cx.propagate();
+            }))
+            .capture_action(cx.listener(|this, action: &gpui_kit::component::input::Enter, window, cx| {
+                if !action.shift && !action.secondary && this.query_key_allowed(window, cx) {
+                    this.request_search_key(crate::interaction_logic::SearchKeyIntent::Open, window, cx);
+                    cx.stop_propagation();
+                } else { cx.propagate(); }
+            }))
             .key_context("FindXMain")
             .track_focus(&self.focus)
             .size_full()
@@ -1758,27 +2006,40 @@ impl Render for MainWindow {
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 this.resize_preview_move(event, cx)
             }))
+            .capture_any_mouse_down(cx.listener(|this,event:&MouseDownEvent,_,cx|{
+                this.workspace_native_side(event.button,cx);
+            }))
+            .on_mouse_up(MouseButton::Navigate(NavigationDirection::Back),cx.listener(|this,_,_,_|this.release_side_button(false)))
+            .on_mouse_up_out(MouseButton::Navigate(NavigationDirection::Back),cx.listener(|this,_,_,_|this.release_side_button(false)))
+            .on_mouse_up(MouseButton::Navigate(NavigationDirection::Forward),cx.listener(|this,_,_,_|this.release_side_button(true)))
+            .on_mouse_up_out(MouseButton::Navigate(NavigationDirection::Forward),cx.listener(|this,_,_,_|this.release_side_button(true)))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| this.finish_preview_resize(cx)),
+                cx.listener(|this, _: &MouseUpEvent, window, cx| {
+                    this.finish_preview_resize(window, cx)
+                }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
                     if event.button == MouseButton::Left {
-                        this.finish_preview_resize(cx);
+                        this.finish_preview_resize(window, cx);
                     }
                 }),
             )
             .overflow_hidden()
             .bg(tokens.bg)
             .text_color(tokens.text_primary)
-            .on_action(
-                cx.listener(|this, _: &WorkspaceBack, _, cx| this.workspace_history(false, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &WorkspaceForward, _, cx| this.workspace_history(true, cx)),
-            )
+            .on_action(cx.listener(|this, _: &WorkspaceBack, window, cx| {
+                if !this.text_edit_active(window, cx) {
+                    this.workspace_history(false, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &WorkspaceForward, window, cx| {
+                if !this.text_edit_active(window, cx) {
+                    this.workspace_history(true, cx)
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &ShowFileMenu, window, cx| this.show_file_menu(window, cx)),
             )
@@ -1829,7 +2090,63 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &ContextAutoFit, window, cx| {
                 this.context_action(12, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &WorkspaceUp, _, cx| this.workspace_up(cx)))
+            .on_action(cx.listener(|this, _: &WorkspaceUp, window, cx| {
+                if !this.text_edit_active(window, cx) {
+                    this.workspace_up(cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ParentSelected, window, cx| {
+                if !this.text_edit_active(window, cx) {
+                    this.workspace_up(cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &PreviewSelected, window, cx| {
+                if this.text_edit_active(window, cx)
+                    || this.preview_resize.is_some()
+                    || this.file_menu_is_open()
+                    || this.run_pending.is_some()
+                    || this.file_actions.confirm_target.is_some()
+                {
+                    return;
+                }
+                if this.active_workspace_hit().is_none() {
+                    return;
+                }
+                this.preview_force = Some(crate::interaction_logic::toggle_preview_force(
+                    this.preview_force,
+                    this.session.read(cx).prefs.preview_open,
+                ));
+                this.preview_active_selection(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &DismissTransient, window, cx| {
+                if this.text_edit_active(window, cx) {
+                    return;
+                }
+                this.search_keyboard.cancel();
+                crate::interaction_logic::cancel_deferred_file_intents(
+                    &mut this.pending_open,
+                    &mut this.file_actions.pending_shell,
+                );
+                if this.preview_resize.is_some() {
+                    this.finish_preview_resize(window, cx);
+                    return;
+                }
+                if this.file_menu_is_open() {
+                    this.dismiss_file_menu(cx);
+                    return;
+                }
+                if this.run_pending.take().is_some()
+                    || this.file_actions.confirm_target.take().is_some()
+                {
+                    cx.notify();
+                    return;
+                }
+                this.workspace.address_menu = None;
+                this.workspace.show_actions = false;
+                this.preview_force = Some(ForceState::Hide);
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &WorkspaceRefresh, _, cx| this.workspace_refresh(cx)))
             .on_action(cx.listener(|this, _: &DirectoryNewTab, window, cx| {
                 this.directory_tab_shortcut(0, window, cx)
@@ -1849,28 +2166,37 @@ impl Render for MainWindow {
                 }
                 this.begin_path_edit(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &SelectNextResult, _, cx| {
+            .on_action(cx.listener(|this, _: &SelectNextResult, window, cx| {
+                if this.text_edit_active(window, cx) {
+                    return;
+                }
                 this.move_sel(ResultNavKey::ArrowDown, cx)
             }))
-            .on_action(cx.listener(|this, _: &SelectPrevResult, _, cx| {
+            .on_action(cx.listener(|this, _: &SelectPrevResult, window, cx| {
+                if this.text_edit_active(window, cx) {
+                    return;
+                }
                 this.move_sel(ResultNavKey::ArrowUp, cx)
             }))
             .on_action(cx.listener(|this, _: &SelectFirstResult, window, cx| {
                 // Home/End in the search box should stay with the input.
-                if focus_is_search(&this.search, window, cx) {
+                if this.text_edit_active(window, cx) {
                     return;
                 }
                 this.move_sel(ResultNavKey::Home, cx)
             }))
             .on_action(cx.listener(|this, _: &SelectLastResult, window, cx| {
-                if focus_is_search(&this.search, window, cx) {
+                if this.text_edit_active(window, cx) {
                     return;
                 }
                 this.move_sel(ResultNavKey::End, cx)
             }))
             .on_action(cx.listener(|this, _: &OpenSelected, window, cx| {
-                if focus_is_search(&this.search, window, cx)
-                    || focus_is_search(&this.workspace.path, window, cx)
+                if this.text_edit_active(window, cx)
+                    || this.preview_resize.is_some()
+                    || this.file_menu_is_open()
+                    || this.run_pending.is_some()
+                    || this.file_actions.confirm_target.is_some()
                 {
                     return;
                 }
@@ -1923,7 +2249,10 @@ impl Render for MainWindow {
                         anchored()
                             .position(self.workspace.address_menu_position)
                             .snap_to_window_with_margin(px(8.))
-                            .child(menu),
+                            .child(v_flex().when_some(self.workspace.address_menu_header.clone(),|container,header|container
+                                .w(px(372.)).h(px(340.))
+                                .child(div().h(px(28.)).flex_shrink_0().w_full().px_3().py_1().bg(Self::tokens(cx).surface).border_1().border_color(Self::tokens(cx).border).text_xs().overflow_hidden().whitespace_nowrap().child(header)))
+                                .child(menu)),
                     )
                     .with_priority(gpui_kit::base::POPUP_PRIORITY),
                 )
@@ -1982,7 +2311,7 @@ impl MainWindow {
                 .bg(tokens.surface)
                 .text_xs()
                 .text_color(tokens.text_secondary)
-                .child(div().flex_shrink_0().child(if selected > 0 {
+                .child(div().w(px(200.)).flex_shrink_0().text_ellipsis().child(if selected > 0 {
                     format!("{selected} 个项目已选择 · 共 {count} 个项目")
                 } else {
                     format!("{count} 个项目")
@@ -2021,7 +2350,11 @@ impl MainWindow {
             self.workspace_footer_label()
         };
         let footer = self.session.read(cx).engine_footer.clone();
-        let left_detail = if self.workspace.mode==ViewMode::Usage {self.workspace_scan_status()} else {left.clone()};
+        let left_detail = if self.workspace.mode == ViewMode::Usage {
+            self.workspace_scan_status()
+        } else {
+            left.clone()
+        };
         h_flex()
             .w_full()
             .h(px(32.))
@@ -2035,30 +2368,50 @@ impl MainWindow {
             .border_color(tokens.border)
             .text_xs()
             .text_color(tokens.text_secondary)
-            .child(div().id("footer-operation-summary").flex_1().min_w_0().text_ellipsis()
-                .tooltip(move |window,cx|gpui_kit::component::tooltip::Tooltip::new(left_detail.clone()).build(window,cx))
-                .child(left))
-            .when(self.workspace.mode==ViewMode::Search,|v| {
-                let detail=footer.counts_tooltip();
-                v.child(div().id("footer-index-counts").flex_shrink_0().text_xs()
-                    .tooltip(move |window,cx|gpui_kit::component::tooltip::Tooltip::new(detail.clone()).build(window,cx))
-                    .child(footer.counts_label()))
-            })
-            .when(
-                self.workspace.mode == ViewMode::Search && self.workspace.scanning,
-                |v| {
-                    v.child(
-                        Button::new("background-scan-status")
-                            .ghost()
-                            .icon(IconName::ChartPie)
-                            .label("后台扫描中")
-                            .tooltip(self.workspace_scan_status())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.workspace_switch(ViewMode::Usage, cx)
-                            })),
-                    )
-                },
+            .child(
+                div()
+                    .id("footer-operation-summary")
+                    .role(gpui_kit::accesskit::Role::Status)
+                    .accessibility_id("usage-read-state")
+                    .aria_label(left_detail.clone())
+                    .flex_1()
+                    .min_w_0()
+                    .text_ellipsis()
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(left_detail.clone())
+                            .build(window, cx)
+                    })
+                    .child(left),
             )
+            .when(self.workspace.mode == ViewMode::Search, |v| {
+                let detail = footer.counts_tooltip();
+                v.child(
+                    div()
+                        .id("footer-index-counts")
+                        .w(px(216.)).text_ellipsis().whitespace_nowrap()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .tooltip(move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(detail.clone())
+                                .build(window, cx)
+                        })
+                        .child(footer.counts_label()),
+                )
+            })
+            .when(self.workspace.mode == ViewMode::Search, |v| {
+                v.child(
+                    Button::new("background-scan-status")
+                        .ghost().icon(IconName::ChartPie)
+                        .w(px(28.)).h(px(24.)).px_0().flex_shrink_0()
+                        .accessibility_label("查看后台扫描")
+                        .disabled(!self.workspace.scanning)
+                        .tooltip(if self.workspace.scanning { self.workspace_scan_status() }
+                            else { "没有后台扫描".into() })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.workspace_switch(ViewMode::Usage, cx)
+                        })),
+                )
+            })
             .child(
                 Button::new("workspace-index-status")
                     .ghost()
@@ -2069,21 +2422,19 @@ impl MainWindow {
                     } else {
                         "icons/circle-check.svg"
                     }))
+                    .w(px(108.)).flex_shrink_0()
                     .label(footer.label())
                     .h(px(24.))
-                    .text_color(if footer.warning(){tokens.warning}else{tokens.text_secondary})
+                    .text_color(if footer.warning() {
+                        tokens.warning
+                    } else {
+                        tokens.text_secondary
+                    })
                     .tooltip(footer.tooltip())
                     .accessibility_label("引擎状态和索引统计"),
             )
             .into_any_element()
     }
-}
-
-fn focus_is_search(search: &Entity<InputState>, window: &Window, cx: &App) -> bool {
-    let Some(focused) = window.focused(cx) else {
-        return false;
-    };
-    focused == search.read(cx).focus_handle(cx)
 }
 
 impl Drop for MainWindow {
@@ -2117,6 +2468,195 @@ mod key_binding_tests {
                 gpui_kit::Keystroke::parse(key).is_ok(),
                 "invalid shortcut {key}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod shortcut_context_tests {
+    use super::{DismissTransient, FILE_SHORTCUT_CONTEXT, OpenSelected, main_key_bindings};
+    use gpui_kit::{KeyBindingContextPredicate, KeyContext};
+    #[test]
+    fn production_raw_guard_matches_real_window_table_context_and_rejects_editors() {
+        use super::file_shortcuts_allowed;
+        let context = |name| KeyContext::parse(name).unwrap();
+        let table = vec![context("Root"), context("FindXMain"), context("DataTable")];
+        assert!(file_shortcuts_allowed(&table));
+        // This reproduces the runtime defect, not just the SDK keymap helper.
+        let predicate = KeyBindingContextPredicate::parse(FILE_SHORTCUT_CONTEXT).unwrap();
+        assert!(!predicate.eval(&table));
+        for input in ["Input", "Input mode=editor", "Input mode=textarea"] {
+            let mut nested = table.clone();
+            nested.push(context(input));
+            assert!(!file_shortcuts_allowed(&nested));
+            nested.push(context("CompletionMenu"));
+            assert!(!file_shortcuts_allowed(&nested));
+        }
+        assert!(!file_shortcuts_allowed(&[context("OtherApp"), context("DataTable")]));
+        assert!(!file_shortcuts_allowed(&[]));
+    }
+    #[test]
+    fn actual_gpui_predicate_excludes_all_nested_text_inputs() {
+        let p = KeyBindingContextPredicate::parse(FILE_SHORTCUT_CONTEXT).unwrap();
+        let main = KeyContext::parse("FindXMain").unwrap();
+        assert!(p.depth_of(&[main.clone()]).is_some());
+        assert!(
+            p.depth_of(&[main.clone(), KeyContext::parse("DataTable").unwrap()])
+                .is_some()
+        );
+        for editor in ["Input", "Input mode=editor", "Input mode=textarea"] {
+            assert!(
+                p.depth_of(&[main.clone(), KeyContext::parse(editor).unwrap()])
+                    .is_none()
+            );
+            assert!(
+                p.depth_of(&[
+                    main.clone(),
+                    KeyContext::parse(editor).unwrap(),
+                    KeyContext::parse("CompletionMenu").unwrap()
+                ])
+                .is_none()
+            );
+        }
+        assert!(
+            p.depth_of(&[KeyContext::parse("OtherApp").unwrap()])
+                .is_none()
+        );
+    }
+    #[test]
+    fn escape_overrides_real_datatable_depth_but_never_a_nested_editor() {
+        use gpui_kit::{KeyBinding, Keymap, Keystroke};
+        // Same shortcut/context as the SDK's private DataTable Cancel action.
+        let mut keys = vec![KeyBinding::new("escape", OpenSelected, Some("DataTable"))];
+        keys.extend(main_key_bindings());
+        let map = Keymap::new(keys);
+        let main = KeyContext::parse("FindXMain").unwrap();
+        let table = KeyContext::parse("DataTable").unwrap();
+        let key = Keystroke::parse("escape").unwrap();
+        let (bindings, pending) =
+            map.bindings_for_input(&[key.clone()], &[main.clone(), table.clone()]);
+        assert!(!pending);
+        assert!(
+            bindings.is_empty(),
+            "SDK table Escape must reach raw repeat-aware preview dismiss"
+        );
+        for input in ["Input", "Input mode=editor", "Input mode=textarea"] {
+            let (bindings, _) = map.bindings_for_input(
+                &[key.clone()],
+                &[
+                    main.clone(),
+                    table.clone(),
+                    KeyContext::parse(input).unwrap(),
+                ],
+            );
+            assert!(
+                bindings
+                    .iter()
+                    .all(|b| !b.action().as_any().is::<DismissTransient>()),
+                "app Escape cannot hijack nested input/IME"
+            );
+        }
+        let (bindings, _) =
+            map.bindings_for_input(&[key], &[KeyContext::parse("OtherApp").unwrap(), table]);
+        assert!(
+            bindings
+                .iter()
+                .all(|b| !b.action().as_any().is::<DismissTransient>())
+        );
+    }
+    #[test]
+    fn production_keymap_leaves_bare_activation_for_repeat_aware_raw_dispatch() {
+        use gpui_kit::{Keymap, Keystroke};
+        let map = Keymap::new(main_key_bindings());
+        for ctx in [
+            vec![KeyContext::parse("FindXMain").unwrap()],
+            vec![
+                KeyContext::parse("FindXMain").unwrap(),
+                KeyContext::parse("DataTable").unwrap(),
+            ],
+        ] {
+            for key in ["space", "enter", "escape"] {
+                let (bindings, pending) =
+                    map.bindings_for_input(&[Keystroke::parse(key).unwrap()], &ctx);
+                assert!(!pending);
+                assert!(
+                    bindings.is_empty(),
+                    "{key} must reach raw held-aware dispatch"
+                );
+            }
+            for key in ["up", "down", "home", "end", "backspace"] {
+                let (bindings, _) = map.bindings_for_input(&[Keystroke::parse(key).unwrap()], &ctx);
+                assert!(
+                    !bindings.is_empty(),
+                    "navigation {key} must retain normal repeat"
+                );
+            }
+        }
+    }
+    #[test]
+    fn production_override_preserves_deeper_native_button_and_input_actions() {
+        use gpui_kit::{KeyBinding, Keymap, Keystroke};
+        let mut keys = vec![
+            KeyBinding::new("space", OpenSelected, Some("Button")),
+            KeyBinding::new("enter", OpenSelected, Some("Button")),
+            KeyBinding::new("escape", DismissTransient, Some("Input")),
+        ];
+        keys.extend(main_key_bindings());
+        let map = Keymap::new(keys);
+        for (key, native) in [
+            ("space", "Button"),
+            ("enter", "Button"),
+            ("escape", "Input mode=editor"),
+        ] {
+            let stack = [
+                KeyContext::parse("FindXMain").unwrap(),
+                KeyContext::parse("DataTable").unwrap(),
+                KeyContext::parse(native).unwrap(),
+            ];
+            let (bindings, pending) =
+                map.bindings_for_input(&[Keystroke::parse(key).unwrap()], &stack);
+            assert!(!pending);
+            assert_eq!(
+                bindings.len(),
+                1,
+                "native {native} {key} action must survive"
+            );
+        }
+    }
+    #[test]
+    fn actual_input_context_resolves_sdk_actions_captured_by_query_navigation() {
+        use gpui_kit::component::input::{Enter, MoveDown, MoveUp};
+        use gpui_kit::{KeyBinding, Keymap, Keystroke};
+        let mut keys = vec![
+            KeyBinding::new("down", MoveDown, Some("Input")),
+            KeyBinding::new("up", MoveUp, Some("Input")),
+            KeyBinding::new(
+                "enter",
+                Enter {
+                    secondary: false,
+                    shift: false,
+                },
+                Some("Input"),
+            ),
+        ];
+        keys.extend(main_key_bindings());
+        let map = Keymap::new(keys);
+        for key in ["down", "up", "enter"] {
+            let (bindings, pending) = map.bindings_for_input(
+                &[Keystroke::parse(key).unwrap()],
+                &[
+                    KeyContext::parse("FindXMain").unwrap(),
+                    KeyContext::parse("Input").unwrap(),
+                ],
+            );
+            assert!(!pending);
+            assert_eq!(bindings.len(), 1);
+            let a = bindings[0].action().as_any();
+            assert!(match key {
+                "down" => a.is::<MoveDown>(),
+                "up" => a.is::<MoveUp>(),
+                _ => a.is::<Enter>(),
+            });
         }
     }
 }

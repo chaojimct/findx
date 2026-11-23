@@ -1,5 +1,7 @@
 //! Three deliberately different information architectures, inside one custom window shell.
 use super::*;
+use gpui_kit::component::FocusableExt as _;
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::menu::ContextMenuExt as _;
 
 impl MainWindow {
@@ -29,7 +31,7 @@ impl MainWindow {
                                 .flex_1()
                                 .min_w_0()
                                 .min_h_0()
-                                .child(self.render_workspace_center(cx)),
+                                .child(self.render_workspace_center(window, cx)),
                         )
                         .when(preview, |view| {
                             view.child(self.render_preview_separator(window, cx))
@@ -55,7 +57,7 @@ impl MainWindow {
                             div()
                                 .flex_1()
                                 .min_h_0()
-                                .child(self.render_workspace_center(cx)),
+                                .child(self.render_workspace_center(window, cx)),
                         ),
                 )
                 .when(preview, |view| {
@@ -162,7 +164,11 @@ impl MainWindow {
             .child(self.tool_button("search-preview", "预览", 0, preview, cx))
     }
 
-    pub(super) fn render_directory_table(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_directory_table(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let tokens = Self::tokens(cx);
         let empty = self.workspace.rows.is_empty();
         let message = if self.workspace.listing {
@@ -179,8 +185,9 @@ impl MainWindow {
             .id("directory-table-context")
             .relative()
             .size_full()
-            .child(
+            .child(crate::ui::native_focus::table_frame(
                 DataTable::new(&self.workspace.table)
+                    .focus_ring(false)
                     .scrollbar_visible(
                         true,
                         self.workspace
@@ -193,7 +200,16 @@ impl MainWindow {
                             > self.table_viewport_width + 0.5,
                     )
                     .bordered(false),
-            )
+                self.table_navigation_focus.visible(
+                    self.workspace
+                        .table
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window),
+                    window.is_window_active(),
+                ),
+                tokens.text_tertiary,
+            ))
             .when(empty, |view| {
                 view.child(
                     div()
@@ -223,11 +239,11 @@ impl MainWindow {
     }
 
     fn navigation_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex().gap_1().children(
+        h_flex().flex_shrink_0().gap_1().children(
             [
-                ("directory-back", "后退 · Alt+Left", 0),
-                ("directory-forward", "前进 · Alt+Right", 1),
-                ("directory-up", "上一级 · Alt+Up", 2),
+                ("directory-back", "后退（Alt+Left）", 0),
+                ("directory-forward", "前进（Alt+Right）", 1),
+                ("directory-up", "上一级（Alt+Up）", 2),
             ]
             .into_iter()
             .map(|(id, label, action)| {
@@ -627,50 +643,39 @@ impl MainWindow {
             .child(self.navigation_buttons(cx))
             .child(
                 Button::new("usage-index-source")
+                    .with_size(gpui_kit::component::Size::XSmall)
                     .ghost()
-                    .h(px(24.))
-                    .label(if self.workspace.engine_usage {
-                        "索引逻辑"
-                    } else if self.workspace.scanning {
-                        "本地实测中"
+                    .icon(Icon::default().path("icons/database.svg"))
+                    .w(px(28.)).h(px(24.)).px_0().flex_shrink_0()
+                    .accessibility_label("索引逻辑")
+                    .tooltip(if self.workspace.engine_usage {
+                        "索引逻辑大小，非实际占用；不会更新或重启引擎"
                     } else {
-                        "本地实测"
+                        "当前为本地实测；选择索引逻辑，不更新或重启引擎"
                     })
-                    .tooltip("当前数据来源；点击选择索引逻辑。不会更新或重启引擎服务")
                     .selected(self.workspace.engine_usage)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.select_engine_usage_source(cx);
                     })),
             )
-            .when(
-                self.workspace.engine_usage && self.workspace.engine_busy,
-                |v| {
-                    v.child(
-                        Button::new("usage-index-cancel")
-                            .ghost()
-                            .label("取消")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.workspace.scan_generation += 1;
-                                this.workspace.engine_busy = false;
-                                this.workspace.engine_checked = false;
-                                this.workspace.scan_status = "索引分页已取消；引擎继续监听".into();
-                                cx.notify();
-                            })),
-                    )
-                },
-            )
-            .when(
-                self.workspace.engine_usage && self.workspace.engine_next.is_some(),
-                |v| {
-                    v.child(
-                        Button::new("usage-index-next")
-                            .ghost()
-                            .label("下一页")
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.load_engine_usage(true, cx)),
-                            ),
-                    )
-                },
+            // Async work never inserts/replaces a navigation slot. Paging is
+            // permanently reserved; the single cancel control lives on the right.
+            .child(
+                Button::new("usage-index-next")
+                    .with_size(gpui_kit::component::Size::XSmall)
+                    .ghost()
+                    .icon(Icon::default().path("icons/list-plus.svg"))
+                    .w(px(28.)).h(px(24.)).px_0().flex_shrink_0()
+                    .accessibility_label("下一页")
+                    .tooltip("读取下一页索引子项；无后续页或读取中时不可用")
+                    .disabled(!self.workspace.engine_usage || self.workspace.engine_busy
+                        || self.workspace.engine_next.is_none())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.workspace.engine_usage && !this.workspace.engine_busy
+                            && this.workspace.engine_next.is_some() {
+                            this.load_engine_usage(true, cx);
+                        }
+                    })),
             )
             .child(
                 div()
@@ -680,49 +685,62 @@ impl MainWindow {
                     .border_color(tokens.border),
             )
             .child(
-                Button::new("usage-depth-down")
-                    .ghost()
-                    .icon(IconName::Minus)
-                    .w(px(22.))
-                    .h(px(24.))
-                    .px_0()
-                    .accessibility_label("减少显示层数")
-                    .disabled(self.workspace.usage_depth <= 1)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.workspace.usage_depth =
-                            this.workspace.usage_depth.saturating_sub(1).max(1);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .child(format!("层 {}", self.workspace.usage_depth)),
-            )
-            .child(
-                Button::new("usage-depth-up")
-                    .ghost()
-                    .icon(IconName::Plus)
-                    .w(px(22.))
-                    .h(px(24.))
-                    .px_0()
-                    .accessibility_label("增加显示层数")
-                    .disabled(self.workspace.usage_depth >= 6)
-                    .tooltip("只改变图中显示层数，不限制扫描深度，不重新扫描")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.workspace.usage_depth = (this.workspace.usage_depth + 1).min(6);
-                        cx.notify();
-                    })),
+                h_flex().id("usage-depth-controls").flex_shrink_0().gap(px(2.))
+                .child(
+                    Button::new("usage-depth-down")
+                        .flex_shrink_0()
+                        .ghost()
+                        .icon(IconName::Minus)
+                        .w(px(22.))
+                        .h(px(24.))
+                        .px_0()
+                        .accessibility_label("减少显示层数")
+                        .tooltip("减少显示层数；最少 1 层")
+                        .disabled(self.workspace.usage_depth <= 1)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if !this.workspace.scanning && !this.usage_scene_interactive(){return;}
+                            this.adjust_usage_depth(-1,cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .id("usage-depth-value")
+                        .text_xs()
+                        .w(px(16.)).flex_shrink_0().text_center().whitespace_nowrap()
+                        .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("显示层数（1–6）").build(window, cx))
+                        .child(self.workspace.usage_depth.to_string()),
+                )
+                .child(
+                    Button::new("usage-depth-up")
+                        .flex_shrink_0()
+                        .ghost()
+                        .icon(IconName::Plus)
+                        .w(px(22.))
+                        .h(px(24.))
+                        .px_0()
+                        .accessibility_label("增加显示层数")
+                        .disabled(self.workspace.usage_depth >= 6)
+                        .tooltip("显示更深一级；按需读取索引元数据，不重新扫描")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if !this.workspace.scanning && !this.usage_scene_interactive(){return;}
+                            this.adjust_usage_depth(1,cx);
+                        })),
+                )
             )
             .child(
                 Button::new("usage-reset-compact")
+                    .with_size(gpui_kit::component::Size::XSmall)
+                    .px_2()
+                    .text_size(px(12.))
                     .ghost()
                     .h(px(24.))
+                    .w(px(64.)).flex_shrink_0()
                     .label(format!("{:.0}%", self.workspace.usage_camera.scale * 100.))
                     .tooltip(
                         "滚轮以指针缩放；边界再滚进入/返回；Shift 横移，Ctrl 平移，0 复位，不重扫",
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
+                        if !this.workspace.scanning && !this.usage_scene_interactive(){return;}
                         this.workspace.usage_camera.reset();
                         this.workspace.usage_transition = None;
                         cx.notify();
@@ -730,6 +748,7 @@ impl MainWindow {
             )
             .child(
                 Button::new("usage-advanced-toggle")
+                    .flex_shrink_0()
                     .ghost()
                     .icon(IconName::Settings)
                     .w(px(24.))
@@ -745,8 +764,7 @@ impl MainWindow {
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(96.))
-                    .min_w_0()
+                    .min_w(px(120.))
                     .overflow_hidden()
                     .child(self.render_address(cx)),
             )
@@ -756,48 +774,41 @@ impl MainWindow {
                     .primary()
                     .flex_shrink_0()
                     .h(px(28.))
-                    .label(if self.workspace.scanning {
-                        "扫描中…"
-                    } else if self.scan_node().is_some() {
-                        "本地实测"
-                    } else {
-                        "本地实测"
-                    })
+                    .w(px(104.))
+                    .label("本地实测")
                     .disabled(self.workspace.scanning || self.workspace.op_busy)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.start_workspace_scan(this.scan_node().is_some(), cx)
                     })),
             )
-            .when(self.workspace.scanning || self.workspace.engine_busy, |view| {
-                view.child(
-                    Button::new("cancel-workspace-scan")
-                        .icon(IconName::Close)
-                        .label("取消")
-                        .h(px(28.))
-                        .tooltip("停止后续枚举；已测部分会保留，不会当作完整结果")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if this.workspace.engine_usage {
-                                this.cancel_engine_usage(cx);
-                                return;
-                            }
+            .child(
+                Button::new("cancel-workspace-scan")
+                    .ghost()
+                    .icon(IconName::Close)
+                    .w(px(28.)).h(px(28.)).px_0().flex_shrink_0()
+                    .accessibility_label("取消当前占用任务")
+                    .disabled(!(self.workspace.scanning || self.workspace.engine_busy
+                        || self.workspace.usage_pending_from.is_some() || self.workspace.usage_depth_pending))
+                    .tooltip("取消当前目录读取或实测；保留已发布画面，不影响引擎监听")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.workspace.engine_usage {
+                            this.cancel_engine_usage(cx);
+                        } else if this.workspace.scanning {
                             this.workspace.scan_cancel.store(true, Ordering::Release);
                             this.workspace.scan_status = "正在取消；已测部分将保留".into();
                             cx.notify();
-                        })),
-                )
-            })
+                        }
+                    })),
+            )
     }
 
     pub(super) fn render_workspace_usage(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = Self::tokens(cx);
-        let selected = self
-            .workspace
-            .usage_focus
-            .as_ref()
-            .and_then(|path| self.workspace.scan_lookup.get(&key(Path::new(path))))
-            .copied()
-            .or_else(|| self.scan_node());
-        let root = self.scan_node();
+        let (root,selected)=crate::usage_view::presented_scope(
+            self.workspace.usage_scene.as_ref().map(|scene|(scene.key.root,self.workspace.usage_scene_selected)),
+            self.scan_node(),
+            self.workspace.usage_focus.as_ref().and_then(|p|self.workspace.scan_lookup.get(&key(Path::new(p)))).copied(),
+        );
         let map = self.render_cached_usage_map(cx);
         let limits = Limits::memory_profile(self.workspace.usage_memory_profile);
         v_flex()
@@ -862,7 +873,7 @@ impl MainWindow {
                     .text_color(tokens.text_secondary)
                     .children(
                         crate::disktree::classify::Category::LEGEND
-                            .into_iter()
+                            .into_iter().chain(std::iter::once(crate::disktree::classify::Category::Other))
                             .map(|class| {
                                 h_flex()
                                     .gap_1()
@@ -919,6 +930,7 @@ impl MainWindow {
     ) -> AnyElement {
         let tokens = Self::tokens(cx);
         const INSPECTOR: f32 = 280.;
+        let inspector_scope=self.usage_inspector_key();
         let mut panel = v_flex()
             .id("usage-detail-panel")
             .overflow_hidden()
@@ -931,30 +943,41 @@ impl MainWindow {
             .border_l_1()
             .border_color(tokens.border)
             .bg(tokens.surface);
-        if let Some(label)=self.usage_pending_label() {
-            return panel.child(div().p_3().text_sm().child(label))
-                .child(div().px_3().text_xs().child(format!("目标：{}",display_path(&self.workspace.location))))
-                .child(div().px_3().py_2().text_xs().child(self.workspace.scan_status.clone())).into_any_element();
-        }
+        let watcher_detail=self.session.read(cx).engine_footer.last.as_ref().and_then(|s|s.watch_error.clone());
+        let source_label=if self.workspace.inspector.pending.is_some(){"读取详情…"}else{crate::usage_presentation::source_label(self.workspace.engine_usage,watcher_detail.as_deref())};
         let mut head = v_flex()
             .flex_shrink_0()
             .px_3()
             .py_2()
             .gap_1()
-            .child(div().text_xs().child(if self.workspace.engine_usage {
-                "索引逻辑大小（非实际占用）"
-            } else {
-                "本地实测 · 实际占用"
-            }));
+            .child(h_flex().w_full().h(px(26.)).min_h(px(26.)).justify_between().gap_1()
+                .child(div().flex_1().min_w_0().text_xs().text_ellipsis().whitespace_nowrap().text_color(tokens.text_secondary).child(source_label))
+                .child(Popover::new("usage-facts-popover").anchor(Anchor::RightCenter).w(px(348.))
+                    .open(self.workspace.usage_facts_open)
+                    .on_open_change({let owner=cx.weak_entity();move|open,_,cx|{let _=owner.update(cx,|this,cx|{this.workspace.usage_facts_open=*open;cx.notify();});}})
+                    .trigger(Button::new("usage-quality-summary").ghost().w(px(100.)).h(px(24.)).px_1()
+                        .label(if self.usage_render_scan().is_some_and(|s|s.unknown>0||s.partial||s.errors>0)||watcher_detail.is_some(){"详情  待核对"}else{"详细信息"})
+                        .accessibility_label("详细信息")
+                        // The framework's mouse-down wrapper alone exposes no UIA
+                        // Invoke. Keep one normal button activation path for pointer,
+                        // keyboard and assistive technology; suppress double toggle.
+                        .on_mouse_down(MouseButton::Left,|_,_,cx|cx.stop_propagation())
+                        .on_click(cx.listener(|this,_,_,cx|{this.workspace.usage_facts_open=!this.workspace.usage_facts_open;cx.notify();}))
+                        .text_color(if self.usage_render_scan().is_some_and(|s|s.unknown>0||s.partial||s.errors>0)||watcher_detail.is_some(){tokens.warning}else{tokens.text_secondary})
+                        .tooltip("记录数、写入时间与范围质量；按 Esc 关闭"))
+                    .content({let owner=cx.weak_entity();move|_,_,cx|{
+                        let close_owner=owner.clone();
+                        div().id("usage-facts-body").child(h_flex().w_full().justify_between().px_3().pt_2().child(div().text_xs().child("详细信息")).child(Button::new("usage-facts-close").ghost().icon(Icon::default().path("icons/x.svg")).accessibility_label("关闭详细信息").tooltip("关闭详细信息（Esc）").on_click(move|_,_,cx|{let _=close_owner.update(cx,|this,cx|{this.workspace.usage_facts_open=false;cx.notify();});}))).child(owner.upgrade().map(|owner|owner.read(cx).render_usage_facts(cx)).unwrap_or_else(||div().child("详情暂不可用").into_any_element())).into_any_element()
+                    }})));
         if self.workspace.scanning {
             let preview = self.workspace.usage_preview.borrow();
             head = head
                 .child(
                     div()
                         .text_lg()
-                        .child(format!("扫描预览 · {}", preview.scope_name)),
+                        .child(format!("扫描预览  {}", preview.scope_name)),
                 )
-                .child(div().text_xs().child("仅已测部分 · 总量未知"))
+                .child(div().text_xs().child("仅已测部分，总量未知"))
                 .child(
                     div()
                         .text_xs()
@@ -974,6 +997,7 @@ impl MainWindow {
             .px_3()
             .py_2()
             .gap_1()
+            .h(px(126.)).min_h(px(126.)).max_h(px(126.))
             .border_t_1()
             .border_color(tokens.border);
         if self.workspace.scanning {
@@ -985,7 +1009,7 @@ impl MainWindow {
                     progress.allocated.load(Ordering::Relaxed),
                 )))
                 .child(div().text_xs().child(format!(
-                    "{} 条路径 · {} 目录",
+                    "{} 条路径  {} 目录",
                     progress.entries.load(Ordering::Relaxed),
                     progress.directories.load(Ordering::Relaxed)
                 )))
@@ -998,7 +1022,7 @@ impl MainWindow {
                 mid = mid
                     .child(div().mt_3().text_sm().child(name))
                     .child(div().text_xs().child(format!(
-                        "已测 {} · 尚未完成",
+                        "已测 {}，未完成",
                         disk_usage::format_bytes(bytes)
                     )));
             }
@@ -1009,13 +1033,15 @@ impl MainWindow {
             );
             return panel.child(head).child(mid).child(foot).into_any_element();
         }
-        if let (Some(scan), Some(index)) = (self.workspace.scan.as_ref(), selected.or(root)) {
+        if let Some((scan,index,visible_root)) = self.inspector_data(selected,root) {
+            let root=Some(visible_root);
             let node = &scan.nodes[index];
             let name = node
                 .path
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| display_path(&node.path));
+            let absolute_path=display_path(&node.path);
             let total = root.map(|i| scan.weight(&scan.nodes[i])).unwrap_or(0);
             let ratio = if total > 0 {
                 scan.weight(node) as f64 / total as f64 * 100.
@@ -1031,66 +1057,19 @@ impl MainWindow {
                         .whitespace_nowrap()
                         .child(name),
                 )
+                .child(div().id("usage-object-path").h(px(17.)).min_h(px(17.)).text_xs().text_color(tokens.text_secondary).text_ellipsis().whitespace_nowrap().overflow_hidden().child(absolute_path.clone()).tooltip(move|window,cx|gpui_kit::component::tooltip::Tooltip::new(absolute_path.clone()).build(window,cx)))
                 .child(
                     div()
                         .text_2xl()
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(disk_usage::format_bytes(scan.weight(node))),
                 )
-                .child(div().w_full().h(px(3.)).rounded_sm().bg(tokens.accent))
+                .child(div().w_full().h(px(4.)).rounded_sm().bg(tokens.border_soft).child(div().h_full().w(relative((ratio/100.).clamp(0.,1.) as f32)).bg(tokens.accent)))
                 .child(div().text_xs().text_color(tokens.text_secondary).child(
-                    if Some(index) == root {
-                        format!(
-                            "当前范围根 · 逻辑 {} · {} 秒",
-                            disk_usage::format_bytes(node.logical),
-                            scan.elapsed.as_secs()
-                        )
-                    } else {
-                        format!("占当前范围 {ratio:.1}%")
-                    },
+                    if Some(index)==root {"当前范围 100%".into()}
+                    else if ratio<=100. {format!("占当前范围 {ratio:.1}%")}
+                    else {"索引汇总暂不能核对比例".into()},
                 ))
-                .child(
-                    h_flex()
-                        .w_full()
-                        .mt_1()
-                        .text_xs()
-                        .text_color(tokens.text_secondary)
-                        .child(div().flex_1().child(format!("文件 {}", node.files)))
-                        .child(div().flex_1().child(format!("目录 {}", node.directories))),
-                )
-                .child(
-                    h_flex()
-                        .w_full()
-                        .text_xs()
-                        .text_color(tokens.text_secondary)
-                        .child(
-                            div()
-                                .flex_1()
-                                .child(format!("写入 {}", search_logic::format_time(node.mtime))),
-                        )
-                        .child(div().flex_1().child(if node.directory {
-                            "目录"
-                        } else {
-                            "文件"
-                        })),
-                )
-                .when(node.hardlink_duplicate, |view| {
-                    view.child(
-                        div()
-                            .text_xs()
-                            .text_color(tokens.warning)
-                            .child("硬链接别名，空间已计入另一路径"),
-                    )
-                })
-                .when(node.uncertain, |view| {
-                    view.child(div().text_xs().text_color(tokens.warning).child(
-                        if self.workspace.engine_usage {
-                            "含未验证逻辑元数据；非实际占用"
-                        } else {
-                            "含未知占用；未知不是 0"
-                        },
-                    ))
-                })
                 .child(
                     h_flex()
                         .w_full()
@@ -1104,21 +1083,8 @@ impl MainWindow {
                                 .h(px(26.))
                                 .px_0()
                                 .tooltip("在此范围搜索")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    let path = this
-                                        .active_workspace_hit()
-                                        .map(|h| {
-                                            if h.is_directory {
-                                                PathBuf::from(h.path)
-                                            } else {
-                                                PathBuf::from(h.path)
-                                                    .parent()
-                                                    .unwrap_or(Path::new("C:\\"))
-                                                    .to_path_buf()
-                                            }
-                                        })
-                                        .unwrap_or_else(|| this.workspace.location.clone());
-                                    this.begin_scoped_search(path, window, cx);
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.inspector_action(inspector_scope,0,Some(window),cx);
                                 })),
                         )
                         .child(
@@ -1130,8 +1096,7 @@ impl MainWindow {
                                 .px_0()
                                 .tooltip("在文件中定位")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.select_usage_node(index, false, cx);
-                                    this.workspace_reveal(cx);
+                                    this.inspector_action(inspector_scope,1,None,cx);
                                 })),
                         )
                         .when(node.directory, |v| {
@@ -1144,13 +1109,13 @@ impl MainWindow {
                                     .px_0()
                                     .tooltip("进入此目录")
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.select_usage_node(index, true, cx)
+                                        this.inspector_action(inspector_scope,2,None,cx);
                                     })),
                             )
                         }),
                 );
             if let Some(scene) = &self.workspace.usage_scene {
-                if !scene.worth_a_look.is_empty() {
+                if Some(index)==root && !scene.worth_a_look.is_empty() {
                     mid = mid
                         .child(
                             div()
@@ -1187,8 +1152,15 @@ impl MainWindow {
                     }
                 }
             }
-            let children = &node.children;
+            let mut children=node.children.clone();
+            children.sort_by(|a,b|scan.weight(&scan.nodes[*b]).cmp(&scan.weight(&scan.nodes[*a])).then_with(||scan.nodes[*a].path.cmp(&scan.nodes[*b].path)));
             let count = children.len();
+            let inspector_issue=self.workspace.inspector.displayed.as_ref().and_then(|s|s.issue.clone());
+            let inspector_partial=self.workspace.inspector.displayed.as_ref().is_some_and(|s|s.partial);
+            if node.directory && count==0 {
+                let status=inspector_issue.clone().unwrap_or_else(||if inspector_partial{"子项列表受限".into()}else if self.workspace.engine_usage{"索引未列出子项".into()}else{"没有已测子项".into()});
+                mid=mid.child(div().id("usage-children-status").mt_2().h(px(20.)).min_h(px(20.)).text_xs().text_color(tokens.text_secondary).text_ellipsis().whitespace_nowrap().child(status.clone()).tooltip(move|window,cx|gpui_kit::component::tooltip::Tooltip::new(status.clone()).build(window,cx)));
+            }
             if count > 0 {
                 mid = mid.child(
                     div()
@@ -1196,12 +1168,8 @@ impl MainWindow {
                         .text_xs()
                         .text_color(tokens.text_secondary)
                         .child(format!(
-                            "子项 · {count}（{}）",
-                            if self.workspace.engine_usage {
-                                "索引逻辑大小"
-                            } else {
-                                "按实际占用"
-                            }
+                            "较大子项 {count} 项（{}）",
+                            if inspector_partial {"已载入列表"}else if self.workspace.engine_usage {"逻辑大小"}else{"实际占用"}
                         )),
                 );
                 mid = mid.child(
@@ -1209,7 +1177,7 @@ impl MainWindow {
                         .id("usage-details-children")
                         .gap_1()
                         .overflow_y_scrollbar()
-                        .children(children.iter().copied().take(80).map(|child| {
+                        .children(children.iter().copied().take(12).map(|child| {
                             let n = &scan.nodes[child];
                             let label = n
                                 .path
@@ -1243,77 +1211,39 @@ impl MainWindow {
                                         .child(disk_usage::format_bytes(scan.weight(n))),
                                 )
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.select_usage_node(child, false, cx)
+                                    this.inspector_pick(inspector_scope,child,false,cx);
                                 }))
                                 .on_double_click(cx.listener(move |this, _, _, cx| {
-                                    this.select_usage_node(child, true, cx)
+                                    this.inspector_pick(inspector_scope,child,true,cx);
                                 }))
                         }))
-                        .when(count > 80, |view| {
+                        .when(count > 12, |view| {
                             view.child(
                                 div()
                                     .text_xs()
                                     .text_color(tokens.text_tertiary)
-                                    .child("仅显示前 80 项"),
+                                    .child(if inspector_partial{"列已载入项中最大 12 项；双击目录深入"}else{"仅列最大 12 项；双击目录继续查看"}),
                             )
                         }),
                 );
             }
-            if scan.partial
-                || scan.errors > 0
-                || scan.unknown > 0
-                || scan.is_legacy_entry_truncation()
-                || scan.memory_limit_reached
-                || scan.alloc_failed
-            {
-                head = head.child(
-                    div()
-                        .mt_2()
-                        .text_xs()
-                        .text_color(tokens.warning)
-                        .child(self.usage_warning_line(scan)),
-                );
+            let volume_path=&scan.nodes[root.unwrap_or(0)].path;
+            let cached=self.workspace.usage_volume.get(volume_path);
+            let value=match cached{Some(Ok(v))=>Some(v),Some(Err(_))=>None,None=>scan.volume.as_ref()};
+            foot=foot.child(div().h(px(18.)).min_h(px(18.)).text_xs().font_weight(FontWeight::SEMIBOLD).text_ellipsis().whitespace_nowrap().overflow_hidden().child(value.map(|v|format!("系统卷容量  {}",display_path(&v.root))).unwrap_or_else(||"系统卷容量".into())));
+            let volume_ratio=value.map_or(0.,|v|v.used() as f64/v.total.max(1) as f64) as f32;
+            foot=foot.child(div().w_full().h(px(5.)).rounded_sm().bg(tokens.border_soft).child(div().h_full().w(relative(volume_ratio.clamp(0.,1.))).bg(tokens.accent)));
+            let mut values=h_flex().w_full().gap_2();
+            for (label,number) in [("总量",value.map(|v|v.total)),("已用",value.map(|v|v.used())),("剩余",value.map(|v|v.free))] {
+                values=values.child(v_flex().flex_1().min_w_0().child(div().text_xs().text_color(tokens.text_secondary).child(label)).child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child(number.map(disk_usage::format_bytes).unwrap_or_else(||"—".into()))));
             }
-            if let Some(v) = &scan.volume {
-                let ratio = if v.total > 0 {
-                    v.used() as f32 / v.total as f32
-                } else {
-                    0.
-                };
-                foot = foot
-                    .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child("卷"))
-                    .child(div().text_xs().text_ellipsis().text_color(tokens.text_secondary).child(display_path(&v.root)))
-                    .child(
-                        div()
-                            .w_full()
-                            .h(px(4.))
-                            .rounded_sm()
-                            .bg(tokens.border_soft)
-                            .child(div().h_full().w(relative(ratio.clamp(0., 1.))).bg(tokens.accent)),
-                    )
-                    .child(div().text_xs().text_color(tokens.text_secondary).child(format!(
-                        "已用 {} · 可用 {} · 共 {}",
-                        disk_usage::format_bytes(v.used()),
-                        disk_usage::format_bytes(v.available),
-                        disk_usage::format_bytes(v.total)
-                    )))
-                    .child(div().text_xs().text_color(tokens.text_tertiary).child(
-                        "卷已用含未扫描目录与系统保留；三种口径不相减推算可清理量。ADS 不在承诺范围。",
-                    ));
-            } else {
-                foot = foot
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("卷"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .child("卷容量暂不可用；不代表 0 或整卷已扫描"),
-                    );
-            }
+            foot=foot.child(values);
+            let explanation=if let Some(Err(_))=cached{"系统未返回容量；不是 0，也不由目录合计推算".to_string()}
+            else if let Some(v)=value{if let Some(age)=self.workspace.usage_volume.age(volume_path){format!("{} 秒前采样  账户可用 {}",age.as_secs(),disk_usage::format_bytes(v.available))}else{"扫描时容量，独立刷新中".into()}}
+            else if self.workspace.usage_volume.slow(volume_path){"系统响应较慢；保持界面可用".into()}
+            else {"正在读取系统容量；与目录大小口径不同".into()};
+            let explanation_detail=match cached{Some(Err(e))=>e.clone(),_=>"卷已用 = 总量 − 系统空闲；不等于目录逻辑合计，不能推算可清理量。索引时效见连接状态。".into()};
+            foot=foot.child(div().id("usage-volume-explanation").h(px(30.)).overflow_hidden().text_xs().text_color(tokens.text_tertiary).child(explanation).tooltip(move|window,cx|gpui_kit::component::tooltip::Tooltip::new(explanation_detail.clone()).build(window,cx)));
             panel = panel.child(head).child(mid).child(foot);
         } else {
             panel = panel
@@ -1328,17 +1258,46 @@ impl MainWindow {
         panel.into_any_element()
     }
 
+    fn render_usage_facts(&self,cx:&App)->AnyElement {
+        let tokens=Self::tokens(cx);
+        let mut body=v_flex().id("usage-facts-scroll").w_full().max_h(px(300.)).overflow_y_scrollbar().p_3().gap_2().text_xs();
+        let (root,selected)=crate::usage_view::presented_scope(self.workspace.usage_scene.as_ref().map(|s|(s.key.root,self.workspace.usage_scene_selected)),self.scan_node(),self.workspace.usage_focus.as_ref().and_then(|p|self.workspace.scan_lookup.get(&key(Path::new(p)))).copied());
+        let Some((scan,selected,_root))=self.inspector_data(selected,root) else{return body.child("尚无已发布的目录数据").into_any_element()};
+        let Some(facts)=crate::usage_presentation::inspector_facts(&scan,Some(selected)) else{return body.child("请选择目录或文件").into_any_element()};
+        let node=facts.selected;
+        let section=|title:&str|div().font_weight(FontWeight::SEMIBOLD).text_color(tokens.text_primary).child(title.to_owned());
+        let row=|label:&str,value:String|h_flex().w_full().gap_2().items_start()
+            .child(div().w(px(76.)).flex_shrink_0().text_color(tokens.text_secondary).child(label.to_owned()))
+            .child(div().flex_1().min_w_0().child(value));
+        let list_status=self.workspace.inspector.displayed.as_ref().map(|s|s.issue.clone().unwrap_or_else(||if s.partial{"当前有界列表不完整".into()}else if node.directory{format!("{} 个直接子项",node.children.len())}else{"文件不含子项".into()})).unwrap_or_else(||"尚未读取".into());
+        body=body.child(section("当前对象"))
+            .child(row("路径",display_path(&node.path)))
+            .child(row("文件记录",node.files.to_string()))
+            .child(row("目录记录",node.directories.to_string()))
+            .child(row("写入时间",if node.mtime>0{search_logic::format_time(node.mtime)}else{"未记录".into()}))
+            .child(row("子项",list_status))
+            .when(node.hardlink_duplicate,|b|b.child(div().text_color(tokens.warning).child("硬链接别名；空间计入另一路径")))
+            .child(div().h(px(1.)).bg(tokens.border))
+            .child(section(if scan.logical_generation.is_some(){"索引统计范围"}else{"扫描统计范围"}))
+            .child(row("范围",display_path(facts.statistics_root)))
+            .child(div().text_color(if scan.partial||scan.unknown>0||scan.errors>0{tokens.warning}else{tokens.text_secondary}).child(self.usage_warning_line(&scan)))
+            .child(div().text_color(tokens.text_tertiary).child("待验证数属于上述统计范围，不是选中项计数"))
+            .child(div().h(px(1.)).bg(tokens.border))
+            .child(section("口径与连接"))
+            .child(div().text_color(tokens.text_secondary).child(if self.workspace.engine_usage{"目录显示索引逻辑大小，不等于磁盘实占；系统卷容量独立采样"}else{"目录显示本地已测占用；系统卷容量独立采样"}));
+        if let Some(error)=self.session.read(cx).engine_footer.last.as_ref().and_then(|s|s.watch_error.as_ref()){
+            body=body.child(row("全局连接",error.clone())).child(div().text_color(tokens.text_tertiary).child("全局诊断可能涉及其他卷，不代表选中对象的独立时效"));
+        }
+        body.child(row("索引标识",format!("{:?}",scan.logical_generation)))
+            .when(!self.workspace.scan_status.is_empty(),|b|b.child(row("读取状态",self.workspace.scan_status.clone())))
+            .into_any_element()
+    }
+
     fn usage_warning_line(&self, scan: &disk_usage::Scan) -> String {
-        if let Some((epoch, generation)) = scan.logical_generation {
-            return format!(
-                "索引逻辑大小 · e{epoch}/g{generation} · {} 项元数据未验证 · 非实际占用{}",
-                scan.unknown,
-                if self.workspace.engine_next.is_some() {
-                    " · 当前分页，尚有子项"
-                } else {
-                    ""
-                }
-            );
+        if scan.logical_generation.is_some() {
+            let mut text=if scan.unknown>0{format!("{} 项元数据待验证",scan.unknown)}else{"索引数据已载入".into()};
+            if scan.partial{text.push_str("；部分未确认");}
+            return text;
         }
         let mut parts = Vec::new();
         if scan.is_legacy_entry_truncation() {
@@ -1368,6 +1327,6 @@ impl MainWindow {
         if parts.is_empty() && scan.partial {
             parts.push("部分结果".into());
         }
-        parts.join(" · ")
+        parts.join("；")
     }
 }

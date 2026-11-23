@@ -6,6 +6,7 @@ mod load_state;
 mod startup_compact;
 mod usage_fixture;
 mod watch_health;
+mod namespace_retry;
 
 mod backfill;
 mod metadata_pipeline;
@@ -34,7 +35,8 @@ pub(crate) const SERVICE_LAST_ERROR_FILENAME: &str = "findx2-service-last-error.
 // including parse/startup failures before RunFlags exist.
 fn startup_error_path() -> std::path::PathBuf {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--no-watch" || a == "--fixture-root") {
+    let isolated_pipe=args.windows(2).any(|w|w[0]=="--pipe" && !w[1].eq_ignore_ascii_case("findx2") && !w[1].eq_ignore_ascii_case(r"\\.\pipe\findx2"));
+    if isolated_pipe || args.iter().any(|a| a == "--no-watch" || a == "--fixture-root") {
         if let Some(i) = args.iter().position(|a| a == "--index" || a == "-i") {
             if let Some(index) = args.get(i + 1) { return std::path::PathBuf::from(index).with_extension("last-error.txt"); }
         }
@@ -120,7 +122,7 @@ fn try_main() -> anyhow::Result<()> {
         }
         // Strict fixtures must not clear the formal service's shared diagnostic file.
         if !cli.no_watch {
-            let _ = std::fs::remove_file(std::env::temp_dir().join(SERVICE_LAST_ERROR_FILENAME));
+            let _ = std::fs::remove_file(startup_error_path());
         }
 
         return run::run_foreground(
@@ -151,7 +153,7 @@ fn try_main() -> anyhow::Result<()> {
         }
         // Strict fixtures must not clear the formal service's shared diagnostic file.
         if !cli.no_watch {
-            let _ = std::fs::remove_file(std::env::temp_dir().join(SERVICE_LAST_ERROR_FILENAME));
+            let _ = std::fs::remove_file(startup_error_path());
         }
         return run_unix::run_foreground(
             cli.index,

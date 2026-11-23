@@ -3,6 +3,7 @@
 #[cfg(windows)]
 mod full_index_build;
 mod metadata_fill;
+mod mft_identity;
 mod mft;
 mod mft_read;
 mod nt_dir_query;
@@ -33,8 +34,8 @@ pub use nt_dir_query::DirMetadataReader;
 #[cfg(windows)]
 pub use open_by_id::metadata_terminal_counts;
 
-#[cfg(windows)]
+#[cfg(any(windows,test))]
 mod ntfs_namespace;
 
 #[cfg(windows)]
-pub use ntfs_namespace::NtfsUnlinkResolver;
+pub use ntfs_namespace::{NtfsUnlinkResolver,FileIdOpenError,open_file_by_id_diagnostic,is_retryable_namespace_error};
