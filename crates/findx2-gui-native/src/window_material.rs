@@ -134,6 +134,22 @@ pub fn clamp_opacity(value: f32) -> f32 {
     }
 }
 
+/// Append-only debug trace so backdrop failures can be diagnosed without a
+/// console (double-clicked GUI has nowhere to print). Best effort: logging
+/// must never break applying.
+pub fn trace(line: &str) {
+    let mut path = std::env::temp_dir();
+    path.push("findx-material-debug.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 /// Backdrop material of a top-level window. Stored in prefs; old files
 /// without the field deserialize to [`WindowMaterial::Solid`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,14 +258,10 @@ mod windows_impl {
             )
         };
         let ok = result.is_ok();
-        eprintln!(
-            "[material] DwmSetWindowAttribute hwnd={:?} attr={} value={} ok={} err={:?}",
-            hwnd,
-            attr,
-            value,
-            ok,
+        super::trace(&format!(
+            "DwmSetWindowAttribute hwnd={hwnd:?} attr={attr} value={value} ok={ok} err={:?}",
             result.err()
-        );
+        ));
         ok
     }
 
@@ -345,29 +357,23 @@ mod windows_impl {
     pub fn apply(window: &Window, material: Material, dark: bool) -> Material {
         let effective = apply_inner(window, material, dark);
         if let Some(hwnd) = hwnd_of(window) {
-            eprintln!(
-                "[material] effective={:?} readback=[{}]",
-                effective,
+            super::trace(&format!(
+                "effective={effective:?} readback=[{}]",
                 read_backdrop(hwnd)
-            );
+            ));
         }
         effective
     }
 
     fn apply_inner(window: &Window, material: Material, dark: bool) -> Material {
-        use super::probe_os_support;
+        use super::{probe_os_support, trace};
         let support = probe_os_support();
-        eprintln!(
-            "[material] apply requested={:?} dark={} build={} sys={} micafx={} legacy={}",
-            material,
-            dark,
-            support.build,
-            support.system_backdrop,
-            support.mica_effect,
-            support.legacy_acrylic
-        );
+        trace(&format!(
+            "apply requested={material:?} dark={dark} build={} sys={} micafx={} legacy={}",
+            support.build, support.system_backdrop, support.mica_effect, support.legacy_acrylic
+        ));
         let Some(hwnd) = hwnd_of(window) else {
-            eprintln!("[material] no HWND, staying solid");
+            trace("no HWND, staying solid");
             return Material::Solid;
         };
         // Skip calls the OS cannot honor; every remaining setter below is

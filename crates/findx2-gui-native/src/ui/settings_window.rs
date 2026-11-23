@@ -479,15 +479,28 @@ impl SettingsWindow {
         crate::session::persist_prefs(self.session.read(cx).prefs.clone(), cx);
         // Backdrops live per HWND: constructors only cover newly opened
         // windows, so re-apply to every live one here.
+        let handles = cx.windows();
+        crate::window_material::trace(&format!(
+            "set_material {material:?}: updating {} window(s)",
+            handles.len()
+        ));
         let mut effective = material;
-        for handle in cx.windows() {
-            let applied = handle
-                .update(cx, |_, window, _| {
-                    crate::window_material::apply_to_window(window, material, dark)
-                })
-                .unwrap_or(material);
-            if applied != material {
-                effective = applied;
+        for handle in handles {
+            match handle.update(cx, |_, window, _| {
+                crate::window_material::apply_to_window(window, material, dark)
+            }) {
+                Ok(applied) => {
+                    crate::window_material::trace(&format!(
+                        "window updated -> {applied:?}"
+                    ));
+                    if applied != material {
+                        effective = applied;
+                    }
+                }
+                Err(e) => {
+                    crate::window_material::trace(&format!("window update FAILED: {e:?}"));
+                    effective = crate::window_material::WindowMaterial::Solid;
+                }
             }
         }
         if effective != material {
