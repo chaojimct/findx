@@ -145,6 +145,29 @@ impl MainWindow {
         .detach();
     }
 
+    /// Sidebar rows are plain paths (not search hits), so they get the same
+    /// Explorer reveal through a dedicated entry point.
+    pub(super) fn reveal_sidebar_path(&mut self, path: &str, cx: &mut Context<Self>) {
+        let path = path.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { crate::open_path::reveal_in_folder(&path) })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.transient_file_notice("已在文件管理器中显示".into(), cx),
+                    Err(e) => {
+                        this.workspace.status = e.clone();
+                        this.file_actions.summary = e;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub(super) fn render_run_confirmation(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = Self::tokens(cx);
         let name = self

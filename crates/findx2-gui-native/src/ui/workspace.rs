@@ -95,7 +95,7 @@ pub(super) fn display_path(p: &Path) -> String {
         s.strip_prefix(r"\\?\").unwrap_or(&s).to_owned()
     }
 }
-fn key(p: &Path) -> String {
+pub(super) fn key(p: &Path) -> String {
     display_path(p)
         .replace('/', "\\")
         .trim_end_matches('\\')
@@ -198,8 +198,6 @@ pub(super) struct Workspace {
     locations: Vec<(&'static str, &'static str, PathBuf)>,
     sidebar_source: Option<(&'static str, String)>,
     collapsed_groups: std::collections::HashSet<&'static str>,
-    /// Target of the sidebar tree context menu (right-click records it before the menu opens).
-    pub(super) sidebar_tree_target: Option<PathBuf>,
     /// Explorer-style folder tree: expanded keys, loaded children, in-flight loads.
     tree_expanded: HashMap<String, PathBuf>,
     tree_children: HashMap<String, Vec<(String, PathBuf)>>,
@@ -368,7 +366,6 @@ impl Workspace {
             locations: Vec::new(),
             sidebar_source: None,
             collapsed_groups: Default::default(),
-            sidebar_tree_target: None,
             tree_expanded: Default::default(),
             tree_children: Default::default(),
             tree_loading: Default::default(),
@@ -3447,7 +3444,7 @@ impl MainWindow {
         .detach();
     }
 
-    fn toggle_tree_node(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    pub(super) fn toggle_tree_node(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let k = key(&path);
         if self.workspace.tree_expanded.remove(&k).is_some() {
             cx.notify();

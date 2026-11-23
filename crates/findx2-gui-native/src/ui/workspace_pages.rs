@@ -529,17 +529,35 @@ impl MainWindow {
             )
             .into_any_element()
     }
-    /// One shared context menu for every sidebar row. Right-click records the
-    /// target path first; the actions then consume it through the session focus.
+    /// One shared context menu for every sidebar row. Actions carry the path
+    /// themselves, so rows no longer need an `on_mouse_down(Right)` listener
+    /// (which made GPUI leave a stale pressed highlight after the menu closed).
     fn sidebar_context_menu(
         &self,
+        path: &Path,
         favorite_label: Option<&'static str>,
+        expandable: bool,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let focus = self.focus.clone();
+        let path = SharedString::from(display_path(path));
         move |menu, _, _| {
-            let mut menu = menu.menu("在新标签页中打开", Box::new(SidebarTreeOpenNewTab));
+            let mut menu = menu.menu(
+                "在新标签页中打开",
+                Box::new(SidebarOpenNewTab { path: path.clone() }),
+            );
             if let Some(label) = favorite_label {
-                menu = menu.menu(label, Box::new(SidebarTreeToggleFavorite));
+                menu = menu.menu(label, Box::new(SidebarToggleFavorite { path: path.clone() }));
+            }
+            menu = menu.menu(
+                "在文件资源管理器中显示",
+                Box::new(SidebarReveal { path: path.clone() }),
+            );
+            menu = menu.menu("复制路径", Box::new(SidebarCopyPath { path: path.clone() }));
+            if expandable {
+                menu = menu.menu(
+                    "展开 / 折叠文件夹",
+                    Box::new(SidebarToggleExpand { path: path.clone() }),
+                );
             }
             menu.action_context(focus.clone())
         }
@@ -561,7 +579,7 @@ impl MainWindow {
         // The row background is inset 12px on BOTH edges. Inside: 16px indent,
         // 20px icon slot, a flexible ellipsized text slot, and 16px tail slot.
         let row_width = DIRECTORY_SIDEBAR_WIDTH - 24.;
-        let right_path = path.clone();
+        let menu = self.sidebar_context_menu(&path, favorite_label, false);
         Button::new(SharedString::from(format!("sidebar-{group}-{index}")))
             .ghost()
             .w_full()
@@ -594,15 +612,11 @@ impl MainWindow {
                     )
                     .child(div().w(px(16.)).flex_shrink_0()),
             )
-            .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| {
-                this.workspace.sidebar_tree_target = Some(right_path.clone());
-                cx.stop_propagation();
-            }))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.workspace.sidebar_source = Some((group, key(&path)));
                 this.workspace_navigate(path.clone(), ViewMode::Directory, None, true, cx);
             }))
-            .context_menu(self.sidebar_context_menu(favorite_label))
+            .context_menu(menu)
             .into_any_element()
     }
     fn render_location_group(
@@ -679,7 +693,6 @@ impl MainWindow {
         let on = self.sidebar_active_group(cx) == Some("tree")
             && key(&path) == key(&self.workspace.location);
         let full = display_path(&path);
-        let right_path = path.clone();
         let chevron_path = path.clone();
         let favorite_label = if self
             .session
@@ -695,6 +708,7 @@ impl MainWindow {
         };
         let indent = 4. + depth.min(6) as f32 * 12.;
         let row_width = DIRECTORY_SIDEBAR_WIDTH - 24.;
+        let menu = self.sidebar_context_menu(&path, favorite_label, true);
         div()
             .id(SharedString::from(format!("sidebar-tree-{k}")))
             .w(px(row_width))
@@ -705,15 +719,11 @@ impl MainWindow {
             .tooltip(move |window, cx| {
                 gpui_kit::component::tooltip::Tooltip::new(full.clone()).build(window, cx)
             })
-            .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| {
-                this.workspace.sidebar_tree_target = Some(right_path.clone());
-                cx.stop_propagation();
-            }))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.workspace.sidebar_source = Some(("tree", key(&path)));
                 this.workspace_navigate(path.clone(), ViewMode::Directory, None, true, cx);
             }))
-            .context_menu(self.sidebar_context_menu(favorite_label))
+            .context_menu(menu)
             .child(
                 h_flex()
                     .w_full()
@@ -858,7 +868,18 @@ impl MainWindow {
             }
             favorites.push(item);
         }
-        let recent = path_items(&recent_paths, "folder-clock", None);
+        let recent = path_items(&recent_paths, "folder-clock", None)
+            .into_iter()
+            .map(|(name, icon, path, _)| {
+                let k = key(&path);
+                let label = if fav_paths.iter().any(|p| key(Path::new(p)) == k) {
+                    "从收藏夹移除"
+                } else {
+                    "加入收藏夹"
+                };
+                (name, icon, path, Some(label))
+            })
+            .collect::<Vec<_>>();
         v_flex()
             .w(px(DIRECTORY_SIDEBAR_WIDTH))
             .h_full()

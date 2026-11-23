@@ -424,14 +424,18 @@ fn usage_toolbar_icon_slots_and_depth_value_are_compact_and_stable() {
 
 #[test] fn sidebar_context_menu_actions_are_declared_and_routed() {
     let pages = include_str!("workspace_pages.rs");
-    assert!(pages.contains("SidebarTreeOpenNewTab") && pages.contains("SidebarTreeToggleFavorite"),
-        "sidebar rows must expose both context actions");
-    assert_eq!(pages.matches("this.workspace.sidebar_tree_target = Some(").count(), 2,
-        "both flat rows and tree rows must record the right-click target");
-    assert!(pages.contains("context_menu(self.sidebar_context_menu("),
-        "the shared context-menu builder must be attached to sidebar rows");
+    assert!(pages.contains("SidebarOpenNewTab") && pages.contains("SidebarToggleFavorite")
+        && pages.contains("SidebarReveal") && pages.contains("SidebarCopyPath")
+        && pages.contains("SidebarToggleExpand"),
+        "sidebar rows must expose the full context-menu action set");
+    assert!(!pages.contains("sidebar_tree_target"),
+        "actions carry their own path; no right-click target stashing may remain");
+    assert_eq!(pages.matches(".on_mouse_down(MouseButton::Right").count(), 0,
+        "right-click must not mark rows as pressed; that caused stale highlights");
+    assert_eq!(pages.matches(".context_menu(menu)").count(), 2,
+        "both flat rows and tree rows must attach the shared menu");
     assert!(pages.contains("加入收藏夹") && pages.contains("从收藏夹移除"),
-        "favorite action must reflect current state");
+        "sidebar favorite action must reflect current state");
 
     let main = include_str!("main_window.rs");
     let actions = main
@@ -441,14 +445,40 @@ fn usage_toolbar_icon_slots_and_depth_value_are_compact_and_stable() {
         .split(");")
         .next()
         .unwrap();
-    assert!(actions.contains("SidebarTreeOpenNewTab") && actions.contains("SidebarTreeToggleFavorite"),
-        "both actions must be registered with GPUI");
-    assert!(main.contains("&SidebarTreeOpenNewTab") && main.contains("open_directory_in_new_tab(path, window, cx)"),
-        "new-tab action must actually open a tab at the target path");
-    assert!(main.contains("&SidebarTreeToggleFavorite") && main.contains("toggle_favorite(path, cx)"),
+    assert!(actions.contains("ContextToggleFavorite"),
+        "file context menu needs a favorite action in the GPUI registry");
+    assert!(main.contains("&SidebarOpenNewTab") && main.contains("open_directory_in_new_tab("),
+        "new-tab action must actually open a tab at the carried path");
+    assert!(main.contains("&SidebarToggleFavorite") && main.contains("toggle_favorite("),
         "favorite action must actually update the saved favorites");
-    assert_eq!(main.matches("sidebar_tree_target.take()").count(), 2,
-        "each action must consume the target exactly once");
+    assert!(main.contains("&SidebarReveal") && main.contains("reveal_sidebar_path("),
+        "reveal action must open Explorer");
+    assert!(main.contains("&SidebarCopyPath") && main.contains("write_to_clipboard("),
+        "copy-path action must write the clipboard");
+    assert!(main.contains("&SidebarToggleExpand") && main.contains("toggle_tree_node("),
+        "expand action must toggle the tree node");
+    assert!(main.contains("&ContextToggleFavorite") && main.contains("context_action(13, window, cx)"),
+        "file favorite action must route through the shared context handler");
+    assert!(main.contains("event.button == MouseButton::Right") && main.contains("window.prevent_default()"),
+        "right-click must not leave GPUI's pressed/active highlight behind");
+    assert!(!main.contains("SidebarTreeOpenNewTab") && !main.contains("SidebarTreeToggleFavorite"),
+        "old target-based actions must be gone");
+}
+
+#[test] fn file_context_menu_exposes_favorite_for_files_and_directories() {
+    let src = include_str!("file_actions.rs");
+    assert!(src.contains("ContextToggleFavorite"),
+        "file right-click menu must include the favorite action");
+    assert!(src.contains("收藏此目录") && src.contains("收藏所在目录"),
+        "label must distinguish a folder/file-parent target");
+    assert!(src.contains("取消收藏此目录") && src.contains("取消收藏所在目录"),
+        "label must reflect the already-favorited state");
+    assert!(src.contains("IconName::Star") && src.contains("IconName::StarOff"),
+        "favorite icon must reflect current state");
+    assert!(src.contains("13 if single =>") && src.contains("13 if current_root =>"),
+        "context handler must favorite a selected row or the current blank directory");
+    assert!(src.contains("locate_parent(&hits[0].path)"),
+        "files must favorite their containing directory, not the file itself");
 }
 
 #[test]fn home_completion_keeps_published_scene_scan_until_scene_handoff(){

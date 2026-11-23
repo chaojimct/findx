@@ -9,6 +9,7 @@ use search_session::SearchSnapshot;
 #[path = "workspace.rs"]
 mod workspace;
 use gpui_kit::component::Disableable as _;
+use std::path::PathBuf;
 use std::time::Duration;
 use workspace::{ViewMode, Workspace};
 
@@ -53,6 +54,7 @@ actions!(
         ContextOpenWith,
         ContextLocate,
         ContextOpenInNewTab,
+        ContextToggleFavorite,
         ContextCopyPath,
         ContextCopy,
         ContextCut,
@@ -83,10 +85,37 @@ actions!(
         DirectoryTab8,
         DirectoryTab9,
         ToggleSidebar,
-        SidebarTreeOpenNewTab,
-        SidebarTreeToggleFavorite,
     ]
 );
+
+// Sidebar context-menu actions carry their own path. That removes the need for
+// an `on_mouse_down(Right)` handler on every row, which made GPUI apply the
+// pressed/hover style on right-click and leave a stale highlight behind.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = findx_native, no_json)]
+pub struct SidebarOpenNewTab {
+    pub path: SharedString,
+}
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = findx_native, no_json)]
+pub struct SidebarToggleFavorite {
+    pub path: SharedString,
+}
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = findx_native, no_json)]
+pub struct SidebarReveal {
+    pub path: SharedString,
+}
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = findx_native, no_json)]
+pub struct SidebarCopyPath {
+    pub path: SharedString,
+}
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = findx_native, no_json)]
+pub struct SidebarToggleExpand {
+    pub path: SharedString,
+}
 
 const FILE_SHORTCUT_CONTEXT: &str = "FindXMain && !Input";
 
@@ -2217,7 +2246,15 @@ impl Render for MainWindow {
 
         v_flex()
             .id("findx-main")
-            .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                // GPUI marks any element under a MouseDown as "active" in the
+                // bubble phase, including right-clicks. That leaves a stale
+                // pressed/hover highlight on rows and buttons after a context
+                // menu closes. Right-click never needs that pressed state, and
+                // gpui-component's context menu does not check default_prevented.
+                if event.button == MouseButton::Right {
+                    window.prevent_default();
+                }
                 if this.table_navigation_focus.pointer() {
                     cx.notify();
                 }
@@ -2336,15 +2373,25 @@ impl Render for MainWindow {
                     this.context_action(11, window, cx)
                 }),
             )
-            .on_action(cx.listener(|this, _: &SidebarTreeOpenNewTab, window, cx| {
-                if let Some(path) = this.workspace.sidebar_tree_target.take() {
-                    this.open_directory_in_new_tab(path, window, cx);
-                }
+            .on_action(cx.listener(|this, action: &SidebarOpenNewTab, window, cx| {
+                this.open_directory_in_new_tab(PathBuf::from(action.path.to_string()), window, cx);
             }))
-            .on_action(cx.listener(|this, _: &SidebarTreeToggleFavorite, _, cx| {
-                if let Some(path) = this.workspace.sidebar_tree_target.take() {
-                    this.toggle_favorite(path, cx);
-                }
+            .on_action(cx.listener(|this, action: &SidebarToggleFavorite, _, cx| {
+                this.toggle_favorite(PathBuf::from(action.path.to_string()), cx);
+            }))
+            .on_action(cx.listener(|this, action: &SidebarReveal, _, cx| {
+                this.reveal_sidebar_path(&action.path, cx);
+            }))
+            .on_action(cx.listener(|this, action: &SidebarCopyPath, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(action.path.to_string()));
+                this.workspace.status = "已复制路径".into();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, action: &SidebarToggleExpand, _, cx| {
+                this.toggle_tree_node(PathBuf::from(action.path.to_string()), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ContextToggleFavorite, window, cx| {
+                this.context_action(13, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ContextCopyPath, window, cx| {
                 this.context_action(3, window, cx)

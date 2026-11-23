@@ -1,5 +1,6 @@
 //! One action model for search rows, directory rows and allocation nodes.
 use super::*;
+use super::workspace::key;
 use crate::{
     browser::FileAction,
     file_transfer::{self, Clipboard, Source},
@@ -375,6 +376,14 @@ impl MainWindow {
             } else {
                 self.session.read(cx).prefs.browser_fit_columns
             };
+            let blank_favorite = self.workspace.mode == ViewMode::Directory
+                && self
+                    .session
+                    .read(cx)
+                    .prefs
+                    .browser_favorites
+                    .iter()
+                    .any(|p| key(Path::new(p)) == key(&self.workspace.location));
             return menu
                 .menu_with_icon("刷新", IconName::RefreshCw, Box::new(WorkspaceRefresh))
                 .menu_with_icon_and_disabled(
@@ -417,8 +426,64 @@ impl MainWindow {
                             IconName::Search,
                             Box::new(ContextScope),
                         )
+                        .menu_with_icon(
+                            if blank_favorite {
+                                "取消收藏此目录"
+                            } else {
+                                "收藏此目录"
+                            },
+                            if blank_favorite {
+                                IconName::StarOff
+                            } else {
+                                IconName::Star
+                            },
+                            Box::new(ContextToggleFavorite),
+                        )
                 });
         }
+        // Favorites are directory shortcuts. A file resolves to its parent, a
+        // folder to itself, and blank space in a directory to that directory.
+        let favorite_target = if blank {
+            Some((self.workspace.location.clone(), "此目录"))
+        } else if single {
+            let path = &hits[0].path;
+            if hits[0].is_directory {
+                Some((PathBuf::from(path), "此目录"))
+            } else {
+                crate::interaction_logic::locate_parent(path)
+                    .map(|parent| (PathBuf::from(parent), "所在目录"))
+            }
+        } else {
+            None
+        };
+        let show_favorite = favorite_target.is_some();
+        let (favorite_label, favorite_icon) = match &favorite_target {
+            Some((path, noun)) => {
+                let fav = self
+                    .session
+                    .read(cx)
+                    .prefs
+                    .browser_favorites
+                    .iter()
+                    .any(|p| key(Path::new(p)) == key(path));
+                let verb = if fav { "取消收藏" } else { "收藏" };
+                let label: &'static str = match (verb, *noun) {
+                    ("收藏", "此目录") => "收藏此目录",
+                    ("收藏", _) => "收藏所在目录",
+                    (_, "此目录") => "取消收藏此目录",
+                    (_, _) => "取消收藏所在目录",
+                };
+                (
+                    label,
+                    if fav {
+                        IconName::StarOff
+                    } else {
+                        IconName::Star
+                    },
+                )
+            }
+            None => ("收藏此目录", IconName::Star),
+        };
         menu.menu_with_icon_and_disabled(
             "打开",
             IconName::ExternalLink,
@@ -461,6 +526,9 @@ impl MainWindow {
                 Icon::default().path("icons/folder-plus.svg"),
                 Box::new(ContextOpenInNewTab),
             )
+        })
+        .when(show_favorite, |menu| {
+            menu.menu_with_icon(favorite_label, favorite_icon, Box::new(ContextToggleFavorite))
         })
         .separator()
         .menu_with_icon("复制路径", IconName::Copy, Box::new(ContextCopyPath))
@@ -633,6 +701,21 @@ impl MainWindow {
                     self.workspace.selected_rows = (0..self.workspace.rows.len()).collect();
                 }
                 self.preview_active_selection(cx);
+            }
+            13 if single => {
+                let target = if hits[0].is_directory {
+                    PathBuf::from(&hits[0].path)
+                } else {
+                    match crate::interaction_logic::locate_parent(&hits[0].path) {
+                        Some(parent) => PathBuf::from(parent),
+                        None => return,
+                    }
+                };
+                self.toggle_favorite(target, cx);
+            }
+            13 if current_root => {
+                let path = self.workspace.location.clone();
+                self.toggle_favorite(path, cx);
             }
             12 if self.workspace.mode != ViewMode::Usage => {
                 let search = self.workspace.mode == ViewMode::Search;
