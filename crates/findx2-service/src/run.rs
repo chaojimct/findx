@@ -436,6 +436,8 @@ pub(crate) fn run_foreground(
         let mut g = slot.write().expect("EngineSlot 写锁中毒");
         *g = Some(engine.clone());
     }
+    // 内容索引：存在则挂载 + 增量跟随；不存在则 `content:` 自动走慢路径。
+    crate::content_index::init(&index, engine.clone());
 
     // legacy 多卷索引拓扑自动升级：2.4.x 旧库没有每卷自父根（顶层目录 parent_idx==0
     // 哨兵），usage（目录占用树）等新特性在旧拓扑上无法构建——启动期的 enable_usage
@@ -795,6 +797,8 @@ fn usn_watch_loop(
                 set_watch_error(letter, Some(format!("legacy namespace batch failed; cursor retained: {e}")));
                 anyhow::anyhow!(e)
             })?;
+        // 内容增量跟随：apply 成功后把事件转 job（热路径只做轻量提取）。
+        crate::content_index::notify_applied(volume_letter, pending);
         pending.clear();
         Ok(total)
     };
