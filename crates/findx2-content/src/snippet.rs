@@ -29,7 +29,29 @@ pub fn query_terms(query_text: &str, tok: &mut crate::index::HybridTokenizer) ->
     out
 }
 
-/// HTML 转义（snippet 其余部分），命中片段包 `<b>`（与 tantivy to_html 同格式）。
+/// 头部预览（拼音查询等命中词不在原文时用；截前 ~240 字）。
+pub fn head_snippet(text: &str) -> Option<String> {
+    let mut end = 0usize;
+    let mut count = 0usize;
+    for (i, _) in text.char_indices() {
+        if count >= WINDOW_CHARS {
+            break;
+        }
+        end = i;
+        count += 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    // end 停在最后一个字符起点，向前取到该字符末尾。
+    let last_len = text[end..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+    let end = (end + last_len).min(text.len());
+    let mut out = escape(&text[..end]);
+    if end < text.len() {
+        out.push_str("…");
+    }
+    Some(out)
+}
 fn escape(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
@@ -199,7 +221,11 @@ impl SnippetPool {
             }
         }
         let text = extract_text(std::path::Path::new(path)).ok()?.text;
-        let html = make_snippet(&text, terms)?;
+        let html = match make_snippet(&text, terms) {
+            Some(h) => h,
+            None if query_text.is_ascii() => head_snippet(&text)?,
+            None => return None,
+        };
         if let Ok(mut c) = self.cache.lock() {
             c.put(key, html.clone());
         }

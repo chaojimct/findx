@@ -12,6 +12,11 @@ pub mod office;
 pub mod pdf_pool;
 pub mod build;
 pub mod snippet;
+pub mod pinyin_aux;
+pub use pinyin_aux::{
+    aux_dir_for, build_aux_from_index, full_text, initials_text, AuxStats, AUX_FULL_SUFFIX,
+    AUX_INITIALS_SUFFIX, CHUNK_SYLLABLES, DOC_SHARD, MAX_FULL_CHARS,
+};
 
 pub use build::{
     build_from_plan, build_from_store, build_vols, plan_range_from_store, BuildConfig, BuildStats,

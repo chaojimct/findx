@@ -34,7 +34,7 @@ pub const TOKENIZER_JIEBA: &str = "jieba_findx";
 /// 索引目录里的版本标记文件（tantivy 自家 meta.json 之外，我方 schema 版本）。
 const SCHEMA_VERSION_FILE: &str = "schema_version.json";
 
-fn read_schema_version(dir: &Path) -> Option<u32> {
+pub(crate) fn read_schema_version(dir: &Path) -> Option<u32> {
     let txt = std::fs::read_to_string(dir.join(SCHEMA_VERSION_FILE)).ok()?;
     txt.trim().parse().ok()
 }
@@ -109,7 +109,7 @@ pub fn doc_key(volume_id: &str, frn: u64) -> u64 {
     h.finish()
 }
 
-fn build_schema() -> (Schema, ContentFields) {
+pub(crate) fn build_schema() -> (Schema, ContentFields) {
     let mut sb = Schema::builder();
     let key = sb.add_u64_field("key", INDEXED | STORED);
     let frn = sb.add_u64_field("frn", STORED | FAST);
@@ -290,6 +290,75 @@ impl ContentIndex {
         let qp = QueryParser::for_index(searcher.index(), vec![self.fields.body]);
         let query = qp.parse_query(query_text).map_err(Error::from)?;
         let top = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
+        let mut out = Vec::with_capacity(top.len());
+        for (score, addr) in top {
+            let doc: tantivy::TantivyDocument = searcher.doc(addr)?;
+            let frn = doc
+                .get_first(self.fields.frn)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let volume_id = doc
+                .get_first(self.fields.volume)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            out.push((volume_id, frn, score));
+        }
+        Ok(out)
+    }
+
+    /// 拼音辅索引查询（只接受纯 ASCII 查询；含 CJK 直接返回空，调用方走主索引）。
+    ///
+    /// 单 token（如 `qw`）：精确 OR 前缀（`^qw.*`，块首匹配）。
+    /// 多 token（如 `quan wen`）：OR 相加，命中越多排名越前。
+    /// 返回 (volume_id, frn, score)，与 search_ids 同形，方便服务层合并。
+    pub fn search_pinyin(&self, query_text: &str, limit: usize) -> Result<Vec<(String, u64, f32)>> {
+        use tantivy::query::{BooleanQuery, Occur, RegexQuery, TermQuery};
+        use tantivy::Term;
+        if !query_text.is_ascii() {
+            return Ok(Vec::new());
+        }
+        let mut tok = HybridTokenizer::new();
+        let terms = crate::snippet::query_terms(query_text, &mut tok);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.reader.reload()?;
+        let searcher = self.reader.searcher();
+        let field = self.fields.body;
+        let query: Box<dyn tantivy::query::Query> = if terms.len() == 1 {
+            let t = &terms[0];
+            // token 已是小写字母数字（simple+lower），无正则元字符，可直接拼 ^t.*
+            let re = RegexQuery::from_pattern(&format!("{t}.*"), field)
+                .map_err(|e| Error::Index(format!("拼音正则查询构造失败: {e}")))?;
+            Box::new(BooleanQuery::new(vec![
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(field, t),
+                        IndexRecordOption::Basic,
+                    ))
+                        as Box<dyn tantivy::query::Query>,
+                ),
+                (Occur::Should, Box::new(re) as Box<dyn tantivy::query::Query>),
+            ]))
+        } else {
+            let subs: Vec<(Occur, Box<dyn tantivy::query::Query>)> = terms
+                .iter()
+                .map(|t| {
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(field, t),
+                            IndexRecordOption::Basic,
+                        ))
+                            as Box<dyn tantivy::query::Query>,
+                    )
+                })
+                .collect();
+            Box::new(BooleanQuery::new(subs))
+        };
+        let top = searcher.search(&*query, &TopDocs::with_limit(limit).order_by_score())?;
         let mut out = Vec::with_capacity(top.len());
         for (score, addr) in top {
             let doc: tantivy::TantivyDocument = searcher.doc(addr)?;

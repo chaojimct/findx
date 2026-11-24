@@ -80,6 +80,17 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         rebuild: bool,
     },
+    /// 构建拼音辅索引（`index.bin.content.pinyin-initials/` + `.pinyin-full/`）：
+    /// 从主内容倒排直接回填，不重读业务文件。供拼音查询加速；
+    /// 不存在时拼音查询自动走主索引（无拼音能力）。
+    ContentIndexPinyin {
+        /// index.bin 路径
+        #[arg(short, long, default_value = "index.bin")]
+        index: std::path::PathBuf,
+        /// 删除旧拼音辅索引后全量重建
+        #[arg(long, default_value_t = false)]
+        rebuild: bool,
+    },
     /// 合并内容索引段（终局 optimize）：不重抽，只把现有段并成一个，
     /// 查询更快、体积最小。构建结束已自动做过一次；此命令用于手动补压。
     ContentOptimize {
@@ -366,6 +377,23 @@ fn run() -> Result<()> {
         }
         Commands::ContentIndex { index, rebuild } => {
             build_content_index(&index, rebuild)?;
+        }
+        Commands::ContentIndexPinyin { index, rebuild } => {
+            use findx2_content::build_aux_from_index;
+            let t0 = std::time::Instant::now();
+            let mut last_log = std::time::Instant::now();
+            let st = build_aux_from_index(&index, rebuild, |scanned, docs| {
+                if last_log.elapsed().as_secs() >= 5 {
+                    last_log = std::time::Instant::now();
+                    eprintln!("[pinyin] 扫描倒排 {scanned} / 已建辅 {docs}（{:.1}s）", t0.elapsed().as_secs_f64());
+                }
+                true
+            })?;
+            eprintln!(
+                "拼音辅索引构建完成：回填 {} 篇，耗时 {:.1}s",
+                st.docs,
+                t0.elapsed().as_secs_f64(),
+            );
         }
         Commands::ContentOptimize { index } => {
             use findx2_content::{content_dir_for, open_if_exists};
