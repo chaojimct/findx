@@ -70,8 +70,12 @@
   生产有 USN 增量清理残留项，非阻塞。附带发现：hybrid 在重叠区比现状 ENUM 更全（待 P1-1 深究 USN-walk 漏检原因）。
 - 两处校验失败 run 照旧走 ENUM 补尾（vcn=818048 len=51228 老坏段 + vcn=1151297 末端 run），尾部新增仅 17 万（其余去重命中），
   说明 bulk 与 ENUM 在重叠区一致。
-- 性能账（须重测）：本次 hybrid 约 11s vs ENUM 约 4.7 分钟，但全程温缓存不可比；冷缓存 A/B 为合入前置 open 项。
-  瓶颈预判仍在尾部 selective backfill（P1-1 打）。
+- 性能账（温缓存背靠背，同机 01:07/01:11，诚实口径、冷机待补）：
+  hybrid 端到端约 40s（bulk 4297MB raw 读+并行解析约 5s → 尾部 ENUM 约 5.3s →
+  尾部回填 17.3 万文件约 18.7s + 2.8 万目录约 2.3s → 落盘+trigram 约 7s）；
+  ENUM 现状端到端约 282s（MFT 走查约 23s + NtQueryDirectoryFile 目录 rescan 约 249s（398K 目录，本机奇慢）+ 落盘约 10s）。
+  端到端约 7 倍；结构性胜利是 hybrid 跳过了目录 rescan（249s → 目录回填 2.3s），bulk 本身约 4.5 倍。
+  瓶颈仍在尾部 selective backfill（18.7s，约 9.3K 条/s）——P1-1 打这里。冷缓存 A/B 仍为 open 项（不阻塞合入）。
 - 备忘：早期 bench 数据（方案 2/4/5 对比、0x80 截断发现过程）见 git 历史；结论以本节为准。
 
 ## 3. 第 1 波：查询路径（1~2 周，体感质变）
