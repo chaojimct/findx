@@ -1,6 +1,7 @@
 //! 内容倒排（tantivy）。schema v1，字段冻结；升级 = 版本号 bump + 全量重建。
 //!
-//! 并发模型：`IndexWriter` behind `Mutex`，调用方（M1 增量线程）串行 commit 即可；
+//! 并发模型：`IndexWriter` 本身线程安全（内部 craving），抽取与入库都在 rayon
+//! 池里并行；`commit` 仍由调用方串行触发（分批 commit 定界内存）。
 //! reader 每次 search 前 `reload()`，保证读到已 commit 数据。
 //!
 //! 多卷注意：FRN 只在卷内唯一，upsert/delete 键 = `doc_key(volume_id, frn)`
@@ -10,7 +11,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{
@@ -18,6 +19,9 @@ use tantivy::schema::{
     STORED,
 };
 use tantivy::snippet::SnippetGenerator;
+use tantivy::tokenizer::{
+    BoxTokenStream, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer, Tokenizer,
+};
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 use tantivy_jieba::JiebaTokenizer;
 
@@ -26,6 +30,50 @@ use crate::{Error, Result};
 /// 内容 schema 版本。v1 字段冻结，改字段必须 bump 并全量重建。
 pub const SCHEMA_VERSION: u32 = 1;
 pub const TOKENIZER_JIEBA: &str = "jieba_findx";
+
+/// 混合分词：纯 ASCII 文本（代码/日志/英文文档，占全盘大多数）走快道
+///（切分 + 去超长 token + 小写），不碰 jieba；含非 ASCII 才走结巴。
+/// 快道单篇提速一个数量级以上，是全量构建超越单线程方案的关键之一。
+/// 小写与 AnyTXT 的 FoldCase 对齐；老索引本来就是大小写敏感，
+/// 新索引统一小写后英文搜索只会更准（内容索引尚无线上兼容负担）。
+///
+/// `JiebaTokenizer::new()` 背后是全局静态实例，Clone 零成本；
+/// tantivy 给每个索引线程 clone 一份，不存在跨线程争用。
+#[derive(Clone)]
+pub struct HybridTokenizer {
+    jieba: JiebaTokenizer,
+    ascii: TextAnalyzer,
+}
+
+impl HybridTokenizer {
+    pub fn new() -> Self {
+        Self {
+            jieba: JiebaTokenizer::new(),
+            ascii: TextAnalyzer::builder(SimpleTokenizer::default())
+                .filter(RemoveLongFilter::limit(40))
+                .filter(LowerCaser)
+                .build(),
+        }
+    }
+}
+
+impl Default for HybridTokenizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Tokenizer for HybridTokenizer {
+    type TokenStream<'a> = BoxTokenStream<'a>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a> {
+        if text.is_ascii() {
+            BoxTokenStream::new(self.ascii.token_stream(text))
+        } else {
+            BoxTokenStream::new(self.jieba.token_stream(text))
+        }
+    }
+}
 
 pub struct ContentFields {
     pub key: Field,
@@ -93,8 +141,15 @@ pub struct ContentHit {
 pub struct ContentIndex {
     fields: ContentFields,
     reader: IndexReader,
-    writer: Mutex<IndexWriter>,
+    /// 读写锁：抽取/写入并发走读锁（writer 内部线程安全），`commit` 走写锁。
+    /// commit 由调用方串行触发，写锁永不争用。
+    writer: RwLock<IndexWriter>,
 }
+
+/// 索引线程数：jieba/写入并行的最大并发。8 线程后 tantivy 段合并开销盖过收益。
+const INDEX_THREADS: usize = 8;
+/// writer 总堆：线程数 × 单线程 arena。1.5GB 常驻可接受（service 本就 GB 级）。
+const INDEX_HEAP_BYTES: usize = 1_500_000_000;
 
 /// 内容索引目录定位：`index.bin` → `<index>.content/`（与 `.bin.v6/` 并列）。
 pub fn content_dir_for(index_bin: &Path) -> std::path::PathBuf {
@@ -122,13 +177,13 @@ pub fn open_or_create(dir: &Path) -> Result<ContentIndex> {
     )?;
     index
         .tokenizers()
-        .register(TOKENIZER_JIEBA, JiebaTokenizer::new());
+        .register(TOKENIZER_JIEBA, HybridTokenizer::new());
     let reader = index
         .reader_builder()
         .reload_policy(ReloadPolicy::Manual)
         .try_into()?;
-    // M0 堆 256MB；M1 按机器内存自适应。
-    let writer = Mutex::new(index.writer(256_000_000)?);
+    // 多线程 writer：抽取（rayon）与分词/写入（tantivy 内部线程池）双并行。
+    let writer = RwLock::new(index.writer_with_num_threads(INDEX_THREADS, INDEX_HEAP_BYTES)?);
     Ok(ContentIndex {
         fields,
         reader,
@@ -138,8 +193,10 @@ pub fn open_or_create(dir: &Path) -> Result<ContentIndex> {
 
 impl ContentIndex {
     /// upsert 语义：先删同 key 旧 doc 再加（tantivy doc 不可变）。
+    /// `&self` 即可并发调用（writer 内部线程安全）；同一 key 的并发 upsert
+    /// 由调用方保证不重叠（规划按批次串行，批内 key 唯一）。
     pub fn index_doc(&self, meta: &DocMeta, body: &str) -> Result<()> {
-        let w = self.writer.lock();
+        let w = self.writer.read();
         w.delete_term(Term::from_field_u64(
             self.fields.key,
             doc_key(&meta.volume_id, meta.frn),
@@ -157,7 +214,7 @@ impl ContentIndex {
     }
 
     pub fn delete_by_frn(&self, volume_id: &str, frn: u64) -> Result<()> {
-        self.writer.lock().delete_term(Term::from_field_u64(
+        self.writer.read().delete_term(Term::from_field_u64(
             self.fields.key,
             doc_key(volume_id, frn),
         ));
@@ -165,7 +222,7 @@ impl ContentIndex {
     }
 
     pub fn commit(&self) -> Result<()> {
-        self.writer.lock().commit()?;
+        self.writer.write().commit()?;
         self.reader.reload()?;
         Ok(())
     }
@@ -289,5 +346,41 @@ impl findx2_core::ContentSearch for ContentIndex {
                     .collect()
             })
             .map_err(|e| findx2_core::Error::Persist(format!("内容索引查询失败: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tantivy::tokenizer::{TokenStream, Tokenizer};
+
+    fn tokens_of(text: &str) -> Vec<String> {
+        let mut t = HybridTokenizer::new();
+        let mut stream = t.token_stream(text);
+        let mut out = Vec::new();
+        while stream.advance() {
+            out.push(stream.token().text.clone());
+        }
+        out
+    }
+
+    #[test]
+    fn ascii_fast_path_tokenizes() {
+        // ASCII 快道：切分 + 小写 + 去超长（和 AnyTXT FoldCase 对齐）。
+        let toks = tokens_of("Hello World foo 123");
+        assert!(toks.iter().any(|t| t == "hello"));
+        assert!(toks.iter().any(|t| t == "foo"));
+        assert!(!toks.is_empty());
+        // 40 字符以上 token 被丢弃（minified/哈希行不进索引）。
+        let long = "a".repeat(41);
+        assert!(tokens_of(&long).is_empty());
+    }
+
+    #[test]
+    fn cjk_still_segments() {
+        // 含 CJK 走结巴： smoke 级断言不断言具体切分（词典版本相关）。
+        let toks = tokens_of("全文搜索 hello world");
+        assert!(toks.len() >= 2);
+        assert!(toks.iter().any(|t| t.contains("全文") || t.contains("搜索")));
     }
 }

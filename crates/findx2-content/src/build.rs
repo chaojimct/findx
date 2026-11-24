@@ -153,8 +153,9 @@ pub fn plan_range_from_store(
 /// `st` 跨分片累加（调用方持有）。返回最终 `docs` 数。
 ///
 /// 流水线：1024 子批次 × rayon 并行抽取（stat + 解码 + Office/PDF 解析，
-/// IO 与 CPU 混合主导）→ 原序串行写入（tantivy `IndexWriter` 单线程，
-/// 结巴分词在写入侧）。子批次定界内存：最多同时持有 1024 篇正文。
+/// IO 与 CPU 混合主导）→ 同批 rayon 并行入库（ASCII 快道/结巴分词/写入，
+/// 纯 CPU 主导，tantivy 多线程 writer）。子批次定界内存：最多同时持有
+/// 1024 篇正文；入库顺序不保证（doc id 仅内部使用，搜索按分排序）。
 pub fn build_from_plan(
     items: &[PlanItem],
     cdir: &Path,
@@ -163,6 +164,8 @@ pub fn build_from_plan(
     mut progress: impl FnMut(&BuildStats) -> bool,
 ) -> Result<u64> {
     const EXTRACT_BATCH: usize = 1024;
+    /// 索引 commit 节流：writer 堆 1.5GB，5 万篇一批，崩溃最多丢一批。
+    const COMMIT_EVERY: u64 = 50_000;
     let existed = cdir.exists();
     if rebuild && existed {
         std::fs::remove_dir_all(cdir).map_err(|e| Error::Io(cdir.display().to_string(), e))?;
@@ -207,26 +210,32 @@ pub fn build_from_plan(
                 }
             })
             .collect();
-        // 串行写入：保持入库顺序稳定，`st` 累加与 commit 节流都在这里。
-        for slot in extracted {
-            match slot {
-                None => st.skipped += 1,
-                Some(Err(())) => st.failed += 1,
-                Some(Ok((meta, text, raw_bytes))) => {
-                    let ok = cidx.index_doc(&meta, &text).is_ok();
-                    if !ok {
-                        st.failed += 1;
-                    } else {
-                        st.extracted += 1;
-                        st.bytes += raw_bytes;
-                        since_commit += 1;
-                        if since_commit >= 20_000 {
-                            cidx.commit()?;
-                            since_commit = 0;
+        // 并行入库：`ContentIndex` 线程安全，同批 key 唯一无冲突；
+        // 计数用 reduce 汇总（无锁、无原子），顺序不保证但总量精确。
+        let (ext_n, byte_n, fail_n, skip_n) = extracted
+            .par_iter()
+            .map(|slot| -> (u64, u64, u64, u64) {
+                match slot {
+                    None => (0, 0, 0, 1),
+                    Some(Err(())) => (0, 0, 1, 0),
+                    Some(Ok((meta, text, raw_bytes))) => {
+                        if cidx.index_doc(meta, text).is_ok() {
+                            (1, *raw_bytes, 0, 0)
+                        } else {
+                            (0, 0, 1, 0)
                         }
                     }
                 }
-            }
+            })
+            .reduce(|| (0, 0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3));
+        st.extracted += ext_n;
+        st.bytes += byte_n;
+        st.failed += fail_n;
+        st.skipped += skip_n;
+        since_commit += ext_n;
+        if since_commit >= COMMIT_EVERY {
+            cidx.commit()?;
+            since_commit = 0;
         }
         // 每子批次查一次取消（中止响应有界，代价一次闭包调用）。
         if !progress(st) {
