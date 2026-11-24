@@ -15,7 +15,8 @@ use findx2_core::{volume_key_for, IndexStore};
 use rayon::prelude::*;
 
 use crate::{
-    extract_text, lower_name_supported, open_or_create, should_extract, DocMeta, Error, Result,
+    extract_text, index::ContentIndex, lower_name_supported, open_or_create, should_extract,
+    DocMeta, Error, Result,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -161,6 +162,22 @@ impl IoThrottle {
             self.window_bytes = 0;
         }
     }
+}
+
+/// commit 带退避重试：Windows 下 Defender 会对新段文件短暂持锁，
+/// 直接 commit 可能撞上 Os code 5。3 次退避基本能过去；都失败再报错。
+fn commit_retry(cidx: &ContentIndex) -> Result<()> {
+    let mut last = None;
+    for wait_ms in [500, 2000, 8000] {
+        match cidx.commit() {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+            }
+        }
+    }
+    Err(last.expect("commit 重试至少执行一次"))
 }
 
 /// 卷前缀（小写）→ 归一化卷键：条目按最长前缀归属卷。
@@ -365,7 +382,7 @@ pub fn build_from_plan(
         throttle.add(byte_n);
         since_commit += ext_n;
         if since_commit >= COMMIT_EVERY {
-            cidx.commit()?;
+            commit_retry(&cidx)?;
             since_commit = 0;
         }
         // 每子批次查一次取消（中止响应有界，代价一次闭包调用）。
@@ -380,7 +397,7 @@ pub fn build_from_plan(
         }
         return Err(Error::Cancelled);
     }
-    cidx.commit()?;
+    commit_retry(&cidx)?;
     Ok(cidx.num_docs())
 }
 

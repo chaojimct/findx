@@ -52,13 +52,19 @@ pub fn global() -> Option<&'static PdfPool> {
 }
 
 fn worker_exe() -> Option<PathBuf> {
-    let mut p = std::env::current_exe().ok()?;
-    p.pop();
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
     #[cfg(windows)]
-    p.push("pdf-worker.exe");
+    const WORKER: &str = "pdf-worker.exe";
     #[cfg(not(windows))]
-    p.push("pdf-worker");
-    p.is_file().then_some(p)
+    const WORKER: &str = "pdf-worker";
+    // exe 同目录（service/GUI/CLI 正式布局），或上一级（cargo test 的 deps/ 下）。
+    let cand = dir.join(WORKER);
+    if cand.is_file() {
+        return Some(cand);
+    }
+    let up = dir.parent()?.join(WORKER);
+    up.is_file().then_some(up)
 }
 
 impl PdfPool {
@@ -214,5 +220,40 @@ impl Drop for Worker {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 最小单页 PDF（无 xref，pdfium 可重建），"hello pool" 明文。
+    const TINY_PDF: &[u8] = b"%PDF-1.4
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj
+3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj
+4 0 obj<</Length 44>>stream
+BT /F1 12 Tf 50 150 Td (hello pool) Tj ET
+endstream
+endobj
+5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj
+trailer<</Root 1 0 R>>";
+
+    fn worker_exe_for_test() -> Option<PathBuf> {
+        super::worker_exe()
+    }
+
+    #[test]
+    fn pool_roundtrip_tiny_pdf() {
+        if worker_exe_for_test().is_none() {
+            eprintln!("SKIP: pdf-worker 未构建（先 cargo build -p findx2-cli --bin pdf-worker）");
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("tiny.pdf");
+        std::fs::write(&p, TINY_PDF).unwrap();
+        let pool = global().expect("worker 存在时池应可用");
+        let text = pool.extract(&p).expect("最小 PDF 应解出文本");
+        assert!(text.contains("hello pool"), "{text:?}");
     }
 }
