@@ -48,3 +48,6 @@ Thumbs.db
 
 # Python release/preflight tooling
 __pycache__/
+\
+# dev web UI (untracked workdir, never commit)\
+gui/
