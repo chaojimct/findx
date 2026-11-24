@@ -739,14 +739,20 @@ fn build_content_index(index: &std::path::Path, rebuild: bool) -> Result<()> {
         true
     })?;
     let dir_bytes = dir_size(&cdir);
+    let mut sample_txt = String::new();
+    for s in st.failed_samples.iter().take(15) {
+        sample_txt.push_str("\n  - ");
+        sample_txt.push_str(&s.chars().take(160).collect::<String>());
+    }
     println!(
-        "内容索引构建完成：扫描 {} 文件，抽取 {}（{:.2} MB 原文），跳过 {}，失败 {}；\
+        "内容索引构建完成：扫描 {} 文件，抽取 {}（{:.2} MB 原文），跳过 {}，失败 {}{}；\
          索引 {} docs / {:.2} MB（体积比 {:.1}%），耗时 {:.1}s → {}",
         st.scanned,
         st.extracted,
         st.bytes as f64 / 1048576.0,
         st.skipped,
         st.failed,
+        sample_txt,
         st.docs,
         dir_bytes as f64 / 1048576.0,
         if st.bytes == 0 {

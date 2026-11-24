@@ -27,6 +27,8 @@ pub struct BuildStats {
     pub failed: u64,
     pub bytes: u64,
     pub docs: u64,
+    /// 前 100 个失败样本（路径 + 原因），供诊断失败构成用；多了不存。
+    pub failed_samples: Vec<String>,
 }
 
 /// 规划项：解析好的待抽取文件（service 分片规划后脱离锁执行）。
@@ -333,8 +335,8 @@ pub fn build_from_plan(
             break;
         }
         // 并行抽取（保序 collect）：None = 执行阶段复检跳过（文件刚好被删/改大等竞态），
-        // Some(Ok) = 待写入，Some(Err) = 抽取失败。
-        let extracted: Vec<Option<std::result::Result<(DocMeta, String, u64), ()>>> = batch
+        // Some(Ok) = 待写入，Some(Err(reason)) = 抽取失败（reason 含路径，供采样）。
+        let extracted: Vec<Option<std::result::Result<(DocMeta, String, u64), String>>> = batch
             .par_iter()
             .map(|item| {
                 let path = Path::new(&item.path);
@@ -353,32 +355,50 @@ pub fn build_from_plan(
                         t.text,
                         t.raw_bytes,
                     ))),
-                    Err(_) => Some(Err(())),
+                    Err(e) => Some(Err(format!("{e}"))),
                 }
             })
             .collect();
         // 并行入库：`ContentIndex` 线程安全，同批 key 唯一无冲突；
         // 计数用 reduce 汇总（无锁、无原子），顺序不保证但总量精确。
-        let (ext_n, byte_n, fail_n, skip_n) = extracted
+        // 失败原因只采样前 100（路径+原因），供诊断失败构成。
+        let (ext_n, byte_n, fail_n, skip_n, mut fail_samples) = extracted
             .par_iter()
-            .map(|slot| -> (u64, u64, u64, u64) {
+            .map(|slot| -> (u64, u64, u64, u64, Vec<String>) {
                 match slot {
-                    None => (0, 0, 0, 1),
-                    Some(Err(())) => (0, 0, 1, 0),
+                    None => (0, 0, 0, 1, Vec::new()),
+                    Some(Err(reason)) => (0, 0, 1, 0, vec![reason.clone()]),
                     Some(Ok((meta, text, raw_bytes))) => {
                         if cidx.index_doc(meta, text).is_ok() {
-                            (1, *raw_bytes, 0, 0)
+                            (1, *raw_bytes, 0, 0, Vec::new())
                         } else {
-                            (0, 0, 1, 0)
+                            (0, 0, 1, 0, vec![format!("入库失败 {}", meta.path)])
                         }
                     }
                 }
             })
-            .reduce(|| (0, 0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3));
+            .reduce(
+                || (0, 0, 0, 0, Vec::new()),
+                |mut a, b| {
+                    a.0 += b.0;
+                    a.1 += b.1;
+                    a.2 += b.2;
+                    a.3 += b.3;
+                    if a.4.len() < 100 {
+                        a.4.extend(b.4.into_iter().take(100 - a.4.len()));
+                    }
+                    a
+                },
+            );
         st.extracted += ext_n;
         st.bytes += byte_n;
         st.failed += fail_n;
         st.skipped += skip_n;
+        if st.failed_samples.len() < 100 {
+            let room = 100 - st.failed_samples.len();
+            fail_samples.truncate(room);
+            st.failed_samples.append(&mut fail_samples);
+        }
         throttle.add(byte_n);
         since_commit += ext_n;
         if since_commit >= COMMIT_EVERY {
