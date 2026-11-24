@@ -202,34 +202,40 @@ impl TableDelegate for ResultsTable {
                                 ),
                         )
                         // 命中摘要第二行（设置页开关；仅 content: 查询有值）。
+                        // 引用线样式 + StyledText 内联高亮，与文件名行明确区分。
                         .when(
                             self.show_snippet && !hit.snippet.is_empty(),
                             |view| {
+                                let (plain, ranges) =
+                                    crate::search_logic::snippet_plain_and_ranges(
+                                        &hit.snippet,
+                                    );
                                 view.child(
                                     div()
                                         .w_full()
                                         .min_w_0()
                                         .overflow_hidden()
                                         .whitespace_nowrap()
-                                        .flex()
-                                        .items_center()
+                                        .text_ellipsis()
+                                        .border_l_1()
+                                        .border_color(tokens.accent)
+                                        .pl_1()
                                         .text_xs()
                                         .text_color(tokens.text_secondary)
-                                        .children(
-                                            snippet_segments(&hit.snippet)
-                                                .into_iter()
-                                                .map(|(text, on)| {
-                                                    div()
-                                                        .flex_shrink_0()
-                                                        .whitespace_nowrap()
-                                                        .text_ellipsis()
-                                                        .when(on, |v| {
-                                                            v.bg(tokens.hit_bg)
-                                                                .text_color(tokens.hit_fg)
-                                                        })
-                                                        .child(text)
-                                                }),
-                                        ),
+                                        .child(StyledText::new(plain).with_highlights(
+                                            ranges.into_iter().map(|range| {
+                                                (
+                                                    range,
+                                                    HighlightStyle {
+                                                        color: Some(tokens.hit_fg),
+                                                        background_color: Some(
+                                                            tokens.hit_bg,
+                                                        ),
+                                                        ..Default::default()
+                                                    },
+                                                )
+                                            }),
+                                        )),
                                 )
                             },
                         ),

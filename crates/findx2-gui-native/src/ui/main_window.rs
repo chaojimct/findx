@@ -273,6 +273,8 @@ pub struct MainWindow {
     pdf_count: u32,
     office_text_only: bool,
     preview_file: Option<String>,
+    /// 当前预览命中的摘要（content: 查询 service 回填；预览窗顶部展示命中上下文）。
+    preview_snippet: String,
     loading: bool,
     sidebar_force: Option<ForceState>,
     preview_force: Option<ForceState>,
@@ -493,6 +495,7 @@ impl MainWindow {
             loading: false,
             sidebar_force: None,
             preview_force: None,
+            preview_snippet: String::new(),
             last_content_width: 1100.0,
             table_viewport_width: 1100.0,
             last_diag: String::new(),
@@ -1400,6 +1403,7 @@ impl MainWindow {
         if !visible {
             self._preview_task = None;
             self.preview = PreviewState::empty();
+            self.preview_snippet.clear();
             return;
         }
         let local_file = self.preview_file.is_some() || self.workspace.mode != ViewMode::Search;
@@ -1423,9 +1427,11 @@ impl MainWindow {
             self.pdf_options = Default::default();
             self.office_text_only = false;
             self.preview = PreviewState::empty();
+            self.preview_snippet.clear();
             self._preview_task = None;
             return;
         };
+        self.preview_snippet = hit.snippet.clone();
         if self.preview_memo.len() > 64 {
             self.preview_memo.clear();
         }
@@ -2238,6 +2244,47 @@ impl MainWindow {
             .border_l_1()
             .border_color(tokens.border)
             .child(header)
+            // 命中上下文卡（content: 查询选中行；全文开关控制显隐）。
+            .when(
+                !self.preview_snippet.is_empty()
+                    && self.session.read(cx).settings.content_snippet,
+                |view| {
+                    let (plain, ranges) =
+                        search_logic::snippet_plain_and_ranges(&self.preview_snippet);
+                    view.child(
+                        v_flex()
+                            .w_full()
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_2()
+                            .gap_1()
+                            .border_b_1()
+                            .border_color(tokens.border_soft)
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(tokens.text_tertiary)
+                                    .child("命中上下文"),
+                            )
+                            .child(
+                                div().w_full().text_sm().child(
+                                    StyledText::new(plain).with_highlights(
+                                        ranges.into_iter().map(|range| {
+                                            (
+                                                range,
+                                                HighlightStyle {
+                                                    color: Some(tokens.hit_fg),
+                                                    background_color: Some(tokens.hit_bg),
+                                                    ..Default::default()
+                                                },
+                                            )
+                                        }),
+                                    ),
+                                ),
+                            ),
+                    )
+                },
+            )
             .when(self.preview.meta.as_ref().is_some_and(|m| std::path::Path::new(&m.path)
                 .extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pdf")))
                 && self.preview.pdf.is_some(), |view| {

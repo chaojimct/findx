@@ -548,6 +548,26 @@ pub fn snippet_segments(html: &str) -> Vec<(String, bool)> {
     out
 }
 
+/// snippet HTML → (纯文本, 高亮字节区间)：去标签+转义，供 StyledText 用。
+/// 行内单行省略与预览窗全文卡共用同一份区间。
+pub fn snippet_plain_and_ranges(html: &str) -> (String, Vec<std::ops::Range<usize>>) {
+    let mut plain = String::new();
+    let mut ranges = Vec::new();
+    for (text, hot) in snippet_segments(html) {
+        if text.is_empty() {
+            continue;
+        }
+        if hot {
+            let start = plain.len();
+            plain.push_str(&text);
+            ranges.push(start..plain.len());
+        } else {
+            plain.push_str(&text);
+        }
+    }
+    (plain, ranges)
+}
+
 pub fn build_full_query(
     raw: &str,
     type_f: TypeFilter,
@@ -866,6 +886,17 @@ mod tests {
             ]
         );
         assert!(snippet_segments("").is_empty());
+    }
+
+    #[test]
+    fn snippet_plain_ranges_cover_hot_spans() {
+        let (plain, ranges) = snippet_plain_and_ranges("前文<b>全文</b>后文");
+        assert_eq!(plain, "前文全文后文");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&plain[ranges[0].clone()], "全文");
+        let (plain2, ranges2) = snippet_plain_and_ranges("纯文本");
+        assert_eq!(plain2, "纯文本");
+        assert!(ranges2.is_empty());
     }
 
     #[test]
