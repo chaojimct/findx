@@ -1521,7 +1521,7 @@ impl MainWindow {
                         .unwrap_or(0),
                     is_directory,
                     name_highlight: Vec::new(),
-                    snippet: String::new(),
+                    snippet: String::new(), pinyin_hit: false,
                 }
             })
             .collect()
@@ -1863,7 +1863,7 @@ mod tests {
                     .as_secs(),
                 is_directory: false,
                 name_highlight: vec![],
-                snippet: String::new(),
+                snippet: String::new(), pinyin_hit: false,
             }
         };
         let hits = vec![make_hit(&first), make_hit(&alias)];

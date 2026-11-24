@@ -28,6 +28,8 @@ enum Job {
         endpoint: String,
         query: String,
         pinyin: bool,
+        pinyin_initials: bool,
+        pinyin_full: bool,
         limit: usize,
         offset: usize,
         reply: oneshot::Sender<IpcResult<SearchOutcome>>,
@@ -93,6 +95,8 @@ impl IpcClient {
         endpoint: String,
         query: String,
         pinyin: bool,
+        pinyin_initials: bool,
+        pinyin_full: bool,
         limit: usize,
         offset: usize,
     ) -> oneshot::Receiver<IpcResult<SearchOutcome>> {
@@ -101,6 +105,8 @@ impl IpcClient {
             endpoint,
             query,
             pinyin,
+            pinyin_initials,
+            pinyin_full,
             limit,
             offset,
             reply,
@@ -148,13 +154,23 @@ async fn dispatch(job: Job) {
             endpoint,
             query,
             pinyin,
+            pinyin_initials,
+            pinyin_full,
             limit,
             offset,
             reply,
         } => {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(15),
-                ipc_search(endpoint, query, pinyin, limit, offset),
+                ipc_search(
+                    endpoint,
+                    query,
+                    pinyin,
+                    pinyin_initials,
+                    pinyin_full,
+                    limit,
+                    offset,
+                ),
             )
             .await
             .unwrap_or_else(|_| Err("搜索响应超时（15 秒）".into()));
@@ -238,6 +254,8 @@ async fn ipc_search(
     endpoint: String,
     query: String,
     pinyin: bool,
+    pinyin_initials: bool,
+    pinyin_full: bool,
     limit: usize,
     offset: usize,
 ) -> IpcResult<SearchOutcome> {
@@ -247,6 +265,8 @@ async fn ipc_search(
         pinyin,
         limit,
         offset,
+        pinyin_initials,
+        pinyin_full,
     };
     match write_request(client, req).await? {
         IpcResponse::SearchResult {

@@ -94,7 +94,7 @@ fn hit(
         mtime,
         is_directory,
         name_highlight: highlight.to_vec(),
-        snippet: String::new(),
+        snippet: String::new(), pinyin_hit: false,
     }
 }
 
@@ -173,9 +173,9 @@ fn handle_request(req: IpcRequest) -> IpcResponse {
         },
         IpcRequest::Search {
             query,
-            pinyin: _,
             limit,
             offset,
+            ..
         } => {
             let started = Instant::now();
             let needle = bare_terms(&query);

@@ -816,6 +816,25 @@ fn build_content_index(index: &std::path::Path, rebuild: bool) -> Result<()> {
         t0.elapsed().as_secs_f64(),
         cdir.display(),
     );
+    // 主库建成后重建拼音辅库（与 service 构建路径一致；失败不影响主库可用）。
+    let t1 = std::time::Instant::now();
+    let mut last_aux = std::time::Instant::now();
+    match findx2_content::build_aux_from_index(index, rebuild, |scanned, _docs| {
+        if last_aux.elapsed().as_secs() >= 5 {
+            last_aux = std::time::Instant::now();
+            eprintln!("[pinyin] scanned={scanned} ({:.1}s)", t1.elapsed().as_secs_f64());
+        }
+        true
+    }) {
+        Ok(ast) => eprintln!(
+            "拼音辅库重建完成：{} docs（首字母 {}/全拼 {}），耗时 {:.1}s",
+            ast.docs,
+            ast.docs_ini,
+            ast.docs_full,
+            t1.elapsed().as_secs_f64()
+        ),
+        Err(e) => eprintln!("[pinyin] 辅库重建失败（主库可用，拼音降级）：{e}"),
+    }
     Ok(())
 }
 

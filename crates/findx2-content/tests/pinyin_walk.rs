@@ -79,5 +79,5 @@ fn pinyin_aux_walk_matches_online_extraction() {
     // 主库按名可查（回归：walk 不破坏主库）。
     let cidx = open_if_exists(&index_bin).expect("主索引应存在");
     assert!(cidx.num_docs() >= 2);
-    let _ = AuxStats { docs: 0, terms_cjk: 0, chars: 0 };
+    let _ = AuxStats { docs: 0, terms_cjk: 0, chars: 0, docs_ini: 0, docs_full: 0 };
 }

@@ -146,9 +146,11 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                 pinyin,
                 limit,
                 offset,
+                pinyin_initials,
+                pinyin_full,
             },
             Some(eng),
-        ) => match search_ipc(&eng, &query, pinyin, limit, offset) {
+        ) => match search_ipc(&eng, &query, pinyin, limit, offset, pinyin_initials, pinyin_full) {
             Ok((hits, total, elapsed_ms)) => IpcResponse::SearchResult {
                 hits,
                 total,
@@ -290,6 +292,8 @@ pub(crate) fn search_ipc(
     pinyin: bool,
     limit_override: usize,
     offset: usize,
+    pinyin_initials: bool,
+    pinyin_full: bool,
 ) -> std::result::Result<(Vec<findx2_ipc::SearchHitDto>, u32, u32), String> {
     let started = std::time::Instant::now();
     let t_parse = std::time::Instant::now();
@@ -307,7 +311,7 @@ pub(crate) fn search_ipc(
             &pq,
             &SearchOptions {
                 allow_pinyin: pinyin,
-                content: crate::content_index::content_opt(),
+                content: crate::content_index::content_opt_with(pinyin_initials, pinyin_full),
                 ..Default::default()
             },
             offset,
@@ -328,11 +332,50 @@ pub(crate) fn search_ipc(
                 is_directory: h.is_directory,
                 name_highlight: h.name_highlight.clone(),
                 snippet: String::new(),
+                pinyin_hit: false,
             }
         })
         .collect();
     // 含 content: 谓词时给当页前 N 个填 snippet（有界成本，超出的行后面懒取）。
+    // 拼音辅库命中同时打标（GUI 显示“拼”徽标；主库直命中不标）。
     if pq.content_substring.is_some() || pq.utf8content_substring.is_some() {
+        let needle_opt = pq
+            .content_substring
+            .as_ref()
+            .or(pq.utf8content_substring.as_ref());
+        if let Some(needle) = needle_opt {
+            if needle.is_ascii() && (pinyin_initials || pinyin_full) {
+                let aux_set = crate::content_index::aux_pinyin_keys(
+                    needle,
+                    pinyin_initials,
+                    pinyin_full,
+                    findx2_core::CONTENT_FAST_CAP,
+                );
+                if !aux_set.is_empty() {
+                    // entry_idx → (volume_key, frn)，与 snippets_for 同一映射。
+                    let g = engine.index_store();
+                    for (h, dto) in hits.iter().zip(dtos.iter_mut()) {
+                        let frn = match g.frns.get(h.entry_idx as usize).copied() {
+                            Some(f) => f,
+                            None => continue,
+                        };
+                        let mut key: Option<(String, u64)> = None;
+                        for (slot, vol) in g.volumes.iter().enumerate() {
+                            if g.frn_to_entry.get_scoped(frn, slot as u32) == Some(h.entry_idx) {
+                                key = Some((
+                                    findx2_core::volume_key_for(&vol.volume_id, slot),
+                                    frn,
+                                ));
+                                break;
+                            }
+                        }
+                        if key.is_some_and(|k| aux_set.contains(&k)) {
+                            dto.pinyin_hit = true;
+                        }
+                    }
+                }
+            }
+        }
         let idxs: Vec<u32> = hits.iter().map(|h| h.entry_idx).collect();
         let map = crate::content_index::snippets_for(
             &engine,
@@ -524,7 +567,7 @@ mod usage_tests {
         let raw=|id,parent,name:&str,dir|findx2_core::RawEntry { file_id:id,file_id_128:None,parent_id:parent,name:name.into(),size:if dir {0}else{123},mtime:0,ctime:0,attrs:if dir{16}else{0},is_dir:dir };
         let store=findx2_core::IndexBuilder::new(b'F',1,7,0).build_from_raw(vec![raw(10,2,"public-file.txt",false)],vec![raw(1,0,"root",true),raw(2,1,"public-folder",true)],true).unwrap();
         let engine=findx2_core::SearchEngine::new(store);
-        let (hits,_,_)=super::search_ipc(&engine,"public",false,50,0).unwrap();
+        let (hits,_,_)=super::search_ipc(&engine,"public",false,50,0,true,true).unwrap();
         assert!(hits.iter().any(|h| h.name=="public-folder" && h.is_directory));
         assert!(hits.iter().any(|h| h.name=="public-file.txt" && !h.is_directory));
     }

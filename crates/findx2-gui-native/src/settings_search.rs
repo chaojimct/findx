@@ -154,6 +154,8 @@ pub fn all_settings_items() -> Vec<SettingsItem> {
         item("content_enable", "content", "启用全文搜索", "查询行为", &["content", "全文", "启用", "enable"]),
         item("content_mode", "content", "默认搜索模式", "查询行为", &["content", "全文", "模式", "文件名", "混合", "mode"]),
         item("content_snippet", "content", "命中摘要", "查询行为", &["content", "全文", "摘要", "snippet", "预览"]),
+        item("content_pinyin_initials", "content", "全文拼音首字母", "查询行为", &["content", "全文", "拼音", "首字母", "pinyin", "简拼"]),
+        item("content_pinyin_full", "content", "全文拼音全拼", "查询行为", &["content", "全文", "拼音", "全拼", "pinyin", "quanpin"]),
         item("content_mix_limit", "content", "混合模式内容上限", "查询行为", &["content", "全文", "混合", "上限", "limit"]),
         item("content_scope", "content", "索引范围与类型", "索引范围", &["content", "全文", "范围", "office", "pdf", "代码", "上限", "mb"]),
         item("content_follow", "content", "增量跟随", "高级", &["content", "全文", "增量", "跟随", "incremental"]),

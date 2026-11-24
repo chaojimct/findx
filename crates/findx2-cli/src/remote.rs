@@ -56,6 +56,8 @@ async fn remote_search(
         pinyin,
         limit,
         offset: 0,
+        pinyin_initials: true,
+        pinyin_full: true,
     };
     let mut body = serde_json::to_string(&req).map_err(|e| Error::Json(e))?;
     body.push('\n');

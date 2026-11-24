@@ -45,6 +45,8 @@ fn main() {
             session.endpoint.clone(),
             "alpha-t162-fixture".into(),
             false,
+            true,
+            true,
             100,
             0,
         )

@@ -90,7 +90,7 @@ pub fn list_with_hidden(
                 .unwrap_or(0),
             is_directory: meta.is_dir(),
             name_highlight: vec![],
-            snippet: String::new(),
+            snippet: String::new(), pinyin_hit: false,
         });
     }
     rows.sort_by(|a, b| {
@@ -170,7 +170,7 @@ pub fn list_recursive(
                     .unwrap_or(0),
                 is_directory: is_dir,
                 name_highlight: vec![],
-                snippet: String::new(),
+                snippet: String::new(), pinyin_hit: false,
             });
             if is_dir && !ft.is_symlink() && depth < MAX_DEPTH && !truncated {
                 stack.push((entry_path, depth + 1));

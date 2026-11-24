@@ -75,6 +75,12 @@ pub enum IpcRequest {
         /// 分页偏移（排序后切片 `[offset, offset+limit)`）。缺省 0，老客户端照常工作。
         #[serde(default)]
         offset: usize,
+        /// 拼音辅库：首字母查询。缺省开（有库才生效）；GUI 全文页可关。
+        #[serde(default = "default_true")]
+        pinyin_initials: bool,
+        /// 拼音辅库：全拼查询。缺省开（有库才生效）；GUI 全文页可关。
+        #[serde(default = "default_true")]
+        pinyin_full: bool,
     },
     /// 全文内容索引构建（`<index>.content/`）：service 后台线程执行，不停服。
     /// 已在构建 → Error；`rebuild=true` 删旧全量重建，否则复用追加。
@@ -109,6 +115,10 @@ fn default_limit() -> usize {
 }
 
 fn default_pinyin() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -286,6 +296,9 @@ pub struct SearchHitDto {
     /// 缺省 "" = 老版 service 未上报。
     #[serde(default)]
     pub snippet: String,
+    /// 拼音辅库命中标记（GUI 可显示“拼”徽标；老客户端忽略）。
+    #[serde(default)]
+    pub pinyin_hit: bool,
 }
 
 #[cfg(test)]
@@ -297,6 +310,8 @@ mod tests {
         let j = serde_json::to_string(&IpcRequest::Search {
             query: "foo".into(),
             pinyin: false,
+            pinyin_initials: true,
+            pinyin_full: true,
             limit: 100,
             offset: 0,
         })
@@ -306,12 +321,16 @@ mod tests {
             IpcRequest::Search {
                 query,
                 pinyin,
+                pinyin_initials,
+                pinyin_full,
                 limit,
                 offset,
             } => {
                 assert_eq!(query, "foo");
                 assert!(!pinyin);
                 assert_eq!(limit, 100);
+                assert!(pinyin_initials);
+                assert!(pinyin_full);
                 assert_eq!(offset, 0);
             }
             _ => panic!(),
@@ -319,9 +338,11 @@ mod tests {
         // 老客户端不带 offset 也能解析（向后兼容）。
         let r2: IpcRequest = serde_json::from_str(r#"{"type":"search","query":"x"}"#).unwrap();
         match r2 {
-            IpcRequest::Search { offset, limit, .. } => {
+            IpcRequest::Search { offset, limit, pinyin_initials, pinyin_full, .. } => {
                 assert_eq!(offset, 0);
                 assert_eq!(limit, 500);
+                assert!(pinyin_initials);
+                assert!(pinyin_full);
             }
             _ => panic!(),
         }

@@ -48,6 +48,31 @@ pub struct AuxStats {
     pub docs_full: u64,
 }
 
+/// 打开已建好的辅库（不存在/版本不对 → None，不报错；调用方视为未建）。
+pub fn open_aux(index_bin: &std::path::Path) -> (Option<ContentIndex>, Option<ContentIndex>) {
+    let ini = aux_dir_for(index_bin, AUX_INITIALS_SUFFIX);
+    let full = aux_dir_for(index_bin, AUX_FULL_SUFFIX);
+    let open_if_compat = |dir: &std::path::PathBuf| -> Option<ContentIndex> {
+        if !dir.join("meta.json").is_file() {
+            return None;
+        }
+        if crate::index::read_schema_version(dir) != Some(crate::SCHEMA_VERSION) {
+            return None;
+        }
+        open_or_create(dir).ok()
+    };
+    (open_if_compat(&ini), open_if_compat(&full))
+}
+
+/// 文本 → (initials 全文, 全拼全文)：增量路径共用（与回填同一算法）。
+pub fn pinyin_texts(text: &str) -> (String, String) {
+    let chars: Vec<char> = text.chars().filter(|c| is_cjk(*c)).collect();
+    if chars.is_empty() {
+        return (String::new(), String::new());
+    }
+    (initials_text(&chars), full_text(&chars))
+}
+
 /// 单个 CJK 字符 → (全拼, 首字母)；非 CJK 返回 None。
 fn pinyin_of(ch: char) -> Option<(&'static str, char)> {
     let s = ch.to_string();

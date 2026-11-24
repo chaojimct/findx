@@ -183,7 +183,7 @@ mod tests {
             mtime: 1,
             is_directory: i == 2,
             name_highlight: vec![],
-            snippet: String::new(),
+            snippet: String::new(), pinyin_hit: false,
         })
         .collect()
     }

@@ -180,6 +180,21 @@ impl TableDelegate for ResultsTable {
                                 }),
                         ),
                 )
+                // 拼音辅库命中徽标（content: + ascii 拼音查到中文时）。
+                .when(hit.pinyin_hit, |view| {
+                    view.child(
+                        div()
+                            .ml_1()
+                            .flex_shrink_0()
+                            .px_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(tokens.border)
+                            .text_xs()
+                            .text_color(tokens.text_secondary)
+                            .child("拼"),
+                    )
+                })
                 .into_any_element();
         }
         let text = match col {

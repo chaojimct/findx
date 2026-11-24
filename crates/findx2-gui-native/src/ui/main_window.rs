@@ -882,17 +882,28 @@ impl MainWindow {
         let generation = self.search_gen;
         self.search_keyboard
             .begin(old_generation, generation, &query);
-        let (endpoint, pinyin, limit, ipc) = self.session.read_with(cx, |s, _| {
-            (
-                s.endpoint.clone(),
-                s.settings.pinyin_default,
-                s.settings.search_limit.max(1).min(PAGE_SIZE as u32) as usize,
-                s.ipc.clone(),
-            )
-        });
+        let (endpoint, pinyin, pinyin_initials, pinyin_full, limit, ipc) =
+            self.session.read_with(cx, |s, _| {
+                (
+                    s.endpoint.clone(),
+                    s.settings.pinyin_default,
+                    s.settings.content_pinyin_initials,
+                    s.settings.content_pinyin_full,
+                    s.settings.search_limit.max(1).min(PAGE_SIZE as u32) as usize,
+                    s.ipc.clone(),
+                )
+            });
         // PAGE_SIZE is the first-page fetch; search_limit is the ceiling shown in status.
         let fetch = PAGE_SIZE.min(limit.max(1));
-        let rx = ipc.search(endpoint, query, pinyin, fetch, 0);
+        let rx = ipc.search(
+            endpoint,
+            query,
+            pinyin,
+            pinyin_initials,
+            pinyin_full,
+            fetch,
+            0,
+        );
         self._search_task = Some(cx.spawn(async move |this, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("IPC 通道已关闭".into()));
             this.update(cx, |this, cx| {
@@ -1006,10 +1017,25 @@ impl MainWindow {
         let generation = self.search_gen;
         let offset = self.hits.len();
         let query = self.current_query(cx);
-        let (endpoint, pinyin, ipc) = self.session.read_with(cx, |s, _| {
-            (s.endpoint.clone(), s.settings.pinyin_default, s.ipc.clone())
-        });
-        let rx = ipc.search(endpoint, query, pinyin, PAGE_SIZE, offset);
+        let (endpoint, pinyin, pinyin_initials, pinyin_full, ipc) =
+            self.session.read_with(cx, |s, _| {
+                (
+                    s.endpoint.clone(),
+                    s.settings.pinyin_default,
+                    s.settings.content_pinyin_initials,
+                    s.settings.content_pinyin_full,
+                    s.ipc.clone(),
+                )
+            });
+        let rx = ipc.search(
+            endpoint,
+            query,
+            pinyin,
+            pinyin_initials,
+            pinyin_full,
+            PAGE_SIZE,
+            offset,
+        );
         self._page_task = Some(cx.spawn(async move |this, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("IPC 通道已关闭".into()));
             let _ = this.update(cx, |this, cx| {
@@ -1271,7 +1297,7 @@ impl MainWindow {
                 mtime: 0,
                 is_directory: false,
                 name_highlight: Vec::new(),
-                snippet: String::new(),
+                snippet: String::new(), pinyin_hit: false,
             })
         });
         let Some(hit) = target else {

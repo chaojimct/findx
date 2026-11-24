@@ -533,6 +533,8 @@ fn do_search_via_pipe(query: &str, max_total: usize) -> Option<Vec<IpcHit>> {
         pinyin: true,
         limit: max_total.min(8192),
         offset: 0,
+        pinyin_initials: true,
+        pinyin_full: true,
     };
     match pipe_rpc(&pipe, &req)? {
         IpcResponse::SearchResult { hits, .. } => {

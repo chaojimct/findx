@@ -1888,6 +1888,34 @@ impl SettingsWindow {
                     cx.notify();
                 },
             ))
+            .child(self.service_switch_row(
+                "content-pinyin-initials",
+                "全文拼音首字母",
+                "content: 查询支持首字母（如 qw 命中“全文”）；辅库未建时自动降级",
+                self.settings.content_pinyin_initials,
+                false,
+                tokens,
+                cx,
+                |this, on, cx| {
+                    this.settings.content_pinyin_initials = *on;
+                    this.apply_settings(cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.service_switch_row(
+                "content-pinyin-full",
+                "全文拼音全拼",
+                "content: 查询支持全拼（如 quan wen 命中“全文”）；辅库未建时自动降级",
+                self.settings.content_pinyin_full,
+                false,
+                tokens,
+                cx,
+                |this, on, cx| {
+                    this.settings.content_pinyin_full = *on;
+                    this.apply_settings(cx);
+                    cx.notify();
+                },
+            ))
             .child(
                 h_flex()
                     .h(px(36.))

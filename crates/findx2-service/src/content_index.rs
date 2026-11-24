@@ -83,6 +83,9 @@ struct Manager {
     index_bin: PathBuf,
     engine: Option<Arc<SearchEngine>>,
     index: Option<Arc<findx2_content::ContentIndex>>,
+    /// 拼音辅库（首字母 / 全拼；缺失即 None，查询自动降级为主库）。
+    aux_ini: Option<Arc<findx2_content::ContentIndex>>,
+    aux_full: Option<Arc<findx2_content::ContentIndex>>,
     state: StateKind,
     /// Stale 原因 / Failed 错误 / Building 备注。
     detail: String,
@@ -103,6 +106,8 @@ impl Manager {
             index_bin: PathBuf::new(),
             engine: None,
             index: None,
+            aux_ini: None,
+            aux_full: None,
             state: StateKind::Missing,
             detail: String::new(),
             dropped_batches: 0,
@@ -211,7 +216,13 @@ fn stop_incremental_locked(m: &mut Manager) {
     }
 }
 
-fn start_incremental_locked(m: &mut Manager, engine: Arc<SearchEngine>, index: Arc<findx2_content::ContentIndex>) {
+fn start_incremental_locked(
+    m: &mut Manager,
+    engine: Arc<SearchEngine>,
+    index: Arc<findx2_content::ContentIndex>,
+    aux_ini: Option<Arc<findx2_content::ContentIndex>>,
+    aux_full: Option<Arc<findx2_content::ContentIndex>>,
+) {
     if m.tx.is_some() {
         return;
     }
@@ -221,7 +232,7 @@ fn start_incremental_locked(m: &mut Manager, engine: Arc<SearchEngine>, index: A
     std::thread::Builder::new()
         .name("findx2-content-index".into())
         .spawn(move || {
-            worker_loop(engine, index, rx, move || {
+            worker_loop(engine, index, aux_ini, aux_full, rx, move || {
                 if let Ok(mut g) = hub().lock() {
                     g.bytes = dir_size(&cdir);
                 }
@@ -252,6 +263,8 @@ pub(crate) fn init(index_bin: &std::path::Path, engine: Arc<SearchEngine>) -> bo
     m.engine = Some(engine.clone());
     m.stash.clear();
     m.build = None;
+    m.aux_ini = None;
+    m.aux_full = None;
     let Some(cidx) = findx2_content::open_if_exists(index_bin) else {
         m.index = None;
         m.docs = 0;
@@ -288,7 +301,12 @@ pub(crate) fn init(index_bin: &std::path::Path, engine: Arc<SearchEngine>) -> bo
     m.bytes = dir_size(&cdir);
     m.entry_total = fp_now.entry_count as u64;
     m.index = Some(cidx.clone());
-    start_incremental_locked(&mut m, engine, cidx);
+    // 拼音辅库：版本一致才挂载，否则视为未建（查询降级，不报错）。
+    let (aux_ini, aux_full) = findx2_content::open_aux(index_bin);
+    m.aux_ini = aux_ini.map(Arc::new);
+    m.aux_full = aux_full.map(Arc::new);
+    let (ai, af) = (m.aux_ini.clone(), m.aux_full.clone());
+    start_incremental_locked(&mut m, engine, cidx, ai, af);
     let docs = m.docs;
     let state = m.state;
     drop(m);
@@ -303,11 +321,136 @@ pub(crate) fn init(index_bin: &std::path::Path, engine: Arc<SearchEngine>) -> bo
 
 /// 查询装配：search_ipc / do_search 共用。仅 `Ready` 挂载，其他状态回退慢路径。
 pub(crate) fn content_opt() -> Option<Arc<dyn findx2_core::ContentSearch>> {
+    content_opt_with(true, true)
+}
+
+/// 带拼音开关的装配（IPC `pinyin_initials` / `pinyin_full` 透传）。
+/// 辅库缺失/开关关闭 → 自动降级为主库直查。
+pub(crate) fn content_opt_with(
+    use_ini: bool,
+    use_full: bool,
+) -> Option<Arc<dyn findx2_core::ContentSearch>> {
     let g = hub().lock().ok()?;
     if g.state != StateKind::Ready {
         return None;
     }
-    g.index.clone().map(|i| i as Arc<dyn findx2_core::ContentSearch>)
+    let main = g.index.clone()?;
+    let ini = if use_ini { g.aux_ini.clone() } else { None };
+    let full = if use_full { g.aux_full.clone() } else { None };
+    if ini.is_none() && full.is_none() {
+        return Some(main as Arc<dyn findx2_core::ContentSearch>);
+    }
+    Some(Arc::new(MergedContentSearch {
+        main,
+        ini,
+        full,
+    }) as Arc<dyn findx2_core::ContentSearch>)
+}
+
+/// 主库 + 拼音辅库合并查询：主库精确命中在前，辅库拼音命中补后（按键去重，截断到 limit）。
+struct MergedContentSearch {
+    main: Arc<findx2_content::ContentIndex>,
+    ini: Option<Arc<findx2_content::ContentIndex>>,
+    full: Option<Arc<findx2_content::ContentIndex>>,
+}
+
+impl findx2_core::ContentSearch for MergedContentSearch {
+    fn search_content(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, u64)>, findx2_core::Error> {
+        use std::collections::HashSet;
+        let map_err = |e: findx2_content::Error| {
+            findx2_core::Error::Persist(format!("内容索引查询失败: {e}"))
+        };
+        let main_hits = self
+            .main
+            .search_ids(query, limit)
+            .map_err(map_err)?;
+        if !query.is_ascii() || limit == 0 {
+            return Ok(main_hits
+                .into_iter()
+                .map(|(v, f, _)| (v, f))
+                .collect());
+        }
+        let mut seen: HashSet<(String, u64)> = HashSet::with_capacity(limit * 2);
+        let mut out: Vec<(String, u64)> = Vec::with_capacity(limit);
+        for (v, f, _) in main_hits {
+            if out.len() >= limit {
+                break;
+            }
+            seen.insert((v.clone(), f));
+            out.push((v, f));
+        }
+        if out.len() >= limit {
+            return Ok(out);
+        }
+        // 辅库各取 limit 条（score 截断由主合并 cap 兜底），合并去重。
+        let mut aux_all: Vec<(String, u64, f32)> = Vec::new();
+        if let Some(ini) = self.ini.as_ref() {
+            if let Ok(h) = ini.search_pinyin(query, limit) {
+                aux_all.extend(h);
+            }
+        }
+        if let Some(full) = self.full.as_ref() {
+            if let Ok(h) = full.search_pinyin(query, limit) {
+                aux_all.extend(h);
+            }
+        }
+        // 按 score 降序，让更像的拼音命中靠前。
+        aux_all.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        for (v, f, _) in aux_all {
+            if out.len() >= limit {
+                break;
+            }
+            if seen.insert((v.clone(), f)) {
+                out.push((v, f));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// 拼音命中键集合（service 侧打 `pinyin_hit` 徽标用；与主库是否命中无关，只表示辅库可查到）。
+/// 非 ASCII 查询直接返回空（走主库中文分词，无拼音概念）。
+pub(crate) fn aux_pinyin_keys(
+    query: &str,
+    use_ini: bool,
+    use_full: bool,
+    limit: usize,
+) -> std::collections::HashSet<(String, u64)> {
+    use std::collections::HashSet;
+    let mut out = HashSet::new();
+    if !query.is_ascii() || limit == 0 {
+        return out;
+    }
+    let g = match hub().lock() {
+        Ok(g) => g,
+        Err(_) => return out,
+    };
+    if g.state != StateKind::Ready {
+        return out;
+    }
+    if use_ini {
+        if let Some(ini) = g.aux_ini.as_ref() {
+            if let Ok(h) = ini.search_pinyin(query, limit) {
+                for (v, f, _) in h {
+                    out.insert((v, f));
+                }
+            }
+        }
+    }
+    if use_full {
+        if let Some(full) = g.aux_full.as_ref() {
+            if let Ok(h) = full.search_pinyin(query, limit) {
+                for (v, f, _) in h {
+                    out.insert((v, f));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// watch 热路径调。`Ready/Stale/Failed` 翻译成 job（不阻塞，不碰 store）；
@@ -655,11 +798,16 @@ fn run_build(
             if prev.is_some() {
                 g.state = StateKind::Ready;
                 g.detail = "构建已取消，仍用旧索引".into();
-                let (eng, idx) = (g.engine.clone(), g.index.clone());
+                let (eng, idx, ai, af) = (
+                    g.engine.clone(),
+                    g.index.clone(),
+                    g.aux_ini.clone(),
+                    g.aux_full.clone(),
+                );
                 drop(g);
                 if let (Some(eng), Some(idx)) = (eng, idx) {
                     let mut m = hub().lock().expect("content hub 锁中毒");
-                    start_incremental_locked(&mut m, eng, idx);
+                    start_incremental_locked(&mut m, eng, idx, ai, af);
                 }
             } else {
                 g.state = prev_state;
@@ -681,11 +829,16 @@ fn run_build(
                 // 重建失败：旧索引继续服务 + 恢复增量。
                 g.state = StateKind::Ready;
                 g.detail = format!("重建失败，仍用旧索引：{e}");
-                let (eng, idx) = (g.engine.clone(), g.index.clone());
+                let (eng, idx, ai, af) = (
+                    g.engine.clone(),
+                    g.index.clone(),
+                    g.aux_ini.clone(),
+                    g.aux_full.clone(),
+                );
                 drop(g);
                 if let (Some(eng), Some(idx)) = (eng, idx) {
                     let mut m = hub().lock().expect("content hub 锁中毒");
-                    start_incremental_locked(&mut m, eng, idx);
+                    start_incremental_locked(&mut m, eng, idx, ai, af);
                 }
             } else {
                 g.state = StateKind::Failed;
@@ -707,11 +860,16 @@ fn run_build(
             if prev.is_some() {
                 g.state = StateKind::Ready;
                 g.detail = format!("发布失败，仍用旧索引：{e}");
-                let (eng, idx) = (g.engine.clone(), g.index.clone());
+                let (eng, idx, ai, af) = (
+                    g.engine.clone(),
+                    g.index.clone(),
+                    g.aux_ini.clone(),
+                    g.aux_full.clone(),
+                );
                 drop(g);
                 if let (Some(eng), Some(idx)) = (eng, idx) {
                     let mut m = hub().lock().expect("content hub 锁中毒");
-                    start_incremental_locked(&mut m, eng, idx);
+                    start_incremental_locked(&mut m, eng, idx, ai, af);
                 }
             } else {
                 g.state = StateKind::Failed;
@@ -734,6 +892,26 @@ fn run_build(
             return;
         }
     };
+    // 主库建成后重建拼音辅库（幂等 upsert；全量 tmp 发布后 rebuild=true 清旧）。
+    // 辅库失败不影响主库可用：记 detail 提示，查询自动降级。
+    let aux_note = match findx2_content::build_aux_from_index(&index_bin, use_tmp, |_, _| {
+        !cancel_flag.load(std::sync::atomic::Ordering::Acquire)
+    }) {
+        Ok(st) => {
+            tracing::info!(
+                "拼音辅库重建完成：{} docs（ini {}/full {}）",
+                st.docs,
+                st.docs_ini,
+                st.docs_full
+            );
+            String::new()
+        }
+        Err(e) => {
+            tracing::warn!("拼音辅库重建失败（主库可用，拼音降级）：{e}");
+            format!("（拼音辅库失败：{e}）")
+        }
+    };
+    let (aux_ini_new, aux_full_new) = findx2_content::open_aux(&index_bin);
     write_sidecar(&final_cdir, &fingerprint_of(&engine));
     let bytes = dir_size(&final_cdir);
     let stash: Vec<Job> = {
@@ -743,21 +921,38 @@ fn run_build(
         };
         g.build = None;
         g.index = Some(cidx.clone());
+        g.aux_ini = aux_ini_new.map(Arc::new);
+        g.aux_full = aux_full_new.map(Arc::new);
         g.docs = docs;
         g.bytes = bytes;
         g.entry_total = entry_len as u64;
         g.state = StateKind::Ready;
         g.detail.clear();
-        start_incremental_locked(&mut g, engine.clone(), cidx.clone());
+        if !aux_note.is_empty() {
+            g.detail = aux_note;
+        }
+        let (ai, af) = (g.aux_ini.clone(), g.aux_full.clone());
+        start_incremental_locked(&mut g, engine.clone(), cidx.clone(), ai, af);
         std::mem::take(&mut g.stash)
     };
-    // 构建窗口期的增量：按 FRN 重新 resolve 后应用（改名/删除天然收敛）。
+    // 构建窗口期的增量：按 FRN 重新 resolve 后应用（改名/删除天然收敛，主+辅同写）。
     if !stash.is_empty() {
         let n = stash.len();
+        let (ai, af) = hub()
+            .lock()
+            .ok()
+            .map(|g| (g.aux_ini.clone(), g.aux_full.clone()))
+            .unwrap_or((None, None));
         for job in &stash {
-            let _ = apply_job(&engine, &cidx, job);
+            let _ = apply_job(&engine, &cidx, ai.as_ref(), af.as_ref(), job);
         }
         let _ = cidx.commit();
+        if let Some(a) = ai.as_ref() {
+            let _ = a.commit();
+        }
+        if let Some(a) = af.as_ref() {
+            let _ = a.commit();
+        }
         tracing::info!("内容索引构建完成，应用构建窗口增量 {n} 条");
     }
     tracing::info!(
@@ -770,6 +965,8 @@ fn run_build(
 fn worker_loop(
     engine: Arc<SearchEngine>,
     index: Arc<findx2_content::ContentIndex>,
+    aux_ini: Option<Arc<findx2_content::ContentIndex>>,
+    aux_full: Option<Arc<findx2_content::ContentIndex>>,
     rx: std::sync::mpsc::Receiver<Vec<Job>>,
     on_commit: impl Fn() + Send + 'static,
 ) {
@@ -792,7 +989,7 @@ fn worker_loop(
             }
         }
         for job in &batch {
-            match apply_job(&engine, &index, job) {
+            match apply_job(&engine, &index, aux_ini.as_ref(), aux_full.as_ref(), job) {
                 Ok(true) => {
                     since_commit += 1;
                     match job.kind {
@@ -806,6 +1003,12 @@ fn worker_loop(
         }
         if since_commit >= 500 || (since_commit > 0 && last_commit.elapsed() >= Duration::from_secs(30)) {
             if index.commit().is_ok() {
+                if let Some(a) = aux_ini.as_ref() {
+                    let _ = a.commit();
+                }
+                if let Some(a) = aux_full.as_ref() {
+                    let _ = a.commit();
+                }
                 since_commit = 0;
                 last_commit = Instant::now();
                 on_commit();
@@ -813,16 +1016,24 @@ fn worker_loop(
         }
     }
     let _ = index.commit();
+    if let Some(a) = aux_ini.as_ref() {
+        let _ = a.commit();
+    }
+    if let Some(a) = aux_full.as_ref() {
+        let _ = a.commit();
+    }
     on_commit();
     tracing::info!(
         "内容索引线程退出：upsert {upserts} / delete {deletes} / 失败 {failed}"
     );
 }
 
-/// 单 job：resolve → 抽取 → 入库。返回 Ok(true)=产生变更。
+/// 单 job：resolve → 抽取 → 入库（主库 + 拼音辅库同写）。返回 Ok(true)=产生变更。
 fn apply_job(
     engine: &Arc<SearchEngine>,
     index: &Arc<findx2_content::ContentIndex>,
+    aux_ini: Option<&Arc<findx2_content::ContentIndex>>,
+    aux_full: Option<&Arc<findx2_content::ContentIndex>>,
     job: &Job,
 ) -> Result<bool, ()> {
     // 路径解析：FRN 在多卷下可能碰撞，按 volume_letter 命中卷，兜底扫全卷。
@@ -893,8 +1104,15 @@ fn apply_job(
         hit.ok_or(())?
     };
     let _ = slot;
-    match job.kind {        JobKind::Delete => {
+    match job.kind {
+        JobKind::Delete => {
             index.delete_by_frn(&vol_key, job.frn).map_err(|_| ())?;
+            if let Some(a) = aux_ini {
+                let _ = a.delete_by_frn(&vol_key, job.frn);
+            }
+            if let Some(a) = aux_full {
+                let _ = a.delete_by_frn(&vol_key, job.frn);
+            }
             Ok(true)
         }
         JobKind::Upsert => {
@@ -903,18 +1121,32 @@ fn apply_job(
                 return Ok(false);
             }
             let t = findx2_content::extract_text(p).map_err(|_| ())?;
-            index
-                .index_doc(
-                    &findx2_content::DocMeta {
-                        frn: job.frn,
-                        volume_id: vol_key,
-                        path,
-                        mtime,
-                        size,
-                    },
-                    &t.text,
-                )
-                .map_err(|_| ())?;
+            let meta = findx2_content::DocMeta {
+                frn: job.frn,
+                volume_id: vol_key,
+                path,
+                mtime,
+                size,
+            };
+            index.index_doc(&meta, &t.text).map_err(|_| ())?;
+            // 辅库同写：拼音文本由原文派生（与回填同一算法），失败不影响主库。
+            if aux_ini.is_some() || aux_full.is_some() {
+                let (ini_text, full_text) = findx2_content::pinyin_texts(&t.text);
+                if let Some(a) = aux_ini {
+                    if !ini_text.is_empty() {
+                        let _ = a.index_doc(&meta, &ini_text);
+                    } else {
+                        let _ = a.delete_by_frn(&meta.volume_id, meta.frn);
+                    }
+                }
+                if let Some(a) = aux_full {
+                    if !full_text.is_empty() {
+                        let _ = a.index_doc(&meta, &full_text);
+                    } else {
+                        let _ = a.delete_by_frn(&meta.volume_id, meta.frn);
+                    }
+                }
+            }
             Ok(true)
         }
     }
@@ -973,5 +1205,85 @@ mod fingerprint_tests {
         assert_eq!(StateKind::Stale.as_str(), cs::STALE);
         assert_eq!(StateKind::Failed.as_str(), cs::FAILED);
         assert_eq!(StateKind::Disabled.as_str(), cs::DISABLED);
+    }
+}
+
+#[cfg(test)]
+mod merged_search_tests {
+    use super::*;
+    use findx2_core::ContentSearch;
+
+    fn tiny_index(
+        dir: &std::path::Path,
+        docs: &[(&str, u64, &str)],
+    ) -> Arc<findx2_content::ContentIndex> {
+        let idx = Arc::new(findx2_content::open_or_create(dir).unwrap());
+        for (vol, frn, body) in docs {
+            idx.index_doc(
+                &findx2_content::DocMeta {
+                    frn: *frn,
+                    volume_id: (*vol).to_string(),
+                    path: format!("C:\\t\\{frn}.txt"),
+                    mtime: 0,
+                    size: body.len() as u64,
+                },
+                body,
+            )
+            .unwrap();
+        }
+        idx.commit().unwrap();
+        idx
+    }
+
+    #[test]
+    fn merged_search_finds_cjk_via_pinyin_and_dedups() {
+        let case = tempfile::tempdir().unwrap();
+        // 主库含 CJK + 一段 ascii（ascii 部分让主/辅同时命中，验证去重）。
+        let main = tiny_index(
+            &case.path().join("main"),
+            &[("v", 7, "全文搜索 qw 备注")],
+        );
+        let (ini_text, full_text) = findx2_content::pinyin_texts("全文搜索 qw 备注");
+        assert!(!ini_text.is_empty() && !full_text.is_empty());
+        let ini = tiny_index(&case.path().join("ini"), &[("v", 7, &ini_text)]);
+        let full = tiny_index(&case.path().join("full"), &[("v", 7, &full_text)]);
+        let merged = MergedContentSearch {
+            main,
+            ini: Some(ini),
+            full: Some(full),
+        };
+        // 中文直查命中主库。
+        let zh = merged.search_content("全文", 50).unwrap();
+        assert!(zh.iter().any(|(_, f)| *f == 7), "{zh:?}");
+        // 首字母命中（主库亦有 ascii qw，去重后只出现一次）。
+        let py = merged.search_content("qw", 50).unwrap();
+        assert!(py.iter().any(|(_, f)| *f == 7), "{py:?}");
+        assert_eq!(py.iter().filter(|(_, f)| *f == 7).count(), 1, "{py:?}");
+        // 全拼命中。
+        let qp = merged.search_content("quan wen", 50).unwrap();
+        assert!(qp.iter().any(|(_, f)| *f == 7), "{qp:?}");
+        // 非 ASCII 查询不走辅库、不 panic。
+        let _ = merged.search_content("全文搜索", 50).unwrap();
+    }
+
+    #[test]
+    fn merged_search_without_aux_behaves_like_main() {
+        let case = tempfile::tempdir().unwrap();
+        let main = tiny_index(&case.path().join("m"), &[("v", 9, "hello world")]);
+        let merged = MergedContentSearch {
+            main,
+            ini: None,
+            full: None,
+        };
+        let hits = merged.search_content("hello", 50).unwrap();
+        assert!(hits.iter().any(|(_, f)| *f == 9), "{hits:?}");
+        // 无辅库时拼音查中文为空（不回退慢路径、不 panic）。
+        let main2 = tiny_index(&case.path().join("m2"), &[("v", 10, "全文")]);
+        let merged2 = MergedContentSearch {
+            main: main2,
+            ini: None,
+            full: None,
+        };
+        assert!(merged2.search_content("qw", 50).unwrap().is_empty());
     }
 }

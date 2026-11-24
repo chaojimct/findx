@@ -159,6 +159,12 @@ pub struct FindxGuiSettings {
     /// 结果表第二行 + 预览窗显示命中摘要。
     #[serde(default = "default_true")]
     pub content_snippet: bool,
+    /// 全文拼音辅库：首字母查询（`qw` 命中“全文”）。缺库时自动降级。
+    #[serde(default = "default_true")]
+    pub content_pinyin_initials: bool,
+    /// 全文拼音辅库：全拼查询（`quan wen` 命中“全文”）。缺库时自动降级。
+    #[serde(default = "default_true")]
+    pub content_pinyin_full: bool,
     /// 混合模式下内容侧取回上限（防 TopDocs 爆炸）。
     #[serde(default = "default_content_mix_limit")]
     pub content_mix_limit: u32,
@@ -231,6 +237,8 @@ impl FindxGuiSettings {
             content_enabled: true,
             content_default_mode: ContentDefaultMode::Name,
             content_snippet: true,
+            content_pinyin_initials: true,
+            content_pinyin_full: true,
             content_mix_limit: default_content_mix_limit(),
             content_max_file_mb: default_content_max_file_mb(),
             content_index_office: true,
@@ -453,6 +461,8 @@ mod tests {
         assert!(s.content_enabled);
         assert_eq!(s.content_default_mode, ContentDefaultMode::Name);
         assert!(s.content_snippet);
+        assert!(s.content_pinyin_initials);
+        assert!(s.content_pinyin_full);
         assert_eq!(s.content_mix_limit, 200);
         assert_eq!(s.content_max_file_mb, 20);
         assert!(s.content_index_office && s.content_index_pdf && s.content_index_code);
@@ -470,6 +480,8 @@ mod tests {
         });
         let s: FindxGuiSettings = serde_json::from_value(old).unwrap();
         assert!(s.content_enabled);
+        assert!(s.content_pinyin_initials);
+        assert!(s.content_pinyin_full);
         assert_eq!(s.content_default_mode, ContentDefaultMode::Name);
         assert_eq!(s.content_max_file_mb, 20);
         // 模式解析。
