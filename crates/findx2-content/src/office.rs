@@ -254,7 +254,89 @@ pub fn extract_pptx(path: &Path) -> Result<String> {
     Ok(out)
 }
 
+/// 线程本地 Pdfium 绑定：每线程首次使用时加载（exe 旁 `pdfium.dll`，
+/// 备选系统库），失败则永久降级（`PDFIUM_TRIED` 保证只试一次）。
+/// 无 DLL/离线构建的机器自动走纯 Rust 兜底，功能不中断。
+thread_local! {
+    static PDFIUM: std::cell::RefCell<Option<pdfium_render::prelude::Pdfium>> =
+        const { std::cell::RefCell::new(None) };
+    static PDFIUM_TRIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn bind_pdfium() -> Option<pdfium_render::prelude::Pdfium> {
+    use pdfium_render::prelude::Pdfium;
+    if let Some(dll) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("pdfium.dll")))
+    {
+        if dll.is_file() {
+            if let Ok(bindings) = Pdfium::bind_to_library(&dll) {
+                return Some(Pdfium::new(bindings));
+            }
+        }
+    }
+    Pdfium::bind_to_system_library()
+        .ok()
+        .map(Pdfium::new)
+}
+
+fn with_pdfium<R>(f: impl FnOnce(&pdfium_render::prelude::Pdfium) -> Result<R>) -> Result<R> {
+    PDFIUM_TRIED.with(|tried| {
+        PDFIUM.with(|cell| {
+            if cell.borrow().is_none() && !tried.get() {
+                tried.set(true);
+                *cell.borrow_mut() = bind_pdfium();
+            }
+            match cell.borrow().as_ref() {
+                Some(p) => f(p),
+                None => Err(Error::Extract(
+                    String::new(),
+                    "pdfium 不可用，已降级".into(),
+                )),
+            }
+        })
+    })
+}
+
+/// Pdfium 主路径（Chrome 同款引擎，又快又不崩 CJK 编码）。
+fn extract_pdf_with_pdfium(path: &Path) -> Result<String> {
+    use pdfium_render::prelude::*;
+    with_pdfium(|pdfium| {
+        let document = pdfium
+            .load_pdf_from_file(path, None)
+            .map_err(|e| Error::Extract(path.display().to_string(), format!("pdfium 打开失败: {e}")))?;
+        let pages = document.pages();
+        let mut out = String::new();
+        for page in pages.iter() {
+            let text = page.text().map_err(|e| {
+                Error::Extract(path.display().to_string(), format!("pdfium 取文本失败: {e}"))
+            })?;
+            out.push_str(&text.all());
+            out.push('\n');
+        }
+        Ok(out)
+    })
+}
+
 pub fn extract_pdf(path: &Path) -> Result<String> {
+    // 主路径：pdfium。失败（加密/损坏/无 DLL）则走纯 Rust 兜底。
+    let text = match extract_pdf_with_pdfium(path) {
+        Ok(t) => t,
+        Err(_) => return extract_pdf_fallback(path),
+    };
+    if text.trim().is_empty() {
+        return Err(Error::Extract(
+            path.display().to_string(),
+            "pdf 无文本层（扫描版走 M2 OCR）".into(),
+        ));
+    }
+    Ok(text)
+}
+
+/// 纯 Rust 兜底（慢；非常见编码会 panic，已接住转失败计数）。
+/// 公开仅供 benchmark 对比主路径；业务代码一律走 [`extract_pdf`]。
+#[doc(hidden)]
+pub fn extract_pdf_fallback(path: &Path) -> Result<String> {
     let bytes =
         std::fs::read(path).map_err(|e| Error::Io(path.display().to_string(), e))?;
     // pdf-extract 遇到不支持的编码（如中文 PDF 常见的 UniGB-UCS2-H）会直接 panic
