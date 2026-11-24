@@ -164,7 +164,7 @@ pub fn build_from_plan(
     mut progress: impl FnMut(&BuildStats) -> bool,
 ) -> Result<u64> {
     const EXTRACT_BATCH: usize = 1024;
-    /// 索引 commit 节流：writer 堆 1.5GB，5 万篇一批，崩溃最多丢一批。
+    // 索引 commit 节流：writer 堆 1.5GB，5 万篇一批，崩溃最多丢一批。
     const COMMIT_EVERY: u64 = 50_000;
     let existed = cdir.exists();
     if rebuild && existed {

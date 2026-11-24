@@ -83,6 +83,20 @@ pub fn should_extract(path: &Path) -> Option<u64> {
     if !meta.is_file() || meta.len() > MAX_EXTRACT_BYTES || meta.len() == 0 {
         return None;
     }
+    // 云占位文件（OneDrive/WPS 云随用随下）：读一次触发整文件下载，
+    // 构建期绝不能碰。只认属性（本次 stat 已拿到，无额外 syscall），不读内容。
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
+        const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x400000;
+        if meta.file_attributes()
+            & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+            != 0
+        {
+            return None;
+        }
+    }
     Some(meta.len())
 }
 
