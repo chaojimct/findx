@@ -1,8 +1,7 @@
 //! Virtualized Kit table: shared header/body geometry, resize handles and two scrollbars.
 use super::main_window::MainWindow;
-use crate::search_logic::{format_size, format_time, highlight_segments, snippet_segments};
+use crate::search_logic::{format_size, format_time, highlight_segments};
 use findx2_ipc::SearchHitDto;
-use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -15,8 +14,8 @@ pub(super) struct ResultsTable {
     pub hits: Vec<SearchHitDto>,
     pub widths: [f32; 4],
     pub more: bool,
-    /// 设置页“命中摘要”开关（sync_table 每次从设置刷新；scoped 表恒 false）。
-    pub show_snippet: bool,
+    /// 全文/混合模式时名称列头的后缀标记（`·全文` / `·混合`），低调区分。
+    pub content_suffix: SharedString,
     pub owner: WeakEntity<MainWindow>,
 }
 impl TableDelegate for ResultsTable {
@@ -94,12 +93,21 @@ impl TableDelegate for ResultsTable {
         self.hits.len()
     }
     fn column(&self, ix: usize, _: &App) -> Column {
-        let (key, label) = [
-            ("name", "名称"),
-            ("path", "路径"),
-            ("size", "大小"),
-            ("mtime", "修改时间"),
-        ][ix];
+        let (key, label): (&str, SharedString) = match ix {
+            // 全文/混合模式名称列头加低调后缀（搜索框模式键的列表侧呼应）。
+            0 if !self.content_suffix.is_empty() => {
+                ("name", format!("名称{}", self.content_suffix).into())
+            }
+            _ => {
+                let (k, l) = [
+                    ("name", "名称"),
+                    ("path", "路径"),
+                    ("size", "大小"),
+                    ("mtime", "修改时间"),
+                ][ix];
+                (k, l.into())
+            }
+        };
         let mut column = Column::new(key, label)
             .width(px(self.widths[ix]))
             .min_width(px(MIN_WIDTHS[ix]))
@@ -138,17 +146,6 @@ impl TableDelegate for ResultsTable {
         let tokens = *cx.global::<crate::theme::FindxTokens>();
         if col == 0 {
             let full_path = hit.path.clone();
-            // tooltip 放完整摘要（行内只显示省略片段，悬停读全）。
-            let tip_text: SharedString = if hit.snippet.is_empty() {
-                full_path.clone().into()
-            } else {
-                let plain: String = snippet_segments(&hit.snippet)
-                    .into_iter()
-                    .map(|(t, _)| t)
-                    .collect::<Vec<_>>()
-                    .join("");
-                format!("{full_path}\n{plain}").into()
-            };
             let menu_open = self
                 .owner
                 .read_with(cx, |view, _| view.file_menu_is_open())
@@ -157,7 +154,7 @@ impl TableDelegate for ResultsTable {
                 .id(("search-name-cell", row))
                 .when(!menu_open, |view| {
                     view.tooltip(move |window, cx| {
-                        gpui_kit::component::tooltip::Tooltip::new(tip_text.clone())
+                        gpui_kit::component::tooltip::Tooltip::new(full_path.clone())
                             .build(window, cx)
                     })
                 })
@@ -173,69 +170,25 @@ impl TableDelegate for ResultsTable {
                     tokens,
                 ))
                 .child(
-                    v_flex()
+                    div()
                         .ml_2()
+                        .flex()
+                        .items_center()
                         .flex_1()
                         .min_w_0()
                         .overflow_hidden()
-                        .justify_center()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .w_full()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .children(
-                                    highlight_segments(&hit.name, &hit.name_highlight)
-                                        .into_iter()
-                                        .map(|(text, on)| {
-                                            div()
-                                                .flex_shrink_0()
-                                                .whitespace_nowrap()
-                                                .when(on, |view| {
-                                                    view.bg(tokens.hit_bg).text_color(tokens.hit_fg)
-                                                })
-                                                .child(text.to_owned())
-                                        }),
-                                ),
-                        )
-                        // 命中摘要行（设置页开关；仅 content: 查询有值）。
-                        // 引用线 + 内联高亮 + 自动换行读全：正文搜索的主角是命中
-                        // 片段，文件名退回纯 ID。service 侧已按 120 字开窗，不会无限长。
-                        .when(
-                            self.show_snippet && !hit.snippet.is_empty(),
-                            |view| {
-                                let (plain, ranges) =
-                                    crate::search_logic::snippet_plain_and_ranges(
-                                        &hit.snippet,
-                                    );
-                                view.child(
+                        .children(
+                            highlight_segments(&hit.name, &hit.name_highlight)
+                                .into_iter()
+                                .map(|(text, on)| {
                                     div()
-                                        .w_full()
-                                        .min_w_0()
-                                        .border_l_1()
-                                        .border_color(tokens.accent)
-                                        .pl_1()
-                                        .text_xs()
-                                        .text_color(tokens.text_secondary)
-                                        .child(StyledText::new(plain).with_highlights(
-                                            ranges.into_iter().map(|range| {
-                                                (
-                                                    range,
-                                                    HighlightStyle {
-                                                        color: Some(tokens.hit_fg),
-                                                        background_color: Some(
-                                                            tokens.hit_bg,
-                                                        ),
-                                                        ..Default::default()
-                                                    },
-                                                )
-                                            }),
-                                        )),
-                                )
-                            },
+                                        .flex_shrink_0()
+                                        .whitespace_nowrap()
+                                        .when(on, |view| {
+                                            view.bg(tokens.hit_bg).text_color(tokens.hit_fg)
+                                        })
+                                        .child(text.to_owned())
+                                }),
                         ),
                 )
                 // 拼音辅库命中徽标（content: + ascii 拼音查到中文时）。

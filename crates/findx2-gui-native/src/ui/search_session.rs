@@ -148,7 +148,7 @@ impl MainWindow {
                     hits: vec![],
                     widths,
                     more: false,
-                    show_snippet: false,
+                    content_suffix: SharedString::default(),
                     owner,
                 },
                 window,

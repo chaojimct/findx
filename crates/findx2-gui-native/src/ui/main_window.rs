@@ -397,7 +397,7 @@ impl MainWindow {
                     hits: Vec::new(),
                     widths,
                     more: false,
-                    show_snippet: false,
+                    content_suffix: SharedString::default(),
                     owner,
                 },
                 window,
@@ -1103,11 +1103,23 @@ impl MainWindow {
     fn sync_table(&mut self, reset: bool, cx: &mut Context<Self>) {
         let hits = self.hits.clone();
         let more = hits.len() < self.match_total as usize && !self.page_loading && !self.page_error;
-        let show_snippet = self.session.read(cx).settings.content_snippet;
+        // 全文/混合模式名称列头加低调后缀（搜索框模式键的列表侧呼应）。
+        let content_suffix: SharedString = {
+            let enabled = self.session.read(cx).settings.content_enabled;
+            if !enabled {
+                "".into()
+            } else {
+                match self.content_mode {
+                    ContentDefaultMode::Content => "·全文".into(),
+                    ContentDefaultMode::Mix => "·混合".into(),
+                    ContentDefaultMode::Name => "".into(),
+                }
+            }
+        };
         self.table.update(cx, |table, cx| {
             table.delegate_mut().hits = hits;
             table.delegate_mut().more = more;
-            table.delegate_mut().show_snippet = show_snippet;
+            table.delegate_mut().content_suffix = content_suffix;
             if reset {
                 table.clear_selection(cx);
                 table.scroll_to_row(0, cx);
