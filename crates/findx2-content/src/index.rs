@@ -173,6 +173,13 @@ pub fn content_dir_for(index_bin: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(dir)
 }
 
+/// 目录里有 tantivy 库但 schema 版本对不上（旧版二进制/旧代码建的库）：
+/// 调用方应提示重建，而不是当成“未建”。避免新旧二进制混跑时静默走慢路径。
+pub fn schema_mismatch(index_bin: &Path) -> bool {
+    let dir = content_dir_for(index_bin);
+    dir.join("meta.json").is_file() && read_schema_version(&dir) != Some(SCHEMA_VERSION)
+}
+
 /// 索引目录已建好才打开（`meta.json` 为 tantivy 建成标志 + 我方 schema 版本一致），
 /// 否则 None（调用方走旧慢路径；版本不一致也视为未建，触发重建）。
 pub fn open_if_exists(index_bin: &Path) -> Option<ContentIndex> {

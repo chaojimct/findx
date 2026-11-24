@@ -256,12 +256,22 @@ pub(crate) fn init(index_bin: &std::path::Path, engine: Arc<SearchEngine>) -> bo
         m.index = None;
         m.docs = 0;
         m.bytes = 0;
-        m.state = StateKind::Missing;
-        m.detail = "内容索引未建（`findx2 content-index` 或 GUI 全文页构建后加速）".into();
-        tracing::info!(
-            "内容索引未建（{} 不存在）：`content:` 查询走慢路径",
-            cdir.display()
-        );
+        if findx2_content::schema_mismatch(index_bin) {
+            // 新旧二进制混跑：库是旧 schema，静默走慢路径会超时；明确提示重建。
+            m.state = StateKind::Stale;
+            m.detail = "内容索引版本过旧，需重建（全文页点“重建”）".into();
+            tracing::warn!(
+                "内容索引 schema 版本过旧（{}），`content:` 查询走慢路径，请重建",
+                cdir.display()
+            );
+        } else {
+            m.state = StateKind::Missing;
+            m.detail = "内容索引未建（`findx2 content-index` 或 GUI 全文页构建后加速）".into();
+            tracing::info!(
+                "内容索引未建（{} 不存在）：`content:` 查询走慢路径",
+                cdir.display()
+            );
+        }
         return false;
     };
     let cidx = Arc::new(cidx);

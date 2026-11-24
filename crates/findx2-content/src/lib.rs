@@ -23,8 +23,8 @@ pub use extract::{
     MAX_EXTRACT_BYTES, SUPPORTED_EXTENSIONS,
 };
 pub use index::{
-    content_dir_for, doc_key, open_if_exists, open_or_create, ContentFields, ContentHit,
-    ContentIndex, DocMeta, SCHEMA_VERSION,
+    content_dir_for, doc_key, open_if_exists, open_or_create, schema_mismatch, ContentFields,
+    ContentHit, ContentIndex, DocMeta, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
