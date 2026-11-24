@@ -76,6 +76,18 @@
   ENUM 现状端到端约 282s（MFT 走查约 23s + NtQueryDirectoryFile 目录 rescan 约 249s（398K 目录，本机奇慢）+ 落盘约 10s）。
   端到端约 7 倍；结构性胜利是 hybrid 跳过了目录 rescan（249s → 目录回填 2.3s），bulk 本身约 4.5 倍。
   瓶颈仍在尾部 selective backfill（18.7s，约 9.3K 条/s）——P1-1 打这里。冷缓存 A/B 仍为 open 项（不阻塞合入）。
+- **2026-11-25 采样公式 bug 修复（优化B，先于优化A见效，优化A直接作废）**：
+  `validate_runs` 偏移曾误写 `(kk % 每簇记录数) * 记录大小`，中/尾采样点全挤在 run 头部 4K 内；
+  vcn=818048 头部恰为已删记录小片区 → 三连挂 → 200MB 整 run 误判缺口 → 17 万条补尾 → 18.7s 回填。
+  法医（SYSTEM python 探针，独立 RETRIEVAL + 落盘字节）：两可疑 run 头记录 magic/ordinal 全对（seq=23/3），
+  挂在 not-in-use/无 FN 上；中/尾点读错位置故 ordinal 必对不上——读错而非数据错。
+  修复（`sample_points` 纯函数，首/中/末簇 spread + 单测锁定法医向量）后：
+  818048 正名，22 extents/4497MB，尾部仅剩末 run（真零区，未写簇）→ 补尾 5700 文件+905 目录 → 回填约 1s；
+  **hybrid 端到端约 15s（bulk+补尾约 6s，落盘+trigram 约 7s），端到端约 19 倍**。
+  A/B（hybrid 01:50 vs ENUM 01:16，间隔 34 分钟）：缺失 4836（散布，42 个 10 万桶仅 5 个超 300，
+  无成墙；[3.5M,4M) 仅 167——runs 14/15 缺口彻底消失），多出 38491（口径差为主，见 extracheck）。
+  瓶颈转移：落盘+trigram（~7s）已超 bulk 本身；P1-1 方向→增量/常驻 + 尾部 6.6K 的 OpenFileById（~1s，可忽略）。
+  冷缓存 A/B 仍为 open 项（不阻塞合入）。
 - 备忘：早期 bench 数据（方案 2/4/5 对比、0x80 截断发现过程）见 git 历史；结论以本节为准。
 
 ## 3. 第 1 波：查询路径（1~2 周，体感质变）
