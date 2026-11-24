@@ -286,6 +286,21 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
     }
 }
 
+/// 各分支的 `content:`/`utf8content:` 取值（主分支 + 顶层 `|` OR 分支）。
+/// snippet 分词与拼音打标只看这些，不看整串 query（操作符名本身不是关键词）。
+fn content_needles(pq: &findx2_core::ParsedQuery) -> Vec<&str> {
+    let mut out = Vec::new();
+    for q in std::iter::once(pq).chain(pq.or_branches.iter()) {
+        if let Some(s) = q.content_substring.as_ref() {
+            out.push(s.as_str());
+        }
+        if let Some(s) = q.utf8content_substring.as_ref() {
+            out.push(s.as_str());
+        }
+    }
+    out
+}
+
 pub(crate) fn search_ipc(
     engine: &SearchEngine,
     query: &str,
@@ -338,12 +353,11 @@ pub(crate) fn search_ipc(
         .collect();
     // 含 content: 谓词时给当页前 N 个填 snippet（有界成本，超出的行后面懒取）。
     // 拼音辅库命中同时打标（GUI 显示“拼”徽标；主库直命中不标）。
-    if pq.content_substring.is_some() || pq.utf8content_substring.is_some() {
-        let needle_opt = pq
-            .content_substring
-            .as_ref()
-            .or(pq.utf8content_substring.as_ref());
-        if let Some(needle) = needle_opt {
+    // 注意：只取各分支的 content: 取值做分词/打标，不拿整串 query
+    // （否则操作符名 `content` 本身会被当关键词高亮，见 content:machuntian 误标）。
+    let needles = content_needles(&pq);
+    if !needles.is_empty() {
+        for needle in &needles {
             if needle.is_ascii() && (pinyin_initials || pinyin_full) {
                 let aux_set = crate::content_index::aux_pinyin_keys(
                     needle,
@@ -376,10 +390,11 @@ pub(crate) fn search_ipc(
                 }
             }
         }
+        let needle_text = needles.join(" ");
         let idxs: Vec<u32> = hits.iter().map(|h| h.entry_idx).collect();
         let map = crate::content_index::snippets_for(
             &engine,
-            query,
+            &needle_text,
             &idxs,
             crate::content_index::SNIPPET_PER_PAGE,
         );
@@ -563,6 +578,15 @@ mod usage_tests {
 }
 
 #[cfg(test)] mod search_snapshot_tests {
+    #[test] fn content_needles_ignores_operator_name_and_covers_or_branches() {
+        let pq = findx2_core::QueryParser::parse("machuntian | content:qw").unwrap();
+        assert_eq!(super::content_needles(&pq), vec!["qw"]);
+        let pq2 = findx2_core::QueryParser::parse("content:machuntian").unwrap();
+        assert_eq!(super::content_needles(&pq2), vec!["machuntian"]);
+        let pq3 = findx2_core::QueryParser::parse("报告").unwrap();
+        assert!(super::content_needles(&pq3).is_empty());
+    }
+
     #[test] fn directory_kind_is_carried_by_search_snapshot() {
         let raw=|id,parent,name:&str,dir|findx2_core::RawEntry { file_id:id,file_id_128:None,parent_id:parent,name:name.into(),size:if dir {0}else{123},mtime:0,ctime:0,attrs:if dir{16}else{0},is_dir:dir };
         let store=findx2_core::IndexBuilder::new(b'F',1,7,0).build_from_raw(vec![raw(10,2,"public-file.txt",false)],vec![raw(1,0,"root",true),raw(2,1,"public-folder",true)],true).unwrap();

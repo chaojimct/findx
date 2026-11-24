@@ -138,6 +138,17 @@ impl TableDelegate for ResultsTable {
         let tokens = *cx.global::<crate::theme::FindxTokens>();
         if col == 0 {
             let full_path = hit.path.clone();
+            // tooltip 放完整摘要（行内只显示省略片段，悬停读全）。
+            let tip_text: SharedString = if hit.snippet.is_empty() {
+                full_path.clone().into()
+            } else {
+                let plain: String = snippet_segments(&hit.snippet)
+                    .into_iter()
+                    .map(|(t, _)| t)
+                    .collect::<Vec<_>>()
+                    .join("");
+                format!("{full_path}\n{plain}").into()
+            };
             let menu_open = self
                 .owner
                 .read_with(cx, |view, _| view.file_menu_is_open())
@@ -146,7 +157,7 @@ impl TableDelegate for ResultsTable {
                 .id(("search-name-cell", row))
                 .when(!menu_open, |view| {
                     view.tooltip(move |window, cx| {
-                        gpui_kit::component::tooltip::Tooltip::new(full_path.clone())
+                        gpui_kit::component::tooltip::Tooltip::new(tip_text.clone())
                             .build(window, cx)
                     })
                 })
@@ -175,6 +186,7 @@ impl TableDelegate for ResultsTable {
                                 .w_full()
                                 .min_w_0()
                                 .overflow_hidden()
+                                .whitespace_nowrap()
                                 .children(
                                     highlight_segments(&hit.name, &hit.name_highlight)
                                         .into_iter()
@@ -198,6 +210,7 @@ impl TableDelegate for ResultsTable {
                                         .w_full()
                                         .min_w_0()
                                         .overflow_hidden()
+                                        .whitespace_nowrap()
                                         .flex()
                                         .items_center()
                                         .text_xs()
