@@ -15,7 +15,7 @@ use findx2_core::{volume_key_for, IndexStore};
 use rayon::prelude::*;
 
 use crate::{
-    extract_text, file_name_supported, open_or_create, should_extract, DocMeta, Error, Result,
+    extract_text, lower_name_supported, open_or_create, should_extract, DocMeta, Error, Result,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -95,16 +95,16 @@ pub fn plan_range_from_store(
     st: &mut BuildStats,
 ) -> Vec<PlanItem> {
     let mut out = Vec::new();
+    // 栈中小写缓冲：449 万条目 × 零堆分配（超长名才走堆，万分之一都不到）。
+    let mut lower_buf = [0u8; 256];
     for idx in start.min(store.entries.len())..end.min(store.entries.len()) {
         let e = &store.entries[idx];
         if e.is_dir_entry() || e.is_deleted() {
             continue;
         }
         st.scanned += 1;
-        // 1) 扩展名预检：无路径拼接、无 stat。
-        let name_ok = std::str::from_utf8(store.name_bytes(e))
-            .map(file_name_supported)
-            .unwrap_or(false);
+        // 1) 扩展名预检：无路径拼接、无 stat、无分配。
+        let name_ok = lower_name_supported(&store.name_lower_into(e, &mut lower_buf));
         if !name_ok {
             st.skipped += 1;
             continue;

@@ -16,8 +16,8 @@ pub use build::{
 };
 pub use error::Error;
 pub use extract::{
-    extract_text, file_name_supported, should_extract, ExtractedText, MAX_EXTRACT_BYTES,
-    SUPPORTED_EXTENSIONS,
+    extract_text, file_name_supported, lower_name_supported, should_extract, ExtractedText,
+    MAX_EXTRACT_BYTES, SUPPORTED_EXTENSIONS,
 };
 pub use index::{
     content_dir_for, doc_key, open_if_exists, open_or_create, ContentFields, ContentHit,

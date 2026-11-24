@@ -48,13 +48,20 @@ pub struct ExtractedText {
 /// 语义与 `should_extract` 的“扩展名/无扩展名白名单”部分一致：
 /// 有扩展名查扩展名表，无扩展名查全名表。大小写不敏感。
 pub fn file_name_supported(file_name: &str) -> bool {
-    let lower = file_name.to_ascii_lowercase();
-    match std::path::Path::new(&lower)
-        .extension()
-        .and_then(|e| e.to_str())
-    {
-        Some(ext) => SUPPORTED_EXTENSIONS.contains(&ext),
-        None => TEXT_BASENAMES.iter().any(|b| *b == lower),
+    lower_name_supported(file_name.to_ascii_lowercase().as_bytes())
+}
+
+/// 小写字节名预检（无分配）：`file_name_supported` 的字节版，供规划热循环用
+///（`IndexStore::name_lower_into` 栈缓冲直传，449 万条目零堆分配）。
+/// 切分语义与 `Path::extension` 对齐：无点/点在首字符（如 `.gitignore`）→
+/// 无扩展名，走全名表；尾点（`foo.`）→ 空扩展名，不在白名单。
+pub fn lower_name_supported(lower: &[u8]) -> bool {
+    match lower.iter().rposition(|&b| b == b'.') {
+        None | Some(0) => TEXT_BASENAMES.iter().any(|b| lower == b.as_bytes()),
+        Some(i) => {
+            let ext = &lower[i + 1..];
+            SUPPORTED_EXTENSIONS.iter().any(|s| ext == s.as_bytes())
+        }
     }
 }
 
@@ -192,6 +199,25 @@ mod tests {
         // 无扩展名：全名表（大小写不敏感）。
         assert!(file_name_supported("Makefile"));
         assert!(file_name_supported("makefile"));
+        assert!(!file_name_supported(".gitignore"));
+        assert!(!file_name_supported("foo."));
+        // 字节版与字符串版一致（含隐藏文件/尾点边界）。
+        for name in [
+            "a.txt",
+            "A.TXT",
+            "report.DOCX",
+            "main.rs",
+            "Makefile",
+            ".gitignore",
+            "foo.",
+            "archive.tar.gz",
+        ] {
+            assert_eq!(
+                lower_name_supported(name.to_ascii_lowercase().as_bytes()),
+                file_name_supported(name),
+                "{name}"
+            );
+        }
     }
 
     #[test]
