@@ -392,7 +392,29 @@ pub(crate) fn start_build(rebuild: bool) -> Result<String, String> {
     };
     std::thread::Builder::new()
         .name("findx2-content-build".into())
-        .spawn(move || run_build(engine, index_bin, rebuild, prev, cancel))
+        .spawn(move || {
+            // 构建线程 panic（毒文件/解析器 bug 漏网）不能无声冻屏：
+            // 兜底落 FAILED 状态，GUI 看得到、下次可重建。
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_build(engine, index_bin, rebuild, prev, cancel)
+            })) {
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| {
+                        payload
+                            .downcast_ref::<&str>()
+                            .map(|s| (*s).to_string())
+                    })
+                    .unwrap_or_else(|| "构建线程 panic".to_string());
+                tracing::error!("内容索引构建线程 panic：{msg}");
+                if let Ok(mut g) = hub().lock() {
+                    g.build = None;
+                    g.state = StateKind::Failed;
+                    g.detail = format!("构建线程崩溃（{msg}），可重试");
+                }
+            }
+        })
         .map_err(|e| format!("构建线程启动失败：{e}"))?;
     Ok(if rebuild { "已开始全量重建" } else { "已开始构建" }.into())
 }

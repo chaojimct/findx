@@ -257,7 +257,28 @@ pub fn extract_pptx(path: &Path) -> Result<String> {
 pub fn extract_pdf(path: &Path) -> Result<String> {
     let bytes =
         std::fs::read(path).map_err(|e| Error::Io(path.display().to_string(), e))?;
-    let text = pdf_extract::extract_text_from_mem(&bytes).map_err(|e| {
+    // pdf-extract 遇到不支持的编码（如中文 PDF 常见的 UniGB-UCS2-H）会直接 panic
+    // 而不是返回 Err；一个毒文件不能把整个构建线程（rayon worker）带走，
+    // 兜底转成 Extract 错误，由调用方计数跳过。
+    let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pdf_extract::extract_text_from_mem(&bytes)
+    }))
+    .map_err(|payload| {
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+            })
+            .unwrap_or_else(|| "pdf 解析器 panic".to_string());
+        Error::Extract(
+            path.display().to_string(),
+            format!("pdf 解析失败（{msg}；加密/损坏/非常见编码走 M2）"),
+        )
+    })?
+    .map_err(|e| {
         Error::Extract(
             path.display().to_string(),
             format!("pdf 解析失败（加密/损坏/图片型走 M2）: {e}"),
@@ -326,5 +347,22 @@ mod tests {
         assert!(extract_docx(&p).is_err());
         assert!(extract_xlsx(&p).is_err());
         assert!(extract_pptx(&p).is_err());
+    }
+
+    #[test]
+    fn malformed_pdf_is_error_not_panic() {
+        // 毒文件（非常见编码/损坏）只能 Err（记失败跳过），绝不能 panic
+        // 把构建线程带走。回归：UniGB-UCS2-H 中文 PDF 曾崩掉整轮构建。
+        let d = tempfile::tempdir().unwrap();
+        let cases: &[&[u8]] = &[
+            b"not a pdf at all",
+            b"%PDF-1.4 truncated",
+            b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n",
+        ];
+        for (i, data) in cases.iter().enumerate() {
+            let p = d.path().join(format!("bad{i}.pdf"));
+            std::fs::write(&p, data).unwrap();
+            assert!(extract_pdf(&p).is_err(), "case {i}");
+        }
     }
 }
