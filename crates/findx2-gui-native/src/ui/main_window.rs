@@ -15,7 +15,6 @@ use workspace::{ViewMode, Workspace, key};
 
 use findx2_ipc::SearchHitDto;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::menu::PopupMenu;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{Icon, IconName, Selectable as _, Sizable as _, h_flex, v_flex};
@@ -87,9 +86,6 @@ actions!(
         DirectoryTab8,
         DirectoryTab9,
         ToggleSidebar,
-        ContentModeName,
-        ContentModeContent,
-        ContentModeMix,
     ]
 );
 
@@ -249,10 +245,6 @@ pub struct MainWindow {
     /// 搜索框全文模式（文件名/全文/混合；`content_enabled` 关时恒为文件名）。
     /// 初值取自设置页“默认搜索模式”。
     content_mode: ContentDefaultMode,
-    /// 全文模式下拉菜单（输入框 prefix 按钮点开；anchored 覆盖层渲染）。
-    content_mode_menu: Option<Entity<PopupMenu>>,
-    content_mode_menu_position: Point<Pixels>,
-    content_mode_menu_subscription: Option<Subscription>,
     hits: Vec<SearchHitDto>,
     selected: Option<usize>,
     match_total: u32,
@@ -273,8 +265,12 @@ pub struct MainWindow {
     pdf_count: u32,
     office_text_only: bool,
     preview_file: Option<String>,
-    /// 当前预览命中的摘要（content: 查询 service 回填；预览窗顶部展示命中上下文）。
+    /// 当前预览命中的摘要（content: 查询 service 回填；预览窗展示用）。
     preview_snippet: String,
+    /// 摘要 tab 是否激活（office 预览 [命中上下文|系统版式|文字摘录] 三态之一）。
+    preview_snippet_view: bool,
+    /// 用户手动点过预览展示 tab 后锁定：后到的摘要不再抢回激活态。
+    preview_snippet_lock: bool,
     loading: bool,
     sidebar_force: Option<ForceState>,
     preview_force: Option<ForceState>,
@@ -287,6 +283,19 @@ pub struct MainWindow {
     _search_task: Option<Task<()>>,
     _status_task: Option<Task<()>>,
     _preview_task: Option<Task<()>>,
+}
+
+/// office 预览扩展名（系统版式/文字摘录/命中上下文 三 tab 只在此出现）。
+fn is_office_preview_path(path: &str) -> bool {
+    matches!(
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|x| x.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "docx" | "xlsx" | "pptx" | "rtf" | "doc" | "xls" | "ppt"
+    )
 }
 
 impl MainWindow {
@@ -469,9 +478,6 @@ impl MainWindow {
             size_min: String::new(),
             size_max: String::new(),
             content_mode: session.read(cx).settings.content_default_mode,
-            content_mode_menu: None,
-            content_mode_menu_position: point(px(0.), px(0.)),
-            content_mode_menu_subscription: None,
             hits: Vec::new(),
             selected: None,
             match_total: 0,
@@ -496,6 +502,8 @@ impl MainWindow {
             sidebar_force: None,
             preview_force: None,
             preview_snippet: String::new(),
+            preview_snippet_view: false,
+            preview_snippet_lock: false,
             last_content_width: 1100.0,
             table_viewport_width: 1100.0,
             last_diag: String::new(),
@@ -879,52 +887,11 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.dismiss_content_mode_menu(cx);
         if self.content_mode == m {
             return;
         }
         self.content_mode = m;
         self.schedule_search(window, cx);
-        cx.notify();
-    }
-
-    fn dismiss_content_mode_menu(&mut self, cx: &mut Context<Self>) {
-        self.content_mode_menu = None;
-        self.content_mode_menu_subscription = None;
-        cx.notify();
-    }
-
-    /// 输入框 prefix 按钮点开的下拉选（当前模式打勾；点击条目走同名 Action）。
-    fn open_content_mode_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.dismiss_content_mode_menu(cx);
-        let current = self.content_mode;
-        let menu = PopupMenu::build(window, cx, move |menu, _, _| {
-            menu.menu_with_check(
-                "文件名：只搜文件名",
-                current == ContentDefaultMode::Name,
-                Box::new(ContentModeName),
-            )
-            .menu_with_check(
-                "全文：只搜正文（content: 包裹，支持拼音首字母如 qw 与全拼）",
-                current == ContentDefaultMode::Content,
-                Box::new(ContentModeContent),
-            )
-            .menu_with_check(
-                "混合：文件名与正文并集",
-                current == ContentDefaultMode::Mix,
-                Box::new(ContentModeMix),
-            )
-        });
-        self.content_mode_menu_subscription = Some(cx.subscribe(
-            &menu,
-            |this, _, _: &DismissEvent, cx| {
-                this.content_mode_menu = None;
-                this.content_mode_menu_subscription = None;
-                cx.notify();
-            },
-        ));
-        self.content_mode_menu_position = window.mouse_position();
-        self.content_mode_menu = Some(menu);
         cx.notify();
     }
 
@@ -1416,6 +1383,7 @@ impl MainWindow {
             self._preview_task = None;
             self.preview = PreviewState::empty();
             self.preview_snippet.clear();
+            self.preview_snippet_view = false;
             return;
         }
         let local_file = self.preview_file.is_some() || self.workspace.mode != ViewMode::Search;
@@ -1440,10 +1408,15 @@ impl MainWindow {
             self.office_text_only = false;
             self.preview = PreviewState::empty();
             self.preview_snippet.clear();
+            self.preview_snippet_view = false;
             self._preview_task = None;
             return;
         };
         self.preview_snippet = hit.snippet.clone();
+        // 新目标默认激活摘要 tab（有摘要才显示该 tab）；手动点过 tab 的选择不受影响
+        // 由各 tab 按钮自行加锁（见 toggle 行），这里先恢复未锁定。
+        self.preview_snippet_view = !self.preview_snippet.is_empty();
+        self.preview_snippet_lock = false;
         // 选中行无摘要时按需补一条（列表首屏只填前 N 行，其余行选中即取；
         // 供行内多行摘要与预览卡用，失败静默）。
         if hit.snippet.is_empty()
@@ -1495,6 +1468,10 @@ impl MainWindow {
                             .is_some_and(|h| h.entry_idx == entry_idx)
                         {
                             this.preview_snippet = text;
+                            // 后到的摘要只在未锁定时抢回激活态（用户点过 tab 则不动）。
+                            if !this.preview_snippet_lock {
+                                this.preview_snippet_view = true;
+                            }
                         }
                         this.sync_table(false, cx);
                         cx.notify();
@@ -2318,7 +2295,12 @@ impl MainWindow {
             // 命中上下文卡（content: 查询选中行；全文开关控制显隐）。
             .when(
                 !self.preview_snippet.is_empty()
-                    && self.session.read(cx).settings.content_snippet,
+                    && self.session.read(cx).settings.content_snippet
+                    && !self
+                        .preview
+                        .meta
+                        .as_ref()
+                        .is_some_and(|m| is_office_preview_path(&m.path)),
                 |view| {
                     let (plain, ranges) =
                         search_logic::snippet_plain_and_ranges(&self.preview_snippet);
@@ -2362,34 +2344,58 @@ impl MainWindow {
                 view.child(self.render_pdf_controls(cx))
             })
             .when(
-                self.preview.meta.as_ref().is_some_and(|m| {
-                    let ext = std::path::Path::new(&m.path)
-                        .extension()
-                        .and_then(|x| x.to_str())
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    matches!(
-                        ext.as_str(),
-                        "docx" | "xlsx" | "pptx" | "rtf" | "doc" | "xls" | "ppt"
-                    )
-                }),
+                self.preview
+                    .meta
+                    .as_ref()
+                    .is_some_and(|m| is_office_preview_path(&m.path)),
                 |view| {
                     view.child(
                         h_flex().px_2().py_1().gap_1().flex_shrink_0().children(
-                            [
-                                ("office-native", "系统版式", false),
-                                ("office-text", "文字摘录", true),
-                            ]
+                            {
+                                // 命中上下文排第一个：有摘要时默认激活，占整块预览区。
+                                let mut tabs: Vec<(&'static str, &'static str, bool)> =
+                                    vec![];
+                                if !self.preview_snippet.is_empty() {
+                                    tabs.push((
+                                        "snippet",
+                                        "命中上下文",
+                                        self.preview_snippet_view,
+                                    ));
+                                }
+                                tabs.push((
+                                    "office-native",
+                                    "系统版式",
+                                    !self.office_text_only && !self.preview_snippet_view,
+                                ));
+                                tabs.push((
+                                    "office-text",
+                                    "文字摘录",
+                                    self.office_text_only && !self.preview_snippet_view,
+                                ));
+                                tabs
+                            }
                             .into_iter()
-                            .map(|(id, label, text_only)| {
+                            .map(|(id, label, selected)| {
                                 let entity = cx.entity();
                                 Button::new(id)
                                     .ghost()
                                     .label(label)
+                                    .selected(selected)
                                     .on_click(move |_, _, cx| {
                                         entity.update(cx, |this, cx| {
-                                            if !this.preview_is_current() { return; }
-                                            this.office_text_only = text_only;
+                                            if id == "snippet" {
+                                                // 摘要已在内存，不重载，只切视图。
+                                                this.preview_snippet_view = true;
+                                                this.preview_snippet_lock = true;
+                                                cx.notify();
+                                                return;
+                                            }
+                                            if !this.preview_is_current() {
+                                                return;
+                                            }
+                                            this.preview_snippet_view = false;
+                                            this.preview_snippet_lock = true;
+                                            this.office_text_only = id == "office-text";
                                             this.request_preview(cx);
                                             cx.notify();
                                         })
@@ -2399,7 +2405,34 @@ impl MainWindow {
                     )
                 },
             )
-            .child(if self.preview.pdf.is_some() {
+            .child(if self.preview_snippet_view && !self.preview_snippet.is_empty() {
+                div()
+                    .id("preview-snippet-body")
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_y_scrollbar()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .child({
+                        let (plain, ranges) =
+                            search_logic::snippet_plain_and_ranges(&self.preview_snippet);
+                        StyledText::new(plain).with_highlights(ranges.into_iter().map(
+                            |range| {
+                                (
+                                    range,
+                                    HighlightStyle {
+                                        color: Some(tokens.hit_fg),
+                                        background_color: Some(tokens.hit_bg),
+                                        ..Default::default()
+                                    },
+                                )
+                            },
+                        ))
+                    })
+                    .into_any_element()
+            } else if self.preview.pdf.is_some() {
                 div()
                     .id("pdf-page-scroll")
                     .flex_1()
@@ -2982,15 +3015,6 @@ impl Render for MainWindow {
                     this.open_settings_page(window, cx)
                 }),
             )
-            .on_action(cx.listener(|this, _: &ContentModeName, window, cx| {
-                this.set_content_mode(ContentDefaultMode::Name, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ContentModeContent, window, cx| {
-                this.set_content_mode(ContentDefaultMode::Content, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ContentModeMix, window, cx| {
-                this.set_content_mode(ContentDefaultMode::Mix, window, cx);
-            }))
             .child(self.render_workspace_title(window, cx))
             .when_some(self.settings_page.clone(), |view, page| {
                 view.child(div().flex_1().min_h_0().child(page))
@@ -3027,17 +3051,6 @@ impl Render for MainWindow {
                                 .w(px(372.)).h(px(340.))
                                 .child(div().h(px(28.)).flex_shrink_0().w_full().px_3().py_1().bg(Self::tokens(cx).surface).border_1().border_color(Self::tokens(cx).border).text_xs().overflow_hidden().whitespace_nowrap().child(header)))
                                 .child(menu)),
-                    )
-                    .with_priority(gpui_kit::base::POPUP_PRIORITY),
-                )
-            })
-            .when_some(self.content_mode_menu.clone(), |view, menu| {
-                view.child(
-                    deferred(
-                        anchored()
-                            .position(self.content_mode_menu_position)
-                            .snap_to_window_with_margin(px(8.))
-                            .child(menu),
                     )
                     .with_priority(gpui_kit::base::POPUP_PRIORITY),
                 )

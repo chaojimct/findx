@@ -154,58 +154,61 @@ impl MainWindow {
             }))
     }
 
-    /// 搜索框输入框内左侧的全文模式下拉键（点开展示 文件名/全文/混合）。
-    /// 用裸 div 自控高度（Button 在 prefix 槽会被撑满）；▾ 明示下拉，tooltip 保留
-    /// 完整说明即拼音入口；菜单条目走 ContentMode* Action（打勾表当前）。
-    fn mode_menu_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 搜索框输入框内左侧的三段 switch（文件/全文/混合，直选）。
+    /// 单键循环和下拉都太绕：三段常显，一眼看到当前模式，点哪段切哪段。
+    /// tooltip 保留完整语义即拼音入口。
+    fn mode_segmented(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = Self::tokens(cx);
-        let active = self.content_mode != ContentDefaultMode::Name;
-        let label: SharedString = match self.content_mode {
-            ContentDefaultMode::Name => "文件 ▾".into(),
-            ContentDefaultMode::Content => "全文 ▾".into(),
-            ContentDefaultMode::Mix => "混合 ▾".into(),
-        };
-        let tip: SharedString = match self.content_mode {
-            ContentDefaultMode::Name => "文件名：只搜文件名。点击展开模式菜单".into(),
-            ContentDefaultMode::Content => {
-                "全文：只搜正文（content: 包裹，支持拼音首字母如 qw 与全拼）。点击展开模式菜单"
-                    .into()
-            }
-            ContentDefaultMode::Mix => "混合：文件名与正文并集。点击展开模式菜单".into(),
-        };
-        div()
+        h_flex()
             .id("search-content-mode")
-            .flex()
-            .items_center()
             .flex_shrink_0()
-            .h(px(22.))
-            .px_1()
-            .rounded_sm()
+            .items_center()
+            .rounded_full()
             .border_1()
-            .border_color(if active {
-                tokens.accent
-            } else {
-                tokens.border_soft
-            })
-            .text_xs()
-            .text_color(if active {
-                tokens.accent
-            } else {
-                tokens.text_secondary
-            })
-            .whitespace_nowrap()
+            .border_color(tokens.border_soft)
+            .bg(tokens.surface)
+            .p(px(2.))
             .cursor_pointer()
             .tooltip({
-                let tip = tip.clone();
+                let tip: SharedString =
+                    "文件名：只搜文件名；全文：只搜正文（content: 包裹，支持拼音首字母如 qw 与全拼）；混合：两者并集。点击切换"
+                        .into();
                 move |window, cx| {
                     gpui_kit::component::tooltip::Tooltip::new(tip.clone())
                         .build(window, cx)
                 }
             })
-            .child(label)
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.open_content_mode_menu(window, cx);
-            }))
+            .children(
+                [
+                    ContentDefaultMode::Name,
+                    ContentDefaultMode::Content,
+                    ContentDefaultMode::Mix,
+                ]
+                .into_iter()
+                .map(|m| {
+                    let active = self.content_mode == m;
+                    div()
+                        .id(SharedString::from(format!(
+                            "search-mode-{}",
+                            m.as_str()
+                        )))
+                        .px_2()
+                        .h(px(20.))
+                        .flex()
+                        .items_center()
+                        .rounded_full()
+                        .text_xs()
+                        .whitespace_nowrap()
+                        .when(active, |d| {
+                            d.bg(tokens.bg).text_color(tokens.text_primary)
+                        })
+                        .when(!active, |d| d.text_color(tokens.text_secondary))
+                        .child(m.label())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.set_content_mode(m, window, cx);
+                        }))
+                }),
+            )
     }
 
     fn render_search_toolbar(&self, preview: bool, cx: &mut Context<Self>) -> impl IntoElement {
@@ -253,7 +256,7 @@ impl MainWindow {
                         .cleanable(true)
                         .focus_bordered(false);
                     if content_enabled {
-                        input.prefix(self.mode_menu_button(cx))
+                        input.prefix(self.mode_segmented(cx))
                     } else {
                         input
                     }
