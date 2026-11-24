@@ -254,9 +254,13 @@ pub fn extract_pptx(path: &Path) -> Result<String> {
     Ok(out)
 }
 
-/// 线程本地 Pdfium 绑定：每线程首次使用时加载（exe 旁 `pdfium.dll`，
-/// 备选系统库），失败则永久降级（`PDFIUM_TRIED` 保证只试一次）。
-/// 无 DLL/离线构建的机器自动走纯 Rust 兜底，功能不中断。
+/// init 门：`FPDF_InitLibrary` 必须串行执行（16 worker 首批并发 init 实测死锁，
+/// 0 CPU 卡死）。门内串行创建，创建完各线程独立使用各自的 `Pdfium` 实例
+/// 处理各自文档（Chrome 同款多线程用法；`thread_safe` 特性会全局串行所有
+/// FFI 调用，直接杀死并行抽取，故不用）。
+/// 无 DLL/离线构建则各线程第一次即降级（`PDFIUM_TRIED`），功能不中断。
+static PDFIUM_INIT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 thread_local! {
     static PDFIUM: std::cell::RefCell<Option<pdfium_render::prelude::Pdfium>> =
         const { std::cell::RefCell::new(None) };
@@ -285,6 +289,8 @@ fn with_pdfium<R>(f: impl FnOnce(&pdfium_render::prelude::Pdfium) -> Result<R>) 
         PDFIUM.with(|cell| {
             if cell.borrow().is_none() && !tried.get() {
                 tried.set(true);
+                // 串行创建：门外排队，门内独占 init，出来后各用各的。
+                let _guard = PDFIUM_INIT_LOCK.lock();
                 *cell.borrow_mut() = bind_pdfium();
             }
             match cell.borrow().as_ref() {
