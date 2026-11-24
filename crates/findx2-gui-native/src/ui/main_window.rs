@@ -1432,6 +1432,65 @@ impl MainWindow {
             return;
         };
         self.preview_snippet = hit.snippet.clone();
+        // 选中行无摘要时按需补一条（列表首屏只填前 N 行，其余行选中即取；
+        // 供行内多行摘要与预览卡用，失败静默）。
+        if hit.snippet.is_empty()
+            && self.workspace.mode == ViewMode::Search
+            && self.preview_file.is_none()
+            && self.session.read(cx).settings.content_snippet
+        {
+            let sent = self.current_query(cx);
+            if sent.to_ascii_lowercase().contains("content:") {
+                let (endpoint, ipc) = self
+                    .session
+                    .read_with(cx, |s, _| (s.endpoint.clone(), s.ipc.clone()));
+                let entry_idx = hit.entry_idx;
+                let search_gen_at_req = self.search_gen;
+                cx.spawn(async move |this, cx| {
+                    let result = ipc
+                        .request(
+                            endpoint,
+                            findx2_ipc::IpcRequest::ContentSnippets {
+                                query: sent,
+                                entry_indices: vec![entry_idx],
+                            },
+                        )
+                        .await
+                        .unwrap_or_else(|_| Err("IPC 通道已关闭".into()));
+                    let Ok(findx2_ipc::IpcResponse::ContentSnippets { snippets }) = result
+                    else {
+                        return;
+                    };
+                    let _ = this.update(cx, |this, cx| {
+                        if this.search_gen != search_gen_at_req {
+                            return;
+                        }
+                        let Some((_, text)) =
+                            snippets.into_iter().find(|(i, _)| *i == entry_idx)
+                        else {
+                            return;
+                        };
+                        if text.is_empty() {
+                            return;
+                        }
+                        if let Some(h) =
+                            this.hits.iter_mut().find(|h| h.entry_idx == entry_idx)
+                        {
+                            h.snippet = text.clone();
+                        }
+                        if this
+                            .active_workspace_hit()
+                            .is_some_and(|h| h.entry_idx == entry_idx)
+                        {
+                            this.preview_snippet = text;
+                        }
+                        this.sync_table(false, cx);
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+        }
         if self.preview_memo.len() > 64 {
             self.preview_memo.clear();
         }

@@ -30,6 +30,7 @@ pub(crate) fn req_kind_label(r: &IpcRequest) -> &'static str {
         IpcRequest::Search { .. } => "Search",
         IpcRequest::ContentBuild { .. } => "ContentBuild",
         IpcRequest::ContentCancel => "ContentCancel",
+        IpcRequest::ContentSnippets { .. } => "ContentSnippets",
     }
 }
 
@@ -283,6 +284,36 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
             crate::content_index::cancel_build();
             IpcResponse::Pong
         }
+        (IpcRequest::ContentSnippets { query, entry_indices }, Some(eng)) => {
+            // 按需补摘要（选中行场景一次 1 个）：截断防刷，无摘要行缺席。
+            // query 取原文，service 侧自行提取 content: 取值（与 Search 一致）。
+            const SNIPPET_FETCH_CAP: usize = 64;
+            let idxs: Vec<u32> = entry_indices.into_iter().take(SNIPPET_FETCH_CAP).collect();
+            match QueryParser::parse(&query) {
+                Ok(pq) => {
+                    let needles = content_needles(&pq);
+                    if needles.is_empty() {
+                        IpcResponse::ContentSnippets { snippets: vec![] }
+                    } else {
+                        let map = crate::content_index::snippets_for(
+                            &eng,
+                            &needles.join(" "),
+                            &idxs,
+                            SNIPPET_FETCH_CAP,
+                        );
+                        IpcResponse::ContentSnippets {
+                            snippets: map.into_iter().collect(),
+                        }
+                    }
+                }
+                Err(e) => IpcResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+        (IpcRequest::ContentSnippets { .. }, None) => IpcResponse::Error {
+            message: "索引加载中，请稍候…".into(),
+        },
     }
 }
 

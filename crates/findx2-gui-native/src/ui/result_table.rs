@@ -201,8 +201,9 @@ impl TableDelegate for ResultsTable {
                                         }),
                                 ),
                         )
-                        // 命中摘要第二行（设置页开关；仅 content: 查询有值）。
-                        // 引用线样式 + StyledText 内联高亮，与文件名行明确区分。
+                        // 命中摘要行（设置页开关；仅 content: 查询有值）。
+                        // 引用线 + 内联高亮 + 自动换行读全：正文搜索的主角是命中
+                        // 片段，文件名退回纯 ID。service 侧已按 120 字开窗，不会无限长。
                         .when(
                             self.show_snippet && !hit.snippet.is_empty(),
                             |view| {
@@ -214,9 +215,6 @@ impl TableDelegate for ResultsTable {
                                     div()
                                         .w_full()
                                         .min_w_0()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
                                         .border_l_1()
                                         .border_color(tokens.accent)
                                         .pl_1()

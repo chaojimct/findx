@@ -90,6 +90,13 @@ pub enum IpcRequest {
     },
     /// 取消正在进行的 `ContentBuild`（无构建在跑 → Pong 空操作）。
     ContentCancel,
+    /// 按 entry_idx 补取命中摘要（列表首屏只填前 N 行，其余选中/可见时按需取；
+    /// 避免首屏为几百行回读文件卡住 service）。
+    /// query 取 content: 取值原文（与 Search 一致，供分词用）。
+    ContentSnippets {
+        query: String,
+        entry_indices: Vec<u32>,
+    },
     /// Negotiation only. Missing/unknown versions must never imply prepare support.
     UpgradeCapabilities { protocol_version: u32 },
     PrepareStop { protocol_version: u32, expected_instance: String, request_nonce: String, index_identity: String, timeout_ms: u64 },
@@ -270,6 +277,10 @@ pub enum IpcResponse {
     },
     UsageChildrenResult {
         page: UsagePageDto,
+    },
+    /// `ContentSnippets` 应答：`(entry_idx, snippet HTML)`，无摘要的行缺席。
+    ContentSnippets {
+        snippets: Vec<(u32, String)>,
     },
     Pong,
     Error {

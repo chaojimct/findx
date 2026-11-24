@@ -139,6 +139,7 @@ fn handle_request(req: IpcRequest) -> IpcResponse {
         IpcRequest::ContentBuild { .. } | IpcRequest::ContentCancel => IpcResponse::Error {
             message: "mock backend does not support content indexing".into(),
         },
+        IpcRequest::ContentSnippets { .. } => IpcResponse::ContentSnippets { snippets: vec![] },
         IpcRequest::Status => IpcResponse::StatusResult {
             entry_count: 8,
             dir_count: 2,
