@@ -10,7 +10,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
-use crate::{extract_text, Error, Result};
+use crate::extract_text;
 
 const CACHE_CAP: usize = 500;
 const WINDOW_CHARS: usize = 120;

@@ -156,6 +156,7 @@ pub struct ContentHit {
 }
 
 pub struct ContentIndex {
+    index: Index,
     fields: ContentFields,
     reader: IndexReader,
     /// 读写锁：抽取/写入并发走读锁（writer 内部线程安全），`commit` 走写锁。
@@ -214,6 +215,7 @@ pub fn open_or_create(dir: &Path) -> Result<ContentIndex> {
     let cfg = crate::build::BuildConfig::auto();
     let writer = RwLock::new(index.writer_with_num_threads(cfg.index_threads, cfg.heap_bytes)?);
     Ok(ContentIndex {
+        index: index.clone(),
         fields,
         reader,
         writer,
@@ -253,6 +255,19 @@ impl ContentIndex {
 
     pub fn commit(&self) -> Result<()> {
         self.writer.write().commit()?;
+        self.reader.reload()?;
+        Ok(())
+    }
+
+    /// 终局合并：把所有段并成一个（查询更快、体积最小）。
+    /// 全量构建结束时调一次（增量构建不调，靠后台自然合并）。
+    /// 耗时与体积成正比（GB 级约数分钟），失败也不影响使用（返回 Err 即可忽略）。
+    pub fn optimize(&self) -> Result<()> {
+        let ids = self.index.searchable_segment_ids().map_err(Error::from)?;
+        if ids.len() > 1 {
+            let fut = { self.writer.write().merge(&ids) };
+            let _ = fut.wait().map_err(Error::from)?;
+        }
         self.reader.reload()?;
         Ok(())
     }

@@ -80,6 +80,13 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         rebuild: bool,
     },
+    /// 合并内容索引段（终局 optimize）：不重抽，只把现有段并成一个，
+    /// 查询更快、体积最小。构建结束已自动做过一次；此命令用于手动补压。
+    ContentOptimize {
+        /// index.bin 路径
+        #[arg(short, long, default_value = "index.bin")]
+        index: std::path::PathBuf,
+    },
     /// 显示索引元信息
     Status {
         #[arg(short, long, default_value = "index.bin")]
@@ -359,6 +366,26 @@ fn run() -> Result<()> {
         }
         Commands::ContentIndex { index, rebuild } => {
             build_content_index(&index, rebuild)?;
+        }
+        Commands::ContentOptimize { index } => {
+            use findx2_content::{content_dir_for, open_if_exists};
+            let t0 = std::time::Instant::now();
+            let cdir = content_dir_for(&index);
+            let before = dir_size(&cdir);
+            let cidx = open_if_exists(&index).ok_or_else(|| {
+                findx2_core::Error::Persist("内容索引不存在，先跑 content-index".into())
+            })?;
+            let docs = cidx.num_docs();
+            cidx.optimize()?;
+            cidx.commit()?;
+            let after = dir_size(&cdir);
+            eprintln!(
+                "内容索引合并完成：{} docs，{:.2} MB → {:.2} MB，耗时 {:.1}s",
+                docs,
+                before as f64 / 1048576.0,
+                after as f64 / 1048576.0,
+                t0.elapsed().as_secs_f64(),
+            );
         }
         Commands::Status { index } => {
             // v6 优先（service 常驻后 index.bin 主文件不再更新，读 v6 才准）。

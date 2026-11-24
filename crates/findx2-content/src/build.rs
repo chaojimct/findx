@@ -432,6 +432,11 @@ pub fn build_from_plan(
         return Err(Error::Cancelled);
     }
     commit_retry(&cidx)?;
+    // 终局合并：段数归一，查询更快、体积最小。失败不影响使用（索引可用，
+    // 只是没压到最小），降级为警告继续。
+    if let Err(e) = cidx.optimize() {
+        eprintln!("[content] 终局合并跳过（不影响使用）: {e}");
+    }
     Ok(cidx.num_docs())
 }
 
