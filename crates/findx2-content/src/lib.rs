@@ -11,6 +11,7 @@ pub mod index;
 pub mod office;
 pub mod pdf_pool;
 pub mod build;
+pub mod snippet;
 
 pub use build::{
     build_from_plan, build_from_store, build_vols, plan_range_from_store, BuildConfig, BuildStats,

@@ -18,7 +18,6 @@ use tantivy::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, INDEXED,
     STORED,
 };
-use tantivy::snippet::SnippetGenerator;
 use tantivy::tokenizer::{
     BoxTokenStream, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer, Tokenizer,
 };
@@ -27,9 +26,26 @@ use tantivy_jieba::JiebaTokenizer;
 
 use crate::{Error, Result};
 
-/// 内容 schema 版本。v1 字段冻结，改字段必须 bump 并全量重建。
-pub const SCHEMA_VERSION: u32 = 1;
+/// 内容 schema 版本。v2：body 去 STORED（体积杀手），snippet 改按需回读；
+/// 改字段必须 bump 并全量重建。
+pub const SCHEMA_VERSION: u32 = 2;
 pub const TOKENIZER_JIEBA: &str = "jieba_findx";
+
+/// 索引目录里的版本标记文件（tantivy 自家 meta.json 之外，我方 schema 版本）。
+const SCHEMA_VERSION_FILE: &str = "schema_version.json";
+
+fn read_schema_version(dir: &Path) -> Option<u32> {
+    let txt = std::fs::read_to_string(dir.join(SCHEMA_VERSION_FILE)).ok()?;
+    txt.trim().parse().ok()
+}
+
+fn write_schema_version(dir: &Path) -> Result<()> {
+    std::fs::write(
+        dir.join(SCHEMA_VERSION_FILE),
+        SCHEMA_VERSION.to_string(),
+    )
+    .map_err(|e| Error::Io(dir.display().to_string(), e))
+}
 
 /// 混合分词：纯 ASCII 文本（代码/日志/英文文档，占全盘大多数）走快道
 ///（切分 + 去超长 token + 小写），不碰 jieba；含非 ASCII 才走结巴。
@@ -106,8 +122,9 @@ fn build_schema() -> (Schema, ContentFields) {
             .set_tokenizer(TOKENIZER_JIEBA)
             .set_index_option(IndexRecordOption::WithFreqsAndPositions),
     );
-    // body STORED：M1 snippet 直接取，不回读原文件。
-    let body = sb.add_text_field("body", body_opts | STORED);
+    // v2：body 不再 STORED（全文原文是体积杀手：v1 体积比 86%）。
+    // snippet 改按需回读原文生成（snippet.rs），体积只剩倒排。
+    let body = sb.add_text_field("body", body_opts);
     let schema = sb.build();
     (
         schema,
@@ -144,6 +161,8 @@ pub struct ContentIndex {
     /// 读写锁：抽取/写入并发走读锁（writer 内部线程安全），`commit` 走写锁。
     /// commit 由调用方串行触发，写锁永不争用。
     writer: RwLock<IndexWriter>,
+    /// 按需 snippet 池（回读原文 + 缓存）。
+    snippets: crate::snippet::SnippetPool,
 }
 
 /// 内容索引目录定位：`index.bin` → `<index>.content/`（与 `.bin.v6/` 并列）。
@@ -153,10 +172,14 @@ pub fn content_dir_for(index_bin: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(dir)
 }
 
-/// 索引目录已建好才打开（`meta.json` 为 tantivy 建成标志），否则 None（调用方走旧慢路径）。
+/// 索引目录已建好才打开（`meta.json` 为 tantivy 建成标志 + 我方 schema 版本一致），
+/// 否则 None（调用方走旧慢路径；版本不一致也视为未建，触发重建）。
 pub fn open_if_exists(index_bin: &Path) -> Option<ContentIndex> {
     let dir = content_dir_for(index_bin);
     if !dir.join("meta.json").is_file() {
+        return None;
+    }
+    if read_schema_version(&dir) != Some(SCHEMA_VERSION) {
         return None;
     }
     open_or_create(&dir).ok()
@@ -165,11 +188,20 @@ pub fn open_if_exists(index_bin: &Path) -> Option<ContentIndex> {
 pub fn open_or_create(dir: &Path) -> Result<ContentIndex> {
     let (schema, fields) = build_schema();
     std::fs::create_dir_all(dir).map_err(|e| Error::Io(dir.display().to_string(), e))?;
+    let existed = dir.join("meta.json").is_file();
+    if existed && read_schema_version(dir) != Some(SCHEMA_VERSION) {
+        return Err(Error::Index(format!(
+            "内容索引 schema 版本不匹配（期望 v{SCHEMA_VERSION}），需重建"
+        )));
+    }
     let index = Index::open_or_create(
         tantivy::directory::MmapDirectory::open(dir)
             .map_err(|e| Error::Index(format!("打开内容索引目录失败: {e}")))?,
         schema,
     )?;
+    if !existed {
+        write_schema_version(dir)?;
+    }
     index
         .tokenizers()
         .register(TOKENIZER_JIEBA, HybridTokenizer::new());
@@ -185,6 +217,7 @@ pub fn open_or_create(dir: &Path) -> Result<ContentIndex> {
         fields,
         reader,
         writer,
+        snippets: crate::snippet::SnippetPool::new(),
     })
 }
 
@@ -254,9 +287,9 @@ impl ContentIndex {
 
     /// 按 upsert/delete 键批量取 snippet（service 搜索装配用）。
     ///
-    /// 返回 `key → snippet HTML`；找不到或无命中的 key 缺席（调用方回退空串）。
-    /// `cap` 截断输入规模，防大页 full-scan。只生成命中的 snippet，
-    /// 不做全表 TopDocs（页内任意 doc 都可取，不限前 5）。
+    /// v2 按需回读：doc 存 path（STORED）→ 回读原文切窗口（snippet.rs）。
+    /// 返回 `key → snippet HTML`；找不到/回读失败/无命中的 key 缺席（调用方回退空串）。
+    /// `cap` 截断输入规模，防大页 full-scan。
     pub fn snippets_for_keys(
         &self,
         query_text: &str,
@@ -270,9 +303,11 @@ impl ContentIndex {
         }
         self.reader.reload()?;
         let searcher = self.reader.searcher();
-        let qp = QueryParser::for_index(searcher.index(), vec![self.fields.body]);
-        let query = qp.parse_query(query_text).map_err(Error::from)?;
-        let snippet_gen = SnippetGenerator::create(&searcher, &*query, self.fields.body)?;
+        let mut tok = HybridTokenizer::new();
+        let terms = crate::snippet::query_terms(query_text, &mut tok);
+        if terms.is_empty() {
+            return Ok(out);
+        }
         for key in keys.iter().take(cap) {
             let tq = tantivy::query::TermQuery::new(
                 Term::from_field_u64(self.fields.key, *key),
@@ -283,8 +318,18 @@ impl ContentIndex {
                 continue;
             };
             let doc: tantivy::TantivyDocument = searcher.doc(*addr)?;
-            let html = snippet_gen.snippet_from_doc(&doc).to_html();
-            if !html.is_empty() {
+            let path = doc
+                .get_first(self.fields.path)
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if path.is_empty() {
+                continue;
+            }
+            let mtime = doc
+                .get_first(self.fields.mtime)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if let Some(html) = self.snippets.for_doc(path, mtime, query_text, &terms) {
                 out.insert(*key, html);
             }
         }
@@ -299,8 +344,9 @@ impl ContentIndex {
         let qp = QueryParser::for_index(searcher.index(), vec![self.fields.body]);
         let query = qp.parse_query(query_text).map_err(Error::from)?;
         let top = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
-        let snippet_gen = SnippetGenerator::create(&searcher, &*query, self.fields.body)?;
-        // snippet 按 doc 全文分词，贵：只给前 5 个生成，其余空串（展示页按需取）。
+        let mut tok = HybridTokenizer::new();
+        let terms = crate::snippet::query_terms(query_text, &mut tok);
+        // snippet 按需回读原文，贵：只给前 5 个生成，其余空串（展示页按需取）。
         let snippet_cap = top.len().min(5);
         let mut out = Vec::with_capacity(top.len());
         for (i, (score, addr)) in top.into_iter().enumerate() {
@@ -314,8 +360,22 @@ impl ContentIndex {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_owned();
-            let snippet = if i < snippet_cap {
-                snippet_gen.snippet_from_doc(&doc).to_html()
+            let snippet = if i < snippet_cap && !terms.is_empty() {
+                let path = doc
+                    .get_first(self.fields.path)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let mtime = doc
+                    .get_first(self.fields.mtime)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                if path.is_empty() {
+                    String::new()
+                } else {
+                    self.snippets
+                        .for_doc(path, mtime, query_text, &terms)
+                        .unwrap_or_default()
+                }
             } else {
                 String::new()
             };
