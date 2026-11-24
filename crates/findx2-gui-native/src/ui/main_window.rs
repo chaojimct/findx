@@ -15,6 +15,7 @@ use workspace::{ViewMode, Workspace, key};
 
 use findx2_ipc::SearchHitDto;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::PopupMenu;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{Icon, IconName, Selectable as _, Sizable as _, h_flex, v_flex};
@@ -86,6 +87,9 @@ actions!(
         DirectoryTab8,
         DirectoryTab9,
         ToggleSidebar,
+        ContentModeName,
+        ContentModeContent,
+        ContentModeMix,
     ]
 );
 
@@ -245,6 +249,10 @@ pub struct MainWindow {
     /// 搜索框全文模式（文件名/全文/混合；`content_enabled` 关时恒为文件名）。
     /// 初值取自设置页“默认搜索模式”。
     content_mode: ContentDefaultMode,
+    /// 全文模式下拉菜单（输入框 prefix 按钮点开；anchored 覆盖层渲染）。
+    content_mode_menu: Option<Entity<PopupMenu>>,
+    content_mode_menu_position: Point<Pixels>,
+    content_mode_menu_subscription: Option<Subscription>,
     hits: Vec<SearchHitDto>,
     selected: Option<usize>,
     match_total: u32,
@@ -459,6 +467,9 @@ impl MainWindow {
             size_min: String::new(),
             size_max: String::new(),
             content_mode: session.read(cx).settings.content_default_mode,
+            content_mode_menu: None,
+            content_mode_menu_position: point(px(0.), px(0.)),
+            content_mode_menu_subscription: None,
             hits: Vec::new(),
             selected: None,
             match_total: 0,
@@ -857,6 +868,61 @@ impl MainWindow {
             s if s == findx2_ipc::content_state::FAILED => "（全文索引失败，走慢速）",
             _ => "",
         }
+    }
+
+    fn set_content_mode(
+        &mut self,
+        m: ContentDefaultMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_content_mode_menu(cx);
+        if self.content_mode == m {
+            return;
+        }
+        self.content_mode = m;
+        self.schedule_search(window, cx);
+        cx.notify();
+    }
+
+    fn dismiss_content_mode_menu(&mut self, cx: &mut Context<Self>) {
+        self.content_mode_menu = None;
+        self.content_mode_menu_subscription = None;
+        cx.notify();
+    }
+
+    /// 输入框 prefix 按钮点开的下拉选（当前模式打勾；点击条目走同名 Action）。
+    fn open_content_mode_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_content_mode_menu(cx);
+        let current = self.content_mode;
+        let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            menu.menu_with_check(
+                "文件名：只搜文件名",
+                current == ContentDefaultMode::Name,
+                Box::new(ContentModeName),
+            )
+            .menu_with_check(
+                "全文：只搜正文（content: 包裹，支持拼音首字母如 qw 与全拼）",
+                current == ContentDefaultMode::Content,
+                Box::new(ContentModeContent),
+            )
+            .menu_with_check(
+                "混合：文件名与正文并集",
+                current == ContentDefaultMode::Mix,
+                Box::new(ContentModeMix),
+            )
+        });
+        self.content_mode_menu_subscription = Some(cx.subscribe(
+            &menu,
+            |this, _, _: &DismissEvent, cx| {
+                this.content_mode_menu = None;
+                this.content_mode_menu_subscription = None;
+                cx.notify();
+            },
+        ));
+        self.content_mode_menu_position = window.mouse_position();
+        self.content_mode_menu = Some(menu);
+        cx.notify();
     }
 
     fn schedule_search(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2798,6 +2864,15 @@ impl Render for MainWindow {
                     this.open_settings_page(window, cx)
                 }),
             )
+            .on_action(cx.listener(|this, _: &ContentModeName, window, cx| {
+                this.set_content_mode(ContentDefaultMode::Name, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ContentModeContent, window, cx| {
+                this.set_content_mode(ContentDefaultMode::Content, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ContentModeMix, window, cx| {
+                this.set_content_mode(ContentDefaultMode::Mix, window, cx);
+            }))
             .child(self.render_workspace_title(window, cx))
             .when_some(self.settings_page.clone(), |view, page| {
                 view.child(div().flex_1().min_h_0().child(page))
@@ -2834,6 +2909,17 @@ impl Render for MainWindow {
                                 .w(px(372.)).h(px(340.))
                                 .child(div().h(px(28.)).flex_shrink_0().w_full().px_3().py_1().bg(Self::tokens(cx).surface).border_1().border_color(Self::tokens(cx).border).text_xs().overflow_hidden().whitespace_nowrap().child(header)))
                                 .child(menu)),
+                    )
+                    .with_priority(gpui_kit::base::POPUP_PRIORITY),
+                )
+            })
+            .when_some(self.content_mode_menu.clone(), |view, menu| {
+                view.child(
+                    deferred(
+                        anchored()
+                            .position(self.content_mode_menu_position)
+                            .snap_to_window_with_margin(px(8.))
+                            .child(menu),
                     )
                     .with_priority(gpui_kit::base::POPUP_PRIORITY),
                 )

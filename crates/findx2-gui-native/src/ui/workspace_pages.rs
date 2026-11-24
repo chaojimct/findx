@@ -154,40 +154,57 @@ impl MainWindow {
             }))
     }
 
-    /// 搜索框输入框内左侧的全文模式循环键（紧凑单键：文件名→全文→混合）。
-    /// 三键并排在小窗口会把工具栏挤爆（定位/预览溢出），单键只占约两个字宽；
-    /// tooltip 保留完整说明即拼音入口。
-    fn mode_cycle_button(&self, cx: &mut Context<Self>) -> Button {
-        let next = match self.content_mode {
-            ContentDefaultMode::Name => ContentDefaultMode::Content,
-            ContentDefaultMode::Content => ContentDefaultMode::Mix,
-            ContentDefaultMode::Mix => ContentDefaultMode::Name,
+    /// 搜索框输入框内左侧的全文模式下拉键（点开展示 文件名/全文/混合）。
+    /// 用裸 div 自控高度（Button 在 prefix 槽会被撑满）；▾ 明示下拉，tooltip 保留
+    /// 完整说明即拼音入口；菜单条目走 ContentMode* Action（打勾表当前）。
+    fn mode_menu_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tokens = Self::tokens(cx);
+        let active = self.content_mode != ContentDefaultMode::Name;
+        let label: SharedString = match self.content_mode {
+            ContentDefaultMode::Name => "文件 ▾".into(),
+            ContentDefaultMode::Content => "全文 ▾".into(),
+            ContentDefaultMode::Mix => "混合 ▾".into(),
         };
         let tip: SharedString = match self.content_mode {
-            ContentDefaultMode::Name => "文件名：只搜文件名。点击切换为全文".into(),
+            ContentDefaultMode::Name => "文件名：只搜文件名。点击展开模式菜单".into(),
             ContentDefaultMode::Content => {
-                "全文：只搜正文（content: 包裹，支持拼音首字母如 qw 与全拼）。点击切换为混合"
+                "全文：只搜正文（content: 包裹，支持拼音首字母如 qw 与全拼）。点击展开模式菜单"
                     .into()
             }
-            ContentDefaultMode::Mix => {
-                "混合：文件名与正文并集。点击切换回文件名".into()
-            }
+            ContentDefaultMode::Mix => "混合：文件名与正文并集。点击展开模式菜单".into(),
         };
-        Button::new("search-content-mode")
-            .ghost()
-            .label(match self.content_mode {
-                ContentDefaultMode::Name => "文件",
-                ContentDefaultMode::Content => "全文",
-                ContentDefaultMode::Mix => "混合",
-            })
-            .selected(self.content_mode != ContentDefaultMode::Name)
-            .tooltip(tip)
-            .h(px(26.))
+        div()
+            .id("search-content-mode")
+            .flex()
+            .items_center()
+            .flex_shrink_0()
+            .h(px(22.))
             .px_1()
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.content_mode = next;
-                this.schedule_search(window, cx);
-                cx.notify();
+            .rounded_sm()
+            .border_1()
+            .border_color(if active {
+                tokens.accent
+            } else {
+                tokens.border_soft
+            })
+            .text_xs()
+            .text_color(if active {
+                tokens.accent
+            } else {
+                tokens.text_secondary
+            })
+            .whitespace_nowrap()
+            .cursor_pointer()
+            .tooltip({
+                let tip = tip.clone();
+                move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(tip.clone())
+                        .build(window, cx)
+                }
+            })
+            .child(label)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_content_mode_menu(window, cx);
             }))
     }
 
@@ -236,7 +253,7 @@ impl MainWindow {
                         .cleanable(true)
                         .focus_bordered(false);
                     if content_enabled {
-                        input.prefix(self.mode_cycle_button(cx))
+                        input.prefix(self.mode_menu_button(cx))
                     } else {
                         input
                     }
