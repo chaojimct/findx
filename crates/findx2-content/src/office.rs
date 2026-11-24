@@ -260,6 +260,9 @@ pub fn extract_pdf(path: &Path) -> Result<String> {
     // pdf-extract 遇到不支持的编码（如中文 PDF 常见的 UniGB-UCS2-H）会直接 panic
     // 而不是返回 Err；一个毒文件不能把整个构建线程（rayon worker）带走，
     // 兜底转成 Extract 错误，由调用方计数跳过。
+    // 注意：panic 触发时默认 hook 仍会往 stderr 打一行“thread panicked”，
+    // 这是 catch 之前的无害噪音（毒 PDF 越多行数越多），真正的信号看 失败 计数。
+    // 不换全局 hook：set_hook 进程级，多线程下会互相覆盖，因小失大。
     let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         pdf_extract::extract_text_from_mem(&bytes)
     }))
