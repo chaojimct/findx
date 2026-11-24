@@ -1962,6 +1962,7 @@ dependencies = [
  "parking_lot",
  "pdf-extract",
  "quick-xml 0.37.5",
+ "rayon",
  "tantivy",
  "tantivy-jieba",
  "tempfile",

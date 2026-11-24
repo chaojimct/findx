@@ -1642,30 +1642,173 @@ impl SettingsWindow {
         format!("{}.content", self.settings.index_path)
     }
 
+    fn content_state_label(state: &str) -> &'static str {
+        if state == findx2_ipc::content_state::MISSING {
+            "未建立"
+        } else if state == findx2_ipc::content_state::BUILDING {
+            "构建中"
+        } else if state == findx2_ipc::content_state::READY {
+            "就绪"
+        } else if state == findx2_ipc::content_state::STALE {
+            "需重建"
+        } else if state == findx2_ipc::content_state::FAILED {
+            "失败"
+        } else if state == findx2_ipc::content_state::DISABLED {
+            "已停用"
+        } else if state.is_empty() {
+            "未知（旧服务）"
+        } else {
+            "未知"
+        }
+    }
+
+    /// 构建/重建：发 IPC 后靠 2s 状态轮询刷新进度；结果进右下 hint。
+    fn request_content_build(&mut self, rebuild: bool, cx: &mut Context<Self>) {
+        let (ipc, endpoint) = self
+            .session
+            .read_with(cx, |s, _| (s.ipc.clone(), s.endpoint.clone()));
+        let label = if rebuild { "重建" } else { "构建" };
+        cx.spawn(async move |this, cx| {
+            let result = ipc
+                .request(endpoint, findx2_ipc::IpcRequest::ContentBuild { rebuild })
+                .await
+                .map_err(|_| "IPC 通道已关闭".to_string())
+                .and_then(|r| r);
+            let _ = this.update(cx, |this, cx| {
+                this.hint = match result {
+                    Ok(findx2_ipc::IpcResponse::Pong) => {
+                        format!("已发送{label}请求，进度随状态轮询刷新").into()
+                    }
+                    Ok(findx2_ipc::IpcResponse::Error { message }) => {
+                        format!("{label}被拒绝：{message}").into()
+                    }
+                    Ok(_) => format!("{label}返回了非预期的响应类型").into(),
+                    Err(e) => format!("{label}请求失败：{e}").into(),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn request_content_cancel(&mut self, cx: &mut Context<Self>) {
+        let (ipc, endpoint) = self
+            .session
+            .read_with(cx, |s, _| (s.ipc.clone(), s.endpoint.clone()));
+        cx.spawn(async move |this, cx| {
+            let result = ipc
+                .request(endpoint, findx2_ipc::IpcRequest::ContentCancel)
+                .await
+                .map_err(|_| "IPC 通道已关闭".to_string())
+                .and_then(|r| r);
+            let _ = this.update(cx, |this, cx| {
+                this.hint = match result {
+                    Ok(_) => "已发送取消请求".into(),
+                    Err(e) => format!("取消请求失败：{e}").into(),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn render_content_status(&self, tokens: FindxTokens, cx: &mut Context<Self>) -> impl IntoElement {
-        let _ = cx;
+        let st = self.session.read(cx).content_index.clone();
+        let building = st.state == findx2_ipc::content_state::BUILDING;
+        let progress_pct = if st.entry_total > 0 && building {
+            ((st.scanned.min(st.entry_total) as f64 / st.entry_total as f64) * 100.0) as u32
+        } else {
+            0
+        };
+        let state_line = if st.detail.is_empty() {
+            Self::content_state_label(&st.state).to_string()
+        } else {
+            format!("{}（{}）", Self::content_state_label(&st.state), st.detail)
+        };
         settings_card(tokens)
             .child(section_title("全文索引状态", tokens))
             .child(settings_note(
-                "内容倒排与文件名索引独立存放；schema v1，多卷 key 隔离。未建时 content: 查询走慢速逐文件。",
+                "内容倒排与文件名索引独立存放；schema v1 多卷 key 隔离。构建跳过系统/程序/缓存目录。未建时 content: 查询走慢速逐文件。",
                 tokens,
             ))
             .child(settings_kv("索引目录", &self.content_dir_label(), tokens))
+            .child(settings_kv("状态", &state_line, tokens))
             .child(settings_kv(
-                "状态",
-                "读取接线后续（service Status 透出 docs/体积后此处显示就绪与否）",
+                "文档 / 体积",
+                &format!(
+                    "{} 篇 · {}",
+                    st.docs,
+                    crate::search_logic::format_size(st.bytes, false)
+                ),
                 tokens,
             ))
+            .when(building, |v| {
+                v.child(
+                    div()
+                        .w_full()
+                        .h(px(6.))
+                        .rounded_sm()
+                        .bg(tokens.border_soft)
+                        .child(
+                            div()
+                                .h_full()
+                                .rounded_sm()
+                                .bg(tokens.accent)
+                                .w(gpui_kit::relative(progress_pct as f32 / 100.0)),
+                        ),
+                )
+                .child(settings_note(
+                    &format!(
+                        "构建进度 {}/{}（{}%）· 已抽取 {} · 跳过 {} · 失败 {}",
+                        st.scanned,
+                        st.entry_total,
+                        progress_pct,
+                        st.extracted,
+                        st.skipped,
+                        st.failed
+                    ),
+                    tokens,
+                ))
+            })
+            .when_some(st.error.clone(), |v, err| {
+                v.child(
+                    div()
+                        .text_xs()
+                        .text_color(tokens.error)
+                        .child(format!("异常：{err}"))
+                )
+            })
             .child(
                 h_flex()
                     .gap_2()
                     .flex_wrap()
-                    .child(Button::new("content-build").label("构建索引").disabled(true))
-                    .child(Button::new("content-rebuild").label("重建").disabled(true))
-                    .child(Button::new("content-clear").label("清空").disabled(true)),
+                    .child(
+                        Button::new("content-build")
+                            .label("构建索引")
+                            .disabled(building)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.request_content_build(false, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("content-rebuild")
+                            .label("重建")
+                            .disabled(building)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.request_content_build(true, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("content-cancel")
+                            .label("取消")
+                            .disabled(!building)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.request_content_cancel(cx)
+                            })),
+                    ),
             )
             .child(settings_note(
-                "构建/重建/清空执行接线后续，本期只保存配置项。",
+                "构建为增量复用（旧索引构建期间照常服务）；重建删除旧库全量重来。取消后可重新构建。",
                 tokens,
             ))
     }

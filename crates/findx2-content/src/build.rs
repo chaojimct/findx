@@ -1,18 +1,22 @@
 //! 全量构建：文件名索引 → 内容倒排（CLI `content-index` 与 service 共用）。
 //!
-//! 单线程 M1（IO 主导，瓶颈在抽取；rayon 化是 M2 优化项）。
-//! 分批 commit：bound writer 内存，崩溃最多丢一批（下次重建/增量补回）。
+//! 流水线：`plan_range_from_store`（纯内存规划，service 按 50k 分片循环调用，
+//! 扩展名/体积/目录三层预过滤，无路径拼接、无 syscall，被过滤项只计 `skipped`）
+//! + `build_from_plan`（rayon 并行抽取 IO+解析，tantivy 单线程串行写入，
+//! 1024 子批次定界内存，跨分片追加到同一 `cdir`）。
 //!
 //! service 在线构建不能长持 store 读锁（会饿死 USN 增量与 checkpoint），
-//! 因此拆成两步：`plan_range_from_store`（纯内存规划，锁只拿毫秒级，
-//! service 按 50k 分片循环调用）+ `build_from_plan`（无锁抽取入库，
-//! 可跨分片追加）。CLI 单线程独占，直接用 `build_from_store`。
+//! 因此拆成两步：`plan_range_from_store`（store 读锁只拿毫秒级）
+//! + `build_from_plan`（无锁抽取入库）。CLI 单线程独占，直接用 `build_from_store`。
 
 use std::path::Path;
 
 use findx2_core::{volume_key_for, IndexStore};
+use rayon::prelude::*;
 
-use crate::{extract_text, open_or_create, should_extract, DocMeta, Error, Result};
+use crate::{
+    extract_text, file_name_supported, open_or_create, should_extract, DocMeta, Error, Result,
+};
 
 #[derive(Debug, Default, Clone)]
 pub struct BuildStats {
@@ -49,9 +53,40 @@ pub fn build_vols(store: &IndexStore) -> Vec<(String, String)> {
         .collect()
 }
 
+/// 默认排除的路径片段（小写，`contains` 匹配）：系统/程序/缓存目录。
+/// 与 AnyTXT 默认排除 `C:\Windows` 同理：这些目录下几乎没有可索引文本，
+/// 逐文件 stat 它们是全盘构建最主要的时间黑洞。用户文档不受影响。
+const EXCLUDED_PATH_PARTS: &[&str] = &[
+    ":\\windows\\",
+    ":\\program files\\",
+    ":\\program files (x86)\\",
+    ":\\programdata\\",
+    ":\\$recycle.bin\\",
+    ":\\system volume information\\",
+    "\\node_modules\\",
+    "\\.git\\",
+    "\\__pycache__\\",
+    "\\appdata\\local\\temp\\",
+    "\\appdata\\local\\microsoft\\",
+];
+
+fn is_excluded_path(lower_full_path: &str) -> bool {
+    EXCLUDED_PATH_PARTS
+        .iter()
+        .any(|p| lower_full_path.contains(p))
+}
+
 /// 纯内存规划 `[start, end)`：解析路径/卷归属/frn，不读文件。
 /// 调用方持读锁（service 按分片短持），`st.scanned/failed` 同步累加，
 /// 语义与 `build_from_store` 单遍一致。
+///
+/// 三层预过滤（全部无 syscall，命中只计 `skipped`）：
+/// 1. 扩展名白名单（`file_name_supported`，只看文件名）——全盘 ~99% 的
+///    exe/dll/sys 在这里被过滤，连完整路径都不拼；
+/// 2. 目录排除（`EXCLUDED_PATH_PARTS`）。
+/// 只有候选文件才走 `entry_display_path` 做卷归属。
+/// 注意：体积不在规划阶段过滤——store 的 size 可能是陈旧值（0 不代表真空），
+/// 超限/空文件由执行阶段 `should_extract` 实测 stat 后判定。
 pub fn plan_range_from_store(
     store: &IndexStore,
     vols: &[(String, String)],
@@ -66,6 +101,14 @@ pub fn plan_range_from_store(
             continue;
         }
         st.scanned += 1;
+        // 1) 扩展名预检：无路径拼接、无 stat。
+        let name_ok = std::str::from_utf8(store.name_bytes(e))
+            .map(file_name_supported)
+            .unwrap_or(false);
+        if !name_ok {
+            st.skipped += 1;
+            continue;
+        }
         let p = match store.entry_display_path(idx) {
             Ok(p) => p,
             Err(_) => {
@@ -74,6 +117,11 @@ pub fn plan_range_from_store(
             }
         };
         let pl = p.to_lowercase();
+        // 2) 目录排除。
+        if is_excluded_path(&pl) {
+            st.skipped += 1;
+            continue;
+        }
         let mut slot = 0usize;
         let mut best = 0usize;
         for (i, (pre, _)) in vols.iter().enumerate() {
@@ -103,6 +151,10 @@ pub fn plan_range_from_store(
 /// `progress` 每 ~1024 文件回调一次，返回 false 即中止
 ///（`Err(Error::Cancelled)`；`fresh` 目录会被删掉）。
 /// `st` 跨分片累加（调用方持有）。返回最终 `docs` 数。
+///
+/// 流水线：1024 子批次 × rayon 并行抽取（stat + 解码 + Office/PDF 解析，
+/// IO 与 CPU 混合主导）→ 原序串行写入（tantivy `IndexWriter` 单线程，
+/// 结巴分词在写入侧）。子批次定界内存：最多同时持有 1024 篇正文。
 pub fn build_from_plan(
     items: &[PlanItem],
     cdir: &Path,
@@ -110,6 +162,7 @@ pub fn build_from_plan(
     st: &mut BuildStats,
     mut progress: impl FnMut(&BuildStats) -> bool,
 ) -> Result<u64> {
+    const EXTRACT_BATCH: usize = 1024;
     let existed = cdir.exists();
     if rebuild && existed {
         std::fs::remove_dir_all(cdir).map_err(|e| Error::Io(cdir.display().to_string(), e))?;
@@ -117,34 +170,55 @@ pub fn build_from_plan(
     let fresh = rebuild || !existed;
     let cidx = open_or_create(cdir)?;
     let mut since_commit = 0u64;
-    let mut done = 0u64;
     // progress 返回 false = 调用方要求中止：跳出循环，统一在循环后清理
     //（`drop(cidx)` 释放 mmap 后再删目录，Windows 下才能删掉）。
     let mut cancelled = false;
-    for item in items {
-        let path = Path::new(&item.path);
-        if should_extract(path).is_none() {
-            st.skipped += 1;
-        } else {
-            match extract_text(path) {
-                Ok(t) => {
-                    let ok = cidx
-                        .index_doc(
-                            &DocMeta {
-                                frn: item.frn,
-                                volume_id: item.volume_key.clone(),
-                                path: item.path.clone(),
-                                mtime: item.mtime,
-                                size: item.size,
-                            },
-                            &t.text,
-                        )
-                        .is_ok();
+    // 启动即回调一次：调用方（service）第一时间看到 extracted/skipped 开始跳动，
+    // 也让“取消”在抽取开始前就生效。返回 false 直接走统一取消清理。
+    if !progress(st) {
+        cancelled = true;
+    }
+    for batch in items.chunks(EXTRACT_BATCH) {
+        if cancelled {
+            break;
+        }
+        // 并行抽取（保序 collect）：None = 执行阶段复检跳过（文件刚好被删/改大等竞态），
+        // Some(Ok) = 待写入，Some(Err) = 抽取失败。
+        let extracted: Vec<Option<std::result::Result<(DocMeta, String, u64), ()>>> = batch
+            .par_iter()
+            .map(|item| {
+                let path = Path::new(&item.path);
+                if should_extract(path).is_none() {
+                    return None;
+                }
+                match extract_text(path) {
+                    Ok(t) => Some(Ok((
+                        DocMeta {
+                            frn: item.frn,
+                            volume_id: item.volume_key.clone(),
+                            path: item.path.clone(),
+                            mtime: item.mtime,
+                            size: item.size,
+                        },
+                        t.text,
+                        t.raw_bytes,
+                    ))),
+                    Err(_) => Some(Err(())),
+                }
+            })
+            .collect();
+        // 串行写入：保持入库顺序稳定，`st` 累加与 commit 节流都在这里。
+        for slot in extracted {
+            match slot {
+                None => st.skipped += 1,
+                Some(Err(())) => st.failed += 1,
+                Some(Ok((meta, text, raw_bytes))) => {
+                    let ok = cidx.index_doc(&meta, &text).is_ok();
                     if !ok {
                         st.failed += 1;
                     } else {
                         st.extracted += 1;
-                        st.bytes += t.raw_bytes;
+                        st.bytes += raw_bytes;
                         since_commit += 1;
                         if since_commit >= 20_000 {
                             cidx.commit()?;
@@ -152,16 +226,11 @@ pub fn build_from_plan(
                         }
                     }
                 }
-                Err(_) => st.failed += 1,
             }
         }
-        // 首文件 + 每 1024 文件查一次取消（中止响应有界，代价一次闭包调用）。
-        done += 1;
-        if done == 1 || done % 1024 == 0 {
-            if !progress(st) {
-                cancelled = true;
-                break;
-            }
+        // 每子批次查一次取消（中止响应有界，代价一次闭包调用）。
+        if !progress(st) {
+            cancelled = true;
         }
     }
     if cancelled {
@@ -175,8 +244,8 @@ pub fn build_from_plan(
     Ok(cidx.num_docs())
 }
 
-/// CLI/单线程独占路径：规划 + 执行一遍（持锁全程，调用方保证无并发写）。
-/// `progress` 透传给 `build_from_plan`（首文件 + 每 1024 回调，false 即中止）；
+/// CLI 独占路径：规划 + 执行一遍（持锁全程，调用方保证无并发写）。
+/// `progress` 透传给 `build_from_plan`（启动 + 每 1024 回调，false 即中止）；
 /// 结束时再回调一次（返回值忽略）。时间节流（如 5 秒打一次日志）由调用方
 /// 闭包内部完成，库侧不代劳（否则会把取消信号也节流掉）。
 pub fn build_from_store(
@@ -192,4 +261,21 @@ pub fn build_from_store(
     st.docs = docs;
     progress(&st);
     Ok(st)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn excluded_system_dirs() {
+        assert!(is_excluded_path("c:\\windows\\system32\\a.txt"));
+        assert!(is_excluded_path("c:\\program files\\app\\a.txt"));
+        assert!(is_excluded_path("c:\\program files (x86)\\app\\a.txt"));
+        assert!(is_excluded_path("c:\\programdata\\x\\a.txt"));
+        assert!(is_excluded_path("d:\\proj\\node_modules\\x\\a.txt"));
+        assert!(is_excluded_path("d:\\proj\\.git\\objects\\a.txt"));
+        assert!(!is_excluded_path("c:\\users\\chaoj\\docs\\report.docx"));
+        assert!(!is_excluded_path("d:\\proj\\src\\main.rs"));
+    }
 }

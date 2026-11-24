@@ -13,6 +13,7 @@ findx2-core = { path = "../findx2-core" }
 parking_lot = "0.12"
 pdf-extract = "0.8"
 quick-xml = "0.37"
+rayon = "1"
 thiserror = "1"
 memmap2 = "0.9"
 zip = "2"

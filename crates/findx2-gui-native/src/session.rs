@@ -8,6 +8,22 @@ use crate::status_logic::{self, IndexStatusView};
 use crate::theme;
 use crate::update_logic::OfficialUpdateState;
 
+/// 全文内容索引状态快照（2s 状态轮询时从 StatusResult.content_* 刷新，
+/// 设置页全文 tab 直接读这里，不再做第二次查询）。
+#[derive(Debug, Clone, Default)]
+pub struct ContentIndexStatus {
+    pub state: String,
+    pub detail: String,
+    pub docs: u64,
+    pub bytes: u64,
+    pub entry_total: u64,
+    pub scanned: u64,
+    pub extracted: u64,
+    pub skipped: u64,
+    pub failed: u64,
+    pub error: Option<String>,
+}
+
 pub struct AppSession {
     pub ipc: IpcClient,
     pub pipe_name: String,
@@ -19,6 +35,7 @@ pub struct AppSession {
     pub settings: FindxGuiSettings,
     pub prefs: LocalPrefs,
     pub index_status: IndexStatusView,
+    pub content_index: ContentIndexStatus,
     pub engine_footer: crate::footer_status::EngineFooter,
     pub connected: bool,
     pub status_raw: String,
@@ -67,6 +84,7 @@ impl AppSession {
             settings,
             prefs,
             index_status: initial_status,
+        content_index: ContentIndexStatus::default(),
             engine_footer: Default::default(),
             connected: false,
             status_raw: "尚未收到 Status 响应".into(),

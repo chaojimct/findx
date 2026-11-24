@@ -15,7 +15,10 @@ pub use build::{
     build_from_plan, build_from_store, build_vols, plan_range_from_store, BuildStats, PlanItem,
 };
 pub use error::Error;
-pub use extract::{extract_text, should_extract, ExtractedText, SUPPORTED_EXTENSIONS};
+pub use extract::{
+    extract_text, file_name_supported, should_extract, ExtractedText, MAX_EXTRACT_BYTES,
+    SUPPORTED_EXTENSIONS,
+};
 pub use index::{
     content_dir_for, doc_key, open_if_exists, open_or_create, ContentFields, ContentHit,
     ContentIndex, DocMeta, SCHEMA_VERSION,

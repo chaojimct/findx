@@ -44,6 +44,20 @@ pub struct ExtractedText {
     pub raw_bytes: u64,
 }
 
+/// 纯内存预检：只看文件名（不 stat 不读盘），供全量规划阶段前置过滤。
+/// 语义与 `should_extract` 的“扩展名/无扩展名白名单”部分一致：
+/// 有扩展名查扩展名表，无扩展名查全名表。大小写不敏感。
+pub fn file_name_supported(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    match std::path::Path::new(&lower)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
+        Some(ext) => SUPPORTED_EXTENSIONS.contains(&ext),
+        None => TEXT_BASENAMES.iter().any(|b| *b == lower),
+    }
+}
+
 /// 是否值得抽取：扩展名/无扩展名白名单 + 大小预检。目录/超限返回 None（跳过，非错误）。
 pub fn should_extract(path: &Path) -> Option<u64> {
     let name = path
@@ -162,6 +176,22 @@ mod tests {
     fn unsupported_ext_skipped() {
         let (_d, p) = tmp_file("c.exe", b"MZ fake binary");
         assert!(should_extract(&p).is_none());
+    }
+
+    #[test]
+    fn file_name_supported_matches_should_extract() {
+        // 白名单内：大小写不敏感。
+        assert!(file_name_supported("a.txt"));
+        assert!(file_name_supported("A.TXT"));
+        assert!(file_name_supported("report.DOCX"));
+        assert!(file_name_supported("main.rs"));
+        // 白名单外。
+        assert!(!file_name_supported("c.exe"));
+        assert!(!file_name_supported("driver.sys"));
+        assert!(!file_name_supported("lib.dll"));
+        // 无扩展名：全名表（大小写不敏感）。
+        assert!(file_name_supported("Makefile"));
+        assert!(file_name_supported("makefile"));
     }
 
     #[test]

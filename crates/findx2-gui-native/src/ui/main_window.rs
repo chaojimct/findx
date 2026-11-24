@@ -1117,6 +1117,34 @@ impl MainWindow {
                                 &resp,
                                 backfill,
                             );
+                            // 全文索引快照：设置页全文 tab 直接读这里。
+                            if let findx2_ipc::IpcResponse::StatusResult {
+                                content_state,
+                                content_docs,
+                                content_bytes,
+                                content_scanned,
+                                content_extracted,
+                                content_skipped,
+                                content_failed,
+                                content_error,
+                                content_detail,
+                                content_entry_total,
+                                ..
+                            } = &resp
+                            {
+                                session.content_index = crate::session::ContentIndexStatus {
+                                    state: content_state.clone(),
+                                    detail: content_detail.clone(),
+                                    docs: *content_docs,
+                                    bytes: *content_bytes,
+                                    entry_total: *content_entry_total,
+                                    scanned: *content_scanned,
+                                    extracted: *content_extracted,
+                                    skipped: *content_skipped,
+                                    failed: *content_failed,
+                                    error: content_error.clone(),
+                                };
+                            }
                         }
                         Err(err) => {
                             session.connected = false;
