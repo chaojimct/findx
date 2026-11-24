@@ -148,6 +148,7 @@ impl MainWindow {
                     hits: vec![],
                     widths,
                     more: false,
+                    show_snippet: false,
                     owner,
                 },
                 window,

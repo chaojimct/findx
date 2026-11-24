@@ -459,6 +459,95 @@ fn local_offset_secs() -> i64 {
 }
 
 /// 修饰符必须排在裸词之前。
+/// 搜索框原文按全文模式改写（过滤器由 `build_full_query` 另行拼接，不受影响）。
+/// - Name：原样返回；
+///
+/// - Content：`content:{raw}`（只搜正文）；Mix：`{raw} | content:{raw}`（两者并集，
+///   引擎顶层 `|` 即 OR 分支 union）。
+/// - 原文已手写 `content:`/`utf8content:` 时视为手动接管，原样返回。
+/// - 含空白/`|` 时加双引号（`"` 本身去引号包裹，引擎取值不支持转义）。
+pub fn apply_content_mode(
+    raw: &str,
+    mode: crate::settings_logic::ContentDefaultMode,
+) -> String {
+    use crate::settings_logic::ContentDefaultMode as M;
+    let r = raw.trim();
+    if r.is_empty() || mode == M::Name {
+        return raw.to_string();
+    }
+    let low = r.to_ascii_lowercase();
+    if low.contains("content:") || low.contains("utf8content:") {
+        return raw.to_string();
+    }
+    let phrase = if r.contains('"') {
+        r.replace('"', "")
+    } else {
+        r.to_string()
+    };
+    let quoted = if phrase.chars().any(|c| c.is_whitespace() || c == '|') {
+        format!("\"{phrase}\"")
+    } else {
+        phrase
+    };
+    match mode {
+        M::Name => raw.to_string(),
+        M::Content => format!("content:{quoted}"),
+        M::Mix => format!("{r} | content:{quoted}"),
+    }
+}
+
+/// tantivy snippet HTML → (文本, 是否命中) 段：`<b>` 标命中词，其余标签丢弃，
+/// 常见 HTML 转义还原。无 `<b>` 时整串一段（拼音 head-fallback 也直接展示）。
+pub fn snippet_segments(html: &str) -> Vec<(String, bool)> {
+    fn unescape(s: &str) -> String {
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&amp;", "&")
+    }
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let mut buf = String::new();
+    let mut hot = false;
+    let mut rest = html;
+    while let Some(lt) = rest.find('<') {
+        buf.push_str(&rest[..lt]);
+        let tag_rest = &rest[lt..];
+        match tag_rest.find('>') {
+            Some(gt) => {
+                match tag_rest[1..gt].trim().to_ascii_lowercase().as_str() {
+                    "b" => {
+                        if !buf.is_empty() {
+                            out.push((unescape(&buf), hot));
+                            buf.clear();
+                        }
+                        hot = true;
+                    }
+                    "/b" => {
+                        if !buf.is_empty() {
+                            out.push((unescape(&buf), hot));
+                            buf.clear();
+                        }
+                        hot = false;
+                    }
+                    _ => {}
+                }
+                rest = &tag_rest[gt + 1..];
+            }
+            None => {
+                buf.push_str(tag_rest);
+                rest = "";
+                break;
+            }
+        }
+    }
+    buf.push_str(rest);
+    if !buf.is_empty() {
+        out.push((unescape(&buf), hot));
+    }
+    out
+}
+
 pub fn build_full_query(
     raw: &str,
     type_f: TypeFilter,
@@ -724,6 +813,59 @@ mod tests {
     fn highlight_uses_unicode_scalar_indexes() {
         let segs = highlight_segments("测试文件.txt", &[[0, 2]]);
         assert_eq!(segs, vec![("测试", true), ("文件.txt", false)]);
+    }
+
+    #[test]
+    fn content_mode_wraps_raw_without_touching_filters() {
+        use crate::settings_logic::ContentDefaultMode as M;
+        assert_eq!(apply_content_mode("报告", M::Name), "报告");
+        assert_eq!(apply_content_mode("报告", M::Content), "content:报告");
+        assert_eq!(
+            apply_content_mode("财务 报告", M::Content),
+            "content:\"财务 报告\""
+        );
+        assert_eq!(
+            apply_content_mode("qw", M::Mix),
+            "qw | content:qw"
+        );
+        assert_eq!(
+            apply_content_mode("quan wen", M::Mix),
+            "quan wen | content:\"quan wen\""
+        );
+        // 手写 content: 视为手动接管，不再包裹。
+        assert_eq!(
+            apply_content_mode("content:报告 ext:pdf", M::Content),
+            "content:报告 ext:pdf"
+        );
+        assert_eq!(apply_content_mode("", M::Content), "");
+        assert_eq!(apply_content_mode("   ", M::Mix), "   ");
+    }
+
+    #[test]
+    fn snippet_html_becomes_hot_segments() {
+        let segs = snippet_segments("前文<b>全文</b>后文");
+        assert_eq!(
+            segs,
+            vec![
+                ("前文".to_string(), false),
+                ("全文".to_string(), true),
+                ("后文".to_string(), false)
+            ]
+        );
+        // 无 b 标签整串一段；未知标签丢弃；转义还原。
+        assert_eq!(
+            snippet_segments("纯文本"), 
+            vec![("纯文本".to_string(), false)]
+        );
+        assert_eq!(
+            snippet_segments("a<i>x</i><b>qw</b>&lt;tag&gt;"),
+            vec![
+                ("ax".to_string(), false),
+                ("qw".to_string(), true),
+                ("<tag>".to_string(), false)
+            ]
+        );
+        assert!(snippet_segments("").is_empty());
     }
 
     #[test]

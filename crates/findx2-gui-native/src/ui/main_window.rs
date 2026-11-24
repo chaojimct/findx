@@ -28,6 +28,7 @@ use crate::search_logic::{
     TypeFilter, explain_panels, move_result_selection,
 };
 use crate::session::AppSession;
+use crate::settings_logic::ContentDefaultMode;
 use crate::status_logic::{self, IndexStatusView};
 use crate::theme::FindxTokens;
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
@@ -241,6 +242,9 @@ pub struct MainWindow {
     path_prefix: String,
     size_min: String,
     size_max: String,
+    /// 搜索框全文模式（文件名/全文/混合；`content_enabled` 关时恒为文件名）。
+    /// 初值取自设置页“默认搜索模式”。
+    content_mode: ContentDefaultMode,
     hits: Vec<SearchHitDto>,
     selected: Option<usize>,
     match_total: u32,
@@ -383,6 +387,7 @@ impl MainWindow {
                     hits: Vec::new(),
                     widths,
                     more: false,
+                    show_snippet: false,
                     owner,
                 },
                 window,
@@ -453,6 +458,7 @@ impl MainWindow {
             path_prefix: String::new(),
             size_min: String::new(),
             size_max: String::new(),
+            content_mode: session.read(cx).settings.content_default_mode,
             hits: Vec::new(),
             selected: None,
             match_total: 0,
@@ -817,6 +823,7 @@ impl MainWindow {
     }
     fn current_query(&self, cx: &App) -> String {
         let raw = self.search.read(cx).value().to_string();
+        let raw = search_logic::apply_content_mode(&raw, self.effective_content_mode(cx));
         search_logic::build_full_query(
             &raw,
             self.type_filter,
@@ -826,6 +833,30 @@ impl MainWindow {
             &self.size_min,
             &self.size_max,
         )
+    }
+
+    /// 设置总开关关时恒为文件名（搜索框模式按钮同步隐藏）。
+    fn effective_content_mode(&self, cx: &App) -> ContentDefaultMode {
+        if self.session.read(cx).settings.content_enabled {
+            self.content_mode
+        } else {
+            ContentDefaultMode::Name
+        }
+    }
+
+    /// 含 `content:` 且索引未就绪时的状态栏后缀（慢速逐文件提示）。
+    /// 就绪/旧服务（状态未知）返回空串。
+    fn content_slow_hint(sent_query: &str, content_state: &str) -> &'static str {
+        if !sent_query.to_ascii_lowercase().contains("content:") {
+            return "";
+        }
+        match content_state {
+            s if s == findx2_ipc::content_state::MISSING => "（全文索引未建，走慢速逐文件）",
+            s if s == findx2_ipc::content_state::BUILDING => "（全文索引构建中，结果可能不全）",
+            s if s == findx2_ipc::content_state::STALE => "（全文索引过期，建议重建；走慢速）",
+            s if s == findx2_ipc::content_state::FAILED => "（全文索引失败，走慢速）",
+            _ => "",
+        }
     }
 
     fn schedule_search(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -882,7 +913,7 @@ impl MainWindow {
         let generation = self.search_gen;
         self.search_keyboard
             .begin(old_generation, generation, &query);
-        let (endpoint, pinyin, pinyin_initials, pinyin_full, limit, ipc) =
+        let (endpoint, pinyin, pinyin_initials, pinyin_full, limit, mix_limit, content_state, ipc) =
             self.session.read_with(cx, |s, _| {
                 (
                     s.endpoint.clone(),
@@ -890,11 +921,22 @@ impl MainWindow {
                     s.settings.content_pinyin_initials,
                     s.settings.content_pinyin_full,
                     s.settings.search_limit.max(1).min(PAGE_SIZE as u32) as usize,
+                    s.settings.content_mix_limit,
+                    s.content_index.state.clone(),
                     s.ipc.clone(),
                 )
             });
         // PAGE_SIZE is the first-page fetch; search_limit is the ceiling shown in status.
-        let fetch = PAGE_SIZE.min(limit.max(1));
+        // 全文/混合模式再按“混合模式内容上限”截断单次取回（防 TopDocs 爆炸）。
+        let mode = self.effective_content_mode(cx);
+        let fetch = if mode == ContentDefaultMode::Name {
+            PAGE_SIZE.min(limit.max(1))
+        } else {
+            PAGE_SIZE
+                .min(limit.max(1))
+                .min(mix_limit.max(1) as usize)
+        };
+        let slow_hint = Self::content_slow_hint(&query, &content_state);
         let rx = ipc.search(
             endpoint,
             query,
@@ -934,9 +976,9 @@ impl MainWindow {
                             format!("匹配 {total} 条，已显示 {shown} 条")
                         };
                         this.search_status = if out.elapsed_ms > 0 {
-                            format!("{head}，{} ms", out.elapsed_ms).into()
+                            format!("{head}，{} ms{slow_hint}", out.elapsed_ms).into()
                         } else {
-                            head.into()
+                            format!("{head}{slow_hint}").into()
                         };
                     }
                     Err(err) => {
@@ -992,9 +1034,11 @@ impl MainWindow {
     fn sync_table(&mut self, reset: bool, cx: &mut Context<Self>) {
         let hits = self.hits.clone();
         let more = hits.len() < self.match_total as usize && !self.page_loading && !self.page_error;
+        let show_snippet = self.session.read(cx).settings.content_snippet;
         self.table.update(cx, |table, cx| {
             table.delegate_mut().hits = hits;
             table.delegate_mut().more = more;
+            table.delegate_mut().show_snippet = show_snippet;
             if reset {
                 table.clear_selection(cx);
                 table.scroll_to_row(0, cx);
@@ -1017,23 +1061,31 @@ impl MainWindow {
         let generation = self.search_gen;
         let offset = self.hits.len();
         let query = self.current_query(cx);
-        let (endpoint, pinyin, pinyin_initials, pinyin_full, ipc) =
+        let (endpoint, pinyin, pinyin_initials, pinyin_full, mix_limit, content_state, ipc) =
             self.session.read_with(cx, |s, _| {
                 (
                     s.endpoint.clone(),
                     s.settings.pinyin_default,
                     s.settings.content_pinyin_initials,
                     s.settings.content_pinyin_full,
+                    s.settings.content_mix_limit,
+                    s.content_index.state.clone(),
                     s.ipc.clone(),
                 )
             });
+        let fetch = if self.effective_content_mode(cx) == ContentDefaultMode::Name {
+            PAGE_SIZE
+        } else {
+            PAGE_SIZE.min(mix_limit.max(1) as usize)
+        };
+        let slow_hint = Self::content_slow_hint(&query, &content_state);
         let rx = ipc.search(
             endpoint,
             query,
             pinyin,
             pinyin_initials,
             pinyin_full,
-            PAGE_SIZE,
+            fetch,
             offset,
         );
         self._page_task = Some(cx.spawn(async move |this, cx| {
@@ -1055,7 +1107,7 @@ impl MainWindow {
                             this.match_total = out.total;
                         }
                         this.search_status = format!(
-                            "匹配 {} 条，已加载 {} 条",
+                            "匹配 {} 条，已加载 {} 条{slow_hint}",
                             this.match_total,
                             this.hits.len()
                         )

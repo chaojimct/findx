@@ -1,6 +1,7 @@
 //! Three deliberately different information architectures, inside one custom window shell.
 use super::*;
 use crate::prefs::BrowserViewMode;
+use crate::settings_logic::ContentDefaultMode;
 use findx2_ipc::SearchHitDto;
 use gpui_kit::component::FocusableExt as _;
 use gpui_kit::component::popover::Popover;
@@ -155,6 +156,47 @@ impl MainWindow {
 
     fn render_search_toolbar(&self, preview: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = Self::tokens(cx);
+        let content_enabled = self.session.read(cx).settings.content_enabled;
+        let mode = self.content_mode;
+        let mode_group = h_flex()
+            .id("search-content-mode")
+            .gap_1()
+            .flex_shrink_0()
+            .children(
+                [
+                    ContentDefaultMode::Name,
+                    ContentDefaultMode::Content,
+                    ContentDefaultMode::Mix,
+                ]
+                .into_iter()
+                .map(|m| {
+                    let tip: SharedString = match m {
+                        ContentDefaultMode::Name => "只搜文件名".into(),
+                        ContentDefaultMode::Content => {
+                            "只搜正文：自动包裹 content:，支持拼音首字母（如 qw）与全拼"
+                                .into()
+                        }
+                        ContentDefaultMode::Mix => {
+                            "文件名与正文并集：自动附加 content: 分支".into()
+                        }
+                    };
+                    Button::new(SharedString::from(format!(
+                        "search-mode-{}",
+                        m.as_str()
+                    )))
+                    .ghost()
+                    .label(m.label())
+                    .selected(mode == m)
+                    .tooltip(tip)
+                    .h(px(30.))
+                    .px_2()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.content_mode = m;
+                        this.schedule_search(window, cx);
+                        cx.notify();
+                    }))
+                }),
+            );
         h_flex()
             .w_full()
             .px_3()
@@ -197,6 +239,7 @@ impl MainWindow {
                     .min_w_0()
                     .child(Input::new(&self.search).cleanable(true).focus_bordered(false)),
             )
+            .when(content_enabled, |view| view.child(mode_group))
             .child(
                 self.tool_button("search-reveal", "定位", 3, false, cx)
                     .disabled(self.active_workspace_hit().is_none()),

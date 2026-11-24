@@ -1,7 +1,8 @@
 //! Virtualized Kit table: shared header/body geometry, resize handles and two scrollbars.
 use super::main_window::MainWindow;
-use crate::search_logic::{format_size, format_time, highlight_segments};
+use crate::search_logic::{format_size, format_time, highlight_segments, snippet_segments};
 use findx2_ipc::SearchHitDto;
+use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -14,6 +15,8 @@ pub(super) struct ResultsTable {
     pub hits: Vec<SearchHitDto>,
     pub widths: [f32; 4],
     pub more: bool,
+    /// 设置页“命中摘要”开关（sync_table 每次从设置刷新；scoped 表恒 false）。
+    pub show_snippet: bool,
     pub owner: WeakEntity<MainWindow>,
 }
 impl TableDelegate for ResultsTable {
@@ -159,25 +162,63 @@ impl TableDelegate for ResultsTable {
                     tokens,
                 ))
                 .child(
-                    div()
+                    v_flex()
                         .ml_2()
-                        .flex()
-                        .items_center()
                         .flex_1()
                         .min_w_0()
                         .overflow_hidden()
-                        .children(
-                            highlight_segments(&hit.name, &hit.name_highlight)
-                                .into_iter()
-                                .map(|(text, on)| {
+                        .justify_center()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .w_full()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .children(
+                                    highlight_segments(&hit.name, &hit.name_highlight)
+                                        .into_iter()
+                                        .map(|(text, on)| {
+                                            div()
+                                                .flex_shrink_0()
+                                                .whitespace_nowrap()
+                                                .when(on, |view| {
+                                                    view.bg(tokens.hit_bg).text_color(tokens.hit_fg)
+                                                })
+                                                .child(text.to_owned())
+                                        }),
+                                ),
+                        )
+                        // 命中摘要第二行（设置页开关；仅 content: 查询有值）。
+                        .when(
+                            self.show_snippet && !hit.snippet.is_empty(),
+                            |view| {
+                                view.child(
                                     div()
-                                        .flex_shrink_0()
-                                        .whitespace_nowrap()
-                                        .when(on, |view| {
-                                            view.bg(tokens.hit_bg).text_color(tokens.hit_fg)
-                                        })
-                                        .child(text.to_owned())
-                                }),
+                                        .w_full()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .flex()
+                                        .items_center()
+                                        .text_xs()
+                                        .text_color(tokens.text_secondary)
+                                        .children(
+                                            snippet_segments(&hit.snippet)
+                                                .into_iter()
+                                                .map(|(text, on)| {
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .whitespace_nowrap()
+                                                        .text_ellipsis()
+                                                        .when(on, |v| {
+                                                            v.bg(tokens.hit_bg)
+                                                                .text_color(tokens.hit_fg)
+                                                        })
+                                                        .child(text)
+                                                }),
+                                        ),
+                                )
+                            },
                         ),
                 )
                 // 拼音辅库命中徽标（content: + ascii 拼音查到中文时）。
