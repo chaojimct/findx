@@ -38,6 +38,131 @@ pub struct PlanItem {
     pub size: u64,
 }
 
+/// 构建资源配置：按机器自动分档，环境变量可覆盖。
+/// 低配机默认保守（AnyTXT 在低配机上直接停实时监控，我们降线程/堆/IO），
+/// 高配机放开。`FINDX_INDEX_THREADS` / `FINDX_INDEX_HEAP_MB` /
+/// `FINDX_READ_MBPS`（0=不限）/`FINDX_BATCH` 覆盖对应项。
+#[derive(Debug, Clone, Copy)]
+pub struct BuildConfig {
+    /// tantivy 索引线程数。
+    pub index_threads: usize,
+    /// writer 总堆（字节）。
+    pub heap_bytes: usize,
+    /// 抽取子批次大小（定界内存）。
+    pub batch: usize,
+    /// 磁盘读取上限 MB/s，0=不限。低配机默认限速，做后台好公民。
+    pub read_mbps: u64,
+}
+
+impl BuildConfig {
+    pub fn auto() -> Self {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let mut cfg = if cpus <= 4 {
+            // 低配（核少，内存通常也小）：2 线程/512MB/40MB/s。
+            Self {
+                index_threads: 2,
+                heap_bytes: 512 << 20,
+                batch: 512,
+                read_mbps: 40,
+            }
+        } else if cpus <= 8 {
+            Self {
+                index_threads: 4,
+                heap_bytes: 768 << 20,
+                batch: 1024,
+                read_mbps: 80,
+            }
+        } else {
+            Self {
+                index_threads: 8,
+                heap_bytes: 1536 << 20,
+                batch: 1024,
+                read_mbps: 0,
+            }
+        };
+        if let Some(v) = std::env::var("FINDX_INDEX_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            cfg.index_threads = v.max(1);
+        }
+        if let Some(v) = std::env::var("FINDX_INDEX_HEAP_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            cfg.heap_bytes = v.max(64) << 20;
+        }
+        if let Some(v) = std::env::var("FINDX_READ_MBPS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            cfg.read_mbps = v;
+        }
+        if let Some(v) = std::env::var("FINDX_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            cfg.batch = v.max(128);
+        }
+        cfg
+    }
+}
+
+/// 把自己降为后台优先级（Windows `BELOW_NORMAL`：CPU/IO/内存优先级全降，
+/// 前台干活时自动让路；空闲时照样跑满）。CLI/service 共用构建入口，调一次即可。
+fn lower_self_priority() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        #[cfg(windows)]
+        {
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn SetPriorityClass(h: *mut std::ffi::c_void, c: u32) -> i32;
+                fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            }
+            const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+            unsafe {
+                SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+            }
+        }
+    });
+}
+
+/// 读盘令牌桶：按秒窗口统计已读字节，超配额 sleep 补齐。开销一次时间检查。
+struct IoThrottle {
+    mbps: u64,
+    window_start: std::time::Instant,
+    window_bytes: u64,
+}
+
+impl IoThrottle {
+    fn new(mbps: u64) -> Self {
+        Self {
+            mbps,
+            window_start: std::time::Instant::now(),
+            window_bytes: 0,
+        }
+    }
+
+    fn add(&mut self, bytes: u64) {
+        if self.mbps == 0 {
+            return;
+        }
+        self.window_bytes += bytes;
+        let quota = self.mbps * 1_048_576;
+        if self.window_bytes >= quota {
+            let el = self.window_start.elapsed();
+            if el < std::time::Duration::from_secs(1) {
+                std::thread::sleep(std::time::Duration::from_secs(1) - el);
+            }
+            self.window_start = std::time::Instant::now();
+            self.window_bytes = 0;
+        }
+    }
+}
+
 /// 卷前缀（小写）→ 归一化卷键：条目按最长前缀归属卷。
 pub fn build_vols(store: &IndexStore) -> Vec<(String, String)> {
     store
@@ -152,10 +277,11 @@ pub fn plan_range_from_store(
 ///（`Err(Error::Cancelled)`；`fresh` 目录会被删掉）。
 /// `st` 跨分片累加（调用方持有）。返回最终 `docs` 数。
 ///
-/// 流水线：1024 子批次 × rayon 并行抽取（stat + 解码 + Office/PDF 解析，
+/// 流水线：自适应子批次 × rayon 并行抽取（stat + 解码 + Office/PDF 解析，
 /// IO 与 CPU 混合主导）→ 同批 rayon 并行入库（ASCII 快道/结巴分词/写入，
-/// 纯 CPU 主导，tantivy 多线程 writer）。子批次定界内存：最多同时持有
-/// 1024 篇正文；入库顺序不保证（doc id 仅内部使用，搜索按分排序）。
+/// 纯 CPU 主导，tantivy 多线程 writer）。子批次定界内存；入库顺序不保证
+///（doc id 仅内部使用，搜索按分排序）。低配机自动降线程/堆/读盘速率，
+/// 并把进程降为后台优先级。
 pub fn build_from_plan(
     items: &[PlanItem],
     cdir: &Path,
@@ -166,6 +292,10 @@ pub fn build_from_plan(
     const EXTRACT_BATCH: usize = 1024;
     // 索引 commit 节流：writer 堆 1.5GB，5 万篇一批，崩溃最多丢一批。
     const COMMIT_EVERY: u64 = 50_000;
+    let cfg = BuildConfig::auto();
+    lower_self_priority();
+    let mut throttle = IoThrottle::new(cfg.read_mbps);
+    let existed = cdir.exists();
     let existed = cdir.exists();
     if rebuild && existed {
         std::fs::remove_dir_all(cdir).map_err(|e| Error::Io(cdir.display().to_string(), e))?;
@@ -181,7 +311,7 @@ pub fn build_from_plan(
     if !progress(st) {
         cancelled = true;
     }
-    for batch in items.chunks(EXTRACT_BATCH) {
+    for batch in items.chunks(cfg.batch) {
         if cancelled {
             break;
         }
@@ -232,6 +362,7 @@ pub fn build_from_plan(
         st.bytes += byte_n;
         st.failed += fail_n;
         st.skipped += skip_n;
+        throttle.add(byte_n);
         since_commit += ext_n;
         if since_commit >= COMMIT_EVERY {
             cidx.commit()?;

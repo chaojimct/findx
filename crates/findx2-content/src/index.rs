@@ -146,11 +146,6 @@ pub struct ContentIndex {
     writer: RwLock<IndexWriter>,
 }
 
-/// 索引线程数：jieba/写入并行的最大并发。8 线程后 tantivy 段合并开销盖过收益。
-const INDEX_THREADS: usize = 8;
-/// writer 总堆：线程数 × 单线程 arena。1.5GB 常驻可接受（service 本就 GB 级）。
-const INDEX_HEAP_BYTES: usize = 1_500_000_000;
-
 /// 内容索引目录定位：`index.bin` → `<index>.content/`（与 `.bin.v6/` 并列）。
 pub fn content_dir_for(index_bin: &Path) -> std::path::PathBuf {
     let mut dir = index_bin.as_os_str().to_owned();
@@ -183,7 +178,9 @@ pub fn open_or_create(dir: &Path) -> Result<ContentIndex> {
         .reload_policy(ReloadPolicy::Manual)
         .try_into()?;
     // 多线程 writer：抽取（rayon）与分词/写入（tantivy 内部线程池）双并行。
-    let writer = RwLock::new(index.writer_with_num_threads(INDEX_THREADS, INDEX_HEAP_BYTES)?);
+    // 线程/堆按机器自适应（低配机保守，见 BuildConfig）。
+    let cfg = crate::build::BuildConfig::auto();
+    let writer = RwLock::new(index.writer_with_num_threads(cfg.index_threads, cfg.heap_bytes)?);
     Ok(ContentIndex {
         fields,
         reader,

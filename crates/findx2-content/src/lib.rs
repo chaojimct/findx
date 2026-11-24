@@ -13,7 +13,8 @@ pub mod pdf_pool;
 pub mod build;
 
 pub use build::{
-    build_from_plan, build_from_store, build_vols, plan_range_from_store, BuildStats, PlanItem,
+    build_from_plan, build_from_store, build_vols, plan_range_from_store, BuildConfig, BuildStats,
+    PlanItem,
 };
 pub use error::Error;
 pub use extract::{
