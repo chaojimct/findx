@@ -382,18 +382,14 @@ fn run() -> Result<()> {
             use findx2_content::build_aux_from_index;
             let t0 = std::time::Instant::now();
             let mut last_log = std::time::Instant::now();
-            let st = build_aux_from_index(&index, rebuild, |scanned, docs| {
+            let st = build_aux_from_index(&index, rebuild, |scanned, _docs| {
                 if last_log.elapsed().as_secs() >= 5 {
                     last_log = std::time::Instant::now();
-                    eprintln!("[pinyin] 扫描倒排 {scanned} / 已建辅 {docs}（{:.1}s）", t0.elapsed().as_secs_f64());
+                    eprintln!("[pinyin] scanned={scanned} ({:.1}s)", t0.elapsed().as_secs_f64());
                 }
                 true
             })?;
-            eprintln!(
-                "拼音辅索引构建完成：回填 {} 篇，耗时 {:.1}s",
-                st.docs,
-                t0.elapsed().as_secs_f64(),
-            );
+            eprintln!("pinyin aux done: initials={} full={} terms_cjk={} ({:.1}s)", st.docs_ini, st.docs_full, st.terms_cjk, t0.elapsed().as_secs_f64());
         }
         Commands::ContentOptimize { index } => {
             use findx2_content::{content_dir_for, open_if_exists};

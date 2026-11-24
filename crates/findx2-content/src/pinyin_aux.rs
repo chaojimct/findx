@@ -44,6 +44,8 @@ pub struct AuxStats {
     pub docs: u64,
     pub terms_cjk: u64,
     pub chars: u64,
+    pub docs_ini: u64,
+    pub docs_full: u64,
 }
 
 /// 单个 CJK 字符 → (全拼, 首字母)；非 CJK 返回 None。
@@ -144,6 +146,8 @@ pub fn build_aux_from_index(
         docs: 0,
         terms_cjk: 0,
         chars: 0,
+        docs_ini: 0,
+        docs_full: 0,
     };
     let mut scanned: u64 = 0;
     for (ord, seg) in searcher.segment_readers().iter().enumerate() {
@@ -204,68 +208,83 @@ fn walk_shard(
     st: &mut AuxStats,
 ) -> Result<u64> {
     use rayon::prelude::*;
-    // term 序表（shard 内复用，避免重复 clone 字符串）。
-    let mut terms: Vec<String> = Vec::new();
-    // doc → [(byte_pos, term_idx)]。
-    let mut per_doc: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
-    let mut stream = inv
-        .terms()
-        .stream()
-        .map_err(|e| Error::Index(format!("term 流打开失败: {e}")))?;
-    let mut positions: Vec<u32> = Vec::new();
-    while stream.advance() {
-        let term_bytes = stream.key();
-        // CJK 预检：无 >=0x80 字节则必为纯 ASCII（拼音无关），跳过。
-        if !term_bytes.iter().any(|&b| b >= 0x80) {
-            continue;
-        }
-        let term_text = match std::str::from_utf8(term_bytes) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if !term_text.chars().any(is_cjk) {
-            continue;
-        }
-        st.terms_cjk += 1;
-        let term = tantivy::Term::from_field_bytes(body_field, term_bytes);
-        let Some(mut postings) = inv
-            .read_postings(&term, IndexRecordOption::WithFreqsAndPositions)
-            .map_err(|e| Error::Index(format!("读 postings 失败: {e}")))?
-        else {
-            continue;
-        };
-        let term_idx = terms.len() as u32;
-        terms.push(term_text.to_string());
-        let mut doc = postings.doc();
-        while doc != TERMINATED {
-            if doc >= shard_end {
-                break;
+    // 1) 串行扫 term 字典：只收集 CJK 词（快，纯 FST 遍历）。
+    let mut terms: Vec<Vec<u8>> = Vec::new();
+    {
+        let mut stream = inv
+            .terms()
+            .stream()
+            .map_err(|e| Error::Index(format!("term 流打开失败: {e}")))?;
+        while stream.advance() {
+            let tb = stream.key();
+            // CJK 预检：无 >=0x80 字节则必为纯 ASCII（拼音无关），跳过。
+            if !tb.iter().any(|&b| b >= 0x80) {
+                continue;
             }
-            if doc >= shard_start && alive.contains(&doc) {
-                positions.clear();
-                postings.positions(&mut positions);
-                let entry = per_doc.entry(doc).or_default();
-                for &p in positions.iter() {
-                    entry.push((p, term_idx));
-                }
+            // 顺手 UTF-8 校验 + 确认含 CJK，避免无效 postings 打开。
+            let ok = std::str::from_utf8(tb)
+                .map(|t| t.chars().any(is_cjk))
+                .unwrap_or(false);
+            if ok {
+                terms.push(tb.to_vec());
             }
-            doc = postings.advance();
         }
     }
+    if terms.is_empty() {
+        return Ok(0);
+    }
+    st.terms_cjk += terms.len() as u64;
+    // 2) 并行扫 postings：每个线程攒自己分片内的 (doc,pos,term_idx)，
+    // fold/reduce 合并。shard 范围过滤在读时完成（postings 有序，超界即停）。
+    let term_strs: Vec<String> = terms
+        .iter()
+        .map(|t| String::from_utf8_lossy(t).into_owned())
+        .collect();
+    let per_doc: HashMap<u32, Vec<(u32, u32)>> = terms
+        .par_iter()
+        .enumerate()
+        .fold(HashMap::new, |mut acc: HashMap<u32, Vec<(u32, u32)>>, (ti, tb)| {
+            let term = tantivy::Term::from_field_bytes(body_field, tb);
+            let postings = match inv.read_postings(&term, IndexRecordOption::WithFreqsAndPositions) {
+                Ok(Some(p)) => p,
+                _ => return acc,
+            };
+            let mut postings = postings;
+            let mut positions: Vec<u32> = Vec::new();
+            let mut doc = postings.doc();
+            while doc != TERMINATED {
+                if doc >= shard_end {
+                    break;
+                }
+                if doc >= shard_start && alive.contains(&doc) {
+                    positions.clear();
+                    postings.positions(&mut positions);
+                    let entry = acc.entry(doc).or_default();
+                    for &p in positions.iter() {
+                        entry.push((p, ti as u32));
+                    }
+                }
+                doc = postings.advance();
+            }
+            acc
+        })
+        .reduce(HashMap::new, |mut a, b| {
+            for (k, mut v) in b {
+                a.entry(k).or_default().append(&mut v);
+            }
+            a
+        });
     if per_doc.is_empty() {
         return Ok(0);
     }
-    // 重建字序 → 拼音文本 → 批量写入（并行，aux writer 线程安全）。
+    // 3) 重建字序 → 拼音文本 → 写入辅库（并行重建，串行写入）。
     let items: Vec<(DocMeta, String, String)> = per_doc
         .par_iter()
         .filter_map(|(&doc_id, tokpos)| {
-            let chars = match rebuild_chars(tokpos, &terms) {
+            let chars = match rebuild_chars(tokpos, &term_strs) {
                 Some(c) if !c.is_empty() => c,
                 _ => return None,
             };
-            if chars.is_empty() {
-                return None;
-            }
             let doc: tantivy::TantivyDocument =
                 searcher.doc(DocAddress::new(segment_ord, doc_id)).ok()?;
             let meta = DocMeta {
@@ -275,6 +294,10 @@ fn walk_shard(
                 mtime: doc.get_first(fields.mtime).and_then(|v| v.as_u64()).unwrap_or(0),
                 size: doc.get_first(fields.size).and_then(|v| v.as_u64()).unwrap_or(0),
             };
+            // 空路径的脏 doc 跳过（不污染辅库）。
+            if meta.path.is_empty() {
+                return None;
+            }
             let ini = initials_text(&chars);
             if ini.is_empty() {
                 return None;
@@ -284,19 +307,19 @@ fn walk_shard(
         })
         .collect();
     st.chars += items.len() as u64;
-    let mut n = 0u64;
+    let mut n_ini = 0u64;
+    let mut n_full = 0u64;
     for (meta, ini, full) in &items {
-        let ok_ini = aux_ini.index_doc(meta, ini).is_ok();
-        let ok_full = if full.is_empty() {
-            true
-        } else {
-            aux_full.index_doc(meta, full).is_ok()
-        };
-        if ok_ini && ok_full {
-            n += 1;
+        if aux_ini.index_doc(meta, ini).is_ok() {
+            n_ini += 1;
+        }
+        if !full.is_empty() && aux_full.index_doc(meta, full).is_ok() {
+            n_full += 1;
         }
     }
-    Ok(n)
+    st.docs_ini += n_ini;
+    st.docs_full += n_full;
+    Ok(n_ini)
 }
 
 /// 按字节偏移贪心覆盖，还原原文 CJK 字序（重叠 token 取最长）。
