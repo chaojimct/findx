@@ -155,29 +155,52 @@ impl MainWindow {
     }
 
     /// 搜索框输入框内左侧的三段 switch（文件/全文/混合，直选）。
-    /// 单键循环和下拉都太绕：三段常显，一眼看到当前模式，点哪段切哪段。
+    /// 常显三段 + 滑动指示块：一眼看到当前检索范围，点哪段切哪段。
     /// tooltip 保留完整语义即拼音入口。
     fn mode_segmented(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::settings_logic::{CONTENT_MODE_GLIDE_MS, CONTENT_MODE_SEG_W};
         let tokens = Self::tokens(cx);
+        let idx = self.content_mode.tab_index();
+        let from = self.content_mode_glide_from;
+        let to = idx as f32 * CONTENT_MODE_SEG_W;
         h_flex()
             .id("search-content-mode")
+            .relative()
             .flex_shrink_0()
             .items_center()
+            .h(px(26.))
             .rounded_full()
             .border_1()
             .border_color(tokens.border_soft)
             .bg(tokens.surface)
-            .p(px(2.))
             .cursor_pointer()
             .tooltip({
                 let tip: SharedString =
-                    "文件名：只搜文件名；全文：只搜正文（content: 包裹，支持拼音首字母如 qw 与全拼）；混合：两者并集。点击切换"
+                    "检索范围：文件名 / 全文检索（支持拼音首字母与全拼）/ 混合检索。点击切换"
                         .into();
                 move |window, cx| {
                     gpui_kit::component::tooltip::Tooltip::new(tip.clone())
                         .build(window, cx)
                 }
             })
+            // 滑动指示块：跟随选中段，180ms ease-in-out 划过去。
+            .child(
+                div()
+                    .absolute()
+                    .top(px(2.))
+                    .bottom(px(2.))
+                    .w(px(CONTENT_MODE_SEG_W))
+                    .rounded_full()
+                    .bg(tokens.row_selected)
+                    .with_animation(
+                        gpui_kit::ElementId::named_usize("mode-glide", idx),
+                        gpui_kit::Animation::new(std::time::Duration::from_millis(
+                            CONTENT_MODE_GLIDE_MS,
+                        ))
+                        .with_easing(crate::ui::motion::ease_in_out_cubic),
+                        move |el, delta| el.left(px(from + (to - from) * delta)),
+                    ),
+            )
             .children(
                 [
                     ContentDefaultMode::Name,
@@ -192,15 +215,17 @@ impl MainWindow {
                             "search-mode-{}",
                             m.as_str()
                         )))
-                        .px_2()
-                        .h(px(20.))
+                        .w(px(CONTENT_MODE_SEG_W))
+                        .h_full()
                         .flex()
                         .items_center()
-                        .rounded_full()
+                        .justify_center()
                         .text_xs()
                         .whitespace_nowrap()
+                        .cursor_pointer()
                         .when(active, |d| {
-                            d.bg(tokens.bg).text_color(tokens.text_primary)
+                            d.text_color(tokens.text_primary)
+                                .font_weight(FontWeight::SEMIBOLD)
                         })
                         .when(!active, |d| d.text_color(tokens.text_secondary))
                         .child(m.label())

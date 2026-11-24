@@ -242,9 +242,11 @@ pub struct MainWindow {
     path_prefix: String,
     size_min: String,
     size_max: String,
-    /// 搜索框全文模式（文件名/全文/混合；`content_enabled` 关时恒为文件名）。
+    /// 搜索框全文模式（文件名/全文检索/混合检索；`content_enabled` 关时恒为文件名）。
     /// 初值取自设置页“默认搜索模式”。
     content_mode: ContentDefaultMode,
+    /// 三段 switch 滑块起点（px，切换瞬间记录旧位置，180ms 划到新位置）。
+    content_mode_glide_from: f32,
     hits: Vec<SearchHitDto>,
     selected: Option<usize>,
     match_total: u32,
@@ -478,6 +480,11 @@ impl MainWindow {
             size_min: String::new(),
             size_max: String::new(),
             content_mode: session.read(cx).settings.content_default_mode,
+            content_mode_glide_from: {
+                use crate::settings_logic::CONTENT_MODE_SEG_W;
+                session.read(cx).settings.content_default_mode.tab_index() as f32
+                    * CONTENT_MODE_SEG_W
+            },
             hits: Vec::new(),
             selected: None,
             match_total: 0,
@@ -890,6 +897,9 @@ impl MainWindow {
         if self.content_mode == m {
             return;
         }
+        // 先记旧位置：滑块从这里划到新位置。
+        self.content_mode_glide_from =
+            self.content_mode.tab_index() as f32 * crate::settings_logic::CONTENT_MODE_SEG_W;
         self.content_mode = m;
         self.schedule_search(window, cx);
         cx.notify();

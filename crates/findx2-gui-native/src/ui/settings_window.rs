@@ -1856,7 +1856,7 @@ impl SettingsWindow {
                                 "content-mode-{}",
                                 m.as_str()
                             )))
-                            .w(px(80.))
+                            .w(px(96.))
                             .flex_shrink_0()
                             .label(m.label())
                             .selected(mode == m)
