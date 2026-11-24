@@ -100,6 +100,93 @@ pub fn list_with_hidden(
     });
     Ok((path, rows, truncated))
 }
+
+/// Recursive variant of [`list_with_hidden`] for the directory filter's
+/// "include subfolders" mode: iterative walk (no symlink descent, no loops),
+/// bounded by entry count and depth, same DTO shape and sort as flat.
+pub fn list_recursive(
+    path: &Path,
+    cancel: &Cancel,
+    show_hidden: bool,
+    reveal: Option<&Path>,
+) -> Result<(PathBuf, Vec<SearchHitDto>, bool), String> {
+    const MAX_ENTRIES: usize = 100_000;
+    const MAX_DEPTH: usize = 10;
+    let root = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    let mut truncated = false;
+    let mut stack = vec![(root.clone(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if cancel.load(Ordering::Acquire) {
+            return Err("目录请求已取消".into());
+        }
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for item in read {
+            if cancel.load(Ordering::Acquire) {
+                return Err("目录请求已取消".into());
+            }
+            if rows.len() >= MAX_ENTRIES {
+                truncated = true;
+                break;
+            }
+            let Ok(e) = item else { continue };
+            // Never descend through links; the link itself still lists.
+            let Ok(ft) = e.file_type() else { continue };
+            let Ok(meta) = e.metadata() else { continue };
+            let hidden = {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    meta.file_attributes() & 0x2 != 0
+                }
+                #[cfg(not(windows))]
+                {
+                    e.file_name().to_string_lossy().starts_with('.')
+                }
+            };
+            let entry_path = e.path();
+            let reveal_text = reveal.map(|p| p.to_string_lossy().into_owned());
+            if !entry_visible(
+                show_hidden,
+                hidden,
+                &entry_path.to_string_lossy(),
+                reveal_text.as_deref(),
+            ) {
+                continue;
+            }
+            let is_dir = meta.is_dir();
+            rows.push(SearchHitDto {
+                entry_idx: rows.len() as u32,
+                name: e.file_name().to_string_lossy().into_owned(),
+                path: e.path().to_string_lossy().into_owned(),
+                size: meta.len(),
+                mtime: meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|t| t.as_secs())
+                    .unwrap_or(0),
+                is_directory: is_dir,
+                name_highlight: vec![],
+                snippet: String::new(),
+            });
+            if is_dir && !ft.is_symlink() && depth < MAX_DEPTH && !truncated {
+                stack.push((entry_path, depth + 1));
+            }
+        }
+        if truncated {
+            break;
+        }
+    }
+    rows.sort_by(|a, b| {
+        b.is_directory
+            .cmp(&a.is_directory)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok((root, rows, truncated))
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileAction {
     Copy,

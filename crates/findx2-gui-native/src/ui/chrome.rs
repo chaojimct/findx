@@ -128,8 +128,7 @@ pub fn title_bar_with_tools(
         .flex_shrink_0()
         .bg(tokens.surface)
         .text_color(tokens.text_primary)
-        .border_b_1()
-        .border_color(tokens.border)
+        // No bottom rule: the bar melts into the content below as one surface.
         .child(content)
         .child(
             div()

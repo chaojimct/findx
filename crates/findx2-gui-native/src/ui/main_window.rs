@@ -11,7 +11,7 @@ mod workspace;
 use gpui_kit::component::Disableable as _;
 use std::path::PathBuf;
 use std::time::Duration;
-use workspace::{ViewMode, Workspace};
+use workspace::{ViewMode, Workspace, key};
 
 use findx2_ipc::SearchHitDto;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -220,6 +220,10 @@ pub struct MainWindow {
     command_palette_selected: usize,
     preview_resize: Option<(f32, f32)>,
     actual_preview_width: f32,
+    sidebar_resize: Option<(f32, f32)>,
+    actual_sidebar_width: f32,
+    /// Plain mousedown anchor for click-vs-drag disambiguation: (search page, row, position).
+    pub(super) press_row: Option<(bool, usize, Point<Pixels>)>,
     table: Entity<TableState<ResultsTable>>,
     page_loading: bool,
     page_error: bool,
@@ -405,6 +409,8 @@ impl MainWindow {
         let mut workspace = Workspace::new(browser_widths, window, cx);
         workspace.usage_depth = session.read(cx).prefs.usage_preferred_depth.clamp(1,6);
         workspace.show_hidden = session.read(cx).prefs.browser_show_hidden;
+        workspace.browser_view = session.read(cx).prefs.browser_view_mode;
+        workspace.filter_recursive = session.read(cx).prefs.browser_recursive;
         let command_palette_query = cx.new(|cx| InputState::new(window, cx));
         let mut this = Self {
             #[cfg(windows)]
@@ -430,6 +436,9 @@ impl MainWindow {
             command_palette_selected: 0,
             preview_resize: None,
             actual_preview_width: PREVIEW_DEFAULT_WIDTH_PX,
+            sidebar_resize: None,
+            actual_sidebar_width: SIDEBAR_WIDTH_PX,
+            press_row: None,
             table: table.clone(),
             page_loading: false,
             page_error: false,
@@ -495,6 +504,7 @@ impl MainWindow {
             .push(cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() {
                     this.finish_preview_resize(window, cx);
+                    this.finish_sidebar_resize(window, cx);
                     this.reset_side_buttons();
                     this.dismiss_usage_facts();
                     cx.notify();
@@ -1480,6 +1490,7 @@ impl MainWindow {
         label: &'static str,
         selected: bool,
         tokens: FindxTokens,
+        row_width: f32,
         on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
         Button::new(id)
@@ -1492,7 +1503,7 @@ impl MainWindow {
             .on_click(on_click)
             .child(
                 h_flex()
-                    .w(px(SIDEBAR_WIDTH_PX - 16.))
+                    .w(px(row_width))
                     .h(px(28.))
                     .px_1()
                     .gap_2()
@@ -1500,11 +1511,13 @@ impl MainWindow {
                     .rounded_md()
                     .cursor_pointer()
                     .when(selected, |this| this.bg(tokens.row_selected))
-                    .when(!selected, |this| this.hover(|s| s.bg(tokens.hover)))
+                    .when(!selected, |this| {
+                        this.hover(|s| s.bg(tokens.row_selected.opacity(0.55)))
+                    })
                     .child(
                         div()
                             .w(px(3.))
-                            .h(px(14.))
+                            .h(px(12.))
                             .rounded_sm()
                             .when(selected, |this| this.bg(tokens.accent))
                             .when(!selected, |this| this.bg(hsla(0., 0., 0., 0.))),
@@ -1539,6 +1552,7 @@ impl MainWindow {
         let entity = cx.entity();
         let type_section = v_flex()
             .w_full()
+            .gap_1()
             .child(Self::render_section_header("类型", tokens))
             .children(TypeFilter::ALL.iter().map(|filter| {
                 let selected = self.type_filter == *filter;
@@ -1550,6 +1564,7 @@ impl MainWindow {
                     f.label(),
                     selected,
                     tokens,
+                    (self.actual_sidebar_width - 16.).max(88.),
                     move |_, window, cx| {
                         entity.update(cx, |this, cx| {
                             this.type_filter = f;
@@ -1561,6 +1576,7 @@ impl MainWindow {
             }));
         let time_section = v_flex()
             .w_full()
+            .gap_1()
             .child(
                 div()
                     .w_full()
@@ -1579,6 +1595,7 @@ impl MainWindow {
                     f.label(),
                     selected,
                     tokens,
+                    (self.actual_sidebar_width - 16.).max(88.),
                     move |_, window, cx| {
                         entity.update(cx, |this, cx| {
                             this.time_filter = f;
@@ -1590,7 +1607,7 @@ impl MainWindow {
             }));
 
         v_flex()
-            .w(px(SIDEBAR_WIDTH_PX))
+            .w(px(self.actual_sidebar_width))
             .min_h_0()
             .flex_shrink_0()
             .bg(tokens.surface)
@@ -2210,11 +2227,18 @@ impl Render for MainWindow {
         let content_width = viewport.width.as_f32();
         self.last_content_width = content_width;
         self.ensure_usage_scene(window, cx);
-        let rail_width = if self.workspace.mode == ViewMode::Directory {
-            workspace::DIRECTORY_SIDEBAR_WIDTH
-        } else {
-            SIDEBAR_WIDTH_PX
-        };
+        let wanted_sidebar = self
+            .session
+            .read(cx)
+            .prefs
+            .sidebar_width
+            .unwrap_or(if self.workspace.mode == ViewMode::Directory {
+                workspace::DIRECTORY_SIDEBAR_WIDTH
+            } else {
+                SIDEBAR_WIDTH_PX
+            })
+            .clamp(120., 320.);
+        let rail_width = wanted_sidebar;
         // Viewport can report the outer frame; leave slack for title bar + borders
         // so the pinned status bar is never pushed off-screen.
         let (saved_sidebar, saved_preview, diag_on, index_view) =
@@ -2229,6 +2253,7 @@ impl Render for MainWindow {
         let (mut sidebar, mut preview, sidebar_reason, preview_reason) = explain_panels(
             content_width,
             PREVIEW_DEFAULT_WIDTH_PX,
+            wanted_sidebar,
             saved_sidebar,
             saved_preview,
             self.sidebar_force,
@@ -2254,10 +2279,12 @@ impl Render for MainWindow {
             preview,
             wanted,
         );
+        self.actual_sidebar_width = wanted_sidebar;
         self.table_viewport_width = content_width
             - if sidebar { rail_width } else { 0. }
+            - if sidebar { 2. } else { 0. }
             - if preview {
-                self.actual_preview_width + 6.
+                self.actual_preview_width + 2.
             } else {
                 0.
             };
@@ -2364,7 +2391,8 @@ impl Render for MainWindow {
             .overflow_hidden()
             .relative()
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                this.resize_preview_move(event, cx)
+                this.resize_preview_move(event, cx);
+                this.resize_sidebar_move(event, cx)
             }))
             .capture_any_mouse_down(cx.listener(|this,event:&MouseDownEvent,_,cx|{
                 this.workspace_native_side(event.button,cx);
@@ -2376,7 +2404,8 @@ impl Render for MainWindow {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, window, cx| {
-                    this.finish_preview_resize(window, cx)
+                    this.finish_preview_resize(window, cx);
+                    this.finish_sidebar_resize(window, cx)
                 }),
             )
             .on_mouse_up_out(
@@ -2384,6 +2413,7 @@ impl Render for MainWindow {
                 cx.listener(|this, event: &MouseUpEvent, window, cx| {
                     if event.button == MouseButton::Left {
                         this.finish_preview_resize(window, cx);
+                        this.finish_sidebar_resize(window, cx);
                     }
                 }),
             )
@@ -2488,6 +2518,7 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &PreviewSelected, window, cx| {
                 if this.text_edit_active(window, cx)
                     || this.preview_resize.is_some()
+                    || this.sidebar_resize.is_some()
                     || this.file_menu_is_open()
                     || this.run_pending.is_some()
                     || this.file_actions.confirm_target.is_some()
@@ -2515,6 +2546,10 @@ impl Render for MainWindow {
                 );
                 if this.preview_resize.is_some() {
                     this.finish_preview_resize(window, cx);
+                    return;
+                }
+                if this.sidebar_resize.is_some() {
+                    this.finish_sidebar_resize(window, cx);
                     return;
                 }
                 if this.file_menu_is_open() {
@@ -2621,6 +2656,7 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &OpenSelected, window, cx| {
                 if this.text_edit_active(window, cx)
                     || this.preview_resize.is_some()
+                    || this.sidebar_resize.is_some()
                     || this.file_menu_is_open()
                     || this.run_pending.is_some()
                     || this.file_actions.confirm_target.is_some()
@@ -2988,6 +3024,13 @@ impl MainWindow {
         v
     }
 
+    /// Prefetch probe for the status bar: whether entering the current
+    /// directory warmed its children sizes ahead of time. Fixed width so
+    /// the switch next to it never jumps.
+    /// Fill-state marker for the status bar: it answers "are THIS page's
+    /// folder sizes actually on screen", not whether the index cache was
+    /// warmed. Green = all shown, pulsing = fill running, amber = blank
+    /// cells remain (index unreachable; retry on next navigation).
     fn render_status_bar(&self, index: &IndexStatusView, cx: &mut Context<Self>) -> AnyElement {
         let tokens = Self::tokens(cx);
         if self.workspace.mode == ViewMode::Directory {

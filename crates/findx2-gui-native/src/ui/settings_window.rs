@@ -1362,6 +1362,26 @@ impl SettingsWindow {
                             ),
                         )
                         .child(settings_note(self.material.note(), tokens))
+                        .child(self.service_switch_row(
+                            "content-translucent",
+                            "内容区透明",
+                            "列表、预览、详情等内容底色跟随材质透明（纯色材质下不可用）。",
+                            self.session.read(cx).prefs.content_translucent,
+                            self.material
+                                == crate::window_material::WindowMaterial::Solid,
+                            tokens,
+                            cx,
+                            |this, on, cx| {
+                                let on = *on;
+                                this.session.update(cx, |s, cx| {
+                                    s.prefs.content_translucent = on;
+                                    s.apply_theme(cx);
+                                    crate::session::persist_prefs(s.prefs.clone(), cx);
+                                });
+                                cx.refresh_windows();
+                                cx.notify();
+                            },
+                        ))
                         .child(settings_note(
                             if support.supports(
                                 crate::window_material::WindowMaterial::Mica,

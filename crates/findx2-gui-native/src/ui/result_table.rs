@@ -5,6 +5,7 @@ use findx2_ipc::SearchHitDto;
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use std::path::PathBuf;
 
 pub(super) const DEFAULT_WIDTHS: [f32; 4] = [280., 360., 90., 164.];
 pub(super) const MIN_WIDTHS: [f32; 4] = [160., 160., 72., 150.];
@@ -24,10 +25,17 @@ impl TableDelegate for ResultsTable {
     ) -> Stateful<Div> {
         let owner = self.owner.clone();
         let right_owner = owner.clone();
+        let up_owner = owner.clone();
+        let press_owner = owner.clone();
         let painted_scope = owner.read_with(cx, |view, _| view.row_paint_scope(true)).ok().flatten();
         let selected = owner
             .read_with(cx, |view, cx| view.context_row_selected(true, row, cx))
             .unwrap_or(false);
+        let press_dir = self
+            .hits
+            .get(row)
+            .filter(|h| h.is_directory)
+            .map(|h| PathBuf::from(h.path.clone()));
         let tokens = *cx.global::<crate::theme::FindxTokens>();
         div()
             .id(("row", row))
@@ -36,11 +44,22 @@ impl TableDelegate for ResultsTable {
             .border_color(tokens.border_soft)
             .when(selected, |v| v.bg(tokens.row_selected))
             .on_mouse_down(MouseButton::Left, move |event, _, cx| {
-                let _ = owner.update(cx, |view, cx| {
+                let _ = press_owner.update(cx, |view, cx| {
                     if !crate::ui::async_publication::painted_event_current(painted_scope, view.row_paint_scope(true)) {
                         cx.stop_propagation(); return;
                     }
-                    view.selection_pointer(true, row, event.modifiers, cx)
+                    view.selection_pointer(true, row, event.modifiers, cx);
+                    if !event.modifiers.control && !event.modifiers.shift {
+                        view.press_row = Some((true, row, event.position));
+                    }
+                    if let Some(dir) = press_dir.clone() {
+                        view.queue_prefetch(dir, cx);
+                    }
+                });
+            })
+            .on_mouse_up(MouseButton::Left, move |event, _, cx| {
+                let _ = up_owner.update(cx, |view, cx| {
+                    view.collapse_press_selection(true, row, event.modifiers, event.position, cx);
                 });
             })
             .on_mouse_down(MouseButton::Right, move |_, _, cx| {

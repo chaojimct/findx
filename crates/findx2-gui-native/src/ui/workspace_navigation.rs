@@ -142,7 +142,12 @@ impl MainWindow {
             .max()
             .unwrap_or(1)).max(1);
         let empty=items.entries.is_empty();
-        let mut menu = menu.scrollable(true).min_w(px(372.)).max_w(px(372.)).max_h(px(312.));
+        // Short menus size to content: with the global always-show scrollbar
+        // even a 1px overflow would paint a thumb. Only long lists scroll.
+        let mut menu = menu.min_w(px(372.)).max_w(px(372.)).max_h(px(312.));
+        if items.entries.len() > 9 {
+            menu = menu.scrollable(true);
+        }
         if empty {menu=menu.item(PopupMenuItem::label("没有可显示的子项"));}
         for item in items.entries {
             let selected = key(&item.path) == key(current);
@@ -277,7 +282,7 @@ impl MainWindow {
             let header=format!("{} 的子项",display_path(&dir));
             let menu=PopupMenu::build(window,cx,|menu,_,_|menu
                 .item(PopupMenuItem::label("正在读取索引…"))
-                .scrollable(true).min_w(px(372.)).max_w(px(372.)).max_h(px(312.)));
+                .min_w(px(372.)).max_w(px(372.)).max_h(px(312.)));
             self.workspace.address_menu_header=Some(header.clone());
             self.install_address_menu(menu.clone(),position,window,cx);
             let generation=self.workspace.address_menu_generation;
@@ -300,7 +305,7 @@ impl MainWindow {
                     let result=result.and_then(|r|if this.workspace.engine_generation.is_some_and(|g|g!=r.stamp){Err("索引已变化，请重新打开".into())}else{Ok(r)});
                     let _=this.workspace.window.update(cx,|_,window,cx|{
                         menu.update(cx,|menu,cx|menu.rebuild(window,cx,|menu,_,cx|{
-                            let menu=menu.scrollable(true).min_w(px(372.)).max_w(px(372.)).max_h(px(312.));
+                            let menu=menu.min_w(px(372.)).max_w(px(372.)).max_h(px(312.));
                             match result{
                                 Ok(list)=>Self::sibling_menu_items(menu,list.items,Some(list.total),&current,owner,mode,cx),
                                 Err(message)=>menu.item(PopupMenuItem::label(format!("读取失败：{message}"))),
@@ -481,6 +486,7 @@ impl MainWindow {
         let owner = cx.weak_entity();
         let mode = self.workspace.mode;
         let menu = PopupMenu::build(window, cx, |mut menu, _, _| {
+            let n = paths.len();
             for path in paths {
                 let owner = owner.clone();
                 menu = menu.item(
@@ -496,7 +502,11 @@ impl MainWindow {
                         }),
                 );
             }
-            menu.scrollable(true).max_h(px(320.))
+            if n > 10 {
+                menu.scrollable(true).max_h(px(320.))
+            } else {
+                menu.max_h(px(320.))
+            }
         });
         self.install_address_menu(menu, position, window, cx);
     }
@@ -837,7 +847,7 @@ impl MainWindow {
             .collect::<Vec<_>>();
         let available = (self.last_content_width
             - if self.workspace.mode == ViewMode::Directory {
-                DIRECTORY_SIDEBAR_WIDTH
+                self.actual_sidebar_width
                     + if self.last_content_width < 900. {
                         142.
                     } else {
@@ -910,6 +920,7 @@ impl MainWindow {
                     .map(|(visible_index, &index)| {
                         let path = paths[index].clone();
                         let dir_path = path.clone();
+                        let hover_path = dir_path.clone();
                         let next = paths.get(index + 1).cloned();
                         let tooltip = display_path(&path);
                         let width = if index == last {
@@ -921,6 +932,12 @@ impl MainWindow {
                             .flex_shrink_0()
                             .min_w_0()
                             .h_full()
+                            .id(SharedString::from(format!("crumb-hover-{index}")))
+                            .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
+                                if index != last {
+                                    this.note_directory_hover(hover_path.clone(), *hovering, cx);
+                                }
+                            }))
                             .when(visible_index == 1 && !hidden.is_empty(), |row| {
                                 let hidden = hidden.clone();
                                 row.child(

@@ -1,5 +1,7 @@
 //! Three deliberately different information architectures, inside one custom window shell.
 use super::*;
+use crate::prefs::BrowserViewMode;
+use findx2_ipc::SearchHitDto;
 use gpui_kit::component::FocusableExt as _;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu};
@@ -26,7 +28,11 @@ impl MainWindow {
                         .w_full()
                         .items_stretch()
                         .overflow_hidden()
-                        .when(sidebar, |view| view.child(self.render_sidebar(cx)))
+                        .when(sidebar, |view| {
+                            view.child(self.render_sidebar(cx)).child(
+                                self.render_sidebar_separator(window, cx),
+                            )
+                        })
                         .child(
                             div()
                                 .flex_1()
@@ -46,7 +52,10 @@ impl MainWindow {
                 .w_full()
                 .items_stretch()
                 .overflow_hidden()
-                .when(sidebar, |view| view.child(self.render_locations(cx)))
+                .when(sidebar, |view| {
+                    view.child(self.render_locations(cx))
+                        .child(self.render_sidebar_separator(window, cx))
+                })
                 .child(
                     v_flex()
                         .flex_1()
@@ -186,7 +195,7 @@ impl MainWindow {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(Input::new(&self.search).cleanable(true)),
+                    .child(Input::new(&self.search).cleanable(true).focus_bordered(false)),
             )
             .child(
                 self.tool_button("search-reveal", "定位", 3, false, cx)
@@ -207,11 +216,17 @@ impl MainWindow {
         } else if self.workspace.status.starts_with("目录读取失败") {
             "无法读取此目录；请检查位置、权限或磁盘连接。诊断见状态栏。"
         } else if !self.workspace.filter_text.is_empty() {
-            "当前目录没有匹配项；本层过滤不包含子目录。"
+            if self.workspace.filter_recursive {
+                "当前目录及子目录没有匹配项。"
+            } else {
+                "当前目录没有匹配项；本层过滤不包含子目录。"
+            }
         } else {
             "此目录为空"
         };
         let owner = cx.weak_entity();
+        let drop_owner = cx.weak_entity();
+        let ext_owner = cx.weak_entity();
         div()
             .id("directory-table-context")
             .relative()
@@ -259,6 +274,19 @@ impl MainWindow {
                         .child(message),
                 )
             })
+            .on_drop::<crate::ui::browser_table::FileDragPayload>(move |payload, _, cx| {
+                let _ = drop_owner.update(cx, |view, cx| {
+                    let target = view.workspace.location.clone();
+                    view.drop_files_on_directory(payload.hits.clone(), true, target, cx)
+                });
+            })
+            .on_drop::<gpui_kit::ExternalPaths>(move |paths, _, cx| {
+                let _ = ext_owner.update(cx, |view, cx| {
+                    let hits = view.external_hits(&paths.0);
+                    let target = view.workspace.location.clone();
+                    view.drop_files_on_directory(hits, false, target, cx)
+                });
+            })
             .context_menu(move |menu, window, cx| {
                 owner
                     .update(cx, |view, cx| {
@@ -269,7 +297,279 @@ impl MainWindow {
             .into_any_element()
     }
 
+    pub(super) fn set_browser_view(&mut self, mode: BrowserViewMode, cx: &mut Context<Self>) {
+        if self.workspace.browser_view == mode {
+            return;
+        }
+        self.workspace.browser_view = mode;
+        self.session.update(cx, |s, cx| {
+            s.prefs.browser_view_mode = mode;
+            crate::session::persist_prefs(s.prefs.clone(), cx);
+        });
+        cx.notify();
+    }
+
+    /// Search-recursive toggle for the active tab: only the filter scope
+    /// changes. The listing stays single-level; a non-empty query searches
+    /// the cached subtree, an empty query always shows the flat level.
+    pub(super) fn set_filter_recursive(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.workspace.mode != ViewMode::Directory || self.workspace.tabs.is_empty() {
+            return;
+        }
+        if self.workspace.filter_recursive == on {
+            return;
+        }
+        self.workspace.filter_recursive = on;
+        self.workspace.tabs[self.workspace.active_tab].filter_recursive = on;
+        self.session.update(cx, |s, cx| {
+            s.prefs.browser_recursive = on;
+            crate::session::persist_prefs(s.prefs.clone(), cx);
+        });
+        if !self.workspace.filter_text.is_empty() {
+            let focus = self.active_workspace_hit().map(|h| h.path);
+            self.schedule_directory_filter(focus, cx);
+        }
+        cx.notify();
+    }
+
+    /// Cap for the icon grid: a wrapping flex renders every cell eagerly,
+    /// so bound it and point at the list for huge directories.
+    const GRID_CAP: usize = 1200;
+
+    pub(super) fn render_directory_grid(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tokens = Self::tokens(cx);
+        let _ = window;
+        let total = self.workspace.rows.len();
+        let shown = total.min(Self::GRID_CAP);
+        let empty_message = if self.workspace.listing {
+            "正在读取目录…"
+        } else if self.workspace.status.starts_with("目录读取失败") {
+            "无法读取此目录；请检查位置、权限或磁盘连接。诊断见状态栏。"
+        } else if !self.workspace.filter_text.is_empty() {
+            if self.workspace.filter_recursive {
+                "当前目录及子目录没有匹配项。"
+            } else {
+                "当前目录没有匹配项；本层过滤不包含子目录。"
+            }
+        } else {
+            "此目录为空"
+        };
+        let owner = cx.weak_entity();
+        let drop_owner = cx.weak_entity();
+        let ext_owner = cx.weak_entity();
+        div()
+            .id("directory-grid-context")
+            .relative()
+            .size_full()
+            .bg(tokens.bg)
+            .overflow_y_scrollbar()
+            .p_2()
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .w_full()
+                    .items_start()
+                    .gap_2()
+                    .children(
+                        self.workspace.rows[..shown]
+                            .iter()
+                            .enumerate()
+                            .map(|(ix, hit)| self.grid_cell(ix, hit, cx)),
+                    ),
+            )
+            .when(total == 0, |view| {
+                view.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .p_4()
+                        .text_sm()
+                        .text_color(tokens.text_secondary)
+                        .child(empty_message),
+                )
+            })
+            .when(total > shown, |view| {
+                view.child(
+                    div()
+                        .w_full()
+                        .pt_2()
+                        .text_xs()
+                        .text_color(tokens.text_tertiary)
+                        .child(format!(
+                            "仅显示前 {shown} 项（共 {total} 项），切到列表查看全部。"
+                        )),
+                )
+            })
+            .on_drop::<crate::ui::browser_table::FileDragPayload>(move |payload, _, cx| {
+                let _ = drop_owner.update(cx, |view, cx| {
+                    let target = view.workspace.location.clone();
+                    view.drop_files_on_directory(payload.hits.clone(), true, target, cx)
+                });
+            })
+            .on_drop::<gpui_kit::ExternalPaths>(move |paths, _, cx| {
+                let _ = ext_owner.update(cx, |view, cx| {
+                    let hits = view.external_hits(&paths.0);
+                    let target = view.workspace.location.clone();
+                    view.drop_files_on_directory(hits, false, target, cx)
+                });
+            })
+            .context_menu(move |menu, window, cx| {
+                owner
+                    .update(cx, |view, cx| {
+                        view.file_context_menu(menu, true, window, cx)
+                    })
+                    .unwrap()
+            })
+            .into_any_element()
+    }
+
+    fn grid_cell(&self, ix: usize, hit: &SearchHitDto, cx: &mut Context<Self>) -> AnyElement {
+        let tokens = Self::tokens(cx);
+        let selected = self.workspace.selected_rows.contains(&ix);
+        let full = hit.path.clone();
+        let owner = cx.weak_entity();
+        let hover_path = hit.path.clone();
+        let hover_path_down = hover_path.clone();
+        let hover_dir = hit.is_directory;        // Same drag rule as table rows: a selected cell drags the selection.
+        let drag_hits = if selected {
+            self.workspace
+                .selected_rows
+                .iter()
+                .filter_map(|&i| self.workspace.rows.get(i))
+                .cloned()
+                .collect()
+        } else {
+            vec![hit.clone()]
+        };
+        let drop_dir = if hit.is_directory {
+            Some(PathBuf::from(hit.path.clone()))
+        } else {
+            None
+        };
+        let drop_owner = cx.weak_entity();
+        v_flex()
+            .id(("grid-cell", ix))
+            .w(px(104.))
+            .items_center()
+            .py_2()
+            .gap_1()
+            .rounded_md()
+            .cursor_pointer()
+            .when(selected, |v| v.bg(tokens.row_selected))
+            .when(!selected, |v| {
+                v.hover(|s| s.bg(tokens.row_selected.opacity(0.55)))
+            })
+            .tooltip({
+                let full = full.clone();
+                move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(full.clone()).build(window, cx)
+                }
+            })
+            .child(crate::ui::file_icon::file_icon_sized(
+                &hit.name,
+                hit.is_directory,
+                tokens,
+                40.,
+            ))
+            .child(
+                div()
+                    .w_full()
+                    .px_1()
+                    .text_xs()
+                    .text_center()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_color(if selected {
+                        tokens.text_primary
+                    } else {
+                        tokens.text_secondary
+                    })
+                    .child(hit.name.clone()),
+            )
+            .on_drag(
+                crate::ui::browser_table::FileDragPayload { hits: drag_hits },
+                |payload, _, _, cx| {
+                    cx.new(|_| crate::ui::browser_table::DragGhost {
+                        label: format!("移动 {} 项", payload.hits.len().max(1)),
+                    })
+                },
+            )
+            .on_drop::<crate::ui::browser_table::FileDragPayload>(move |payload, _, cx| {
+                if let Some(dir) = drop_dir.clone() {
+                    let _ = drop_owner.update(cx, |view, cx| {
+                        view.drop_files_on_directory(payload.hits.clone(), true, dir, cx)
+                    });
+                }
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.selection_pointer(false, ix, event.modifiers, cx);
+                    if !event.modifiers.control && !event.modifiers.shift {
+                        this.press_row = Some((false, ix, event.position));
+                    }
+                    if hover_dir {
+                        this.queue_prefetch(PathBuf::from(hover_path_down.clone()), cx);
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                    this.collapse_press_selection(false, ix, event.modifiers, event.position, cx);
+                }),
+            )
+            .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
+                if hover_dir {
+                    this.note_directory_hover(PathBuf::from(hover_path.clone()), *hovering, cx);
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    this.prepare_context_row(false, ix, cx)
+                }),
+            )
+            .on_double_click(cx.listener(move |this, _, _, cx| {
+                this.workspace_select(ix, cx);
+                this.open_selected(cx)
+            }))
+            .context_menu(move |menu, window, cx| {
+                owner
+                    .update(cx, |view, cx| {
+                        view.prepare_context_row(false, ix, cx);
+                        view.file_context_menu(menu, false, window, cx)
+                    })
+                    .unwrap()
+            })
+            .into_any_element()
+    }
+
     fn navigation_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Hovering a nav button warms the target directory, so going
+        // back/forward/up fills sizes instantly from cache.
+        let back_target = self
+            .workspace
+            .history
+            .back
+            .last()
+            .map(|r| r.path.clone());
+        let fwd_target = self
+            .workspace
+            .history
+            .forward
+            .last()
+            .map(|r| r.path.clone());
+        let up_target = self
+            .workspace
+            .location
+            .parent()
+            .map(|p| p.to_path_buf());
         h_flex().flex_shrink_0().gap_1().children(
             [
                 ("directory-back", "后退（Alt+Left）", 0),
@@ -278,7 +578,12 @@ impl MainWindow {
             ]
             .into_iter()
             .map(|(id, label, action)| {
-                Button::new(id)
+                let hover_target = match action {
+                    0 => back_target.clone(),
+                    1 => fwd_target.clone(),
+                    _ => up_target.clone(),
+                };
+                let button = Button::new(id)
                     .ghost()
                     .icon(match action {
                         0 => IconName::ArrowLeft,
@@ -315,7 +620,17 @@ impl MainWindow {
                         0 => this.workspace_history(false, cx),
                         1 => this.workspace_history(true, cx),
                         _ => this.workspace_up(cx),
-                    }))
+                    }));
+                match hover_target {
+                    Some(target) => div()
+                        .id(SharedString::from(format!("nav-hover-{id}")))
+                        .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
+                            this.note_directory_hover(target.clone(), *hovering, cx)
+                        }))
+                        .child(button)
+                        .into_any_element(),
+                    None => button.into_any_element(),
+                }
             }),
         )
     }
@@ -336,13 +651,69 @@ impl MainWindow {
             .child(
                 div()
                     .w(px(if self.last_content_width < 900. {
-                        142.
+                        172.
                     } else {
-                        196.
+                        228.
                     }))
-                    .child(Input::new(&self.workspace.filter_input).cleanable(true)),
+                    .child(
+                        Input::new(&self.workspace.filter_input)
+                            .cleanable(true)
+                            .focus_bordered(false)
+                            .suffix(
+                                Button::new("browser-filter-recursive")
+                                    .ghost()
+                                    .child(
+                                        Icon::default()
+                                            .path("icons/folder-search.svg")
+                                            .size_4(),
+                                    )
+                                    .w(px(28.))
+                                    .h(px(22.))
+                                    .px_0()
+                                    .selected(self.workspace.filter_recursive)
+                                    .tooltip("递归搜索子文件夹（深度≤10，上限10万项）")
+                                    .accessibility_label("递归搜索子文件夹")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let next = !this.workspace.filter_recursive;
+                                        this.set_filter_recursive(next, cx)
+                                    })),
+                            ),
+                    ),
             )
-            .into_any_element()
+            .child(
+                Button::new("browser-view-toggle")
+                    .ghost()
+                    .child(
+                        Icon::default()
+                            .path(if self.workspace.browser_view == BrowserViewMode::List {
+                                "icons/layout-grid.svg"
+                            } else {
+                                "icons/layout-list.svg"
+                            })
+                            .size_4(),
+                    )
+                    .tooltip(if self.workspace.browser_view == BrowserViewMode::List {
+                        "切换到平铺视图"
+                    } else {
+                        "切换到列表视图"
+                    })
+                    .accessibility_label("切换列表/平铺视图")
+                    .w(px(28.))
+                    .h(px(30.))
+                    .px_0()
+                    .selected(self.workspace.browser_view == BrowserViewMode::Icons)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_browser_view(
+                            if this.workspace.browser_view == BrowserViewMode::List {
+                                BrowserViewMode::Icons
+                            } else {
+                                BrowserViewMode::List
+                            },
+                            cx,
+                        )
+                    })),
+            )
+                        .into_any_element()
     }
 
     // Sidebar anatomy is fixed for every group and item. No label-sized centring.
@@ -409,7 +780,7 @@ impl MainWindow {
             .iter()
             .any(|p| key(Path::new(p)) == key(&self.workspace.location));
         // 16px outer padding + 8px header inset + a permanent 24px action slot.
-        let header_content = DIRECTORY_SIDEBAR_WIDTH - 16. - 8. - 24.;
+        let header_content = (self.actual_sidebar_width - 16. - 8. - 24.).max(64.);
         h_flex()
             .w_full()
             .h(px(26.))
@@ -576,41 +947,67 @@ impl MainWindow {
         let on = self.sidebar_active_group(cx) == Some(group)
             && key(&path) == key(&self.workspace.location);
         let full = display_path(&path);
-        // The row background is inset 12px on BOTH edges. Inside: 16px indent,
-        // 20px icon slot, a flexible ellipsized text slot, and 16px tail slot.
-        let row_width = DIRECTORY_SIDEBAR_WIDTH - 24.;
+        let t = Self::tokens(cx);
+        // Shared sidebar-row language (mirrors the search filter rows):
+        // 32px, rounded, blue-family hover, accent bar + tinted icon on select.
+        let row_width = (self.actual_sidebar_width - 24.).max(88.);
         let menu = self.sidebar_context_menu(&path, favorite_label, false);
         Button::new(SharedString::from(format!("sidebar-{group}-{index}")))
             .ghost()
             .w_full()
             .h(px(28.))
             .px_0()
-            .rounded_sm()
+            .rounded_md()
             .selected(on)
             .accessibility_label(label.clone())
             .tooltip(full)
             .child(
                 h_flex()
                     .w(px(row_width))
+                    .h_full()
                     .items_center()
-                    .child(div().w(px(16.)).flex_shrink_0())
+                    .px_1()
+                    .gap_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(on, |v| v.bg(t.row_selected))
+                    .when(!on, |v| {
+                        v.hover(|s| s.bg(t.row_selected.opacity(0.55)))
+                    })
+                    .child(
+                        div()
+                            .w(px(3.))
+                            .h(px(12.))
+                            .rounded_sm()
+                            .flex_shrink_0()
+                            .when(on, |v| v.bg(t.accent))
+                            .when(!on, |v| v.bg(hsla(0., 0., 0., 0.))),
+                    )
                     .child(
                         h_flex()
                             .w(px(20.))
                             .flex_shrink_0()
                             .justify_center()
-                            .child(Icon::default().path(format!("icons/{icon}.svg")).size_4()),
+                            .child(
+                                Icon::default()
+                                    .path(format!("icons/{icon}.svg"))
+                                    .size_4()
+                                    .text_color(if on {
+                                        t.accent
+                                    } else {
+                                        t.text_secondary
+                                    }),
+                            ),
                     )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .pl_1()
                             .whitespace_nowrap()
                             .text_ellipsis()
+                            .text_sm()
                             .child(label),
-                    )
-                    .child(div().w(px(16.)).flex_shrink_0()),
+                    ),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.workspace.sidebar_source = Some((group, key(&path)));
@@ -632,6 +1029,7 @@ impl MainWindow {
         v_flex()
             .w_full()
             .py_1()
+            .gap_1()
             .border_b_1()
             .border_color(t.border_soft)
             .child(self.sidebar_header(group, title, empty, cx))
@@ -640,6 +1038,7 @@ impl MainWindow {
                     v_flex()
                         .w_full()
                         .px_1()
+                        .gap_1()
                         .children(
                             items
                                 .into_iter()
@@ -707,15 +1106,19 @@ impl MainWindow {
             Some("加入收藏夹")
         };
         let indent = 4. + depth.min(6) as f32 * 12.;
-        let row_width = DIRECTORY_SIDEBAR_WIDTH - 24.;
+        let row_width = (self.actual_sidebar_width - 24.).max(88.);
         let menu = self.sidebar_context_menu(&path, favorite_label, true);
         div()
             .id(SharedString::from(format!("sidebar-tree-{k}")))
             .w(px(row_width))
             .h(px(28.))
             .flex_shrink_0()
-            .rounded_sm()
+            .rounded_md()
+            .cursor_pointer()
             .when(on, |v| v.bg(t.row_selected))
+            .when(!on, |v| {
+                v.hover(|s| s.bg(t.row_selected.opacity(0.55)))
+            })
             .tooltip(move |window, cx| {
                 gpui_kit::component::tooltip::Tooltip::new(full.clone()).build(window, cx)
             })
@@ -753,7 +1156,16 @@ impl MainWindow {
                             .w(px(18.))
                             .flex_shrink_0()
                             .justify_center()
-                            .child(Icon::default().path(format!("icons/{icon}.svg")).size_4()),
+                            .child(
+                                Icon::default()
+                                    .path(format!("icons/{icon}.svg"))
+                                    .size_4()
+                                    .text_color(if on {
+                                        t.accent
+                                    } else {
+                                        t.text_secondary
+                                    }),
+                            ),
                     )
                     .child(
                         div()
@@ -826,10 +1238,11 @@ impl MainWindow {
         v_flex()
             .w_full()
             .py_1()
+            .gap_1()
             .border_b_1()
             .border_color(t.border_soft)
             .child(self.sidebar_header("tree", "此电脑", false, cx))
-            .when(!collapsed, |v| v.child(v_flex().w_full().px_1().children(rows)))
+            .when(!collapsed, |v| v.child(v_flex().w_full().px_1().gap_1().children(rows)))
             .into_any_element()
     }
 
@@ -881,7 +1294,7 @@ impl MainWindow {
             })
             .collect::<Vec<_>>();
         v_flex()
-            .w(px(DIRECTORY_SIDEBAR_WIDTH))
+            .w(px(self.actual_sidebar_width))
             .h_full()
             .min_h_0()
             .flex_shrink_0()
@@ -1128,6 +1541,7 @@ impl MainWindow {
                     .flex_shrink_0()
                     .text_xs()
                     .text_color(tokens.text_secondary)
+                    .bg(tokens.surface)
                     .children(
                         crate::disktree::classify::Category::LEGEND
                             .into_iter().chain(std::iter::once(crate::disktree::classify::Category::Other))
@@ -1161,6 +1575,7 @@ impl MainWindow {
                             .min_w_0()
                             .min_h_0()
                             .overflow_hidden()
+                            .bg(tokens.surface)
                             .child(map),
                     )
                     .child(self.render_usage_details(selected, root, cx)),
@@ -1224,7 +1639,10 @@ impl MainWindow {
             .flex_shrink_0()
             .border_l_1()
             .border_color(tokens.border)
-            .bg(tokens.surface);
+            // Readout panel stays opaque even on glass: selected rows,
+            // scrollbar and cards inside are solid fills; a translucent base
+            // would leave them floating harshly over the backdrop.
+            .bg(Hsla { a: 1.0, ..tokens.surface });
         let watcher_detail=self.session.read(cx).engine_footer.last.as_ref().and_then(|s|s.watch_error.clone());
         let source_label=if self.workspace.inspector.pending.is_some(){"读取详情…"}else{crate::usage_presentation::source_label(self.workspace.engine_usage,watcher_detail.as_deref())};
         let mut head = v_flex()

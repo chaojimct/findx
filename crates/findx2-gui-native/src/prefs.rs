@@ -5,6 +5,13 @@ pub use crate::isolation::settings_path;
 use crate::settings_logic::{FindxGuiSettings, UiThemePref};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BrowserViewMode {
+    #[default]
+    List,
+    Icons,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalPrefs {
@@ -28,6 +35,10 @@ pub struct LocalPrefs {
     pub browser_show_hidden: bool,
     #[serde(default)]
     pub browser_column_schema: u8,
+    #[serde(default)]
+    pub browser_view_mode: BrowserViewMode,
+    #[serde(default)]
+    pub browser_recursive: bool,
     /// User-defined shortcut overrides: action id -> canonical keystroke.
     #[serde(default)]
     pub key_bindings: std::collections::BTreeMap<String, String>,
@@ -43,6 +54,10 @@ pub struct LocalPrefs {
     pub preview_open: bool,
     #[serde(default)]
     pub preview_width: Option<f32>,
+    #[serde(default)]
+    pub sidebar_width: Option<f32>,
+    #[serde(default)]
+    pub content_translucent: bool,
     #[serde(default)]
     pub column_widths: Option<[f32; 4]>,
     #[serde(default = "default_true")]
@@ -82,6 +97,8 @@ impl Default for LocalPrefs {
             browser_recent: Vec::new(),
             browser_show_hidden: false,
             browser_column_schema: 0,
+            browser_view_mode: BrowserViewMode::List,
+            browser_recursive: false,
             key_bindings: std::collections::BTreeMap::new(),
             theme: UiThemePref::Light,
             theme_style: crate::theme::ThemeStyle::default(),
@@ -89,6 +106,8 @@ impl Default for LocalPrefs {
             sidebar_open: true,
             preview_open: true,
             preview_width: None,
+            sidebar_width: None,
+            content_translucent: false,
             column_widths: None,
             search_fit_columns: true,
             browser_fit_columns: true,

@@ -134,20 +134,54 @@ fn root_hit(path: &Path) -> SearchHitDto {
 }
 
 #[derive(Clone)]
-struct PageContext {
+pub(super) struct PageContext {
     pub(in crate::ui) location: PathBuf,
     pub(in crate::ui) table: Entity<TableState<BrowserTable>>,
     pub(in crate::ui) rows: Vec<SearchHitDto>,
-    all_rows: Arc<Vec<SearchHitDto>>,
+    pub(super) all_rows: Arc<Vec<SearchHitDto>>,
     pub(in crate::ui) selected_rows: std::collections::BTreeSet<usize>,
     pub(in crate::ui) selected: Option<usize>,
     history: History,
     status: String,
     filter: String,
+    filter_recursive: bool,
     needs_load: bool,
     preview_force: Option<ForceState>,
 }
 
+/// Directory list ordering: folders always group first (Explorer-style),
+/// the key comparison follows the requested column and direction.
+pub(super) fn sort_directory_rows(rows: &mut [SearchHitDto], col: usize, descending: bool) {
+    rows.sort_by(|a, b| {
+        let group = b.is_directory.cmp(&a.is_directory);
+        if group != std::cmp::Ordering::Equal {
+            return group;
+        }
+        let key_ord = match col {
+            1 => a.size.cmp(&b.size),
+            2 => sort_type_key(a).cmp(&sort_type_key(b)),
+            3 => a.mtime.cmp(&b.mtime),
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        };
+        let key_ord = if descending {
+            key_ord.reverse()
+        } else {
+            key_ord
+        };
+        key_ord.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+}
+fn sort_type_key(hit: &SearchHitDto) -> String {
+    if hit.is_directory {
+        String::new()
+    } else {
+        std::path::Path::new(&hit.name)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    }
+}
 fn fit_columns(
     mut widths: [f32; 4],
     minimum: [f32; 4],
@@ -206,15 +240,19 @@ pub(super) struct Workspace {
     tree_generation: u64,
     tree_cancel: Arc<AtomicBool>,
     pub(super) mode: ViewMode,
-    tabs: Vec<PageContext>,
+    pub(super) tabs: Vec<PageContext>,
     active_tab: usize,
     usage_page: Option<PageContext>,
     search_preview: Option<ForceState>,
     filter_input: Entity<InputState>,
-    filter_text: String,
+    pub(super) filter_text: String,
+    pub(super) filter_recursive: bool,
+    /// Recursive enumeration cache for search-recursive filtering:
+    /// (location key, show_hidden, rows). Flat listing stays in all_rows.
+    recursive_rows: Option<(String, bool, Arc<Vec<SearchHitDto>>)>,
     filter_generation: u64,
     filter_cancel: Arc<AtomicBool>,
-    all_rows: Arc<Vec<SearchHitDto>>,
+    pub(super) all_rows: Arc<Vec<SearchHitDto>>,
     pub(super) editing_path: bool,
     path_edit: crate::navigation::AddressEdit,
     path_error: Option<String>,
@@ -240,17 +278,29 @@ pub(super) struct Workspace {
     pub(in crate::ui) rows: Vec<SearchHitDto>,
     pub(in crate::ui) selected_rows: std::collections::BTreeSet<usize>,
     pub(in crate::ui) selected: Option<usize>,
+    /// Directory presentation: details list vs icon tiles. Workspace-level
+    /// (not per tab); persisted in prefs.
+    pub(super) browser_view: crate::prefs::BrowserViewMode,
+    /// Sticky list sorting: (column, descending). None = natural order
+    /// (folders first, name ascending). Re-applied after every listing/filter.
+    pub(in crate::ui) sort_spec: Option<(usize, bool)>,
     pending_hit: Option<SearchHitDto>,
     reveal_focus: Option<String>,
     history: History,
     pub(in crate::ui) cache: HashMap<String, (Vec<SearchHitDto>, bool)>,
-    list_generation: u64,
+    pub(super) list_generation: u64,
     /// Bumped on every ViewMode change; drives the page-enter slide.
     /// (Same generation-counter pattern as `list_generation`.)
     pub(in crate::ui) page_epoch: u64,
     rows_epoch: Option<(u64, u64)>,
     list_cancel: Arc<AtomicBool>,
     pub(super) listing: bool,
+    /// Cancel token for the background indexed-size fill of the browser.
+    pub(super) size_fill_cancel: Arc<AtomicBool>,
+    /// Hover/selection prefetch: an LRU of warmed paths plus the single
+    /// in-flight prefetch cancel. Hover fires immediately.
+    pub(super) prefetch_done: std::collections::VecDeque<String>,
+    pub(super) prefetch_cancel: Arc<AtomicBool>,
     window: AnyWindowHandle,
     pub(super) usage_depth: usize,
     usage_depth_pending: bool,
@@ -261,7 +311,7 @@ pub(super) struct Workspace {
     usage_scene_loaded_depth: usize,
     usage_scene_more_depth: bool,
     usage_volume: crate::usage_volume::State,
-    usage_page_cache: Arc<std::sync::Mutex<crate::indexed_depth::PageCache>>,
+    pub(super) usage_page_cache: Arc<std::sync::Mutex<crate::indexed_depth::PageCache>>,
     inspector: crate::usage_inspector::State,
     inspector_pin: Option<(crate::usage_inspector::Source,crate::disk_usage::Node)>,
     side_buttons: [bool;2],
@@ -271,7 +321,7 @@ pub(super) struct Workspace {
     engine_cancel: Arc<AtomicBool>,
     engine_checked: bool,
     engine_next: Option<u32>,
-    engine_generation: Option<(u64, u64)>,
+    pub(super) engine_generation: Option<(u64, u64)>,
     engine_tick: u8,
     usage_memory_profile: usize,
     scan: Option<Arc<Scan>>,
@@ -341,7 +391,7 @@ impl Workspace {
                 .default_value(display_path(&location))
         });
         let filter_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("过滤当前目录（仅本层）"));
+            cx.new(|cx| InputState::new(window, cx).placeholder("过滤当前目录…"));
         let target =
             cx.new(|cx| InputState::new(window, cx).placeholder("完整目标路径 / 新文件名"));
         let owner = cx.weak_entity();
@@ -380,6 +430,8 @@ impl Workspace {
             search_preview: None,
             filter_input,
             filter_text: String::new(),
+            filter_recursive: false,
+            recursive_rows: None,
             filter_generation: 0,
             filter_cancel: Arc::new(AtomicBool::new(false)),
             all_rows: Arc::new(vec![]),
@@ -408,6 +460,8 @@ impl Workspace {
             rows: vec![],
             selected_rows: Default::default(),
             selected: None,
+            browser_view: crate::prefs::BrowserViewMode::List,
+            sort_spec: None,
             pending_hit: None,
             reveal_focus: None,
             history: History::default(),
@@ -416,6 +470,9 @@ impl Workspace {
         page_epoch: 0,
             rows_epoch: None,
             list_cancel: Arc::new(AtomicBool::new(false)),
+            size_fill_cancel: Arc::new(AtomicBool::new(false)),
+            prefetch_done: std::collections::VecDeque::new(),
+            prefetch_cancel: Arc::new(AtomicBool::new(false)),
             listing: false,
             window: window.window_handle(),
             usage_depth: 3,
@@ -516,6 +573,7 @@ impl Workspace {
             history: self.history.clone(),
             status: self.status.clone(),
             filter: self.filter_text.clone(),
+            filter_recursive: self.filter_recursive,
             needs_load,
             preview_force,
         }
@@ -753,6 +811,7 @@ impl MainWindow {
         self.workspace.history = state.history;
         self.workspace.status = state.status;
         self.workspace.filter_text = state.filter.clone();
+        self.workspace.filter_recursive = state.filter_recursive;
         self.workspace.listing = false;
         self.workspace.rows_epoch = (!state.needs_load).then_some((self.workspace.list_generation, self.workspace.filter_generation));
         self.preview_force = state.preview_force;
@@ -789,6 +848,10 @@ impl MainWindow {
                 false,
                 cx,
             );
+        } else {
+            // Cached tab: rows were stored before sizes arrived.
+            self.maybe_fill_index_sizes(cx);
+            self.prefetch_related(cx);
         }
         self.preview_active_selection(cx);
         cx.notify();
@@ -842,11 +905,17 @@ impl MainWindow {
         self.subscribe_workspace_table(table.clone(), cx);
         let mut state = self.workspace.snapshot(Some(ForceState::Hide), true);
         state.table = table;
+        // New tabs open at the user's home directory, not a copy of the
+        // current tab: snapshot() clones the current location/filter.
+        state.location = std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\"));
         state.rows.clear();
         state.all_rows = Arc::new(vec![]);
         state.selected_rows.clear();
         state.selected = None;
         state.filter.clear();
+        state.filter_recursive = self.session.read(cx).prefs.browser_recursive;
         state.history = History::default();
         self.workspace.tabs.push(state);
         self.select_directory_tab(self.workspace.tabs.len() - 1, cx);
@@ -986,6 +1055,12 @@ impl MainWindow {
             self.pause_preview();
             cx.notify();
             return;
+        }
+        // The focused directory (mouse or keyboard) warms the size cache.
+        if let Some(hit) = self.active_workspace_hit() {
+            if hit.is_directory {
+                self.queue_prefetch(PathBuf::from(&hit.path), cx);
+            }
         }
         if self.workspace.suspend_preview {
             return;
@@ -1145,7 +1220,41 @@ impl MainWindow {
             input.update(cx, |i, cx| i.set_value(text, w, cx))
         });
     }
-    fn set_workspace_rows(
+    /// Fill folder sizes from the covering usage scan (占用 data), measured
+    /// or indexed-logical alike. Indexed values render under the plain 大小
+    /// header; only measured scans flip the shared allocated flag (实际占用).
+    /// Locations without scan data keep the blank cell, and no new
+    /// measurement is triggered. Returns (filled, measured).
+    pub(super) fn fill_scan_sizes(&mut self, rows: &mut [SearchHitDto]) -> (bool, bool) {
+        let Some(ix) = self.scan_node() else {
+            return (false, false);
+        };
+        let Some(scan) = &self.workspace.scan else {
+            return (false, false);
+        };
+        let measured = scan.logical_generation.is_none();
+        let mut weights = std::collections::HashMap::new();
+        for &i in &scan.nodes[ix].children {
+            let n = &scan.nodes[i];
+            if n.directory {
+                weights.insert(key(&n.path), scan.weight(n));
+            }
+        }
+        if weights.is_empty() {
+            return (false, false);
+        }
+        let mut filled = false;
+        for h in rows.iter_mut() {
+            if h.is_directory && h.size == 0 {
+                if let Some(&w) = weights.get(&key(Path::new(&h.path))) {
+                    h.size = w;
+                    filled = true;
+                }
+            }
+        }
+        (filled, measured)
+    }
+    pub(super) fn set_workspace_rows(
         &mut self,
         rows: Vec<SearchHitDto>,
         focus: Option<String>,
@@ -1154,6 +1263,18 @@ impl MainWindow {
     ) {
         self.workspace.filter_cancel.store(true, Ordering::Release);
         self.workspace.filter_generation = self.workspace.filter_generation.wrapping_add(1);
+        let mut rows = rows;
+        // Directory listings borrow folder sizes from a covering measured
+        // scan; measured values flip the allocation column via the shared flag.
+        let allocated = if self.workspace.mode == ViewMode::Directory {
+            let (filled, measured) = self.fill_scan_sizes(&mut rows);
+            if let Some((col, descending)) = self.workspace.sort_spec {
+                sort_directory_rows(&mut rows, col, descending);
+            }
+            allocated || (filled && measured)
+        } else {
+            allocated
+        };
         self.workspace.all_rows = Arc::new(rows);
         if self.workspace.mode == ViewMode::Directory && !self.workspace.filter_text.is_empty() {
             self.schedule_directory_filter(focus, cx);
@@ -1173,16 +1294,88 @@ impl MainWindow {
             self.schedule_directory_filter(focus, cx);
         }
     }
-    fn schedule_directory_filter(&mut self, focus: Option<String>, cx: &mut Context<Self>) {
+    pub(super) fn schedule_directory_filter(&mut self, focus: Option<String>, cx: &mut Context<Self>) {
         self.workspace.filter_cancel.store(true, Ordering::Release);
         self.workspace.filter_cancel = Arc::new(AtomicBool::new(false));
         self.workspace.filter_generation = self.workspace.filter_generation.wrapping_add(1);
         let generation = self.workspace.filter_generation;
         let cancel = self.workspace.filter_cancel.clone();
-        let source = self.workspace.all_rows.clone();
-        let work = source.clone();
         let scope = key(&self.workspace.location);
         let query = self.workspace.filter_text.clone();
+        // Search-recursive: a non-empty query searches the whole subtree.
+        // The subtree is enumerated once per location and cached; an empty
+        // query always shows the flat single level.
+        if self.workspace.filter_recursive
+            && !query.is_empty()
+            && self.workspace.mode == ViewMode::Directory
+        {
+            let location = self.workspace.location.clone();
+            let hidden = self.workspace.show_hidden;
+            let cached = self
+                .workspace
+                .recursive_rows
+                .as_ref()
+                .filter(|(k, h, _)| *k == scope && *h == hidden)
+                .map(|(_, _, rows)| rows.clone());
+            if let Some(source) = cached {
+                Self::spawn_filter_rows(
+                    source, query, focus, scope, generation, cancel, cx,
+                );
+                return;
+            }
+            self.workspace.status = "正在递归搜索…".into();
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                if cancel.load(Ordering::Acquire) {
+                    return;
+                }
+                let list_cancel = cancel.clone();
+                let enumerated = cx
+                    .background_spawn(async move {
+                        browser::list_recursive(&location, &list_cancel, hidden, None)
+                            .ok()
+                            .map(|(_, rows, _)| Arc::new(rows))
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if cancel.load(Ordering::Acquire)
+                        || generation != this.workspace.filter_generation
+                        || this.workspace.mode != ViewMode::Directory
+                        || key(&this.workspace.location) != scope
+                    {
+                        return;
+                    }
+                    let Some(source) = enumerated else {
+                        return;
+                    };
+                    this.workspace.recursive_rows =
+                        Some((scope.clone(), hidden, source.clone()));
+                    Self::spawn_filter_rows(
+                        source, query, focus, scope, generation, cancel, cx,
+                    );
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+        let source = self.workspace.all_rows.clone();
+        Self::spawn_filter_rows(source, query, focus, scope, generation, cancel, cx);
+    }
+    /// Debounced background filter shared by the flat and recursive paths.
+    fn spawn_filter_rows(
+        source: Arc<Vec<SearchHitDto>>,
+        query: String,
+        focus: Option<String>,
+        scope: String,
+        generation: u64,
+        cancel: Arc<AtomicBool>,
+        cx: &mut Context<Self>,
+    ) {
+        let work = source.clone();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(80))
@@ -1203,7 +1396,12 @@ impl MainWindow {
                     this.workspace.filter_generation,
                     this.workspace.mode == ViewMode::Directory,
                     key(&this.workspace.location) == scope,
-                    Arc::ptr_eq(&source, &this.workspace.all_rows),
+                    Arc::ptr_eq(&source, &this.workspace.all_rows)
+                        || this
+                            .workspace
+                            .recursive_rows
+                            .as_ref()
+                            .is_some_and(|(_, _, rows)| Arc::ptr_eq(&source, rows)),
                 ) {
                     return;
                 }
@@ -1216,13 +1414,22 @@ impl MainWindow {
         })
         .detach();
     }
-    fn apply_workspace_rows(
+    pub(super) fn apply_workspace_rows(
         &mut self,
         rows: Vec<SearchHitDto>,
         focus: Option<String>,
         allocated: bool,
         cx: &mut Context<Self>,
     ) {
+        // Single choke point for every publish path (listing, filter,
+        // refill): sticky sort is enforced here so the header icon can
+        // never disagree with the row order.
+        let mut rows = rows;
+        if self.workspace.mode == ViewMode::Directory {
+            if let Some((col, descending)) = self.workspace.sort_spec {
+                sort_directory_rows(&mut rows, col, descending);
+            }
+        }
         self.workspace.rows_epoch = Some((self.workspace.list_generation, self.workspace.filter_generation));
         self.workspace.selected = focus.as_ref().and_then(|p| {
             rows.iter()
@@ -1380,6 +1587,8 @@ impl MainWindow {
         }
         self.workspace.list_cancel.store(true, Ordering::Release);
         self.workspace.list_cancel = Arc::new(AtomicBool::new(false));
+        self.workspace.size_fill_cancel.store(true, Ordering::Release);
+        self.workspace.size_fill_cancel = Arc::new(AtomicBool::new(false));
         self.workspace.list_generation = self.workspace.list_generation.wrapping_add(1);
         let generation = self.workspace.list_generation;
         let pending = source_hit.filter(|h| {
@@ -1487,6 +1696,8 @@ impl MainWindow {
             );
             self.remember_directory(cx);
             self.set_workspace_rows(rows, focus, false, cx);
+            self.maybe_fill_index_sizes(cx);
+            self.prefetch_related(cx);
             return;
         }
         self.workspace.listing = true;
@@ -1540,7 +1751,8 @@ impl MainWindow {
                             let missing = focus.as_ref().is_some_and(|focus| {
                                 !rows.iter().any(|row| key(Path::new(&row.path)) == key(Path::new(focus)))
                             });
-                            this.set_workspace_rows(rows, focus, false, cx);
+                            this.publish_listed_rows(rows, focus, cx);
+                            this.prefetch_related(cx);
                             if announce_locate && missing {
                                 this.transient_file_notice("无法定位：目标不在该目录中".into(), cx);
                             }
@@ -2753,6 +2965,10 @@ impl MainWindow {
                             let selected=this.workspace.usage_preview.borrow().selected;
                             let focus=selected.and_then(|i|this.workspace.scan.as_ref().and_then(|s|s.nodes.get(i))).map(|n|display_path(&n.path));
                             this.show_scanned_directory(focus, cx);
+                        } else if this.workspace.mode == ViewMode::Directory {
+                            // A measurement triggered from the file panel:
+                            // refill the visible rows in place, no navigation.
+                            this.refill_directory_sizes(cx);
                         }
                     }
                     Err(e) => this.workspace.scan_status = format!("扫描失败：{e}"),
@@ -2932,15 +3148,36 @@ impl MainWindow {
     ) -> impl IntoElement {
         let tokens = Self::tokens(cx);
         let brand_width = (window.viewport_size().width.as_f32() / 2. - 96.).max(64.);
-        let settings = Button::new("titlebar-settings")
-            .ghost()
-            .icon(IconName::Settings)
-            .accessibility_label("设置")
-            .tooltip("设置（Ctrl+,）")
-            .w(px(36.))
-            .h(px(32.))
-            .mr_2()
-            .on_click(cx.listener(|this, _, window, cx| this.open_settings_page(window, cx)));
+        let settings_open = self.settings_page.is_some();
+        let settings = div()
+            .relative()
+            .h_full()
+            .child(
+                Button::new("titlebar-settings")
+                    .ghost()
+                    .icon(IconName::Settings)
+                    .accessibility_label("设置")
+                    .tooltip("设置（Ctrl+,）")
+                    .w(px(36.))
+                    .h(px(32.))
+                    .mr_2()
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_settings_page(window, cx)),
+                    ),
+            )
+            // Same current-tab underline as the mode tabs, so the gear reads
+            // as "where you are" while the settings page is open.
+            .when(settings_open, |v| {
+                v.child(
+                    div()
+                        .absolute()
+                        .bottom(px(0.))
+                        .left(px(0.))
+                        .right(px(8.))
+                        .h(px(2.))
+                        .bg(tokens.accent),
+                )
+            });
         crate::ui::chrome::title_bar_with_tools(
             h_flex()
                 .h_full()
@@ -2971,13 +3208,29 @@ impl MainWindow {
                         div()
                             .h_full()
                             .relative()
-                            .border_b_2()
-                            .border_color(tokens.surface)
+                            .child(
+                                Button::new(SharedString::from(format!("mode-{label}")))
+                                    .ghost()
+                                    .rounded_none()
+                                    .w(px(64.))
+                                    .h_full()
+                                    .label(label)
+                                    .text_color(if active {
+                                        tokens.text_primary
+                                    } else {
+                                        tokens.text_secondary
+                                    })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.request_mode(mode, window, cx)
+                                    })),
+                            )
                             .child(
                                 // Animated active indicator: crossfades in/out on
                                 // mode switch (each button animates its own bar,
                                 // so no geometry measurement is needed and a
                                 // mid-transition re-switch restarts cleanly).
+                                // Painted after the button so hover fill never
+                                // covers the active underline.
                                 div()
                                     .absolute()
                                     .bottom(px(0.))
@@ -2996,22 +3249,6 @@ impl MainWindow {
                                             el.opacity(if active { delta } else { 1.0 - delta })
                                         },
                                     ),
-                            )
-                            .child(
-                                Button::new(SharedString::from(format!("mode-{label}")))
-                                    .ghost()
-                                    .rounded_none()
-                                    .w(px(64.))
-                                    .h_full()
-                                    .label(label)
-                                    .text_color(if active {
-                                        tokens.text_primary
-                                    } else {
-                                        tokens.text_secondary
-                                    })
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.request_mode(mode, window, cx)
-                                    })),
                             )
                     }),
                 ),
@@ -3161,7 +3398,7 @@ impl MainWindow {
             .accessibility_id("preview-width-handle")
             .role(gpui_kit::accesskit::Role::Splitter)
             .aria_label("调整预览宽度")
-            .w(px(6.))
+            .w(px(2.))
             .h_full()
             .flex_shrink_0()
             .cursor_col_resize()
@@ -3178,6 +3415,55 @@ impl MainWindow {
                     cx.stop_propagation();
                 }),
             )
+    }
+    pub(super) fn render_sidebar_separator(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let tokens = Self::tokens(cx);
+        let _ = window;
+        div()
+            .id("sidebar-width-handle")
+            .accessibility_id("sidebar-width-handle")
+            .role(gpui_kit::accesskit::Role::Splitter)
+            .aria_label("调整侧栏宽度")
+            .w(px(2.))
+            .h_full()
+            .flex_shrink_0()
+            .cursor_col_resize()
+            .bg(tokens.border_soft)
+            .hover(|s| s.bg(tokens.border_soft.opacity(0.75)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, w, cx| {
+                    this.sidebar_resize =
+                        Some((event.position.x.as_f32(), this.actual_sidebar_width));
+                    crate::ui::chrome::capture_pointer(w);
+                    w.prevent_default();
+                    cx.stop_propagation();
+                }),
+            )
+    }
+    pub(super) fn resize_sidebar_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if let Some((start, width)) = self.sidebar_resize {
+            let next = (width + event.position.x.as_f32() - start)
+                .clamp(120., 320.)
+                .min((self.last_content_width - 566.).max(120.));
+            self.session
+                .update(cx, |s, _| s.prefs.sidebar_width = Some(next));
+            cx.notify();
+        }
+    }
+    pub(super) fn finish_sidebar_resize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sidebar_resize.take().is_some() {
+            // Same rationale as the preview splitter: release with the live
+            // event window so a re-entered WindowHandle cannot leak capture.
+            crate::ui::chrome::release_pointer(window);
+            let prefs = self.session.read(cx).prefs.clone();
+            crate::session::persist_prefs(prefs, cx);
+            cx.notify();
+        }
     }
     pub(super) fn resize_preview_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         if let Some((start, width)) = self.preview_resize {
@@ -3236,7 +3522,13 @@ impl MainWindow {
                 })
                 .when(self.service_down(cx), |view| view.child(self.render_service_down(cx)))
                 .into_any_element(),
-            ViewMode::Directory => self.render_directory_table(window, cx),
+            ViewMode::Directory => {
+                if self.workspace.browser_view == crate::prefs::BrowserViewMode::Icons {
+                    self.render_directory_grid(window, cx)
+                } else {
+                    self.render_directory_table(window, cx)
+                }
+            }
             ViewMode::Usage => self.render_workspace_usage(cx).into_any_element(),
         }
     }
@@ -3434,9 +3726,15 @@ impl MainWindow {
     fn remember_directory(&mut self, cx: &mut Context<Self>) {
         let path = display_path(&self.workspace.location);
         self.session.update(cx, |s, cx| {
-            s.prefs
+            // Already listed: leave order alone so the row under the cursor
+            // never jumps on click. Only genuinely new directories go first.
+            if s.prefs
                 .browser_recent
-                .retain(|p| key(Path::new(p)) != key(Path::new(&path)));
+                .iter()
+                .any(|p| key(Path::new(p)) == key(Path::new(&path)))
+            {
+                return;
+            }
             s.prefs.browser_recent.insert(0, path);
             s.prefs.browser_recent.truncate(12);
             crate::session::persist_prefs(s.prefs.clone(), cx);

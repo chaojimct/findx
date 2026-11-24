@@ -300,9 +300,11 @@ pub fn apply_findx_style(style: ThemeStyle, appearance: EffectiveTheme, cx: &mut
         c.title_bar_border = t.border;
         c.status_bar = t.surface;
         c.status_bar_border = t.border;
-        c.scrollbar = t.bg;
-        c.scrollbar_thumb = t.border;
-        c.scrollbar_thumb_hover = t.text_tertiary;
+        // No track rail: only the highlight thumb floats over content.
+        c.scrollbar = hsla(0., 0., 0., 0.);
+        // Thumb rides the highlight (accent) style by default, not gray.
+        c.scrollbar_thumb = t.accent;
+        c.scrollbar_thumb_hover = t.accent_hover;
         c.link = t.accent;
         c.link_hover = t.accent_hover;
         c.link_active = t.accent;
@@ -344,6 +346,59 @@ pub fn apply_material_translucency(
         c.title_bar = set(c.title_bar, alpha);
         c.sidebar = set(c.sidebar, alpha);
         c.status_bar = set(c.status_bar, alpha);
+    });
+    // No track rail in any mode: only the highlight thumb floats over
+    // content. Rebuilt from the current mode/motion every time so nothing
+    // compounds across opacity drags.
+    let track = hsla(0., 0., 0., 0.);
+    cx.update_global::<gpui_kit::base::Theme, _>(|t, _| {
+        let cur = t.scrollbar.clone();
+        t.scrollbar = gpui_kit::base::ScrollbarTheme::new()
+            .with_mode(cur.mode())
+            .with_motion(cur.motion())
+            .with_styles(
+                cur.styles().clone()
+                    .track(|s| s.bg(track))
+                    .track_hover(|s| s.bg(track))
+                    .track_active(|s| s.bg(track)),
+            );
+    });
+}
+
+/// Optional full-glass content: list/table bodies and every token-driven
+/// content background follow the material opacity. Chrome fields belong to
+/// [`apply_material_translucency`] (untouched here so alpha never compounds);
+/// text, borders, hover and selection stay opaque for readability.
+/// Only meaningful on a translucent backdrop; solid keeps everything opaque.
+pub fn apply_content_translucency(
+    on: bool,
+    material: crate::window_material::WindowMaterial,
+    opacity: f32,
+    cx: &mut App,
+) {
+    if !(on && cfg!(windows) && material.translucent_chrome()) {
+        return;
+    }
+    let alpha = crate::window_material::clamp_opacity(opacity);
+    fn set(color: Hsla, alpha: f32) -> Hsla {
+        Hsla {
+            a: (color.a * alpha).clamp(0.0, 1.0),
+            ..color
+        }
+    }
+    cx.update_global::<FindxTokens, _>(|t, _| {
+        t.bg = set(t.bg, alpha);
+        t.surface_raised = set(t.surface_raised, alpha);
+        t.search_box_bg = set(t.search_box_bg, alpha);
+    });
+    Theme::update(cx, |theme| {
+        let c = &mut theme.colors;
+        c.list = set(c.list, alpha);
+        c.list_even = set(c.list_even, alpha);
+        c.table = set(c.table, alpha);
+        c.table_even = set(c.table_even, alpha);
+        c.table_head = set(c.table_head, alpha);
+        c.table_foot = set(c.table_foot, alpha);
     });
 }
 

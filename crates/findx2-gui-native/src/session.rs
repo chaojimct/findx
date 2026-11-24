@@ -100,6 +100,12 @@ impl AppSession {
             self.prefs.material_opacity,
             cx,
         );
+        theme::apply_content_translucency(
+            self.prefs.content_translucent,
+            self.prefs.window_material,
+            self.prefs.material_opacity,
+            cx,
+        );
     }
 
     pub fn set_theme_pref(&mut self, pref: UiThemePref, cx: &mut App) {

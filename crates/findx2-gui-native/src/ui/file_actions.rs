@@ -1,6 +1,6 @@
 //! One action model for search rows, directory rows and allocation nodes.
 use super::*;
-use super::workspace::key;
+use super::workspace::{display_path, key};
 use crate::{
     browser::FileAction,
     file_transfer::{self, Clipboard, Source},
@@ -81,6 +81,9 @@ pub(super) struct FileActions {
     identity_baselines:
         std::collections::HashMap<(String, u64, u64), crate::file_identity::FileStamp>,
     pending_clipboard: Option<bool>,
+    /// Drag-and-drop target waiting for the async identity snapshot: when
+    /// the clipboard lands, the paste dialog opens against this directory.
+    pending_drop_target: Option<PathBuf>,
 }
 impl MainWindow {
     pub(crate) fn file_menu_is_open(&self) -> bool {
@@ -174,7 +177,12 @@ impl MainWindow {
         } else {
             &mut self.workspace.selected_rows
         };
-        update_selection(set, row, anchor, modifiers.control, modifiers.shift);
+        // Plain mousedown on an already-selected row keeps the multi-selection
+        // so a drag can start with it; a click that never moves collapses on
+        // mouseup (collapse_press_selection).
+        if modifiers.control || modifiers.shift || !set.contains(&row) {
+            update_selection(set, row, anchor, modifiers.control, modifiers.shift);
+        }
         let focus = if set.contains(&row) {
             Some(row)
         } else {
@@ -223,6 +231,473 @@ impl MainWindow {
         };
         set.clear();
         set.extend(index);
+    }
+    /// Plain mousedown on an already-selected row keeps the multi-selection so a
+    /// drag can start; a click that never moves collapses here on mouseup.
+    pub(crate) fn collapse_press_selection(
+        &mut self,
+        search: bool,
+        row: usize,
+        modifiers: Modifiers,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((psearch, prow, ppos)) = self.press_row.take() else {
+            return;
+        };
+        if psearch != search || prow != row {
+            return;
+        }
+        if modifiers.control || modifiers.shift {
+            return;
+        }
+        let moved = (position.x.as_f32() - ppos.x.as_f32()).abs()
+            + (position.y.as_f32() - ppos.y.as_f32()).abs();
+        if moved > 8. {
+            return;
+        }
+        let set = if search {
+            &mut self.search_selection
+        } else {
+            &mut self.workspace.selected_rows
+        };
+        if set.len() > 1 && set.contains(&row) {
+            set.clear();
+            set.insert(row);
+            if search {
+                self.selected = Some(row);
+            } else {
+                self.workspace.selected = Some(row);
+            }
+            self.file_actions.anchor = Some((self.selection_table_key(search), row));
+            self.preview_active_selection(cx);
+            cx.notify();
+        }
+    }
+    /// Header-click sorting for the directory list. Cycles Default (natural
+    /// order) → Descending → Ascending per the table widget; selection
+    /// follows file identity, not row position.
+    /// Shared indexed-children fetch behind fill and prefetch: one bounded
+    /// page per directory, cancellable, result warms the shared cache.
+    async fn fetch_indexed_children(
+        path: PathBuf,
+        stamp: Option<(u64, u64)>,
+        cache: Arc<std::sync::Mutex<crate::indexed_depth::PageCache>>,
+        cancel: Arc<AtomicBool>,
+        ipc: crate::ipc::IpcClient,
+        endpoint: String,
+    ) -> Result<crate::indexed_siblings::Listing, String> {
+        let path_str = workspace::display_path(&path);
+        crate::indexed_siblings::load(
+            path,
+            stamp,
+            cache,
+            cancel.clone(),
+            |after, expected| {
+                let ipc = ipc.clone();
+                let endpoint = endpoint.clone();
+                let cancel = cancel.clone();
+                let path = path_str.clone();
+                async move {
+                    match ipc
+                        .request_cancellable(
+                            endpoint,
+                            findx2_ipc::IpcRequest::UsageChildren {
+                                path,
+                                expected,
+                                after,
+                                max_bytes: 48 * 1024,
+                            },
+                            cancel,
+                        )
+                        .await
+                        .map_err(|_| "读取已取消".to_string())??
+                    {
+                        findx2_ipc::IpcResponse::UsageChildrenResult { page } => Ok(page),
+                        findx2_ipc::IpcResponse::Error { message } => Err(message),
+                        _ => Err("索引响应不兼容".to_string()),
+                    }
+                }
+            },
+        )
+        .await
+    }
+    /// Indexed sizes for the browser, filled by default: after a listing,
+    /// directories without a size get their logical weight from the engine
+    /// index (bounded page, background, cancellable). Measured scans still
+    /// win through the shared fill path; unindexed locations keep the blank
+    /// cell and no local measurement is triggered.
+    /// Publish a fresh listing. When sorted by size with unknown folder
+    /// sizes, the first paint waits for the index (bounded): entering a
+    /// size-sorted directory then never flashes blank cells. Every other
+    /// case publishes immediately and backfills as usual.
+    pub(super) fn publish_listed_rows(
+        &mut self,
+        rows: Vec<SearchHitDto>,
+        focus: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let need_hold = matches!(self.workspace.sort_spec, Some((1, _)))
+            && self.workspace.mode == ViewMode::Directory
+            && rows.iter().any(|h| h.is_directory && h.size == 0);
+        if !need_hold {
+            self.set_workspace_rows(rows, focus, false, cx);
+            self.maybe_fill_index_sizes(cx);
+            return;
+        }
+        let location = self.workspace.location.clone();
+        let scope = key(&location);
+        let generation = self.workspace.list_generation;
+        let published = Arc::new(AtomicBool::new(false));
+        // Slow path: bounded wait, first finisher publishes.
+        {
+            let published = published.clone();
+            let scope = scope.clone();
+            let published = published.clone();
+            let rows = rows.clone();
+            let focus = focus.clone();
+            let scope = scope.clone();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(1200))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if published.swap(true, Ordering::AcqRel) {
+                        return;
+                    }
+                    if this.workspace.list_generation != generation
+                        || key(&this.workspace.location) != scope
+                        || this.workspace.mode != ViewMode::Directory
+                    {
+                        return;
+                    }
+                    this.set_workspace_rows(rows, focus, false, cx);
+                    this.maybe_fill_index_sizes(cx);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        // Fast path: indexed fill, then publish filled.
+        let cache = self.workspace.usage_page_cache.clone();
+        let stamp = self.workspace.engine_generation;
+        let cancel = self.workspace.size_fill_cancel.clone();
+        let session = self.session.read(cx);
+        let ipc = session.ipc.clone();
+        let endpoint = session.endpoint.clone();
+        drop(session);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(Self::fetch_indexed_children(
+                    location,
+                    stamp,
+                    cache,
+                    cancel,
+                    ipc,
+                    endpoint,
+                ))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if published.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                if this.workspace.list_generation != generation
+                    || key(&this.workspace.location) != scope
+                    || this.workspace.mode != ViewMode::Directory
+                {
+                    return;
+                }
+                let mut rows = rows;
+                if let Ok(listing) = result {
+                    let mut weights = std::collections::HashMap::new();
+                    for e in &listing.items.entries {
+                        if e.directory {
+                            if let Some(b) = e.bytes {
+                                weights.insert(key(&e.path), b);
+                            }
+                        }
+                    }
+                    for h in rows.iter_mut() {
+                        if h.is_directory && h.size == 0 {
+                            if let Some(&w) = weights.get(&key(std::path::Path::new(&h.path))) {
+                                h.size = w;
+                            }
+                        }
+                    }
+                }
+                this.set_workspace_rows(rows, focus, false, cx);
+                this.maybe_fill_index_sizes(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+    pub(super) fn maybe_fill_index_sizes(&mut self, cx: &mut Context<Self>) {
+        if self.workspace.mode != ViewMode::Directory {
+            return;
+        }
+        if !self
+            .workspace
+            .rows
+            .iter()
+            .any(|h| h.is_directory && h.size == 0)
+        {
+            return;
+        }
+        // No gate on engine_generation: None means "accept whatever epoch the
+        // service is on". If the index service is down the request just fails
+        // and the cells stay blank.
+        let stamp = self.workspace.engine_generation;
+        self.workspace.size_fill_cancel.store(true, Ordering::Release);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.workspace.size_fill_cancel = cancel.clone();
+        let location = self.workspace.location.clone();
+        let scope = key(&location);
+        let generation = self.workspace.list_generation;
+        let cache = self.workspace.usage_page_cache.clone();
+        let session = self.session.read(cx);
+        let ipc = session.ipc.clone();
+        let endpoint = session.endpoint.clone();
+        drop(session);
+        let cancelled = cancel.clone();
+        cx.spawn(async move |this, cx| {
+            let fetch_ipc = ipc.clone();
+            let fetch_endpoint = endpoint.clone();
+            let result = cx
+                .background_spawn(Self::fetch_indexed_children(
+                    location,
+                    stamp,
+                    cache,
+                    cancel.clone(),
+                    fetch_ipc,
+                    fetch_endpoint,
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                if this.workspace.list_generation != generation
+                    || this.workspace.mode != ViewMode::Directory
+                    || key(&this.workspace.location) != scope
+                {
+                    return;
+                }
+                let Ok(listing) = result else {
+                    // A superseded fill (cancelled by a newer one) stays
+                    // silent; a real outage is surfaced so blank cells
+                    // aren't a mystery. The next navigation retries.
+                    if cancelled.load(Ordering::Acquire) {
+                        return;
+                    }
+                    this.workspace.status = format!(
+                        "{} 项（索引未连接，文件夹大小缺失）",
+                        this.workspace.rows.len()
+                    );
+                    cx.notify();
+                    return;
+                };
+                let mut weights = std::collections::HashMap::new();
+                for e in &listing.items.entries {
+                    if e.directory {
+                        if let Some(b) = e.bytes {
+                            weights.insert(key(&e.path), b);
+                        }
+                    }
+                }
+                if weights.is_empty() {
+                    return;
+                }
+                let mut touched = false;
+                for h in this.workspace.rows.iter_mut() {
+                    if h.is_directory && h.size == 0 {
+                        if let Some(&w) = weights.get(&key(Path::new(&h.path))) {
+                            h.size = w;
+                            touched = true;
+                        }
+                    }
+                }
+                if touched {
+                    // Clone-on-write: filter tasks may still hold the old Arc.
+                    for h in Arc::make_mut(&mut this.workspace.all_rows).iter_mut() {
+                        if h.is_directory && h.size == 0 {
+                            if let Some(&w) = weights.get(&key(Path::new(&h.path))) {
+                                h.size = w;
+                            }
+                        }
+                    }
+                }
+                // Clone-on-write: filter tasks may still hold the old Arc.
+                if touched {
+                    // Sizes landed after the publish-time sort, so re-apply
+                    // it and remap the selection by identity.
+                    let sel_paths: Vec<String> = this
+                        .workspace
+                        .selected_rows
+                        .iter()
+                        .filter_map(|&i| this.workspace.rows.get(i))
+                        .map(|h| h.path.clone())
+                        .collect();
+                    let focus_path = this
+                        .workspace
+                        .selected
+                        .and_then(|i| this.workspace.rows.get(i))
+                        .map(|h| h.path.clone());
+                    if let Some((col, descending)) = this.workspace.sort_spec {
+                        super::workspace::sort_directory_rows(
+                            &mut this.workspace.rows,
+                            col,
+                            descending,
+                        );
+                    }
+                    this.workspace.selected_rows = sel_paths
+                        .iter()
+                        .filter_map(|p| {
+                            this.workspace
+                                .rows
+                                .iter()
+                                .position(|h| key(Path::new(&h.path)) == key(Path::new(p)))
+                        })
+                        .collect();
+                    this.workspace.selected = focus_path.as_ref().and_then(|p| {
+                        this.workspace
+                            .rows
+                            .iter()
+                            .position(|h| key(Path::new(&h.path)) == key(Path::new(p)))
+                    });
+                    let rows = this.workspace.rows.clone();
+                    let selected = this.workspace.selected;
+                    this.workspace.table.update(cx, |t, cx| {
+                        t.delegate_mut().hits = rows;
+                        t.refresh(cx);
+                        if let Some(ix) = selected {
+                            t.set_selected_row(ix, cx);
+                        } else {
+                            t.clear_selection(cx);
+                        }
+                    });
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// After a listing lands, warm the parent directory: the likeliest next
+    /// step (up/back) then fills instantly from cache.
+    pub(super) fn prefetch_related(&mut self, cx: &mut Context<Self>) {
+        if self.workspace.mode != ViewMode::Directory {
+            return;
+        }
+        if let Some(parent) = self.workspace.location.parent() {
+            let parent = parent.to_path_buf();
+            if !parent.as_os_str().is_empty() {
+                self.queue_prefetch(parent, cx);
+            }
+        }
+    }
+    /// Re-fill folder sizes for the visible rows after a scan lands while
+    /// browsing. Filtered views re-filter from the filled source.
+    pub(super) fn refill_directory_sizes(&mut self, cx: &mut Context<Self>) {
+        if self.workspace.mode != ViewMode::Directory {
+            return;
+        }
+        let mut all = self.workspace.all_rows.as_ref().clone();
+        let (filled, measured) = self.fill_scan_sizes(&mut all);
+        if !filled {
+            self.workspace.status = "当前目录暂无可用占用数据".into();
+            cx.notify();
+            return;
+        }
+        self.workspace.all_rows = Arc::new(all);
+        if self.workspace.filter_text.is_empty() {
+            let rows = self.workspace.all_rows.as_ref().clone();
+            let focus = self.active_workspace_hit().map(|h| h.path);
+            let allocated = measured
+                || self
+                    .workspace
+                    .table
+                    .read(cx)
+                    .delegate()
+                    .allocated;
+            self.apply_workspace_rows(rows, focus, allocated, cx);
+            self.workspace.status = format!(
+                "{} 项，文件夹大小已更新（{}）",
+                self.workspace.rows.len(),
+                if measured { "实测" } else { "索引" }
+            );
+        } else {
+            let focus = self.active_workspace_hit().map(|h| h.path);
+            self.schedule_directory_filter(focus, cx);
+        }
+        cx.notify();
+    }
+    pub(crate) fn apply_directory_sort(
+        &mut self,
+        col: usize,
+        sort: gpui_kit::component::table::ColumnSort,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.mode != ViewMode::Directory {
+            return;
+        }
+        let spec = match sort {
+            gpui_kit::component::table::ColumnSort::Ascending => Some((col, false)),
+            gpui_kit::component::table::ColumnSort::Descending => Some((col, true)),
+            gpui_kit::component::table::ColumnSort::Default => None,
+        };
+        let paths: Vec<String> = self
+            .workspace
+            .selected_rows
+            .iter()
+            .filter_map(|&i| self.workspace.rows.get(i))
+            .map(|h| h.path.clone())
+            .collect();
+        let focus_path = self
+            .workspace
+            .selected
+            .and_then(|i| self.workspace.rows.get(i))
+            .map(|h| h.path.clone());
+        self.workspace.sort_spec = spec;
+        match spec {
+            Some((c, d)) => super::workspace::sort_directory_rows(&mut self.workspace.rows, c, d),
+            None => super::workspace::sort_directory_rows(&mut self.workspace.rows, 0, false),
+        }
+        self.workspace.selected_rows = paths
+            .iter()
+            .filter_map(|p| {
+                self.workspace
+                    .rows
+                    .iter()
+                    .position(|h| key(Path::new(&h.path)) == key(Path::new(p)))
+            })
+            .collect();
+        self.workspace.selected = focus_path.as_ref().and_then(|p| {
+            self.workspace
+                .rows
+                .iter()
+                .position(|h| key(Path::new(&h.path)) == key(Path::new(p)))
+        });
+        // The table entity is mid-dispatch (it invoked this sort), so the
+        // delegate refresh must run after it releases its borrow.
+        let rows = self.workspace.rows.clone();
+        let selected = self.workspace.selected;
+        let table = self.workspace.table.clone();
+        cx.defer(move |cx| {
+            table.update(cx, |t, cx| {
+                t.delegate_mut().hits = rows;
+                t.refresh(cx);
+                if let Some(ix) = selected {
+                    t.set_selected_row(ix, cx);
+                } else {
+                    t.clear_selection(cx);
+                }
+            })
+        });
+        cx.notify();
+    }
+    /// Current sticky sort for header icons (single source of truth lives
+    /// in the workspace; the delegate never caches it).
+    pub(in crate::ui) fn directory_sort_spec(&self) -> Option<(usize, bool)> {
+        self.workspace.sort_spec
     }
     pub(crate) fn table_selected_event(
         &mut self,
@@ -757,9 +1232,15 @@ impl MainWindow {
         self.file_actions.snapshot_error = None;
         self.file_actions.snapshot_pending = false;
         self.file_actions.pending_clipboard = None;
+        self.file_actions.pending_drop_target = None;
     }
     pub(super) fn refresh_selection_snapshot(&mut self, cx: &mut Context<Self>) {
         let hits = self.selected_file_hits();
+        self.refresh_snapshot_for(hits, cx);
+    }
+    /// Snapshot identity for an explicit hit list (drag-and-drop builds its
+    /// own list instead of going through the selection).
+    fn refresh_snapshot_for(&mut self, hits: Vec<SearchHitDto>, cx: &mut Context<Self>) {
         let keys = hits
             .iter()
             .map(|h| workspace::preview_stamp(&h.path, h.size, h.mtime))
@@ -846,13 +1327,211 @@ impl MainWindow {
         })
         .detach();
     }
+    /// Drag payload rule shared by table rows and grid cells: a selected
+    /// row drags the whole selection, otherwise just itself.
+    pub(crate) fn drag_hits_for_row(
+        &self,
+        row: usize,
+        hits: &[SearchHitDto],
+    ) -> Vec<SearchHitDto> {
+        if self.workspace.selected_rows.contains(&row) {
+            self.workspace
+                .selected_rows
+                .iter()
+                .filter_map(|&i| hits.get(i))
+                .cloned()
+                .collect()
+        } else {
+            hits.get(row).into_iter().cloned().collect()
+        }
+    }
+    /// Drag-and-drop entry: snapshot the dragged hits, then open the same
+    /// paste-confirm dialog against `target`. Internal drags move (`cut`),
+    /// OS drops copy. Dropping onto one of the dragged paths is a no-op.
+    /// Predictive size warmup: hovering a directory (rows, grid cells,
+    /// crumbs, back/up targets) or landing the selection on one warms the
+    /// shared index cache, so entering it later fills sizes from cache.
+    /// Dwell-debounced, single-flight, bounded LRU; silent on any failure.
+    pub(crate) fn note_directory_hover(
+        &mut self,
+        path: PathBuf,
+        hovering: bool,
+        cx: &mut Context<Self>
+    ) {
+        if hovering {
+            self.queue_prefetch(path, cx);
+        }
+    }
+    pub(crate) fn queue_prefetch(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !path.is_absolute() {
+            return;
+        }
+        let k = key(&path);
+        if self.workspace.prefetch_done.iter().any(|p| *p == k) {
+            return;
+        }
+        self.workspace.prefetch_cancel.store(true, Ordering::Release);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.workspace.prefetch_cancel = cancel.clone();
+
+        cx.notify();
+        let cache = self.workspace.usage_page_cache.clone();
+        let stamp = self.workspace.engine_generation;
+        let session = self.session.read(cx);
+        let ipc = session.ipc.clone();
+        let endpoint = session.endpoint.clone();
+        drop(session);
+        cx.spawn(async move |this, cx| {
+            let first = cx
+                .background_spawn(Self::fetch_indexed_children(
+                    path.clone(),
+                    stamp,
+                    cache.clone(),
+                    cancel.clone(),
+                    ipc.clone(),
+                    endpoint.clone(),
+                ))
+                .await;
+            if first.is_ok() {
+                let _ = this.update(cx, |this, _| {
+                    if !this.workspace.prefetch_done.iter().any(|p| *p == k) {
+                        this.workspace.prefetch_done.push_back(k.clone());
+                        while this.workspace.prefetch_done.len() > 256 {
+                            this.workspace.prefetch_done.pop_front();
+                        }
+                    }
+                });
+                // Second layer: warm grandchildren too, so diving two
+                // levels stays instant. Bounded, shares the cancel token.
+                let subs: Vec<PathBuf> = first
+                    .as_ref()
+                    .map(|listing| {
+                        listing
+                            .items
+                            .entries
+                            .iter()
+                            .filter(|e| e.directory)
+                            .take(15)
+                            .map(|e| e.path.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for sub in subs {
+                    if cancel.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let ks = key(&sub);
+                    let fresh = this
+                        .update(cx, |this, _| {
+                            !this.workspace.prefetch_done.iter().any(|p| *p == ks)
+                        })
+                        .unwrap_or(false);
+                    if !fresh {
+                        continue;
+                    }
+                    let got = cx
+                        .background_spawn(Self::fetch_indexed_children(
+                            sub,
+                            stamp,
+                            cache.clone(),
+                            cancel.clone(),
+                            ipc.clone(),
+                            endpoint.clone(),
+                        ))
+                        .await;
+                    if got.is_ok() {
+                        let _ = this.update(cx, |this, _| {
+                            this.workspace.prefetch_done.push_back(ks);
+                            while this.workspace.prefetch_done.len() > 256 {
+                                this.workspace.prefetch_done.pop_front();
+                            }
+                        });
+                    }
+                }
+            }
+
+        })
+        .detach();
+    }
+    pub(crate) fn drop_files_on_directory(
+        &mut self,
+        hits: Vec<SearchHitDto>,
+        cut: bool,
+        target: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if hits.is_empty() || self.file_actions.busy {
+            return;
+        }
+        let target_key = key(&target);
+        if hits
+            .iter()
+            .any(|h| key(Path::new(&h.path)) == target_key)
+        {
+            self.transient_file_notice("不能放到所选项自身".into(), cx);
+            return;
+        }
+        self.file_actions.clipboard_generation =
+            self.file_actions.clipboard_generation.wrapping_add(1);
+        self.file_actions.clipboard = Clipboard::default();
+        self.file_actions.pending_drop_target = Some(target);
+        self.refresh_selection_snapshot_for_drop(hits, cut, cx);
+    }
+    fn refresh_selection_snapshot_for_drop(
+        &mut self,
+        hits: Vec<SearchHitDto>,
+        cut: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_snapshot_for(hits, cx);
+        if self.file_actions.snapshot_pending {
+            self.file_actions.pending_clipboard = Some(cut);
+            self.file_actions.summary = "正在核对所选文件身份；尚未记录文件剪贴板".into();
+        } else {
+            self.finish_file_clipboard(cut, cx);
+        }
+        cx.notify();
+    }
+    /// Build drop DTOs for OS-dragged paths. Size/mtime/is_dir come from a
+    /// fresh stat so the identity check passes; the snapshot revalidates.
+    pub(crate) fn external_hits(&self, paths: &[PathBuf]) -> Vec<SearchHitDto> {
+        paths
+            .iter()
+            .map(|p| {
+                let meta = std::fs::metadata(p).ok();
+                let is_directory = meta.as_ref().is_some_and(|m| m.is_dir());
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.to_string_lossy().into_owned());
+                SearchHitDto {
+                    entry_idx: 0,
+                    name,
+                    path: p.to_string_lossy().into_owned(),
+                    size: if is_directory {
+                        0
+                    } else {
+                        meta.as_ref().map(|m| m.len()).unwrap_or(0)
+                    },
+                    mtime: meta
+                        .as_ref()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    is_directory,
+                    name_highlight: Vec::new(),
+                    snippet: String::new(),
+                }
+            })
+            .collect()
+    }
     fn capture_file_clipboard(
         &mut self,
         _hits: Vec<SearchHitDto>,
         cut: bool,
         cx: &mut Context<Self>,
-    ) {
-        self.file_actions.clipboard_generation =
+    ) {        self.file_actions.clipboard_generation =
             self.file_actions.clipboard_generation.wrapping_add(1);
         // A failed new copy must not leave an older unrelated file list ready to paste.
         self.file_actions.clipboard = Clipboard::default();
@@ -867,12 +1546,14 @@ impl MainWindow {
     }
     fn finish_file_clipboard(&mut self, cut: bool, cx: &mut Context<Self>) {
         if let Some(error) = self.file_actions.snapshot_error.clone() {
+            self.file_actions.pending_drop_target = None;
             self.file_actions.summary = error;
             cx.notify();
             return;
         }
         let sources = self.file_actions.snapshot_sources.clone();
         if sources.is_empty() {
+            self.file_actions.pending_drop_target = None;
             self.file_actions.summary = "没有可复制的有效文件；请重新选择".into();
             cx.notify();
             return;
@@ -895,12 +1576,30 @@ impl MainWindow {
                     Ok(sources) => {
                         let count = sources.len();
                         this.file_actions.clipboard = Clipboard { sources, cut };
+                        // Mirror the paths to the OS clipboard so Explorer can
+                        // paste them; internal flow is unchanged. Best effort.
+                        let paths = this
+                            .file_actions
+                            .clipboard
+                            .sources
+                            .iter()
+                            .map(|s| s.path.clone())
+                            .collect::<Vec<_>>();
+                        crate::drop_clipboard::write_hdrop(&paths);
                         this.file_actions.summary = format!(
                             "应用内{} {count} 项，到目标目录粘贴；尚未修改源文件",
                             if cut { "剪切" } else { "复制" }
                         );
+                        if let Some(target) =
+                            this.file_actions.pending_drop_target.take()
+                        {
+                            this.file_actions.confirm_target = Some(target);
+                        }
                     }
-                    Err(error) => this.file_actions.summary = error,
+                    Err(error) => {
+                        this.file_actions.pending_drop_target = None;
+                        this.file_actions.summary = error;
+                    }
                 }
                 cx.notify();
             })

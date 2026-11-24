@@ -1,7 +1,16 @@
 //! All file and directory glyphs use the same bundled Lucide SVG library as controls.
 use crate::theme::FindxTokens;
+use gpui_kit::component::Sizable as _;
 use gpui_kit::{component::Icon, *};
 pub(super) fn file_icon(name: &str, directory: bool, t: FindxTokens) -> AnyElement {
+    file_icon_sized(name, directory, t, 16.)
+}
+pub(super) fn file_icon_sized(
+    name: &str,
+    directory: bool,
+    t: FindxTokens,
+    icon_px: f32,
+) -> AnyElement {
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     let (asset, color) = if directory {
         ("folder", t.warning)
@@ -18,7 +27,7 @@ pub(super) fn file_icon(name: &str, directory: bool, t: FindxTokens) -> AnyEleme
     };
     Icon::default()
         .path(format!("icons/{asset}.svg"))
-        .size_4()
+        .with_size(px(icon_px))
         .text_color(color)
         .into_any_element()
 }

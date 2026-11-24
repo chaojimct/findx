@@ -124,6 +124,7 @@ pub enum PanelKind {
 pub fn resolve_panels(
     content_width: f32,
     preview_width: f32,
+    sidebar_width: f32,
     saved_sidebar: bool,
     saved_preview: bool,
     sidebar_force: Option<ForceState>,
@@ -143,7 +144,7 @@ pub fn resolve_panels(
     );
     let results = |side: bool, prev: bool| {
         content_width
-            - if side { SIDEBAR_WIDTH_PX } else { 0.0 }
+            - if side { sidebar_width } else { 0.0 }
             - if prev { preview_width + 4.0 } else { 0.0 }
     };
     if results(sidebar, preview) < NAME_READABLE_PX
@@ -164,6 +165,7 @@ pub fn resolve_panels(
 pub fn explain_panels(
     content_width: f32,
     preview_width: f32,
+    sidebar_width: f32,
     saved_sidebar: bool,
     saved_preview: bool,
     sidebar_force: Option<ForceState>,
@@ -172,6 +174,7 @@ pub fn explain_panels(
     let (sidebar, preview) = resolve_panels(
         content_width,
         preview_width,
+        sidebar_width,
         saved_sidebar,
         saved_preview,
         sidebar_force,
@@ -706,13 +709,14 @@ mod tests {
 
     #[test]
     fn panels_collapse_at_thresholds() {
-        let (side, prev) = resolve_panels(960.0, 320.0, true, true, None, None);
+        let (side, prev) = resolve_panels(960.0, 320.0, 156.0, true, true, None, None);
         assert!(side && prev);
-        let (side, prev) = resolve_panels(862.0, 320.0, true, true, None, None);
+        let (side, prev) = resolve_panels(862.0, 320.0, 156.0, true, true, None, None);
         assert!(side && !prev);
-        let (side, prev) = resolve_panels(759.0, 320.0, true, true, None, None);
+        let (side, prev) = resolve_panels(759.0, 320.0, 156.0, true, true, None, None);
         assert!(!side && !prev);
-        let (side, prev) = resolve_panels(759.0, 320.0, true, true, Some(ForceState::Show), None);
+        let (side, prev) =
+            resolve_panels(759.0, 320.0, 156.0, true, true, Some(ForceState::Show), None);
         assert!(side && !prev);
     }
 
