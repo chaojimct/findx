@@ -343,7 +343,14 @@ pub fn build_from_plan(
                 if should_extract(path).is_none() {
                     return None;
                 }
-                match extract_text(path) {
+                // 慢文件抓现行：单文件抽取超 10 秒打一行（正常文件毫秒级）。
+                let t0 = std::time::Instant::now();
+                let r = extract_text(path);
+                let dt = t0.elapsed();
+                if dt.as_secs() >= 10 {
+                    eprintln!("[content] slow extract {:?} {}", dt, item.path);
+                }
+                match r {
                     Ok(t) => Some(Ok((
                         DocMeta {
                             frn: item.frn,
@@ -369,7 +376,14 @@ pub fn build_from_plan(
                     None => (0, 0, 0, 1, Vec::new()),
                     Some(Err(reason)) => (0, 0, 1, 0, vec![reason.clone()]),
                     Some(Ok((meta, text, raw_bytes))) => {
-                        if cidx.index_doc(meta, text).is_ok() {
+                        // 慢入库抓现行：单篇超 10 秒打一行（分词/写入病态输入）。
+                        let t0 = std::time::Instant::now();
+                        let ok = cidx.index_doc(meta, text).is_ok();
+                        let dt = t0.elapsed();
+                        if dt.as_secs() >= 10 {
+                            eprintln!("[content] slow index {:?} {}", dt, meta.path);
+                        }
+                        if ok {
                             (1, *raw_bytes, 0, 0, Vec::new())
                         } else {
                             (0, 0, 1, 0, vec![format!("入库失败 {}", meta.path)])
@@ -431,9 +445,15 @@ pub fn build_from_store(
     rebuild: bool,
     mut progress: impl FnMut(&BuildStats) -> bool,
 ) -> Result<BuildStats> {
+    eprintln!("[content] plan start entries={}", store.entries.len());
     let vols = build_vols(store);
     let mut st = BuildStats::default();
     let items = plan_range_from_store(store, &vols, 0, store.entries.len(), &mut st);
+    eprintln!(
+        "[content] plan done candidates={} skipped={}",
+        items.len(),
+        st.skipped
+    );
     let docs = build_from_plan(&items, cdir, rebuild, &mut st, |s| progress(s))?;
     st.docs = docs;
     progress(&st);
