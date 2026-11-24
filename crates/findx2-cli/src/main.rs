@@ -744,7 +744,9 @@ fn build_content_index(index: &std::path::Path, rebuild: bool) -> Result<()> {
         sample_txt.push_str("\n  - ");
         sample_txt.push_str(&s.chars().take(160).collect::<String>());
     }
-    println!(
+    // 用 eprintln! 而非 println!：输出重定向到文件时 stdout 是块缓冲，
+    // 进程被 kill 或异常退出会丢尾巴；总结算必须落盘。
+    eprintln!(
         "内容索引构建完成：扫描 {} 文件，抽取 {}（{:.2} MB 原文），跳过 {}，失败 {}{}；\
          索引 {} docs / {:.2} MB（体积比 {:.1}%），耗时 {:.1}s → {}",
         st.scanned,
