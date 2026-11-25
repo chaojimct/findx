@@ -330,6 +330,11 @@ mod tests {
             content_error: None,
             content_detail: String::new(),
             content_entry_total: 0,
+            content_dir: String::new(),
+            content_aux_ini_docs: 0,
+            content_aux_ini_bytes: 0,
+            content_aux_full_docs: 0,
+            content_aux_full_bytes: 0,
         };
         let v = summarize_status(&resp, true);
         assert_eq!(v.summary, "索引 1,234,567 项");
@@ -369,6 +374,11 @@ mod tests {
             content_error: None,
             content_detail: String::new(),
             content_entry_total: 0,
+            content_dir: String::new(),
+            content_aux_ini_docs: 0,
+            content_aux_ini_bytes: 0,
+            content_aux_full_docs: 0,
+            content_aux_full_bytes: 0,
         };
         let v = summarize_status(&resp, true);
         assert_eq!(v.summary, "索引加载中");
@@ -417,6 +427,11 @@ mod tests {
             content_error: None,
             content_detail: String::new(),
             content_entry_total: 0,
+            content_dir: String::new(),
+            content_aux_ini_docs: 0,
+            content_aux_ini_bytes: 0,
+            content_aux_full_docs: 0,
+            content_aux_full_bytes: 0,
         };
         let prev = summarize_status(&ready, true);
         let contention = IpcResponse::StatusResult {
@@ -450,6 +465,11 @@ mod tests {
             content_error: None,
             content_detail: String::new(),
             content_entry_total: 0,
+            content_dir: String::new(),
+            content_aux_ini_docs: 0,
+            content_aux_ini_bytes: 0,
+            content_aux_full_docs: 0,
+            content_aux_full_bytes: 0,
         };
         let kept = apply_status(Some(&prev), &contention, true);
         assert_eq!(kept, prev);

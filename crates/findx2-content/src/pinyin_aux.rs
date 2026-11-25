@@ -129,6 +129,107 @@ pub fn full_text(chars: &[char]) -> String {
     out
 }
 
+/// 标准无调拼音节集合（含 `lv`/`nv`/`lue`/`nue` 写法；`ü` 按 `v` 归一）。
+///
+/// 覆盖 GB/T 16159 常用音节 + 口语残留（`dei`/`den`/`kei`/`lo` 等），贪心最长
+/// 匹配够用；漏收的生僻拼写走“已切分头 + 尾部前缀”降级，不会零命中。
+fn is_pinyin_syllable(s: &str) -> bool {
+    matches!(s,
+        "a" | "ai" | "an" | "ang" | "ao" | "ba" | "bai" | "ban" | "bang" | "bao"
+        | "bei" | "ben" | "beng" | "bi" | "bian" | "biao" | "bie" | "bin" | "bing"
+        | "bo" | "bu" | "ca" | "cai" | "can" | "cang" | "cao" | "ce" | "cen" | "ceng"
+        | "cha" | "chai" | "chan" | "chang" | "chao" | "che" | "chen" | "cheng"
+        | "chi" | "chong" | "chou" | "chu" | "chuai" | "chuan" | "chuang" | "chui"
+        | "chun" | "chuo" | "ci" | "cong" | "cou" | "cu" | "cuan" | "cui" | "cun"
+        | "cuo" | "da" | "dai" | "dan" | "dang" | "dao" | "de" | "dei" | "den"
+        | "deng" | "di" | "dian" | "diao" | "die" | "ding" | "diu" | "dong" | "dou"
+        | "du" | "duan" | "dui" | "dun" | "duo" | "e" | "ei" | "en" | "eng" | "er"
+        | "fa" | "fan" | "fang" | "fei" | "fen" | "feng" | "fo" | "fou" | "fu"
+        | "ga" | "gai" | "gan" | "gang" | "gao" | "ge" | "gei" | "gen" | "geng"
+        | "gong" | "gou" | "gu" | "gua" | "guai" | "guan" | "guang" | "gui" | "gun"
+        | "guo" | "ha" | "hai" | "han" | "hang" | "hao" | "he" | "hei" | "hen"
+        | "heng" | "hong" | "hou" | "hu" | "hua" | "huai" | "huan" | "huang" | "hui"
+        | "hun" | "huo" | "ji" | "jia" | "jian" | "jiang" | "jiao" | "jie" | "jin"
+        | "jing" | "jiong" | "jiu" | "ju" | "juan" | "jue" | "jun" | "ka" | "kai"
+        | "kan" | "kang" | "kao" | "ke" | "kei" | "ken" | "keng" | "kong" | "kou"
+        | "ku" | "kua" | "kuai" | "kuan" | "kuang" | "kui" | "kun" | "kuo" | "la"
+        | "lai" | "lan" | "lang" | "lao" | "le" | "lei" | "leng" | "li" | "lia"
+        | "lian" | "liang" | "liao" | "lie" | "lin" | "ling" | "liu" | "long"
+        | "lou" | "lu" | "luan" | "lun" | "luo" | "lue" | "lv" | "ma" | "mai"
+        | "man" | "mang" | "mao" | "me" | "mei" | "men" | "meng" | "mi" | "mian"
+        | "miao" | "mie" | "min" | "ming" | "miu" | "mo" | "mou" | "mu" | "na"
+        | "nai" | "nan" | "nang" | "nao" | "ne" | "nei" | "nen" | "neng" | "ni"
+        | "nian" | "niang" | "niao" | "nie" | "nin" | "ning" | "niu" | "nong"
+        | "nou" | "nu" | "nuan" | "nun" | "nuo" | "nue" | "nv" | "o" | "ou" | "pa"
+        | "pai" | "pan" | "pang" | "pao" | "pei" | "pen" | "peng" | "pi" | "pian"
+        | "piao" | "pie" | "pin" | "ping" | "po" | "pou" | "pu" | "qi" | "qia"
+        | "qian" | "qiang" | "qiao" | "qie" | "qin" | "qing" | "qiong" | "qiu"
+        | "qu" | "quan" | "que" | "qun" | "ran" | "rang" | "rao" | "re" | "ren"
+        | "reng" | "ri" | "rong" | "rou" | "ru" | "ruan" | "rui" | "run" | "ruo"
+        | "sa" | "sai" | "san" | "sang" | "sao" | "se" | "sen" | "seng" | "sha"
+        | "shai" | "shan" | "shang" | "shao" | "she" | "shei" | "shen" | "sheng"
+        | "shi" | "shou" | "shu" | "shua" | "shuai" | "shuan" | "shuang" | "shui"
+        | "shun" | "shuo" | "si" | "song" | "sou" | "su" | "suan" | "sui" | "sun"
+        | "suo" | "ta" | "tai" | "tan" | "tang" | "tao" | "te" | "tei" | "teng"
+        | "ti" | "tian" | "tiao" | "tie" | "ting" | "tong" | "tou" | "tu" | "tuan"
+        | "tui" | "tun" | "tuo" | "wa" | "wai" | "wan" | "wang" | "wei" | "wen"
+        | "weng" | "wo" | "wu" | "xi" | "xia" | "xian" | "xiang" | "xiao" | "xie"
+        | "xin" | "xing" | "xiong" | "xiu" | "xu" | "xuan" | "xue" | "xun" | "ya"
+        | "yan" | "yang" | "yao" | "ye" | "yi" | "yin" | "ying" | "yo" | "yong"
+        | "you" | "yu" | "yuan" | "yue" | "yun" | "za" | "zai" | "zan" | "zang"
+        | "zao" | "ze" | "zei" | "zen" | "zeng" | "zha" | "zhai" | "zhan" | "zhang"
+        | "zhao" | "zhe" | "zhei" | "zhen" | "zheng" | "zhi" | "zhong" | "zhou"
+        | "zhu" | "zhua" | "zhuai" | "zhuan" | "zhuang" | "zhui" | "zhun" | "zhuo"
+        | "zi" | "zong" | "zou" | "zu" | "zuan" | "zui" | "zun" | "zuo")
+}
+
+/// 连写全拼切音节（如 `quanwen` → 头 `["quan"]` + 尾 `"wen"` 全切；`quanwe` →
+/// 头 `["quan"]` + 尾 `"we"` 待补全；`qw` → `None` 走首字母正则）。
+///
+/// 只接受纯小写字母（调用方保证已小写、无空格）；含其他字符直接 `None`。
+/// 返回 `(已切完整音节, 剩余尾巴)`；完整切分时尾巴为空串。
+/// 全切失败且一个完整音节都拿不到时返回 `None`（首字母/垃圾输入走原正则路）。
+pub fn split_pinyin_query(q: &str) -> Option<(Vec<String>, String)> {
+    if q.is_empty() || !q.bytes().all(|b| b.is_ascii_lowercase()) {
+        return None;
+    }
+    let mut heads: Vec<String> = Vec::new();
+    let mut pos = 0usize;
+    let bytes = q.as_bytes();
+    while pos < q.len() {
+        let mut matched: Option<&str> = None;
+        let max_len = (q.len() - pos).min(6);
+        for len in (1..=max_len).rev() {
+            let cand = &q[pos..pos + len];
+            if is_pinyin_syllable(cand) {
+                matched = Some(cand);
+                break;
+            }
+        }
+        match matched {
+            Some(syl) => {
+                heads.push(syl.to_string());
+                pos += syl.len();
+            }
+            None => {
+                // 剩下的全是尾巴（用户正在输入的半个音节）。
+                let tail = q[pos..].to_string();
+                // 尾巴必须是纯字母（已保证）且不能太长（防 `qw` 类首字母串被误切）。
+                if heads.is_empty() {
+                    return None;
+                }
+                let _ = bytes;
+                return Some((heads, tail));
+            }
+        }
+    }
+    if heads.len() < 2 && heads.first().map(|h| h == q).unwrap_or(false) {
+        // 单音节原样（如 `ma`）：与原单 token 路等价，交回调用方走原路。
+        return None;
+    }
+    Some((heads, String::new()))
+}
+
 /// 从主索引倒排回填拼音辅库（initials + full 一次走完）。
 /// `progress(scanned_docs, aux_docs)` 返回 false 即中止。
 pub fn build_aux_from_index(
@@ -371,4 +472,37 @@ fn rebuild_chars(tokpos: &[(u32, u32)], terms: &[String]) -> Option<Vec<char>> {
         return None;
     }
     Some(out.chars().filter(|c| is_cjk(*c)).collect())
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::split_pinyin_query;
+
+    #[test]
+    fn concatenated_splits_like_spaced() {
+        let (heads, tail) = split_pinyin_query("quanwen").expect("quanwen 应切分");
+        assert_eq!(heads, vec!["quan".to_string(), "wen".to_string()]);
+        assert!(tail.is_empty());
+        let (heads, tail) = split_pinyin_query("machuntian").expect("machuntian 应切分");
+        assert_eq!(
+            heads,
+            vec!["ma".to_string(), "chun".to_string(), "tian".to_string()]
+        );
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn partial_tail_degrades_to_prefix() {
+        let (heads, tail) = split_pinyin_query("quanw").expect("quanw 应部分切分");
+        assert_eq!(heads, vec!["quan".to_string()]);
+        assert_eq!(tail, "w");
+    }
+
+    #[test]
+    fn initials_and_single_syllable_keep_old_path() {
+        assert!(split_pinyin_query("qw").is_none(), "qw 是首字母串，不切分");
+        assert!(split_pinyin_query("ma").is_none(), "单音节走原单 token 路");
+        assert!(split_pinyin_query("").is_none());
+        assert!(split_pinyin_query("QuanWen").is_none(), "非全小写不切分");
+    }
 }

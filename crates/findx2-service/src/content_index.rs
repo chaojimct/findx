@@ -595,6 +595,14 @@ pub(crate) struct ContentStatusSnapshot {
     pub skipped: u64,
     pub failed: u64,
     pub error: Option<String>,
+    /// service 实际挂载的内容目录（GUI 设置页展示用；不从 GUI 的 indexPath 推导，
+    /// dev 隔离 service 的 index 与 GUI 设置里的正式库路径不同）。
+    pub content_dir: String,
+    /// 拼音辅库挂载情况（缺库/开关关闭即 0，查询自动降级）。
+    pub aux_ini_docs: u64,
+    pub aux_ini_bytes: u64,
+    pub aux_full_docs: u64,
+    pub aux_full_bytes: u64,
 }
 
 /// Status 轮询用快照（2s 一次；只读计数器，不碰 tantivy）。
@@ -624,6 +632,21 @@ pub(crate) fn status_snapshot() -> ContentStatusSnapshot {
         skipped,
         failed,
         error,
+        content_dir: findx2_content::content_dir_for(&g.index_bin)
+            .display()
+            .to_string(),
+        aux_ini_docs: g.aux_ini.as_ref().map(|a| a.num_docs()).unwrap_or(0),
+        aux_ini_bytes: g
+            .aux_ini
+            .as_ref()
+            .map(|_| dir_size(&findx2_content::aux_dir_for(&g.index_bin, findx2_content::AUX_INITIALS_SUFFIX)))
+            .unwrap_or(0),
+        aux_full_docs: g.aux_full.as_ref().map(|a| a.num_docs()).unwrap_or(0),
+        aux_full_bytes: g
+            .aux_full
+            .as_ref()
+            .map(|_| dir_size(&findx2_content::aux_dir_for(&g.index_bin, findx2_content::AUX_FULL_SUFFIX)))
+            .unwrap_or(0),
     }
 }
 

@@ -1642,6 +1642,30 @@ impl SettingsWindow {
         format!("{}.content", self.settings.index_path)
     }
 
+    /// 设置页展示的内容目录：优先 service 上报的实际挂载路径（dev 隔离 service
+    /// 与 GUI 设置里的正式库路径不同）；老服务未上报时回退到本地推导。
+    fn content_dir_shown(&self, cx: &App) -> String {
+        let dir = self.session.read(cx).content_index.dir.clone();
+        if dir.is_empty() {
+            self.content_dir_label()
+        } else {
+            dir
+        }
+    }
+
+    /// 辅库状态行：有库报篇数体积，无库明示降级（与查询开关文案呼应）。
+    fn aux_state_line(docs: u64, bytes: u64) -> String {
+        if docs == 0 {
+            "未建（查询自动降级为主库）".to_string()
+        } else {
+            format!(
+                "{} 篇 · {}",
+                docs,
+                crate::search_logic::format_size(bytes, false)
+            )
+        }
+    }
+
     fn content_state_label(state: &str) -> &'static str {
         if state == findx2_ipc::content_state::MISSING {
             "未建立"
@@ -1731,7 +1755,7 @@ impl SettingsWindow {
                 "内容倒排与文件名索引独立存放；schema v1 多卷 key 隔离。构建跳过系统/程序/缓存目录。未建时 content: 查询走慢速逐文件。",
                 tokens,
             ))
-            .child(settings_kv("索引目录", &self.content_dir_label(), tokens))
+            .child(settings_kv("索引目录", &self.content_dir_shown(cx), tokens))
             .child(settings_kv("状态", &state_line, tokens))
             .child(settings_kv(
                 "文档 / 体积",
@@ -1740,6 +1764,16 @@ impl SettingsWindow {
                     st.docs,
                     crate::search_logic::format_size(st.bytes, false)
                 ),
+                tokens,
+            ))
+            .child(settings_kv(
+                "拼音辅库（首字母）",
+                &Self::aux_state_line(st.aux_ini_docs, st.aux_ini_bytes),
+                tokens,
+            ))
+            .child(settings_kv(
+                "拼音辅库（全拼）",
+                &Self::aux_state_line(st.aux_full_docs, st.aux_full_bytes),
                 tokens,
             ))
             .when(building, |v| {

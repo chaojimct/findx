@@ -22,6 +22,15 @@ pub struct ContentIndexStatus {
     pub skipped: u64,
     pub failed: u64,
     pub error: Option<String>,
+    /// service 实际挂载的内容目录（`StatusResult.content_dir`；老服务为空时
+    /// 设置页回退到 `settings.index_path + ".content"` 推导）。
+    pub dir: String,
+    /// 拼音辅库（首字母）文档数；0 = 未建/未挂载/老服务。
+    pub aux_ini_docs: u64,
+    pub aux_ini_bytes: u64,
+    /// 拼音辅库（全拼）文档数；0 = 未建/未挂载/老服务。
+    pub aux_full_docs: u64,
+    pub aux_full_bytes: u64,
 }
 
 pub struct AppSession {

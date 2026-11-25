@@ -14,8 +14,9 @@ pub mod build;
 pub mod snippet;
 pub mod pinyin_aux;
 pub use pinyin_aux::{
-    aux_dir_for, build_aux_from_index, full_text, initials_text, open_aux, pinyin_texts, AuxStats,
-    AUX_FULL_SUFFIX, AUX_INITIALS_SUFFIX, CHUNK_SYLLABLES, DOC_SHARD, MAX_FULL_CHARS,
+    aux_dir_for, build_aux_from_index, full_text, initials_text, open_aux, pinyin_texts,
+    split_pinyin_query, AuxStats, AUX_FULL_SUFFIX, AUX_INITIALS_SUFFIX, CHUNK_SYLLABLES,
+    DOC_SHARD, MAX_FULL_CHARS,
 };
 
 pub use build::{

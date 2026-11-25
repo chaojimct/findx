@@ -136,6 +136,11 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                 content_error: None,
                 content_detail: String::new(),
                 content_entry_total: 0,
+                content_dir: String::new(),
+                content_aux_ini_docs: 0,
+                content_aux_ini_bytes: 0,
+                content_aux_full_docs: 0,
+                content_aux_full_bytes: 0,
             }
         }
         (IpcRequest::Search { .. }, None) => IpcResponse::Error {
@@ -224,6 +229,11 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                         content_error: cs.error,
                         content_detail: cs.detail,
                         content_entry_total: cs.entry_total,
+                        content_dir: cs.content_dir.clone(),
+                        content_aux_ini_docs: cs.aux_ini_docs,
+                        content_aux_ini_bytes: cs.aux_ini_bytes,
+                        content_aux_full_docs: cs.aux_full_docs,
+                        content_aux_full_bytes: cs.aux_full_bytes,
                     }
                 }
                 None => {
@@ -269,6 +279,11 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                         content_error: cs.error,
                         content_detail: cs.detail,
                         content_entry_total: cs.entry_total,
+                        content_dir: cs.content_dir.clone(),
+                        content_aux_ini_docs: cs.aux_ini_docs,
+                        content_aux_ini_bytes: cs.aux_ini_bytes,
+                        content_aux_full_docs: cs.aux_full_docs,
+                        content_aux_full_bytes: cs.aux_full_bytes,
                     }
                 }
             }

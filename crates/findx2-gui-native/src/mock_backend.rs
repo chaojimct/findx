@@ -171,6 +171,11 @@ fn handle_request(req: IpcRequest) -> IpcResponse {
         content_error: None,
         content_detail: String::new(),
         content_entry_total: 0,
+        content_dir: String::new(),
+        content_aux_ini_docs: 0,
+        content_aux_ini_bytes: 0,
+        content_aux_full_docs: 0,
+        content_aux_full_bytes: 0,
         },
         IpcRequest::Search {
             query,

@@ -310,6 +310,7 @@ impl ContentIndex {
     /// 拼音辅索引查询（只接受纯 ASCII 查询；含 CJK 直接返回空，调用方走主索引）。
     ///
     /// 单 token（如 `qw`）：精确 OR 前缀（`^qw.*`，块首匹配）。
+    /// 连写全拼（如 `quanwen`）：切音节 OR，与 `quan wen` 同义；半个尾音降级前缀。
     /// 多 token（如 `quan wen`）：OR 相加，命中越多排名越前。
     /// 返回 (volume_id, frn, score)，与 search_ids 同形，方便服务层合并。
     pub fn search_pinyin(&self, query_text: &str, limit: usize) -> Result<Vec<(String, u64, f32)>> {
@@ -328,20 +329,44 @@ impl ContentIndex {
         let field = self.fields.body;
         let query: Box<dyn tantivy::query::Query> = if terms.len() == 1 {
             let t = &terms[0];
-            // token 已是小写字母数字（simple+lower），无正则元字符，可直接拼 ^t.*
-            let re = RegexQuery::from_pattern(&format!("{t}.*"), field)
-                .map_err(|e| Error::Index(format!("拼音正则查询构造失败: {e}")))?;
-            Box::new(BooleanQuery::new(vec![
-                (
-                    Occur::Should,
-                    Box::new(TermQuery::new(
-                        Term::from_field_text(field, t),
-                        IndexRecordOption::Basic,
-                    ))
-                        as Box<dyn tantivy::query::Query>,
-                ),
-                (Occur::Should, Box::new(re) as Box<dyn tantivy::query::Query>),
-            ]))
+            // 连写全拼（如 `quanwen`）：切成音节 OR（`quan`/`wen`），与空格写法同义；
+            // 尾部半个音节（如 `quanwe` 的 `we`）降级为前缀正则，不会输入一半就零命中。
+            // 切分失败（`qw` 类首字母串）走原单 token 精确 OR 前缀。
+            if let Some((heads, tail)) = crate::pinyin_aux::split_pinyin_query(t) {
+                let mut subs: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
+                    Vec::with_capacity(heads.len() + 1);
+                for h in &heads {
+                    subs.push((
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(field, h),
+                            IndexRecordOption::Basic,
+                        ))
+                            as Box<dyn tantivy::query::Query>,
+                    ));
+                }
+                if !tail.is_empty() {
+                    if let Ok(re) = RegexQuery::from_pattern(&format!("{tail}.*"), field) {
+                        subs.push((Occur::Should, Box::new(re) as Box<dyn tantivy::query::Query>));
+                    }
+                }
+                Box::new(BooleanQuery::new(subs))
+            } else {
+                // token 已是小写字母数字（simple+lower），无正则元字符，可直接拼 ^t.*
+                let re = RegexQuery::from_pattern(&format!("{t}.*"), field)
+                    .map_err(|e| Error::Index(format!("拼音正则查询构造失败: {e}")))?;
+                Box::new(BooleanQuery::new(vec![
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(field, t),
+                            IndexRecordOption::Basic,
+                        ))
+                            as Box<dyn tantivy::query::Query>,
+                    ),
+                    (Occur::Should, Box::new(re) as Box<dyn tantivy::query::Query>),
+                ]))
+            }
         } else {
             let subs: Vec<(Occur, Box<dyn tantivy::query::Query>)> = terms
                 .iter()

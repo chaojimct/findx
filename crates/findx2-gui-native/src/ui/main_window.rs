@@ -1313,6 +1313,11 @@ impl MainWindow {
                                 content_error,
                                 content_detail,
                                 content_entry_total,
+                                content_dir,
+                                content_aux_ini_docs,
+                                content_aux_ini_bytes,
+                                content_aux_full_docs,
+                                content_aux_full_bytes,
                                 ..
                             } = &resp
                             {
@@ -1327,6 +1332,11 @@ impl MainWindow {
                                     skipped: *content_skipped,
                                     failed: *content_failed,
                                     error: content_error.clone(),
+                                    dir: content_dir.clone(),
+                                    aux_ini_docs: *content_aux_ini_docs,
+                                    aux_ini_bytes: *content_aux_ini_bytes,
+                                    aux_full_docs: *content_aux_full_docs,
+                                    aux_full_bytes: *content_aux_full_bytes,
                                 };
                             }
                         }

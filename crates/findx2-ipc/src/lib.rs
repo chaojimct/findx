@@ -259,6 +259,21 @@ pub enum IpcResponse {
         /// 文件名索引总条目数（构建进度 `content_scanned / content_entry_total` 即百分比）。
         #[serde(default)]
         content_entry_total: u64,
+        /// service 实际挂载的内容目录（GUI 不再从自身 indexPath 推导；缺省 "" = 老版 service）。
+        #[serde(default)]
+        content_dir: String,
+        /// 拼音辅库（首字母）文档数；0 = 未建/未挂载，查询自动降级。
+        #[serde(default)]
+        content_aux_ini_docs: u64,
+        /// 拼音辅库（首字母）目录体积（字节）。
+        #[serde(default)]
+        content_aux_ini_bytes: u64,
+        /// 拼音辅库（全拼）文档数；0 = 未建/未挂载，查询自动降级。
+        #[serde(default)]
+        content_aux_full_docs: u64,
+        /// 拼音辅库（全拼）目录体积（字节）。
+        #[serde(default)]
+        content_aux_full_bytes: u64,
     },
     UpgradeCapabilitiesResult {
         protocol_version: u32,
