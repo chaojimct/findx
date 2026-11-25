@@ -390,7 +390,7 @@ impl ContentIndex {
         Ok(self
             .snippets_for_keys_windowed(query_text, keys, cap, 0)?
             .into_iter()
-            .map(|(k, (html, _))| (k, html))
+            .map(|(k, (html, _, _))| (k, html))
             .collect())
     }
 
@@ -402,7 +402,7 @@ impl ContentIndex {
         keys: &[u64],
         cap: usize,
         window_idx: usize,
-    ) -> Result<std::collections::HashMap<u64, (String, usize)>> {
+    ) -> Result<std::collections::HashMap<u64, (String, usize, usize)>> {
         use std::collections::HashMap;
         let mut out = HashMap::new();
         if keys.is_empty() || cap == 0 {
@@ -436,11 +436,11 @@ impl ContentIndex {
                 .get_first(self.fields.mtime)
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            if let Some((html, total)) =
+            if let Some((html, total, window_used)) =
                 self.snippets
                     .for_doc_windowed(path, mtime, query_text, &terms, window_idx)
             {
-                out.insert(*key, (html, total));
+                out.insert(*key, (html, total, window_used));
             }
         }
         Ok(out)

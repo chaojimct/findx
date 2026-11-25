@@ -305,11 +305,11 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                         IpcResponse::ContentSnippets {
                             snippets: map
                                 .into_iter()
-                                .map(|(entry_idx, (html, total))| {
+                                .map(|(entry_idx, (html, total, window_used))| {
                                     findx2_ipc::ContentSnippetDto {
                                         entry_idx,
                                         html,
-                                        window,
+                                        window: window_used,
                                         total: total as u32,
                                     }
                                 })
@@ -445,9 +445,9 @@ pub(crate) fn search_ipc(
         );
         if !map.is_empty() {
             for (h, dto) in hits.iter().zip(dtos.iter_mut()) {
-                if let Some((html, total)) = map.get(&h.entry_idx) {
+                if let Some((html, total, window_used)) = map.get(&h.entry_idx) {
                     dto.snippet = html.clone();
-                    dto.snippet_window = 0;
+                    dto.snippet_window = *window_used;
                     dto.snippet_total = *total as u32;
                 }
             }

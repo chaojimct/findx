@@ -163,13 +163,13 @@ pub fn match_spans(text: &str, terms: &[String]) -> Vec<(usize, usize)> {
     out
 }
 
-/// 第 k 个匹配点的上下文窗口 HTML + 全文共多少个匹配点（上一个/下一个用）。
-/// k 越界钳到最后一个；无匹配返回 None。
+/// 第 k 个匹配点的上下文窗口 HTML + 全文共多少个匹配点 + 实际使用的窗口号
+/// （k 越界时钳到最后一个；无匹配返回 None）。
 pub fn make_snippet_windowed(
     text: &str,
     terms: &[String],
     window_idx: usize,
-) -> Option<(String, usize)> {
+) -> Option<(String, usize, usize)> {
     let spans = match_spans(text, terms);
     if spans.is_empty() {
         return None;
@@ -183,7 +183,8 @@ pub fn make_snippet_windowed(
     if start >= end {
         return None;
     }
-    render_window(text, &folded, start, end, terms).map(|html| (html, spans.len()))
+    render_window(text, &folded, start, end, terms)
+        .map(|html| (html, spans.len(), k))
 }
 
 /// 窗口内全部命中高亮成 HTML（make_snippet 与 windowed 共用；调用方保证字节边界合法）。
@@ -239,16 +240,16 @@ fn render_window(
 }
 
 struct SnippetCache {
-    map: HashMap<(String, u64, String, usize), (String, usize)>,
+    map: HashMap<(String, u64, String, usize), (String, usize, usize)>,
     order: VecDeque<(String, u64, String, usize)>,
 }
 
 impl SnippetCache {
-    fn get(&self, k: &(String, u64, String, usize)) -> Option<(String, usize)> {
+    fn get(&self, k: &(String, u64, String, usize)) -> Option<(String, usize, usize)> {
         self.map.get(k).cloned()
     }
 
-    fn put(&mut self, k: (String, u64, String, usize), v: (String, usize)) {
+    fn put(&mut self, k: (String, u64, String, usize), v: (String, usize, usize)) {
         if self.map.contains_key(&k) {
             return;
         }
@@ -285,7 +286,7 @@ impl SnippetPool {
         terms: &[String],
     ) -> Option<String> {
         self.for_doc_windowed(path, mtime, query_text, terms, 0)
-            .map(|(html, _)| html)
+            .map(|(html, _, _)| html)
     }
 
     /// 第 window_idx 个匹配点的上下文窗口 + 全文共多少个匹配点（上一个/下一个用）。
@@ -297,7 +298,7 @@ impl SnippetPool {
         query_text: &str,
         terms: &[String],
         window_idx: usize,
-    ) -> Option<(String, usize)> {
+    ) -> Option<(String, usize, usize)> {
         let key = (
             path.to_string(),
             mtime,
@@ -310,15 +311,15 @@ impl SnippetPool {
             }
         }
         let text = extract_text(std::path::Path::new(path)).ok()?.text;
-        let (html, total) = match make_snippet_windowed(&text, terms, window_idx) {
+        let (html, total, window_used) = match make_snippet_windowed(&text, terms, window_idx) {
             Some(t) => t,
-            None if query_text.is_ascii() && window_idx == 0 => (head_snippet(&text)?, 1),
+            None if query_text.is_ascii() && window_idx == 0 => (head_snippet(&text)?, 1, 0),
             None => return None,
         };
         if let Ok(mut c) = self.cache.lock() {
-            c.put(key, (html.clone(), total));
+            c.put(key, (html.clone(), total, window_used));
         }
-        Some((html, total))
+        Some((html, total, window_used))
     }
 }
 
@@ -395,16 +396,18 @@ mod tests {
         let spans = match_spans(&text, &terms);
         assert!(spans.len() >= 2, "{spans:?}");
         let total = spans.len();
-        let (h0, total0) = make_snippet_windowed(&text, &terms, 0).unwrap();
-        let (hlast, total1) =
+        let (h0, total0, w0) = make_snippet_windowed(&text, &terms, 0).unwrap();
+        let (hlast, total1, wlast) =
             make_snippet_windowed(&text, &terms, total - 1).unwrap();
         assert_eq!((total0, total1), (total, total));
+        assert_eq!((w0, wlast), (0, total - 1));
         assert_ne!(h0, hlast, "首尾窗口应切到不同上下文");
         assert!(h0.contains("<b>"), "{h0}");
         assert!(hlast.contains("<b>"), "{hlast}");
-        // 越界钳到最后一个。
-        let (hclamp, _) = make_snippet_windowed(&text, &terms, total + 99).unwrap();
+        // 越界钳到最后一个（返回实际窗口号）。
+        let (hclamp, _, wclamp) = make_snippet_windowed(&text, &terms, total + 99).unwrap();
         assert_eq!(hclamp, hlast);
+        assert_eq!(wclamp, total - 1);
         // 无匹配返回 None。
         assert!(make_snippet_windowed("hello world", &terms, 0).is_none());
     }
