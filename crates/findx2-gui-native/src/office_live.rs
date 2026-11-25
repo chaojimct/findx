@@ -555,24 +555,23 @@ impl LiveSession {
         use com as C;
         let sel = self.app.get("Selection")?;
         let find = sel.get("Find")?;
-        // Find.Execute(FindText, MatchCase, MatchWholeWord, ..., Forward, Wrap, ..., ReplaceWith, Replace)
-        // 只填 FindText + Forward=true + Wrap=1(wdFindContinue)，其余 Missing。
+        // Find.Execute 全显式传参（声明逆序，rgvarg 顺序；Missing 拒收，见 Open）。
+        // Execute(FindText, MatchCase, MatchWholeWord, MatchWildcards, MatchSoundsLike,
+        //         MatchAllWordForms, Forward, Wrap, Format, ReplaceWith, Replace)
         let r = find.call(
             "Execute",
             vec![
-                C::v_missing(), // Replace
-                C::v_missing(), // ReplaceWith
+                C::v_i4(0),     // Replace = wdReplaceNone
+                C::v_str(""),   // ReplaceWith
                 C::v_i4(1),     // Wrap = wdFindContinue
                 C::v_bool(true), // Forward
-                C::v_missing(), // Format
-                C::v_missing(), // MatchByte
-                C::v_missing(), // MatchWildcards
-                C::v_missing(), // MatchSoundsLike
-                C::v_missing(), // MatchAllWordForms
-                C::v_missing(), // MatchFuzzy
-                C::v_missing(), // MatchWholeWord
-                C::v_missing(), // MatchCase
-                C::v_str(needle),
+                C::v_bool(false), // Format
+                C::v_bool(false), // MatchAllWordForms
+                C::v_bool(false), // MatchSoundsLike
+                C::v_bool(false), // MatchWildcards
+                C::v_bool(false), // MatchWholeWord
+                C::v_bool(false), // MatchCase
+                C::v_str(needle), // FindText
             ],
         );
         // Execute 返回 bool（VARIANT_BOOL）。index>0 时重复执行跳到第 n 个。
@@ -585,18 +584,16 @@ impl LiveSession {
             let rr = find.call(
                 "Execute",
                 vec![
-                    C::v_missing(),
-                    C::v_missing(),
+                    C::v_i4(0),
+                    C::v_str(""),
                     C::v_i4(1),
                     C::v_bool(true),
-                    C::v_missing(),
-                    C::v_missing(),
-                    C::v_missing(),
-                    C::v_missing(),
-                    C::v_missing(),
-                    C::v_missing(),
-                    C::v_missing(),
-                    C::v_missing(),
+                    C::v_bool(false),
+                    C::v_bool(false),
+                    C::v_bool(false),
+                    C::v_bool(false),
+                    C::v_bool(false),
+                    C::v_bool(false),
                     C::v_str(needle),
                 ],
             );
@@ -637,23 +634,22 @@ impl LiveSession {
             let find = content.get("Find")?;
             let _ = find.call("ClearFormatting", vec![]);
             // Execute 全文查找循环：找到一个 → Range.HighlightColorIndex=7 → Collapse(0) 继续。
+            // 全显式传参（Format=false；ReplaceWith="" + Replace=0 不替换只查找）。
             loop {
                 let r = find.call(
                     "Execute",
                     vec![
-                        C::v_missing(),
-                        C::v_missing(),
+                        C::v_i4(0), // Replace = wdReplaceNone
+                        C::v_str(""), // ReplaceWith
                         C::v_i4(0), // Wrap = wdFindStop，到文末停
-                        C::v_bool(true),
-                        C::v_bool(true), // Format=true（允许 Highlight 生效口径）
-                        C::v_missing(),
-                        C::v_missing(),
-                        C::v_missing(),
-                        C::v_missing(),
-                        C::v_missing(),
-                        C::v_missing(),
-                        C::v_missing(),
-                        C::v_str(needle),
+                        C::v_bool(true), // Forward
+                        C::v_bool(false), // Format
+                        C::v_bool(false), // MatchAllWordForms
+                        C::v_bool(false), // MatchSoundsLike
+                        C::v_bool(false), // MatchWildcards
+                        C::v_bool(false), // MatchWholeWord
+                        C::v_bool(false), // MatchCase
+                        C::v_str(needle), // FindText
                     ],
                 );
                 if !variant_is_true(&r.unwrap_or_else(|_| C::v_bool(false))) {
@@ -762,13 +758,15 @@ fn open_document(
                 use std::io::Write as _;
                 let _ = writeln!(std::io::stderr(), "[live] docs got");
             }
-            // Open(FileName, ConfirmConversions, ReadOnly, AddToRecentFiles)
+            // Open(FileName, ConfirmConversions, ReadOnly, AddToRecentFiles)：
+            // 全部显式传值（ConfirmConversions=false 即不弹窗；Missing 在
+            // Word IDispatch 上实测拒收 arg_err=2，见 sta 日志）。
             let v = docs.call(
                 "Open",
                 vec![
                     com::v_bool(false), // AddToRecentFiles
                     com::v_bool(true),  // ReadOnly
-                    com::v_missing(),   // ConfirmConversions
+                    com::v_bool(false), // ConfirmConversions
                     com::v_str(path),
                 ],
             )?;
@@ -780,12 +778,12 @@ fn open_document(
         }
         LiveKind::Excel => {
             let books = app.get("Workbooks")?;
-            // Open(Filename, UpdateLinks, ReadOnly)
+            // Open(Filename, UpdateLinks, ReadOnly)：UpdateLinks=0 不更新外部链接。
             let v = books.call(
                 "Open",
                 vec![
                     com::v_bool(true), // ReadOnly
-                    com::v_missing(),  // UpdateLinks
+                    com::v_i4(0),      // UpdateLinks
                     com::v_str(path),
                 ],
             )?;
