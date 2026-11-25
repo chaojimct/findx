@@ -1134,6 +1134,9 @@ impl MainWindow {
                         };
                     }
                     Err(err) => {
+                        // 诊断：搜索失败必须留痕（突发连击下偶发 Error 却无服务端记录，
+                        // stderr 是定位 connect/超时/通道三类错误的唯一现场）。
+                        eprintln!("[findx-gui] search failed gen={} rid={} err={}", generation, this.search_request_id, err.as_str());
                         this.search_keyboard.invalidate();
                         this.hits.clear();
                         this.match_total = 0;

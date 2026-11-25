@@ -310,12 +310,25 @@ async fn write_request<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 #[cfg(windows)]
-async fn connect_endpoint(
-    endpoint: &str,
-) -> IpcResult<tokio::net::windows::named_pipe::NamedPipeClient> {
-    ClientOptions::new()
-        .open(endpoint)
-        .map_err(|e| map_pipe_open_err(endpoint, e))
+async fn connect_endpoint(endpoint: &str) -> IpcResult<tokio::net::windows::named_pipe::NamedPipeClient> {
+    // ERROR_PIPE_BUSY(231)：服务端监听实例正在换挂（单监听的调度窗口；旧 service
+    // 常驻单 accept loop 时高频撞窗）。瞬态，短暂退避重试几次；其他错误直接返回。
+    // 重试上限 400ms，远小于上层 15s/45s 超时，不会拖慢真实故障的报错。
+    const ERROR_PIPE_BUSY: i32 = 231;
+    let mut attempts = 0u32;
+    loop {
+        match ClientOptions::new().open(endpoint) {
+            Ok(c) => return Ok(c),
+            Err(e) => {
+                attempts += 1;
+                if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempts < 5 {
+                    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                    continue;
+                }
+                return Err(map_pipe_open_err(endpoint, e));
+            }
+        }
+    }
 }
 
 #[cfg(unix)]

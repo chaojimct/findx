@@ -85,9 +85,35 @@ fn create_next_pipe_server(
 pub async fn pipe_accept_loop(pipe_path: String, slot: EngineSlot) -> anyhow::Result<()> {
     info!("监听命名管道 {}", pipe_path);
 
-    // 先挂好第一条监听，再在接到连接后立即 create 下一条，避免出现「无监听实例」窗口导致 ERROR_PIPE_BUSY(231)。
-    let mut server = create_first_pipe_server(&pipe_path)?;
+    // 先挂好第一条监听（独占 + DACL），再起多个 accept worker，每条 worker
+    // 独立持有 pending 中的监听实例。单 worker 时“接到连接→挂下一条”之间有
+    // 调度窗口，GUI 每次击键 cancel+search 背靠背建连、负载稍高就撞窗
+    // （客户端 ERROR_PIPE_BUSY 231 → 搜索失败）；多 worker 让窗口恒有后备。
+    let first = create_first_pipe_server(&pipe_path)?;
+    const ACCEPT_WORKERS: usize = 3;
+    let mut set = tokio::task::JoinSet::new();
+    set.spawn(accept_worker(pipe_path.clone(), slot.clone(), first));
+    for _ in 1..ACCEPT_WORKERS {
+        let next = create_next_pipe_server(&pipe_path)?;
+        set.spawn(accept_worker(pipe_path.clone(), slot.clone(), next));
+    }
+    // 任一 worker 退出（无论 Ok 还是 Err）都视为致命：accept 能力缺损必须让
+    // 外层 main 看到（沿用旧语义：listener 起不来不静默 hang，而是直接报错退出）。
+    while let Some(r) = set.join_next().await {
+        match r {
+            Err(e) => return Err(anyhow::anyhow!("accept worker 崩溃: {e}")),
+            Ok(Err(e)) => return Err(e),
+            Ok(Ok(())) => return Err(anyhow::anyhow!("accept worker 意外退出")),
+        }
+    }
+    Ok(())
+}
 
+async fn accept_worker(
+    pipe_path: String,
+    slot: EngineSlot,
+    mut server: tokio::net::windows::named_pipe::NamedPipeServer,
+) -> anyhow::Result<()> {
     loop {
         if let Err(e) = server.connect().await {
             error!("命名管道 connect 失败: {e}");
@@ -96,7 +122,8 @@ pub async fn pipe_accept_loop(pipe_path: String, slot: EngineSlot) -> anyhow::Re
         }
 
         let connected = server;
-        // 立刻挂下一条 listener，避免出现"无监听实例"窗口（客户端 connect 必 ERROR_PIPE_BUSY 231）。
+        // 立刻挂下一条 listener（本 worker 在 create 完成前无监听，但其余
+        // worker 的 pending accept 仍然在线，客户端 connect 不会撞 231）。
         // 这里 unwrap_or_else：万一 create 失败也别让 accept loop 死掉，sleep 后重试。
         server = match create_next_pipe_server(&pipe_path) {
             Ok(s) => s,
