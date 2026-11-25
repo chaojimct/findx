@@ -15,6 +15,8 @@ pub(super) struct SearchSnapshot {
     path_prefix: String,
     size_min: String,
     size_max: String,
+    /// P0-2：快照同时保存会话 ID；返回全局时恢复，范围框用新 ID。
+    session: u64,
 }
 impl MainWindow {
     pub(super) fn query_key_allowed(
@@ -125,8 +127,12 @@ impl MainWindow {
                 path_prefix: self.path_prefix.clone(),
                 size_min: self.size_min.clone(),
                 size_max: self.size_max.clone(),
+                session: self.search_session_id,
             });
         }
+        // 范围框是新输入框：分配新会话 ID（主框 ID 保留在快照里，返回时恢复）。
+        self.search_session_id = self.next_search_session_id;
+        self.next_search_session_id = self.next_search_session_id.wrapping_add(1).max(2);
         self.search_gen = self.search_gen.wrapping_add(1);
         self.search_keyboard.invalidate();
         self._search_task = None;
@@ -200,6 +206,7 @@ impl MainWindow {
         self.path_prefix = saved.path_prefix;
         self.size_min = saved.size_min;
         self.size_max = saved.size_max;
+        self.search_session_id = saved.session;
         self.loading = false;
         self.page_loading = false;
         self.page_error = false;

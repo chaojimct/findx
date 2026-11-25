@@ -424,6 +424,63 @@ impl SnippetPool {
         }
         Some((html, total, window_used))
     }
+
+    /// 全窗口摘要（AnyTXT 式编号命中列表用）：一次回读，按匹配点逐窗渲染。
+    /// 返回 `(Vec<(实际窗口号, html)>, 全文匹配点总数)`；`cap` 截断返回个数
+    /// （总数照实）。无匹配时：ascii 查询回退单条头部预览（与单窗行为一致），
+    /// 否则 None。逐窗结果顺手写入单窗缓存（pager 点击直接命中）。
+    pub fn all_windows(
+        &self,
+        path: &str,
+        mtime: u64,
+        query_text: &str,
+        terms: &[String],
+        cap: usize,
+    ) -> Option<(Vec<(usize, String)>, usize)> {
+        if terms.is_empty() || cap == 0 {
+            return None;
+        }
+        let text = extract_text(std::path::Path::new(path)).ok()?.text;
+        let spans = match_spans(&text, terms);
+        if spans.is_empty() {
+            if !query_text.is_ascii() {
+                return None;
+            }
+            let html = head_snippet(&text)?;
+            let key = (path.to_string(), mtime, query_text.to_string(), 0usize);
+            if let Ok(mut c) = self.cache.lock() {
+                c.put(key, (html.clone(), 1, 0));
+            }
+            return Some((vec![(0, html)], 1));
+        }
+        let total = spans.len();
+        let folded = text.to_ascii_lowercase();
+        let mut out = Vec::with_capacity(total.min(cap));
+        for (k, (pos, term_end)) in spans.iter().enumerate().take(cap) {
+            let term_len = term_end.saturating_sub(*pos).min(64);
+            let (start, mut end) = char_window(&text, *pos, term_len);
+            end = end.min(text.len());
+            if start >= end {
+                continue;
+            }
+            if let Some(html) = render_window(&text, &folded, start, end, terms) {
+                let key = (
+                    path.to_string(),
+                    mtime,
+                    query_text.to_string(),
+                    k,
+                );
+                if let Ok(mut c) = self.cache.lock() {
+                    c.put(key, (html.clone(), total, k));
+                }
+                out.push((k, html));
+            }
+        }
+        if out.is_empty() {
+            return None;
+        }
+        Some((out, total))
+    }
 }
 
 impl Default for SnippetPool {

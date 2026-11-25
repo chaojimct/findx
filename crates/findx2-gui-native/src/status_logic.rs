@@ -51,6 +51,7 @@ pub fn summarize_status(resp: &IpcResponse, enable_metadata_backfill: bool) -> I
             loading_elapsed_secs,
             watch_error,
             backfill_error,
+            rebuild_failures,
             ..
         } => {
             if *loading {
@@ -115,6 +116,15 @@ pub fn summarize_status(resp: &IpcResponse, enable_metadata_backfill: bool) -> I
                 return IndexStatusView {
                     summary: format!("{base}，元数据回填中"),
                     detail: None,
+                };
+            }
+            // P0-G contract：自愈计数器 > 0 时状态栏提示（可选；放最后，不盖活跃告警）。
+            if *rebuild_failures > 0 {
+                return IndexStatusView {
+                    summary: format!("{base}，索引曾多次重建失败"),
+                    detail: Some(format!(
+                        "启动/增量重建失败已累计 {rebuild_failures} 次，点状态可看详情。"
+                    )),
                 };
             }
             IndexStatusView {
@@ -340,6 +350,60 @@ mod tests {
         let v = summarize_status(&resp, true);
         assert_eq!(v.summary, "索引 1,234,567 项");
         assert!(v.detail.is_none());
+    }
+
+    #[test]
+    fn rebuild_failures_hint_when_nonzero() {
+        let mut resp = IpcResponse::StatusResult {
+            entry_count: 1_234_567,
+            dir_count: 0,
+            last_usn: 0,
+            journal_id: 0,
+            volume_letter: None,
+            healthy: true,
+            metadata_ready: true,
+            backfill_done: 0,
+            backfill_total: 0,
+            loading: false,
+            loading_stage: None,
+            loading_elapsed_secs: None,
+            loading_phase_done: None,
+            loading_phase_total: None,
+            watch_error: None,
+            backfill_error: None,
+            tombstone_count: None,
+            indexed_drive_mask: 0,
+            wal_bytes: 0,
+            last_fold_secs_ago: None,
+            content_state: String::new(),
+            content_docs: 0,
+            content_bytes: 0,
+            content_scanned: 0,
+            content_extracted: 0,
+            content_skipped: 0,
+            content_failed: 0,
+            content_error: None,
+            content_detail: String::new(),
+            content_entry_total: 0,
+            rebuild_failures: 3,
+            content_dir: String::new(),
+            content_aux_ini_docs: 0,
+            content_aux_ini_bytes: 0,
+            content_aux_full_docs: 0,
+            content_aux_full_bytes: 0,
+        };
+        let v = summarize_status(&resp, true);
+        assert!(v.summary.contains("重建失败"), "{v:?}");
+        // 零值不打扰（与旧行为一致）。
+        if let IpcResponse::StatusResult {
+            ref mut rebuild_failures,
+            ..
+        } = resp
+        {
+            *rebuild_failures = 0;
+        }
+        let v = summarize_status(&resp, true);
+        assert_eq!(v.summary, "索引 1,234,567 项");
     }
 
     #[test]

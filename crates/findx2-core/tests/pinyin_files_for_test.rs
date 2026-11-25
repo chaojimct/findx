@@ -73,6 +73,25 @@ fn names(engine: &SearchEngine, q: &str, allow_pinyin: bool) -> Vec<String> {
     hits.into_iter().map(|h| h.name).collect()
 }
 
+fn total_of(engine: &SearchEngine, q: &str, allow_pinyin: bool) -> u32 {
+    let pq = QueryParser::parse(q).expect("parse");
+    let (_hits, total) = engine
+        .search_paged(
+            q,
+            &pq,
+            &SearchOptions {
+                allow_pinyin,
+                ..Default::default()
+            },
+            0,
+            20_000,
+            None,
+            None,
+        )
+        .expect("search_paged");
+    total
+}
+
 fn assert_hit_contains(names: &[String], needle: &str) {
     assert!(
         names.iter().any(|n| n.contains(needle)),
@@ -273,6 +292,66 @@ fn chinese_literal_name_term_no_ascii_pinyin_path() {
     let n = names(&engine, "北京", true);
     assert_hit_contains(&n, "北京");
     assert_eq!(n.len(), 1);
+}
+
+fn engine_from_names(names_list: &[&str]) -> SearchEngine {
+    const ROOT_FRN: u64 = 100;
+    let dirs = vec![RawEntry {
+        file_id: ROOT_FRN,
+        file_id_128: None,
+        parent_id: 0,
+        name: "fixture_root".into(),
+        size: 0,
+        mtime: 0,
+        ctime: 0,
+        attrs: 0x10,
+        is_dir: true,
+    }];
+    let files: Vec<RawEntry> = names_list
+        .iter()
+        .enumerate()
+        .map(|(i, n)| RawEntry {
+            file_id: 10_000 + i as u64,
+            file_id_128: None,
+            parent_id: ROOT_FRN,
+            name: n.to_string(),
+            size: 1,
+            mtime: 1,
+            ctime: 1,
+            attrs: 0,
+            is_dir: false,
+        })
+        .collect();
+    let store = IndexBuilder::new(b'C', 1, 1, 1)
+        .build_from_raw(files, dirs, true)
+        .expect("build_from_raw");
+    SearchEngine::new(store)
+}
+
+/// P0-P2（ASCII 门）决策记录：字面管够（≥8192）跳 pin；稀疏回补 pin。
+/// `sh` 在 9000 个 `sh-*.log` 中只给字面（上海被门挡掉——这是决策，不是 bug）；
+/// `shang` 字面稀疏，回补 pin 后上海必须在。
+#[test]
+fn ascii_gate_skips_pin_when_literal_abundant() {
+    let mut owned: Vec<String> = (0..9000).map(|i| format!("sh-{i:05}.log")).collect();
+    owned.push("上海.md".to_string());
+    let refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+    let engine = engine_from_names(&refs);
+    // search() 默认截断 1000，看 total（search_paged 不截断总数）。
+    assert_eq!(total_of(&engine, "sh", true), 9000);
+    // 前 200 条里不应出现上海（门挡掉 pin；字面页已满）。
+    let n = names(&engine, "sh", true);
+    assert!(
+        !n.iter().any(|s| s.contains("上海")),
+        "abundant-literal 下跳 pin"
+    );
+}
+
+#[test]
+fn ascii_gate_falls_back_to_pin_when_literal_sparse() {
+    let engine = engine_from_names(&["a.txt", "b.txt", "上海.md"]);
+    let n = names(&engine, "shang", true);
+    assert_hit_contains(&n, "上海");
 }
 
 /// 拼音剪枝一致性回归：trigram 边车挂载前后，拼音 Auto / 字面查询结果必须逐条一致。

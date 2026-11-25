@@ -30,6 +30,8 @@ const PLAN_CHUNK: usize = 50_000;
 const STASH_CAP: usize = 100_000;
 /// snippet 每页填充上限（tantivy 按 doc 生成，有界成本）。
 pub(crate) const SNIPPET_PER_PAGE: usize = 10;
+/// 全窗口摘要上限（AnyTXT 式编号命中列表；单文档一次回读，多窗渲染）。
+pub(crate) const SNIPPET_ALL_CAP: usize = 50;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StateKind {
@@ -783,6 +785,35 @@ pub(crate) fn snippets_for(
         .into_iter()
         .filter_map(|(k, (html, total, window))| rev.remove(&k).map(|idx| (idx, (html, total, window))))
         .collect()
+}
+
+/// 全窗口摘要（AnyTXT 式编号命中列表用）：单 entry 全窗一次回读。
+/// 返回 `(Vec<(实际窗口号, html)>, 全文匹配点总数)`；`cap` 截断返回个数。
+pub(crate) fn snippets_all_for(
+    engine: &SearchEngine,
+    query: &str,
+    entry_index: u32,
+    cap: usize,
+) -> Option<(Vec<(usize, String)>, usize)> {
+    let cidx = hub().lock().ok().and_then(|g| g.index.clone())?;
+    let key = {
+        let g = engine.index_store();
+        let frn = g.frns.get(entry_index as usize).copied()?;
+        let mut found = None;
+        for (slot, vol) in g.volumes.iter().enumerate() {
+            if g.frn_to_entry.get_scoped(frn, slot as u32) == Some(entry_index) {
+                found = Some(findx2_content::doc_key(
+                    &volume_key_for(&vol.volume_id, slot),
+                    frn,
+                ));
+                break;
+            }
+        }
+        found?
+    };
+    cidx
+        .all_windows_for_key(query, key, cap.max(1))
+        .unwrap_or_default()
 }
 
 fn tmp_build_dir(final_cdir: &Path) -> PathBuf {

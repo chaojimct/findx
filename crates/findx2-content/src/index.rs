@@ -559,6 +559,47 @@ impl ContentIndex {
         Ok(out)
     }
 
+    /// 按 key 取全部匹配窗口（AnyTXT 式编号列表用）：一次回读，逐窗渲染。
+    /// 返回 `(Vec<(实际窗口号, html)>, 全文匹配点总数)`；`cap` 截断返回个数。
+    pub fn all_windows_for_key(
+        &self,
+        query_text: &str,
+        key: u64,
+        cap: usize,
+    ) -> Result<Option<(Vec<(usize, String)>, usize)>> {
+        if cap == 0 {
+            return Ok(None);
+        }
+        self.reader.reload()?;
+        let searcher = self.reader.searcher();
+        let mut tok = HybridTokenizer::new();
+        let terms = crate::snippet::query_terms(query_text, &mut tok);
+        if terms.is_empty() {
+            return Ok(None);
+        }
+        let tq = tantivy::query::TermQuery::new(
+            Term::from_field_u64(self.fields.key, key),
+            IndexRecordOption::Basic,
+        );
+        let top = searcher.search(&tq, &TopDocs::with_limit(1).order_by_score())?;
+        let Some((_, addr)) = top.first() else {
+            return Ok(None);
+        };
+        let doc: tantivy::TantivyDocument = searcher.doc(*addr)?;
+        let path = doc
+            .get_first(self.fields.path)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if path.is_empty() {
+            return Ok(None);
+        }
+        let mtime = doc
+            .get_first(self.fields.mtime)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        Ok(self.snippets.all_windows(path, mtime, query_text, &terms, cap))
+    }
+
     /// 返回按 BM25 排序的 (volume_id, frn, score, snippet)。
     pub fn search(&self, query_text: &str, limit: usize) -> Result<Vec<ContentHit>> {
         self.reader.reload()?;

@@ -257,6 +257,14 @@ pub struct MainWindow {
     resume_search_when_connected: bool,
     search_gen: u64,
     search_keyboard: crate::interaction_logic::SearchKeyboard,
+    /// P0-1：最后一次发出的查询 ID（每次击键搜索 +1；翻页沿用，不自增）。
+    /// 回包 `request_id` 对不上即过期丢弃；`__CANCELLED__` 静默丢弃。
+    search_request_id: u64,
+    /// P0-2：当前输入框固定的会话 ID（主框 1；范围框每次新建递增；返回全局恢复）。
+    /// 同会话 + needle 收窄时 service 侧复用基结果集免全表扫描。
+    search_session_id: u64,
+    /// 会话 ID 分配器（0 保留 = 未跟踪）。
+    next_search_session_id: u64,
     status_gen: u64,
     status_inflight: bool,
     preview_diagnostics: bool,
@@ -275,6 +283,13 @@ pub struct MainWindow {
     snippet_window: usize,
     /// 当前预览摘要的全文匹配点总数（0 = 未知；首屏命中自带，补取时回填）。
     snippet_total: u32,
+    /// AnyTXT 式编号命中列表：全部窗口摘要（window, html），按需拉取后缓存。
+    /// 点击行即跳窗（复用 fetch_snippet_window）；新目标/新查询时清空。
+    snippet_list: Vec<(usize, String)>,
+    /// 列表面板展开态（默认收起，只占 pager 行一个按钮）。
+    snippet_list_open: bool,
+    /// 列表拉取中（按钮置灰防重复请求）。
+    snippet_list_loading: bool,
     /// 摘要 tab 是否激活（office 预览 [命中上下文|系统版式|文字摘录] 三态之一）。
     preview_snippet_view: bool,
     /// 用户手动点过预览展示 tab 后锁定：后到的摘要不再抢回激活态。
@@ -501,6 +516,9 @@ impl MainWindow {
             resume_search_when_connected: false,
             search_gen: 0,
             search_keyboard: Default::default(),
+            search_request_id: 0,
+            search_session_id: 1,
+            next_search_session_id: 2,
             status_gen: 0,
             status_inflight: false,
             preview_diagnostics: false,
@@ -519,6 +537,9 @@ impl MainWindow {
             preview_snippet: String::new(),
             snippet_window: 0,
             snippet_total: 0,
+            snippet_list: Vec::new(),
+            snippet_list_open: false,
+            snippet_list_loading: false,
             preview_snippet_view: false,
             preview_snippet_lock: false,
             last_content_width: 1100.0,
@@ -1031,7 +1052,15 @@ impl MainWindow {
                 .min(mix_limit.max(1) as usize)
         };
         let slow_hint = Self::content_slow_hint(&query, &content_state);
-        let rx = ipc.search(
+        // P0-1/P0-2：每次击键搜索 request_id +1，会话按输入框固定；
+        // 先取消在飞的上一查询（fire-and-forget，service 幂等），防堆积。
+        self.search_request_id = self.search_request_id.wrapping_add(1).max(1);
+        let rid = self.search_request_id;
+        let sid = self.search_session_id;
+        if rid > 1 {
+            ipc.cancel_search(endpoint.clone(), rid - 1);
+        }
+        let rx = ipc.search_tracked(
             endpoint,
             query,
             pinyin,
@@ -1039,12 +1068,24 @@ impl MainWindow {
             pinyin_full,
             fetch,
             0,
+            rid,
+            sid,
         );
         self._search_task = Some(cx.spawn(async move |this, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("IPC 通道已关闭".into()));
             this.update(cx, |this, cx| {
                 if this.search_gen != generation {
                     return;
+                }
+                // P0-1：过期回包 / 取消确认一律静默丢弃（不清空旧结果、不弹错）。
+                match &result {
+                    Ok(out)
+                        if crate::ipc::is_stale_response(out.request_id, this.search_request_id) =>
+                    {
+                        return
+                    }
+                    Err(e) if crate::ipc::is_cancelled_err(e) => return,
+                    _ => {}
                 }
                 this.loading = false;
                 let mut pending_key = None;
@@ -1185,7 +1226,10 @@ impl MainWindow {
             PAGE_SIZE.min(mix_limit.max(1) as usize)
         };
         let slow_hint = Self::content_slow_hint(&query, &content_state);
-        let rx = ipc.search(
+        // 翻页沿用当前 request_id/session_id（不自增、不取消；回包照样验旧丢弃）。
+        let rid = self.search_request_id;
+        let sid = self.search_session_id;
+        let rx = ipc.search_tracked(
             endpoint,
             query,
             pinyin,
@@ -1193,12 +1237,24 @@ impl MainWindow {
             pinyin_full,
             fetch,
             offset,
+            rid,
+            sid,
         );
         self._page_task = Some(cx.spawn(async move |this, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("IPC 通道已关闭".into()));
             let _ = this.update(cx, |this, cx| {
                 if this.search_gen != generation || this.hits.len() != offset {
                     return;
+                }
+                // P0-1：翻页回包同样过期/取消丢弃（不置 page_error，避免误报）。
+                match &result {
+                    Ok(out)
+                        if crate::ipc::is_stale_response(out.request_id, this.search_request_id) =>
+                    {
+                        return
+                    }
+                    Err(e) if crate::ipc::is_cancelled_err(e) => return,
+                    _ => {}
                 }
                 this.page_loading = false;
                 match result {
@@ -1496,6 +1552,115 @@ impl MainWindow {
                         this.fetch_snippet_window(entry_idx, w, true, cx);
                     })),
             )
+            .when(total > 1, |row| {
+                let list_label = if self.snippet_list_loading {
+                    SharedString::from("拉取中…")
+                } else {
+                    SharedString::from(format!(
+                        "全部{total}处{}",
+                        if self.snippet_list_open { "▾" } else { "▸" }
+                    ))
+                };
+                row.child(
+                    Button::new("snippet-list")
+                        .ghost()
+                        .label(list_label)
+                        .disabled(self.snippet_list_loading)
+                        .h(px(22.))
+                        .px_2()
+                        .tooltip("编号命中列表（一次拉全窗，点击行号跳窗）")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.snippet_list_open {
+                                this.snippet_list_open = false;
+                                cx.notify();
+                                return;
+                            }
+                            if !this.snippet_list.is_empty() {
+                                this.snippet_list_open = true;
+                                cx.notify();
+                                return;
+                            }
+                            let Some(entry_idx) =
+                                this.active_workspace_hit().map(|h| h.entry_idx)
+                            else {
+                                return;
+                            };
+                            this.fetch_snippet_list(entry_idx, cx);
+                        })),
+                )
+            })
+    }
+
+    /// AnyTXT 式编号命中列表：行号 badge + 单行摘要；点 badge 即跳窗。
+    /// 当前窗行高亮；行数 = service 回传窗数（cap 50 截断，末尾明示）。
+    fn snippet_list_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tokens = Self::tokens(cx);
+        let cur = self.snippet_window;
+        let total = self.snippet_total as usize;
+        let rows = self.snippet_list.clone();
+        let shown = rows.len();
+        v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .gap_px()
+            .children(rows.into_iter().map(|(w, html)| {
+                let (plain, _) = search_logic::snippet_plain_and_ranges(&html);
+                let one: String = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+                let short: String = if one.chars().count() > 96 {
+                    one.chars().take(96).collect::<String>() + "…"
+                } else {
+                    one
+                };
+                let badge = Button::new(SharedString::from(format!("snippet-goto-{w}")))
+                    .ghost()
+                    .label(format!("{}", w + 1))
+                    .selected(w == cur)
+                    .h(px(20.))
+                    .px_2()
+                    .tooltip(format!("跳到第 {} 处", w + 1))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let Some(entry_idx) =
+                            this.active_workspace_hit().map(|h| h.entry_idx)
+                        else {
+                            return;
+                        };
+                        if !this.snippet_list_open {
+                            return;
+                        }
+                        this.preview_snippet_lock = true;
+                        this.fetch_snippet_window(entry_idx, w, true, cx);
+                    }));
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .child(badge)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(if w == cur {
+                                tokens.text_primary
+                            } else {
+                                tokens.text_secondary
+                            })
+                            .child(short),
+                    )
+            }))
+            .when(total > shown, |v| {
+                v.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .text_color(tokens.text_tertiary)
+                        .child(format!(
+                            "共 {total} 处，只列前 {shown}（上一个/下一个可达其余）"
+                        )),
+                )
+            })
     }
 
     /// 按需取指定窗口的摘要（选中行补取 + 上一个/下一个翻页共用）。
@@ -1573,6 +1738,70 @@ impl MainWindow {
         .detach();
     }
 
+    /// AnyTXT 式编号命中列表：一次拉全窗（cap 50，service 侧钳制），点击行即跳窗。
+    /// 复用单窗缓存（service 侧拉全窗时顺手写入），翻页按钮仍走原单窗通道。
+    /// 新目标/新查询时面板与缓存一起清空（见 request_preview）。
+    fn fetch_snippet_list(&mut self, entry_idx: u32, cx: &mut Context<Self>) {
+        if self.workspace.mode != ViewMode::Search || self.preview_file.is_some() {
+            return;
+        }
+        if !self.session.read(cx).settings.content_snippet {
+            return;
+        }
+        if self.snippet_list_loading {
+            return;
+        }
+        let sent = self.current_query(cx);
+        if !sent.to_ascii_lowercase().contains("content:") {
+            return;
+        }
+        let (endpoint, ipc) = self
+            .session
+            .read_with(cx, |s, _| (s.endpoint.clone(), s.ipc.clone()));
+        let search_gen_at_req = self.search_gen;
+        self.snippet_list_loading = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = ipc
+                .request(
+                    endpoint,
+                    findx2_ipc::IpcRequest::ContentSnippetsAll {
+                        query: sent,
+                        entry_index: entry_idx,
+                        cap: 50,
+                    },
+                )
+                .await
+                .unwrap_or_else(|_| Err("IPC 通道已关闭".into()));
+            let _ = this.update(cx, |this, cx| {
+                this.snippet_list_loading = false;
+                if this.search_gen != search_gen_at_req {
+                    return;
+                }
+                let Ok(findx2_ipc::IpcResponse::ContentSnippets { snippets }) = result
+                else {
+                    return;
+                };
+                // 只收本 entry 的窗（service 原样回显 entry_idx；防御性过滤）。
+                let mut list: Vec<(usize, String)> = snippets
+                    .into_iter()
+                    .filter(|s| s.entry_idx == entry_idx)
+                    .map(|s| (s.window, s.html))
+                    .collect();
+                list.sort_by_key(|(w, _)| *w);
+                list.dedup_by_key(|(w, _)| *w);
+                if list.is_empty() {
+                    cx.notify();
+                    return;
+                }
+                this.snippet_list = list;
+                this.snippet_list_open = true;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 取自渲染 PDF 当前页的命中框（高亮黄框用；失败/无命中静默无高亮）。
     /// 只在全文搜索 + 自渲染 PDF 页（非原生处理器）时请求。
     fn fetch_pdf_boxes(&mut self, entry_idx: u32, page: u32, path: String, cx: &mut Context<Self>) {
@@ -1644,6 +1873,9 @@ impl MainWindow {
             self._preview_task = None;
             self.preview = PreviewState::empty();
             self.preview_snippet.clear();
+            self.snippet_list.clear();
+            self.snippet_list_open = false;
+            self.snippet_list_loading = false;
             self.preview_snippet_view = false;
             return;
         }
@@ -1669,6 +1901,9 @@ impl MainWindow {
             self.office_text_only = false;
             self.preview = PreviewState::empty();
             self.preview_snippet.clear();
+            self.snippet_list.clear();
+            self.snippet_list_open = false;
+            self.snippet_list_loading = false;
             self.preview_snippet_view = false;
             self._preview_task = None;
             return;
@@ -1676,6 +1911,10 @@ impl MainWindow {
         self.preview_snippet = hit.snippet.clone();
         self.snippet_window = hit.snippet_window;
         self.snippet_total = hit.snippet_total;
+        // 新目标：编号列表清空（旧文档的窗与新目标无关），收起面板。
+        self.snippet_list.clear();
+        self.snippet_list_open = false;
+        self.snippet_list_loading = false;
         // 新目标默认激活摘要 tab（有摘要才显示该 tab）；手动点过 tab 的选择不受影响
         // 由各 tab 按钮自行加锁（见 toggle 行），这里先恢复未锁定。
         self.preview_snippet_view = !self.preview_snippet.is_empty();
@@ -2591,6 +2830,19 @@ impl MainWindow {
                                         .child(self.snippet_pager(cx)),
                                 )
                             })
+                            // 编号命中列表（AnyTXT 式）：展开时列全部窗口，点行号跳窗。
+                            .when(self.snippet_list_open, |view| {
+                                view.child(
+                                    div()
+                                        .w_full()
+                                        .flex_shrink_0()
+                                        .px_3()
+                                        .py_1()
+                                        .border_b_1()
+                                        .border_color(tokens.border_soft)
+                                        .child(self.snippet_list_view(cx)),
+                                )
+                            })
                             .child(
                                 div().w_full().text_sm().child(
                                     StyledText::new(plain).with_highlights(
@@ -2700,6 +2952,28 @@ impl MainWindow {
                             .border_b_1()
                             .border_color(tokens.border_soft)
                             .child(self.snippet_pager(cx)),
+                    )
+                },
+            )
+            // 编号命中列表（office 摘要 tab 同款，位置在操作栏与正文之间）。
+            .when(
+                self.preview_snippet_view
+                    && self.snippet_list_open
+                    && self
+                        .preview
+                        .meta
+                        .as_ref()
+                        .is_some_and(|m| preview_has_mode_tabs(&m.path)),
+                |view| {
+                    view.child(
+                        div()
+                            .w_full()
+                            .flex_shrink_0()
+                            .px_2()
+                            .py_1()
+                            .border_b_1()
+                            .border_color(tokens.border_soft)
+                            .child(self.snippet_list_view(cx)),
                     )
                 },
             )

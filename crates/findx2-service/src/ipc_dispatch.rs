@@ -91,6 +91,7 @@ pub(crate) fn req_kind_label(r: &IpcRequest) -> &'static str {
         IpcRequest::ContentBuild { .. } => "ContentBuild",
         IpcRequest::ContentCancel => "ContentCancel",
         IpcRequest::ContentSnippets { .. } => "ContentSnippets",
+        IpcRequest::ContentSnippetsAll { .. } => "ContentSnippetsAll",
         IpcRequest::ContentPdfBoxes { .. } => "ContentPdfBoxes",
     }
 }
@@ -426,6 +427,51 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
             }
         }
         (IpcRequest::ContentSnippets { .. }, None) => IpcResponse::Error {
+            message: "索引加载中，请稍候…".into(),
+        },
+        (
+            IpcRequest::ContentSnippetsAll {
+                query,
+                entry_index,
+                cap,
+            },
+            Some(eng),
+        ) => {
+            // 编号命中列表：单文档全窗一次回读（cap 钳制，逐窗 DTO 复用展示）。
+            let cap = cap.min(crate::content_index::SNIPPET_ALL_CAP).max(1);
+            match QueryParser::parse(&query) {
+                Ok(pq) => {
+                    let needles = content_needles(&pq);
+                    if needles.is_empty() {
+                        IpcResponse::ContentSnippets { snippets: vec![] }
+                    } else {
+                        let snippets = crate::content_index::snippets_all_for(
+                            &eng,
+                            &needles.join(" "),
+                            entry_index,
+                            cap,
+                        )
+                        .map(|(windows, total)| {
+                            windows
+                                .into_iter()
+                                .map(|(window, html)| findx2_ipc::ContentSnippetDto {
+                                    entry_idx: entry_index,
+                                    html,
+                                    window,
+                                    total: total as u32,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                        IpcResponse::ContentSnippets { snippets }
+                    }
+                }
+                Err(e) => IpcResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+        (IpcRequest::ContentSnippetsAll { .. }, None) => IpcResponse::Error {
             message: "索引加载中，请稍候…".into(),
         },
         (

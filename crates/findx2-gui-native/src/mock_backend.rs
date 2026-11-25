@@ -141,7 +141,9 @@ fn handle_request(req: IpcRequest) -> IpcResponse {
         IpcRequest::ContentBuild { .. } | IpcRequest::ContentCancel => IpcResponse::Error {
             message: "mock backend does not support content indexing".into(),
         },
-        IpcRequest::ContentSnippets { .. } => IpcResponse::ContentSnippets { snippets: vec![] },
+        IpcRequest::ContentSnippets { .. } | IpcRequest::ContentSnippetsAll { .. } => {
+            IpcResponse::ContentSnippets { snippets: vec![] }
+        }
         IpcRequest::ContentPdfBoxes { .. } => IpcResponse::ContentPdfBoxes {
             rects: Vec::new(),
             page_w: 0.0,

@@ -22,6 +22,16 @@ pub struct SearchOutcome {
 /// `search_session` 收到此前缀应静默丢弃（同 ID 的新查询已在路上），不得弹错、不得清空旧结果。
 pub const CANCELLED_PREFIX: &str = "__CANCELLED__:";
 
+/// P0-1：`Err` 是否为"本次被替代"确认（调用方静默丢弃，不碰行/状态）。
+pub fn is_cancelled_err(err: &str) -> bool {
+    err.starts_with(CANCELLED_PREFIX)
+}
+
+/// P0-1：回包是否过期（`request_id` 与最新不一致；0 = 未跟踪的老调用/老服务，放行）。
+pub fn is_stale_response(outcome_rid: u64, latest_rid: u64) -> bool {
+    outcome_rid != 0 && outcome_rid != latest_rid
+}
+
 pub type IpcResult<T> = Result<T, String>;
 
 enum Job {
@@ -30,6 +40,11 @@ enum Job {
         req: IpcRequest,
         cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         reply: oneshot::Sender<IpcResult<IpcResponse>>,
+    },
+    /// P0-1 取消（fire-and-forget；service 幂等回 Cancelled，本侧直接丢弃）。
+    Cancel {
+        endpoint: String,
+        request_id: u64,
     },
     Search {
         endpoint: String,
@@ -154,6 +169,17 @@ impl IpcClient {
         let _ = self.tx.send(Job::Ping { endpoint, reply });
         rx
     }
+
+    /// P0-1：取消在飞的上一个查询（fire-and-forget；`request_id == 0` 无意义，直接返回）。
+    pub fn cancel_search(&self, endpoint: String, request_id: u64) {
+        if request_id == 0 {
+            return;
+        }
+        let _ = self.tx.send(Job::Cancel {
+            endpoint,
+            request_id,
+        });
+    }
 }
 
 async fn dispatch(job: Job) {
@@ -215,6 +241,12 @@ async fn dispatch(job: Job) {
                     .await
                     .unwrap_or_else(|_| Err("Status 响应超时（5 秒）".into()));
             let _ = reply.send(result);
+        }
+        Job::Cancel {
+            endpoint,
+            request_id,
+        } => {
+            tokio::spawn(cancel_search(endpoint, request_id));
         }
         Job::Ping { endpoint, reply } => {
             let _ = reply.send(ipc_ping(endpoint).await);
@@ -326,6 +358,38 @@ async fn ipc_search(
 async fn ipc_status(endpoint: String) -> IpcResult<IpcResponse> {
     let client = connect_endpoint(&endpoint).await?;
     write_request(client, IpcRequest::Status).await
+}
+
+/// P0-1 取消发送（后台 detached；响应直接丢弃，service 侧幂等）。
+async fn cancel_search(endpoint: String, request_id: u64) {
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        async {
+            let client = connect_endpoint(&endpoint).await?;
+            let req = IpcRequest::SearchCancel { request_id };
+            let _ = write_request(client, req).await;
+            Ok::<_, String>(())
+        },
+    )
+    .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_err_and_stale_response_predicates() {
+        // 取消确认静默丢弃。
+        assert!(is_cancelled_err("__CANCELLED__:7"));
+        assert!(!is_cancelled_err("管道响应超时（15 秒）"));
+        assert!(!is_cancelled_err(""));
+        // request_id 对不上即过期；0 放行（老调用/老服务）。
+        assert!(is_stale_response(7, 9));
+        assert!(!is_stale_response(9, 9));
+        assert!(!is_stale_response(0, 9));
+        assert!(!is_stale_response(0, 0));
+    }
 }
 
 async fn ipc_ping(endpoint: String) -> IpcResult<()> {

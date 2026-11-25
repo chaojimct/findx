@@ -111,6 +111,16 @@ pub enum IpcRequest {
         #[serde(default)]
         window: usize,
     },
+    /// 取某文档的全部摘要窗（AnyTXT 式编号命中列表用；一次回读，多窗渲染）。
+    /// query 取 content: 取值原文；entry_index 为结果行号；cap 为返回上限
+    ///（防病态大文件，service 侧钳到 `SNIPPET_ALL_CAP`）。
+    /// 应答复用 `ContentSnippets`（逐窗 DTO，`window` 为实际窗口号）。
+    ContentSnippetsAll {
+        query: String,
+        entry_index: u32,
+        #[serde(default = "default_snippet_all_cap")]
+        cap: usize,
+    },
     /// 取 PDF 单页命中框（预览高亮用；与 `ContentSnippets` 同源解析 query）。
     /// query 取 content: 取值原文；entry_index 为结果行号；page 为预览侧当前页。
     /// 失败/无命中 → 空 rects（预览降级为无高亮，不报错）。
@@ -153,6 +163,11 @@ fn default_true() -> bool {
 
 fn default_metadata_ready() -> bool {
     true
+}
+
+/// `ContentSnippetsAll.cap` 缺省上限（与 service 侧 `SNIPPET_ALL_CAP` 对齐）。
+fn default_snippet_all_cap() -> usize {
+    50
 }
 
 /// 全文内容索引状态（`StatusResult.content_state` 取值）。
@@ -472,6 +487,33 @@ mod tests {
                 (IpcRequest::ContentCancel, IpcRequest::ContentCancel) => {}
                 _ => panic!("content request roundtrip mismatch: {j}"),
             }
+        }
+        // 全窗请求往返（含 cap；老对端缺 cap 时走缺省 50）。
+        let r = IpcRequest::ContentSnippetsAll {
+            query: "content:machuntian".into(),
+            entry_index: 7,
+            cap: 50,
+        };
+        let j = serde_json::to_string(&r).unwrap();
+        let back: IpcRequest = serde_json::from_str(&j).unwrap();
+        match back {
+            IpcRequest::ContentSnippetsAll {
+                query,
+                entry_index,
+                cap,
+            } => {
+                assert_eq!(query, "content:machuntian");
+                assert_eq!(entry_index, 7);
+                assert_eq!(cap, 50);
+            }
+            _ => panic!("snippets-all roundtrip mismatch: {j}"),
+        }
+        let old_all: IpcRequest =
+            serde_json::from_str(r#"{"type":"content_snippets_all","query":"content:x","entry_index":3}"#)
+                .unwrap();
+        match old_all {
+            IpcRequest::ContentSnippetsAll { cap, .. } => assert_eq!(cap, 50),
+            _ => panic!(),
         }
         // 老 service 的 Status（无 content_* 字段）按缺省值解析。
         let old: IpcResponse = serde_json::from_str(

@@ -1147,13 +1147,37 @@ impl SearchEngine {
         //
         // pin_res 非空意味着调用方已经决定要走拼音匹配，整张表跑预编译的 IbRegex。
         // 这是 IbEverythingExt ms 响应的关键。
+        //
+        // P0-P2（ASCII 门）：纯 ASCII + Auto 时字面先行；字面管够（≥ 页缓存 Top-K，
+        // 与 sort_top_k 同口径）即跳过 pin 全表 IbRegex（打字链提速）；
+        // 字面稀疏时仍走 pin union（`sh`→上海这类首字母召回不丢，保持现有单测语义）。
+        // 决策记录：硬跳（字面非空即跳）会丢 headline 拼音召回，见 pinyin_initials；
+        // 故按"盖住首屏"阈值软跳。
+        const PIN_SKIP_THRESHOLD: usize = PAGE_CACHE_TOP;
         let mut hits = if !pin_res.is_empty() && no_ext_filter && no_complex_name {
             #[cfg(feature = "pinyin")]
             {
-                // 拼音候选剪枝：lita 匹配要求名字含 needle 字面（trigram 可检）
-                // 或含拼音字符（cjk_names 可检），二者必居其一 → 候选是命中超集。
-                let cands = pinyin_candidate_ids(store, q);
-                fused_scan_pinyin(store, overlay, q, pin_res, cands, cancel)?
+                if matches!(opt.pinyin_match_mode, PinyinMatchMode::Auto)
+                    && ascii_needles_only(q)
+                {
+                    let literal = match trigram_candidate_ids(store, q) {
+                        Some(ids) => fused_scan_cand(store, overlay, q, &ids, cancel)?,
+                        None => fused_scan(store, overlay, q, cancel)?,
+                    };
+                    if literal.len() >= PIN_SKIP_THRESHOLD {
+                        literal
+                    } else {
+                        // 拼音候选剪枝：lita 匹配要求名字含 needle 字面（trigram 可检）
+                        // 或含拼音字符（cjk_names 可检），二者必居其一 → 候选是命中超集。
+                        let cands = pinyin_candidate_ids(store, q);
+                        fused_scan_pinyin(store, overlay, q, pin_res, cands, cancel)?
+                    }
+                } else {
+                    // 拼音候选剪枝：lita 匹配要求名字含 needle 字面（trigram 可检）
+                    // 或含拼音字符（cjk_names 可检），二者必居其一 → 候选是命中超集。
+                    let cands = pinyin_candidate_ids(store, q);
+                    fused_scan_pinyin(store, overlay, q, pin_res, cands, cancel)?
+                }
             }
             #[cfg(not(feature = "pinyin"))]
             {
@@ -2143,6 +2167,29 @@ fn collect_pinyin_needles(q: &ParsedQuery, opt: &SearchOptions) -> Vec<String> {
         }
     }
     out
+}
+
+/// P0-P2（ASCII 门）：参与 pin 收集的 needle 是否全为纯 ASCII。
+/// 全 ASCII ⇒ 字面先行有意义（含 CJK 时放行 pin 路径，不改变中文行为）。
+#[cfg(feature = "pinyin")]
+fn ascii_needles_only(q: &ParsedQuery) -> bool {
+    let mut any = false;
+    for s in q.name_terms.iter().chain(q.substring.iter()) {
+        if s.is_empty() {
+            continue;
+        }
+        if !s.is_ascii() {
+            return false;
+        }
+        any = true;
+    }
+    // starts_with/ends_with 同样参与 pin 收集；含非 ASCII 同样放行 pin 路径。
+    for s in q.starts_with.iter().chain(q.ends_with.iter()) {
+        if !s.is_empty() && !s.is_ascii() {
+            return false;
+        }
+    }
+    any
 }
 
 /// 一次性编译拼音 matcher，下游 par_iter / highlight 全部复用。
