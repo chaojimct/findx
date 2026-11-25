@@ -224,8 +224,8 @@ mod com {
         use windows::Win32::System::Ole::DISPID_PROPERTYPUT;
         unsafe {
             let id = dispid(disp, name)?;
-            // COM 参数逆序。
-            args.reverse();
+            // rgvarg[0] 是最后一个形参：调用方一律按“声明逆序”传参，
+            // 这里不再翻转（翻转曾把 Open/Execute 全搞错，0x80020005）。
             // 属性赋值必须带具名参数 DISPID_PROPERTYPUT，否则 Word 直接拒收。
             let is_put = flags & 4 != 0;
             let mut named = DISPID_PROPERTYPUT;
@@ -597,9 +597,10 @@ impl LiveSession {
             // ActiveWindow.ScrollIntoView(Range, true)（Word/WPS 同口径验证通过）。
             if let Ok(range) = sel.get("Range") {
                 if let Ok(win) = self.app.get("ActiveWindow") {
+                    // rgvarg 顺序（声明逆序）：ScrollIntoView(Object, Start) → [Start, Object]。
                     let _ = win.call(
                         "ScrollIntoView",
-                        vec![C::v_disp(range.raw()), C::v_bool(true)],
+                        vec![C::v_bool(true), C::v_disp(range.raw())],
                     );
                 }
             }
