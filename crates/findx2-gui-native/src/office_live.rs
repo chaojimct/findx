@@ -455,6 +455,11 @@ impl LiveSession {
             let _ = writeln!(std::io::stderr(), "[live] visible ok");
         }
         let _ = app.put_bool("DisplayAlerts", false);
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "[live] alerts ok");
+        }
+        let _ = app.put_bool("DisplayAlerts", false);
 
         // 打开目标：先试只读源文件；needs_paint 则直接用 temp 副本。
         let (open_path, temp_copy) = if needs_paint {
@@ -465,6 +470,10 @@ impl LiveSession {
         } else {
             (path.to_string(), None)
         };
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "[live] staging ok open_path={open_path}");
+        }
         let doc = match open_document(&app, engine, &open_path) {
             Ok(d) => d,
             Err(e) => {
@@ -724,6 +733,10 @@ fn open_document(
     engine: LiveEngine,
     path: &str,
 ) -> Result<com::Dispatch, String> {
+    {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "[live] open_document enter kind={:?}", engine.kind());
+    }
     match engine.kind() {
         LiveKind::Word => {
             let docs = app.get("Documents")?;
