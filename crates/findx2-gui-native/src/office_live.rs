@@ -469,8 +469,7 @@ impl LiveSession {
     pub fn resize(&self, x: i32, y: i32, w: i32, h: i32) {
         if self.embedded_hwnd == 0 {
             return;
-        }
-        unsafe {
+        }        unsafe {
             use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::*};
             let _ = MoveWindow(
                 HWND(self.embedded_hwnd as *mut _),
@@ -480,6 +479,19 @@ impl LiveSession {
                 h.max(1),
                 true,
             );
+        }
+    }
+
+    /// 云文档窗口稍后才出现时重找并嵌入（open 时 h=0 的补偿）。
+    pub fn reembed_if_needed(&mut self) {
+        if self.embedded_hwnd != 0 || self.host_hwnd == 0 {
+            return;
+        }
+        if let Ok(h) = find_app_window(self.engine) {
+            if h != 0 {
+                self.embedded_hwnd = h;
+                embed(h, self.host_hwnd);
+            }
         }
     }
 
@@ -940,9 +952,13 @@ pub mod host {
         let path = path.to_string();
         let cancel_in = cancel.clone();
         std::thread::spawn(move || {
-            let res = sta_main(&path, engine, &needles, jump_index, owner, &state, &cancel_in);
+            // 就绪（打开+嵌入完成）即回执；之后驻留做位置跟随直到 cancel。
+            let res = sta_main(&path, engine, &needles, jump_index, owner, &state, &cancel_in, &tx);
             state.alive.store(false, Ordering::Release);
-            let _ = tx.send(res);
+            // sta_main 内已发送就绪；这里只处理“就绪前失败”的回执。
+            if res.is_err() {
+                let _ = tx.send(res);
+            }
         });
         let start = Instant::now();
         loop {
@@ -976,18 +992,28 @@ pub mod host {
         owner: usize,
         surface: &Arc<LiveSurface>,
         cancel: &Cancel,
+        ready: &mpsc::SyncSender<Result<(), String>>,
     ) -> Result<(), String> {
         // 全部 COM 对象归属本 STA 线程；退出时 Quit + temp 清理。
         let needs_paint = !needles.is_empty();
-        let sess = LiveSession::open(path, engine, owner, needs_paint)?;
+        let mut sess = LiveSession::open(path, engine, owner, needs_paint)?;
         if engine.kind() == LiveKind::Word && !needles.is_empty() {
             let _ = sess.word_highlight_all(needles);
             let first = needles.first().map(|s| s.as_str()).unwrap_or("");
             let _ = sess.word_jump(first, jump_index);
         }
+        // 就绪回执（窗口可能稍后才可见——云文档下载慢时 find_app_window 为 0，
+        // 位置循环里按可见性 show/hide，不阻塞就绪）。
+        let _ = ready.send(Ok(()));
         // 位置跟随：GPUI canvas 每帧 place()，这里 20ms 轮询 MoveWindow。
         let mut last: Option<[i32; 4]> = None;
+        let mut ticks: u64 = 0;
         while !cancel.load(Ordering::Acquire) {
+            ticks += 1;
+            if sess.embedded_hwnd == 0 && ticks % 25 == 0 {
+                // 云文档窗口稍后出现：约每 500ms 重找一次。
+                sess.reembed_if_needed();
+            }
             let cur = surface
                 .position
                 .lock()
