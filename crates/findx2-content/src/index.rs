@@ -31,6 +31,14 @@ use crate::{Error, Result};
 pub const SCHEMA_VERSION: u32 = 2;
 pub const TOKENIZER_JIEBA: &str = "jieba_findx";
 
+/// 列表摘要单文件上限（字节）：超过直接缺席、选中后单窗补取。
+/// 实测 18MB xlsx 解析一次约 25 秒、7.6MB js 约 5 秒——列表装配等不起；
+/// 4MB 以下 office/文本通常在数百毫秒内完成。
+pub const SNIPPET_LIST_MAX_BYTES: u64 = 4 << 20;
+/// 列表摘要全局预算（毫秒）：`snippets_for_keys_windowed` 逐 key 检查，
+/// 超时即停（剩下的行懒取），保证搜索 format 阶段不拖过 GUI 超时。
+pub const SNIPPET_LIST_BUDGET_MS: u64 = 1000;
+
 /// 索引目录里的版本标记文件（tantivy 自家 meta.json 之外，我方 schema 版本）。
 const SCHEMA_VERSION_FILE: &str = "schema_version.json";
 
@@ -509,6 +517,11 @@ impl ContentIndex {
 
     /// 按 key 批量取第 `window_idx` 个匹配窗口的 snippet（上一个/下一个用），
     /// 返回 `key → (html, 全文匹配点总数)`；找不到/回读失败的 key 缺席。
+    ///
+    /// 列表装配有界成本（搜索超时的主因曾是这里）：
+    /// - 超大文件（`> SNIPPET_LIST_MAX_BYTES`，如十几 MB 的 xlsx 解析一次 25 秒）
+    ///   直接缺席——行不受影响，选中后按需走单窗补取；
+    /// - 全局预算 `SNIPPET_LIST_BUDGET_MS`，超时即停，剩下的行同样懒取。
     pub fn snippets_for_keys_windowed(
         &self,
         query_text: &str,
@@ -521,6 +534,7 @@ impl ContentIndex {
         if keys.is_empty() || cap == 0 {
             return Ok(out);
         }
+        let started = std::time::Instant::now();
         self.reader.reload()?;
         let searcher = self.reader.searcher();
         let mut tok = HybridTokenizer::new();
@@ -529,6 +543,9 @@ impl ContentIndex {
             return Ok(out);
         }
         for key in keys.iter().take(cap) {
+            if started.elapsed().as_millis() as u64 >= SNIPPET_LIST_BUDGET_MS {
+                break;
+            }
             let tq = tantivy::query::TermQuery::new(
                 Term::from_field_u64(self.fields.key, *key),
                 IndexRecordOption::Basic,
@@ -549,6 +566,16 @@ impl ContentIndex {
                 .get_first(self.fields.mtime)
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
+            // 超大文件跳过列表摘要（office/大文本解析一次可达数十秒：18MB xlsx
+            // 约 25 秒）：行保留（无 snippet），选中后单窗按需补取。
+            // 用实时 stat 而不用索引里存的 size（后者在回填期可能为零/过期）；
+            // stat 不触发云占位下载，10 个 key 的开销可忽略。
+            let too_big = std::fs::metadata(path)
+                .map(|m| m.len() > SNIPPET_LIST_MAX_BYTES)
+                .unwrap_or(false);
+            if too_big {
+                continue;
+            }
             if let Some((html, total, window_used)) =
                 self.snippets
                     .for_doc_windowed(path, mtime, query_text, &terms, window_idx)

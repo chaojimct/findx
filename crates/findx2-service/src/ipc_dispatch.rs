@@ -599,13 +599,19 @@ pub(crate) fn search_ipc(
     // （否则操作符名 `content` 本身会被当关键词高亮，见 content:machuntian 误标）。
     let needles = content_needles(&pq);
     if !needles.is_empty() {
+        // 徽标判定集只需覆盖当页行（`pinyin_hit` 只打在返回的 dtos 上）：
+        // 按 `hits.len()` 取 TopDocs，与合并查询同量级（百级），毫秒级完成。
+        // 此前传 `CONTENT_FAST_CAP`（5 万）做 5 万级 TopDocs + 全量 stored 回读，
+        // 短拼音串（如 `mct`）首命中即数秒、稍有负载即超 GUI 15 秒超时 → 大面积「搜索失败」。
+        // 合并查询已按同量级 limit 顺手喂过打标缓存，多数情况此处直接命中缓存、零查询。
+        let aux_limit = hits.len().max(1);
         for needle in &needles {
             if needle.is_ascii() && (pinyin_initials || pinyin_full) {
                 let aux_set = crate::content_index::aux_pinyin_keys(
                     needle,
                     pinyin_initials,
                     pinyin_full,
-                    findx2_core::CONTENT_FAST_CAP,
+                    aux_limit,
                 );
                 if !aux_set.is_empty() {
                     // entry_idx → (volume_key, frn)，与 snippets_for 同一映射。
