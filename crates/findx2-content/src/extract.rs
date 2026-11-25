@@ -17,7 +17,7 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     // 纯文本
     "txt", "md", "markdown", "csv", "log", "ini", "cfg", "env", "properties", "text",
     // M1 富格式（专用抽取器，见 office.rs）
-    "docx", "xlsx", "pptx", "pdf",
+    "docx", "xlsx", "xls", "pptx", "pdf",
     // 代码
     "rs", "toml", "json", "json5", "xml", "html", "htm", "xhtml", "js", "mjs", "cjs", "ts",
     "mts", "cts", "jsx", "tsx", "css", "scss", "less", "sass", "py", "pyi", "go", "java",
@@ -115,8 +115,8 @@ pub fn extract_text(path: &Path) -> Result<ExtractedText> {
                 text,
             });
         }
-        "xlsx" => {
-            let text = crate::office::extract_xlsx(path)?;
+        "xlsx" | "xls" => {
+            let text = crate::office::extract_sheet_book(path)?;
             return Ok(ExtractedText {
                 raw_bytes: text.len() as u64,
                 text,
@@ -205,6 +205,7 @@ mod tests {
         assert!(file_name_supported("a.txt"));
         assert!(file_name_supported("A.TXT"));
         assert!(file_name_supported("report.DOCX"));
+        assert!(file_name_supported("report.XLS"));
         assert!(file_name_supported("main.rs"));
         // 白名单外。
         assert!(!file_name_supported("c.exe"));

@@ -6,6 +6,7 @@ license.workspace = true
 description = "findx2 全文内容索引 M0 PoC：文本抽取 + tantivy 倒排（与文件名索引解耦）"
 
 [dependencies]
+calamine = "0.38"
 tantivy = "0.27"
 tantivy-jieba = "0.21"
 encoding_rs = "0.8"

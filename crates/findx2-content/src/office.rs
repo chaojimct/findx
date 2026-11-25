@@ -112,102 +112,67 @@ pub fn extract_docx(path: &Path) -> Result<String> {
 }
 
 pub fn extract_xlsx(path: &Path) -> Result<String> {
-    let f = std::fs::File::open(path).map_err(|e| Error::Io(path.display().to_string(), e))?;
-    let mut zip = zip::ZipArchive::new(f)
-        .map_err(|e| Error::Extract(path.display().to_string(), format!("zip 打开失败: {e}")))?;
+    extract_sheet_book(path)
+}
+
+/// 老二进制 `.xls`（BIFF）：calamine 原生支持，索引/预览与 xlsx 同路。
+/// 此前该格式无文本后备，只能走系统预览处理器。
+pub fn extract_xls(path: &Path) -> Result<String> {
+    extract_sheet_book(path)
+}
+
+/// xls/xlsx（乃至 xlsb/ods，白名单只放行 xls/xlsx）统一走 calamine 结构化读：
+/// 按行列输出 `{列字母}{行号}: 值`（与旧手写解析同格式，网格预览可直接复用地址），
+/// 工作表名追加在末尾（旧行为：表名可搜，1.2.941 修过表名搜不到的教训）。
+pub(crate) fn extract_sheet_book(path: &Path) -> Result<String> {
+    use calamine::{open_workbook_auto, Data, Reader};
+    let mut book = open_workbook_auto(path)
+        .map_err(|e| Error::Extract(path.display().to_string(), format!("表格打开失败: {e}")))?;
     let mut out = String::new();
-    // sharedStrings：按下标取（sheet 引用的 <v> 是下标）。
-    let mut shared: Vec<String> = Vec::new();
-    if let Ok(mut entry) = zip.by_name("xl/sharedStrings.xml") {
-        if entry.size() <= RICH_MAX_XML_BYTES as u64 {
-            let mut xml = String::new();
-            if entry.read_to_string(&mut xml).is_ok() {
-                let mut tmp = String::new();
-                if collect_xml_text(&xml, &mut tmp).is_ok() {
-                    // sharedStrings 按 <si> 分段；简化：整段切词即可搜（丢失单元格边界可接受）。
-                    shared.push(tmp);
-                }
-            }
-        }
-    }
-    for s in &shared {
-        out.push_str(s);
-        out.push('\n');
-    }
-    // sheet 内联字符串 + 行列文本（含数字原样保留，如金额/年份可搜）。
-    let sheet_names: Vec<String> = zip
-        .file_names()
-        .filter(|n| {
-            n.starts_with("xl/worksheets/sheet") || n.starts_with("xl/chartsheets/sheet")
-        })
-        .map(|s| s.to_owned())
-        .collect();
-    for name in sheet_names {
-        let mut entry = match zip.by_name(&name) {
-            Ok(e) => e,
+    for name in book.sheet_names() {
+        let range = match book.worksheet_range(&name) {
+            Ok(r) => r,
             Err(_) => continue,
         };
-        if entry.size() > RICH_MAX_XML_BYTES as u64 {
-            continue;
-        }
-        let mut xml = String::new();
-        if entry.read_to_string(&mut xml).is_err() {
-            continue;
-        }
-        drop(entry);
-        let mut tmp = String::new();
-        if collect_xml_text(&xml, &mut tmp).is_ok() {
-            out.push_str(&tmp);
+        for (ri, row) in range.rows().enumerate() {
+            for (ci, cell) in row.iter().enumerate() {
+                if matches!(cell, Data::Empty) {
+                    continue;
+                }
+                out.push_str(&col_letters(ci));
+                out.push_str(&(ri + 1).to_string());
+                out.push_str(": ");
+                out.push_str(&cell.to_string());
+                out.push('\t');
+            }
             out.push('\n');
         }
     }
-    // 工作表名也可搜（1.2.941 修过 .xls 表名搜不到的问题，教训：表名别丢）。
-    if let Ok(mut entry) = zip.by_name("xl/workbook.xml") {
-        let mut xml = String::new();
-        if entry.read_to_string(&mut xml).is_ok() {
-            let mut tmp = String::new();
-            if collect_sheet_names(&xml, &mut tmp).is_ok() {
-                out.push_str(&tmp);
-            }
-        }
+    // 工作表名也可搜（旧行为保留）。
+    for name in book.sheet_names() {
+        out.push_str(&name);
+        out.push(' ');
     }
     if out.trim().is_empty() {
         return Err(Error::Extract(
             path.display().to_string(),
-            "xlsx 无文本（纯数字表也可能全空）".into(),
+            "表格无文本（纯空表走跳过）".into(),
         ));
     }
     Ok(out)
 }
 
-/// workbook.xml 的 `<sheet name="...">` 取名。
-fn collect_sheet_names(xml: &str, out: &mut String) -> std::result::Result<(), String> {
-    use quick_xml::events::Event;
-    use quick_xml::reader::Reader;
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
+/// 0 基列下标 → A..Z, AA.. 字母（网格预览与索引共用同一地址写法）。
+fn col_letters(mut ci: usize) -> String {
+    let mut s = Vec::new();
     loop {
-        match reader.read_event_into(&mut buf).map_err(|e| e.to_string())? {
-            Event::Start(ref e) | Event::Empty(ref e) => {
-                let n = e.name();
-                if n.as_ref().eq_ignore_ascii_case(b"sheet") {
-                    for attr in e.attributes().flatten() {
-                        if attr.key.as_ref().eq_ignore_ascii_case(b"name") {
-                            if let Ok(v) = attr.decode_and_unescape_value(reader.decoder()) {
-                                out.push_str(&v);
-                                out.push(' ');
-                            }
-                        }
-                    }
-                }
-            }
-            Event::Eof => break,
-            _ => {}
+        s.push((b'A' + (ci % 26) as u8) as char);
+        if ci < 26 {
+            break;
         }
-        buf.clear();
+        ci = ci / 26 - 1;
     }
-    Ok(())
+    s.iter().rev().collect()
 }
 
 pub fn extract_pptx(path: &Path) -> Result<String> {
@@ -379,6 +344,58 @@ mod tests {
         assert!(extract_docx(&p).is_err());
         assert!(extract_xlsx(&p).is_err());
         assert!(extract_pptx(&p).is_err());
+    }
+
+    #[test]
+    fn col_letters_boundaries() {
+        assert_eq!(col_letters(0), "A");
+        assert_eq!(col_letters(25), "Z");
+        assert_eq!(col_letters(26), "AA");
+        assert_eq!(col_letters(27), "AB");
+        assert_eq!(col_letters(51), "AZ");
+        assert_eq!(col_letters(52), "BA");
+    }
+
+    /// 内存合成最小 xlsx（sharedStrings + sheet + workbook），验证 calamine 路：
+    /// 共享字符串/数字原样、A1 地址、表名可搜。
+    fn make_xlsx(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        let f = std::fs::File::create(&p).unwrap();
+        let mut zip = zip::ZipWriter::new(f);
+        let opt = zip::write::SimpleFileOptions::default();
+        let parts = [
+            ("[Content_Types].xml", r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>"#),
+            ("_rels/.rels", r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#),
+            ("xl/workbook.xml", r#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="费用表" sheetId="1" r:id="rId1"/></sheets></workbook>"#),
+            ("xl/_rels/workbook.xml.rels", r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#),
+            ("xl/sharedStrings.xml", r#"<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1"><si><t>全文搜索</t></si></sst>"#),
+            ("xl/worksheets/sheet1.xml", r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1"><v>42</v></c></row></sheetData></worksheet>"#),
+        ];
+        for (n, body) in parts {
+            zip.start_file(n, opt).unwrap();
+            use std::io::Write;
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+        p
+    }
+
+    #[test]
+    fn xlsx_calamine_addresses_and_sheet_name() {
+        let d = tempfile::tempdir().unwrap();
+        let p = make_xlsx(d.path(), "a.xlsx");
+        let t = extract_xlsx(&p).unwrap();
+        assert!(t.contains("A1: 全文搜索"), "{t}");
+        assert!(t.contains("B1: 42"), "{t}");
+        assert!(t.contains("费用表"), "{t}");
+    }
+
+    #[test]
+    fn xls_garbage_is_error_not_panic() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("bad.xls");
+        std::fs::write(&p, b"not a BIFF stream at all").unwrap();
+        assert!(extract_xls(&p).is_err());
     }
 
     #[test]
