@@ -310,11 +310,21 @@ impl ContentIndex {
     /// 拼音辅索引查询（只接受纯 ASCII 查询；含 CJK 直接返回空，调用方走主索引）。
     ///
     /// 单 token（如 `qw`）：精确 OR 前缀（`^qw.*`，块首匹配）。
-    /// 连写全拼（如 `quanwen`）：切音节 OR，与 `quan wen` 同义；半个尾音降级前缀。
-    /// 多 token（如 `quan wen`）：OR 相加，命中越多排名越前。
+    /// `for_full`（全拼侧）连写全拼（如 `quanwen`）：切音节后严格连续
+    /// （Phrase），散音节文档不再召回；半个尾音降级 AND + 前缀。
+    /// 多 token（如 `quan wen`）：OR 相加，命中越多排名越前（空格写法兼容
+    /// “拼音+英文”混合，保持原语义）。
     /// 返回 (volume_id, frn, score)，与 search_ids 同形，方便服务层合并。
-    pub fn search_pinyin(&self, query_text: &str, limit: usize) -> Result<Vec<(String, u64, f32)>> {
-        use tantivy::query::{BooleanQuery, Occur, RegexQuery, TermQuery};
+    /// `for_full` 区分辅库种类：全拼侧连写查询（`machuntian`）是严格连续语义
+    /// （Phrase/AND，打一半不断流）；首字母侧保持“精确 OR 前缀”，音节词不掺入
+    /// （音节不可能出现在首字母块里，掺入只会召回噪声）。
+    pub fn search_pinyin(
+        &self,
+        query_text: &str,
+        limit: usize,
+        for_full: bool,
+    ) -> Result<Vec<(String, u64, f32)>> {
+        use tantivy::query::{BooleanQuery, Occur, PhraseQuery, RegexQuery, TermQuery};
         use tantivy::Term;
         if !query_text.is_ascii() {
             return Ok(Vec::new());
@@ -327,46 +337,58 @@ impl ContentIndex {
         self.reader.reload()?;
         let searcher = self.reader.searcher();
         let field = self.fields.body;
-        let query: Box<dyn tantivy::query::Query> = if terms.len() == 1 {
+        // 全拼侧连写（如 `machuntian`）：切音节后严格连续（Phrase），散音节
+        // 文档不再召回——“多输一个音节即收窄”，与输入直觉一致；尾部半个音节
+        // （如 `quanwe` 的 `we`）按 AND + 前缀，打一半不断流。
+        // （空格写法 `ma chun tian` 保持 OR，兼容“拼音+英文”混合查询。）
+        if for_full && terms.len() == 1 {
             let t = &terms[0];
-            // 连写全拼（如 `quanwen`）：切成音节 OR（`quan`/`wen`），与空格写法同义；
-            // 尾部半个音节（如 `quanwe` 的 `we`）降级为前缀正则，不会输入一半就零命中。
-            // 切分失败（`qw` 类首字母串）走原单 token 精确 OR 前缀。
             if let Some((heads, tail)) = crate::pinyin_aux::split_pinyin_query(t) {
-                let mut subs: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
-                    Vec::with_capacity(heads.len() + 1);
-                for h in &heads {
-                    subs.push((
-                        Occur::Should,
-                        Box::new(TermQuery::new(
-                            Term::from_field_text(field, h),
-                            IndexRecordOption::Basic,
-                        ))
-                            as Box<dyn tantivy::query::Query>,
-                    ));
+                if tail.is_empty() && heads.len() >= 2 {
+                    let phrase_terms: Vec<Term> = heads
+                        .iter()
+                        .map(|h| Term::from_field_text(field, h))
+                        .collect();
+                    let query = PhraseQuery::new(phrase_terms);
+                    return self.top_aux(&searcher, &query, limit);
                 }
                 if !tail.is_empty() {
-                    if let Ok(re) = RegexQuery::from_pattern(&format!("{tail}.*"), field) {
-                        subs.push((Occur::Should, Box::new(re) as Box<dyn tantivy::query::Query>));
+                    let mut subs: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
+                        Vec::with_capacity(heads.len() + 1);
+                    for h in &heads {
+                        subs.push((
+                            Occur::Must,
+                            Box::new(TermQuery::new(
+                                Term::from_field_text(field, h),
+                                IndexRecordOption::Basic,
+                            ))
+                                as Box<dyn tantivy::query::Query>,
+                        ));
                     }
+                    if let Ok(re) = RegexQuery::from_pattern(&format!("{tail}.*"), field) {
+                        subs.push((Occur::Must, Box::new(re) as Box<dyn tantivy::query::Query>));
+                    }
+                    return self.top_aux(&searcher, &BooleanQuery::new(subs), limit);
                 }
-                Box::new(BooleanQuery::new(subs))
-            } else {
-                // token 已是小写字母数字（simple+lower），无正则元字符，可直接拼 ^t.*
-                let re = RegexQuery::from_pattern(&format!("{t}.*"), field)
-                    .map_err(|e| Error::Index(format!("拼音正则查询构造失败: {e}")))?;
-                Box::new(BooleanQuery::new(vec![
-                    (
-                        Occur::Should,
-                        Box::new(TermQuery::new(
-                            Term::from_field_text(field, t),
-                            IndexRecordOption::Basic,
-                        ))
-                            as Box<dyn tantivy::query::Query>,
-                    ),
-                    (Occur::Should, Box::new(re) as Box<dyn tantivy::query::Query>),
-                ]))
             }
+        }
+        let query: Box<dyn tantivy::query::Query> = if terms.len() == 1 {
+            let t = &terms[0];
+            // token 已是小写字母数字（simple+lower），无正则元字符，可直接拼 ^t.*
+            // （首字母串走这里；全拼侧切分失败的也回落到这里，如单音节 `ma`）。
+            let re = RegexQuery::from_pattern(&format!("{t}.*"), field)
+                .map_err(|e| Error::Index(format!("拼音正则查询构造失败: {e}")))?;
+            Box::new(BooleanQuery::new(vec![
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(field, t),
+                        IndexRecordOption::Basic,
+                    ))
+                        as Box<dyn tantivy::query::Query>,
+                ),
+                (Occur::Should, Box::new(re) as Box<dyn tantivy::query::Query>),
+            ]))
         } else {
             let subs: Vec<(Occur, Box<dyn tantivy::query::Query>)> = terms
                 .iter()
@@ -401,6 +423,30 @@ impl ContentIndex {
         Ok(out)
     }
 
+    /// 辅库 TopDocs 收集（phrase/boolean 早退路径共用）。
+    fn top_aux(
+        &self,
+        searcher: &tantivy::Searcher,
+        query: &dyn tantivy::query::Query,
+        limit: usize,
+    ) -> Result<Vec<(String, u64, f32)>> {
+        let top = searcher.search(query, &TopDocs::with_limit(limit).order_by_score())?;
+        let mut out = Vec::with_capacity(top.len());
+        for (score, addr) in top {
+            let doc: tantivy::TantivyDocument = searcher.doc(addr)?;
+            let frn = doc
+                .get_first(self.fields.frn)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let volume_id = doc
+                .get_first(self.fields.volume)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            out.push((volume_id, frn, score));
+        }
+        Ok(out)
+    }
     /// 按 upsert/delete 键批量取 snippet（service 搜索装配用）。
     ///
     /// v2 按需回读：doc 存 path（STORED）→ 回读原文切窗口（snippet.rs）。

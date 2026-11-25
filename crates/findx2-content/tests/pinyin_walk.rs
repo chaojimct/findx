@@ -67,23 +67,23 @@ fn pinyin_aux_walk_matches_online_extraction() {
         AUX_INITIALS_SUFFIX,
     ))
     .unwrap();
-    let hits = ini_idx.search_pinyin("qw", 10).unwrap();
+    let hits = ini_idx.search_pinyin("qw", 10, false).unwrap();
     assert!(!hits.is_empty(), "initials qw 应命中全文文档");
 
     // full 辅库可查 "quan wen"。
     let full_idx = findx2_content::open_or_create(&aux_dir_for(&index_bin, AUX_FULL_SUFFIX)).unwrap();
     // full 用 search_pinyin（多词 OR）；单音节走前缀 tested in unit tests.
-    let hits2 = full_idx.search_pinyin("quan wen", 10).unwrap();
+    let hits2 = full_idx.search_pinyin("quan wen", 10, true).unwrap();
     assert!(!hits2.is_empty(), "全拼 quan wen 应命中全文文档");
 
-    // 连写全拼 `quanwen` 与空格写法同义（用户自然输入不带空格）。
-    let hits3 = full_idx.search_pinyin("quanwen", 10).unwrap();
+    // 连写全拼 `quanwen` 严格连续命中（用户自然输入不带空格）。
+    let hits3 = full_idx.search_pinyin("quanwen", 10, true).unwrap();
     assert!(!hits3.is_empty(), "连写 quanwen 应命中全文文档");
     // 半个尾音降级：`quanw`（wen 只打了 w）仍应命中。
-    let hits4 = full_idx.search_pinyin("quanw", 10).unwrap();
+    let hits4 = full_idx.search_pinyin("quanw", 10, true).unwrap();
     assert!(!hits4.is_empty(), "半截 quanw 应命中全文文档");
     // 首字母串不受切分影响：`qw` 在 full 侧无命中（只走 initials 侧）。
-    let hits5 = full_idx.search_pinyin("qw", 10).unwrap();
+    let hits5 = full_idx.search_pinyin("qw", 10, true).unwrap();
     assert!(hits5.is_empty(), "qw 在全拼侧应无命中");
 
     // 主库按名可查（回归：walk 不破坏主库）。

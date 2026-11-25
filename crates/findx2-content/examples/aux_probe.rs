@@ -9,15 +9,15 @@ fn main() {
     }
     let ini = open_or_create(&aux_dir_for(index_bin, AUX_INITIALS_SUFFIX)).unwrap();
     for q in ["qw", "qws", "zhong", "zhongwen"] {
-        let hits = ini.search_pinyin(q, 5).unwrap_or_default();
+        let hits = ini.search_pinyin(q, 5, false).unwrap_or_default();
         println!("q={q} hits={}", hits.len());
         for (v, f, s) in hits.iter().take(2) {
             println!("   score={s:.2} {v}:{f}");
         }
     }
     let full = open_or_create(&aux_dir_for(index_bin, AUX_FULL_SUFFIX)).unwrap();
-    for q in ["quan wen", "zhong wen"] {
-        let hits = full.search_pinyin(q, 5).unwrap_or_default();
+    for q in ["quan wen", "zhong wen", "quanwen", "machuntian"] {
+        let hits = full.search_pinyin(q, 5, true).unwrap_or_default();
         println!("full q={q} hits={}", hits.len());
     }
 }

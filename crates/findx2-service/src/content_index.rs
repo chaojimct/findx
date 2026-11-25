@@ -396,12 +396,12 @@ impl findx2_core::ContentSearch for MergedContentSearch {
         // 辅库各取 limit 条（score 截断由主合并 cap 兜底），合并去重。
         let mut aux_all: Vec<(String, u64, f32)> = Vec::new();
         if let Some(ini) = self.ini.as_ref() {
-            if let Ok(h) = ini.search_pinyin(query, limit) {
+            if let Ok(h) = ini.search_pinyin(query, limit, false) {
                 aux_all.extend(h);
             }
         }
         if let Some(full) = self.full.as_ref() {
-            if let Ok(h) = full.search_pinyin(query, limit) {
+            if let Ok(h) = full.search_pinyin(query, limit, true) {
                 aux_all.extend(h);
             }
         }
@@ -454,7 +454,7 @@ pub(crate) fn aux_pinyin_keys(
     }
     if use_ini {
         if let Some(ini) = g.aux_ini.as_ref() {
-            if let Ok(h) = ini.search_pinyin(query, limit) {
+            if let Ok(h) = ini.search_pinyin(query, limit, false) {
                 for (v, f, _) in h {
                     out.insert((v, f));
                 }
@@ -463,7 +463,7 @@ pub(crate) fn aux_pinyin_keys(
     }
     if use_full {
         if let Some(full) = g.aux_full.as_ref() {
-            if let Ok(h) = full.search_pinyin(query, limit) {
+            if let Ok(h) = full.search_pinyin(query, limit, true) {
                 for (v, f, _) in h {
                     out.insert((v, f));
                 }
