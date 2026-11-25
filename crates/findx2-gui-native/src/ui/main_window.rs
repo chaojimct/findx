@@ -1006,6 +1006,15 @@ impl MainWindow {
             self.loading = false;
             self.search_keyboard.invalidate();
             self.search_status = "就绪".into();
+            // 清空也取消在飞搜索（服务端立刻停扫；无在飞则幂等无操作）。
+            // 此前清空后旧扫描继续烧 CPU 且其回包只能靠代检查丢弃。
+            let rid = self.search_request_id;
+            if rid > 0 {
+                let (endpoint, ipc) = self
+                    .session
+                    .read_with(cx, |s, _| (s.endpoint.clone(), s.ipc.clone()));
+                ipc.cancel_search(endpoint, rid);
+            }
             self.request_preview(cx);
             self.sync_table(true, cx);
             cx.notify();
@@ -1084,7 +1093,15 @@ impl MainWindow {
                     {
                         return
                     }
-                    Err(e) if crate::ipc::is_cancelled_err(e) => return,
+                    // 能走到这里说明本代仍是最新（顶部 gen 检查已过）却收到取消确认：
+                    // 没有更新查询在途的迹象，立即收掉 loading，状态栏不得永远
+                    //「搜索中…」（实测「搜不了」的即时自愈；兜底看门狗在 run_search）。
+                    Err(e) if crate::ipc::is_cancelled_err(e) => {
+                        this.loading = false;
+                        this.search_status = "查询已取消".into();
+                        cx.notify();
+                        return;
+                    }
                     _ => {}
                 }
                 this.loading = false;
@@ -1163,6 +1180,24 @@ impl MainWindow {
             })
             .ok();
         }));
+        // 看门狗（P0-1 兜底）：取消/过期分支不回写状态，响应若因竞态彻底未达
+        //（连接消失、任务替换、服务端无响应），loading 会永远挂 true——本次
+        //「搜不了」的实测形态。16s（> IPC 15s 超时）后按代收口；正常路径
+        // 早已清掉 loading，看门狗无事可做。
+        let wd_gen = generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(16))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.search_gen == wd_gen && this.loading {
+                    this.loading = false;
+                    this.search_status = "搜索响应超时（已自动收口）；请重试".into();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         cx.notify();
     }
 
