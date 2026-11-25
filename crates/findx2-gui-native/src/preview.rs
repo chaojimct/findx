@@ -480,21 +480,9 @@ pub async fn load_preview_with_options(
             Err(_) => {} // 落回文字摘录
         }
     }
-    // PDF优先走已安装的系统预览处理器(与Office文档同一条路):
-    // 处理器进程常驻、文档只解析一次、原生滚动;不再为每页起新进程、
-    // 重解析全文。WinRT光栅只在没有可用处理器时兜底。
-    if !is_directory && ext == "pdf" && prefer_native {
-        #[cfg(windows)]
-        match crate::office_host::start(path, cancel.clone()) {
-            Ok(client) => {
-                state.native = Some(client);
-                state.kind = PreviewKind::NativeOffice;
-                state.message = Some("系统预览处理器已接管，可直接滚动浏览".into());
-                return state;
-            }
-            Err(e) => native_error = Some(e),
-        }
-    }
+    // PDF 不走系统预览处理器：原生 OLE 是一个外部 HWND，无法叠加命中黄框，
+    // 且全文 `ContentPdfBoxes` 只在自渲染页（`preview.pdf.is_some()`）才请求。
+    // PDF 的「系统版式」即 WinRT 光栅自渲染（带页控件 + 黄框高亮）；office 文档仍走上方的原生宿主。
     if matches!(ext.as_str(), "doc" | "xls" | "ppt") {
         state.kind = PreviewKind::Unsupported;
         state.message = Some(native_error.unwrap_or_else(|| {

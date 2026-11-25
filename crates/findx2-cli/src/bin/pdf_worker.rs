@@ -126,7 +126,7 @@ struct BoxesReply {
 }
 
 /// 单页命中框：逐字重建文本（保证字↔框 1:1，不依赖 `all()` 的 rect 抽取顺序），
-/// ASCII 折叠后按字节找 needles（`to_ascii_lowercase` 保字节长，偏移可直映），
+/// 命中 spans 复用 `snippet::match_spans`（字面优先 + 拼音对齐，与摘要高亮同口径），
 /// 合并重叠命中后取并框；单页上限 2000 框（交互 sanity）。
 fn boxes_one(
     pdfium: &pdfium_render::prelude::Pdfium,
@@ -156,45 +156,26 @@ fn boxes_one(
         };
         boxes.push(r);
     }
-    // 字节偏移→字下标（ASCII 折叠保字节长；非 ASCII 原样，char 边界对齐）。
-    let folded = s.to_ascii_lowercase();
-    // 字节偏移→字下标（ASCII 折叠保字节长，单遍填充）。
-    let mut byte_to_char = vec![0usize; folded.len() + 1];
+    // 命中 spans 与「命中上下文」同一套口径（`snippet::match_spans`）：
+    // 字面优先；纯拼音查询（如 `machuntian`）按拼音对齐到原文汉字（“马春天”），
+    // 否则 PDF 页内永远找不到框——用户实测「全文模式 + 拼音词」高亮缺失的根因。
+    let mut spans = findx2_content::snippet::match_spans(&s, &job.needles);
+    if spans.is_empty() {
+        return Some(BoxesReply { rects: Vec::new(), page_w, page_h });
+    }
+    // 字节偏移→字下标（char 边界对齐，单遍填充）。
+    let mut byte_to_char = vec![0usize; s.len() + 1];
     let mut total_chars = 0usize;
     for (b, ch) in s.char_indices() {
         byte_to_char[b] = total_chars;
         for k in 1..ch.len_utf8() {
-            if b + k <= folded.len() {
+            if b + k <= s.len() {
                 byte_to_char[b + k] = total_chars;
             }
         }
         total_chars += 1;
     }
-    byte_to_char[folded.len()] = total_chars;
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    for needle in &job.needles {
-        let nd = needle.to_ascii_lowercase();
-        if nd.is_empty() {
-            continue;
-        }
-        let mut from = 0usize;
-        while let Some(pos) = folded[from..].find(&nd) {
-            let a = from + pos;
-            // 非 ASCII needle 必须落在 char 边界（ASCII needle 天然对齐）。
-            if s.is_char_boundary(a) && s.is_char_boundary(a + nd.len()) {
-                spans.push((a, a + nd.len()));
-                from = a + nd.len().max(1);
-            } else {
-                from = a + 1;
-            }
-            if from >= folded.len() {
-                break;
-            }
-        }
-    }
-    if spans.is_empty() {
-        return Some(BoxesReply { rects: Vec::new(), page_w, page_h });
-    }
+    byte_to_char[s.len()] = total_chars;
     spans.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
     for (a, b) in spans {
@@ -208,7 +189,7 @@ fn boxes_one(
     }
     let mut rects = Vec::new();
     for (a, b) in merged {
-        let (ca, cb) = (byte_to_char[a.min(folded.len())], byte_to_char[b.min(folded.len())]);
+        let (ca, cb) = (byte_to_char[a.min(s.len())], byte_to_char[b.min(s.len())]);
         let mut x0 = f32::INFINITY;
         let mut y0 = f32::INFINITY;
         let mut x1 = f32::NEG_INFINITY;
