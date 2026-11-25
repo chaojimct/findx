@@ -1138,7 +1138,7 @@ impl MainWindow {
             .copied()
             .unwrap_or_default();
         self.office_text_only = false;
-        self.request_preview(cx);
+        self.request_preview(cx, true);
         cx.notify();
     }
     /// Single choke point for ViewMode changes: bumps `page_epoch` (drives

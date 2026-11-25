@@ -1,4 +1,4 @@
-#[path = "file_actions.rs"]
+﻿#[path = "file_actions.rs"]
 mod file_actions;
 use file_actions::FileActions;
 #[path = "file_context.rs"]
@@ -320,6 +320,15 @@ fn preview_has_mode_tabs(path: &str) -> bool {
             .as_str(),
         "docx" | "xlsx" | "pptx" | "rtf" | "doc" | "xls" | "ppt" | "pdf"
     )
+}
+
+/// PDF 可视命中上下文的判定口径（请求分流与展示共用）：命中上下文 tab
+/// 激活的 PDF 才走自渲染光栅 + 黄框；系统版式恒走原生，不受影响。
+fn is_pdf_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|x| x.to_str())
+        .is_some_and(|x| x.eq_ignore_ascii_case("pdf"))
 }
 
 impl MainWindow {
@@ -719,7 +728,7 @@ impl MainWindow {
         }
         this.schedule_status_poll(cx);
         if this.preview_file.is_some() {
-            this.request_preview(cx);
+            this.request_preview(cx, true);
         }
         this
     }
@@ -1015,7 +1024,7 @@ impl MainWindow {
                     .read_with(cx, |s, _| (s.endpoint.clone(), s.ipc.clone()));
                 ipc.cancel_search(endpoint, rid);
             }
-            self.request_preview(cx);
+            self.request_preview(cx, true);
             self.sync_table(true, cx);
             cx.notify();
             return;
@@ -1154,13 +1163,13 @@ impl MainWindow {
                             session.last_error = Some(err.clone());
                             session.index_status = status_logic::disconnected_status(&err);
                         });
-                        this.request_preview(cx);
+                        this.request_preview(cx, true);
                     }
                 }
                 this.search_selection.clear();
                 this.selected = None;
                 this.sync_table(true, cx);
-                if pending_key.is_none() { this.request_preview(cx); }
+                if pending_key.is_none() { this.request_preview(cx, true); }
                 if let Some(intent) = pending_key {
                     let handle = this.native_window_handle();
                     let owner = cx.weak_entity();
@@ -1173,7 +1182,7 @@ impl MainWindow {
                                     this.apply_search_key(intent, window, cx);
                                     // Lost focus / new IME composition may reject the queued key.
                                     // Then publish the legitimate no-selection preview, not old data forever.
-                                    if this.selected.is_none() { this.request_preview(cx); }
+                                    if this.selected.is_none() { this.request_preview(cx, true); }
                                 }
                             });
                         });
@@ -1516,6 +1525,18 @@ impl MainWindow {
                 self.active_workspace_hit().map(|h| h.path).or_else(|| self.preview_file.clone())
                     .is_some_and(|path| path == meta.path)
             })
+    }
+    /// PDF 可视命中上下文是否成立：摘要 tab 激活 + 光栅已就绪。
+    /// 成立时正文区展示页面光栅（含黄框），不再展示纯文本摘要块；
+    /// pager 与编号列表照常（ AnyTXT 式内容在上、导航在下）。
+    fn pdf_visual_active(&self) -> bool {
+        self.preview_snippet_view
+            && self.preview.pdf.is_some()
+            && self
+                .preview
+                .meta
+                .as_ref()
+                .is_some_and(|m| is_pdf_path(&m.path))
     }
     fn pause_preview(&mut self) {
         self.preview_cancel
@@ -1884,6 +1905,7 @@ impl MainWindow {
                     this.preview.pdf_highlights = rects;
                     this.preview.pdf_hl_page = Some(page);
                     this.preview.pdf_hl_path = Some(path);
+                    this.preview.pdf_hl_gen = Some(search_gen_at_req);
                     cx.notify();
                 }
             });
@@ -1891,13 +1913,12 @@ impl MainWindow {
         .detach();
     }
 
-    fn request_preview(&mut self, cx: &mut Context<Self>) {
+    fn request_preview(&mut self, cx: &mut Context<Self>, reset_view: bool) {
         self.preview_cancel
             .store(true, std::sync::atomic::Ordering::Release);
         self.preview_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel = self.preview_cancel.clone();
         let options = self.pdf_options;
-        let prefer_native = !self.office_text_only;
         self.preview_gen = self.preview_gen.wrapping_add(1);
         let generation = self.preview_gen;
         let visible = self.settings_page.is_none()
@@ -1955,12 +1976,29 @@ impl MainWindow {
         self.snippet_list_loading = false;
         // 新目标默认激活摘要 tab（有摘要才显示该 tab）；手动点过 tab 的选择不受影响
         // 由各 tab 按钮自行加锁（见 toggle 行），这里先恢复未锁定。
-        self.preview_snippet_view = !self.preview_snippet.is_empty();
-        self.preview_snippet_lock = false;
+        if reset_view {
+            self.preview_snippet_view = !hit.snippet.is_empty();
+            self.preview_snippet_lock = false;
+        }
         // 选中行无摘要时按需补第 0 窗（列表首屏只填前 N 行；失败静默）。
         if hit.snippet.is_empty() {
             let entry_idx = hit.entry_idx;
             self.fetch_snippet_window(entry_idx, 0, false, cx);
+        }
+        // 预览意图：命中上下文 + PDF 走自渲染光栅（可视命中上下文）；
+        // 系统版式恒走原生（不动）；其他（office/文字摘录）沿用原开关。
+        // office 文档在摘要 tab 下沿用原行为（选中即预载原生宿主）。
+        let want_pdf_visual = self.preview_snippet_view
+            && !hit.is_directory
+            && is_pdf_path(&hit.path);
+        let prefer_native = !self.office_text_only && !want_pdf_visual;
+        if want_pdf_visual {
+            // 光栅与命中框并行取：框早到会等光栅（见 fetch 守卫），
+            // 首屏不再串行等两轮；页被钳制时 completion 会按实际页补一次。
+            self.fetch_pdf_boxes(hit.entry_idx, options.page, hit.path.clone(), cx);
+            // 编号列表自动拉开（AnyTXT 同款常显）：与摘要同源，按需回读，
+            // 超大文件被 service 侧跳过（空列表不展开）。
+            self.fetch_snippet_list(hit.entry_idx, cx);
         }
         if self.preview_memo.len() > 64 {
             self.preview_memo.clear();
@@ -2028,12 +2066,20 @@ impl MainWindow {
                 }
                 this.preview = loaded;
                 // 自渲染 PDF 页：顺手取本页命中框（翻页重载也会经过这里）。
+                // 预取（request 时并行发出）通常已命中：仅当框缺失/过期
+                //（页被钳制、查询已换代）才按实际页补一次，避免重复请求。
                 if let (Some(pdf), Some(meta)) =
                     (this.preview.pdf, this.preview.meta.clone())
                 {
-                    if let Some(h) = this.active_workspace_hit() {
-                        let (idx, path) = (h.entry_idx, meta.path.clone());
-                        this.fetch_pdf_boxes(idx, pdf.page, path, cx);
+                    let hl_fresh = this.preview.pdf_hl_path.as_deref()
+                        == Some(meta.path.as_str())
+                        && this.preview.pdf_hl_page == Some(pdf.page)
+                        && this.preview.pdf_hl_gen == Some(this.search_gen);
+                    if !hl_fresh {
+                        if let Some(h) = this.active_workspace_hit() {
+                            let (idx, path) = (h.entry_idx, meta.path.clone());
+                            this.fetch_pdf_boxes(idx, pdf.page, path, cx);
+                        }
                     }
                 }
                 cx.notify();
@@ -2375,7 +2421,7 @@ impl MainWindow {
         // Fit/100%/zoom can relayout the current raster immediately. Reload only when
         // the page changed or a sharper (or smaller) decode is actually required.
         if self.pdf_options.page != previous_page || edge != previous_edge {
-            self.request_preview(cx);
+            self.request_preview(cx, false);
         } else {
             self.preview_options = self.pdf_options;
         }
@@ -2947,8 +2993,21 @@ impl MainWindow {
                                         entity.update(cx, |this, cx| {
                                             if id == "snippet" {
                                                 // 摘要已在内存，不重载，只切视图。
+                                                // 唯 PDF 可视命中上下文例外：光栅还没好就起一次
+                                                // Visual 加载（视图已先落到摘要 tab，request
+                                                // 按当前视图算 intent，不会被重置）。
                                                 this.preview_snippet_view = true;
                                                 this.preview_snippet_lock = true;
+                                                if !this.preview_snippet.is_empty()
+                                                    && this
+                                                        .active_workspace_hit()
+                                                        .is_some_and(|h| {
+                                                            is_pdf_path(&h.path)
+                                                        })
+                                                    && this.preview.pdf.is_none()
+                                                {
+                                                    this.request_preview(cx, false);
+                                                }
                                                 cx.notify();
                                                 return;
                                             }
@@ -2956,11 +3015,11 @@ impl MainWindow {
                                                 return;
                                             }
                                             this.office_text_only = id == "office-text";
-                                            this.request_preview(cx);
-                                            // request_preview 会按新目标重置视图；
-                                            // 手动选择优先，在它之后覆盖回来。
+                                            // 意图先行：request_preview 按当前视图算 intent，
+                                            // 必须先落到目标 tab 再请求。
                                             this.preview_snippet_view = false;
                                             this.preview_snippet_lock = true;
+                                            this.request_preview(cx, false);
                                             cx.notify();
                                         })
                                     })
@@ -2970,9 +3029,11 @@ impl MainWindow {
                 },
             )
             // 命中上下文的操作栏：上一个/下一个翻页
-            //（仅 office 预览、摘要 tab 激活且有多处匹配时展示一行）。
+            //（仅 office 预览、摘要 tab 激活且有多处匹配时展示一行；
+            // PDF 可视态走专用列，这里隐藏，避免重复）。
             .when(
-                self.preview_snippet_view
+                !self.pdf_visual_active()
+                    && self.preview_snippet_view
                     && self.snippet_total > 1
                     && self
                         .preview
@@ -2993,9 +3054,11 @@ impl MainWindow {
                     )
                 },
             )
-            // 编号命中列表（office 摘要 tab 同款，位置在操作栏与正文之间）。
+            // 编号命中列表（office 摘要 tab 同款，位置在操作栏与正文之间；
+            // PDF 可视态走专用列这里隐藏避免重复）。
             .when(
-                self.preview_snippet_view
+                !self.pdf_visual_active()
+                    && self.preview_snippet_view
                     && self.snippet_list_open
                     && self
                         .preview
@@ -3015,7 +3078,54 @@ impl MainWindow {
                     )
                 },
             )
-            .child(if self.preview_snippet_view && !self.preview_snippet.is_empty() {
+            // PDF 可视命中上下文专用列：内容在上、导航在下。
+            // 光栅（含黄框）占整块 + pager + 编号列表（capped 高度内部滚动）。
+            // 光栅未就绪时不走这里（走下面的纯文本渐进态），避免转圈。
+            .child(if self.pdf_visual_active() {
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .id("pdf-visual-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .overflow_scrollbar()
+                            .child(body),
+                    )
+                    .child(if self.snippet_total > 1 {
+                        h_flex()
+                            .w_full()
+                            .flex_shrink_0()
+                            .px_2()
+                            .py_1()
+                            .gap_1()
+                            .border_t_1()
+                            .border_color(tokens.border_soft)
+                            .child(self.snippet_pager(cx))
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    })
+                    .child(if self.snippet_list_open {
+                        div()
+                            .w_full()
+                            .flex_shrink_0()
+                            .px_2()
+                            .py_1()
+                            .max_h(px(220.))
+                            .overflow_y_scrollbar()
+                            .border_t_1()
+                            .border_color(tokens.border_soft)
+                            .child(self.snippet_list_view(cx))
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    })
+                    .into_any_element()
+            } else if self.preview_snippet_view && !self.preview_snippet.is_empty() {
                 div()
                     .id("preview-snippet-body")
                     .flex_1()

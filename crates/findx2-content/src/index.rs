@@ -620,6 +620,14 @@ impl ContentIndex {
         if path.is_empty() {
             return Ok(None);
         }
+        // 超大文件跳过全窗列表（与 snippets_for_keys_windowed 同口径）：
+        // 单窗走按需补取通道，列表不为一个巨文件卡住整个面板。
+        if std::fs::metadata(path)
+            .map(|m| m.len() > SNIPPET_LIST_MAX_BYTES)
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
         let mtime = doc
             .get_first(self.fields.mtime)
             .and_then(|v| v.as_u64())

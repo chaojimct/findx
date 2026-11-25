@@ -70,6 +70,9 @@ pub struct PreviewState {
     pub pdf_highlights: Vec<[f32; 4]>,
     pub pdf_hl_page: Option<u32>,
     pub pdf_hl_path: Option<String>,
+    /// 命中框对应的 search 代（`fetch_pdf_boxes` 请求时的 `search_gen`）：
+    /// 光栅先到、框后到是常态，凭此判定“已是最新查询的框”，避免重复请求。
+    pub pdf_hl_gen: Option<u64>,
     pub generation: u64,
     pub meta: Option<PreviewMeta>,
     pub kind: PreviewKind,
@@ -99,6 +102,7 @@ impl PreviewState {
             pdf_highlights: Vec::new(),
             pdf_hl_page: None,
             pdf_hl_path: None,
+            pdf_hl_gen: None,
             generation: 0,
             meta: None,
             kind: PreviewKind::Empty,
@@ -123,6 +127,7 @@ impl PreviewState {
             pdf_highlights: Vec::new(),
             pdf_hl_page: None,
             pdf_hl_path: None,
+            pdf_hl_gen: None,
             generation,
             meta: Some(meta),
             kind: PreviewKind::Loading,
