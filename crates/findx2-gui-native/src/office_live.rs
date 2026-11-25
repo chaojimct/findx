@@ -337,8 +337,15 @@ mod com {
         variant_bstr(s)
     }
     pub fn v_missing() -> VARIANT {
-        // Word/Excel 可选参数：VT_ERROR + DISP_E_PARAMNOTFOUND 也行，但多数版本接受 Empty。
-        variant_empty()
+        // 真正的“缺省”：VT_ERROR + DISP_E_PARAMNOTFOUND（CLR Type.Missing 同款）。
+        // VT_EMPTY 在部分 Office 参数上会被当成“显式空值”而非缺省。
+        unsafe {
+            let mut v = VARIANT::default();
+            let a = &mut *v.Anonymous.Anonymous;
+            a.vt = windows::Win32::System::Variant::VT_ERROR;
+            a.Anonymous.scode = -2147352573; // DISP_E_PARAMNOTFOUND
+            v
+        }
     }
     pub fn v_disp(d: &IDispatch) -> VARIANT {
         variant_dispatch(d)
@@ -740,6 +747,10 @@ fn open_document(
     match engine.kind() {
         LiveKind::Word => {
             let docs = app.get("Documents")?;
+            {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "[live] docs got");
+            }
             // Open(FileName, ConfirmConversions, ReadOnly, AddToRecentFiles)
             let v = docs.call(
                 "Open",
@@ -750,6 +761,10 @@ fn open_document(
                     com::v_str(path),
                 ],
             )?;
+            {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "[live] open returned");
+            }
             com::variant_to_dispatch(v)
         }
         LiveKind::Excel => {
@@ -998,8 +1013,12 @@ pub mod host {
             let res = sta_main(&path, engine, &needles, jump_index, owner, &state, &cancel_in, &tx);
             state.alive.store(false, Ordering::Release);
             // sta_main 内已发送就绪；这里只处理“就绪前失败”的回执。
-            if res.is_err() {
-                let _ = tx.send(res);
+            if let Err(e) = &res {
+                {
+                    use std::io::Write as _;
+                    let _ = writeln!(std::io::stderr(), "[live] sta failed: {e}");
+                }
+                let _ = tx.send(Err(e.clone()));
             }
         });
         let start = Instant::now();
