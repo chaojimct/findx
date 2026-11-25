@@ -2675,8 +2675,16 @@ impl Render for MainWindow {
         }
         #[cfg(windows)]
         if let Some(client) = &self.preview.native {
-            client.surface.set_interactive(self.preview_is_current());
-            let mounted = preview && matches!(self.preview.kind, PreviewKind::NativeOffice);
+            // 摘要 tab 激活时原生覆盖层必须让位：否则它盖住摘要正文还抢焦点
+            //（这正是“切回命中上下文没反应”的根因：kind 没变，mounted 照旧）。
+            let snippet_active =
+                self.preview_snippet_view && !self.preview_snippet.is_empty();
+            client
+                .surface
+                .set_interactive(self.preview_is_current() && !snippet_active);
+            let mounted = preview
+                && matches!(self.preview.kind, PreviewKind::NativeOffice)
+                && !snippet_active;
             let allowed = crate::preview_visibility::surface_allowed(
                 mounted,
                 self.workspace.show_actions || self.file_actions.native_menu.is_open(),
