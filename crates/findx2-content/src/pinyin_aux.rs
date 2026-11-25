@@ -448,25 +448,34 @@ fn walk_shard(
     Ok(n_ini)
 }
 
-/// 按字节偏移贪心覆盖，还原原文 CJK 字序（重叠 token 取最长）。
+/// 按字符偏移贪心覆盖，还原原文 CJK 字序（重叠 token 取最长）。
+/// 单位警告：postings positions 对 jieba token 即 `jieba_rs::Token.start`
+///（字符偏移，见 tantivy-jieba 非 ordinal 模式），`covered` 必须同为字符数；
+/// 若误用字节长度比较，多字 CJK 词会吞掉后续全部 token（辅库只剩首词）。
 fn rebuild_chars(tokpos: &[(u32, u32)], terms: &[String]) -> Option<Vec<char>> {
     if tokpos.is_empty() {
         return None;
     }
     let mut v: Vec<(u32, u32)> = tokpos.to_vec();
     // 同一起点取最长，起点升序。
-    v.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    v.sort_by(|a, b| {
+        a.0.cmp(&b.0).then_with(|| {
+            let la = terms.get(a.1 as usize).map(|s| s.chars().count()).unwrap_or(0);
+            let lb = terms.get(b.1 as usize).map(|s| s.chars().count()).unwrap_or(0);
+            lb.cmp(&la)
+        })
+    });
     let mut out = String::new();
     let mut covered = 0u32;
     for (pos, ti) in v {
         let t = terms.get(ti as usize)?;
-        let blen = t.len() as u32;
+        let clen = t.chars().count() as u32;
         if pos < covered {
             continue;
         }
         // 缺口（被丢弃的标点/超长 token）：直接跳过，不补。
         out.push_str(t);
-        covered = pos + blen;
+        covered = pos + clen;
     }
     if out.is_empty() {
         return None;

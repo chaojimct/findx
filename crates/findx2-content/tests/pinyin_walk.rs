@@ -82,6 +82,10 @@ fn pinyin_aux_walk_matches_online_extraction() {
     // 半个尾音降级：`quanw`（wen 只打了 w）仍应命中。
     let hits4 = full_idx.search_pinyin("quanw", 10, true).unwrap();
     assert!(!hits4.is_empty(), "半截 quanw 应命中全文文档");
+    // 回填完整性：文档中部的“测试”（ce shi）必须可查——若 walk 只留首词，
+    // 这里就是空（单位混淆回归网）。
+    let hits_mid = full_idx.search_pinyin("ceshi", 10, true).unwrap();
+    assert!(!hits_mid.is_empty(), "中部音节 ceshi 应命中（回填截断回归）");
     // 首字母串不受切分影响：`qw` 在 full 侧无命中（只走 initials 侧）。
     let hits5 = full_idx.search_pinyin("qw", 10, true).unwrap();
     assert!(hits5.is_empty(), "qw 在全拼侧应无命中");
