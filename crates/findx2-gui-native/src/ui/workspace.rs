@@ -129,7 +129,7 @@ fn root_hit(path: &Path) -> SearchHitDto {
         mtime: 0,
         is_directory: true,
         name_highlight: vec![],
-        snippet: String::new(), pinyin_hit: false,
+        snippet: String::new(), pinyin_hit: false, snippet_window: 0, snippet_total: 0,
     }
 }
 
@@ -1029,7 +1029,7 @@ impl MainWindow {
                     mtime: node.mtime,
                     is_directory: node.directory,
                     name_highlight: vec![],
-                    snippet: String::new(), pinyin_hit: false,
+                    snippet: String::new(), pinyin_hit: false, snippet_window: 0, snippet_total: 0,
                 })
             } else {
                 Some(root_hit(&self.workspace.location))
@@ -1514,7 +1514,7 @@ impl MainWindow {
                     mtime: n.mtime,
                     is_directory: n.directory,
                     name_highlight: vec![],
-                    snippet: String::new(), pinyin_hit: false,
+                    snippet: String::new(), pinyin_hit: false, snippet_window: 0, snippet_total: 0,
                 }
             })
             .collect();
