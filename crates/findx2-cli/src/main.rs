@@ -775,6 +775,7 @@ fn build_content_index(index: &std::path::Path, rebuild: bool) -> Result<()> {
     }
     // 5 秒打一次日志；返回值恒 true（CLI 无取消源，Ctrl-C 直接杀进程）。
     let mut last_log = std::time::Instant::now();
+    let mut last_sample = std::time::Instant::now();
     let st = build_from_store(&store, &cdir, rebuild, |s| {
         if last_log.elapsed().as_secs() >= 5 {
             last_log = std::time::Instant::now();
@@ -786,6 +787,17 @@ fn build_content_index(index: &std::path::Path, rebuild: bool) -> Result<()> {
                 s.failed,
                 t0.elapsed().as_secs_f64()
             );
+        }
+        // 失败样本定期落盘（eprintln 即时刷盘；长构建中途崩溃也能看到死因构成，
+        // 不必等终局总结——大库构建曾因失败爆炸 + OOM 而拿不到样本）。
+        if last_sample.elapsed().as_secs() >= 30 && !s.failed_samples.is_empty() {
+            last_sample = std::time::Instant::now();
+            let mut txt = String::new();
+            for f in s.failed_samples.iter().take(8) {
+                txt.push_str("\n  ! ");
+                txt.push_str(&f.chars().take(160).collect::<String>());
+            }
+            eprintln!("[content] 失败样本（累计失败 {}）:{txt}", s.failed);
         }
         true
     })?;
