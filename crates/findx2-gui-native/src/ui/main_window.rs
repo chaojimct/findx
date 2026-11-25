@@ -487,11 +487,9 @@ impl MainWindow {
             size_min: String::new(),
             size_max: String::new(),
             content_mode: session.read(cx).settings.content_default_mode,
-            content_mode_glide_px: {
-                use crate::settings_logic::CONTENT_MODE_SEG_W;
-                session.read(cx).settings.content_default_mode.tab_index() as f32
-                    * CONTENT_MODE_SEG_W
-            },
+            content_mode_glide_px: crate::settings_logic::content_mode_left(
+                session.read(cx).settings.content_default_mode,
+            ),
             content_mode_glide_gen: 0,
             hits: Vec::new(),
             selected: None,
@@ -909,11 +907,7 @@ impl MainWindow {
         }
         let from = self.content_mode_glide_px;
         self.content_mode = m;
-        self.animate_content_glide(
-            cx,
-            from,
-            m.tab_index() as f32 * crate::settings_logic::CONTENT_MODE_SEG_W,
-        );
+        self.animate_content_glide(cx, from, crate::settings_logic::content_mode_left(m));
         self.schedule_search(window, cx);
         cx.notify();
     }

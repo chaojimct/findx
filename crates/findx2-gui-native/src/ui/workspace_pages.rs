@@ -158,7 +158,7 @@ impl MainWindow {
     /// 去边框底色、直接长在输入框底色上；选中态只靠滑动指示块 + 加粗。
     /// tooltip 保留完整语义即拼音入口。
     fn mode_segmented(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        use crate::settings_logic::CONTENT_MODE_SEG_W;
+        use crate::settings_logic::{CONTENT_MODE_PAD_X, CONTENT_MODE_SEG_W};
         let tokens = Self::tokens(cx);
         let gx = self.content_mode_glide_px;
         h_flex()
@@ -167,6 +167,7 @@ impl MainWindow {
             .flex_shrink_0()
             .items_center()
             .h(px(24.))
+            .pl(px(CONTENT_MODE_PAD_X))
             .cursor_pointer()
             .tooltip({
                 let tip: SharedString =
@@ -222,13 +223,14 @@ impl MainWindow {
                 }),
             )
             // 与右侧真实输入框之间的小分隔线（弱化存在感，只做分区）。
+            // 左侧留白与此分隔线左侧间距相等（CONTENT_MODE_PAD_X），左右对称。
             .child(
                 div()
                     .w(px(1.))
                     .h(px(16.))
                     .flex_shrink_0()
                     .bg(tokens.border_soft)
-                    .ml_1(),
+                    .ml(px(crate::settings_logic::CONTENT_MODE_PAD_X)),
             )
     }
 

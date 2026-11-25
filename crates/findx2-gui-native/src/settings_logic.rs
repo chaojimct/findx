@@ -130,6 +130,14 @@ impl ContentDefaultMode {
 
 /// 搜索框三段 switch 单段宽度（px）：三段等宽，滑块按下标定位。
 pub const CONTENT_MODE_SEG_W: f32 = 46.0;
+/// 三段 switch 左右留白（px）：左侧内边距与右侧分隔符外边距相等，对称。
+pub const CONTENT_MODE_PAD_X: f32 = 4.0;
+
+/// 滑块（选中指示）左偏移：左侧留白 + 段下标 × 段宽。渲染与动画共用同一公式。
+#[inline]
+pub fn content_mode_left(mode: ContentDefaultMode) -> f32 {
+    CONTENT_MODE_PAD_X + mode.tab_index() as f32 * CONTENT_MODE_SEG_W
+}
 /// 滑块滑动时长（ms，逐帧驱动 + ease_in_out_cubic）。
 pub const CONTENT_MODE_GLIDE_MS: u64 = 220;
 
