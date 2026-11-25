@@ -504,7 +504,7 @@ impl LiveSession {
         }
         let embedded_hwnd = find_app_window(engine).unwrap_or(0);
         if embedded_hwnd != 0 && host_hwnd != 0 {
-            embed(embedded_hwnd, host_hwnd);
+            set_owner_follow(embedded_hwnd, host_hwnd);
         }
         Ok(Self {
             engine,
@@ -520,24 +520,15 @@ impl LiveSession {
         self.engine
     }
 
-    /// 同步嵌入窗口尺寸（预览区 resize 时调用）。
+    /// 同步跟随窗口位置/尺寸（预览区 place 时调用；屏幕坐标跟随）。
     pub fn resize(&self, x: i32, y: i32, w: i32, h: i32) {
-        if self.embedded_hwnd == 0 {
+        if self.embedded_hwnd == 0 || self.host_hwnd == 0 {
             return;
-        }        unsafe {
-            use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::*};
-            let _ = MoveWindow(
-                HWND(self.embedded_hwnd as *mut _),
-                x,
-                y,
-                w.max(1),
-                h.max(1),
-                true,
-            );
         }
+        place_owned(self.embedded_hwnd, self.host_hwnd, x, y, w, h);
     }
 
-    /// 云文档窗口稍后才出现时重找并嵌入（open 时 h=0 的补偿）。
+    /// 云文档窗口稍后才出现时重找并跟随（open 时 h=0 的补偿）。
     pub fn reembed_if_needed(&mut self) {
         if self.embedded_hwnd != 0 || self.host_hwnd == 0 {
             return;
@@ -545,7 +536,7 @@ impl LiveSession {
         if let Ok(h) = find_app_window(self.engine) {
             if h != 0 {
                 self.embedded_hwnd = h;
-                embed(h, self.host_hwnd);
+                set_owner_follow(h, self.host_hwnd);
             }
         }
     }
@@ -793,8 +784,7 @@ fn open_document(
 }
 
 #[cfg(windows)]
-fn find_app_window(engine: LiveEngine) -> Result<usize, String> {
-    use windows::Win32::{Foundation::*, UI::WindowsAndMessaging::*};
+fn find_app_window(engine: LiveEngine) -> Result<usize, String> {    use windows::Win32::{Foundation::*, UI::WindowsAndMessaging::*};
     // 按进程名找顶层窗口：WINWORD.EXE / KWPS / EXCEL.EXE / KET。
     let exe = match engine {
         LiveEngine::Word => "WINWORD.EXE",
@@ -860,19 +850,52 @@ fn find_app_window(engine: LiveEngine) -> Result<usize, String> {
     Ok(ctx.found)
 }
 
+/// GPUI 用 DirectX 渲染整块客户区：SetParent 进去的子窗口会被 DX 画面盖住。
+/// 因此活文档窗口保持顶层，只设 owner（GWLP_HWNDPARENT）——永远压在主窗口上、
+/// 随主窗口最小化/隐藏，但不被 DX 覆盖；位置用屏幕坐标跟随预览区。
+/// 与 office_host 独立宿主窗口同构。
 #[cfg(windows)]
-fn embed(child: usize, parent: usize) {
+fn set_owner_follow(child: usize, owner: usize) {
     use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::*};
     unsafe {
-        let _ = SetParent(HWND(child as *mut _), Some(HWND(parent as *mut _)));
-        // 去掉顶层边框观感，子窗口化。
+        let _ = SetWindowLongPtrW(
+            HWND(child as *mut _),
+            GWLP_HWNDPARENT,
+            owner as isize,
+        );
+        // 去标题栏/粗边框，观感嵌入；保持 POPUP 顶层形态。
         let style = GetWindowLongW(HWND(child as *mut _), GWL_STYLE) as u32;
         let _ = SetWindowLongW(
             HWND(child as *mut _),
             GWL_STYLE,
-            (style & !(WS_POPUP.0 | WS_CAPTION.0 | WS_THICKFRAME.0)) as i32 | WS_CHILD.0 as i32,
+            (style & !(WS_CAPTION.0 | WS_THICKFRAME.0)) as i32,
         );
-        let _ = MoveWindow(HWND(child as *mut _), 0, 0, 800, 600, true);
+    }
+}
+
+#[cfg(windows)]
+fn place_owned(child: usize, owner: usize, x: i32, y: i32, w: i32, h: i32) {
+    use windows::Win32::{
+        Foundation::{HWND, POINT},
+        Graphics::Gdi::ClientToScreen,
+        UI::WindowsAndMessaging::*,
+    };
+    if child == 0 || owner == 0 {
+        return;
+    }
+    unsafe {
+        // place() 给的是主窗口客户区相对物理像素，转屏幕坐标再跟随。
+        let mut pt = POINT { x, y };
+        let _ = ClientToScreen(HWND(owner as *mut _), &mut pt);
+        let _ = SetWindowPos(
+            HWND(child as *mut _),
+            Some(HWND_TOP),
+            pt.x,
+            pt.y,
+            w.max(1),
+            h.max(1),
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
     }
 }
 
@@ -1122,9 +1145,19 @@ pub mod host {
         }
         unsafe {
             use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::*};
-            let _ = ShowWindow(
+            // NOACTIVATE：跟随显示/隐藏绝不抢焦点。
+            let _ = SetWindowPos(
                 HWND(hwnd as *mut _),
-                if show { SW_SHOW } else { SW_HIDE },
+                None,
+                0,
+                0,
+                0,
+                0,
+                if show {
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+                } else {
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW
+                },
             );
         }
     }
