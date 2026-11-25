@@ -293,8 +293,9 @@ pub struct MainWindow {
     _preview_task: Option<Task<()>>,
 }
 
-/// office 预览扩展名（系统版式/文字摘录/命中上下文 三 tab 只在此出现）。
-fn is_office_preview_path(path: &str) -> bool {
+/// 原生预览宿主处理的文件类型（与 preview.rs 走同一条路：office 文档 + pdf）。
+/// 这类预览才有展示形态 tab 行（命中上下文/系统版式/文字摘录）。
+fn preview_has_mode_tabs(path: &str) -> bool {
     matches!(
         std::path::Path::new(path)
             .extension()
@@ -302,7 +303,7 @@ fn is_office_preview_path(path: &str) -> bool {
             .unwrap_or("")
             .to_ascii_lowercase()
             .as_str(),
-        "docx" | "xlsx" | "pptx" | "rtf" | "doc" | "xls" | "ppt"
+        "docx" | "xlsx" | "pptx" | "rtf" | "doc" | "xls" | "ppt" | "pdf"
     )
 }
 
@@ -2442,7 +2443,7 @@ impl MainWindow {
                         .preview
                         .meta
                         .as_ref()
-                        .is_some_and(|m| is_office_preview_path(&m.path)),
+                        .is_some_and(|m| preview_has_mode_tabs(&m.path)),
                 |view| {
                     let (plain, ranges) =
                         search_logic::snippet_plain_and_ranges(&self.preview_snippet);
@@ -2510,7 +2511,7 @@ impl MainWindow {
                 self.preview
                     .meta
                     .as_ref()
-                    .is_some_and(|m| is_office_preview_path(&m.path)),
+                    .is_some_and(|m| preview_has_mode_tabs(&m.path)),
                 |view| {
                     view.child(
                         h_flex().px_2().py_1().gap_1().flex_shrink_0().children(
@@ -2579,7 +2580,7 @@ impl MainWindow {
                         .preview
                         .meta
                         .as_ref()
-                        .is_some_and(|m| is_office_preview_path(&m.path)),
+                        .is_some_and(|m| preview_has_mode_tabs(&m.path)),
                 |view| {
                     view.child(
                         h_flex()
