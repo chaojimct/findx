@@ -502,7 +502,17 @@ impl LiveSession {
             use std::io::Write as _;
             let _ = writeln!(std::io::stderr(), "[live] doc opened");
         }
-        let embedded_hwnd = find_app_window(engine).unwrap_or(0);
+        let doc_name = std::path::Path::new(&open_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        // 按文档名锁定真窗口（splash 标题不对，自动跳过）。
+        let embedded_hwnd = find_app_window_titled(engine, doc_name);
+        let embedded_hwnd = if embedded_hwnd != 0 {
+            embedded_hwnd
+        } else {
+            find_app_window(engine)
+        };
         if embedded_hwnd != 0 && host_hwnd != 0 {
             set_owner_follow(embedded_hwnd, host_hwnd);
         }
@@ -528,16 +538,18 @@ impl LiveSession {
         place_owned(self.embedded_hwnd, self.host_hwnd, x, y, w, h);
     }
 
-    /// 云文档窗口稍后才出现时重找并跟随（open 时 h=0 的补偿）。
+    /// 窗口失效或 open 时没抓到时重找（真窗口稍后出现 / transient 替代）。
     pub fn reembed_if_needed(&mut self) {
-        if self.embedded_hwnd != 0 || self.host_hwnd == 0 {
+        if self.host_hwnd == 0 {
             return;
         }
-        if let Ok(h) = find_app_window(self.engine) {
-            if h != 0 {
-                self.embedded_hwnd = h;
-                set_owner_follow(h, self.host_hwnd);
-            }
+        if self.embedded_hwnd != 0 && is_window_alive(self.embedded_hwnd) {
+            return;
+        }
+        let h = find_app_window(self.engine);
+        if h != 0 {
+            self.embedded_hwnd = h;
+            set_owner_follow(h, self.host_hwnd);
         }
     }
 
@@ -783,8 +795,31 @@ fn open_document(
     }
 }
 
+/// 按进程名 + 标题子串找顶层可见窗口（open 时按文档名锁定真窗口，
+/// 避免抓到 splash 等 transient 窗口；找不到返回 0）。
 #[cfg(windows)]
-fn find_app_window(engine: LiveEngine) -> Result<usize, String> {    use windows::Win32::{Foundation::*, UI::WindowsAndMessaging::*};
+fn find_app_window_titled(engine: LiveEngine, title_sub: &str) -> usize {
+    find_app_window_impl(engine, Some(title_sub))
+}
+
+#[cfg(windows)]
+fn find_app_window(engine: LiveEngine) -> usize {
+    find_app_window_impl(engine, None)
+}
+
+#[cfg(windows)]
+fn is_window_alive(hwnd: usize) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    unsafe {
+        use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::IsWindow};
+        IsWindow(Some(HWND(hwnd as *mut _))).as_bool()
+    }
+}
+
+#[cfg(windows)]
+fn find_app_window_impl(engine: LiveEngine, title_sub: Option<&str>) -> usize {    use windows::Win32::{Foundation::*, UI::WindowsAndMessaging::*};
     // 按进程名找顶层窗口：WINWORD.EXE / KWPS / EXCEL.EXE / KET。
     let exe = match engine {
         LiveEngine::Word => "WINWORD.EXE",
@@ -794,10 +829,12 @@ fn find_app_window(engine: LiveEngine) -> Result<usize, String> {    use windows
     };
     struct Ctx {
         exe: String,
+        title_sub: Option<String>,
         found: usize,
     }
     let mut ctx = Ctx {
         exe: exe.to_string(),
+        title_sub: title_sub.map(|s| s.to_lowercase()),
         found: 0,
     };
     unsafe extern "system" fn visit(
@@ -829,10 +866,24 @@ fn find_app_window(engine: LiveEngine) -> Result<usize, String> {    use windows
                 {
                     let name = String::from_utf16_lossy(&buf[..len as usize]);
                     if name.to_ascii_uppercase().ends_with(ctx.exe.as_str()) {
-                        // 取第一个可见顶层窗口。
+                        // 取第一个可见顶层窗口；带标题子串时只收标题匹配的
+                        //（splash 等 transient 窗口标题不对，自动跳过）。
                         if IsWindowVisible(h).as_bool() {
-                            ctx.found = h.0 as usize;
-                            return false.into();
+                            let take = match ctx.title_sub.as_ref() {
+                                Some(sub) => {
+                                    let mut t = [0u16; 260];
+                                    let n = GetWindowTextW(h, &mut t);
+                                    n > 0
+                                        && String::from_utf16_lossy(&t[..n as usize])
+                                            .to_lowercase()
+                                            .contains(sub.as_str())
+                                }
+                                None => true,
+                            };
+                            if take {
+                                ctx.found = h.0 as usize;
+                                return false.into();
+                            }
                         }
                     }
                 }
@@ -847,7 +898,7 @@ fn find_app_window(engine: LiveEngine) -> Result<usize, String> {    use windows
             windows::Win32::Foundation::LPARAM(&mut ctx as *mut Ctx as isize),
         );
     }
-    Ok(ctx.found)
+    ctx.found
 }
 
 /// GPUI 用 DirectX 渲染整块客户区：SetParent 进去的子窗口会被 DX 画面盖住。
@@ -1113,8 +1164,8 @@ pub mod host {
         let mut ticks: u64 = 0;
         while !cancel.load(Ordering::Acquire) {
             ticks += 1;
-            if sess.embedded_hwnd == 0 && ticks % 25 == 0 {
-                // 云文档窗口稍后出现：约每 500ms 重找一次。
+            if ticks % 100 == 0 {
+                // 约每 2s 校验窗口有效性：transient 消亡/真窗口迟到都重找。
                 sess.reembed_if_needed();
             }
             let cur = surface
