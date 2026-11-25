@@ -1150,9 +1150,15 @@ pub mod host {
         let mut sess = LiveSession::open(path, engine, owner, needs_paint)?;
         tlog!("open ok hwnd={} needles={}", sess.embedded_hwnd, needles.len());
         if engine.kind() == LiveKind::Word && !needles.is_empty() {
-            let _ = sess.word_highlight_all(needles);
+            match sess.word_highlight_all(needles) {
+                Ok(n) => tlog!("painted={n}"),
+                Err(e) => tlog!("paint failed: {e}"),
+            }
             let first = needles.first().map(|s| s.as_str()).unwrap_or("");
-            let _ = sess.word_jump(first, jump_index);
+            match sess.word_jump(first, jump_index) {
+                Ok(b) => tlog!("jump ok found={b}"),
+                Err(e) => tlog!("jump failed: {e}"),
+            }
         }
         // 就绪回执（窗口可能稍后才可见——云文档下载慢时 find_app_window 为 0，
         // 位置循环里按可见性 show/hide，不阻塞就绪）。
