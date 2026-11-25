@@ -16,15 +16,19 @@ const CACHE_CAP: usize = 500;
 const WINDOW_CHARS: usize = 120;
 
 /// query → 分词（与索引同一套 HybridTokenizer，保证切分一致）。
+/// 过滤纯标点/空白/操作符词（jieba search 模式会吐出 `；`/`：`/`|`/`"`/空格等；
+/// 进倒排无意义，进摘要则把每个空格都算一次命中——混合查询曾报出 1/131631）。
+/// 保留条件：至少含一个字母或数字（含 CJK）。
 pub fn query_terms(query_text: &str, tok: &mut crate::index::HybridTokenizer) -> Vec<String> {
     use tantivy::tokenizer::{TokenStream, Tokenizer};
     let mut stream = tok.token_stream(query_text);
     let mut out = Vec::new();
     while stream.advance() {
         let t = stream.token().text.clone();
-        if !t.is_empty() {
-            out.push(t);
+        if t.is_empty() || !t.chars().any(|c| c.is_alphanumeric()) {
+            continue;
         }
+        out.push(t);
     }
     out
 }
@@ -441,6 +445,22 @@ mod tests {
         let t = terms_of("全文搜索 hello");
         assert!(t.iter().any(|x| x.contains("全文") || x.contains("搜索")));
         assert!(t.iter().any(|x| x == "hello"));
+    }
+
+    #[test]
+    fn terms_drop_junk_punct_and_space() {
+        // 混合查询原文（含 |/引号/冒号/空格）进摘要前必须洗掉标点空白词，
+        // 否则空格被当成命中词（曾报出 1/131631）。
+        let t = terms_of("mct 彩石智能月报 | content:\"mct 彩石智能月报\"");
+        assert!(!t.is_empty(), "{t:?}");
+        assert!(
+            t.iter().all(|x| x.chars().any(|c| c.is_alphanumeric())),
+            "残留标点/空白词: {t:?}"
+        );
+        assert!(t.iter().any(|x| x == "mct"), "{t:?}");
+        assert!(t.iter().any(|x| x.contains("彩石")), "{t:?}");
+        // 纯标点查询直接无词（调用方走头部预览，不再全空格标热）。
+        assert!(terms_of("：； …").is_empty());
     }
 
     #[test]
