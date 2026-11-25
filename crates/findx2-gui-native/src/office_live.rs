@@ -10,8 +10,8 @@
 //!   不允许时，复制到 temp 副本再打开涂色，用户源文件永不落盘。
 //! - 进程管理照搬 office_host 模式：COM Quit + 超时 kill，崩溃可重启。
 //!
-//! 当前状态：Spike 落地——探测、COM 打开/Find/Scroll/Quit、SetParent 嵌入、
-//! temp 副本策略全部可用；GPUI 命中列表联动在后续步骤接入。
+//! 当前状态：Spike 验证通过（Find✓/temp 副本涂色✓/WPS✓/ActiveWindow 滚动✓）；
+//! GPUI 命中列表联动在后续步骤接入。
 
 use crate::settings_logic::OfficeEngine as EnginePref;
 
@@ -536,7 +536,16 @@ impl LiveSession {
             found = variant_is_true(&rr.unwrap_or_else(|_| C::v_bool(false)));
         }
         if found {
-            let _ = sel.method0("ScrollIntoView");
+            // Spike 实测：Selection 自身无 ScrollIntoView，必须走
+            // ActiveWindow.ScrollIntoView(Range, true)（Word/WPS 同口径验证通过）。
+            if let Ok(range) = sel.get("Range") {
+                if let Ok(win) = self.app.get("ActiveWindow") {
+                    let _ = win.call(
+                        "ScrollIntoView",
+                        vec![C::v_disp(range.raw()), C::v_bool(true)],
+                    );
+                }
+            }
             // 选中即高亮（Selection 本身就是视觉高亮，不落盘）。
             Ok(true)
         } else {
@@ -786,5 +795,266 @@ fn embed(child: usize, parent: usize) {
             (style & !(WS_POPUP.0 | WS_CAPTION.0 | WS_THICKFRAME.0)) as i32 | WS_CHILD.0 as i32,
         );
         let _ = MoveWindow(HWND(child as *mut _), 0, 0, 800, 600, true);
+    }
+}
+
+/// 从查询串提取 content  needles（与 service 侧 content_needles 同口径的子集）：
+/// 取 `content:` 后到空白/引号边界的值；多条件取多个；失败返回空（调用方降级纯展示）。
+pub fn needles_from_query(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let lower = query.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    while let Some(i) = rest.find("content:") {
+        let v = rest[i + 8..].trim_start();
+        let token: String = if v.starts_with('"') {
+            v[1..].chars().take_while(|&c| c != '"').collect()
+        } else {
+            v.chars().take_while(|c| !c.is_whitespace()).collect()
+        };
+        let token = token.trim().to_string();
+        if !token.is_empty() && out.len() < 8 {
+            out.push(token.clone());
+        }
+        rest = &v[token.len().min(v.len())..];
+        if rest.len() < 9 {
+            break;
+        }
+    }
+    out
+}
+
+#[cfg(windows)]
+pub mod host {
+    //! GPUI 侧宿主：STA 线程拥有全部 COM 对象，位置跟随预览区。
+    use super::*;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy, Default)]
+    struct Position {
+        rect: [i32; 4],
+        visible: bool,
+    }
+
+    pub struct LiveSurface {
+        position: Mutex<Position>,
+        suppressed: AtomicBool,
+        cancel: Cancel,
+        alive: AtomicBool,
+    }
+
+    pub type Cancel = Arc<AtomicBool>;
+
+    impl LiveSurface {
+        pub fn place(&self, bounds: gpui_kit::Bounds<gpui_kit::Pixels>, scale: f32) {
+            if let Ok(mut p) = self.position.lock() {
+                if self.suppressed.load(Ordering::Acquire)
+                    || self.cancel.load(Ordering::Acquire)
+                    || !self.is_alive()
+                {
+                    p.visible = false;
+                    return;
+                }
+                *p = Position {
+                    rect: [
+                        (bounds.origin.x.as_f32() * scale).round() as i32,
+                        (bounds.origin.y.as_f32() * scale).round() as i32,
+                        (bounds.size.width.as_f32() * scale).round() as i32,
+                        (bounds.size.height.as_f32() * scale).round() as i32,
+                    ],
+                    visible: true,
+                };
+            }
+        }
+        pub fn is_alive(&self) -> bool {
+            self.alive.load(Ordering::Acquire)
+        }
+        pub fn hide(&self) {
+            if let Ok(mut p) = self.position.lock() {
+                p.visible = false;
+            }
+        }
+        pub fn set_suppressed(&self, suppressed: bool) {
+            self.suppressed.store(suppressed, Ordering::Release);
+            if suppressed {
+                self.hide();
+            }
+        }
+    }
+
+    pub struct LiveClient {
+        pub surface: Arc<LiveSurface>,
+        pub engine: LiveEngine,
+        cancel: Cancel,
+    }
+
+    impl Drop for LiveClient {
+        fn drop(&mut self) {
+            self.surface.set_suppressed(true);
+            self.cancel.store(true, Ordering::Release);
+        }
+    }
+
+    /// 启动活文档会话（STA 线程 + 位置跟随）。
+    /// `needles` 为空时只读展示；非空时走 temp 副本涂色 + 跳首命中。
+    /// 就绪（窗口已嵌入）后返回；8 秒超时则报错（调用方降级文字摘录）。
+    pub fn start_live(
+        path: &str,
+        kind: LiveKind,
+        pref: EnginePref,
+        needles: Vec<String>,
+        jump_index: usize,
+        cancel: Cancel,
+    ) -> Result<LiveClient, String> {
+        if path.trim().is_empty() {
+            return Err("路径为空".into());
+        }
+        if std::fs::metadata(path)
+            .map(|m| m.len())
+            .unwrap_or(u64::MAX)
+            > 64 * 1024 * 1024
+        {
+            return Err("文档超过 64 MiB 活文档上限".into());
+        }
+        let engines = probe_order(pref, kind);
+        let engine = engines
+            .into_iter()
+            .find(|e| engine_available(*e))
+            .ok_or_else(|| "未检测到 Word/WPS（活文档不可用，已降级）".to_string())?;
+        let owner = find_owner();
+        if owner == 0 {
+            return Err("原生主窗口尚未就绪".into());
+        }
+        let (tx, rx) = mpsc::sync_channel::<Result<(), String>>(1);
+        let surface = Arc::new(LiveSurface {
+            position: Mutex::new(Position::default()),
+            suppressed: AtomicBool::new(false),
+            cancel: cancel.clone(),
+            alive: AtomicBool::new(true),
+        });
+        let state = surface.clone();
+        let path = path.to_string();
+        let cancel_in = cancel.clone();
+        std::thread::spawn(move || {
+            let res = sta_main(&path, engine, &needles, jump_index, owner, &state, &cancel_in);
+            state.alive.store(false, Ordering::Release);
+            let _ = tx.send(res);
+        });
+        let start = Instant::now();
+        loop {
+            if start.elapsed() > Duration::from_secs(8) {
+                cancel.store(true, Ordering::Release);
+                return Err("活文档启动超时（8 秒）；已降级".into());
+            }
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(r) => {
+                    r?;
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("活文档宿主提前退出".into());
+                }
+                Err(_) => {}
+            }
+        }
+        Ok(LiveClient {
+            surface,
+            engine,
+            cancel,
+        })
+    }
+
+    fn sta_main(
+        path: &str,
+        engine: LiveEngine,
+        needles: &[String],
+        jump_index: usize,
+        owner: usize,
+        surface: &Arc<LiveSurface>,
+        cancel: &Cancel,
+    ) -> Result<(), String> {
+        // 全部 COM 对象归属本 STA 线程；退出时 Quit + temp 清理。
+        let needs_paint = !needles.is_empty();
+        let sess = LiveSession::open(path, engine, owner, needs_paint)?;
+        if engine.kind() == LiveKind::Word && !needles.is_empty() {
+            let _ = sess.word_highlight_all(needles);
+            let first = needles.first().map(|s| s.as_str()).unwrap_or("");
+            let _ = sess.word_jump(first, jump_index);
+        }
+        // 位置跟随：GPUI canvas 每帧 place()，这里 20ms 轮询 MoveWindow。
+        let mut last: Option<[i32; 4]> = None;
+        while !cancel.load(Ordering::Acquire) {
+            let cur = surface
+                .position
+                .lock()
+                .map(|p| if p.visible { Some(p.rect) } else { None })
+                .unwrap_or(None);
+            if cur != last {
+                match cur {
+                    Some([x, y, w, h]) => {
+                        sess.resize(x, y, w, h);
+                        show_child(sess.embedded_hwnd, true);
+                    }
+                    None => show_child(sess.embedded_hwnd, false),
+                }
+                last = cur;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        sess.close();
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn show_child(hwnd: usize, show: bool) {
+        if hwnd == 0 {
+            return;
+        }
+        unsafe {
+            use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::*};
+            let _ = ShowWindow(
+                HWND(hwnd as *mut _),
+                if show { SW_SHOW } else { SW_HIDE },
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    fn find_owner() -> usize {
+        use windows::Win32::{Foundation::*, UI::WindowsAndMessaging::*};
+        unsafe extern "system" fn visit(
+            h: HWND,
+            data: windows::Win32::Foundation::LPARAM,
+        ) -> windows::core::BOOL {
+            unsafe {
+                let mut pid = 0;
+                GetWindowThreadProcessId(h, Some(&mut pid));
+                if pid == std::process::id() {
+                    let mut title = [0u16; 128];
+                    let n = GetWindowTextW(h, &mut title);
+                    if n > 0
+                        && crate::isolation::is_main_window_title(&String::from_utf16_lossy(
+                            &title[..n as usize],
+                        ))
+                    {
+                        *(data.0 as *mut usize) = h.0 as usize;
+                        return false.into();
+                    }
+                }
+                true.into()
+            }
+        }
+        let mut hwnd = 0usize;
+        unsafe {
+            let _ = EnumWindows(
+                Some(visit),
+                windows::Win32::Foundation::LPARAM(&mut hwnd as *mut usize as isize),
+            );
+        }
+        hwnd
     }
 }

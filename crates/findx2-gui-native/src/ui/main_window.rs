@@ -292,6 +292,18 @@ pub struct MainWindow {
     full_truncated: bool,
     match_list_h: f32,
     split_drag: Option<(f32, f32)>,
+    /// 活文档会话（管线 A）：命中上下文 tab 为 office 文件时嵌入 Word/WPS 活窗口。
+    /// 与系统版式 tab 的 IPreviewHandler 完全独立；None = 未启动/已降级文字。
+    #[cfg(windows)]
+    live_doc: Option<crate::office_live::host::LiveClient>,
+    /// 活文档归属：(path, query)。目标/查询变化时重建会话。
+    #[cfg(windows)]
+    live_key: Option<(String, String)>,
+    /// 活文档启动中（STA 线程 8s 内回执；防重复启动）。
+    #[cfg(windows)]
+    live_starting: bool,
+    #[cfg(windows)]
+    live_cancel: crate::office_live::host::Cancel,
     /// 列表面板展开态（默认收起，只占 pager 行一个按钮）。
     snippet_list_open: bool,
     /// 列表拉取中（按钮置灰防重复请求）。
@@ -552,6 +564,14 @@ impl MainWindow {
             full_truncated: false,
             match_list_h: 220.0,
             split_drag: None,
+            #[cfg(windows)]
+            live_doc: None,
+            #[cfg(windows)]
+            live_key: None,
+            #[cfg(windows)]
+            live_starting: false,
+            #[cfg(windows)]
+            live_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             preview_snippet_view: false,
             preview_snippet_lock: false,
             last_content_width: 1100.0,
@@ -1559,6 +1579,108 @@ impl MainWindow {
         }
     }
 
+    /// 活文档嵌入是否激活：会话存活且归属当前目标/查询。
+    /// 激活时命中上下文顶部展示 Word/WPS 活窗口（真版式+高亮+跳转），
+    /// 而不是纯文本列；系统版式 tab 保持原生 IPreviewHandler 不动。
+    #[cfg(windows)]
+    fn live_active(&self) -> bool {
+        self.preview_snippet_view
+            && self
+                .live_doc
+                .as_ref()
+                .is_some_and(|c| c.surface.is_alive())
+            && self
+                .live_key
+                .as_ref()
+                .is_some_and(|(p, q)| {
+                    self.active_workspace_hit()
+                        .map(|h| &h.path == p)
+                        .unwrap_or(false)
+                        && self.live_query_matches(q)
+                })
+    }
+
+    #[cfg(windows)]
+    fn live_query_matches(&self, _q: &str) -> bool {
+        // 查询变化即重建：比较宽松，精ava确比较由 ensure_live_doc 的 key 负责。
+        // 这里只确认仍在搜索模式且仍是 content 查询。
+        true
+    }
+
+    /// 确保活文档会话：office 文件 + 命中上下文 tab + content 查询时启动。
+    /// 后台 spawn_blocking（COM 打开 400~600ms 不卡 UI）；就绪后重绘。
+    #[cfg(windows)]
+    fn ensure_live_doc(&mut self, cx: &mut Context<Self>) {
+        if !self.preview_snippet_view || self.workspace.mode != ViewMode::Search {
+            return;
+        }
+        let Some(hit) = self.active_workspace_hit() else {
+            return;
+        };
+        if hit.is_directory {
+            return;
+        }
+        let ext = std::path::Path::new(&hit.path)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let kind = match crate::office_live::kind_for_ext(&ext) {
+            Some(k) => k,
+            None => return,
+        };
+        let query = self.current_query(cx);
+        if !query.to_ascii_lowercase().contains("content:") {
+            return;
+        }
+        let key = (hit.path.clone(), query.clone());
+        if self.live_key.as_ref() == Some(&key)
+            && self.live_doc.as_ref().is_some_and(|c| c.surface.is_alive())
+        {
+            return;
+        }
+        if self.live_starting {
+            return;
+        }
+        // 旧会话先取消（Drop 即 suppressed + cancel，STA 线程 Quit 退出）。
+        self.live_cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.live_doc = None;
+        self.live_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = self.live_cancel.clone();
+        let pref = self.session.read(cx).settings.office_engine;
+        let needles = crate::office_live::needles_from_query(&query);
+        let jump = self.snippet_window;
+        self.live_key = Some(key.clone());
+        self.live_starting = true;
+        cx.spawn(async move |this, cx| {
+            let started = tokio::task::spawn_blocking(move || {
+                crate::office_live::host::start_live(
+                    &key.0, kind, pref, needles, jump, cancel,
+                )
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                this.live_starting = false;
+                match started {
+                    Ok(Ok(client)) => {
+                        this.live_doc = Some(client);
+                        cx.notify();
+                    }
+                    _ => {
+                        // 启动失败即降级文字（live_doc 保持 None，走文本列）。
+                        this.live_doc = None;
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(not(windows))]
+    fn ensure_live_doc(&mut self, _cx: &mut Context<Self>) {}
+
     fn pause_preview(&mut self) {
         self.preview_cancel
             .store(true, std::sync::atomic::Ordering::Release);
@@ -2075,6 +2197,8 @@ impl MainWindow {
         if self.preview_snippet_view && !hit.is_directory {
             self.fetch_full_text(hit.entry_idx, cx);
             self.fetch_snippet_list(hit.entry_idx, cx);
+            #[cfg(windows)]
+            self.ensure_live_doc(cx);
         }
         if self.preview_memo.len() > 64 {
             self.preview_memo.clear();
@@ -3081,6 +3205,8 @@ impl MainWindow {
                                                         }
                                                     }
                                                 }
+                                                #[cfg(windows)]
+                                                this.ensure_live_doc(cx);
                                                 cx.notify();
                                                 return;
                                             }
@@ -3092,6 +3218,16 @@ impl MainWindow {
                                             // 必须先落到目标 tab 再请求。
                                             this.preview_snippet_view = false;
                                             this.preview_snippet_lock = true;
+                                            #[cfg(windows)]
+                                            {
+                                                // 离开命中上下文：活文档窗口隐藏，会话释放。
+                                                this.live_cancel.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                                this.live_doc = None;
+                                                this.live_starting = false;
+                                            }
                                             this.request_preview(cx, false);
                                             cx.notify();
                                         })
@@ -3170,19 +3306,48 @@ impl MainWindow {
                             .py_2()
                             .text_sm()
                             .child({
-                                let (plain, ranges) = self.hit_text_and_ranges();
-                                StyledText::new(plain).with_highlights(
-                                    ranges.into_iter().map(|range| {
-                                        (
-                                            range,
-                                            HighlightStyle {
-                                                color: Some(tokens.hit_fg),
-                                                background_color: Some(tokens.hit_bg),
-                                                ..Default::default()
-                                            },
-                                        )
-                                    }),
-                                )
+                                #[cfg(windows)]
+                                let live_canvas: Option<AnyElement> = if self.live_active() {
+                                    // 活文档已接管：顶部不再画文本，画嵌入位（Word/WPS 窗口跟随）。
+                                    self.live_doc.as_ref().and_then(|c| {
+                                        let surface = c.surface.clone();
+                                        surface.is_alive().then(|| {
+                                            canvas(
+                                                |_, _, _| (),
+                                                move |bounds, _, window, _| {
+                                                    surface.place(
+                                                        bounds,
+                                                        window.scale_factor(),
+                                                    );
+                                                },
+                                            )
+                                            .size_full()
+                                            .into_any_element()
+                                        })
+                                    })
+                                } else {
+                                    None
+                                };
+                                #[cfg(not(windows))]
+                                let live_canvas: Option<AnyElement> = None;
+                                match live_canvas {
+                                    Some(el) => el,
+                                    None => {
+                                        let (plain, ranges) = self.hit_text_and_ranges();
+                                        StyledText::new(plain)
+                                            .with_highlights(ranges.into_iter().map(|range| {
+                                                (
+                                                    range,
+                                                    HighlightStyle {
+                                                        color: Some(tokens.hit_fg),
+                                                        background_color: Some(tokens.hit_bg),
+                                                        ..Default::default()
+                                                    },
+                                                )
+                                            }))
+                                            .into_any_element()
+                                    }
+                                }
                             })
                             .into_any_element(),
                     )
