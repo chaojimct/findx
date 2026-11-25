@@ -1653,13 +1653,17 @@ impl MainWindow {
         let jump = self.snippet_window;
         self.live_key = Some(key.clone());
         self.live_starting = true;
+        // GPUI executor 不是 Tokio runtime：阻塞 COM 打开走 throwaway 线程 +
+        // oneshot 接回（preview_worker::run_uncached 同款），禁止 spawn_blocking。
         cx.spawn(async move |this, cx| {
-            let started = tokio::task::spawn_blocking(move || {
-                crate::office_live::host::start_live(
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                let r = crate::office_live::host::start_live(
                     &key.0, kind, pref, needles, jump, cancel,
-                )
-            })
-            .await;
+                );
+                let _ = tx.send(r);
+            });
+            let started = rx.await;
             let _ = this.update(cx, |this, cx| {
                 this.live_starting = false;
                 match started {
