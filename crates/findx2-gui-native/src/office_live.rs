@@ -256,7 +256,17 @@ mod com {
                 Some(&mut excep),
                 Some(&mut arg_err),
             )
-            .map_err(|e| format!("{name} 调用失败: {e}"))?;
+            .map_err(|e| {
+                let desc = unsafe {
+                    let b = &*excep.bstrDescription;
+                    if b.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" desc={}", b.to_string())
+                    }
+                };
+                format!("{name} 调用失败(arg_err={arg_err}{desc}): {e}")
+            })?;
             // 调用方负责 VARIANT 清理（BSTR/IDispatch 泄漏可接受：宿主进程级，Quit 后随进程回收）。
             Ok(out)
         }
