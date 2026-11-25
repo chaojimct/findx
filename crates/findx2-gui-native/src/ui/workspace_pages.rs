@@ -221,6 +221,15 @@ impl MainWindow {
                         }))
                 }),
             )
+            // 与右侧真实输入框之间的小分隔线（弱化存在感，只做分区）。
+            .child(
+                div()
+                    .w(px(1.))
+                    .h(px(16.))
+                    .flex_shrink_0()
+                    .bg(tokens.border_soft)
+                    .ml_1(),
+            )
     }
 
     fn render_search_toolbar(&self, preview: bool, cx: &mut Context<Self>) -> impl IntoElement {
