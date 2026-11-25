@@ -86,6 +86,9 @@ fn pinyin_aux_walk_matches_online_extraction() {
     // 这里就是空（单位混淆回归网）。
     let hits_mid = full_idx.search_pinyin("ceshi", 10, true).unwrap();
     assert!(!hits_mid.is_empty(), "中部音节 ceshi 应命中（回填截断回归）");
+    // 模糊音：`shousuo`（shou/sou）命中“搜索”。
+    let hits_fuzzy = full_idx.search_pinyin("shousuo", 10, true).unwrap();
+    assert!(!hits_fuzzy.is_empty(), "模糊音 shousuo 应命中搜索");
     // 首字母串不受切分影响：`qw` 在 full 侧无命中（只走 initials 侧）。
     let hits5 = full_idx.search_pinyin("qw", 10, true).unwrap();
     assert!(hits5.is_empty(), "qw 在全拼侧应无命中");

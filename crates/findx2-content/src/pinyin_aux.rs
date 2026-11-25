@@ -129,6 +129,107 @@ pub fn full_text(chars: &[char]) -> String {
     out
 }
 
+/// 标准模糊音变体（前后鼻音 + 平翘舌；不含输入本身，调用方自行 prepend）。
+/// 查询扩展用：索引里只会出现真实音节，过度生成无害（匹配不到即无命中）。
+/// 初衷：`shousuo` 命中"搜索"（sou/shou），`zang` 命中"张"（zhang/zh 前缀对）。
+pub(crate) fn fuzzy_variants(syl: &str) -> Vec<&'static str> {
+    // 注：返回 'static 需查表而非拼接；表覆盖常用音节，漏收即无扩展（行为退化为精确）。
+    const PAIRS: &[(&str, &str)] = &[
+        ("zhang", "zang"),
+        ("zhan", "zan"),
+        ("zhao", "zao"),
+        ("zha", "za"),
+        ("zhei", "zei"),
+        ("zhen", "zen"),
+        ("zheng", "zeng"),
+        ("zhi", "zi"),
+        ("zhong", "zong"),
+        ("zhou", "zou"),
+        ("zhu", "zu"),
+        ("zhua", "zua"),
+        ("zhuai", "zuai"),
+        ("zhuan", "zuan"),
+        ("zhuang", "zuang"),
+        ("zhui", "zui"),
+        ("zhun", "zun"),
+        ("zhuo", "zuo"),
+        ("chang", "cang"),
+        ("chan", "can"),
+        ("chao", "cao"),
+        ("cha", "ca"),
+        ("che", "ce"),
+        ("chen", "cen"),
+        ("cheng", "ceng"),
+        ("chi", "ci"),
+        ("chong", "cong"),
+        ("chou", "cou"),
+        ("chu", "cu"),
+        ("chuan", "cuan"),
+        ("chuang", "cuang"),
+        ("chui", "cui"),
+        ("chun", "cun"),
+        ("chuo", "cuo"),
+        ("shang", "sang"),
+        ("shan", "san"),
+        ("shao", "sao"),
+        ("sha", "sa"),
+        ("she", "se"),
+        ("shen", "sen"),
+        ("sheng", "seng"),
+        ("shi", "si"),
+        ("shou", "sou"),
+        ("shu", "su"),
+        ("shua", "sua"),
+        ("shuai", "suai"),
+        ("shuan", "suan"),
+        ("shuang", "suang"),
+        ("shui", "sui"),
+        ("shun", "sun"),
+        ("shuo", "suo"),
+        ("lin", "ling"),
+        ("min", "ming"),
+        ("nin", "ning"),
+        ("bin", "bing"),
+        ("pin", "ping"),
+        ("jin", "jing"),
+        ("qin", "qing"),
+        ("xin", "xing"),
+        ("yin", "ying"),
+        ("men", "meng"),
+        ("fen", "feng"),
+        ("gen", "geng"),
+        ("ken", "keng"),
+        ("hen", "heng"),
+        ("ren", "reng"),
+        ("zen", "zeng"),
+        ("cen", "ceng"),
+        ("sen", "seng"),
+        ("man", "mang"),
+        ("nan", "nang"),
+        ("lan", "lang"),
+        ("gan", "gang"),
+        ("kan", "kang"),
+        ("han", "hang"),
+        ("ran", "rang"),
+        ("zan", "zang"),
+        ("can", "cang"),
+        ("san", "sang"),
+    ];
+    let mut out = vec![];
+    // 精确音节本身是否在表里不重要；调用方保证输入是切分出的真实音节。
+    for (a, b) in PAIRS {
+        if *a == syl {
+            out.push(*b);
+            break;
+        }
+        if *b == syl {
+            out.push(*a);
+            break;
+        }
+    }
+    out
+}
+
 /// 标准无调拼音节集合（含 `lv`/`nv`/`lue`/`nue` 写法；`ü` 按 `v` 归一）。
 ///
 /// 覆盖 GB/T 16159 常用音节 + 口语残留（`dei`/`den`/`kei`/`lo` 等），贪心最长
@@ -513,5 +614,18 @@ mod split_tests {
         assert!(split_pinyin_query("ma").is_none(), "单音节走原单 token 路");
         assert!(split_pinyin_query("").is_none());
         assert!(split_pinyin_query("QuanWen").is_none(), "非全小写不切分");
+    }
+
+    #[test]
+    fn fuzzy_variants_cover_pingqiao_and_qianhou() {
+        use super::fuzzy_variants;
+        assert!(fuzzy_variants("sou").contains(&"shou"), "sou↔shou");
+        assert!(fuzzy_variants("shou").contains(&"sou"), "反向 shou↔sou");
+        assert!(fuzzy_variants("zhang").contains(&"zang"), "zhang↔zang");
+        assert!(fuzzy_variants("lin").contains(&"ling"), "lin↔ling");
+        assert!(fuzzy_variants("fen").contains(&"feng"), "fen↔feng");
+        assert!(fuzzy_variants("man").contains(&"mang"), "man↔mang");
+        assert!(fuzzy_variants("ma").is_empty(), "精确音节无变体");
+        assert!(fuzzy_variants("xyz").is_empty(), "非法串无变体");
     }
 }

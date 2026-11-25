@@ -76,7 +76,7 @@ fn escape(s: &str) -> String {
 /// 对齐口径与辅库查询一致：单音节全拼（`ma`）/ 连写全拼（`machuntian`，
 /// 半截尾巴按前缀）/ 首字母串（`mct`，长度≥2）。
 fn pinyin_spans(text: &str, terms: &[String]) -> Vec<(usize, usize)> {
-    use crate::pinyin_aux::{is_cjk, is_pinyin_syllable, pinyin_of, split_pinyin_query};
+    use crate::pinyin_aux::{is_cjk, pinyin_of, split_pinyin_query};
     const SCAN_BYTES: usize = 1 << 20;
     let mut scan_end = text.len().min(SCAN_BYTES);
     while scan_end > 0 && !text.is_char_boundary(scan_end) {
@@ -107,17 +107,19 @@ fn pinyin_spans(text: &str, terms: &[String]) -> Vec<(usize, usize)> {
         return Vec::new();
     }
     let mut hits: Vec<(usize, usize)> = Vec::new();
+    // 音节相等或互为模糊音即对齐（与辅库查询扩展同口径）。
+    let plain_matches = |plain: &str, syl: &str| {
+        plain == syl || crate::pinyin_aux::fuzzy_variants(syl).contains(&plain)
+    };
     for t in terms {
         let q = t.to_ascii_lowercase();
         if q.len() < 2 || !q.bytes().all(|b| b.is_ascii_lowercase()) {
             continue;
         }
-        // 1) 单音节全拼（如 `ma` 命中“马”）。
-        if is_pinyin_syllable(&q) {
-            for it in &seq {
-                if it.plain == q {
-                    hits.push((it.start, it.end));
-                }
+        // 1) 单音节全拼（如 `ma` 命中“马”；`zang` 命中“张”）。
+        for it in &seq {
+            if plain_matches(it.plain, &q) {
+                hits.push((it.start, it.end));
             }
         }
         // 2) 连写全拼（如 `machuntian` 命中“马春田”；`quanw` 的 `w` 按前缀）。
@@ -128,7 +130,7 @@ fn pinyin_spans(text: &str, terms: &[String]) -> Vec<(usize, usize)> {
                 let full_ok = seq[i..i + n]
                     .iter()
                     .zip(heads.iter())
-                    .all(|(it, h)| it.plain == *h);
+                    .all(|(it, h)| plain_matches(it.plain, h));
                 if full_ok {
                     if tail.is_empty() {
                         hits.push((seq[i].start, seq[i + n - 1].end));
@@ -529,6 +531,18 @@ mod tests {
         assert_eq!(&"这是全文检索"[spans3[0].0..spans3[0].1], "全文");
         // 纯拉丁无 CJK：拼音对齐不产出，不掩盖字面逻辑。
         assert!(match_spans("nothing here", &vec!["qw".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn pinyin_spans_align_fuzzy_variants() {
+        // 模糊音 `shousuo`（shou/sou）对齐“搜索”并标热。
+        let terms = vec!["shousuo".to_string()];
+        let text = "核心是搜索引擎模块";
+        let spans = match_spans(text, &terms);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(&text[spans[0].0..spans[0].1], "搜索");
+        let html = make_snippet(text, &terms).expect("模糊命中应有 snippet");
+        assert!(html.contains("<b>搜索</b>"), "{html}");
     }
 
     #[test]

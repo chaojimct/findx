@@ -340,11 +340,53 @@ impl ContentIndex {
         // 全拼侧连写（如 `machuntian`）：切音节后严格连续（Phrase），散音节
         // 文档不再召回——“多输一个音节即收窄”，与输入直觉一致；尾部半个音节
         // （如 `quanwe` 的 `we`）按 AND + 前缀，打一半不断流。
+        // 模糊音：每音节展开平翘/前后鼻变体，笛卡尔封顶 8 个 phrase 或（超限回落精确）。
         // （空格写法 `ma chun tian` 保持 OR，兼容“拼音+英文”混合查询。）
         if for_full && terms.len() == 1 {
             let t = &terms[0];
             if let Some((heads, tail)) = crate::pinyin_aux::split_pinyin_query(t) {
                 if tail.is_empty() && heads.len() >= 2 {
+                    let mut lists: Vec<Vec<&str>> = Vec::with_capacity(heads.len());
+                    for h in &heads {
+                        let mut v = vec![h.as_str()];
+                        v.extend(crate::pinyin_aux::fuzzy_variants(h));
+                        lists.push(v);
+                    }
+                    // 笛卡尔积上限，避免长串组合爆炸。
+                    let mut combos: Vec<Vec<&str>> = vec![Vec::new()];
+                    for opts in &lists {
+                        if combos.len() * opts.len() > 8 {
+                            combos.clear();
+                            break;
+                        }
+                        let mut next = Vec::with_capacity(combos.len() * opts.len());
+                        for prefix in &combos {
+                            for o in opts {
+                                let mut c = prefix.clone();
+                                c.push(o);
+                                next.push(c);
+                            }
+                        }
+                        combos = next;
+                    }
+                    if !combos.is_empty() {
+                        let subs: Vec<(Occur, Box<dyn tantivy::query::Query>)> = combos
+                            .into_iter()
+                            .map(|combo| {
+                                let ts: Vec<Term> = combo
+                                    .into_iter()
+                                    .map(|h| Term::from_field_text(field, h))
+                                    .collect();
+                                (
+                                    Occur::Should,
+                                    Box::new(PhraseQuery::new(ts))
+                                        as Box<dyn tantivy::query::Query>,
+                                )
+                            })
+                            .collect();
+                        return self.top_aux(&searcher, &BooleanQuery::new(subs), limit);
+                    }
+                    // 超限回落精确 phrase。
                     let phrase_terms: Vec<Term> = heads
                         .iter()
                         .map(|h| Term::from_field_text(field, h))
