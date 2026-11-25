@@ -1172,7 +1172,18 @@ pub mod host {
             ticks += 1;
             if ticks % 100 == 0 {
                 // 约每 2s 校验窗口有效性：transient 消亡/真窗口迟到都重找。
+                let before = sess.embedded_hwnd;
+                let alive_now = is_window_alive(before);
                 sess.reembed_if_needed();
+                if sess.embedded_hwnd != before || !alive_now {
+                    tlog!(
+                        "recheck hwnd {before} alive={alive_now} -> {}",
+                        sess.embedded_hwnd
+                    );
+                }
+            }
+            if ticks % 250 == 0 {
+                tlog!("tick alive");
             }
             let cur = surface
                 .position
