@@ -2466,12 +2466,22 @@ impl MainWindow {
                                             .text_xs()
                                             .text_color(tokens.text_tertiary)
                                             .child("命中上下文"),
-                                    )
-                                    // 多个匹配点时可上一个/下一个翻页。
-                                    .when(self.snippet_total > 1, |view| {
-                                        view.child(self.snippet_pager(cx))
-                                    }),
+                                    ),
                             )
+                            // 命中上下文的操作栏：上一个/下一个（多处匹配时单起一行）。
+                            .when(self.snippet_total > 1, |view| {
+                                view.child(
+                                    h_flex()
+                                        .w_full()
+                                        .flex_shrink_0()
+                                        .px_3()
+                                        .py_1()
+                                        .gap_1()
+                                        .border_b_1()
+                                        .border_color(tokens.border_soft)
+                                        .child(self.snippet_pager(cx)),
+                                )
+                            })
                             .child(
                                 div().w_full().text_sm().child(
                                     StyledText::new(plain).with_highlights(
@@ -2556,11 +2566,31 @@ impl MainWindow {
                                         })
                                     })
                             }),
-                        )
-                        // 多个匹配点时可上一个/下一个翻页（仅摘要 tab 激活时展示）。
-                        .when(self.preview_snippet_view && self.snippet_total > 1, |view| {
-                            view.child(self.snippet_pager(cx))
-                        }),
+                        ),
+                    )
+                },
+            )
+            // 命中上下文的操作栏：上一个/下一个翻页
+            //（仅 office 预览、摘要 tab 激活且有多处匹配时展示一行）。
+            .when(
+                self.preview_snippet_view
+                    && self.snippet_total > 1
+                    && self
+                        .preview
+                        .meta
+                        .as_ref()
+                        .is_some_and(|m| is_office_preview_path(&m.path)),
+                |view| {
+                    view.child(
+                        h_flex()
+                            .w_full()
+                            .flex_shrink_0()
+                            .px_2()
+                            .py_1()
+                            .gap_1()
+                            .border_b_1()
+                            .border_color(tokens.border_soft)
+                            .child(self.snippet_pager(cx)),
                     )
                 },
             )
