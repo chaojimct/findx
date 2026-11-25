@@ -564,11 +564,11 @@ impl LiveSession {
         let r = find.call(
             "Execute",
             vec![
-                C::v_i4(0),     // Replace = wdReplaceNone
-                C::v_str(""),   // ReplaceWith
-                C::v_i4(1),     // Wrap = wdFindContinue
-                C::v_bool(true), // Forward
+                C::v_i4(0),      // Replace = wdReplaceNone
+                C::v_str(""),    // ReplaceWith
                 C::v_bool(false), // Format
+                C::v_i4(1),      // Wrap = wdFindContinue
+                C::v_bool(true),  // Forward
                 C::v_bool(false), // MatchAllWordForms
                 C::v_bool(false), // MatchSoundsLike
                 C::v_bool(false), // MatchWildcards
@@ -589,9 +589,9 @@ impl LiveSession {
                 vec![
                     C::v_i4(0),
                     C::v_str(""),
+                    C::v_bool(false),
                     C::v_i4(1),
                     C::v_bool(true),
-                    C::v_bool(false),
                     C::v_bool(false),
                     C::v_bool(false),
                     C::v_bool(false),
@@ -642,11 +642,11 @@ impl LiveSession {
                 let r = find.call(
                     "Execute",
                     vec![
-                        C::v_i4(0), // Replace = wdReplaceNone
-                        C::v_str(""), // ReplaceWith
-                        C::v_i4(0), // Wrap = wdFindStop，到文末停
-                        C::v_bool(true), // Forward
+                        C::v_i4(0),      // Replace = wdReplaceNone
+                        C::v_str(""),    // ReplaceWith
                         C::v_bool(false), // Format
+                        C::v_i4(0),      // Wrap = wdFindStop，到文末停
+                        C::v_bool(true),  // Forward
                         C::v_bool(false), // MatchAllWordForms
                         C::v_bool(false), // MatchSoundsLike
                         C::v_bool(false), // MatchWildcards
