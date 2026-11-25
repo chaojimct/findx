@@ -440,11 +440,19 @@ impl LiveSession {
             .map_err(|e| format!("COM 初始化失败: {e}"))?;
         }
         let app = com::create(engine.prog_id())?;
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "[live] com created");
+        }
         // open 后续任一步失败必须 Quit，否则泄漏无窗口 Word 进程。
         // 不弹窗、不改用户 normal 模板。
         if let Err(e) = app.put_bool("Visible", true) {
             let _ = app.method0("Quit");
             return Err(e);
+        }
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "[live] visible ok");
         }
         let _ = app.put_bool("DisplayAlerts", false);
 
@@ -464,6 +472,10 @@ impl LiveSession {
                 return Err(e);
             }
         };
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "[live] doc opened");
+        }
         let embedded_hwnd = find_app_window(engine).unwrap_or(0);
         if embedded_hwnd != 0 && host_hwnd != 0 {
             embed(embedded_hwnd, host_hwnd);
@@ -1011,9 +1023,17 @@ pub mod host {
         cancel: &Cancel,
         ready: &mpsc::SyncSender<Result<(), String>>,
     ) -> Result<(), String> {
+        use std::io::Write as _;
+        macro_rules! tlog {
+            ($($a:tt)*) => {{
+                let _ = writeln!(std::io::stderr(), "[live] {}", format!($($a)*));
+            }};
+        }
         // 全部 COM 对象归属本 STA 线程；退出时 Quit + temp 清理。
         let needs_paint = !needles.is_empty();
+        tlog!("open begin path={path} engine={} paint={needs_paint}", engine.prog_id());
         let mut sess = LiveSession::open(path, engine, owner, needs_paint)?;
+        tlog!("open ok hwnd={} needles={}", sess.embedded_hwnd, needles.len());
         if engine.kind() == LiveKind::Word && !needles.is_empty() {
             let _ = sess.word_highlight_all(needles);
             let first = needles.first().map(|s| s.as_str()).unwrap_or("");
@@ -1021,8 +1041,10 @@ pub mod host {
         }
         // 就绪回执（窗口可能稍后才可见——云文档下载慢时 find_app_window 为 0，
         // 位置循环里按可见性 show/hide，不阻塞就绪）。
+        tlog!("ready send");
         let _ = ready.send(Ok(()));
         // 位置跟随：GPUI canvas 每帧 place()，这里 20ms 轮询 MoveWindow。
+        tlog!("loop enter");
         let mut last: Option<[i32; 4]> = None;
         let mut ticks: u64 = 0;
         while !cancel.load(Ordering::Acquire) {
