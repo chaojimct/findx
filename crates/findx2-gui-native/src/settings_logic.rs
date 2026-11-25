@@ -112,9 +112,18 @@ impl ContentDefaultMode {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Name => "名称",
+            Self::Name => "标题",
             Self::Content => "全文",
             Self::Mix => "混合",
+        }
+    }
+
+    /// 搜索框占位提示，随检索模式切换（全文模式顺带提示拼音）。
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Name => "按标题搜索…",
+            Self::Content => "搜正文，支持拼音如 qw…",
+            Self::Mix => "搜标题或正文…",
         }
     }
 
@@ -508,6 +517,9 @@ mod tests {
         assert_eq!(s.content_max_file_mb, 20);
         // 模式解析。
         assert_eq!(ContentDefaultMode::parse("mix"), Some(ContentDefaultMode::Mix));
+        // 模式标签与占位提示：两字中文 + 全文带拼音入口提示。
+        assert_eq!(ContentDefaultMode::Name.label(), "标题");
+        assert!(ContentDefaultMode::Content.hint().contains("拼音"));
         assert_eq!(ContentDefaultMode::parse("nope"), None);
     }
 

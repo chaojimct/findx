@@ -394,7 +394,9 @@ impl MainWindow {
         let saved_bindings = session.read(cx).prefs.key_bindings.clone();
         crate::keybindings::apply(&saved_bindings, cx);
 
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索文件…"));
+        let search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(session.read(cx).settings.content_default_mode.hint())
+        });
 
         let widths = session
             .read(cx)
@@ -909,6 +911,11 @@ impl MainWindow {
         self.content_mode = m;
         self.animate_content_glide(cx, from, crate::settings_logic::content_mode_left(m));
         self.schedule_search(window, cx);
+        // 占位提示跟随检索模式（全文顺带提示拼音）。
+        let hint: SharedString = m.hint().into();
+        self.search.update(cx, |input, cx| {
+            input.set_placeholder(hint, window, cx);
+        });
         cx.notify();
     }
 

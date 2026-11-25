@@ -171,7 +171,7 @@ impl MainWindow {
             .cursor_pointer()
             .tooltip({
                 let tip: SharedString =
-                    "检索范围：名称 / 全文 / 混合。全文支持拼音首字母与全拼。点击切换"
+                    "检索范围：标题 / 全文 / 混合。全文支持拼音首字母与全拼；点击切换"
                         .into();
                 move |window, cx| {
                     gpui_kit::component::tooltip::Tooltip::new(tip.clone())
