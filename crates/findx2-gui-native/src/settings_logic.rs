@@ -129,7 +129,7 @@ impl ContentDefaultMode {
 }
 
 /// 搜索框三段 switch 单段宽度（px）：三段等宽，滑块按下标定位。
-pub const CONTENT_MODE_SEG_W: f32 = 60.0;
+pub const CONTENT_MODE_SEG_W: f32 = 52.0;
 /// 滑块滑动时长（ms，逐帧驱动 + ease_in_out_cubic）。
 pub const CONTENT_MODE_GLIDE_MS: u64 = 220;
 

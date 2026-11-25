@@ -154,8 +154,8 @@ impl MainWindow {
             }))
     }
 
-    /// 搜索框输入框内左侧的三段 switch（文件/全文/混合，直选）。
-    /// 常显三段 + 滑动指示块：一眼看到当前检索范围，点哪段切哪段。
+    /// 搜索框输入框内左侧的三段 switch（名称/全文/混合，直选）。
+    /// 去边框底色、直接长在输入框底色上；选中态只靠滑动指示块 + 加粗。
     /// tooltip 保留完整语义即拼音入口。
     fn mode_segmented(&self, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::settings_logic::CONTENT_MODE_SEG_W;
@@ -166,11 +166,7 @@ impl MainWindow {
             .relative()
             .flex_shrink_0()
             .items_center()
-            .h(px(26.))
-            .rounded_full()
-            .border_1()
-            .border_color(tokens.border_soft)
-            .bg(tokens.surface)
+            .h(px(24.))
             .cursor_pointer()
             .tooltip({
                 let tip: SharedString =
@@ -185,11 +181,11 @@ impl MainWindow {
             .child(
                 div()
                     .absolute()
-                    .top(px(2.))
-                    .bottom(px(2.))
+                    .top(px(1.))
+                    .bottom(px(1.))
                     .left(px(gx))
                     .w(px(CONTENT_MODE_SEG_W))
-                    .rounded_full()
+                    .rounded_md()
                     .bg(tokens.row_selected),
             )
             .children(
