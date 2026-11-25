@@ -13,7 +13,7 @@
 //! - `status_snapshot()`：`Status` 轮询用（2s 一次，零新通道）。
 //! - `snippets_for(...)`：搜索装配用，按页内 `entry_idx` 取前 N 个 snippet。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -98,6 +98,11 @@ struct Manager {
     stash: Vec<Job>,
     tx: Option<std::sync::mpsc::SyncSender<Vec<Job>>>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// 拼音打标缓存：needle(+开关) → 辅库命中的 (volume_key, frn) 全集（带查询 limit）。
+    /// MergedContentSearch 在合并查询时顺手填入（与打标同源），命中即省掉两次
+    /// TopDocs(CAP) 重查；FIFO 上限防内存膨胀。
+    aux_mark_cache: HashMap<(String, bool, bool), (usize, HashSet<(String, u64)>)>,
+    aux_mark_order: std::collections::VecDeque<(String, bool, bool)>,
 }
 
 impl Manager {
@@ -119,6 +124,8 @@ impl Manager {
             stash: Vec::new(),
             tx: None,
             worker: None,
+            aux_mark_cache: HashMap::new(),
+            aux_mark_order: std::collections::VecDeque::new(),
         }
     }
 }
@@ -398,6 +405,15 @@ impl findx2_core::ContentSearch for MergedContentSearch {
                 aux_all.extend(h);
             }
         }
+        // 顺手喂打标缓存：同 needle 的徽标判定免重查（与打标同源同 limit）。
+        // main 填满提前返回的路径不写（辅库根本没查，写了会毒化缓存）。
+        note_aux_marks(
+            query,
+            self.ini.is_some(),
+            self.full.is_some(),
+            limit,
+            aux_all.iter().map(|(v, f, _)| (v.clone(), *f)),
+        );
         // 按 score 降序，让更像的拼音命中靠前。
         aux_all.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         for (v, f, _) in aux_all {
@@ -414,6 +430,7 @@ impl findx2_core::ContentSearch for MergedContentSearch {
 
 /// 拼音命中键集合（service 侧打 `pinyin_hit` 徽标用；与主库是否命中无关，只表示辅库可查到）。
 /// 非 ASCII 查询直接返回空（走主库中文分词，无拼音概念）。
+/// 合并查询已顺手填缓存（同 needle 同开关同 limit）：命中即免两次 TopDocs 重查。
 pub(crate) fn aux_pinyin_keys(
     query: &str,
     use_ini: bool,
@@ -424,6 +441,9 @@ pub(crate) fn aux_pinyin_keys(
     let mut out = HashSet::new();
     if !query.is_ascii() || limit == 0 {
         return out;
+    }
+    if let Some(cached) = read_aux_marks(query, use_ini, use_full, limit) {
+        return cached;
     }
     let g = match hub().lock() {
         Ok(g) => g,
@@ -450,7 +470,55 @@ pub(crate) fn aux_pinyin_keys(
             }
         }
     }
+    drop(g);
+    // 回填缓存（合并查询没跑过此 needle 时走这里，后续翻页/重查命中）。
+    note_aux_marks(query, use_ini, use_full, limit, out.iter().map(|(v, f)| (v.clone(), *f)));
     out
+}
+
+/// 打标缓存上限（needle 级，每项约 5 万 × (短串+u64) ≈ 2~3MB）。
+const AUX_MARK_CACHE_CAP: usize = 4;
+
+/// 合并查询顺手填入 / miss 时回填（FIFO 逐出最老）。
+fn note_aux_marks(
+    query: &str,
+    use_ini: bool,
+    use_full: bool,
+    limit: usize,
+    keys: impl Iterator<Item = (String, u64)>,
+) {
+    let Ok(mut g) = hub().lock() else {
+        return;
+    };
+    let k = (query.to_string(), use_ini, use_full);
+    if !g.aux_mark_cache.contains_key(&k) {
+        g.aux_mark_order.push_back(k.clone());
+        while g.aux_mark_order.len() > AUX_MARK_CACHE_CAP {
+            if let Some(old) = g.aux_mark_order.pop_front() {
+                g.aux_mark_cache.remove(&old);
+            }
+        }
+    }
+    g.aux_mark_cache.insert(k, (limit, keys.collect()));
+}
+
+/// 缓存命中要求同 needle 同开关且缓存 limit 覆盖本次请求（合并查询的 cap
+/// 随候选集大小浮动；覆盖不足时回退重查，不毒化徽标）。
+fn read_aux_marks(
+    query: &str,
+    use_ini: bool,
+    use_full: bool,
+    limit: usize,
+) -> Option<std::collections::HashSet<(String, u64)>> {
+    let g = hub().lock().ok()?;
+    let (cached_limit, set) = g
+        .aux_mark_cache
+        .get(&(query.to_string(), use_ini, use_full))?;
+    if *cached_limit >= limit {
+        Some(set.clone())
+    } else {
+        None
+    }
 }
 
 /// watch 热路径调。`Ready/Stale/Failed` 翻译成 job（不阻塞，不碰 store）；

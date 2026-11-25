@@ -74,7 +74,7 @@ pub fn pinyin_texts(text: &str) -> (String, String) {
 }
 
 /// 单个 CJK 字符 → (全拼, 首字母)；非 CJK 返回 None。
-fn pinyin_of(ch: char) -> Option<(&'static str, char)> {
+pub(crate) fn pinyin_of(ch: char) -> Option<(&'static str, char)> {
     let s = ch.to_string();
     let mut it = s.as_str().to_pinyin();
     match it.next() {
@@ -83,7 +83,7 @@ fn pinyin_of(ch: char) -> Option<(&'static str, char)> {
     }
 }
 
-fn is_cjk(c: char) -> bool {
+pub(crate) fn is_cjk(c: char) -> bool {
     // CJK 统一表意 + 扩展 A~G + 兼容区 + 日文假名/谚文（顺带覆盖）。
     matches!(c,
         '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' |
@@ -133,7 +133,7 @@ pub fn full_text(chars: &[char]) -> String {
 ///
 /// 覆盖 GB/T 16159 常用音节 + 口语残留（`dei`/`den`/`kei`/`lo` 等），贪心最长
 /// 匹配够用；漏收的生僻拼写走“已切分头 + 尾部前缀”降级，不会零命中。
-fn is_pinyin_syllable(s: &str) -> bool {
+pub(crate) fn is_pinyin_syllable(s: &str) -> bool {
     matches!(s,
         "a" | "ai" | "an" | "ang" | "ao" | "ba" | "bai" | "ban" | "bang" | "bao"
         | "bei" | "ben" | "beng" | "bi" | "bian" | "biao" | "bie" | "bin" | "bing"

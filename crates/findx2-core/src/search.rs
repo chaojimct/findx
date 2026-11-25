@@ -3042,7 +3042,12 @@ fn filter_content(
                 }
             }
         }
-        return Ok(hits.iter().filter(|i| set.contains(i)).copied().collect());
+        // 纯 `content:` 查询 hits 常是数百万全表，并行求交（乱序无妨，下游重排）。
+        return Ok(hits
+            .par_iter()
+            .filter(|i| set.contains(*i))
+            .copied()
+            .collect());
     }
     // 超过此大小的文件跳过内容搜索，避免内存爆炸和长时间阻塞
     const MAX_CONTENT_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB

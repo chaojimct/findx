@@ -66,23 +66,113 @@ fn escape(s: &str) -> String {
     o
 }
 
-/// 在正文里找任一词的最早命中字节位（ASCII 大小写不敏感；ascii-fold 不改变
-/// 字节长度，偏移在原文中直接有效）。
-fn earliest_hit(folded: &str, terms: &[String]) -> Option<usize> {
-    let mut best: Option<usize> = None;
-    for t in terms {
-        let needle = t.to_ascii_lowercase();
-        if needle.is_empty() {
+/// 拼音对齐 spans（字节区间，文档序）：ascii 拼音词 → 原文 CJK 字串。
+/// 只在字面 spans 为空时调用（辅库拼音命中行）；扫描定界在正文前 1MB，
+/// 超界无命中返回空（调用方走头部预览，与过去行为一致）。
+/// 对齐口径与辅库查询一致：单音节全拼（`ma`）/ 连写全拼（`machuntian`，
+/// 半截尾巴按前缀）/ 首字母串（`mct`，长度≥2）。
+fn pinyin_spans(text: &str, terms: &[String]) -> Vec<(usize, usize)> {
+    use crate::pinyin_aux::{is_cjk, is_pinyin_syllable, pinyin_of, split_pinyin_query};
+    const SCAN_BYTES: usize = 1 << 20;
+    let mut scan_end = text.len().min(SCAN_BYTES);
+    while scan_end > 0 && !text.is_char_boundary(scan_end) {
+        scan_end -= 1;
+    }
+    let scan = &text[..scan_end];
+    struct Item {
+        start: usize,
+        end: usize,
+        plain: &'static str,
+        first: char,
+    }
+    let mut seq: Vec<Item> = Vec::new();
+    for (i, ch) in scan.char_indices() {
+        if !is_cjk(ch) {
             continue;
         }
-        if let Some(pos) = folded.find(needle.as_str()) {
-            best = Some(match best {
-                Some(b) if b <= pos => b,
-                _ => pos,
+        if let Some((plain, first)) = pinyin_of(ch) {
+            seq.push(Item {
+                start: i,
+                end: i + ch.len_utf8(),
+                plain,
+                first: first.to_ascii_lowercase(),
             });
         }
     }
-    best
+    if seq.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    for t in terms {
+        let q = t.to_ascii_lowercase();
+        if q.len() < 2 || !q.bytes().all(|b| b.is_ascii_lowercase()) {
+            continue;
+        }
+        // 1) 单音节全拼（如 `ma` 命中“马”）。
+        if is_pinyin_syllable(&q) {
+            for it in &seq {
+                if it.plain == q {
+                    hits.push((it.start, it.end));
+                }
+            }
+        }
+        // 2) 连写全拼（如 `machuntian` 命中“马春田”；`quanw` 的 `w` 按前缀）。
+        if let Some((heads, tail)) = split_pinyin_query(&q) {
+            let n = heads.len();
+            let mut i = 0;
+            while i + n <= seq.len() {
+                let full_ok = seq[i..i + n]
+                    .iter()
+                    .zip(heads.iter())
+                    .all(|(it, h)| it.plain == *h);
+                if full_ok {
+                    if tail.is_empty() {
+                        hits.push((seq[i].start, seq[i + n - 1].end));
+                        i += n;
+                        continue;
+                    } else if i + n < seq.len() && seq[i + n].plain.starts_with(tail.as_str()) {
+                        hits.push((seq[i].start, seq[i + n].end));
+                        i += n + 1;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+        // 3) 首字母串（如 `mct` 命中“马春田”）。
+        {
+            let qs: Vec<char> = q.chars().collect();
+            let m = qs.len();
+            let mut i = 0;
+            while i + m <= seq.len() {
+                if seq[i..i + m]
+                    .iter()
+                    .zip(qs.iter())
+                    .all(|(it, c)| it.first == *c)
+                {
+                    hits.push((seq[i].start, seq[i + m - 1].end));
+                    i += m;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    if hits.is_empty() {
+        return Vec::new();
+    }
+    hits.sort();
+    // 去重叠（与 match_spans 同规则：排序首个胜出）。
+    let mut out = Vec::with_capacity(hits.len());
+    let mut cur = 0usize;
+    for (a, b) in hits {
+        if a < cur || a >= b {
+            continue;
+        }
+        out.push((a, b.min(text.len())));
+        cur = b;
+    }
+    out
 }
 
 /// 命中点前后各 WINDOW_CHARS 个字符的字节窗口（含命中词本身）。
@@ -107,18 +197,15 @@ fn char_window(text: &str, pos: usize, term_len: usize) -> (usize, usize) {
 }
 
 /// 生成 snippet HTML；无命中返回 None（调用方回退空串）。
+/// 首个匹配点（字面或拼音对齐）前后各 WINDOW_CHARS 个字符开窗。
 pub fn make_snippet(text: &str, terms: &[String]) -> Option<String> {
     if terms.is_empty() || text.is_empty() {
         return None;
     }
+    let spans = match_spans(text, terms);
+    let (pos, term_end) = spans.into_iter().next()?;
+    let term_len = term_end.saturating_sub(pos).min(64);
     let folded = text.to_ascii_lowercase();
-    let pos = earliest_hit(&folded, terms)?;
-    let term_len = terms
-        .iter()
-        .map(|t| t.len())
-        .max()
-        .unwrap_or(0)
-        .min(64);
     let (start, mut end) = char_window(text, pos, term_len);
     end = end.min(text.len());
     if start >= end {
@@ -127,8 +214,9 @@ pub fn make_snippet(text: &str, terms: &[String]) -> Option<String> {
     render_window(text, &folded, start, end, terms)
 }
 
-/// 全文全部非重叠命中（字节区间，文档序；与 make_snippet 同一收集规则，
-/// 重叠取排序首个）。上一个/下一个翻页用：窗口 k 围绕第 k 个命中展开。
+/// 全文全部非重叠命中（字节区间，文档序；字面优先，字面为空时做拼音对齐，
+/// 与 make_snippet 同一收集规则，重叠取排序首个）。上一个/下一个翻页用：
+/// 窗口 k 围绕第 k 个命中展开。
 pub fn match_spans(text: &str, terms: &[String]) -> Vec<(usize, usize)> {
     if terms.is_empty() || text.is_empty() {
         return Vec::new();
@@ -148,7 +236,12 @@ pub fn match_spans(text: &str, terms: &[String]) -> Vec<(usize, usize)> {
         }
     }
     if hits.is_empty() {
-        return Vec::new();
+        // 拼音辅库命中行：原文是汉字，拼音词字面找不到，做拼音对齐
+        // （`machuntian` → “马春田”字串标热，高亮与开窗都用它）。
+        hits = pinyin_spans(text, terms);
+        if hits.is_empty() {
+            return Vec::new();
+        }
     }
     hits.sort();
     let mut out = Vec::with_capacity(hits.len());
@@ -197,7 +290,8 @@ fn render_window(
 ) -> Option<String> {
     let window = &text[start..end];
     let wfold = &folded[start..end];
-    // 收集窗口内全部命中（按字节序），重叠取最长。
+    // 收集窗口内全部命中（按字节序）：字面优先；拼音行（字面为空）用同一
+    // 拼音对齐，保证高亮与 match_spans 选窗一致（窗口小，开销可忽略）。
     let mut hits: Vec<(usize, usize)> = Vec::new();
     for t in terms {
         let needle = t.to_ascii_lowercase();
@@ -210,6 +304,9 @@ fn render_window(
             hits.push((a, a + needle.len()));
             from = a + needle.len().max(1);
         }
+    }
+    if hits.is_empty() {
+        hits = match_spans(window, terms);
     }
     if hits.is_empty() {
         return None;
@@ -384,6 +481,34 @@ mod tests {
         let terms2 = vec!["全文".to_string(), "全文搜索".to_string()];
         let spans2 = match_spans("全文搜索好", &terms2);
         assert_eq!(spans2.len(), 1, "{spans2:?}");
+    }
+
+    #[test]
+    fn pinyin_spans_highlight_cjk_for_concatenated_full() {
+        // 连写全拼 `machuntian` 对齐到“马春田”三字并标热。
+        let terms = vec!["machuntian".to_string()];
+        let text = "核心是马春田负责的模块";
+        let spans = match_spans(text, &terms);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(&text[spans[0].0..spans[0].1], "马春田");
+        let html = make_snippet(text, &terms).expect("拼音命中应有 snippet");
+        assert!(html.contains("<b>马春田</b>"), "{html}");
+    }
+
+    #[test]
+    fn pinyin_spans_cover_initials_and_single_syllable() {
+        // 首字母 `mct` 同样对齐到“马春田”。
+        let spans = match_spans("马春田在此", &vec!["mct".to_string()]);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        // 单音节 `ma` 命中“马”。
+        let spans2 = match_spans("马春田在此", &vec!["ma".to_string()]);
+        assert!(!spans2.is_empty(), "{spans2:?}");
+        // 半截尾巴 `quanw`（wen 只打了 w）仍对齐“全文”。
+        let spans3 = match_spans("这是全文检索", &vec!["quanw".to_string()]);
+        assert_eq!(spans3.len(), 1, "{spans3:?}");
+        assert_eq!(&"这是全文检索"[spans3[0].0..spans3[0].1], "全文");
+        // 纯拉丁无 CJK：拼音对齐不产出，不掩盖字面逻辑。
+        assert!(match_spans("nothing here", &vec!["qw".to_string()]).is_empty());
     }
 
     #[test]
