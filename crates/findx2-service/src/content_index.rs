@@ -628,12 +628,15 @@ pub(crate) fn status_snapshot() -> ContentStatusSnapshot {
 }
 
 /// 搜索装配用：按页内 `entry_idx` 取前 `cap` 个 snippet（key→html，无命中缺席）。
+/// 搜索装配用：按页内 `entry_idx` 取第 `window_idx` 个匹配窗口的 snippet。
+/// 返回 `entry_idx → (html, 全文匹配点总数)`；找不到/回读失败的 key 缺席。
 pub(crate) fn snippets_for(
     engine: &SearchEngine,
     query: &str,
     entry_indices: &[u32],
     cap: usize,
-) -> HashMap<u32, String> {
+    window_idx: usize,
+) -> HashMap<u32, (String, usize)> {
     let cidx = match hub().lock().ok().and_then(|g| g.index.clone()) {
         Some(c) => c,
         None => return HashMap::new(),
@@ -662,10 +665,10 @@ pub(crate) fn snippets_for(
         }
         (keys, rev)
     };
-    cidx.snippets_for_keys(query, &keys, cap)
+    cidx.snippets_for_keys_windowed(query, &keys, cap, window_idx)
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|(k, html)| rev.remove(&k).map(|idx| (idx, html)))
+        .filter_map(|(k, (html, total))| rev.remove(&k).map(|idx| (idx, (html, total))))
         .collect()
 }
 

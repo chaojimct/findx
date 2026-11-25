@@ -93,9 +93,12 @@ pub enum IpcRequest {
     /// 按 entry_idx 补取命中摘要（列表首屏只填前 N 行，其余选中/可见时按需取；
     /// 避免首屏为几百行回读文件卡住 service）。
     /// query 取 content: 取值原文（与 Search 一致，供分词用）。
+    /// window：第几个匹配点（上一个/下一个翻页），缺省 0。
     ContentSnippets {
         query: String,
         entry_indices: Vec<u32>,
+        #[serde(default)]
+        window: usize,
     },
     /// Negotiation only. Missing/unknown versions must never imply prepare support.
     UpgradeCapabilities { protocol_version: u32 },
@@ -278,9 +281,9 @@ pub enum IpcResponse {
     UsageChildrenResult {
         page: UsagePageDto,
     },
-    /// `ContentSnippets` 应答：`(entry_idx, snippet HTML)`，无摘要的行缺席。
+    /// `ContentSnippets` 应答：按 entry_idx 的命中摘要窗口。
     ContentSnippets {
-        snippets: Vec<(u32, String)>,
+        snippets: Vec<ContentSnippetDto>,
     },
     Pong,
     Error {
@@ -310,6 +313,21 @@ pub struct SearchHitDto {
     /// 拼音辅库命中标记（GUI 可显示“拼”徽标；老客户端忽略）。
     #[serde(default)]
     pub pinyin_hit: bool,
+    /// 摘要对应窗口是全文第几个匹配点（0 起；上一个/下一个翻页用）。
+    #[serde(default)]
+    pub snippet_window: usize,
+    /// 全文共多少个匹配点（上一个/下一个翻页与 `x/y` 展示用；0 = 未知）。
+    #[serde(default)]
+    pub snippet_total: u32,
+}
+
+/// 单条命中摘要（`ContentSnippets` 应答用；`window`/`total` 含义同上）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentSnippetDto {
+    pub entry_idx: u32,
+    pub html: String,
+    pub window: usize,
+    pub total: u32,
 }
 
 #[cfg(test)]

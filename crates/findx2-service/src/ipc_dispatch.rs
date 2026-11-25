@@ -284,7 +284,7 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
             crate::content_index::cancel_build();
             IpcResponse::Pong
         }
-        (IpcRequest::ContentSnippets { query, entry_indices }, Some(eng)) => {
+        (IpcRequest::ContentSnippets { query, entry_indices, window }, Some(eng)) => {
             // 按需补摘要（选中行场景一次 1 个）：截断防刷，无摘要行缺席。
             // query 取原文，service 侧自行提取 content: 取值（与 Search 一致）。
             const SNIPPET_FETCH_CAP: usize = 64;
@@ -300,9 +300,20 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                             &needles.join(" "),
                             &idxs,
                             SNIPPET_FETCH_CAP,
+                            window,
                         );
                         IpcResponse::ContentSnippets {
-                            snippets: map.into_iter().collect(),
+                            snippets: map
+                                .into_iter()
+                                .map(|(entry_idx, (html, total))| {
+                                    findx2_ipc::ContentSnippetDto {
+                                        entry_idx,
+                                        html,
+                                        window,
+                                        total: total as u32,
+                                    }
+                                })
+                                .collect(),
                         }
                     }
                 }
@@ -379,6 +390,8 @@ pub(crate) fn search_ipc(
                 name_highlight: h.name_highlight.clone(),
                 snippet: String::new(),
                 pinyin_hit: false,
+                snippet_window: 0,
+                snippet_total: 0,
             }
         })
         .collect();
@@ -428,11 +441,14 @@ pub(crate) fn search_ipc(
             &needle_text,
             &idxs,
             crate::content_index::SNIPPET_PER_PAGE,
+            0,
         );
         if !map.is_empty() {
             for (h, dto) in hits.iter().zip(dtos.iter_mut()) {
-                if let Some(s) = map.get(&h.entry_idx) {
-                    dto.snippet = s.clone();
+                if let Some((html, total)) = map.get(&h.entry_idx) {
+                    dto.snippet = html.clone();
+                    dto.snippet_window = 0;
+                    dto.snippet_total = *total as u32;
                 }
             }
         }

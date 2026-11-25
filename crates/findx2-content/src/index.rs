@@ -387,6 +387,22 @@ impl ContentIndex {
         keys: &[u64],
         cap: usize,
     ) -> Result<std::collections::HashMap<u64, String>> {
+        Ok(self
+            .snippets_for_keys_windowed(query_text, keys, cap, 0)?
+            .into_iter()
+            .map(|(k, (html, _))| (k, html))
+            .collect())
+    }
+
+    /// 按 key 批量取第 `window_idx` 个匹配窗口的 snippet（上一个/下一个用），
+    /// 返回 `key → (html, 全文匹配点总数)`；找不到/回读失败的 key 缺席。
+    pub fn snippets_for_keys_windowed(
+        &self,
+        query_text: &str,
+        keys: &[u64],
+        cap: usize,
+        window_idx: usize,
+    ) -> Result<std::collections::HashMap<u64, (String, usize)>> {
         use std::collections::HashMap;
         let mut out = HashMap::new();
         if keys.is_empty() || cap == 0 {
@@ -420,8 +436,11 @@ impl ContentIndex {
                 .get_first(self.fields.mtime)
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            if let Some(html) = self.snippets.for_doc(path, mtime, query_text, &terms) {
-                out.insert(*key, html);
+            if let Some((html, total)) =
+                self.snippets
+                    .for_doc_windowed(path, mtime, query_text, &terms, window_idx)
+            {
+                out.insert(*key, (html, total));
             }
         }
         Ok(out)

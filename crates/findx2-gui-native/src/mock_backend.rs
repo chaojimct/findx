@@ -94,7 +94,7 @@ fn hit(
         mtime,
         is_directory,
         name_highlight: highlight.to_vec(),
-        snippet: String::new(), pinyin_hit: false,
+        snippet: String::new(), pinyin_hit: false, snippet_window: 0, snippet_total: 0,
     }
 }
 

@@ -124,6 +124,76 @@ pub fn make_snippet(text: &str, terms: &[String]) -> Option<String> {
     if start >= end {
         return None;
     }
+    render_window(text, &folded, start, end, terms)
+}
+
+/// 全文全部非重叠命中（字节区间，文档序；与 make_snippet 同一收集规则，
+/// 重叠取排序首个）。上一个/下一个翻页用：窗口 k 围绕第 k 个命中展开。
+pub fn match_spans(text: &str, terms: &[String]) -> Vec<(usize, usize)> {
+    if terms.is_empty() || text.is_empty() {
+        return Vec::new();
+    }
+    let folded = text.to_ascii_lowercase();
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    for t in terms {
+        let needle = t.to_ascii_lowercase();
+        if needle.is_empty() {
+            continue;
+        }
+        let mut from = 0;
+        while let Some(p) = folded[from..].find(needle.as_str()) {
+            let a = from + p;
+            hits.push((a, a + needle.len()));
+            from = a + needle.len().max(1);
+        }
+    }
+    if hits.is_empty() {
+        return Vec::new();
+    }
+    hits.sort();
+    let mut out = Vec::with_capacity(hits.len());
+    let mut cur = 0usize;
+    for (a, b) in hits {
+        if a < cur || a >= b {
+            continue;
+        }
+        out.push((a, b.min(text.len())));
+        cur = b;
+    }
+    out
+}
+
+/// 第 k 个匹配点的上下文窗口 HTML + 全文共多少个匹配点（上一个/下一个用）。
+/// k 越界钳到最后一个；无匹配返回 None。
+pub fn make_snippet_windowed(
+    text: &str,
+    terms: &[String],
+    window_idx: usize,
+) -> Option<(String, usize)> {
+    let spans = match_spans(text, terms);
+    if spans.is_empty() {
+        return None;
+    }
+    let k = window_idx.min(spans.len() - 1);
+    let (pos, term_end) = spans[k];
+    let term_len = term_end.saturating_sub(pos).min(64);
+    let folded = text.to_ascii_lowercase();
+    let (start, mut end) = char_window(text, pos, term_len);
+    end = end.min(text.len());
+    if start >= end {
+        return None;
+    }
+    render_window(text, &folded, start, end, terms).map(|html| (html, spans.len()))
+}
+
+/// 窗口内全部命中高亮成 HTML（make_snippet 与 windowed 共用；调用方保证字节边界合法）。
+fn render_window(
+    text: &str,
+    folded: &str,
+    start: usize,
+    end: usize,
+    terms: &[String],
+) -> Option<String> {
     let window = &text[start..end];
     let wfold = &folded[start..end];
     // 收集窗口内全部命中（按字节序），重叠取最长。
@@ -169,16 +239,16 @@ pub fn make_snippet(text: &str, terms: &[String]) -> Option<String> {
 }
 
 struct SnippetCache {
-    map: HashMap<(String, u64, String), String>,
-    order: VecDeque<(String, u64, String)>,
+    map: HashMap<(String, u64, String, usize), (String, usize)>,
+    order: VecDeque<(String, u64, String, usize)>,
 }
 
 impl SnippetCache {
-    fn get(&self, k: &(String, u64, String)) -> Option<String> {
+    fn get(&self, k: &(String, u64, String, usize)) -> Option<(String, usize)> {
         self.map.get(k).cloned()
     }
 
-    fn put(&mut self, k: (String, u64, String), v: String) {
+    fn put(&mut self, k: (String, u64, String, usize), v: (String, usize)) {
         if self.map.contains_key(&k) {
             return;
         }
@@ -214,22 +284,41 @@ impl SnippetPool {
         query_text: &str,
         terms: &[String],
     ) -> Option<String> {
-        let key = (path.to_string(), mtime, query_text.to_string());
+        self.for_doc_windowed(path, mtime, query_text, terms, 0)
+            .map(|(html, _)| html)
+    }
+
+    /// 第 window_idx 个匹配点的上下文窗口 + 全文共多少个匹配点（上一个/下一个用）。
+    /// 窗口越界钳到最后一个；缓存键带窗口号。
+    pub fn for_doc_windowed(
+        &self,
+        path: &str,
+        mtime: u64,
+        query_text: &str,
+        terms: &[String],
+        window_idx: usize,
+    ) -> Option<(String, usize)> {
+        let key = (
+            path.to_string(),
+            mtime,
+            query_text.to_string(),
+            window_idx,
+        );
         if let Ok(c) = self.cache.lock() {
-            if let Some(h) = c.get(&key) {
-                return Some(h);
+            if let Some(hit) = c.get(&key) {
+                return Some(hit);
             }
         }
         let text = extract_text(std::path::Path::new(path)).ok()?.text;
-        let html = match make_snippet(&text, terms) {
-            Some(h) => h,
-            None if query_text.is_ascii() => head_snippet(&text)?,
+        let (html, total) = match make_snippet_windowed(&text, terms, window_idx) {
+            Some(t) => t,
+            None if query_text.is_ascii() && window_idx == 0 => (head_snippet(&text)?, 1),
             None => return None,
         };
         if let Ok(mut c) = self.cache.lock() {
-            c.put(key, html.clone());
+            c.put(key, (html.clone(), total));
         }
-        Some(html)
+        Some((html, total))
     }
 }
 
@@ -282,5 +371,41 @@ mod tests {
         let html = make_snippet(text, &terms_of("全文搜索")).unwrap();
         assert!(!html.contains("<script>"), "{html}");
         assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    #[test]
+    fn match_spans_collects_doc_order_and_dedups_overlap() {
+        let terms = vec!["qw".to_string(), "quanw".to_string()];
+        let spans = match_spans("xxqwyyquanwenz", &terms);
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        assert!(spans[0].0 < spans[1].0);
+        // 重叠取排序首个（与 make_snippet 窗口内规则一致）。
+        let terms2 = vec!["全文".to_string(), "全文搜索".to_string()];
+        let spans2 = match_spans("全文搜索好", &terms2);
+        assert_eq!(spans2.len(), 1, "{spans2:?}");
+    }
+
+    #[test]
+    fn windowed_snippet_pages_through_matches() {
+        // 两处匹配间隔拉开（>120 字窗口），保证窗口内容不同。
+        let pad: String = "垫".repeat(150);
+        let text = format!("前马春天后{pad}左马春天右");
+        let terms = terms_of("马春天");
+        assert!(!terms.is_empty());
+        let spans = match_spans(&text, &terms);
+        assert!(spans.len() >= 2, "{spans:?}");
+        let total = spans.len();
+        let (h0, total0) = make_snippet_windowed(&text, &terms, 0).unwrap();
+        let (hlast, total1) =
+            make_snippet_windowed(&text, &terms, total - 1).unwrap();
+        assert_eq!((total0, total1), (total, total));
+        assert_ne!(h0, hlast, "首尾窗口应切到不同上下文");
+        assert!(h0.contains("<b>"), "{h0}");
+        assert!(hlast.contains("<b>"), "{hlast}");
+        // 越界钳到最后一个。
+        let (hclamp, _) = make_snippet_windowed(&text, &terms, total + 99).unwrap();
+        assert_eq!(hclamp, hlast);
+        // 无匹配返回 None。
+        assert!(make_snippet_windowed("hello world", &terms, 0).is_none());
     }
 }
