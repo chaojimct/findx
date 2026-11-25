@@ -470,21 +470,9 @@ pub async fn load_preview_with_options(
             Err(e) => native_error = Some(e),
         }
     }
-    // rdocx 纯 Rust 后备：COM 预览处理器缺失/失败时，docx 走内置渲染出首屏 PNG
-    //（Image 态，可缩放由图片预览链路接管；失败则落回文字摘录）。
-    // 只做 docx（spike 仅验证 docx 开/渲染/HTML）；xlsx/pptx 沿用旧链路。
-    // Windows only：rdocx 依赖只在 Windows 启用（COM 路径本就只存在于 Windows）。
-    #[cfg(windows)]
-    if !is_directory && ext == "docx" && native_error.is_some() {
-        match render_docx_fallback(path) {
-            Ok(loaded) => {
-                apply_image(&mut state, loaded);
-                state.image_note = Some("内置渲染（首屏；无系统预览处理器时后备）".into());
-                return state;
-            }
-            Err(_) => {} // 落回文字摘录
-        }
-    }
+    // docx/xlsx 等走系统预览处理器（IPreviewHandler）或活文档管线；
+    // 不做任何内置转换（用户已明确否决 docx→PDF/图片路线）。
+    // 处理器缺失时落回文字摘录。
     // PDF优先走已安装的系统预览处理器(与Office文档同一条路):
     // 处理器进程常驻、文档只解析一次、原生滚动;不再为每页起新进程、
     // 重解析全文。WinRT光栅只在没有可用处理器时兜底。
@@ -671,32 +659,6 @@ pub(crate) struct LoadedImage {
     height: u32,
     file_len: u64,
     note: Option<String>,
-}
-
-/// rdocx 首屏渲染（COM 预览处理器缺失时的 docx 后备；见 tests/rdocx_spike.rs）。
-/// 成功返回解码后的渲染图；任何失败（含 panic、超限、空页）都交回调用方，
-/// 调用方落回文字摘录（行为与之前无处理器时一致）。
-/// Windows only（rdocx 依赖只在 Windows 启用）。
-#[cfg(windows)]
-fn render_docx_fallback(path: &str) -> Result<LoadedImage, String> {
-    let file_len = std::fs::metadata(path)
-        .map(|m| m.len())
-        .unwrap_or(u64::MAX);
-    if file_len > 20 * 1024 * 1024 {
-        return Err("文档超过 20 MiB 内置渲染上限".into());
-    }
-    let inner = std::panic::catch_unwind(|| {
-        let doc = rdocx::Document::open(path).map_err(|e| e.to_string())?;
-        doc.render_page_to_png_deterministic(0, 150.0)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "首屏为空".to_string())
-    })
-    .map_err(|_| "内置渲染异常".to_string())?;
-    let png = inner?;
-    if png.is_empty() {
-        return Err("首屏为空".into());
-    }
-    decode_image_bytes(&png, file_len)
 }
 
 fn load_image(path: &Path) -> Result<LoadedImage, String> {
@@ -908,59 +870,6 @@ fn load_directory(path: &Path) -> Result<(Vec<DirEntryPreview>, usize, bool), St
 mod tests {
     use super::*;
     use std::io::Write;
-
-    /// 最小可渲染 docx（rdocx 后备路径回归网；COM 缺失时预览不至于直接掉文字）。
-    fn make_min_docx(dir: &std::path::Path, name: &str) {
-        let f = std::fs::File::create(dir.join(name)).unwrap();
-        let mut zip = zip::ZipWriter::new(f);
-        let opt = zip::write::SimpleFileOptions::default();
-        for (n, body) in [
-            (
-                "word/document.xml",
-                r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>内置渲染回归</w:t></w:r></w:p></w:body></w:document>"#,
-            ),
-            (
-                "_rels/.rels",
-                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
-            ),
-            (
-                "word/_rels/document.xml.rels",
-                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>"#,
-            ),
-            (
-                "[Content_Types].xml",
-                r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
-            ),
-        ] {
-            zip.start_file(n, opt).unwrap();
-            zip.write_all(body.as_bytes()).unwrap();
-        }
-        zip.finish().unwrap();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn rdocx_fallback_renders_first_page() {
-        let d = tempfile::tempdir().unwrap();
-        make_min_docx(d.path(), "r.docx");
-        let p = d.path().join("r.docx");
-        let loaded = render_docx_fallback(&p.display().to_string());
-        let loaded = match loaded {
-            Ok(v) => v,
-            Err(e) => panic!("内置渲染失败: {e}"),
-        };
-        assert!(loaded.width > 0 && loaded.height > 0);
-        assert!(loaded.file_len > 0);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn rdocx_fallback_rejects_garbage() {
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("bad.docx");
-        std::fs::write(&p, b"not a zip at all").unwrap();
-        assert!(render_docx_fallback(&p.display().to_string()).is_err());
-    }
 
     #[test]
     fn classifies_common_extensions() {

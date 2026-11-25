@@ -133,6 +133,15 @@ pub enum IpcRequest {
         entry_index: u32,
         page: u32,
     },
+    /// 取某文档的全文文本（命中上下文文本预览用；与摘要同源解析 query）。
+    /// query 取 content: 取值原文；entry_index 为结果行号。
+    /// 应答 `ContentFullText`：text 为上限内的原文（UTF-8，可能截断），
+    /// spans 为命中字节区间（char 边界对齐），total 为全文匹配点总数，
+    /// truncated 为是否因体积/上限截断。超大/失败 → 空文本（预览降级）。
+    ContentFullText {
+        query: String,
+        entry_index: u32,
+    },
     /// Negotiation only. Missing/unknown versions must never imply prepare support.
     UpgradeCapabilities { protocol_version: u32 },
     PrepareStop { protocol_version: u32, expected_instance: String, request_nonce: String, index_identity: String, timeout_ms: u64 },
@@ -359,6 +368,18 @@ pub enum IpcResponse {
         page_w: f32,
         #[serde(default)]
         page_h: f32,
+    },
+    /// `ContentFullText` 应答：全文文本 + 命中区间（字节偏移，char 边界对齐）。
+    /// 空 text = 超大/失败，调用方回退摘要窗展示。
+    ContentFullText {
+        #[serde(default)]
+        text: String,
+        #[serde(default)]
+        spans: Vec<[usize; 2]>,
+        #[serde(default)]
+        total: u32,
+        #[serde(default)]
+        truncated: bool,
     },
     Pong,
     Error {

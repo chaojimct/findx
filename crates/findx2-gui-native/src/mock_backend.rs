@@ -150,6 +150,12 @@ fn handle_request(req: IpcRequest) -> IpcResponse {
             page_w: 0.0,
             page_h: 0.0,
         },
+        IpcRequest::ContentFullText { .. } => IpcResponse::ContentFullText {
+            text: String::new(),
+            spans: Vec::new(),
+            total: 0,
+            truncated: false,
+        },
         IpcRequest::Status => IpcResponse::StatusResult {
             entry_count: 8,
             dir_count: 2,

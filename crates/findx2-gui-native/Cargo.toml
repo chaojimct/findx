@@ -32,6 +32,8 @@ gpui-kit = "=0.9.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "webp"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# md 富文本渲染：pulldown-cmark 解析 → GPUI 原生绘制（标题/段落/列表/表格）。
+pulldown-cmark = "0.13"
 semver = "1"
 sha2 = "0.10"
 ureq = "2.9"
@@ -40,14 +42,13 @@ rustc-hash = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61.3", features = ["Data_Pdf", "Storage", "Storage_Streams", "Foundation", "Win32_Foundation", "Win32_System_IO", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Com", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole"] }
-# docx 内置渲染后备（COM 预览处理器缺失时；见 preview::render_docx_fallback）。
-rdocx = "0.17"
+windows = { version = "0.61.3", features = ["Data_Pdf", "Storage", "Storage_Streams", "Foundation", "Win32_Foundation", "Win32_System_IO", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Com", "Win32_System_Variant", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole"] }
+# PDF 真文档渲染：pdfium 光栅（RGBA 直传）+ 字符层，与索引侧同引擎保证坐标同源。
+pdfium-render = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
-rdocx = "0.17"
 tempfile = "3"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }

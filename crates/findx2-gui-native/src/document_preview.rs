@@ -364,59 +364,65 @@ pub fn pdf_page(
     page_index: u32,
     max_edge: u32,
 ) -> Result<(Vec<u8>, u32, f32, f32), String> {
-    use std::io::Read;
-    use windows::{
-        Data::Pdf::{PdfDocument, PdfPageRenderOptions},
-        Storage::Streams::{DataReader, DataWriter, InMemoryRandomAccessStream},
-    };
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("无法读取 PDF；请检查本地文件或云盘下载状态：{e}"))?;
-    if file.metadata().map_err(|e| e.to_string())?.len() > MAX_FILE {
+    // pdfium 渲染（与命中框 boxes 同引擎，保证光栅与字符坐标同源）。
+    // 独立预览 worker 进程内串行使用，规避 pdfium 多线程挂起问题。
+    let file_len = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    if file_len > MAX_FILE {
         return Err("PDF 超过 32 MiB 预览上限".into());
     }
-    let mut input = Vec::new();
-    file.take(MAX_FILE + 1)
-        .read_to_end(&mut input)
-        .map_err(|e| format!("无法读取本地 PDF 或云盘副本：{e}"))?;
-    if input.len() as u64 > MAX_FILE {
-        return Err("PDF 超过 32 MiB 预览上限".into());
+    let pdfium = bind_pdfium().ok_or_else(|| {
+        "PDF 引擎不可用（pdfium.dll 缺失）；请确认安装目录完整。".to_string()
+    })?;
+    let document = pdfium
+        .load_pdf_from_file(path, None)
+        .map_err(|e| format!("PDF 解析失败：{e}"))?;
+    let count = document.pages().len() as u32;
+    if count == 0 {
+        return Err("此 PDF 没有可显示的页面".into());
     }
-    let run = || -> windows::core::Result<(Vec<u8>, u32, f32, f32)> {
-        let source = InMemoryRandomAccessStream::new()?;
-        let writer = DataWriter::CreateDataWriter(&source.GetOutputStreamAt(0)?)?;
-        writer.WriteBytes(&input)?;
-        writer.StoreAsync()?.get()?;
-        writer.FlushAsync()?.get()?;
-        writer.DetachStream()?;
-        source.Seek(0)?;
-        let doc = PdfDocument::LoadFromStreamAsync(&source)?.get()?;
-        let count = doc.PageCount()?;
-        let page = doc.GetPage(page_index.min(count.saturating_sub(1)))?;
-        let stream = InMemoryRandomAccessStream::new()?;
-        let options = PdfPageRenderOptions::new()?;
-        let page_size = page.Size()?;
-        let edge = max_edge.clamp(400, 3072) as f32;
-        let scale = (edge / page_size.Width.max(1.0)).min(edge / page_size.Height.max(1.0));
-        options.SetDestinationWidth((page_size.Width * scale).max(1.0) as u32)?;
-        options.SetDestinationHeight((page_size.Height * scale).max(1.0) as u32)?;
-        page.RenderWithOptionsToStreamAsync(&stream, &options)?
-            .get()?;
-        let size = stream.Size()?;
-        if size > 24 * 1024 * 1024 {
-            return Err(windows::core::Error::from_win32());
+    let idx = page_index.min(count.saturating_sub(1)) as u16;
+    let page = document
+        .pages()
+        .get(idx)
+        .map_err(|e| format!("PDF 取页失败：{e}"))?;
+    let (page_w, page_h) = (page.width().value, page.height().value);
+    if !(page_w > 0.0 && page_h > 0.0) {
+        return Err("PDF 页面尺寸无效".into());
+    }
+    let edge = max_edge.clamp(400, 3072) as f32;
+    let scale = (edge / page_w.max(1.0)).min(edge / page_h.max(1.0)).max(0.1);
+    let target_w = (page_w * scale).round().clamp(1.0, 3072.0) as i32;
+    let config = pdfium_render::prelude::PdfRenderConfig::new().set_target_width(target_w);
+    let bitmap = page
+        .render_with_config(&config)
+        .map_err(|e| format!("PDF 渲染失败：{e}"))?;
+    let img = bitmap.as_image();
+    let mut png = Vec::new();
+    {
+        let mut cursor = std::io::Cursor::new(&mut png);
+        img.write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(|e| format!("PDF 编码失败：{e}"))?;
+    }
+    if png.is_empty() || png.len() > 24 * 1024 * 1024 {
+        return Err("PDF 渲染输出异常".into());
+    }
+    Ok((png, count, page_w, page_h))
+}
+
+#[cfg(windows)]
+fn bind_pdfium() -> Option<pdfium_render::prelude::Pdfium> {
+    use pdfium_render::prelude::Pdfium;
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let dll = dir.join("pdfium.dll");
+            if dll.is_file() {
+                if let Ok(b) = Pdfium::bind_to_library(&dll) {
+                    return Some(Pdfium::new(b));
+                }
+            }
         }
-        let size = size as u32;
-        let reader = DataReader::CreateDataReader(&stream.GetInputStreamAt(0)?)?;
-        reader.LoadAsync(size)?.get()?;
-        let mut bytes = vec![0; size as usize];
-        reader.ReadBytes(&mut bytes)?;
-        page.Close()?;
-        Ok((bytes, count, page_size.Width, page_size.Height))
-    };
-    run().map_err(|e| {
-        eprintln!("findx PDF engine: {e}");
-        "此 PDF 暂时无法显示。请确认文件已完整下载、未加密；可以重试或查看其他文件。".into()
-    })
+    }
+    Pdfium::bind_to_system_library().ok().map(Pdfium::new)
 }
 
 #[cfg(windows)]

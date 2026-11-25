@@ -816,6 +816,37 @@ pub(crate) fn snippets_all_for(
         .unwrap_or_default()
 }
 
+/// 全文文本预览（命中上下文升级用）：单 entry 一次回读 + 命中 spans。
+/// 返回 `(文本, [(起, 止)], 全文匹配点总数, 是否截断)`；超大/失败 → None
+///（调用方回退摘要窗展示）。
+pub(crate) fn full_text_for(
+    engine: &SearchEngine,
+    query: &str,
+    entry_index: u32,
+) -> Option<(String, Vec<[usize; 2]>, u32, bool)> {
+    let cidx = hub().lock().ok().and_then(|g| g.index.clone())?;
+    let key = {
+        let g = engine.index_store();
+        let frn = g.frns.get(entry_index as usize).copied()?;
+        let mut found = None;
+        for (slot, vol) in g.volumes.iter().enumerate() {
+            if g.frn_to_entry.get_scoped(frn, slot as u32) == Some(entry_index) {
+                found = Some(findx2_content::doc_key(
+                    &volume_key_for(&vol.volume_id, slot),
+                    frn,
+                ));
+                break;
+            }
+        }
+        found?
+    };
+    // 传输上限 256 KiB（与 GUI 预览渲染量级匹配，过长截断明示）。
+    let (text, spans, total, truncated) =
+        cidx.full_text_for_key(query, key, 256 << 10).ok()??;
+    let spans = spans.into_iter().map(|(a, b)| [a, b]).collect();
+    Some((text, spans, total as u32, truncated))
+}
+
 fn tmp_build_dir(final_cdir: &Path) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

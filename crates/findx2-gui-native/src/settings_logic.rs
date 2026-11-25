@@ -150,6 +150,45 @@ pub fn content_mode_left(mode: ContentDefaultMode) -> f32 {
 /// 滑块滑动时长（ms，逐帧驱动 + ease_in_out_cubic）。
 pub const CONTENT_MODE_GLIDE_MS: u64 = 220;
 
+/// 命中上下文活文档引擎偏好：Word 优先（默认）、只用 WPS、只用 Word。
+/// auto = Word/Excel 优先，失败切 WPS（KWPS/KET），都没有则降级文字摘录。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OfficeEngine {
+    #[default]
+    #[serde(alias = "Auto")]
+    Auto,
+    #[serde(alias = "Word")]
+    Word,
+    #[serde(alias = "Wps")]
+    Wps,
+}
+
+impl OfficeEngine {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Word => "word",
+            Self::Wps => "wps",
+        }
+    }
+    pub fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "word" => Self::Word,
+            "wps" => Self::Wps,
+            _ => Self::Auto,
+        }
+    }
+    /// 按偏好展开探测顺序：(word_first, wps_allowed)。
+    pub fn probe_order(self) -> (bool, bool) {
+        match self {
+            Self::Auto => (true, true),
+            Self::Word => (true, false),
+            Self::Wps => (false, true),
+        }
+    }
+}
+
 /// 与现有 GUI 设置字段对齐，但只落在隔离目录，不写正式 GUI 配置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -220,6 +259,9 @@ pub struct FindxGuiSettings {
     /// 增量线程攒批 commit 的时间阈值（秒）。
     #[serde(default = "default_content_commit_secs")]
     pub content_commit_secs: u64,
+    /// 命中上下文活文档引擎：auto（默认，Word 优先失败切 WPS）/ word / wps。
+    #[serde(default)]
+    pub office_engine: OfficeEngine,
 }
 
 fn default_true() -> bool {
@@ -278,6 +320,7 @@ impl FindxGuiSettings {
             content_follow_incremental: true,
             content_commit_docs: default_content_commit_docs(),
             content_commit_secs: default_content_commit_secs(),
+            office_engine: OfficeEngine::Auto,
         }
     }
 }

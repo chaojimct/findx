@@ -1,4 +1,4 @@
-//! 按需 snippet（schema v2）：body 不再 STORED，snippet 在展示时回读原文生成。
+﻿//! 按需 snippet（schema v2）：body 不再 STORED，snippet 在展示时回读原文生成。
 //!
 //! 流程：doc 存 path（STORED 不变）→ `extract_text(path)` 回读 → 按查询词
 //! 切窗口（命中前后各约 120 字）→ 高亮 → HTML。结果按
@@ -368,7 +368,23 @@ impl SnippetCache {
 
 pub struct SnippetPool {
     cache: Mutex<SnippetCache>,
+    texts: Mutex<TextCache>,
 }
+
+/// 原文缓存（全文预览 + 摘要回读共用一次抽取）：key 为 (path, mtime)，
+/// 失败不缓存（重试语义由调用方决定）；总字节有界，FIFO 逐出最老。
+struct TextCache {
+    map: HashMap<(String, u64), std::sync::Arc<String>>,
+    order: VecDeque<(String, u64)>,
+    bytes: usize,
+}
+
+/// 全文预览单文档上限（字节）：超出走“命中上下文摘要”通道，不再全文展示。
+/// 与列表摘要的 `SNIPPET_LIST_MAX_BYTES`（index.rs）同口径：超限文件两边一致跳过。
+pub const FULL_TEXT_MAX_BYTES: u64 = 4 << 20;
+/// IPC/预览传输上限：只传开头截断（char 边界），`truncated` 置位明示。
+pub const FULL_TEXT_WIRE_CAP: usize = 256 << 10;
+const TEXT_CACHE_BYTES: usize = 16 << 20;
 
 impl SnippetPool {
     pub fn new() -> Self {
@@ -377,7 +393,46 @@ impl SnippetPool {
                 map: HashMap::new(),
                 order: VecDeque::new(),
             }),
+            texts: Mutex::new(TextCache {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+                bytes: 0,
+            }),
         }
+    }
+
+    /// 回读原文（带缓存）：命中上下文全文预览与摘要窗口共用一次抽取。
+    /// 超大文件（> `FULL_TEXT_MAX_BYTES`）/抽取失败返回 None（调用方降级）。
+    pub fn full_text(&self, path: &str, mtime: u64) -> Option<std::sync::Arc<String>> {
+        if let Ok(t) = self.texts.lock() {
+            if let Some(hit) = t.map.get(&(path.to_string(), mtime)) {
+                return Some(hit.clone());
+            }
+        }
+        // stat 不触发云占位下载；超限直接跳过（不读不解析）。
+        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if len == 0 || len > FULL_TEXT_MAX_BYTES {
+            return None;
+        }
+        let text = crate::extract_text(std::path::Path::new(path)).ok()?.text;
+        let text = std::sync::Arc::new(text);
+        if let Ok(mut t) = self.texts.lock() {
+            let k = (path.to_string(), mtime);
+            if !t.map.contains_key(&k) && text.len() <= TEXT_CACHE_BYTES {
+                t.bytes += text.len();
+                t.order.push_back(k.clone());
+                t.map.insert(k, text.clone());
+                while t.bytes > TEXT_CACHE_BYTES {
+                    let Some(old) = t.order.pop_front() else {
+                        break;
+                    };
+                    if let Some(v) = t.map.remove(&old) {
+                        t.bytes = t.bytes.saturating_sub(v.len());
+                    }
+                }
+            }
+        }
+        Some(text)
     }
 
     /// 回读原文生成 snippet；失败/无命中返回 None（行不受影响）。
@@ -413,7 +468,7 @@ impl SnippetPool {
                 return Some(hit);
             }
         }
-        let text = extract_text(std::path::Path::new(path)).ok()?.text;
+        let text = self.full_text(path, mtime)?;
         let (html, total, window_used) = match make_snippet_windowed(&text, terms, window_idx) {
             Some(t) => t,
             None if query_text.is_ascii() && window_idx == 0 => (head_snippet(&text)?, 1, 0),
@@ -440,7 +495,7 @@ impl SnippetPool {
         if terms.is_empty() || cap == 0 {
             return None;
         }
-        let text = extract_text(std::path::Path::new(path)).ok()?.text;
+        let text = self.full_text(path, mtime)?;
         let spans = match_spans(&text, terms);
         if spans.is_empty() {
             if !query_text.is_ascii() {

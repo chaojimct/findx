@@ -635,6 +635,64 @@ impl ContentIndex {
         Ok(self.snippets.all_windows(path, mtime, query_text, &terms, cap))
     }
 
+    /// 全文文本预览用：一次抽取（缓存）+ 命中 spans；输出截断到 `wire_cap`
+    ///（char 边界），`truncated` 明示是否被体积/上限截断；超大文件直接 None
+    ///（调用方回退摘要窗）。返回 `(文本, 命中字节区间, 全文匹配点总数, 是否截断)`。
+    pub fn full_text_for_key(
+        &self,
+        query_text: &str,
+        key: u64,
+        wire_cap: usize,
+    ) -> Result<Option<(String, Vec<(usize, usize)>, usize, bool)>> {
+        let mut tok = HybridTokenizer::new();
+        let terms = crate::snippet::query_terms(query_text, &mut tok);
+        if terms.is_empty() {
+            return Ok(None);
+        }
+        self.reader.reload()?;
+        let searcher = self.reader.searcher();
+        let tq = tantivy::query::TermQuery::new(
+            Term::from_field_u64(self.fields.key, key),
+            IndexRecordOption::Basic,
+        );
+        let top = searcher.search(&tq, &TopDocs::with_limit(1).order_by_score())?;
+        let Some((_, addr)) = top.first() else {
+            return Ok(None);
+        };
+        let doc: tantivy::TantivyDocument = searcher.doc(*addr)?;
+        let path = doc
+            .get_first(self.fields.path)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if path.is_empty() {
+            return Ok(None);
+        }
+        let mtime = doc
+            .get_first(self.fields.mtime)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let text = match self.snippets.full_text(path, mtime) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let mut spans = crate::snippet::match_spans(&text, &terms);
+        let total = spans.len();
+        // 截断到传输上限（char 边界），命中区间同步裁剪，总数照实。
+        let mut truncated = false;
+        let mut out = text.to_string();
+        if out.len() > wire_cap {
+            let mut n = wire_cap.min(out.len());
+            while !out.is_char_boundary(n) {
+                n -= 1;
+            }
+            out.truncate(n);
+            out.push_str("\n[内容过长，仅显示开头部分]");
+            truncated = true;
+        }
+        spans.retain(|(a, _)| *a < out.len());
+        Ok(Some((out, spans, total, truncated)))
+    }
+
     /// 返回按 BM25 排序的 (volume_id, frn, score, snippet)。
     pub fn search(&self, query_text: &str, limit: usize) -> Result<Vec<ContentHit>> {
         self.reader.reload()?;

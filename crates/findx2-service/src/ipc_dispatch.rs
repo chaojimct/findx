@@ -1,4 +1,4 @@
-//! JSON IPC 请求处理（命名管道与 Unix socket 共用）。
+﻿//! JSON IPC 请求处理（命名管道与 Unix socket 共用）。
 
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -94,6 +94,7 @@ pub(crate) fn req_kind_label(r: &IpcRequest) -> &'static str {
         IpcRequest::ContentSnippets { .. } => "ContentSnippets",
         IpcRequest::ContentSnippetsAll { .. } => "ContentSnippetsAll",
         IpcRequest::ContentPdfBoxes { .. } => "ContentPdfBoxes",
+        IpcRequest::ContentFullText { .. } => "ContentFullText",
     }
 }
 
@@ -514,6 +515,54 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
             rects: Vec::new(),
             page_w: 0.0,
             page_h: 0.0,
+        },
+        (
+            IpcRequest::ContentFullText {
+                query,
+                entry_index,
+            },
+            Some(eng),
+        ) => {
+            match QueryParser::parse(&query) {
+                Ok(pq) => {
+                    let needles = content_needles(&pq);
+                    if needles.is_empty() {
+                        IpcResponse::ContentFullText {
+                            text: String::new(),
+                            spans: Vec::new(),
+                            total: 0,
+                            truncated: false,
+                        }
+                    } else {
+                        match crate::content_index::full_text_for(
+                            &eng,
+                            &needles.join(" "),
+                            entry_index,
+                        ) {
+                            Some((text, spans, total, truncated)) => {
+                                IpcResponse::ContentFullText {
+                                    text,
+                                    spans,
+                                    total,
+                                    truncated,
+                                }
+                            }
+                            None => IpcResponse::ContentFullText {
+                                text: String::new(),
+                                spans: Vec::new(),
+                                total: 0,
+                                truncated: false,
+                            },
+                        }
+                    }
+                }
+                Err(e) => IpcResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+        (IpcRequest::ContentFullText { .. }, None) => IpcResponse::Error {
+            message: "索引加载中，请稍候…".into(),
         },
     }
 }

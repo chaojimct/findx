@@ -27,6 +27,8 @@ pub mod preview_worker;
 
 #[cfg(windows)]
 pub mod office_host;
+#[cfg(windows)]
+pub mod office_live;
 
 pub mod autostart;
 pub mod service_control;
@@ -48,6 +50,7 @@ mod preview_visibility;
 
 pub mod disktree;
 pub mod usage_cache;
+pub mod markdown_blocks;
 
 pub mod indexed_usage;
 
