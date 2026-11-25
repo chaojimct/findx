@@ -125,10 +125,55 @@ pub fn extract_xls(path: &Path) -> Result<String> {
 /// 按行列输出 `{列字母}{行号}: 值`（与旧手写解析同格式，网格预览可直接复用地址），
 /// 工作表名追加在末尾（旧行为：表名可搜，1.2.941 修过表名搜不到的教训）。
 pub(crate) fn extract_sheet_book(path: &Path) -> Result<String> {
-    use calamine::{open_workbook_auto, Data, Reader};
-    let mut book = open_workbook_auto(path)
-        .map_err(|e| Error::Extract(path.display().to_string(), format!("表格打开失败: {e}")))?;
+    use calamine::{open_workbook, open_workbook_auto, Data, Reader, Xlsx};
     let mut out = String::new();
+    match open_workbook_auto(path) {
+        Ok(mut b) => dump_sheet_book(&mut b, &mut out),
+        Err(first) => {
+            // 扩展名撒谎的常见情形：内容是 OOXML zip 却挂着 .xls 后缀
+            //（calamine 按 BIFF 走直接报 Invalid OLE）。嗅探 ZIP 魔数后
+            // 按 Xlsx 重试一次；仍失败则报原文（保留首错信息）。
+            let is_zip = std::fs::File::open(path)
+                .and_then(|mut f| {
+                    use std::io::Read;
+                    let mut magic = [0u8; 4];
+                    f.read_exact(&mut magic).map(|_| magic)
+                })
+                .map(|m| m == *b"PK\x03\x04")
+                .unwrap_or(false);
+            if !is_zip {
+                return Err(Error::Extract(
+                    path.display().to_string(),
+                    format!("表格打开失败: {first}"),
+                ));
+            }
+            let mut xb = open_workbook::<Xlsx<_>, _>(path).map_err(|e| {
+                Error::Extract(
+                    path.display().to_string(),
+                    format!("表格打开失败（zip 回退亦失败，首错: {first}；回退错: {e})"),
+                )
+            })?;
+            dump_sheet_book(&mut xb, &mut out);
+        }
+    }
+    // 工作表名也可搜（旧行为保留）。
+    // 注：表名追加在 dump 之后，避免与单元格同行混淆（旧格式约定）。
+    if out.trim().is_empty() {
+        return Err(Error::Extract(
+            path.display().to_string(),
+            "表格无文本（纯空表走跳过）".into(),
+        ));
+    }
+    Ok(out)
+}
+
+/// 工作簿 → `{列字母}{行号}: 值` 文本（与旧手写解析同格式）+ 末尾工作表名。
+/// 泛型 over calamine `Reader`：auto 探测的 `Sheets` 枚举与显式 `Xlsx` 共用同一逻辑。
+fn dump_sheet_book<RS: std::io::Read + std::io::Seek>(
+    book: &mut impl calamine::Reader<RS>,
+    out: &mut String,
+) {
+    use calamine::{Data, Reader};
     for name in book.sheet_names() {
         let range = match book.worksheet_range(&name) {
             Ok(r) => r,
@@ -148,18 +193,10 @@ pub(crate) fn extract_sheet_book(path: &Path) -> Result<String> {
             out.push('\n');
         }
     }
-    // 工作表名也可搜（旧行为保留）。
     for name in book.sheet_names() {
         out.push_str(&name);
         out.push(' ');
     }
-    if out.trim().is_empty() {
-        return Err(Error::Extract(
-            path.display().to_string(),
-            "表格无文本（纯空表走跳过）".into(),
-        ));
-    }
-    Ok(out)
 }
 
 /// 0 基列下标 → A..Z, AA.. 字母（网格预览与索引共用同一地址写法）。
@@ -396,6 +433,16 @@ mod tests {
         let p = d.path().join("bad.xls");
         std::fs::write(&p, b"not a BIFF stream at all").unwrap();
         assert!(extract_xls(&p).is_err());
+    }
+
+    #[test]
+    fn xls_with_zip_content_falls_back_to_xlsx() {
+        // 真实坏案：OOXML 内容挂着 .xls 后缀（calamine 按 BIFF 走直接报 Invalid OLE）。
+        let d = tempfile::tempdir().unwrap();
+        let p = make_xlsx(d.path(), "mislabeled.xls");
+        let t = extract_xls(&p).unwrap();
+        assert!(t.contains("A1: 全文搜索"), "{t}");
+        assert!(t.contains("费用表"), "{t}");
     }
 
     #[test]
