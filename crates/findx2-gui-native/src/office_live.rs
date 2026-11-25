@@ -221,19 +221,27 @@ mod com {
         flags: u16,
         mut args: Vec<VARIANT>,
     ) -> Result<VARIANT, String> {
+        use windows::Win32::System::Ole::DISPID_PROPERTYPUT;
         unsafe {
             let id = dispid(disp, name)?;
             // COM 参数逆序。
             args.reverse();
+            // 属性赋值必须带具名参数 DISPID_PROPERTYPUT，否则 Word 直接拒收。
+            let is_put = flags & 4 != 0;
+            let mut named = DISPID_PROPERTYPUT;
             let mut dp = DISPPARAMS {
                 rgvarg: if args.is_empty() {
                     std::ptr::null_mut()
                 } else {
                     args.as_mut_ptr()
                 },
-                rgdispidNamedArgs: std::ptr::null_mut(),
+                rgdispidNamedArgs: if is_put {
+                    &mut named as *mut _
+                } else {
+                    std::ptr::null_mut()
+                },
                 cArgs: args.len() as u32,
-                cNamedArgs: 0,
+                cNamedArgs: if is_put { 1 } else { 0 },
             };
             let mut out = variant_empty();
             let mut excep = EXCEPINFO::default();
@@ -432,9 +440,12 @@ impl LiveSession {
             .map_err(|e| format!("COM 初始化失败: {e}"))?;
         }
         let app = com::create(engine.prog_id())?;
+        // open 后续任一步失败必须 Quit，否则泄漏无窗口 Word 进程。
         // 不弹窗、不改用户 normal 模板。
-        let _ = app.method0("SetVisible");
-        app.put_bool("Visible", true)?;
+        if let Err(e) = app.put_bool("Visible", true) {
+            let _ = app.method0("Quit");
+            return Err(e);
+        }
         let _ = app.put_bool("DisplayAlerts", false);
 
         // 打开目标：先试只读源文件；needs_paint 则直接用 temp 副本。
@@ -446,8 +457,14 @@ impl LiveSession {
         } else {
             (path.to_string(), None)
         };
-        let doc = open_document(&app, engine, &open_path)?;
-        let embedded_hwnd = find_app_window(engine)?;
+        let doc = match open_document(&app, engine, &open_path) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = app.method0("Quit");
+                return Err(e);
+            }
+        };
+        let embedded_hwnd = find_app_window(engine).unwrap_or(0);
         if embedded_hwnd != 0 && host_hwnd != 0 {
             embed(embedded_hwnd, host_hwnd);
         }
