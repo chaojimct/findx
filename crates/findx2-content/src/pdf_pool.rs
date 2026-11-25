@@ -51,7 +51,7 @@ pub fn global() -> Option<&'static PdfPool> {
     GLOBAL.get_or_init(PdfPool::new).as_ref()
 }
 
-fn worker_exe() -> Option<PathBuf> {
+pub(crate) fn worker_exe() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     #[cfg(windows)]

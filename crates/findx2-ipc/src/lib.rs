@@ -100,6 +100,14 @@ pub enum IpcRequest {
         #[serde(default)]
         window: usize,
     },
+    /// 取 PDF 单页命中框（预览高亮用；与 `ContentSnippets` 同源解析 query）。
+    /// query 取 content: 取值原文；entry_index 为结果行号；page 为预览侧当前页。
+    /// 失败/无命中 → 空 rects（预览降级为无高亮，不报错）。
+    ContentPdfBoxes {
+        query: String,
+        entry_index: u32,
+        page: u32,
+    },
     /// Negotiation only. Missing/unknown versions must never imply prepare support.
     UpgradeCapabilities { protocol_version: u32 },
     PrepareStop { protocol_version: u32, expected_instance: String, request_nonce: String, index_identity: String, timeout_ms: u64 },
@@ -299,6 +307,16 @@ pub enum IpcResponse {
     /// `ContentSnippets` 应答：按 entry_idx 的命中摘要窗口。
     ContentSnippets {
         snippets: Vec<ContentSnippetDto>,
+    },
+    /// `ContentPdfBoxes` 应答：单页命中框（点坐标，左上原点）+ 页尺寸（点）。
+    /// 空 rects = 无命中/失败，调用方降级为无高亮。
+    ContentPdfBoxes {
+        #[serde(default)]
+        rects: Vec<[f32; 4]>,
+        #[serde(default)]
+        page_w: f32,
+        #[serde(default)]
+        page_h: f32,
     },
     Pong,
     Error {

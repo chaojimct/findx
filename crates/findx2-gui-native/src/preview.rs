@@ -66,6 +66,10 @@ pub struct PreviewState {
     #[cfg(windows)]
     pub native: Option<crate::office_host::NativeClient>,
     pub pdf: Option<PdfMeta>,
+    /// 自渲染 PDF 页的命中框（点坐标，左上原点；与 `pdf` 同页同文件才展示）。
+    pub pdf_highlights: Vec<[f32; 4]>,
+    pub pdf_hl_page: Option<u32>,
+    pub pdf_hl_path: Option<String>,
     pub generation: u64,
     pub meta: Option<PreviewMeta>,
     pub kind: PreviewKind,
@@ -92,6 +96,9 @@ impl PreviewState {
             #[cfg(windows)]
             native: None,
             pdf: None,
+            pdf_highlights: Vec::new(),
+            pdf_hl_page: None,
+            pdf_hl_path: None,
             generation: 0,
             meta: None,
             kind: PreviewKind::Empty,
@@ -113,6 +120,9 @@ impl PreviewState {
             #[cfg(windows)]
             native: None,
             pdf: None,
+            pdf_highlights: Vec::new(),
+            pdf_hl_page: None,
+            pdf_hl_path: None,
             generation,
             meta: Some(meta),
             kind: PreviewKind::Loading,

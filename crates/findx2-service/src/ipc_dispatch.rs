@@ -31,6 +31,7 @@ pub(crate) fn req_kind_label(r: &IpcRequest) -> &'static str {
         IpcRequest::ContentBuild { .. } => "ContentBuild",
         IpcRequest::ContentCancel => "ContentCancel",
         IpcRequest::ContentSnippets { .. } => "ContentSnippets",
+        IpcRequest::ContentPdfBoxes { .. } => "ContentPdfBoxes",
     }
 }
 
@@ -339,6 +340,41 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
         }
         (IpcRequest::ContentSnippets { .. }, None) => IpcResponse::Error {
             message: "索引加载中，请稍候…".into(),
+        },
+        (
+            IpcRequest::ContentPdfBoxes {
+                query,
+                entry_index,
+                page,
+            },
+            Some(eng),
+        ) => match QueryParser::parse(&query) {
+            Ok(pq) => {
+                let needles: Vec<String> =
+                    content_needles(&pq).into_iter().map(str::to_string).collect();
+                match crate::content_index::pdf_boxes_for(&eng, &needles, entry_index, page) {
+                    Some((rects, page_w, page_h)) => IpcResponse::ContentPdfBoxes {
+                        rects,
+                        page_w,
+                        page_h,
+                    },
+                    None => IpcResponse::ContentPdfBoxes {
+                        rects: Vec::new(),
+                        page_w: 0.0,
+                        page_h: 0.0,
+                    },
+                }
+            }
+            Err(_) => IpcResponse::ContentPdfBoxes {
+                rects: Vec::new(),
+                page_w: 0.0,
+                page_h: 0.0,
+            },
+        },
+        (IpcRequest::ContentPdfBoxes { .. }, None) => IpcResponse::ContentPdfBoxes {
+            rects: Vec::new(),
+            page_w: 0.0,
+            page_h: 0.0,
         },
     }
 }

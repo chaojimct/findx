@@ -16,6 +16,9 @@ Thumbs.db
 # .NET build output
 **/bin/
 **/obj/
+# 例外：Rust helper 二进制源码（被上一条误伤，需显式放行）
+!crates/findx2-cli/src/bin/
+!crates/findx2-cli/src/bin/pdf_worker.rs
 
 # Publish / release output
 /publish/

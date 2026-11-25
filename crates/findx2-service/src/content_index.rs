@@ -718,6 +718,28 @@ pub(crate) fn status_snapshot() -> ContentStatusSnapshot {
     }
 }
 
+/// PDF 单页命中框（预览高亮用）：entry_idx → 文件路径 → `pdf_boxes` 常驻 worker。
+/// 非 PDF/解析失败/worker 失败一律返回 None（调用方回空 rects，前端降级无高亮）。
+pub(crate) fn pdf_boxes_for(
+    engine: &SearchEngine,
+    needles: &[String],
+    entry_idx: u32,
+    page: u32,
+) -> Option<(Vec<[f32; 4]>, f32, f32)> {
+    if needles.is_empty() || page > 100_000 {
+        return None;
+    }
+    let path = {
+        let g = engine.index_store();
+        g.entry_display_path(entry_idx as usize).ok()?
+    };
+    if !path.to_ascii_lowercase().ends_with(".pdf") {
+        return None;
+    }
+    let pb = findx2_content::pdf_boxes::page_boxes(Path::new(&path), page, needles).ok()?;
+    Some((pb.rects, pb.page_w, pb.page_h))
+}
+
 /// 搜索装配用：按页内 `entry_idx` 取前 `cap` 个 snippet（key→html，无命中缺席）。
 /// 搜索装配用：按页内 `entry_idx` 取第 `window_idx` 个匹配窗口的 snippet。
 /// 返回 `entry_idx → (html, 全文匹配点总数, 实际窗口号)`；找不到/回读失败的 key 缺席。

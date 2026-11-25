@@ -9,6 +9,7 @@ pub mod error;
 pub mod extract;
 pub mod index;
 pub mod office;
+pub mod pdf_boxes;
 pub mod pdf_pool;
 pub mod build;
 pub mod snippet;

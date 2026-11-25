@@ -1573,6 +1573,57 @@ impl MainWindow {
         .detach();
     }
 
+    /// 取自渲染 PDF 当前页的命中框（高亮黄框用；失败/无命中静默无高亮）。
+    /// 只在全文搜索 + 自渲染 PDF 页（非原生处理器）时请求。
+    fn fetch_pdf_boxes(&mut self, entry_idx: u32, page: u32, path: String, cx: &mut Context<Self>) {
+        if self.workspace.mode != ViewMode::Search || self.preview_file.is_some() {
+            return;
+        }
+        let sent = self.current_query(cx);
+        if !sent.to_ascii_lowercase().contains("content:") {
+            return;
+        }
+        let (endpoint, ipc) = self
+            .session
+            .read_with(cx, |s, _| (s.endpoint.clone(), s.ipc.clone()));
+        let search_gen_at_req = self.search_gen;
+        cx.spawn(async move |this, cx| {
+            let result = ipc
+                .request(
+                    endpoint,
+                    findx2_ipc::IpcRequest::ContentPdfBoxes {
+                        query: sent,
+                        entry_index: entry_idx,
+                        page,
+                    },
+                )
+                .await
+                .unwrap_or_else(|_| Err("IPC 通道已关闭".into()));
+            let Ok(findx2_ipc::IpcResponse::ContentPdfBoxes {
+                rects,
+                page_w: _,
+                page_h: _,
+            }) = result
+            else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                if this.search_gen != search_gen_at_req {
+                    return;
+                }
+                let cur = this.preview.pdf.map(|p| p.page);
+                let cur_path = this.preview.meta.as_ref().map(|m| m.path.clone());
+                if cur == Some(page) && cur_path.as_deref() == Some(path.as_str()) {
+                    this.preview.pdf_highlights = rects;
+                    this.preview.pdf_hl_page = Some(page);
+                    this.preview.pdf_hl_path = Some(path);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn request_preview(&mut self, cx: &mut Context<Self>) {
         self.preview_cancel
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1699,6 +1750,15 @@ impl MainWindow {
                     this.preview_options.page = pdf.page;
                 }
                 this.preview = loaded;
+                // 自渲染 PDF 页：顺手取本页命中框（翻页重载也会经过这里）。
+                if let (Some(pdf), Some(meta)) =
+                    (this.preview.pdf, this.preview.meta.clone())
+                {
+                    if let Some(h) = this.active_workspace_hit() {
+                        let (idx, path) = (h.entry_idx, meta.path.clone());
+                        this.fetch_pdf_boxes(idx, pdf.page, path, cx);
+                    }
+                }
                 cx.notify();
             })
             .ok();
@@ -2317,15 +2377,52 @@ impl MainWindow {
                     pdf.width * self.preview_options.zoom
                 };
                 let height = width * pdf.height / pdf.width.max(1.);
-                div()
-                    .p_3()
-                    .child(
-                        img(self.preview.image.clone().unwrap())
-                            .w(px(width))
-                            .h(px(height))
-                            .object_fit(ObjectFit::Contain),
-                    )
-                    .into_any_element()
+                // 本页命中框（点→显示像素；仅同文件同页展示，翻页/切文件即失效）。
+                let show_hl = self.preview.pdf_hl_page == Some(pdf.page)
+                    && self
+                        .preview
+                        .pdf_hl_path
+                        .as_deref()
+                        .zip(self.preview.meta.as_ref().map(|m| m.path.as_str()))
+                        .is_some_and(|(a, b)| a == b);
+                let hl = if show_hl {
+                    self.preview.pdf_highlights.clone()
+                } else {
+                    Vec::new()
+                };
+                let sx = width / pdf.width.max(1.);
+                let sy = height / pdf.height.max(1.);
+                let mut stack = div().relative().child(
+                    img(self.preview.image.clone().unwrap())
+                        .w(px(width))
+                        .h(px(height))
+                        .object_fit(ObjectFit::Contain),
+                );
+                for r in hl {
+                    let (w, h) = ((r[2] - r[0]) * sx, (r[3] - r[1]) * sy);
+                    if w <= 0. || h <= 0. {
+                        continue;
+                    }
+                    stack = stack.child(
+                        div()
+                            .absolute()
+                            .left(px(r[0] * sx))
+                            .top(px(r[1] * sy))
+                            .w(px(w))
+                            .h(px(h))
+                            .bg(rgba(0xffee58cc)),
+                    );
+                }
+                let mut col = v_flex().p_3().gap_1();
+                if !self.preview.pdf_highlights.is_empty() && show_hl {
+                    col = col.child(
+                        div()
+                            .text_xs()
+                            .text_color(tokens.text_tertiary)
+                            .child(format!("本页 {} 个命中", self.preview.pdf_highlights.len())),
+                    );
+                }
+                col.child(stack).into_any_element()
             }
             PreviewKind::Image => {
                 let mut col = v_flex()
