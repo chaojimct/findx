@@ -245,8 +245,10 @@ pub struct MainWindow {
     /// 搜索框全文模式（文件名/全文检索/混合检索；`content_enabled` 关时恒为文件名）。
     /// 初值取自设置页“默认搜索模式”。
     content_mode: ContentDefaultMode,
-    /// 三段 switch 滑块起点（px，切换瞬间记录旧位置，180ms 划到新位置）。
-    content_mode_glide_from: f32,
+    /// 三段 switch 滑块当前位置（px）；点击后逐帧划向新位置，杜绝哑火。
+    content_mode_glide_px: f32,
+    /// 滑块动画代次：快速连点时旧任务自动认输，保证只剩最后一个在跑。
+    content_mode_glide_gen: u64,
     hits: Vec<SearchHitDto>,
     selected: Option<usize>,
     match_total: u32,
@@ -480,11 +482,12 @@ impl MainWindow {
             size_min: String::new(),
             size_max: String::new(),
             content_mode: session.read(cx).settings.content_default_mode,
-            content_mode_glide_from: {
+            content_mode_glide_px: {
                 use crate::settings_logic::CONTENT_MODE_SEG_W;
                 session.read(cx).settings.content_default_mode.tab_index() as f32
                     * CONTENT_MODE_SEG_W
             },
+            content_mode_glide_gen: 0,
             hits: Vec::new(),
             selected: None,
             match_total: 0,
@@ -897,12 +900,49 @@ impl MainWindow {
         if self.content_mode == m {
             return;
         }
-        // 先记旧位置：滑块从这里划到新位置。
-        self.content_mode_glide_from =
-            self.content_mode.tab_index() as f32 * crate::settings_logic::CONTENT_MODE_SEG_W;
+        let from = self.content_mode_glide_px;
         self.content_mode = m;
+        self.animate_content_glide(
+            cx,
+            from,
+            m.tab_index() as f32 * crate::settings_logic::CONTENT_MODE_SEG_W,
+        );
         self.schedule_search(window, cx);
         cx.notify();
+    }
+
+    /// 滑块逐帧滑动：确定性重绘，不依赖声明式动画排期。
+    /// 快速连点时只有最新一代跑完，旧任务中途认输。
+    fn animate_content_glide(&mut self, cx: &mut Context<Self>, from: f32, to: f32) {
+        self.content_mode_glide_gen = self.content_mode_glide_gen.wrapping_add(1);
+        let round = self.content_mode_glide_gen;
+        cx.spawn(async move |this, cx| {
+            let t0 = std::time::Instant::now();
+            let total = std::time::Duration::from_millis(
+                crate::settings_logic::CONTENT_MODE_GLIDE_MS,
+            );
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+                let t = (t0.elapsed().as_secs_f32() / total.as_secs_f32()).min(1.0);
+                let eased = crate::ui::motion::ease_in_out_cubic(t);
+                let cont = this
+                    .update(cx, |this, cx| {
+                        if this.content_mode_glide_gen != round {
+                            return false;
+                        }
+                        this.content_mode_glide_px = from + (to - from) * eased;
+                        cx.notify();
+                        t < 1.0
+                    })
+                    .unwrap_or(false);
+                if !cont {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn schedule_search(&mut self, _window: &mut Window, cx: &mut Context<Self>) {

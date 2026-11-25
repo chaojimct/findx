@@ -112,9 +112,9 @@ impl ContentDefaultMode {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Name => "文件名",
-            Self::Content => "全文检索",
-            Self::Mix => "混合检索",
+            Self::Name => "名称",
+            Self::Content => "全文",
+            Self::Mix => "混合",
         }
     }
 
@@ -129,9 +129,9 @@ impl ContentDefaultMode {
 }
 
 /// 搜索框三段 switch 单段宽度（px）：三段等宽，滑块按下标定位。
-pub const CONTENT_MODE_SEG_W: f32 = 68.0;
-/// 滑块滑动时长（ms，与 motion::ease_in_out_cubic 搭配）。
-pub const CONTENT_MODE_GLIDE_MS: u64 = 180;
+pub const CONTENT_MODE_SEG_W: f32 = 60.0;
+/// 滑块滑动时长（ms，逐帧驱动 + ease_in_out_cubic）。
+pub const CONTENT_MODE_GLIDE_MS: u64 = 220;
 
 /// 与现有 GUI 设置字段对齐，但只落在隔离目录，不写正式 GUI 配置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

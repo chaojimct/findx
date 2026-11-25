@@ -158,11 +158,9 @@ impl MainWindow {
     /// 常显三段 + 滑动指示块：一眼看到当前检索范围，点哪段切哪段。
     /// tooltip 保留完整语义即拼音入口。
     fn mode_segmented(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        use crate::settings_logic::{CONTENT_MODE_GLIDE_MS, CONTENT_MODE_SEG_W};
+        use crate::settings_logic::CONTENT_MODE_SEG_W;
         let tokens = Self::tokens(cx);
-        let idx = self.content_mode.tab_index();
-        let from = self.content_mode_glide_from;
-        let to = idx as f32 * CONTENT_MODE_SEG_W;
+        let gx = self.content_mode_glide_px;
         h_flex()
             .id("search-content-mode")
             .relative()
@@ -176,30 +174,23 @@ impl MainWindow {
             .cursor_pointer()
             .tooltip({
                 let tip: SharedString =
-                    "检索范围：文件名 / 全文检索（支持拼音首字母与全拼）/ 混合检索。点击切换"
+                    "检索范围：名称 / 全文 / 混合。全文支持拼音首字母与全拼。点击切换"
                         .into();
                 move |window, cx| {
                     gpui_kit::component::tooltip::Tooltip::new(tip.clone())
                         .build(window, cx)
                 }
             })
-            // 滑动指示块：跟随选中段，180ms ease-in-out 划过去。
+            // 滑动指示块：位置由逐帧动画驱动（set_content_mode 起任务）。
             .child(
                 div()
                     .absolute()
                     .top(px(2.))
                     .bottom(px(2.))
+                    .left(px(gx))
                     .w(px(CONTENT_MODE_SEG_W))
                     .rounded_full()
-                    .bg(tokens.row_selected)
-                    .with_animation(
-                        gpui_kit::ElementId::named_usize("mode-glide", idx),
-                        gpui_kit::Animation::new(std::time::Duration::from_millis(
-                            CONTENT_MODE_GLIDE_MS,
-                        ))
-                        .with_easing(crate::ui::motion::ease_in_out_cubic),
-                        move |el, delta| el.left(px(from + (to - from) * delta)),
-                    ),
+                    .bg(tokens.row_selected),
             )
             .children(
                 [
