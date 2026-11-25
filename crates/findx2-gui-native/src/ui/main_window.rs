@@ -2443,10 +2443,12 @@ impl MainWindow {
                                             if !this.preview_is_current() {
                                                 return;
                                             }
-                                            this.preview_snippet_view = false;
-                                            this.preview_snippet_lock = true;
                                             this.office_text_only = id == "office-text";
                                             this.request_preview(cx);
+                                            // request_preview 会按新目标重置视图；
+                                            // 手动选择优先，在它之后覆盖回来。
+                                            this.preview_snippet_view = false;
+                                            this.preview_snippet_lock = true;
                                             cx.notify();
                                         })
                                     })
