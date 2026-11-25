@@ -308,8 +308,6 @@ pub fn build_from_plan(
     st: &mut BuildStats,
     mut progress: impl FnMut(&BuildStats) -> bool,
 ) -> Result<u64> {
-    const EXTRACT_BATCH: usize = 1024;
-    // 索引 commit 节流：writer 堆 1.5GB，5 万篇一批，崩溃最多丢一批。
     const COMMIT_EVERY: u64 = 50_000;
     let cfg = BuildConfig::auto();
     lower_self_priority();

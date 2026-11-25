@@ -74,3 +74,6 @@
    `fetch_snippet_window(entry, k)` 跳窗；当前窗高亮态与 pager 双向同步）。
 3. 验收：管道 `ContentSnippets` 全量 == 逐窗遍历拼接；点击列表第 k 项，
    预览窗内容与 pager 跳到 k 完全一致；50 窗以上截断提示。
+
+**状态（2026-11-25）**：1/2 已实现（`ContentSnippetsAll` + `all_windows` + 双处列
+表 UI，均有单测与管道验证：全窗 == 逐窗拼接一致）；待用户目检列表交互。
