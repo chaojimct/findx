@@ -306,7 +306,7 @@ fn second_volume_self_parent_root_and_nested_paths_match_cached_and_uncached() {
         let (hits,total)=engine.search(&query,&options).unwrap();
         assert_eq!(total,1,"canonical direct query: {text}");
         assert_eq!(hits[0].path,expected,"canonical direct query: {text}");
-        let (page,n)=engine.search_paged(text,&query,&options,0,10).unwrap();
+        let (page,n)=engine.search_paged(text,&query,&options,0,10,None,None).unwrap();
         assert_eq!(n,1,"canonical paged query: {text}");
         assert_eq!(page[0].path,expected,"canonical paged query: {text}");
     }

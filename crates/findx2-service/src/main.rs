@@ -6,6 +6,7 @@ mod everything_status;
 mod ipc_dispatch;
 mod load_state;
 mod startup_compact;
+mod rebuild_health;
 mod shutdown;
 mod runtime_lifecycle;
 mod stat_queue;

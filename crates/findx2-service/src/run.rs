@@ -267,6 +267,9 @@ pub(crate) fn run_foreground(
     // Different pipe names cannot open the same index in another new-engine process.
     let _index_owner=acquire_index_owner(&index)?;
 
+    // P1-3：登记 index 位置，供自愈计数器（Status 展示 + 下次启动强制重建判定）定位健康文件。
+    crate::rebuild_health::note_index_path(&index);
+
     // Crash tracer: a panic in a service process otherwise vanishes (SCM only
     // reports "terminated unexpectedly"). Leave the payload + location in the
     // service log so the next boot explains the last death.
@@ -767,6 +770,27 @@ fn usn_watch_loop(
         }
     }
 
+    // P1-3：连续失败超阈值 → 启动时强制全卷重建（消费一次），而不是增量 resume。
+    // 健康文件与 index.bin 同目录；计数器在成功 checkpoint 到达时清零（见下）。
+    if crate::rebuild_health::take_force_rebuild(&index_path, letter) {
+        set_watch_error(
+            letter,
+            Some("连续重建失败超阈值，启动时强制全卷重建…".into()),
+        );
+        tracing::warn!("卷 {letter} 自愈计数器超阈值，强制全卷重建");
+        match rebuild_volume(&engine, letter, &index_path) {
+            Ok(()) => {
+                info!("卷 {letter} 启动强制重建完成，恢复增量监听");
+                set_watch_error(letter, None);
+            }
+            Err(e) => {
+                set_watch_error(letter, Some(format!("启动强制重建失败: {e:#}")));
+                error!("卷 {letter} 启动强制重建失败: {e:#}");
+                crate::rebuild_health::record_failure(&index_path, letter);
+            }
+        }
+    }
+
     // 后台 stat worker（watch 线程只解析 journal，stat 全走这里；volume 固定，随 loop 常驻）。
     let vol_dev = format!(r"\\.\{}:", volume_letter as char);
     let stat_worker = spawn_stat_worker(engine.clone(), vol_dev, stop.clone());
@@ -1030,8 +1054,10 @@ fn usn_watch_loop(
                         continue;
                     }
                     // 存活确认：收到 journal 心跳即视为健康，复位退避/重建计数。
+                    // P1-3：自愈计数器同步清零（增量链跑通的证明）。
                     backoff = Duration::from_secs(1);
                     gap_rebuilds = 0;
+                    crate::rebuild_health::record_success(&index_path, letter);
                     if let Some(w) = probe_journal_wrap_warning(&volume_path, letter, next_usn) {
                         set_watch_error(letter, Some(w));
                     } else {
@@ -1074,6 +1100,8 @@ fn usn_watch_loop(
                     if let Err(re) = rebuild_volume(&engine, letter, &index_path) {
                         set_watch_error(letter, Some(format!("重建失败: {re}，退避重试…")));
                         error!("卷 {letter} 重建失败: {re:#}");
+                        // P1-3：重建失败记一次（跨进程累计；成功由 Checkpoint 到达清零）。
+                        crate::rebuild_health::record_failure(&index_path, letter);
                     } else {
                         info!("卷 {letter} 重建完成，恢复增量监听");
                         set_watch_error(letter, None);
@@ -1082,6 +1110,8 @@ fn usn_watch_loop(
                         // 再清零，否则状态栏永远停在「1/3」，重建会无限循环。
                     }
                 } else if is_gap {
+                    // P1-3：进程内 3 次用尽仍断档 → 跨进程记一次，下次启动强制重建。
+                    crate::rebuild_health::record_failure(&index_path, letter);
                     set_watch_error(
                         letter,
                         Some("USN 断档且自动重建已达上限，请手动重建索引".into()),

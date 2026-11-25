@@ -13,7 +13,14 @@ pub struct SearchOutcome {
     pub hits: Vec<SearchHitDto>,
     pub total: u32,
     pub elapsed_ms: u32,
+    /// 发起 `Search` 时的 `request_id` 回显（P0-1；0 = 未跟踪的老调用）。
+    /// GUI 凭此丢弃过期响应（防"结果闪回旧查询"）。
+    pub request_id: u64,
 }
+
+/// service 回 `Cancelled` 时 GUI 侧的错误串前缀（P0-1 约定）：
+/// `search_session` 收到此前缀应静默丢弃（同 ID 的新查询已在路上），不得弹错、不得清空旧结果。
+pub const CANCELLED_PREFIX: &str = "__CANCELLED__:";
 
 pub type IpcResult<T> = Result<T, String>;
 
@@ -32,6 +39,8 @@ enum Job {
         pinyin_full: bool,
         limit: usize,
         offset: usize,
+        request_id: u64,
+        session_id: u64,
         reply: oneshot::Sender<IpcResult<SearchOutcome>>,
     },
     Status {
@@ -100,6 +109,24 @@ impl IpcClient {
         limit: usize,
         offset: usize,
     ) -> oneshot::Receiver<IpcResult<SearchOutcome>> {
+        self.search_tracked(endpoint, query, pinyin, pinyin_initials, pinyin_full, limit, offset, 0, 0)
+    }
+
+    /// 带跟踪的搜索（P0-1/P0-2）：`request_id` 自增（每次击键+1，翻页沿用），
+    /// `session_id` 按输入框固定；击键前先对上一 `request_id` 发 `SearchCancel`。
+    /// 收到 `Err("__CANCELLED__:id")` 即本次被替代，静默丢弃。详见 T122 文档。
+    pub fn search_tracked(
+        &self,
+        endpoint: String,
+        query: String,
+        pinyin: bool,
+        pinyin_initials: bool,
+        pinyin_full: bool,
+        limit: usize,
+        offset: usize,
+        request_id: u64,
+        session_id: u64,
+    ) -> oneshot::Receiver<IpcResult<SearchOutcome>> {
         let (reply, rx) = oneshot::channel();
         let _ = self.tx.send(Job::Search {
             endpoint,
@@ -109,6 +136,8 @@ impl IpcClient {
             pinyin_full,
             limit,
             offset,
+            request_id,
+            session_id,
             reply,
         });
         rx
@@ -158,6 +187,8 @@ async fn dispatch(job: Job) {
             pinyin_full,
             limit,
             offset,
+            request_id,
+            session_id,
             reply,
         } => {
             let result = tokio::time::timeout(
@@ -170,6 +201,8 @@ async fn dispatch(job: Job) {
                     pinyin_full,
                     limit,
                     offset,
+                    request_id,
+                    session_id,
                 ),
             )
             .await
@@ -258,6 +291,8 @@ async fn ipc_search(
     pinyin_full: bool,
     limit: usize,
     offset: usize,
+    request_id: u64,
+    session_id: u64,
 ) -> IpcResult<SearchOutcome> {
     let client = connect_endpoint(&endpoint).await?;
     let req = IpcRequest::Search {
@@ -267,17 +302,22 @@ async fn ipc_search(
         offset,
         pinyin_initials,
         pinyin_full,
+        request_id,
+        session_id,
     };
     match write_request(client, req).await? {
         IpcResponse::SearchResult {
             hits,
             total,
             elapsed_ms,
+            request_id,
         } => Ok(SearchOutcome {
             hits,
             total,
             elapsed_ms,
+            request_id,
         }),
+        IpcResponse::Cancelled { request_id } => Err(format!("{CANCELLED_PREFIX}{request_id}")),
         IpcResponse::Error { message } => Err(message),
         _ => Err("管道响应异常".into()),
     }

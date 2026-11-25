@@ -57,7 +57,7 @@ fn compare(e: &SearchEngine, text: &str) {
     assert_eq!(all.len(), total as usize);
     for (offset, limit) in [(0, 13), (7, 31), (0, 10000), (9999, 20), (0, 0)] {
         let (page, n) = e
-            .search_paged(text, &q, &SearchOptions::default(), offset, limit)
+            .search_paged(text, &q, &SearchOptions::default(), offset, limit, None, None)
             .unwrap();
         assert_eq!(n, total, "{text}");
         let expected: Vec<_> = all.iter().skip(offset).take(limit).collect();

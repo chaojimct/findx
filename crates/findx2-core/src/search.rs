@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 // 用 parking_lot::RwLock 替代 std::sync::RwLock：
 // - std 在 Windows 上是 SRW Lock，writer 一旦排队，**所有后续 reader 都被阻塞**——
@@ -19,7 +19,7 @@ use roaring::RoaringBitmap;
 use crate::index::{hash_ext8, IndexStore};
 use crate::meta_overlay::MetaOverlay;
 use crate::query::{ParsedQuery, SortField};
-use crate::Result;
+use crate::{Error, Result};
 
 /// 元数据未就绪时，按大小/时间的排序退化为按文件名（占位 0 无意义）。
 fn effective_sort_field(store: &IndexStore, q: &ParsedQuery) -> SortField {
@@ -186,6 +186,169 @@ pub struct SearchEngine {
     /// key 含原始 query 文本 + 拼音开关（同文本同开关 ⇒ 同解析结果），
     /// revision 对不上即失效。CLI / Everything 走 `search()` 不经过这里。
     page_cache: parking_lot::Mutex<Option<CachedTop>>,
+    /// 会话增量缓存（P0-2）：`session_id → SessionEntry`，存该会话基查询的**全量无序结果集**。
+    /// 续写（`ab`→`abc`）命中时只在该集合上跑 fused 过滤 + 重排，不做全表扫描。
+    /// 条目上限见 `MAX_SESSIONS`（LRU 逐出）；revision 对不上即失效（USN 增量自动失效，
+    /// 无需在 `note_external_mutation` 里清）。内存上界 ≈ 条目数 × 全表 u32 集。
+    sessions: parking_lot::Mutex<HashMap<u64, SessionEntry>>,
+    /// 会话 LRU 时钟（`session_store` 每次 +1，逐出最小者）。
+    session_clock: AtomicU64,
+    /// 测试专用：miss 全量扫描次数（P0-2 验证复用是否真实发生；生产无用）。
+    #[cfg(test)]
+    pub(crate) session_full_scans: AtomicU64,
+    /// 测试专用：top 复用命中次数（免排序路径；生产无用）。
+    #[cfg(test)]
+    pub(crate) session_top_reused: AtomicU64,
+    /// 目录路径表缓存（P0-3）：`path:` 查询的 `build_dir_path_table` 按 revision 缓存，
+    /// 连续的 path: 查询（打字 refine 场景）只建一次表。revision 变化自动失效；
+    /// `Arc` 共享给 par 闭包零拷贝。内存约 目录数×平均路径长（600K 目录约数十 MB）。
+    dir_paths: parking_lot::Mutex<Option<(u64, std::sync::Arc<DirPathTable>)>>,
+}
+
+/// 会话基查询快照（P0-2）：未来续写命中的当且仅当——同 opts、同 revision、
+/// 基文本是新文本的前缀、除 needle 外解析结构相同、新 needle 覆盖旧 needle（见 `needles_narrow`）。
+#[derive(Debug, Clone)]
+struct SessionEntry {
+    query_text: String,
+    parsed: ParsedQuery,
+    allow_pinyin: bool,
+    pinyin_mode: PinyinMatchMode,
+    /// 基查询是否走了纯字面路径（`pin_res` 为空）。拼音匹配的单调性未经证明，
+    /// 含拼音的基查询不存（将来命中也要求新查询 `pin_res` 为空）。
+    pin_free: bool,
+    revision: u64,
+    /// 基查询的全量无序结果集（`Arc` 共享：restrict 只克隆 `Arc`，零拷贝 17MB）。
+    unordered: Arc<Vec<u32>>,
+    /// 基查询的已排序 top（`sort_top_k` 产物，深度 ≤ `PAGE_CACHE_TOP`），供 top 复用免排序。
+    top: Vec<u32>,
+    total: u32,
+    sort_by: SortField,
+    sort_desc: bool,
+    last_use: u64,
+}
+
+/// 会话命中快照（P0-2）：`session_restrict` 一次持锁取出，供 miss 分支免锁使用。
+struct SessionHit {
+    unordered: Arc<Vec<u32>>,
+    top: Vec<u32>,
+    total: u32,
+    sort_by: SortField,
+    sort_desc: bool,
+}
+
+/// 会话条目上限（P0-2）：4 会话 × 全表 u32 集。4.4M 条目约 17MB/集，上界 ~70MB；
+/// GUI 同时活跃的输入框通常 ≤2。超限逐出 `last_use` 最小者。
+const MAX_SESSIONS: usize = 4;
+
+/// 会话结构兼容（P0-2）：除名字 needle 载荷（`substring`/`name_terms`）与展示ivolatile
+/// （`sort_by`/`sort_desc`/`limit`）外，其余字段必须完全相同。排序/分页不影响结果集，
+/// 由命中后的重排/切片处理；needle 由 `needles_narrow` 另行判定。
+fn session_struct_compat(base: &ParsedQuery, new_q: &ParsedQuery) -> bool {
+    let mut a = base.clone();
+    let mut b = new_q.clone();
+    for q in [&mut a, &mut b] {
+        q.substring = None;
+        q.name_terms.clear();
+        q.sort_by = SortField::Name;
+        q.sort_desc = false;
+        q.limit = 0;
+    }
+    a == b
+}
+
+/// fused 扫描的 needle 提取（P0-2，与 `fused_scan_par` 同规则）：
+/// `name_terms` 非空用它（AND），否则 fallback `substring`。
+fn session_needles(q: &ParsedQuery) -> Vec<Vec<u8>> {
+    let raw: Vec<&str> = if !q.name_terms.is_empty() {
+        q.name_terms.iter().map(|s| s.as_str()).collect()
+    } else if let Some(ref s) = q.substring {
+        vec![s.as_str()]
+    } else {
+        Vec::new()
+    };
+    raw.into_iter()
+        .map(|s| {
+            if q.case_sensitive {
+                s.as_bytes().to_vec()
+            } else {
+                s.to_ascii_lowercase().into_bytes()
+            }
+        })
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+/// 会话复用的扫描条件（P0-2）：新查询必须走纯字面 fused 路径
+/// （`fused_scan_cand` 直接在基结果集上跑，与全量同语义）。
+/// pin/parent:/OR/ext/regex/glob/多 term 不兼容等情况一律回退全量（保守正确，
+/// 复用 miss 只是多一次全扫，不影响正确性）。
+fn session_scan_eligible(q: &ParsedQuery) -> bool {
+    if q.parent_path.is_some() || !q.or_branches.is_empty() {
+        return false;
+    }
+    if !q.ext_list.is_empty() || q.ext.is_some() {
+        return false;
+    }
+    if q.regex_pattern.is_some() || q.glob_pattern.is_some() {
+        return false;
+    }
+    match q.name_terms.len() {
+        0 => true,
+        1 => q
+            .name_terms
+            .first()
+            .map(|t| Some(t.as_str()) == q.substring.as_deref())
+            .unwrap_or(true),
+        _ => true,
+    }
+}
+
+/// 单条目 needle 命中判定（P0-2 top 复用）：与 fused 字面路径同语义
+/// （大小写规则一致）。调用方已保证 filters 相同（`session_struct_compat`）
+/// 且同 revision（数据未变），此处只校验名字 needle（AND）+ 存活。
+/// `finders` 由调用方按 `session_needles` 预编译（`memmem::Finder` 借 needle）。
+fn id_matches_session_needles(
+    store: &IndexStore,
+    idx: u32,
+    finders: &[memmem::Finder],
+    case_sensitive: bool,
+) -> bool {
+    let Some(e) = store.entries.get(idx as usize) else {
+        return false;
+    };
+    if e.is_deleted() {
+        return false;
+    }
+    if finders.is_empty() {
+        return true;
+    }
+    let raw = store.name_bytes(e);
+    let nb: Vec<u8> = if case_sensitive {
+        raw.to_vec()
+    } else {
+        raw.iter().map(|b| b.to_ascii_lowercase()).collect()
+    };
+    finders.iter().all(|f| f.find(&nb).is_some())
+}
+
+/// needle 收窄判定（P0-2）：旧 needle 必须每条都被某条新 needle 包含
+/// （AND 语义下新结果集 ⊆ 旧结果集）。都为空 ⇒ 同集合（文本不同但解析 needle 相同，
+/// 如大小写/空白差异），允许复用（过滤即恒等）。
+fn needles_narrow(base: &ParsedQuery, new_q: &ParsedQuery) -> bool {
+    let old_ns = session_needles(base);
+    if old_ns.is_empty() {
+        return true;
+    }
+    let new_ns = session_needles(new_q);
+    if new_ns.is_empty() {
+        return false;
+    }
+    old_ns.iter().all(|o| {
+        new_ns.iter().any(|n| {
+            n.len() >= o.len()
+                && memmem::find(n, o).is_some()
+        })
+    })
 }
 
 /// 分页缓存条目：已排序的 top-K（K 见 `PAGE_CACHE_TOP`）+ 总数。
@@ -247,7 +410,147 @@ impl SearchEngine {
             wal_flushed: AtomicUsize::new(0),
             revision: AtomicU64::new(0),
             page_cache: parking_lot::Mutex::new(None),
+            sessions: parking_lot::Mutex::new(HashMap::new()),
+            session_clock: AtomicU64::new(0),
+            #[cfg(test)]
+            session_full_scans: AtomicU64::new(0),
+            #[cfg(test)]
+            session_top_reused: AtomicU64::new(0),
+            dir_paths: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// 目录路径表（P0-3）：`path:` 查询复用按 revision 缓存的表，不再每次现建。
+    /// unix 卷不建表（`path_full_lower_with_table` 的 unix 分支根本不查表）。
+    /// 非 `path:` 查询不调用（零开销）。
+    /// 逃生开关：`FINDX2_NO_DIR_TABLE_CACHE=1` 时永远现建（回退旧行为；诊断/对比用）。
+    fn dir_path_table_cached(
+        &self,
+        store: &IndexStore,
+        rev: u64,
+    ) -> Option<std::sync::Arc<DirPathTable>> {
+        if std::env::var("FINDX2_NO_DIR_TABLE_CACHE").as_deref() == Ok("1") {
+            return None;
+        }
+        if store.volumes.iter().any(|v| v.is_unix()) {
+            return None;
+        }
+        let mut g = self.dir_paths.lock();
+        if let Some((tag, table)) = g.as_ref() {
+            if *tag == rev {
+                return Some(table.clone());
+            }
+        }
+        let table = std::sync::Arc::new(build_dir_path_table(store));
+        *g = Some((rev, table.clone()));
+        Some(table)
+    }
+
+    /// 会话探针（P0-2）：命中返回基查询快照（`Arc` 集 + 已排序 top，无拷贝大数据）。
+    /// 未命中（无条目/opts 变化/revision 变化/非前缀/结构不兼容/needle 未收窄/任一方拼音）
+    /// 返回 `None`，调用方走全量扫描。只持锁做判定 + 克隆 `Arc`/小 top，不做扫描。
+    fn session_restrict(
+        &self,
+        session: Option<u64>,
+        _query_text: &str,
+        q: &ParsedQuery,
+        opt: &SearchOptions,
+        rev: u64,
+        pin_empty: bool,
+    ) -> Option<SessionHit> {
+        let sid = session?;
+        if sid == 0 || !pin_empty {
+            return None;
+        }
+        // 扫描路径一致性：会话命中跑 fused_scan_cand，要求新查询本身走纯字面 fused
+        //（parent:/OR/ext/regex/glob 不兼容，直接回退全量）。
+        if !session_scan_eligible(q) {
+            return None;
+        }
+        let mut sessions = self.sessions.lock();
+        let e = sessions.get_mut(&sid)?;
+        if e.allow_pinyin != opt.allow_pinyin
+            || e.pinyin_mode != opt.pinyin_match_mode
+            || !e.pin_free
+            || e.revision != rev
+        {
+            return None;
+        }
+        // 注：刻意不用文本前缀做门控——修饰符前置语法下（`sort:size:desc noise_…`），
+        // 文本前缀 ≠ 语义前缀（排序/过滤器变化时文本必然不延续）。soundness 只由
+        // `session_struct_compat`（除 needle 外全等）+ `needles_narrow`（AND 收窄 ⇒ 子集）保证；
+        // 同文本同 revision 走 page_cache，revision 变了则上面的 rev 检查已拦。
+        if !session_struct_compat(&e.parsed, q) || !needles_narrow(&e.parsed, q) {
+            return None;
+        }
+        e.last_use = self.session_clock.fetch_add(1, Ordering::Relaxed);
+        Some(SessionHit {
+            unordered: e.unordered.clone(),
+            top: e.top.clone(),
+            total: e.total,
+            sort_by: e.sort_by,
+            sort_desc: e.sort_desc,
+        })
+    }
+
+    /// 会话基刷新（P0-2）：miss 扫描后，把本次结果集存为该会话的新基
+    /// （续写链越走集合越小；`unordered` 以 `Arc` 存入，调用方 move，无拷贝）。
+    /// 含拼音/OR/parent: 的查询不存（它们服务不了未来的复用）。
+    /// `top`/`total` 存本次已排序 top（供下一次 top 复用免排序；深度不足时自动回退重排）。
+    #[allow(clippy::too_many_arguments)]
+    fn session_store(
+        &self,
+        session: Option<u64>,
+        query_text: &str,
+        q: &ParsedQuery,
+        opt: &SearchOptions,
+        rev: u64,
+        pin_empty: bool,
+        unordered: Arc<Vec<u32>>,
+        top: Vec<u32>,
+        total: u32,
+    ) {
+        let sid = match session {
+            Some(s) if s != 0 => s,
+            _ => return,
+        };
+        if !pin_empty || !q.or_branches.is_empty() || q.parent_path.is_some() {
+            return;
+        }
+        let mut sessions = self.sessions.lock();
+        if !sessions.contains_key(&sid) && sessions.len() >= MAX_SESSIONS {
+            // LRU 逐出最久未用者。
+            if let Some(victim) = sessions
+                .iter()
+                .min_by_key(|(_, e)| e.last_use)
+                .map(|(k, _)| *k)
+            {
+                sessions.remove(&victim);
+            }
+        }
+        let last_use = self.session_clock.fetch_add(1, Ordering::Relaxed);
+        sessions.insert(
+            sid,
+            SessionEntry {
+                query_text: query_text.to_string(),
+                parsed: q.clone(),
+                allow_pinyin: opt.allow_pinyin,
+                pinyin_mode: opt.pinyin_match_mode,
+                pin_free: true,
+                revision: rev,
+                unordered,
+                top,
+                total,
+                sort_by: q.sort_by,
+                sort_desc: q.sort_desc,
+                last_use,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_debug_len(&self, sid: u64) -> Option<usize> {
+        self.sessions.lock().get(&sid).map(|e| e.unordered.len())
     }
 
     /// 索引变更计数（见字段文档）。service 经 `index_store_mut()` 直接改索引后，
@@ -440,7 +743,14 @@ impl SearchEngine {
     ///   Everything 左下角显示的就是这个数；查询 `android` 全盘可能 8M+。
     pub fn search(&self, q: &ParsedQuery, opt: &SearchOptions) -> Result<(Vec<SearchHit>, u32)> {
         let store = self.store.read();
-        Self::search_inner(&store, q, opt, &self.metadata_overlay)
+        let rev = self.revision.load(Ordering::Relaxed);
+        // P0-3：`path:` 查询复用缓存表（非 path: 查询零开销，见 `dir_path_table_cached`）。
+        let dir_table = if q.path_match.is_some() {
+            self.dir_path_table_cached(&store, rev)
+        } else {
+            None
+        };
+        Self::search_inner(&store, q, opt, &self.metadata_overlay, None, dir_table.as_deref())
     }
 
     /// 分页搜索（GUI 无限滚动 / IPC 分页用）。
@@ -455,6 +765,18 @@ impl SearchEngine {
     /// `query_text` 必须与 `q` 的来源一致（service 传收到的原始串），用作缓存 key；
     /// 同文本同开关 ⇒ 同解析结果（parse 确定性），revision 保证索引未变。
     /// `offset` 越界 → 空页（`total` 照常返回）。
+    ///
+    /// `cancel`（P0-1）：`Some(&AtomicBool)` 时扫描中每 4096 条查一次，置位即
+    /// 以 `Err(Error::Cancelled)` 提前返回；`None` = 不可取消。缓存命中路径不查
+    /// （已是纯内存切片，无需中止）；miss 路径在扫描后、排序前、构页前各查一次，
+    /// 保证已置位时不做无用功。
+    ///
+    /// `session`（P0-2）：`Some(id)`（id != 0）时，同会话语义续写
+    /// （除 needle 外结构相同 + needle 收窄 ⇒ 新结果集 ⊆ 基结果集）
+    /// 只在基结果集上跑 fused 计数扫描 + top 复用，不做全表扫描；
+    /// miss 全量扫描后把结果集存为新基。`None`/`Some(0)` = 无会话（现状行为）。
+    /// 会话可复用的查询限纯字面 fused 路径（pin/parent:/OR/ext/regex/glob 回退全量）。
+    /// 注：门控是解析结构而非文本前缀（修饰符前置语法下文本前缀 ≠ 语义前缀）。
     pub fn search_paged(
         &self,
         query_text: &str,
@@ -462,6 +784,8 @@ impl SearchEngine {
         opt: &SearchOptions,
         offset: usize,
         limit: usize,
+        cancel: Option<&AtomicBool>,
+        session: Option<u64>,
     ) -> Result<(Vec<SearchHit>, u32)> {
         // pin matcher 构建（与 search_inner 同样的一次性编译，下游扫描/高亮复用）。
         #[cfg(feature = "pinyin")]
@@ -502,27 +826,101 @@ impl SearchEngine {
             }
         };
 
-        let (top, total) = match cached {
-            Some(c) => (c.top, c.total),
+        let (top, total, fresh_scan) = match cached {
+            Some(c) => (c.top, c.total, false),
             None => {
                 // miss：读锁下全量扫描 + 排到 K（K 覆盖将来翻页，见 CachedTop）。
                 // 读锁持有期间 writer 进不来，扫完再取 revision 打标签，
                 // 保证「数据 ⇒ 标签」的时序正确。
-                let unordered = if q.parent_path.is_some() {
-                    match self.direct_parent_candidates(&store, q) {
-                        Some(ids) => ids,
-                        None => Self::search_unordered(&store, &self.metadata_overlay, q, opt, pin_res_ref)?,
-                    }
+                //
+                // P0-2 会话增量：续写命中时在基结果集上跑 fused 计数扫描（exact total，
+                // 无排序），再尝试 top 复用（旧 top 按 needle 过滤，覆盖本页即免 sort）；
+                // 任一条件不满足回退全量 + 重排。parent: 查询不进会话。
+                let pin_empty = pin_res_ref.is_empty();
+                let sess_hit = if q.parent_path.is_none() {
+                    self.session_restrict(session, query_text, q, opt, rev_now, pin_empty)
                 } else {
-                    Self::search_unordered(&store, &self.metadata_overlay, q, opt, pin_res_ref)?
+                    None
                 };
+                // P0-3：`path:` 查询复用按 revision 缓存的目录表（只建一次；
+                // 非 path: 查询不进这里，零开销；SMALL_HITS 小路也用此表，免逐条回溯）。
+                let dir_table = if q.path_match.is_some() {
+                    self.dir_path_table_cached(&store, rev_now)
+                } else {
+                    None
+                };
+                let dir_table_ref = dir_table.as_deref();
+                // unordered 全集（Arc）：会话命中=基集（零拷贝）；否则全量扫描。
+                // parent: 走直接候选（Vec 转 Arc，一次 move，无拷贝）。
+                let unordered: Arc<Vec<u32>> = if q.parent_path.is_some() {
+                    match self.direct_parent_candidates(&store, q) {
+                        Some(ids) => Arc::new(ids),
+                        None => Arc::new(Self::search_unordered(&store, &self.metadata_overlay, q, opt, pin_res_ref, cancel, dir_table_ref)?),
+                    }
+                } else if let Some(ref hit) = sess_hit {
+                    hit.unordered.clone()
+                } else {
+                    #[cfg(test)]
+                    self.session_full_scans.fetch_add(1, Ordering::Relaxed);
+                    Arc::new(Self::search_unordered(&store, &self.metadata_overlay, q, opt, pin_res_ref, cancel, dir_table_ref)?)
+                };
+                // 扫描后检查点：扫完才置位的取消，在排序前拦截（P0-1）。
+                if is_cancelled(cancel) {
+                    return Err(Error::Cancelled);
+                }
                 if lock_wait.as_millis() > 10 || cpu_started.elapsed().as_millis() > 100 {
                     crate::progress!("search_phase scan_lock_wait_ms={} scan_cpu_ms={}",lock_wait.as_millis(),cpu_started.elapsed().as_millis());
                 }
                 let tag = self.revision.load(Ordering::Relaxed);
-                let total = unordered.len() as u32;
-                let k = want_end.max(PAGE_CACHE_TOP).min(unordered.len());
-                let top = Self::sort_top_k(&store, &unordered, q, k);
+                // 会话命中：fused 计数扫描（exact total）+ top 复用免排序。
+                // 全量/parent 路径：走原逻辑（直接排序）。
+                let (top, total) = if let Some(hit) = sess_hit {
+                    let filtered = fused_scan_cand(&store, &self.metadata_overlay, q, hit.unordered.as_slice(), cancel)?;
+                    let total = filtered.len() as u32;
+                    // top 复用：排序相同且旧 top 按新 needle 过滤后覆盖本页。
+                    // 旧 top 与新结果同序（排序相同），过滤即新序子序列；
+                    // 覆盖 max(页尾, 总数) ⇒ 切片即真页（总数不足一页时 top_try 即全集）。
+                    let top = if q.sort_by == hit.sort_by && q.sort_desc == hit.sort_desc {
+                        let needle_bytes = session_needles(q);
+                        let finders: Vec<memmem::Finder> =
+                            needle_bytes.iter().map(|n| memmem::Finder::new(n)).collect();
+                        let top_try: Vec<u32> = hit
+                            .top
+                            .iter()
+                            .copied()
+                            .filter(|&idx| {
+                                id_matches_session_needles(&store, idx, &finders, q.case_sensitive)
+                            })
+                            .collect();
+                        if top_try.len() >= want_end.min(filtered.len()) {
+                            #[cfg(test)]
+                            self.session_top_reused.fetch_add(1, Ordering::Relaxed);
+                            top_try
+                        } else {
+                            let k = want_end.max(PAGE_CACHE_TOP).min(filtered.len());
+                            Self::sort_top_k(&store, &filtered, q, k)
+                        }
+                    } else {
+                        let k = want_end.max(PAGE_CACHE_TOP).min(filtered.len());
+                        Self::sort_top_k(&store, &filtered, q, k)
+                    };
+                    // P0-2：续写后刷新会话基（收窄集 + 新 top，下一次继续复用）。
+                    self.session_store(
+                        session, query_text, q, opt, tag, pin_empty,
+                        Arc::new(filtered), top.clone(), total,
+                    );
+                    (top, total)
+                } else {
+                    let total = unordered.len() as u32;
+                    let k = want_end.max(PAGE_CACHE_TOP).min(unordered.len());
+                    let top = Self::sort_top_k(&store, &unordered, q, k);
+                    // P0-2：miss 全量扫描后刷新会话基（续写链越走集合越小）。
+                    self.session_store(
+                        session, query_text, q, opt, tag, pin_empty,
+                        unordered.clone(), top.clone(), total,
+                    );
+                    (top, total)
+                };
                 drop(unordered);
                 let entry = CachedTop {
                     query_text: query_text.to_string(),
@@ -533,7 +931,7 @@ impl SearchEngine {
                     total,
                 };
                 *self.page_cache.lock() = Some(entry);
-                (top, total)
+                (top, total, true)
             }
         };
 
@@ -544,6 +942,11 @@ impl SearchEngine {
             top[offset..].iter().take(limit).copied().collect()
         };
         drop(top);
+        // 构页前检查点（仅新扫描）：缓存命中是纯内存切片，直接返回（已完成的工作不丢弃）；
+        // miss 路径排序完才置位的取消，在这里拦截，不做当页构建（P0-1）。
+        if fresh_scan && is_cancelled(cancel) {
+            return Err(Error::Cancelled);
+        }
         let page_cpu_started = std::time::Instant::now();
         let dbg_page = std::env::var("FINDX2_DEBUG_SEARCH").is_ok();
         let (out, _) = Self::build_hit_page(
@@ -566,6 +969,8 @@ impl SearchEngine {
         q: &ParsedQuery,
         opt: &SearchOptions,
         overlay: &MetaOverlay,
+        cancel: Option<&AtomicBool>,
+        dir_table: Option<&DirPathTable>,
     ) -> Result<(Vec<SearchHit>, u32)> {
         let dbg = std::env::var("FINDX2_DEBUG_SEARCH").is_ok();
         let needle_for_log: String = q.substring.clone().unwrap_or_default();
@@ -597,7 +1002,7 @@ impl SearchEngine {
         let pin_res_ref: &PinList<'_> = &[];
 
         let t_flat = std::time::Instant::now();
-        let mut hits = Self::search_unordered(store, overlay, q, opt, pin_res_ref)?;
+        let mut hits = Self::search_unordered(store, overlay, q, opt, pin_res_ref, cancel, dir_table)?;
         let flat_us = t_flat.elapsed().as_micros();
         let total = hits.len() as u32;
         let t_fin = std::time::Instant::now();
@@ -625,11 +1030,13 @@ impl SearchEngine {
         q: &ParsedQuery,
         opt: &SearchOptions,
         pin_res: &PinList<'_>,
+        cancel: Option<&AtomicBool>,
+        dir_table: Option<&DirPathTable>,
     ) -> Result<Vec<u32>> {
         if !q.or_branches.is_empty() {
-            Self::search_or_union(store, overlay, q, opt)
+            Self::search_or_union(store, overlay, q, opt, cancel, dir_table)
         } else {
-            Self::search_flat_indices(store, overlay, q, opt, pin_res)
+            Self::search_flat_indices(store, overlay, q, opt, pin_res, cancel, dir_table)
         }
     }
 
@@ -640,6 +1047,8 @@ impl SearchEngine {
         overlay: &MetaOverlay,
         q: &ParsedQuery,
         opt: &SearchOptions,
+        cancel: Option<&AtomicBool>,
+        dir_table: Option<&DirPathTable>,
     ) -> Result<Vec<u32>> {
         // OR 分支各自独立（只读共享 store/overlay），并行扫描后 union。
         // 语义：union 后走同一排序；分支间相对顺序本来就不保证（HashSet 去重）。
@@ -671,7 +1080,7 @@ impl SearchEngine {
                 let m: &PinList<'_> = branch_matchers[i].as_slice();
                 #[cfg(not(feature = "pinyin"))]
                 let m: &PinList<'_> = &[];
-                Self::search_flat_indices(store, overlay, &branch_qs[i], opt, m)
+                Self::search_flat_indices(store, overlay, &branch_qs[i], opt, m, cancel, dir_table)
             })
             .collect::<Result<Vec<_>>>()?;
         let mut uni: HashSet<u32> = HashSet::new();
@@ -694,6 +1103,8 @@ impl SearchEngine {
         q: &ParsedQuery,
         opt: &SearchOptions,
         pin_res: &PinList<'_>,
+        cancel: Option<&AtomicBool>,
+        dir_table: Option<&DirPathTable>,
     ) -> Result<Vec<u32>> {
         // === Fast path: ext 全集 + 普通子串/无名匹配 + 非 regex/glob
         // 把 deleted/dir/file/attr/size/time/name 6+ 次全表 retain 融成 1 次并行 filter，
@@ -742,24 +1153,24 @@ impl SearchEngine {
                 // 拼音候选剪枝：lita 匹配要求名字含 needle 字面（trigram 可检）
                 // 或含拼音字符（cjk_names 可检），二者必居其一 → 候选是命中超集。
                 let cands = pinyin_candidate_ids(store, q);
-                fused_scan_pinyin(store, overlay, q, pin_res, cands)
+                fused_scan_pinyin(store, overlay, q, pin_res, cands, cancel)?
             }
             #[cfg(not(feature = "pinyin"))]
             {
                 let _ = pin_res;
-                fused_scan(store, overlay, q)
+                fused_scan(store, overlay, q, cancel)?
             }
         } else if no_ext_filter && no_complex_name && name_terms_compatible {
             // trigram 剪枝：字面 case-insensitive 查询先求交倒排候选，命中稀疏时直接省掉全表扫描。
             match trigram_candidate_ids(store, q) {
-                Some(ids) => fused_scan_cand(store, overlay, q, ids),
-                None => fused_scan(store, overlay, q),
+                Some(ids) => fused_scan_cand(store, overlay, q, &ids, cancel)?,
+                None => fused_scan(store, overlay, q, cancel)?,
             }
         } else {
             // === Slow / 复杂 path：属性过滤单遍并行（slow_attr_candidates，
             // 替代原来的 deleted/dir/size/time/attrib 6 次串行全表 retain），
             // 之后 name_match_phase（regex/glob/pinyin/name_terms）与 post 链语义不变。
-            let cand = slow_attr_candidates(store, overlay, q);
+            let cand = slow_attr_candidates(store, overlay, q, cancel)?;
 
             if !q.name_terms.is_empty() {
                 name_match_all_terms(store, q, opt, cand, &q.name_terms)?
@@ -821,22 +1232,37 @@ impl SearchEngine {
                 const SMALL_HITS_DIRECT: usize = 50_000;
                 let unix_store = store.volumes.iter().any(|v| v.is_unix());
                 if unix_store || hits.len() <= SMALL_HITS_DIRECT {
-                    // 空表：`path_full_lower_with_table` 的 Windows 分支对空表项回退
-                    // `resolve_dir_path_lower`（父链回溯），即朴素语义；unix 分支本就不查表。
-                    let empty_table = DirPathTable {
-                        buf: Vec::new(),
-                        ranges: Vec::new(),
+                    // 小命中：用缓存表查路径（P0-3），无表（unix/极小库）才回退空表语义。
+                    // `path_full_lower_with_table` 对缺表项自动回退父链回溯，语义不变。
+                    let empty_table;
+                    let table: &DirPathTable = match dir_table {
+                        Some(t) => t,
+                        None => {
+                            empty_table = DirPathTable {
+                                buf: Vec::new(),
+                                ranges: Vec::new(),
+                            };
+                            &empty_table
+                        }
                     };
                     hits.retain(|&idx| {
                         memmem::find(
-                            &path_full_lower_with_table(store, &empty_table, idx as usize, q.nowfn),
+                            &path_full_lower_with_table(store, table, idx as usize, q.nowfn),
                             nb,
                         )
                         .is_some()
                     });
                 } else {
-                    let dir_paths = build_dir_path_table(store);
-                    match path_candidate_ids(store, &dir_paths, nb) {
+                    // 大命中两段式：表由调用方按 revision 缓存传入（P0-3），缺失才现建。
+                    let owned_table;
+                    let dir_paths: &DirPathTable = match dir_table {
+                        Some(t) => t,
+                        None => {
+                            owned_table = build_dir_path_table(store);
+                            &owned_table
+                        }
+                    };
+                    match path_candidate_ids(store, dir_paths, nb, cancel)? {
                         Some(cands) => {
                             hits.retain(|&idx| {
                                 // 精确命中免拼路径；疑似命中才做第二段校验。
@@ -845,7 +1271,7 @@ impl SearchEngine {
                                         && memmem::find(
                                             &path_full_lower_with_table(
                                                 store,
-                                                &dir_paths,
+                                                dir_paths,
                                                 idx as usize,
                                                 q.nowfn,
                                             ),
@@ -859,7 +1285,7 @@ impl SearchEngine {
                             hits.retain(|&idx| {
                                 let pb = path_full_lower_with_table(
                                     store,
-                                    &dir_paths,
+                                    dir_paths,
                                     idx as usize,
                                     q.nowfn,
                                 );
@@ -1654,6 +2080,15 @@ impl<'a> CowBytes<'a> {
     }
 }
 
+/// 查询取消检查（P0-1）：service 为每个 `Search{request_id != 0}` 配一个 flag，
+/// `SearchCancel` 置位。扫描热循环每 4096 条查一次（relaxed + 可预测分支，开销忽略），
+/// 置位后 `try_fold` 短路，中止延迟约一个 chunk（亚毫秒~毫秒级）。
+/// `None` = 不可取消（CLI / Everything 老路径零行为变化）。
+#[inline]
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+}
+
 /// 融合扫：单次 par_iter 把 `0..N` 范围 + deleted/dir/file/属性/大小/时间/名字子串
 /// 的过滤条件全部一次过做完，避免 6+ 次全表 `retain` 各自跑 cache miss。
 ///
@@ -1732,9 +2167,14 @@ fn build_pinyin_matcher(needle: &str) -> Result<IbRegex<'_>> {
         .map_err(|e| crate::Error::Query(format!("拼音 matcher 构建失败: {e}")))
 }
 
-fn fused_scan(store: &IndexStore, overlay: &MetaOverlay, q: &ParsedQuery) -> Vec<u32> {
+fn fused_scan(
+    store: &IndexStore,
+    overlay: &MetaOverlay,
+    q: &ParsedQuery,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<u32>> {
     let n = store.entries.len() as u32;
-    fused_scan_par(store, overlay, q, (0..n).into_par_iter())
+    fused_scan_par(store, overlay, q, (0..n).into_par_iter(), cancel)
 }
 
 /// 候选集版本：trigram 剪枝后只在候选 idx 上跑同一套融合过滤。
@@ -1743,9 +2183,10 @@ fn fused_scan_cand(
     store: &IndexStore,
     overlay: &MetaOverlay,
     q: &ParsedQuery,
-    ids: Vec<u32>,
-) -> Vec<u32> {
-    fused_scan_par(store, overlay, q, ids.into_par_iter())
+    ids: &[u32],
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<u32>> {
+    fused_scan_par(store, overlay, q, ids.into_par_iter().copied(), cancel)
 }
 
 /// trigram 剪枝候选（含 pending 并入）。返回 `None` 表示不适合剪枝，应回退全表扫描。
@@ -1869,7 +2310,8 @@ fn fused_scan_par<PI>(
     overlay: &MetaOverlay,
     q: &ParsedQuery,
     ids: PI,
-) -> Vec<u32>
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<u32>>
 where
     PI: rayon::iter::IndexedParallelIterator<Item = u32>,
 {
@@ -1934,65 +2376,69 @@ where
         0
     };
     let result = ids
-        .fold(Vec::new, |mut acc, idx| {
+        .try_fold(Vec::new as fn() -> Vec<u32>, |mut acc, idx| -> Result<Vec<u32>> {
+            // 取消检查：每 4096 条一次（P0-1），分支可预测，热循环开销忽略。
+            if idx & 0xFFF == 0 && is_cancelled(cancel) {
+                return Err(Error::Cancelled);
+            }
             let e = unsafe { store.entries.get_unchecked(idx as usize) };
             // 1) deleted（最常 false，先剪枝）
             if e.is_deleted() {
-                return acc;
+                return Ok(acc);
             }
             if check_deleted_bm && store.deleted.contains(idx) {
-                return acc;
+                return Ok(acc);
             }
             // 2) dir/file 类型
             let is_dir = e.is_dir_entry();
             if only_files && is_dir {
-                return acc;
+                return Ok(acc);
             }
             if only_dirs && !is_dir {
-                return acc;
+                return Ok(acc);
             }
             // 3) attribute mask
             if attrib_must != 0 {
                 let a = e.attrs & 0xff;
                 if (a & attrib_must) != attrib_must {
-                    return acc;
+                    return Ok(acc);
                 }
             }
             // 4) 元数据：size 仅 metadata_ready 后可信；单条未验证位在全局位翻回后仍然排除。
             if any_size_filter {
-                if e.metadata_unverified() { return acc; }
+                if e.metadata_unverified() { return Ok(acc); }
                 if let Some(v) = size_min {
                     if e.size < v {
-                        return acc;
+                        return Ok(acc);
                     }
                 }
                 if let Some(v) = size_max {
                     if e.size > v {
-                        return acc;
+                        return Ok(acc);
                     }
                 }
             }
             if any_time_filter {
-                if e.metadata_unverified() { return acc; }
+                if e.metadata_unverified() { return Ok(acc); }
                 let (_, mt, ct) = entry_meta_for_filter(overlay, store, idx);
                 if let Some(v) = mtime_min {
                     if mt < v {
-                        return acc;
+                        return Ok(acc);
                     }
                 }
                 if let Some(v) = mtime_max {
                     if mt > v {
-                        return acc;
+                        return Ok(acc);
                     }
                 }
                 if let Some(v) = ctime_min {
                     if ct < v {
-                        return acc;
+                        return Ok(acc);
                     }
                 }
                 if let Some(v) = ctime_max {
                     if ct > v {
-                        return acc;
+                        return Ok(acc);
                     }
                 }
             }
@@ -2009,20 +2455,20 @@ where
                 };
                 for f in finders.iter() {
                     if f.find(nb).is_none() {
-                        return acc;
+                        return Ok(acc);
                     }
                 }
             }
             acc.push(idx);
-            acc
+            Ok(acc)
         })
-        .reduce(Vec::new, |mut a, mut b| {
+        .try_reduce(Vec::new as fn() -> Vec<u32>, |mut a, mut b| {
             if a.len() < b.len() {
                 std::mem::swap(&mut a, &mut b);
             }
             a.extend_from_slice(&b);
-            a
-        });
+            Ok(a)
+        })?;
     if _dbg {
         eprintln!(
             "[fused_scan] entries={} hits={} threads={} took={:.2}ms needles={}",
@@ -2033,7 +2479,7 @@ where
             finders.len()
         );
     }
-    result
+    Ok(result)
 }
 
 /// 拼音版全表融合扫描：与 `fused_scan` 同语义（dir/file/attr/size/time/AND-needles），
@@ -2055,16 +2501,17 @@ fn fused_scan_pinyin(
     q: &ParsedQuery,
     pin_res: &[IbRegex<'_>],
     cands: Option<Vec<u32>>,
-) -> Vec<u32> {
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<u32>> {
     debug_assert!(
         !pin_res.is_empty(),
         "fused_scan_pinyin 调用方必须保证 pin_res 非空"
     );
     match cands {
-        Some(ids) => fused_scan_pinyin_par(store, overlay, q, pin_res, ids.into_par_iter()),
+        Some(ids) => fused_scan_pinyin_par(store, overlay, q, pin_res, ids.into_par_iter(), cancel),
         None => {
             let n = store.entries.len() as u32;
-            fused_scan_pinyin_par(store, overlay, q, pin_res, (0..n).into_par_iter())
+            fused_scan_pinyin_par(store, overlay, q, pin_res, (0..n).into_par_iter(), cancel)
         }
     }
 }
@@ -2076,7 +2523,8 @@ fn fused_scan_pinyin_par<PI>(
     q: &ParsedQuery,
     pin_res: &[IbRegex<'_>],
     ids: PI,
-) -> Vec<u32>
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<u32>>
 where
     PI: rayon::iter::IndexedParallelIterator<Item = u32>,
 {
@@ -2108,63 +2556,67 @@ where
     // 同一实例会在短 haystack + 大并发下自旋竞争（上游文档建议 per-thread clone）。
     // fold 的 identity 在每线程（及切分）调用一次，clone 数有界；匹配语义与共享引用一致。
     let result = ids
-        .fold(
+        .try_fold(
             || (Vec::new(), pin_res.to_vec()),
-            |(mut acc, pin_local), idx| {
+            |(mut acc, pin_local), idx| -> Result<(Vec<u32>, Vec<IbRegex<'_>>)> {
+                // 取消检查（P0-1）：同 fused_scan_par，每 4096 条一次。
+                if idx & 0xFFF == 0 && is_cancelled(cancel) {
+                    return Err(Error::Cancelled);
+                }
                 let e = unsafe { store.entries.get_unchecked(idx as usize) };
                 if e.is_deleted() {
-                    return (acc, pin_local);
+                    return Ok((acc, pin_local));
                 }
                 if check_deleted_bm && store.deleted.contains(idx) {
-                    return (acc, pin_local);
+                    return Ok((acc, pin_local));
                 }
                 let is_dir = e.is_dir_entry();
                 if only_files && is_dir {
-                    return (acc, pin_local);
+                    return Ok((acc, pin_local));
                 }
                 if only_dirs && !is_dir {
-                    return (acc, pin_local);
+                    return Ok((acc, pin_local));
                 }
                 if attrib_must != 0 {
                     let a = e.attrs & 0xff;
                     if (a & attrib_must) != attrib_must {
-                        return (acc, pin_local);
+                        return Ok((acc, pin_local));
                     }
                 }
                 if any_size_filter {
-                    if e.metadata_unverified() { return (acc, pin_local); }
+                    if e.metadata_unverified() { return Ok((acc, pin_local)); }
                     if let Some(v) = size_min {
                         if e.size < v {
-                            return (acc, pin_local);
+                            return Ok((acc, pin_local));
                         }
                     }
                     if let Some(v) = size_max {
                         if e.size > v {
-                            return (acc, pin_local);
+                            return Ok((acc, pin_local));
                         }
                     }
                 }
                 if any_time_filter {
-                    if e.metadata_unverified() { return (acc, pin_local); }
+                    if e.metadata_unverified() { return Ok((acc, pin_local)); }
                     let (_, mt, ct) = entry_meta_for_filter(overlay, store, idx);
                     if let Some(v) = mtime_min {
                         if mt < v {
-                            return (acc, pin_local);
+                            return Ok((acc, pin_local));
                         }
                     }
                     if let Some(v) = mtime_max {
                         if mt > v {
-                            return (acc, pin_local);
+                            return Ok((acc, pin_local));
                         }
                     }
                     if let Some(v) = ctime_min {
                         if ct < v {
-                            return (acc, pin_local);
+                            return Ok((acc, pin_local));
                         }
                     }
                     if let Some(v) = ctime_max {
                         if ct > v {
-                            return (acc, pin_local);
+                            return Ok((acc, pin_local));
                         }
                     }
                 }
@@ -2176,23 +2628,23 @@ where
                 // 用本线程 clone 的 matcher（pin_local），不碰共享实例的内部 cache pool。
                 for re in pin_local.iter() {
                     if re.find(name_str).is_none() {
-                        return (acc, pin_local);
+                        return Ok((acc, pin_local));
                     }
                 }
                 acc.push(idx);
-                (acc, pin_local)
+                Ok((acc, pin_local))
             },
         )
-        .reduce(
+        .try_reduce(
             || (Vec::new(), pin_res.to_vec()),
             |(mut a, pa), (mut b, _pb)| {
                 if a.len() < b.len() {
                     std::mem::swap(&mut a, &mut b);
                 }
                 a.extend_from_slice(&b);
-                (a, pa)
+                Ok((a, pa))
             },
-        )
+        )?
         .0;
     if _dbg {
         eprintln!(
@@ -2204,7 +2656,7 @@ where
             pin_res.len()
         );
     }
-    result
+    Ok(result)
 }
 
 /// 文件名最后一段后缀（小写 ASCII）；无 `.` 或空后缀则 `None`。
@@ -2257,7 +2709,12 @@ fn ext_union_ids(store: &IndexStore, ext_src: &[String]) -> Option<Vec<u32>> {
 /// 语义与原 retain 链逐条对齐（含 `metadata_ready` 门控 size、overlay 时间源、
 /// deleted 位图必查）。结果顺序：ext 起点保持位图迭代序，全表起点保持下标升序
 /// （par filter / fold+reduce 保序），与原来一致。
-fn slow_attr_candidates(store: &IndexStore, overlay: &MetaOverlay, q: &ParsedQuery) -> Vec<u32> {
+fn slow_attr_candidates(
+    store: &IndexStore,
+    overlay: &MetaOverlay,
+    q: &ParsedQuery,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<u32>> {
     let ext_src: Vec<String> = if !q.ext_list.is_empty() {
         q.ext_list.clone()
     } else if let Some(ref e) = q.ext {
@@ -2345,27 +2802,47 @@ fn slow_attr_candidates(store: &IndexStore, overlay: &MetaOverlay, q: &ParsedQue
     } else {
         Some(ext_union_ids(store, &ext_src).unwrap_or_default())
     };
-    match base {
-        Some(ids) => ids.into_par_iter().filter(|&idx| pred(idx)).collect(),
+    Ok(match base {
+        Some(ids) => ids
+            .into_par_iter()
+            .try_fold(Vec::new as fn() -> Vec<u32>, |mut a, idx| -> Result<Vec<u32>> {
+                if idx & 0xFFF == 0 && is_cancelled(cancel) {
+                    return Err(Error::Cancelled);
+                }
+                if pred(idx) {
+                    a.push(idx);
+                }
+                Ok(a)
+            })
+            .try_reduce(Vec::new as fn() -> Vec<u32>, |mut a, mut b| {
+                if a.len() < b.len() {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                a.extend_from_slice(&b);
+                Ok(a)
+            })?,
         None => {
             let n = store.entries.len() as u32;
             (0..n)
                 .into_par_iter()
-                .fold(Vec::new, |mut a, idx| {
+                .try_fold(Vec::new as fn() -> Vec<u32>, |mut a, idx| -> Result<Vec<u32>> {
+                    if idx & 0xFFF == 0 && is_cancelled(cancel) {
+                        return Err(Error::Cancelled);
+                    }
                     if pred(idx) {
                         a.push(idx);
                     }
-                    a
+                    Ok(a)
                 })
-                .reduce(Vec::new, |mut a, mut b| {
+                .try_reduce(Vec::new as fn() -> Vec<u32>, |mut a, mut b| {
                     if a.len() < b.len() {
                         std::mem::swap(&mut a, &mut b);
                     }
                     a.extend_from_slice(&b);
-                    a
-                })
+                    Ok(a)
+                })?
         }
-    }
+    })
 }
 
 fn path_matches_drive_prefix(
@@ -2617,10 +3094,11 @@ fn path_candidate_ids(
     store: &IndexStore,
     table: &DirPathTable,
     needle: &[u8],
-) -> Option<PathCandidates> {
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<PathCandidates>> {
     // 单字节 needle 命中面太大，候选收不紧，走查表逐条校验更省内存。
     if needle.len() < 2 {
-        return None;
+        return Ok(None);
     }
     // ⚠️ Unix 卷回退全量精确校验：unix 的 haystack 是 `root_prefix + dir_path + / + name`
     // （见 `path_full_lower_with_table` 的 unix 分支），而目录表只含 dir_path 部分——
@@ -2628,7 +3106,7 @@ fn path_candidate_ids(
     // 不被变体覆盖，候选集会漏报。unix 库规模小、性能非热点，正确性优先直接回退。
     // （回归 `unix_path_syntax_with_pinyin` 曾抓到此处漏报全部命中。）
     if store.volumes.iter().any(|v| v.is_unix()) {
-        return None;
+        return Ok(None);
     }
 
     // needle 小写化由调用方保证（`q.path_match` 已是小写）；这里不再重复转换。
@@ -2774,7 +3252,7 @@ fn path_candidate_ids(
                 None => acc = Some(bm),
             }
         }
-        let acc = acc?;
+        let Some(acc) = acc else { return Ok(None) };
         // 候选太密（如 "the" / "ing" 高频 trigram）：位图逐条 contains 的判定开销
         // 省不过几个 memmem，回退全库更直接。
         if acc.len() as usize > store.entries.len() / 3 {
@@ -2792,9 +3270,13 @@ fn path_candidate_ids(
     let n = store.entries.len();
     let (mut exact_v, mut check_v): (Vec<u32>, Vec<u32>) = (0..n as u32)
         .into_par_iter()
-        .fold(
+        .try_fold(
             || (Vec::new(), Vec::new()),
-            |mut acc, idx| {
+            |mut acc, idx| -> Result<(Vec<u32>, Vec<u32>)> {
+                // 取消检查（P0-1）：path: 候选构建是全表 par 扫描，同 fused 处理。
+                if idx & 0xFFF == 0 && is_cancelled(cancel) {
+                    return Err(Error::Cancelled);
+                }
                 let e = &store.entries[idx as usize];
                 // 名字侧：tri 位图不含此条目 → 名字必不含任何变体，跳过小写化+比对。
                 let in_tri = tri_union.as_ref().map_or(true, |bm| bm.contains(idx));
@@ -2804,7 +3286,7 @@ fn path_candidate_ids(
                     // needles[0] 恒为完整 needle：完整命中 → 精确；仅变体命中 → 待校验。
                     if memmem::find(nl.as_ref(), needle).is_some() {
                         acc.0.push(idx);
-                        return acc;
+                        return Ok(acc);
                     }
                     if needles
                         .iter()
@@ -2812,7 +3294,7 @@ fn path_candidate_ids(
                         .any(|nd| memmem::find(nl.as_ref(), nd).is_some())
                     {
                         acc.1.push(idx);
-                        return acc;
+                        return Ok(acc);
                     }
                 }
                 // 目录侧：祖先链判定。FULL → 精确；VARIANT → 待校验。
@@ -2827,10 +3309,10 @@ fn path_candidate_ids(
                     2 => acc.1.push(idx),
                     _ => {}
                 }
-                acc
+                Ok(acc)
             },
         )
-        .reduce(
+        .try_reduce(
             || (Vec::new(), Vec::new()),
             |mut a, mut b| {
                 if a.0.len() < b.0.len() {
@@ -2841,18 +3323,18 @@ fn path_candidate_ids(
                     std::mem::swap(&mut a.1, &mut b.1);
                 }
                 a.1.extend_from_slice(&b.1);
-                a
+                Ok((a.0, a.1))
             },
-        );
+        )?;
 
     exact_v.sort_unstable();
     exact_v.dedup();
     check_v.sort_unstable();
     check_v.dedup();
-    Some(PathCandidates {
+    Ok(Some(PathCandidates {
         exact: exact_v.into_iter().collect(),
         check: check_v.into_iter().collect(),
-    })
+    }))
 }
 
 // Keep parent-only allocation/loops out of the ordinary query hot function.
@@ -3705,3 +4187,307 @@ mod directory_filter_memo_tests {
         compare(&s);
     }
 }
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use crate::index::IndexBuilder;
+    use crate::platform::RawEntry;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn big_engine(n: u32) -> SearchEngine {
+        let root = RawEntry {
+            file_id: 100,
+            file_id_128: None,
+            parent_id: 0,
+            name: " canc_root".into(),
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            attrs: 0x10,
+            is_dir: true,
+        };
+        let files: Vec<RawEntry> = (0..n)
+            .map(|i| RawEntry {
+                file_id: 10_000 + i as u64,
+                file_id_128: None,
+                parent_id: 100,
+                name: format!("noise_file_{i:08}.txt"),
+                size: (i % 4096) as u64,
+                mtime: i as u64,
+                ctime: 0,
+                attrs: 0,
+                is_dir: false,
+            })
+            .collect();
+        let store = IndexBuilder::new(b'C', 1, 2, 3)
+            .build_from_raw(files, vec![root], true)
+            .unwrap();
+        SearchEngine::new(store)
+    }
+
+    #[test]
+    fn preset_flag_aborts_before_any_work() {
+        let engine = big_engine(50_000);
+        let q = crate::QueryParser::parse("noise_file").unwrap();
+        let flag = AtomicBool::new(true);
+        let r = engine.search_paged("noise_file", &q, &SearchOptions::default(), 0, 10, Some(&flag), None);
+        assert!(matches!(r, Err(crate::Error::Cancelled)), "preset flag must abort: {r:?}");
+    }
+
+    #[test]
+    fn midflight_cancel_aborts_long_scan() {
+        // 50 万条 + 全表子串扫（约数十 ms；与 timing 敏感测试并行时保持轻量，1ms 后置位必命中扫描中段）。
+        let engine = big_engine(500_000);
+        // 对照：不取消时正常出结果（排除 builder/查询本身的问题；顺带预热 page_cache 给 text A）。
+        let qa = crate::QueryParser::parse("noise_file_0").unwrap();
+        let (hits, total) = engine
+            .search_paged("noise_file_0", &qa, &SearchOptions::default(), 0, 10, None, None)
+            .unwrap();
+        assert!(total > 0 && !hits.is_empty());
+        // 实战：换一个未缓存的 query（text B 也全表扫），扫描线程跑，2ms 后置位。
+        let qb = crate::QueryParser::parse("noise_file_01").unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let setter = flag.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            setter.store(true, Ordering::Relaxed);
+        });
+        let r = engine.search_paged("noise_file_01", &qb, &SearchOptions::default(), 0, 10, Some(&flag), None);
+        assert!(matches!(r, Err(crate::Error::Cancelled)), "mid-flight cancel must abort: total={total}");
+    }
+
+    #[test]
+    fn cancel_flag_ignores_completed_cache_hit() {
+        // 缓存命中是纯内存切片：即使置位也直接返回（语义：已完成的工作不丢弃）。
+        let engine = big_engine(50_000);
+        let q = crate::QueryParser::parse("noise_file").unwrap();
+        let (hits, _) = engine
+            .search_paged("noise_file", &q, &SearchOptions::default(), 0, 10, None, None)
+            .unwrap();
+        assert!(!hits.is_empty());
+        let flag = AtomicBool::new(true);
+        let (hits2, _) = engine
+            .search_paged("noise_file", &q, &SearchOptions::default(), 0, 10, Some(&flag), None)
+            .unwrap();
+        assert_eq!(hits.len(), hits2.len());
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::index::IndexBuilder;
+    use crate::platform::RawEntry;
+
+    fn sess_engine(n: u32) -> SearchEngine {
+        let root = RawEntry {
+            file_id: 100, file_id_128: None, parent_id: 0,
+            name: "sess_root".into(), size: 0, mtime: 0, ctime: 0,
+            attrs: 0x10, is_dir: true,
+        };
+        let files: Vec<RawEntry> = (0..n)
+            .map(|i| RawEntry {
+                file_id: 10_000 + i as u64, file_id_128: None, parent_id: 100,
+                name: format!("noise_file_{i:06}.txt"),
+                size: (i % 4096) as u64, mtime: i as u64, ctime: 0,
+                attrs: 0, is_dir: false,
+            })
+            .collect();
+        let store = IndexBuilder::new(b'C', 1, 2, 3)
+            .build_from_raw(files, vec![root], true)
+            .unwrap();
+        SearchEngine::new(store)
+    }
+
+    fn opt_no_pin() -> SearchOptions {
+        SearchOptions { allow_pinyin: false, ..Default::default() }
+    }
+
+    fn paged(engine: &SearchEngine, text: &str, session: Option<u64>) -> (Vec<u32>, u32) {
+        let q = crate::QueryParser::parse(text).unwrap();
+        let (hits, total) = engine
+            .search_paged(text, &q, &opt_no_pin(), 0, 10_000, None, session)
+            .unwrap();
+        (hits.into_iter().map(|h| h.entry_idx).collect(), total)
+    }
+
+    #[test]
+    fn struct_compat_ignores_needle_sort_limit_only() {
+        let mut a = ParsedQuery::default();
+        a.substring = Some("ab".into());
+        let mut b = ParsedQuery::default();
+        b.substring = Some("abc".into());
+        b.sort_desc = true;
+        b.limit = 5;
+        assert!(session_struct_compat(&a, &b));
+        // name_terms 同样视为 needle 载荷。
+        let mut c = ParsedQuery::default();
+        c.name_terms = vec!["abc".into()];
+        assert!(session_struct_compat(&a, &c));
+        // 过滤器变化 → 不兼容。
+        let mut d = ParsedQuery::default();
+        d.substring = Some("abc".into());
+        d.only_dirs = true;
+        assert!(!session_struct_compat(&a, &d));
+        // OR 分支不同 → 不兼容。
+        let mut e = ParsedQuery::default();
+        e.substring = Some("abc".into());
+        e.or_branches.push(ParsedQuery::default());
+        assert!(!session_struct_compat(&a, &e));
+    }
+
+    #[test]
+    fn needles_narrow_prefix_cases() {
+        let mut old = ParsedQuery::default();
+        old.substring = Some("noise".into());
+        let mut new = ParsedQuery::default();
+        new.substring = Some("noise_file_0".into());
+        assert!(needles_narrow(&old, &new));
+        assert!(!needles_narrow(&new, &old));
+        // 非前缀 → false。
+        let mut other = ParsedQuery::default();
+        other.substring = Some("noisy".into());
+        assert!(!needles_narrow(&old, &other));
+        // 都空 → true（同集合）。
+        let empty = ParsedQuery::default();
+        assert!(needles_narrow(&empty, &empty));
+        // 旧空新非空 → true（全集收窄）。
+        assert!(needles_narrow(&empty, &new));
+        // 旧非空新空 → false（放宽）。
+        assert!(!needles_narrow(&new, &empty));
+        // 多 term：旧每条都被覆盖才行。
+        let mut m_old = ParsedQuery::default();
+        m_old.name_terms = vec!["aa".into(), "bb".into()];
+        let mut m_new = ParsedQuery::default();
+        m_new.name_terms = vec!["xaay".into(), "zzbb".into()];
+        assert!(needles_narrow(&m_old, &m_new));
+        let mut m_new2 = ParsedQuery::default();
+        m_new2.name_terms = vec!["xaay".into()];
+        assert!(!needles_narrow(&m_old, &m_new2));
+    }
+
+    #[test]
+    fn session_extend_reuses_and_matches_full_scan() {
+        let engine = sess_engine(50_000);
+        let sid = Some(7u64);
+        // 基：全量。
+        let (base_hits, base_total) = paged(&engine, "noise_file_0", sid);
+        assert_eq!(base_total, 50_000);
+        assert_eq!(engine.session_debug_len(7), Some(50_000));
+        assert_eq!(engine.session_full_scans.load(Ordering::Relaxed), 1);
+        // 续写：复用（full_scans 不涨，top 复用涨），结果与无会话全量一致。
+        let (ext_hits, ext_total) = paged(&engine, "noise_file_00", sid);
+        assert_eq!(ext_total, 10_000);
+        assert_eq!(engine.session_full_scans.load(Ordering::Relaxed), 1);
+        assert!(engine.session_top_reused.load(Ordering::Relaxed) >= 1, "top 复用应命中");
+        let fresh = sess_engine(50_000);
+        let (ref_hits, ref_total) = paged(&fresh, "noise_file_00", None);
+        assert_eq!(ext_total, ref_total);
+        assert_eq!(ext_hits, ref_hits);
+        // 基已被收窄集替换（续写链越走越小）。
+        assert_eq!(engine.session_debug_len(7), Some(10_000));
+        // 再续写一层。
+        let (ext2_hits, ext2_total) = paged(&engine, "noise_file_001", sid);
+        assert_eq!(ext2_total, 1_000);
+        assert_eq!(engine.session_full_scans.load(Ordering::Relaxed), 1);
+        assert!(engine.session_top_reused.load(Ordering::Relaxed) >= 2, "连续续写应连续命中 top");
+        let (ref2_hits, _) = paged(&fresh, "noise_file_001", None);
+        assert_eq!(ext2_hits, ref2_hits);
+        assert!(base_hits.len() == 10_000);
+    }
+
+    #[test]
+    fn session_sort_change_reuses_unordered_but_resorts() {
+        let engine = sess_engine(50_000);
+        let sid = Some(7u64);
+        let _ = paged(&engine, "noise_file_0", sid);
+        let top_before = engine.session_top_reused.load(Ordering::Relaxed);
+        // 排序变化：unordered 照复用（full_scans 不涨），但 top 不可复用（重排）。
+        let (hits, total) = paged(&engine, "sort:size:desc noise_file_00", sid);
+        assert_eq!(total, 10_000);
+        assert_eq!(engine.session_full_scans.load(Ordering::Relaxed), 1);
+        assert_eq!(engine.session_top_reused.load(Ordering::Relaxed), top_before);
+        let fresh = sess_engine(50_000);
+        let (ref_hits, _) = paged(&fresh, "sort:size:desc noise_file_00", None);
+        // 集合相同（Size 排序 tie 用非稳定选择，顺序可能不同；Name 排序才逐条可比）。
+        let mut a = hits.clone();
+        let mut b = ref_hits.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn session_non_prefix_falls_back_to_full_scan() {
+        let engine = sess_engine(50_000);
+        let sid = Some(7u64);
+        let _ = paged(&engine, "noise_file_00", sid);
+        assert_eq!(engine.session_full_scans.load(Ordering::Relaxed), 1);
+        // 非前缀 → 全量（full_scans+1），结果仍正确，基被刷新为新查询。
+        let (hits, total) = paged(&engine, "noise_file_01", sid);
+        assert_eq!(total, 10_000);
+        assert_eq!(engine.session_full_scans.load(Ordering::Relaxed), 2);
+        let fresh = sess_engine(50_000);
+        let (ref_hits, _) = paged(&fresh, "noise_file_01", None);
+        assert_eq!(hits, ref_hits);
+        assert_eq!(engine.session_debug_len(7), Some(10_000));
+    }
+
+    #[test]
+    fn session_evicts_lru_beyond_cap() {
+        let engine = sess_engine(10_000);
+        for (i, sid) in (11u64..=15).enumerate() {
+            let text = format!("noise_file_{i}");
+            let _ = paged(&engine, &text, Some(sid));
+        }
+        // 5 个会话、cap=4：最老的 sid=11 被逐出。
+        assert_eq!(engine.session_debug_len(11), None);
+        for sid in 12u64..=15 {
+            assert!(engine.session_debug_len(sid).is_some(), "sid={sid}");
+        }
+    }
+}
+#[cfg(test)]
+mod dir_table_cache_tests {
+    use super::*;
+
+    #[test]
+    fn cached_table_matches_fresh_build_and_rebuilds_on_rev() {
+        let store = crate::index::IndexBuilder::new(b'C', 1, 2, 3)
+            .build_from_raw(
+                vec![crate::platform::RawEntry {
+                    file_id: 10, file_id_128: None, parent_id: 100,
+                    name: "a.txt".into(), size: 1, mtime: 1, ctime: 1,
+                    attrs: 0, is_dir: false,
+                }],
+                vec![crate::platform::RawEntry {
+                    file_id: 100, file_id_128: None, parent_id: 0,
+                    name: "root".into(), size: 0, mtime: 0, ctime: 0,
+                    attrs: 0x10, is_dir: true,
+                }],
+                true,
+            )
+            .unwrap();
+        let engine = SearchEngine::new(store);
+        let rev = engine.revision.load(Ordering::Relaxed);
+        // 同 revision 两次拿的是同一份（Arc 指针相同）。
+        let t1 = engine.dir_path_table_cached(&engine.store.read(), rev).unwrap();
+        let t2 = engine.dir_path_table_cached(&engine.store.read(), rev).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&t1, &t2));
+        // 与现建表字节一致。
+        let fresh = build_dir_path_table(&engine.store.read());
+        assert_eq!(t1.buf, fresh.buf);
+        assert_eq!(t1.ranges, fresh.ranges);
+        // revision 变化 → 重建（指针不同）。
+        engine.bump_revision();
+        let rev2 = engine.revision.load(Ordering::Relaxed);
+        assert_ne!(rev, rev2);
+        let t3 = engine.dir_path_table_cached(&engine.store.read(), rev2).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&t1, &t3));
+        assert_eq!(t3.buf, fresh.buf);
+    }
+}
+
+

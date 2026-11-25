@@ -136,6 +136,8 @@ fn handle_request(req: IpcRequest) -> IpcResponse {
             message: "mock backend does not support indexed usage".into(),
         },
         IpcRequest::Ping => IpcResponse::Pong,
+        // mock 后端无在飞查询：取消恒幂等成功（P0-1 语义与 service 一致）。
+        IpcRequest::SearchCancel { request_id } => IpcResponse::Cancelled { request_id },
         IpcRequest::ContentBuild { .. } | IpcRequest::ContentCancel => IpcResponse::Error {
             message: "mock backend does not support content indexing".into(),
         },
@@ -176,6 +178,7 @@ fn handle_request(req: IpcRequest) -> IpcResponse {
         content_error: None,
         content_detail: String::new(),
         content_entry_total: 0,
+        rebuild_failures: 0,
         content_dir: String::new(),
         content_aux_ini_docs: 0,
         content_aux_ini_bytes: 0,
@@ -186,6 +189,7 @@ fn handle_request(req: IpcRequest) -> IpcResponse {
             query,
             limit,
             offset,
+            request_id,
             ..
         } => {
             let started = Instant::now();
@@ -208,6 +212,7 @@ fn handle_request(req: IpcRequest) -> IpcResponse {
                 hits,
                 total,
                 elapsed_ms: started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32,
+                request_id,
             }
         }
     }

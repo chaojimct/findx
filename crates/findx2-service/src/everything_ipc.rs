@@ -535,6 +535,8 @@ fn do_search_via_pipe(query: &str, max_total: usize) -> Option<Vec<IpcHit>> {
         offset: 0,
         pinyin_initials: true,
         pinyin_full: true,
+        request_id: 0,
+        session_id: 0,
     };
     match pipe_rpc(&pipe, &req)? {
         IpcResponse::SearchResult { hits, .. } => {

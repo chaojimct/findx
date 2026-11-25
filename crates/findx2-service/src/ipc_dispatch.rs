@@ -7,6 +7,65 @@ use findx2_ipc::{IpcRequest, IpcResponse};
 
 pub(crate) type EngineSlot = Arc<RwLock<Option<Arc<SearchEngine>>>>;
 
+/// 在飞查询的取消注册表（P0-1）：`request_id != 0` 的 Search 登记一个 flag；
+/// `SearchCancel{request_id}` 置位；扫描线程每 4096 条查一次，置位即 `Err(Cancelled)`。
+/// 完成后（无论 Ok/Cancelled/Err）由 process_request 摘除；Cancel 先于完成到达只置位不摘除。
+fn inflight_searches() -> &'static Mutex<std::collections::HashMap<u64, Arc<std::sync::atomic::AtomicBool>>> {
+    static SLOT: OnceLock<Mutex<std::collections::HashMap<u64, Arc<std::sync::atomic::AtomicBool>>>> =
+        OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn register_search(request_id: u64) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+    if request_id == 0 {
+        return None;
+    }
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    inflight_searches()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(request_id, flag.clone());
+    Some(flag)
+}
+
+fn cancel_inflight_search(request_id: u64) {
+    if request_id == 0 {
+        return;
+    }
+    if let Some(flag) = inflight_searches()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&request_id)
+    {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    // 未知/已完成 ID：幂等，无操作（调用方仍回 Cancelled 确认）。
+}
+
+fn unregister_search(request_id: u64) {
+    if request_id == 0 {
+        return;
+    }
+    inflight_searches()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&request_id);
+}
+
+/// `search_ipc` 的失败：取消单独成项（service 回 `Cancelled` 而非 Error，
+/// GUI 凭此静默丢弃，不弹错）。`From<String>` 让 `?` 保持可用。
+#[derive(Debug)]
+pub(crate) enum SearchFail {
+    Cancelled,
+    Message(String),
+}
+
+impl From<String> for SearchFail {
+    fn from(s: String) -> Self {
+        SearchFail::Message(s)
+    }
+}
+
 fn resident_index() -> &'static Mutex<Option<crate::everything_status::ResidentIndex>> {
     static SLOT: OnceLock<Mutex<Option<crate::everything_status::ResidentIndex>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
@@ -28,6 +87,7 @@ pub(crate) fn req_kind_label(r: &IpcRequest) -> &'static str {
         IpcRequest::Ping => "Ping",
         IpcRequest::Status => "Status",
         IpcRequest::Search { .. } => "Search",
+        IpcRequest::SearchCancel { .. } => "SearchCancel",
         IpcRequest::ContentBuild { .. } => "ContentBuild",
         IpcRequest::ContentCancel => "ContentCancel",
         IpcRequest::ContentSnippets { .. } => "ContentSnippets",
@@ -137,6 +197,7 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                 content_error: None,
                 content_detail: String::new(),
                 content_entry_total: 0,
+                rebuild_failures: 0,
                 content_dir: String::new(),
                 content_aux_ini_docs: 0,
                 content_aux_ini_bytes: 0,
@@ -155,16 +216,40 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                 offset,
                 pinyin_initials,
                 pinyin_full,
+                request_id,
+                session_id,
             },
             Some(eng),
-        ) => match search_ipc(&eng, &query, pinyin, limit, offset, pinyin_initials, pinyin_full) {
-            Ok((hits, total, elapsed_ms)) => IpcResponse::SearchResult {
-                hits,
-                total,
-                elapsed_ms,
-            },
-            Err(message) => IpcResponse::Error { message },
-        },
+        ) => {
+            let flag = register_search(request_id);
+            let outcome = search_ipc(
+                &eng,
+                &query,
+                pinyin,
+                limit,
+                offset,
+                pinyin_initials,
+                pinyin_full,
+                request_id,
+                session_id,
+                flag.as_deref(),
+            );
+            unregister_search(request_id);
+            match outcome {
+                Ok((hits, total, elapsed_ms)) => IpcResponse::SearchResult {
+                    hits,
+                    total,
+                    elapsed_ms,
+                    request_id,
+                },
+                Err(SearchFail::Cancelled) => IpcResponse::Cancelled { request_id },
+                Err(SearchFail::Message(message)) => IpcResponse::Error { message },
+            }
+        }
+        (IpcRequest::SearchCancel { request_id }, _) => {
+            cancel_inflight_search(request_id);
+            IpcResponse::Cancelled { request_id }
+        }
         (IpcRequest::Status, Some(eng)) => {
             let backfill = eng.backfill_progress_snapshot();
             let backfill_error = eng.backfill_error_snapshot();
@@ -230,6 +315,7 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                         content_error: cs.error,
                         content_detail: cs.detail,
                         content_entry_total: cs.entry_total,
+                        rebuild_failures: crate::rebuild_health::failures_for_letter(volume_letter),
                         content_dir: cs.content_dir.clone(),
                         content_aux_ini_docs: cs.aux_ini_docs,
                         content_aux_ini_bytes: cs.aux_ini_bytes,
@@ -280,6 +366,7 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                         content_error: cs.error,
                         content_detail: cs.detail,
                         content_entry_total: cs.entry_total,
+                        rebuild_failures: crate::rebuild_health::failures_for_letter(locked.volume_letter),
                         content_dir: cs.content_dir.clone(),
                         content_aux_ini_docs: cs.aux_ini_docs,
                         content_aux_ini_bytes: cs.aux_ini_bytes,
@@ -402,7 +489,10 @@ pub(crate) fn search_ipc(
     offset: usize,
     pinyin_initials: bool,
     pinyin_full: bool,
-) -> std::result::Result<(Vec<findx2_ipc::SearchHitDto>, u32, u32), String> {
+    _request_id: u64,
+    session_id: u64,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> std::result::Result<(Vec<findx2_ipc::SearchHitDto>, u32, u32), SearchFail> {
     let started = std::time::Instant::now();
     let t_parse = std::time::Instant::now();
     let pq = QueryParser::parse(query).map_err(|e| e.to_string())?;
@@ -424,8 +514,13 @@ pub(crate) fn search_ipc(
             },
             offset,
             lim,
+            cancel,
+            session_id.ne(&0).then_some(session_id),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| match e {
+            findx2_core::Error::Cancelled => SearchFail::Cancelled,
+            other => SearchFail::Message(other.to_string()),
+        })?;
     let search_us = t_search.elapsed().as_micros() as u64;
     let t_format = std::time::Instant::now();
     let mut dtos: Vec<findx2_ipc::SearchHitDto> = hits
@@ -689,9 +784,57 @@ mod usage_tests {
         let raw=|id,parent,name:&str,dir|findx2_core::RawEntry { file_id:id,file_id_128:None,parent_id:parent,name:name.into(),size:if dir {0}else{123},mtime:0,ctime:0,attrs:if dir{16}else{0},is_dir:dir };
         let store=findx2_core::IndexBuilder::new(b'F',1,7,0).build_from_raw(vec![raw(10,2,"public-file.txt",false)],vec![raw(1,0,"root",true),raw(2,1,"public-folder",true)],true).unwrap();
         let engine=findx2_core::SearchEngine::new(store);
-        let (hits,_,_)=super::search_ipc(&engine,"public",false,50,0,true,true).unwrap();
+        let (hits,_,_)=super::search_ipc(&engine,"public",false,50,0,true,true,0,0,None).unwrap();
         assert!(hits.iter().any(|h| h.name=="public-folder" && h.is_directory));
         assert!(hits.iter().any(|h| h.name=="public-file.txt" && !h.is_directory));
+    }
+
+    #[cfg(test)] mod search_cancel_tests {
+        use super::super::*;
+        fn tiny_engine() -> SearchEngine {
+            let raw=|id,parent,name:&str,dir|findx2_core::RawEntry { file_id:id,file_id_128:None,parent_id:parent,name:name.into(),size:if dir {0}else{123},mtime:0,ctime:0,attrs:if dir{16}else{0},is_dir:dir };
+            let store=findx2_core::IndexBuilder::new(b'F',1,7,0).build_from_raw(vec![raw(10,2,"cancel-me.txt",false)],vec![raw(1,0,"root",true),raw(2,1,"folder",true)],true).unwrap();
+            SearchEngine::new(store)
+        }
+        fn slot_with(engine: SearchEngine) -> EngineSlot {
+            Arc::new(RwLock::new(Some(Arc::new(engine))))
+        }
+        fn search_req(id: u64) -> IpcRequest {
+            IpcRequest::Search { query: "cancel-me".into(), pinyin: false, limit: 50, offset: 0, pinyin_initials: false, pinyin_full: false, request_id: id, session_id: 0 }
+        }
+        #[test] fn search_result_echoes_request_id() {
+            let slot = slot_with(tiny_engine());
+            match process_request(&slot, search_req(42)) {
+                IpcResponse::SearchResult { total, request_id, .. } => {
+                    assert_eq!(total, 1);
+                    assert_eq!(request_id, 42);
+                }
+                other => panic!("expected SearchResult, got {other:?}"),
+            }
+            // request_id=0：老行为，无回显。
+            match process_request(&slot, search_req(0)) {
+                IpcResponse::SearchResult { total, request_id, .. } => {
+                    assert_eq!(total, 1);
+                    assert_eq!(request_id, 0);
+                }
+                other => panic!("expected SearchResult, got {other:?}"),
+            }
+        }
+        #[test] fn search_cancel_unknown_id_is_idempotent() {
+            let slot = slot_with(tiny_engine());
+            match process_request(&slot, IpcRequest::SearchCancel { request_id: 999 }) {
+                IpcResponse::Cancelled { request_id } => assert_eq!(request_id, 999),
+                other => panic!("expected Cancelled, got {other:?}"),
+            }
+        }
+        #[test] fn search_ipc_preset_flag_returns_cancelled_not_error() {
+            let engine = tiny_engine();
+            let flag = std::sync::atomic::AtomicBool::new(true);
+            match super::super::search_ipc(&engine, "cancel-me", false, 50, 0, false, false, 77, 0, Some(&flag)) {
+                Err(super::super::SearchFail::Cancelled) => {}
+                other => panic!("expected Cancelled, got {:?}", other.is_ok()),
+            }
+        }
     }
 }
 

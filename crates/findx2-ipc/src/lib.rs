@@ -81,7 +81,18 @@ pub enum IpcRequest {
         /// 拼音辅库：全拼查询。缺省开（有库才生效）；GUI 全文页可关。
         #[serde(default = "default_true")]
         pinyin_full: bool,
+        /// 查询 ID（P0-1）：GUI 每次击键自增；`SearchCancel{request_id}` 取消在飞的同 ID 查询；
+        /// `SearchResult`/`Cancelled` 原样回显，GUI 凭此丢弃过期响应（防"结果闪回旧查询"）。
+        /// 缺省 0 = 不跟踪（老客户端行为：不可取消、无回显）。
+        #[serde(default)]
+        request_id: u64,
+        /// 会话 ID（P0-2）：同输入框的连续击键共用一 ID，service 复用该会话的结果集做增量过滤；
+        /// 0 = 无会话（现状行为，每次全量）。换输入框/新搜索意图请换 ID。
+        #[serde(default)]
+        session_id: u64,
     },
+    /// 取消在飞的 `Search{request_id}`（P0-1）。未知/已完成的 ID → 回 `Cancelled`（幂等，无错误）。
+    SearchCancel { request_id: u64 },
     /// 全文内容索引构建（`<index>.content/`）：service 后台线程执行，不停服。
     /// 已在构建 → Error；`rebuild=true` 删旧全量重建，否则复用追加。
     ContentBuild {
@@ -172,7 +183,14 @@ pub enum IpcResponse {
         /// `0` 表示旧版 service 未上报。GUI 状态栏显示 「查询 N 条 · 耗时 X ms」。
         #[serde(default)]
         elapsed_ms: u32,
+        /// 请求 ID 回显（P0-1）：与发出 `Search` 时的 `request_id` 一致；
+        /// 缺省 0 = 老版 service 未上报。GUI 凭此丢弃过期响应。
+        #[serde(default)]
+        request_id: u64,
     },
+    /// 查询被取消的确认（P0-1）：`SearchCancel` / 新查询替代旧查询触发。
+    /// 老客户端收不到（从不发 request_id != 0 的请求）；收到即丢弃该 ID 的等待。
+    Cancelled { request_id: u64 },
     StatusResult {
         entry_count: u64,
         #[serde(default)]
@@ -282,6 +300,11 @@ pub enum IpcResponse {
         /// 拼音辅库（全拼）目录体积（字节）。
         #[serde(default)]
         content_aux_full_bytes: u64,
+        /// 自愈计数器（P1-3）：跨进程持久的连续重建失败数（`rebuild_health.json`）。
+        /// ≥3 时 service 下次启动强制全卷重建。缺省 0 = 老版 service 未上报。
+        /// GUI 状态栏可在 >0 时提示"索引曾多次重建失败"。
+        #[serde(default)]
+        rebuild_failures: u32,
     },
     UpgradeCapabilitiesResult {
         protocol_version: u32,
@@ -376,6 +399,8 @@ mod tests {
             pinyin_full: true,
             limit: 100,
             offset: 0,
+            request_id: 7,
+            session_id: 3,
         })
         .unwrap();
         let r: IpcRequest = serde_json::from_str(&j).unwrap();
@@ -387,6 +412,8 @@ mod tests {
                 pinyin_full,
                 limit,
                 offset,
+                request_id,
+                session_id,
             } => {
                 assert_eq!(query, "foo");
                 assert!(!pinyin);
@@ -394,20 +421,38 @@ mod tests {
                 assert!(pinyin_initials);
                 assert!(pinyin_full);
                 assert_eq!(offset, 0);
+                assert_eq!(request_id, 7);
+                assert_eq!(session_id, 3);
             }
             _ => panic!(),
         }
-        // 老客户端不带 offset 也能解析（向后兼容）。
+        // 老客户端不带 offset/request_id/session_id 也能解析（向后兼容）。
         let r2: IpcRequest = serde_json::from_str(r#"{"type":"search","query":"x"}"#).unwrap();
         match r2 {
-            IpcRequest::Search { offset, limit, pinyin_initials, pinyin_full, .. } => {
+            IpcRequest::Search { offset, limit, pinyin_initials, pinyin_full, request_id, session_id, .. } => {
                 assert_eq!(offset, 0);
                 assert_eq!(limit, 500);
                 assert!(pinyin_initials);
                 assert!(pinyin_full);
+                assert_eq!(request_id, 0);
+                assert_eq!(session_id, 0);
             }
             _ => panic!(),
         }
+        // SearchCancel 往返 + 已取消确认。
+        let c = IpcRequest::SearchCancel { request_id: 9 };
+        let back: IpcRequest = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert!(matches!(back, IpcRequest::SearchCancel { request_id: 9 }));
+        let cr = IpcResponse::Cancelled { request_id: 9 };
+        let back_r: IpcResponse =
+            serde_json::from_str(&serde_json::to_string(&cr).unwrap()).unwrap();
+        assert!(matches!(back_r, IpcResponse::Cancelled { request_id: 9 }));
+        // 老 service 的 SearchResult（无 request_id）按缺省解析。
+        let sr: IpcResponse = serde_json::from_str(
+            r#"{"type":"search_result","hits":[],"total":1,"elapsed_ms":5}"#,
+        )
+        .unwrap();
+        assert!(matches!(sr, IpcResponse::SearchResult { request_id: 0, .. }));
     }
 
     #[test]

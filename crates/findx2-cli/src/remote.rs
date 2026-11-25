@@ -58,6 +58,8 @@ async fn remote_search(
         offset: 0,
         pinyin_initials: true,
         pinyin_full: true,
+        request_id: 0,
+        session_id: 0,
     };
     let mut body = serde_json::to_string(&req).map_err(|e| Error::Json(e))?;
     body.push('\n');

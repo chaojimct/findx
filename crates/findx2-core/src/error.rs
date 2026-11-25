@@ -19,6 +19,11 @@ pub enum Error {
     #[error("USN 日志断档，需全量重建: {0}")]
     JournalGap(String),
 
+    /// 查询被取消（`SearchCancel{request_id}` / 新输入替代旧查询）。
+    /// 非错误语义：调用方（service）应回 `Cancelled{request_id}` 而非 Error，避免 GUI 弹错。
+    #[error("查询已取消")]
+    Cancelled,
+
     #[error("UTF-8 无效")]
     Utf8(#[from] std::str::Utf8Error),
 
