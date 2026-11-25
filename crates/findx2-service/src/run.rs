@@ -269,6 +269,8 @@ pub(crate) fn run_foreground(
 
     // P1-3：登记 index 位置，供自愈计数器（Status 展示 + 下次启动强制重建判定）定位健康文件。
     crate::rebuild_health::note_index_path(&index);
+    // P1-D：launch 历史边车跟随同一 index 落盘。
+    crate::launch_hist::note_launch_index(&index);
 
     // Crash tracer: a panic in a service process otherwise vanishes (SCM only
     // reports "terminated unexpectedly"). Leave the payload + location in the

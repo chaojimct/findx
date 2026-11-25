@@ -99,6 +99,8 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) {
         self.pause_preview();
+        // P1-D：上报打开（fire-and-forget；路径先克隆，spawn 后 hit 即被移走）。
+        let report_path = hit.path.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
@@ -108,7 +110,13 @@ impl MainWindow {
                 .await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(()) => this.transient_file_notice("已交给系统打开".into(), cx),
+                    Ok(()) => {
+                        this.transient_file_notice("已交给系统打开".into(), cx);
+                        let (endpoint, ipc) = this
+                            .session
+                            .read_with(cx, |s, _| (s.endpoint.clone(), s.ipc.clone()));
+                        ipc.record_open(endpoint, report_path);
+                    }
                     Err(e) => {
                         this.workspace.status = e.clone();
                         this.file_actions.summary = e;

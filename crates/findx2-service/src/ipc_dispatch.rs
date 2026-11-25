@@ -90,6 +90,7 @@ pub(crate) fn req_kind_label(r: &IpcRequest) -> &'static str {
         IpcRequest::SearchCancel { .. } => "SearchCancel",
         IpcRequest::ContentBuild { .. } => "ContentBuild",
         IpcRequest::ContentCancel => "ContentCancel",
+        IpcRequest::RecordOpen { .. } => "RecordOpen",
         IpcRequest::ContentSnippets { .. } => "ContentSnippets",
         IpcRequest::ContentSnippetsAll { .. } => "ContentSnippetsAll",
         IpcRequest::ContentPdfBoxes { .. } => "ContentPdfBoxes",
@@ -386,6 +387,11 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
         (IpcRequest::ContentCancel, _) => {
             // 幂等：无构建在跑也是 Pong，GUI 只管轮询 Status 看状态。
             crate::content_index::cancel_build();
+            IpcResponse::Pong
+        }
+        (IpcRequest::RecordOpen { path }, _) => {
+            // P1-D：上报打开成功即累计落盘；best-effort，恒回 Pong。
+            crate::launch_hist::record_open(&path);
             IpcResponse::Pong
         }
         (IpcRequest::ContentSnippets { query, entry_indices, window }, Some(eng)) => {

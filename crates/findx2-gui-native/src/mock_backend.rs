@@ -144,6 +144,7 @@ fn handle_request(req: IpcRequest) -> IpcResponse {
         IpcRequest::ContentSnippets { .. } | IpcRequest::ContentSnippetsAll { .. } => {
             IpcResponse::ContentSnippets { snippets: vec![] }
         }
+        IpcRequest::RecordOpen { .. } => IpcResponse::Pong,
         IpcRequest::ContentPdfBoxes { .. } => IpcResponse::ContentPdfBoxes {
             rects: Vec::new(),
             page_w: 0.0,

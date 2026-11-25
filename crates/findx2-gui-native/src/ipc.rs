@@ -46,6 +46,11 @@ enum Job {
         endpoint: String,
         request_id: u64,
     },
+    /// P1-D 上报打开（fire-and-forget；service 侧累计落盘，恒回 Pong）。
+    RecordOpen {
+        endpoint: String,
+        path: String,
+    },
     Search {
         endpoint: String,
         query: String,
@@ -180,6 +185,14 @@ impl IpcClient {
             request_id,
         });
     }
+
+    /// P1-D：上报一次文件打开成功（fire-and-forget；service 侧累计落盘，恒回 Pong）。
+    pub fn record_open(&self, endpoint: String, path: String) {
+        if path.is_empty() {
+            return;
+        }
+        let _ = self.tx.send(Job::RecordOpen { endpoint, path });
+    }
 }
 
 async fn dispatch(job: Job) {
@@ -247,6 +260,9 @@ async fn dispatch(job: Job) {
             request_id,
         } => {
             tokio::spawn(cancel_search(endpoint, request_id));
+        }
+        Job::RecordOpen { endpoint, path } => {
+            tokio::spawn(record_open(endpoint, path));
         }
         Job::Ping { endpoint, reply } => {
             let _ = reply.send(ipc_ping(endpoint).await);
@@ -367,6 +383,20 @@ async fn cancel_search(endpoint: String, request_id: u64) {
         async {
             let client = connect_endpoint(&endpoint).await?;
             let req = IpcRequest::SearchCancel { request_id };
+            let _ = write_request(client, req).await;
+            Ok::<_, String>(())
+        },
+    )
+    .await;
+}
+
+/// P1-D 上报打开（后台 detached；恒回 Pong，失败静默）。
+async fn record_open(endpoint: String, path: String) {
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        async {
+            let client = connect_endpoint(&endpoint).await?;
+            let req = IpcRequest::RecordOpen { path };
             let _ = write_request(client, req).await;
             Ok::<_, String>(())
         },

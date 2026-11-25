@@ -4,6 +4,7 @@ mod cli;
 mod content_index;
 mod everything_status;
 mod ipc_dispatch;
+mod launch_hist;
 mod load_state;
 mod startup_compact;
 mod rebuild_health;

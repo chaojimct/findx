@@ -101,7 +101,11 @@ pub enum IpcRequest {
     },
     /// 取消正在进行的 `ContentBuild`（无构建在跑 → Pong 空操作）。
     ContentCancel,
-    /// 按 entry_idx 补取命中摘要（列表首屏只填前 N 行，其余选中/可见时按需取；
+    /// 上报一次文件打开成功（P1-D launch 历史；fire-and-forget，恒回 Pong）。
+    /// service 侧累计 `{path → 打开次数, last_open}` 并落盘边车，不参与本次查询。
+    RecordOpen {
+        path: String,
+    },    /// 按 entry_idx 补取命中摘要（列表首屏只填前 N 行，其余选中/可见时按需取；
     /// 避免首屏为几百行回读文件卡住 service）。
     /// query 取 content: 取值原文（与 Search 一致，供分词用）。
     /// window：第几个匹配点（上一个/下一个翻页），缺省 0。
@@ -514,6 +518,15 @@ mod tests {
         match old_all {
             IpcRequest::ContentSnippetsAll { cap, .. } => assert_eq!(cap, 50),
             _ => panic!(),
+        }
+        // P1-D 上报打开往返。
+        let ro = IpcRequest::RecordOpen {
+            path: r"C:\a\b.txt".into(),
+        };
+        let j = serde_json::to_string(&ro).unwrap();
+        match serde_json::from_str::<IpcRequest>(&j).unwrap() {
+            IpcRequest::RecordOpen { path } => assert_eq!(path, r"C:\a\b.txt"),
+            _ => panic!("record-open roundtrip mismatch: {j}"),
         }
         // 老 service 的 Status（无 content_* 字段）按缺省值解析。
         let old: IpcResponse = serde_json::from_str(
