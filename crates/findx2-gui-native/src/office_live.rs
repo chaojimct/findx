@@ -835,17 +835,8 @@ fn hide_chrome(app: &com::Dispatch, engine: LiveEngine) {
     match engine.kind() {
         LiveKind::Word => {
             if let Ok(win) = app.get("ActiveWindow") {
-                // FullScreen 是 View 的属性（不是 Window），设错层会静默失败。
-                // 全屏是 Word 唯一可靠清 chrome 的方式（非全屏时 ribbon/标题栏
-                // 会被 Word 周期性还原，实测 MinimizeRibbon 无效）。
-                if let Ok(view) = win.get("View") {
-                    if let Err(e) = view.put_bool("FullScreen", true) {
-                        {
-                            use std::io::Write as _;
-                            let _ = writeln!(std::io::stderr(), "[live] fullscreen failed: {e}");
-                        }
-                    }
-                }
+                // 不开全屏：全屏会让 Word 按整屏布局，裁剪后内容位置与预览区错位。
+                // 改为普通窗口 + SetWindowRgn 裁掉 chrome（见 place_owned）。
                 let _ = win.put_bool("DocumentMap", false);
             }
         }
@@ -855,22 +846,11 @@ fn hide_chrome(app: &com::Dispatch, engine: LiveEngine) {
     }
 }
 
-/// 确认 Word 仍处于全屏（用户按 Esc/Alt 会退出全屏，chrome 会回来）。
-/// 循环里定期调用，被退出就立刻恢复。
+/// 维持无 chrome 状态：非全屏方案下 chrome 被 rgn 裁掉，这里只确保导航窗格
+/// 不因用户操作重新展开（展开会改变文档区宽度）。
 #[cfg(windows)]
-fn ensure_fullscreen(app: &com::Dispatch, engine: LiveEngine) {
-    if engine.kind() != LiveKind::Word {
-        return;
-    }
-    if let Ok(win) = app.get("ActiveWindow") {
-        if let Ok(view) = win.get("View") {
-            if let Ok(on) = view.prop_bool("FullScreen") {
-                if !on {
-                    let _ = view.put_bool("FullScreen", true);
-                }
-            }
-        }
-    }
+fn ensure_fullscreen(_app: &com::Dispatch, _engine: LiveEngine) {
+    // 非全屏方案：chrome 由 place_owned 的 rgn 裁剪，无需周期性恢复。
 }
 
 #[cfg(windows)]
@@ -1008,45 +988,36 @@ fn set_owner_follow(child: usize, owner: usize) {
 #[cfg(windows)]
 fn place_owned(child: usize, owner: usize, x: i32, y: i32, w: i32, h: i32) {
     use windows::Win32::{
-        Foundation::{HWND, POINT, RECT},
+        Foundation::{HWND, POINT},
         Graphics::Gdi::{ClientToScreen, CreateRectRgn, SetWindowRgn},
-        UI::WindowsAndMessaging::{GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_SHOWWINDOW},
+        UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_SHOWWINDOW},
     };
     if child == 0 || owner == 0 {
         return;
     }
     let (w, h) = (w.max(1), h.max(1));
+    // Word 主窗口的 chrome 高度（标题栏+ribbon 标签行 / 状态栏）。
+    // 实测 Office 16：上 78px、下 22px（302x265 窗口里 _WwG rel=(0,78) size=302x165）。
+    // 窗口按“预览区 + chrome 余量”摆放，rgn 只保留文档区 → 文档区正好等于预览区。
+    const CHROME_TOP: i32 = 78;
+    const CHROME_BOTTOM: i32 = 22;
     unsafe {
-        // place() 给的是主窗口客户区相对物理像素，转屏幕坐标。
         let mut pt = POINT { x, y };
         let _ = ClientToScreen(HWND(owner as *mut _), &mut pt);
-
-        // 1) 普通窗口响应 SetWindowPos；全屏窗口（Word View.FullScreen）忽略它，
-        //    所以这步对全屏是无害的 no-op。
+        let win_x = pt.x;
+        let win_y = pt.y - CHROME_TOP;
+        let win_w = w;
+        let win_h = h + CHROME_TOP + CHROME_BOTTOM;
         let _ = SetWindowPos(
             HWND(child as *mut _),
             None,
-            pt.x,
-            pt.y,
-            w,
-            h,
+            win_x,
+            win_y,
+            win_w,
+            win_h,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
-
-        // 2) 统一用 rgn 把可见区域对齐到预览区：
-        //    普通窗口此时 rect 已等于目标 → rgn 覆盖整窗（无裁剪效果）；
-        //    全屏窗口 rect 仍是整屏 → rgn 精确裁出预览区那一条。
-        //    不用屏幕尺寸判断（任务栏会让全屏高度 < SM_CYSCREEN，判断会失效）。
-        let mut wr = RECT::default();
-        if GetWindowRect(HWND(child as *mut _), &mut wr).is_err() {
-            return;
-        }
-        let rgn = CreateRectRgn(
-            pt.x - wr.left,
-            pt.y - wr.top,
-            pt.x - wr.left + w,
-            pt.y - wr.top + h,
-        );
+        let rgn = CreateRectRgn(0, CHROME_TOP, win_w, CHROME_TOP + h);
         if !rgn.is_invalid() {
             let _ = SetWindowRgn(HWND(child as *mut _), Some(rgn), true);
         }
