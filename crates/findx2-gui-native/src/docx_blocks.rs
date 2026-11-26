@@ -304,6 +304,42 @@ fn parse_hex_color(s: &str) -> Option<u32> {
 // 命中匹配（docx 侧自算，不依赖 service 的提取器）
 // ---------------------------------------------------------------------------
 
+/// 从查询串里取 `content:` / `utf8content:` 的**查询词列表**。
+/// `content:"马春天 我与青松" glob:0` → ["马春天", "我与青松"]
+/// `content:青松` → ["青松"]
+pub fn content_needles_of(query: &str) -> Vec<String> {
+    let lower = query.to_ascii_lowercase();
+    for key in ["content:", "utf8content:"] {
+        if let Some(i) = lower.find(key) {
+            let rest = &query[i + key.len()..];
+            let v = rest.trim_start();
+            let inner: String = if let Some(stripped) = v.strip_prefix('"') {
+                stripped.chars().take_while(|&c| c != '"').collect()
+            } else {
+                v.chars().take_while(|c| !c.is_whitespace()).collect()
+            };
+            let mut out: Vec<String> = inner
+                .split_whitespace()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && s.len() <= 64 && !s.contains(':'))
+                .collect();
+            if out.is_empty() {
+                let t = inner.trim();
+                if !t.is_empty() {
+                    out.push(t.to_string());
+                }
+            }
+            return out;
+        }
+    }
+    let q = query.trim();
+    if q.is_empty() {
+        Vec::new()
+    } else {
+        vec![q.to_string()]
+    }
+}
+
 /// 多词命中：每个查询词分别匹配后合并（与 service 的 AND 语义一致）。
 /// 用户输入 `马春天 我与青松` → 两个词各自在文中定位，
 /// 而不是拿整串「马春天 我与青松」当子串找（那样永远不命中）。
@@ -474,6 +510,30 @@ mod tests {
         let hits2 = match_hits(t, "mct");
         assert_eq!(hits2.len(), 1, "首字母应命中马春天");
         assert_eq!(&t[hits2[0].clone()], "马春天");
+    }
+
+    #[test]
+    fn needles_from_query_forms() {
+        // 全文模式：search_logic 会把多词包成引号
+        assert_eq!(
+            content_needles_of("content:\"马春天 我与青松\" glob:0"),
+            vec!["马春天".to_string(), "我与青松".to_string()]
+        );
+        // 单词
+        assert_eq!(
+            content_needles_of("content:青松 glob:0"),
+            vec!["青松".to_string()]
+        );
+        // utf8content
+        assert_eq!(
+            content_needles_of("utf8content:马春天"),
+            vec!["马春天".to_string()]
+        );
+        // 无 content: 前缀 → 整串
+        assert_eq!(
+            content_needles_of("马春天 我与青松"),
+            vec!["马春天 我与青松".to_string()]
+        );
     }
 
     #[test]
