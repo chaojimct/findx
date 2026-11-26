@@ -111,6 +111,21 @@ pub struct DocxDoc {
     pub truncated: bool,
 }
 
+impl DocxDoc {
+    /// plain 字节偏移落在第几个块（命中→块 的滚动定位用）。
+    /// 返回 Some(block_index)；越界返回最后一个块。
+    pub fn block_of_offset(&self, off: usize) -> Option<usize> {
+        if self.blocks.is_empty() {
+            return None;
+        }
+        match self.block_starts.binary_search(&off) {
+            Ok(i) => Some(i),
+            Err(0) => Some(0),
+            Err(i) => Some(i - 1),
+        }
+    }
+}
+
 const MAX_BLOCKS: usize = 4000;
 const MAX_PLAIN: usize = 1 << 20; // 1 MiB 纯文本上限
 

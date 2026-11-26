@@ -34,55 +34,83 @@ fn heading_px(level: u8) -> f32 {
     }
 }
 
-/// 渲染整篇文档。`hit_ranges` 是 `doc.plain` 的字节区间（来自 match_spans）。
+/// 渲染整篇文档（`focus` 为 None）或**以某个命中块为中心的窗口**。
+///
+/// `focus_block` 定向渲染：只输出该块前后各 `WINDOW_BEFORE` / `WINDOW_AFTER` 块，
+/// 命中总能落在可见区第一屏——比依赖 GPUI 滚动 API 可靠（实测 `set_offset`
+/// 会被内部滚动状态覆盖）。点击列表行/翻页只需切换 focus 并重绘。
+/// `hit_ranges` 是 `doc.plain` 的字节区间（来自 match_spans）。
 pub fn render_docx(
     doc: &DocxDoc,
     hit_ranges: &[Range<usize>],
+    focus_block: Option<usize>,
     tokens: &FindxTokens,
-) -> AnyElement {
-    let mut container = v_flex().w_full().gap_0();
-    let mut block_off = 0usize; // 当前块在 plain 中的起点
-    let mut rendered = 0usize;
+) -> Vec<AnyElement> {
+    const WINDOW_BEFORE: usize = 12;
+    const WINDOW_AFTER: usize = 80;
 
-    for (i, block) in doc.blocks.iter().enumerate() {
-        if rendered >= MAX_RENDER_BLOCKS {
-            container = container.child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_sm()
-                    .text_color(tokens.text_secondary)
-                    .child(format!(
-                        "（已渲染前 {MAX_RENDER_BLOCKS} 块，后续省略；可切换文字摘录查看全文）"
-                    )),
-            );
-            break;
+    let total = doc.blocks.len();
+    let (lo, hi) = match focus_block {
+        Some(f) if total > WINDOW_BEFORE + WINDOW_AFTER => {
+            let lo = f.saturating_sub(WINDOW_BEFORE);
+            (lo, (lo + WINDOW_BEFORE + WINDOW_AFTER).min(total))
         }
-        let start = doc.block_starts.get(i).copied().unwrap_or(block_off);
-        match block {
-            DocxBlock::Paragraph(p) => {
-                container = container.child(render_paragraph(p, start, hit_ranges, tokens));
-                block_off = start + p.text().len() + 1;
-            }
-            DocxBlock::Table(t) => {
-                container = container.child(render_table(t, start, hit_ranges, tokens));
-                // 表格 plain 占位：每行 cells 用 \t 分隔 + \n
-                let mut n = 0usize;
-                for row in &t.rows {
-                    for cell in row {
-                        for p in &cell.paragraphs {
-                            n += p.text().len() + 1;
-                        }
-                    }
-                    n += 1;
-                }
-                block_off = start + n;
-            }
-        }
-        rendered += 1;
+        _ => (0, total.min(MAX_RENDER_BLOCKS)),
+    };
+    let truncated_head = lo > 0;
+    let truncated_tail = hi < total;
+
+    let mut out: Vec<AnyElement> = Vec::with_capacity(hi - lo + 2);
+    if truncated_head {
+        out.push(
+            div()
+                .px_3()
+                .py_2()
+                .text_xs()
+                .text_color(tokens.text_tertiary)
+                .child(format!("（前面还有 {lo} 段，已按命中定位）"))
+                .into_any_element(),
+        );
     }
 
-    container.into_any_element()
+    for i in lo..hi {
+        let block = &doc.blocks[i];
+        let start = doc.block_starts.get(i).copied().unwrap_or(0);
+        match block {
+            DocxBlock::Paragraph(p) => {
+                out.push(render_paragraph(p, start, hit_ranges, tokens));
+            }
+            DocxBlock::Table(t) => {
+                out.push(render_table(t, start, hit_ranges, tokens));
+            }
+        }
+    }
+
+    if truncated_tail {
+        out.push(
+            div()
+                .px_3()
+                .py_2()
+                .text_xs()
+                .text_color(tokens.text_tertiary)
+                .child(format!("（后面还有 {} 段）", total - hi))
+                .into_any_element(),
+        );
+    } else if total > MAX_RENDER_BLOCKS && focus_block.is_none() {
+        out.push(
+            div()
+                .px_3()
+                .py_2()
+                .text_sm()
+                .text_color(tokens.text_secondary)
+                .child(format!(
+                    "（已渲染前 {MAX_RENDER_BLOCKS} 段；点命中列表可定位到后面）"
+                ))
+                .into_any_element(),
+        );
+    }
+
+    out
 }
 
 fn render_paragraph(

@@ -298,6 +298,10 @@ pub struct MainWindow {
     docx_hits: Vec<std::ops::Range<usize>>,
     /// docx 解析代（防止旧解析覆盖新目标）。
     docx_gen: u64,
+    /// docx 内容区滚动句柄：块与子元素一一对应，点击列表行/翻页可精确定位。
+    hit_scroll: gpui_kit::ScrollHandle,
+    /// docx 定向渲染焦点块（点击列表/翻页时切换，只渲染该块附近的窗口）。
+    docx_focus: Option<usize>,
     /// 搜索选项：区分大小写（Aa）。标题搜索精确生效；全文搜索后置过滤。
     search_match_case: bool,
     /// 搜索选项：全匹配（ab）。整串连续出现才算命中。
@@ -619,6 +623,8 @@ impl MainWindow {
             docx_doc: None,
             docx_hits: Vec::new(),
             docx_gen: 0,
+            hit_scroll: gpui_kit::ScrollHandle::new(),
+            docx_focus: None,
             search_match_case: false,
             search_exact: false,
             search_wildcard: false,
@@ -1621,14 +1627,32 @@ impl MainWindow {
                     .is_some_and(|path| path == meta.path)
             })
     }
-    /// PDF 可视命中上下文是否成立：摘要 tab 激活 + 光栅已就绪。
-    /// 成立时正文区展示页面光栅（含黄框），不再展示纯文本摘要块；
-    /// pager 与编号列表照常（ AnyTXT 式内容在上、导航在下）。
-    /// 命中上下文文本列是否激活：摘要 tab 打开且有可展示文本
-    ///（全文已到，或先用摘要顶着）。
+    /// 是否「全文检索」上下文：模式是全文/混合，或查询串显式含 content:/utf8content:。
+    /// 全文检索时命中上下文 tab 应立即出现，不等全文异步返回。
+    fn is_content_query(&self, cx: &mut Context<Self>) -> bool {
+        if self.effective_content_mode(cx) != ContentDefaultMode::Name {
+            return true;
+        }
+        let q = self.current_query(cx).to_ascii_lowercase();
+        q.contains("content:") || q.contains("utf8content:")
+    }
+
+    /// 命中上下文是否可用（与是否已有异步结果无关）：
+    /// 全文检索 + 选中非目录文件。tab 显示与激活态都用这个口径。
+    fn hit_ctx_available(&self, cx: &mut Context<Self>) -> bool {
+        if !self.preview_snippet_view && !self.is_content_query(cx) {
+            return false;
+        }
+        match self.active_workspace_hit() {
+            Some(h) => !h.is_directory,
+            None => false,
+        }
+    }
+
+    /// 命中上下文文本列是否激活：只要该 tab 处于打开态就渲染区域
+    /// （内容未到先显示占位，避免"过一会才冒出来"的跳变）。
     fn hit_text_active(&self) -> bool {
         self.preview_snippet_view
-            && (!self.full_text.is_empty() || !self.preview_snippet.is_empty())
     }
 
     /// 命中上下文文本列内容：全文优先（spans 为字节区间），
@@ -1695,6 +1719,8 @@ impl MainWindow {
                         let w = this.snippet_window - 1;
                         this.preview_snippet_lock = true;
                         this.fetch_snippet_window(entry_idx, w, true, cx);
+                        this.scroll_to_hit(w);
+                        cx.notify();
                     })),
             )
             .child(
@@ -1724,6 +1750,8 @@ impl MainWindow {
                         let w = this.snippet_window + 1;
                         this.preview_snippet_lock = true;
                         this.fetch_snippet_window(entry_idx, w, true, cx);
+                        this.scroll_to_hit(w);
+                        cx.notify();
                     })),
             )
             .when(total > 1, |row| {
@@ -1767,6 +1795,24 @@ impl MainWindow {
 
     /// AnyTXT 式编号命中列表：行号 badge + 单行摘要；点 badge 即跳窗。
     /// 当前窗行高亮；行数 = service 回传窗数（cap 50 截断，末尾明示）。
+    /// docx 内容定位到第 N 个命中所在的块（点列表行 / 翻页共用）。
+    /// 采用「定向渲染窗口」而非滚动：切 focus 块重绘，命中必在首屏。
+    fn scroll_to_hit(&mut self, n: usize) {
+        let Some(off) = self.docx_hits.get(n).map(|r| r.start) else {
+            return;
+        };
+        let Some(block) = self
+            .docx_doc
+            .as_ref()
+            .and_then(|d| d.block_of_offset(off))
+        else {
+            return;
+        };
+        self.docx_focus = Some(block);
+        // 滚回顶部（窗口换了，旧偏移无意义）。
+        self.hit_scroll.scroll_to_top_of_item(0);
+    }
+
     fn snippet_list_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = Self::tokens(cx);
         let cur = self.snippet_window;
@@ -1836,6 +1882,9 @@ impl MainWindow {
                             }
                             this.preview_snippet_lock = true;
                             this.fetch_snippet_window(entry_idx, w, true, cx);
+                            // docx：内容区滚到该命中所在块。
+                            this.scroll_to_hit(w);
+                            cx.notify();
                         })
                     })
                     // 序号
@@ -2108,6 +2157,7 @@ impl MainWindow {
         let req_gen = self.docx_gen;
         self.docx_doc = None;
         self.docx_hits.clear();
+        self.docx_focus = None;
         cx.spawn(async move |this, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || {
@@ -2304,18 +2354,21 @@ impl MainWindow {
         self.preview_snippet = hit.snippet.clone();
         self.snippet_window = hit.snippet_window;
         self.snippet_total = hit.snippet_total;
-        // 新目标：编号列表清空（旧文档的窗与新目标无关），收起面板。
+        // 全文检索：选中非目录文件即激活命中上下文 tab（不等全文/摘要异步返回）。
+        // 非全文查询：沿用旧口径（有摘要才激活）。
+        let content_query = self.is_content_query(cx);
+        // 新目标：编号列表清空（旧文档的窗与新目标无关）。
         self.snippet_list.clear();
-        self.snippet_list_open = false;
+        // AnyTXT 式：全文检索时默认展开编号列表（内容在上、列表在下）。
+        self.snippet_list_open = content_query || hit.snippet_total > 1;
         self.snippet_list_loading = false;
         self.full_text.clear();
         self.full_spans.clear();
         self.full_total = 0;
         self.full_truncated = false;
-        // 新目标默认激活摘要 tab（有摘要才显示该 tab）；手动点过 tab 的选择不受影响
-        // 由各 tab 按钮自行加锁（见 toggle 行），这里先恢复未锁定。
         if reset_view {
-            self.preview_snippet_view = !hit.snippet.is_empty();
+            self.preview_snippet_view =
+                !hit.is_directory && (content_query || !hit.snippet.is_empty());
             self.preview_snippet_lock = false;
         }
         // 选中行无摘要时按需补第 0 窗（列表首屏只填前 N 行；失败静默）。
@@ -3204,86 +3257,6 @@ impl MainWindow {
             .border_l_1()
             .border_color(tokens.border)
             .child(header)
-            // 命中上下文卡（content: 查询选中行；全文开关控制显隐）。
-            .when(
-                !self.preview_snippet.is_empty()
-                    && self.session.read(cx).settings.content_snippet
-                    && !self
-                        .preview
-                        .meta
-                        .as_ref()
-                        .is_some_and(|m| preview_has_mode_tabs(&m.path)),
-                |view| {
-                    let (plain, ranges) =
-                        search_logic::snippet_plain_and_ranges(&self.preview_snippet);
-                    view.child(
-                        v_flex()
-                            .w_full()
-                            .flex_shrink_0()
-                            .px_3()
-                            .py_2()
-                            .gap_1()
-                            .border_b_1()
-                            .border_color(tokens.border_soft)
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .text_xs()
-                                            .text_color(tokens.text_tertiary)
-                                            .child("命中上下文"),
-                                    ),
-                            )
-                            // 命中上下文的操作栏：上一个/下一个（多处匹配时单起一行）。
-                            .when(self.snippet_total > 1, |view| {
-                                view.child(
-                                    h_flex()
-                                        .w_full()
-                                        .flex_shrink_0()
-                                        .px_3()
-                                        .py_1()
-                                        .gap_1()
-                                        .border_b_1()
-                                        .border_color(tokens.border_soft)
-                                        .child(self.snippet_pager(cx)),
-                                )
-                            })
-                            // 编号命中列表（AnyTXT 式）：展开时列全部窗口，点行号跳窗。
-                            .when(self.snippet_list_open, |view| {
-                                view.child(
-                                    div()
-                                        .w_full()
-                                        .flex_shrink_0()
-                                        .px_3()
-                                        .py_1()
-                                        .border_b_1()
-                                        .border_color(tokens.border_soft)
-                                        .child(self.snippet_list_view(cx)),
-                                )
-                            })
-                            .child(
-                                div().w_full().text_sm().child(
-                                    StyledText::new(plain).with_highlights(
-                                        ranges.into_iter().map(|range| {
-                                            (
-                                                range,
-                                                HighlightStyle {
-                                                    color: Some(tokens.hit_fg),
-                                                    background_color: Some(tokens.hit_bg),
-                                                    ..Default::default()
-                                                },
-                                            )
-                                        }),
-                                    ),
-                                ),
-                            ),
-                    )
-                },
-            )
             .when(self.preview.meta.as_ref().is_some_and(|m| std::path::Path::new(&m.path)
                 .extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pdf")))
                 && self.preview.pdf.is_some(), |view| {
@@ -3298,10 +3271,11 @@ impl MainWindow {
                     view.child(
                         h_flex().px_2().py_1().gap_1().flex_shrink_0().children(
                             {
-                                // 命中上下文排第一个：有摘要时默认激活，占整块预览区。
+                                // 命中上下文排第一个：全文检索即出现（不等异步摘要），
+                                // 非全文查询仍有摘要时也展示。
                                 let mut tabs: Vec<(&'static str, &'static str, bool)> =
                                     vec![];
-                                if !self.preview_snippet.is_empty() {
+                                if self.hit_ctx_available(cx) {
                                     tabs.push((
                                         "snippet",
                                         "命中上下文",
@@ -3439,22 +3413,26 @@ impl MainWindow {
                             .flex_1()
                             .min_h_0()
                             .min_w_0()
+                            .track_scroll(&self.hit_scroll)
                             .overflow_y_scrollbar()
                             .px_3()
                             .py_2()
                             .text_sm()
-                            .child({
-                                // docx：有块模型就自绘真版式（标题/段落/粗体/表格/命中高亮）；
-                                // 未解析完成或解析失败时回退纯文本列（渐进态）。
-                                if let Some(doc) = self.docx_doc.as_ref() {
-                                    crate::ui::rich_view::render_docx(
-                                        doc,
-                                        &self.docx_hits,
-                                        &tokens,
-                                    )
+                            // 每个块一个子元素：ScrollHandle::scroll_to_item(块号) 才能定位。
+                            .children(if let Some(doc) = self.docx_doc.as_ref() {
+                                // docx：纯 Rust 自绘真版式（标题/段落/粗体/表格/命中高亮）。
+                                crate::ui::rich_view::render_docx(doc, &self.docx_hits, self.docx_focus, &tokens)
+                            } else {
+                                // 未解析完成或解析失败：回退纯文本列（渐进态）。
+                                let (plain, ranges) = self.hit_text_and_ranges();
+                                if plain.trim().is_empty() {
+                                    vec![div()
+                                        .text_sm()
+                                        .text_color(tokens.text_tertiary)
+                                        .child("正在加载命中上下文…")
+                                        .into_any_element()]
                                 } else {
-                                    let (plain, ranges) = self.hit_text_and_ranges();
-                                    StyledText::new(plain)
+                                    vec![StyledText::new(plain)
                                         .with_highlights(ranges.into_iter().map(|range| {
                                             (
                                                 range,
@@ -3465,7 +3443,7 @@ impl MainWindow {
                                                 },
                                             )
                                         }))
-                                        .into_any_element()
+                                        .into_any_element()]
                                 }
                             })
                             .into_any_element(),
