@@ -304,6 +304,32 @@ fn parse_hex_color(s: &str) -> Option<u32> {
 // 命中匹配（docx 侧自算，不依赖 service 的提取器）
 // ---------------------------------------------------------------------------
 
+/// 多词命中：每个查询词分别匹配后合并（与 service 的 AND 语义一致）。
+/// 用户输入 `马春天 我与青松` → 两个词各自在文中定位，
+/// 而不是拿整串「马春天 我与青松」当子串找（那样永远不命中）。
+pub fn match_hits_multi(text: &str, needles: &[String]) -> Vec<std::ops::Range<usize>> {
+    let mut all: Vec<std::ops::Range<usize>> = Vec::new();
+    for n in needles {
+        all.extend(match_hits(text, n));
+        if all.len() >= 4000 {
+            break;
+        }
+    }
+    all.sort_by_key(|r| r.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(all.len());
+    for r in all {
+        if let Some(last) = merged.last_mut() {
+            if r.start <= last.end {
+                last.end = last.end.max(r.end);
+                continue;
+            }
+        }
+        merged.push(r);
+    }
+    merged.truncate(2000);
+    merged
+}
+
 /// 在文本里查查询词的命中区间：先字面（ASCII 小写），失败再走拼音对齐。
 /// 为什么要自算：service 用 `document_preview::xml_text`、文档侧用 rdocx，
 /// 两套提取器的空白/表格顺序不同，跨提取器按字节定位会失败。
@@ -448,6 +474,18 @@ mod tests {
         let hits2 = match_hits(t, "mct");
         assert_eq!(hits2.len(), 1, "首字母应命中马春天");
         assert_eq!(&t[hits2[0].clone()], "马春天");
+    }
+
+    #[test]
+    fn multi_needles_merge() {
+        let t = "我与青松——马春天文案。开头：轻松工作，马春天加入青松。";
+        let hits = match_hits_multi(t, &["马春天".into(), "青松".into()]);
+        // 马春天×2 + 青松×2
+        assert!(hits.len() >= 4, "got {}", hits.len());
+        // 区间不重叠且有序
+        for w in hits.windows(2) {
+            assert!(w[0].end <= w[1].start);
+        }
     }
 
     #[test]

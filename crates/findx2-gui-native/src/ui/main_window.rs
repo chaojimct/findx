@@ -384,26 +384,44 @@ fn flatten_with_ranges(
     (out, new_ranges)
 }
 
-/// 从查询串里取 `content:` / `utf8content:` 的值（去掉引号与修饰符）。
-/// `content:"马春天" glob:0` → `马春天`
-fn content_needle_of(query: &str) -> Option<String> {
+/// 从查询串里取 `content:` / `utf8content:` 的**查询词列表**。
+/// `content:"马春天 我与青松" glob:0` → ["马春天", "我与青松"]
+/// `content:马春天` → ["马春天"]
+fn content_needles_of(query: &str) -> Vec<String> {
     let lower = query.to_ascii_lowercase();
     for key in ["content:", "utf8content:"] {
         if let Some(i) = lower.find(key) {
             let rest = &query[i + key.len()..];
             let v = rest.trim_start();
-            let needle: String = if let Some(stripped) = v.strip_prefix('"') {
+            let inner: String = if let Some(stripped) = v.strip_prefix('"') {
                 stripped.chars().take_while(|&c| c != '"').collect()
             } else {
-                v.chars().take_while(|c| !c.is_whitespace()).collect()
+                v.chars()
+                    .take_while(|c| !c.is_whitespace())
+                    .collect::<String>()
             };
-            let needle = needle.trim().to_string();
-            if !needle.is_empty() {
-                return Some(needle);
+            let mut out: Vec<String> = inner
+                .split_whitespace()
+                .map(|s| s.trim().to_string())
+                // 跳过修饰符（如 glob:0 / exact:1 / sort:name）
+                .filter(|s| !s.is_empty() && s.len() <= 64 && !s.contains(':'))
+                .collect();
+            if out.is_empty() {
+                let t = inner.trim();
+                if !t.is_empty() {
+                    out.push(t.to_string());
+                }
             }
+            return out;
         }
     }
-    None
+    // 非 content: 查询（标题/混合未包前缀）：整串当一个词。
+    let q = query.trim();
+    if q.is_empty() {
+        Vec::new()
+    } else {
+        vec![q.to_string()]
+    }
 }
 
 fn preview_has_mode_tabs(path: &str) -> bool {    matches!(
@@ -2214,10 +2232,11 @@ impl MainWindow {
             return;
         };
         let q = self.effective_query(cx);
-        let Some(needle) = content_needle_of(&q) else {
+        let needles = content_needles_of(&q);
+        if needles.is_empty() {
             return;
-        };
-        self.docx_hits = crate::docx_blocks::match_hits(&doc.plain, &needle);
+        }
+        self.docx_hits = crate::docx_blocks::match_hits_multi(&doc.plain, &needles);
         // 命中定位：默认跳到第一处，避免长文档打开在开头看不到命中。
         self.docx_focus = self
             .docx_hits
