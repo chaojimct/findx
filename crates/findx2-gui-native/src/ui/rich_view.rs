@@ -173,28 +173,21 @@ pub fn render_pptx(
 const CELL_W: f32 = 112.0;
 const GUTTER_W: f32 = 46.0;
 
-/// 渲染当前 sheet 的网格（不含页签；页签由调用方渲染以便交互）。
-pub fn render_sheet(wb: &crate::xlsx_blocks::Workbook, tokens: &FindxTokens) -> AnyElement {
-    let Some(sheet) = wb.sheets.get(wb.focus_sheet) else {
+/// 渲染当前 sheet 网格：列标行（固定）+ 虚拟滚动数据区。
+/// 数据区用 `uniform_list`，只渲染可见行——上万行 sheet 也不卡。
+/// `cx` 用于构造行渲染闭包（闭包只捕获 `Arc<Sheet>`，无逐帧深拷贝）。
+pub fn render_sheet(
+    book: &crate::xlsx_blocks::Workbook,
+    tokens: &FindxTokens,
+) -> AnyElement {
+    let Some(sheet) = book.sheets.get(book.focus_sheet) else {
         return div().into_any_element();
     };
-    if sheet.oversized {
-        return div()
-            .p_3()
-            .text_sm()
-            .text_color(tokens.text_secondary)
-            .child(format!(
-                "「{}」数据量过大（上万行），已跳过网格渲染；可切换「文字摘录」查看内容。",
-                sheet.name
-            ))
-            .into_any_element();
-    }
     let cols = sheet.cols().max(1);
+    let row_h = 22.0;
 
-    let mut grid = v_flex().w(px(GUTTER_W + CELL_W * cols as f32));
-
-    // 列标行（A B C ...）
-    let mut head = h_flex().w_full().flex_shrink_0();
+    // 列标行（固定不滚动）
+    let mut head = h_flex().w(px(GUTTER_W + CELL_W * cols as f32)).flex_shrink_0();
     head = head.child(
         div()
             .w(px(GUTTER_W))
@@ -223,60 +216,94 @@ pub fn render_sheet(wb: &crate::xlsx_blocks::Workbook, tokens: &FindxTokens) -> 
                 .child(crate::xlsx_blocks::col_label(c)),
         );
     }
-    grid = grid.child(head);
 
-    // 数据行
-    for (r, row) in sheet.rows.iter().enumerate() {
-        let mut row_el = h_flex().w_full().flex_shrink_0();
-        row_el = row_el.child(
-            div()
-                .w(px(GUTTER_W))
-                .h(px(22.))
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .border_r_1()
-                .border_b_1()
-                .border_color(tokens.border_soft)
-                .bg(tokens.surface_raised)
-                .text_xs()
-                .text_color(tokens.text_tertiary)
-                .child(format!("{}", r + 1)),
-        );
-        for c in 0..cols {
-            let text = row.get(c).map(|s| s.as_str()).unwrap_or("");
-            let is_hit = sheet.hits.contains(&(r, c));
-            let mut cell = div()
-                .w(px(CELL_W))
-                .h(px(22.))
-                .flex_shrink_0()
-                .px_1()
-                .flex()
-                .items_center()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .border_r_1()
-                .border_b_1()
-                .border_color(tokens.border_soft)
-                .text_xs()
-                .text_color(tokens.text_primary);
-            if is_hit {
-                cell = cell.bg(tokens.hit_bg).text_color(tokens.hit_fg);
+    let row_count = sheet.rows.len();
+    let sheet_arc = std::sync::Arc::new(sheet.clone());
+    let hits: std::sync::Arc<Vec<(usize, usize)>> = std::sync::Arc::new(sheet.hits.clone());
+    let tokens_copy = *tokens;
+    let processor =
+        move |range: std::ops::Range<usize>,
+              _window: &mut gpui_kit::Window,
+              _cx: &mut gpui_kit::App|
+              -> Vec<AnyElement> {
+            let mut out: Vec<AnyElement> = Vec::with_capacity(range.len());
+            for r in range {
+                let row = sheet_arc.rows.get(r);
+                let mut row_el = h_flex()
+                    .w(px(GUTTER_W + CELL_W * cols as f32))
+                    .h(px(row_h))
+                    .flex_shrink_0();
+                row_el = row_el.child(
+                    div()
+                        .w(px(GUTTER_W))
+                        .h(px(row_h))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .border_r_1()
+                        .border_b_1()
+                        .border_color(tokens_copy.border_soft)
+                        .bg(tokens_copy.surface_raised)
+                        .text_xs()
+                        .text_color(tokens_copy.text_tertiary)
+                        .child(format!("{}", r + 1)),
+                );
+                for c in 0..cols {
+                    let text = row
+                        .and_then(|x| x.get(c))
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    let is_hit = hits.contains(&(r, c));
+                    let mut cell = div()
+                        .w(px(CELL_W))
+                        .h(px(row_h))
+                        .flex_shrink_0()
+                        .px_1()
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .border_r_1()
+                        .border_b_1()
+                        .border_color(tokens_copy.border_soft)
+                        .text_xs()
+                        .text_color(tokens_copy.text_primary);
+                    if is_hit {
+                        cell = cell.bg(tokens_copy.hit_bg).text_color(tokens_copy.hit_fg);
+                    }
+                    row_el = row_el.child(cell.child(text.to_string()));
+                }
+                out.push(row_el.into_any_element());
             }
-            cell = cell.child(text.to_string());
-            row_el = row_el.child(cell);
-        }
-        grid = grid.child(row_el);
-    }
+            out
+        };
 
-    // 横向 + 纵向滚动（网格可能比视口宽/高）
-    div()
-        .id("sheet-grid-scroll")
-        .size_full()
-        .overflow_x_scroll()
-        .overflow_y_scroll()
-        .child(grid)
+    let list = uniform_list("sheet-rows", row_count, processor)
+        .w(px(GUTTER_W + CELL_W * cols as f32))
+        .flex_1()
+        .min_h_0();
+
+    v_flex()
+        .w_full()
+        .h_full()
+        .min_h_0()
+        .child(
+            // 横向滚动包住「列标 + 数据区」，两者一起左右滚。
+            div()
+                .id("sheet-hscroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_x_scroll()
+                .child(
+                    v_flex()
+                        .w(px(GUTTER_W + CELL_W * cols as f32))
+                        .h_full()
+                        .min_h_0()
+                        .child(head)
+                        .child(list),
+                ),
+        )
         .into_any_element()
 }
 

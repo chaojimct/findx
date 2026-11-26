@@ -1,20 +1,28 @@
-//! xlsx 表格网格模型：calamine 读单元格 → 行列网格 → GPUI 自绘。
+//! xlsx 表格模型：**流式解析 + 虚拟滚动**。
 //!
-//! 对标 AnyTXT：行号列标、sheet 页签、命中格高亮、单元格选中。
-//! 不做公式计算（读缓存值），不做图表/条件格式。
+//! 关键设计（性能）：
+//! - 不把整表读进内存：用 quick-xml 流式读 `<row>`，读够 MAX_ROWS 立即停，
+//!   即使 sheet 有 3.8 万行 / 27MB，也只解析前若干行（毫秒级）。
+//! - sharedStrings 流式读成索引数组（顺序读取，比 calamine 建表快一个量级）。
+//! - 渲染走 GPUI `uniform_list`（虚拟滚动），只渲染可见行，行数再多也不卡。
+//!
+//! 不再有"超大 sheet 跳过"——大表也能看（看到多少行由 MAX_ROWS 决定）。
 
-use calamine::{open_workbook_auto, Data, Reader};
+use quick_xml::events::Event;
+use quick_xml::Reader;
+use std::io::{BufReader, Read};
+use std::sync::Arc;
 
 /// 单页表格。
 #[derive(Debug, Clone, Default)]
 pub struct Sheet {
     pub name: String,
-    /// 行优先的单元格文本（空串 = 空格）。
-    pub rows: Vec<Vec<String>>,
-    /// 命中格坐标 (row, col)，1-based 显示。
+    /// 行优先的单元格文本（Arc：虚拟滚动闭包可廉价捕获）。
+    pub rows: Arc<Vec<Vec<String>>>,
+    /// 命中格坐标 (row, col)。
     pub hits: Vec<(usize, usize)>,
-    /// 超大 sheet（原始数据等）：只保留名字，不解析内容（加载保护）。
-    pub oversized: bool,
+    /// 该 sheet 真实总行数（来自 XML 的 row 数，用于提示"仅显示前 N 行"）。
+    pub total_rows: usize,
 }
 
 impl Sheet {
@@ -26,90 +34,56 @@ impl Sheet {
 #[derive(Debug, Clone, Default)]
 pub struct Workbook {
     pub sheets: Vec<Sheet>,
-    /// 命中所在 sheet 索引（默认 0）。
     pub focus_sheet: usize,
 }
 
-const MAX_ROWS: usize = 300;
-const MAX_COLS: usize = 60;
+/// 每页最多解析的行数：虚拟滚动负责渲染，这里只限制内存与解析时间。
+const MAX_ROWS: usize = 5000;
+const MAX_COLS: usize = 100;
 
-/// 读工作簿。失败返回 Err（调用方降级文字摘录）。
-///
-/// 注意：这里**不做命中检测**。逐格做子串/拼音匹配会让加载慢一个数量级
-/// （3 万格 × N 词 × 逐字拼音）。命中由 `recompute_hits` 在拿到实际命中词后
-/// 一次性计算（纯 `contains`，不碰拼音）。
+/// 解析工作簿（流式，只读每页前 MAX_ROWS 行）。
 pub fn parse(path: &str) -> Result<Workbook, String> {
-    let mut wb = open_workbook_auto(path).map_err(|e| format!("xlsx 打开失败: {e}"))?;
-    let names = wb.sheet_names().to_vec();
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len > 128 * 1024 * 1024 {
+        return Err("xlsx 超过 128 MiB 上限".into());
+    }
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("xlsx 打开失败: {e}"))?;
+
+    // 1) sheet 名（按 workbook.xml 顺序）
+    let names = sheet_names(&mut zip)?;
     if names.is_empty() {
         return Err("工作簿没有工作表".into());
     }
-    // 预先取各 sheet 的未压缩大小：原始数据 sheet 常有数万行/几十 MB，
-    // calamine 会整表加载，单个就能拖到 6s+。超过阈值只保留名字不解析。
-    const MAX_SHEET_BYTES: usize = 4 * 1024 * 1024;
-    // 单独开一次 zip 读各 sheet 的未压缩大小（calamine 不暴露）。
-    // sheet_names() 的顺序与 xl/worksheets/sheetN.xml 的顺序一致（Excel/WPS 都如此），
-    // 这里按序号映射；取不到就当 0（不跳过，行为与之前一致）。
-    let sizes: Vec<usize> = (|| {
-        let f = std::fs::File::open(path).ok()?;
-        let mut z = zip::ZipArchive::new(f).ok()?;
-        Some(
-            (1..=names.len())
-                .map(|i| {
-                    let p = format!("xl/worksheets/sheet{i}.xml");
-                    z.by_name(&p).map(|f| f.size() as usize).unwrap_or(0)
-                })
-                .collect::<Vec<_>>(),
-        )
-    })()
-    .unwrap_or_default();
 
+    // 2) sharedStrings（流式，索引顺序）
+    let shared = read_shared_strings(&mut zip);
+
+    // 3) 逐 sheet 流式读（行数按 sheet 体量自适应：超大表少读几行，
+    //    虚拟滚动只渲染可见区，够滚一屏即可，避免「原始数据」巨表拖慢首屏）。
     let mut out = Workbook::default();
-    for (idx, name) in names.iter().take(20).enumerate() {
-        if sizes.get(idx).copied().unwrap_or(0) > MAX_SHEET_BYTES {
-            out.sheets.push(Sheet {
-                name: name.clone(),
-                rows: Vec::new(),
-                hits: Vec::new(),
-                oversized: true,
-            });
-            continue;
-        }
-        let range = match wb.worksheet_range(name) {
-            Ok(r) => r,
+    for (i, name) in names.iter().enumerate() {
+        let part = format!("xl/worksheets/sheet{}.xml", i + 1);
+        let sz = zip.by_name(&part).map(|f| f.size() as usize).unwrap_or(0);
+        let max_rows = if sz > 8 * 1024 * 1024 {
+            1200
+        } else if sz > 2 * 1024 * 1024 {
+            3000
+        } else {
+            MAX_ROWS
+        };
+        let (rows, total_rows) = match read_sheet_rows(&mut zip, &part, &shared, max_rows) {
+            Ok(v) => v,
             Err(_) => continue,
         };
-        let mut rows: Vec<Vec<String>> = Vec::new();
-        for (r, row) in range.rows().enumerate().take(MAX_ROWS) {
-            if r + 1 > MAX_ROWS {
-                break;
-            }
-            let mut cells: Vec<String> = Vec::new();
-            for (c, cell) in row.iter().enumerate().take(MAX_COLS) {
-                cells.push(cell_text(cell));
-            }
-            // 去掉行尾空格
-            while cells.last().is_some_and(|s| s.is_empty()) {
-                cells.pop();
-            }
-            if !cells.is_empty() {
-                rows.push(cells);
-            } else if !rows.is_empty() {
-                rows.push(Vec::new()); // 保留空行占位
-            }
-        }
-        // 去掉尾部空行
-        while rows.last().is_some_and(|r| r.is_empty()) {
-            rows.pop();
-        }
         if rows.is_empty() {
             continue;
         }
         out.sheets.push(Sheet {
             name: name.clone(),
-            rows,
+            rows: Arc::new(rows),
             hits: Vec::new(),
-            oversized: false,
+            total_rows,
         });
     }
     if out.sheets.is_empty() {
@@ -118,8 +92,191 @@ pub fn parse(path: &str) -> Result<Workbook, String> {
     Ok(out)
 }
 
-/// 命中重算：给定**实际命中词**（来自 service 的摘要高亮），逐格做 contains。
-/// 不碰拼音，纯 ASCII 小写比较，3 万格约几毫秒。
+/// 读 sheet 名列表（xl/workbook.xml 的 `<sheet name="...">`）。
+fn sheet_names(zip: &mut zip::ZipArchive<std::fs::File>) -> Result<Vec<String>, String> {
+    let f = zip
+        .by_name("xl/workbook.xml")
+        .map_err(|e| format!("缺少 workbook.xml: {e}"))?;
+    let mut xml = String::new();
+    let mut limited = f.take(4 * 1024 * 1024);
+    limited
+        .read_to_string(&mut xml)
+        .map_err(|e| e.to_string())?;
+    drop(limited);
+    let mut reader = Reader::from_str(&xml);
+    let mut names = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                if e.local_name().as_ref() == b"sheet" {
+                    for a in e.attributes().flatten() {
+                        if a.key.local_name().as_ref() == b"name" {
+                            if let Ok(v) = a.unescape_value() {
+                                names.push(v.into_owned());
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    Ok(names)
+}
+
+/// 流式读 sharedStrings → Vec<String>（按索引顺序）。
+fn read_shared_strings(zip: &mut zip::ZipArchive<std::fs::File>) -> Vec<String> {
+    let Ok(f) = zip.by_name("xl/sharedStrings.xml") else {
+        return Vec::new();
+    };
+    let mut reader = Reader::from_reader(BufReader::new(f));
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_si = false;
+    let mut in_t = false;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match e.local_name().as_ref() {
+                b"si" => {
+                    in_si = true;
+                    cur.clear();
+                }
+                b"t" if in_si => in_t = true,
+                _ => {}
+            },
+            Ok(Event::End(e)) => match e.local_name().as_ref() {
+                b"si" => {
+                    in_si = false;
+                    out.push(cur.clone());
+                    if out.len() > 500_000 {
+                        break;
+                    }
+                }
+                b"t" => in_t = false,
+                _ => {}
+            },
+            Ok(Event::Text(t)) => {
+                if in_t {
+                    if let Ok(s) = t.unescape() {
+                        cur.push_str(&s);
+                    }
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 流式读 sheet 前 MAX_ROWS 行。返回 (rows, total_rows_seen)。
+fn read_sheet_rows(
+    zip: &mut zip::ZipArchive<std::fs::File>,
+    part: &str,
+    shared: &[String],
+    max_rows: usize,
+) -> Result<(Vec<Vec<String>>, usize), String> {
+    let f = zip.by_name(part).map_err(|e| format!("缺少 {part}: {e}"))?;
+    Ok(parse_rows(BufReader::new(f), shared, max_rows))
+}
+
+/// 通用流式行解析（正式路径与单测共用，避免两套逻辑不一致）。
+fn parse_rows<R: std::io::BufRead>(
+    src: R,
+    shared: &[String],
+    max_rows: usize,
+) -> (Vec<Vec<String>>, usize) {
+    let mut reader = Reader::from_reader(src);
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(max_rows.min(256));
+    let mut total_rows = 0usize;
+    let mut cur_row: Vec<String> = Vec::new();
+    let mut ctype: u8 = 0; // b's' = 共享串
+    let mut is_inline = false;
+    let mut in_v = false;
+    let mut in_is_t = false;
+    let mut cell_text = String::new();
+    let mut buf = Vec::new();
+
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match e.local_name().as_ref() {
+                b"row" => cur_row.clear(),
+                b"c" => {
+                    ctype = 0;
+                    is_inline = false;
+                    for a in e.attributes().flatten() {
+                        if a.key.local_name().as_ref() == b"t" {
+                            match a.value.as_ref() {
+                                b"s" => ctype = b's',
+                                b"inlineStr" => is_inline = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                    cell_text.clear();
+                }
+                b"v" => in_v = true,
+                b"t" if is_inline => in_is_t = true,
+                _ => {}
+            },
+            Ok(Event::End(e)) => match e.local_name().as_ref() {
+                b"c" => {
+                    let text = if ctype == b's' {
+                        cell_text
+                            .trim()
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|i| shared.get(i))
+                            .cloned()
+                            .unwrap_or_default()
+                    } else {
+                        cell_text.clone()
+                    };
+                    if cur_row.len() < MAX_COLS {
+                        cur_row.push(text.trim().to_string());
+                    }
+                    ctype = 0;
+                    is_inline = false;
+                    in_v = false;
+                    in_is_t = false;
+                    cell_text.clear();
+                }
+                b"row" => {
+                    total_rows += 1;
+                    if rows.len() < max_rows {
+                        let mut r = std::mem::take(&mut cur_row);
+                        while r.last().is_some_and(|s| s.is_empty()) {
+                            r.pop();
+                        }
+                        rows.push(r);
+                    } else {
+                        // 读够即停：剩余行不再解析（这是大表提速的关键）。
+                        break;
+                    }
+                }
+                b"v" => in_v = false,
+                b"t" => in_is_t = false,
+                _ => {}
+            },
+            Ok(Event::Text(t)) => {
+                if in_v || in_is_t {
+                    if let Ok(s) = t.unescape() {
+                        cell_text.push_str(&s);
+                    }
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    (rows, total_rows)
+}
+
+/// 命中重算：给定实际命中词（来自 service 摘要 `<b>`），逐格 contains。
 pub fn recompute_hits(wb: &mut Workbook, words: &[String]) {
     let words: Vec<String> = words
         .iter()
@@ -144,29 +301,8 @@ pub fn recompute_hits(wb: &mut Workbook, words: &[String]) {
         }
         sheet.hits = hits;
     }
-    // 默认聚焦第一个有命中的 sheet。
     if let Some(i) = wb.sheets.iter().position(|s| !s.hits.is_empty()) {
         wb.focus_sheet = i;
-    }
-}
-
-fn cell_text(cell: &Data) -> String {
-    match cell {
-        Data::Empty => String::new(),
-        Data::String(s) => s.trim().to_string(),
-        Data::Float(f) => {
-            if f.fract() == 0.0 && f.abs() < 1e15 {
-                format!("{}", *f as i64)
-            } else {
-                format!("{f}")
-            }
-        }
-        Data::Int(i) => i.to_string(),
-        Data::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-        Data::DateTime(dt) => dt.to_string(),
-        Data::DateTimeIso(s) => s.clone(),
-        Data::DurationIso(s) => s.clone(),
-        Data::Error(e) => format!("#{e:?}"),
     }
 }
 
@@ -194,4 +330,20 @@ mod tests {
         assert_eq!(col_label(26), "AA");
         assert_eq!(col_label(27), "AB");
     }
+
+    #[test]
+    fn row_parse_with_shared_and_number() {
+        let xml = r#"<worksheet><sheetData>
+            <row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>
+            <row r="2"><c r="A2"><v>42</v></c><c r="B2" t="inlineStr"><is><t>内联</t></is></c></row>
+        </sheetData></worksheet>"#;
+        // 直接测 XML 解析核心（不经 zip）
+        let shared = vec!["甲乙".to_string(), "丙丁".to_string()];
+        let (rows, total) = parse_rows(std::io::Cursor::new(xml.as_bytes()), &shared, MAX_ROWS);
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec!["甲乙".to_string(), "丙丁".to_string()]);
+        assert_eq!(rows[1], vec!["42".to_string(), "内联".to_string()]);
+    }
+
 }

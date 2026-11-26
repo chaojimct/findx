@@ -2115,7 +2115,6 @@ dependencies = [
 name = "findx2-gui-native"
 version = "2.5.12"
 dependencies = [
- "calamine",
  "encoding_rs",
  "findx2-ipc",
  "flate2",

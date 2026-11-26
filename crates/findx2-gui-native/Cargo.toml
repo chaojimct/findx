@@ -50,8 +50,6 @@ rdocx = "0.17"
 rdocx-oxml = "0.17"
 # docx 侧命中匹配（拼音对齐）：轻量纯 Rust，与索引侧同源词表。
 pinyin = "0.11"
-# xlsx 表格网格自绘：读单元格（与索引侧同版本）。
-calamine = "0.38"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
