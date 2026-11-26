@@ -298,6 +298,14 @@ pub struct MainWindow {
     docx_hits: Vec<std::ops::Range<usize>>,
     /// docx 解析代（防止旧解析覆盖新目标）。
     docx_gen: u64,
+    /// 搜索选项：区分大小写（Aa）。标题搜索精确生效；全文搜索后置过滤。
+    search_match_case: bool,
+    /// 搜索选项：全匹配（ab）。整串连续出现才算命中。
+    search_exact: bool,
+    /// 搜索选项：通配符（*）。开 = `*`/`?` 生效；关 = 按字面。
+    search_wildcard: bool,
+    /// 搜索选项：OR 模式。默认 AND（分词词全要）；开 = 任一命中。
+    search_or: bool,
     /// 列表面板展开态（默认收起，只占 pager 行一个按钮）。
     snippet_list_open: bool,
     /// 列表拉取中（按钮置灰防重复请求）。
@@ -322,6 +330,56 @@ pub struct MainWindow {
 
 /// 原生预览宿主处理的文件类型（与 preview.rs 走同一条路：office 文档 + pdf）。
 /// 这类预览才有展示形态 tab 行（命中上下文/系统版式/文字摘录）。
+/// 单行化：把空白折叠成一个空格，同时按字符重映射高亮区间（保持对齐）。
+fn flatten_with_ranges(
+    text: &str,
+    ranges: &[std::ops::Range<usize>],
+) -> (String, Vec<std::ops::Range<usize>>) {
+    let mut out = String::with_capacity(text.len());
+    // 旧字节偏移 → 新字节偏移
+    let mut map: Vec<(usize, usize)> = Vec::with_capacity(text.len() + 1);
+    let mut prev_space = false;
+    for (i, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            if prev_space {
+                // 折叠：不产出，但记录映射（指向当前位置）
+                map.push((i, out.len()));
+                continue;
+            }
+            prev_space = true;
+            map.push((i, out.len()));
+            out.push(' ');
+        } else {
+            prev_space = false;
+            map.push((i, out.len()));
+            out.push(ch);
+        }
+    }
+    map.push((text.len(), out.len()));
+    let remap = |b: usize| -> usize {
+        // 二分找最后一个 <= b 的映射
+        match map.binary_search_by_key(&b, |&(old, _)| old) {
+            Ok(i) => map[i].1,
+            Err(i) => {
+                if i == 0 {
+                    0
+                } else {
+                    map[i - 1].1
+                }
+            }
+        }
+    };
+    let new_ranges = ranges
+        .iter()
+        .filter_map(|r| {
+            let a = remap(r.start.min(text.len()));
+            let b = remap(r.end.min(text.len()));
+            (b > a).then_some(a..b)
+        })
+        .collect();
+    (out, new_ranges)
+}
+
 fn preview_has_mode_tabs(path: &str) -> bool {
     matches!(
         std::path::Path::new(path)
@@ -561,6 +619,10 @@ impl MainWindow {
             docx_doc: None,
             docx_hits: Vec::new(),
             docx_gen: 0,
+            search_match_case: false,
+            search_exact: false,
+            search_wildcard: false,
+            search_or: false,
             preview_snippet_view: false,
             preview_snippet_lock: false,
             last_content_width: 1100.0,
@@ -1016,8 +1078,29 @@ impl MainWindow {
         }));
     }
 
+    /// 把搜索选项拼进查询串（只用于发请求；输入框显示不变）。
+    /// `case:1` 大小写、`exact:1` 全匹配（优先）、`or:1` 分词任一、`glob:0` 关通配。
+    fn effective_query(&self, cx: &mut Context<Self>) -> String {
+        let mut q = self.current_query(cx);
+        if q.trim().is_empty() {
+            return q;
+        }
+        if self.search_match_case {
+            q.push_str(" case:1");
+        }
+        if self.search_exact {
+            q.push_str(" exact:1");
+        } else if self.search_or {
+            q.push_str(" or:1");
+        }
+        if !self.search_wildcard {
+            q.push_str(" glob:0");
+        }
+        q
+    }
+
     fn run_search(&mut self, cx: &mut Context<Self>) {
-        let query = self.current_query(cx);
+        let query = self.effective_query(cx);
         if query.trim().is_empty() {
             self.record_reset("查询变空");
             self.hits.clear();
@@ -1690,54 +1773,118 @@ impl MainWindow {
         let total = self.snippet_total as usize;
         let rows = self.snippet_list.clone();
         let shown = rows.len();
+        // 整串查询词：用于判断每条是「全匹配」还是「分词匹配」。
+        let needle = {
+            let q = self.current_query(cx);
+            let lower = q.to_ascii_lowercase();
+            lower
+                .split("content:")
+                .nth(1)
+                .map(|rest| {
+                    let v = rest.trim_start();
+                    if let Some(stripped) = v.strip_prefix('"') {
+                        stripped.chars().take_while(|&c| c != '"').collect::<String>()
+                    } else {
+                        v.chars().take_while(|c| !c.is_whitespace()).collect::<String>()
+                    }
+                })
+                .filter(|s| !s.is_empty())
+        };
         v_flex()
             .w_full()
             .flex_shrink_0()
             .gap_px()
             .children(rows.into_iter().map(|(w, html)| {
-                let (plain, _) = search_logic::snippet_plain_and_ranges(&html);
-                let one: String = plain.split_whitespace().collect::<Vec<_>>().join(" ");
-                let short: String = if one.chars().count() > 96 {
-                    one.chars().take(96).collect::<String>() + "…"
+                let (plain, ranges) = search_logic::snippet_plain_and_ranges(&html);
+                // 单行：空白折叠（不改变字符数，只把连续空白压成一个空格，
+                // 这样 ranges 仍然有效——用字符级重算）。
+                let (flat, flat_ranges) = flatten_with_ranges(&plain, &ranges);
+                // 匹配类型：任一命中区间内容等于整串查询词 → 全匹配。
+                let is_exact = needle.as_ref().is_some_and(|n| {
+                    flat_ranges
+                        .iter()
+                        .any(|r| flat.get(r.clone()).is_some_and(|s| s.eq_ignore_ascii_case(n)))
+                });
+                let badge_text = if is_exact { "全" } else { "词" };
+                let badge_color = if is_exact {
+                    tokens.accent
                 } else {
-                    one
+                    tokens.text_tertiary
                 };
-                let badge = Button::new(SharedString::from(format!("snippet-goto-{w}")))
-                    .ghost()
-                    .label(format!("{}", w + 1))
-                    .selected(w == cur)
-                    .h(px(20.))
-                    .px_2()
-                    .tooltip(format!("跳到第 {} 处", w + 1))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let Some(entry_idx) =
-                            this.active_workspace_hit().map(|h| h.entry_idx)
-                        else {
-                            return;
-                        };
-                        if !this.snippet_list_open {
-                            return;
-                        }
-                        this.preview_snippet_lock = true;
-                        this.fetch_snippet_window(entry_idx, w, true, cx);
-                    }));
+                let selected = w == cur;
+                let entity = cx.entity();
                 h_flex()
+                    .id(SharedString::from(format!("snippet-row-{w}")))
                     .w_full()
                     .items_center()
-                    .gap_1()
+                    .gap(px(6.))
                     .px_2()
-                    .child(badge)
+                    .py(px(3.))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(selected, |d| d.bg(tokens.row_selected))
+                    .hover(|d| d.bg(tokens.hover))
+                    .on_click(move |_, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            let Some(entry_idx) =
+                                this.active_workspace_hit().map(|h| h.entry_idx)
+                            else {
+                                return;
+                            };
+                            if !this.snippet_list_open {
+                                return;
+                            }
+                            this.preview_snippet_lock = true;
+                            this.fetch_snippet_window(entry_idx, w, true, cx);
+                        })
+                    })
+                    // 序号
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(18.))
+                            .text_xs()
+                            .text_color(tokens.text_tertiary)
+                            .child(format!("{}", w + 1)),
+                    )
+                    // 匹配类型徽章
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px(px(3.))
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(badge_color)
+                            .when(is_exact, |d| d.bg(tokens.row_selected))
+                            .child(badge_text),
+                    )
+                    // 单行上下文（命中高亮）
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
                             .text_xs()
-                            .text_color(if w == cur {
+                            .text_color(if selected {
                                 tokens.text_primary
                             } else {
                                 tokens.text_secondary
                             })
-                            .child(short),
+                            .child(
+                                StyledText::new(flat).with_highlights(
+                                    flat_ranges.into_iter().map(|r| {
+                                        (
+                                            r,
+                                            HighlightStyle {
+                                                background_color: Some(tokens.hit_bg),
+                                                color: Some(tokens.hit_fg),
+                                                ..Default::default()
+                                            },
+                                        )
+                                    }),
+                                ),
+                            ),
                     )
             }))
             .when(total > shown, |v| {
@@ -1770,7 +1917,7 @@ impl MainWindow {
         if !self.session.read(cx).settings.content_snippet {
             return;
         }
-        let sent = self.current_query(cx);
+        let sent = self.effective_query(cx);
         if !sent.to_ascii_lowercase().contains("content:") {
             return;
         }
@@ -1842,7 +1989,7 @@ impl MainWindow {
         if self.snippet_list_loading {
             return;
         }
-        let sent = self.current_query(cx);
+        let sent = self.effective_query(cx);
         if !sent.to_ascii_lowercase().contains("content:") {
             return;
         }
@@ -1902,7 +2049,7 @@ impl MainWindow {
         if !self.session.read(cx).settings.content_snippet {
             return;
         }
-        let sent = self.current_query(cx);
+        let sent = self.effective_query(cx);
         if !sent.to_ascii_lowercase().contains("content:") {
             return;
         }
@@ -2054,7 +2201,7 @@ impl MainWindow {
         if self.workspace.mode != ViewMode::Search || self.preview_file.is_some() {
             return;
         }
-        let sent = self.current_query(cx);
+        let sent = self.effective_query(cx);
         if !sent.to_ascii_lowercase().contains("content:") {
             return;
         }

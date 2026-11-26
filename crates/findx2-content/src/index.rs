@@ -31,6 +31,17 @@ use crate::{Error, Result};
 pub const SCHEMA_VERSION: u32 = 2;
 pub const TOKENIZER_JIEBA: &str = "jieba_findx";
 
+/// 全文匹配模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MatchMode {
+    /// 整串连续出现（PhraseQuery slop=0）——「全匹配」。
+    Exact,
+    /// 分词后全部词都要有（默认 AND）。
+    All,
+    /// 分词后任一命中（OR）。
+    #[default]
+    Any,
+}
 /// 列表摘要单文件上限（字节）：超过直接缺席、选中后单窗补取。
 /// 实测 18MB xlsx 解析一次约 25 秒、7.6MB js 约 5 秒——列表装配等不起；
 /// 4MB 以下 office/文本通常在数百毫秒内完成。
@@ -293,10 +304,97 @@ impl ContentIndex {
 
     /// 快查询：只要 (volume_id, frn, score)，不生成 snippet（展示页按需取）。
     pub fn search_ids(&self, query_text: &str, limit: usize) -> Result<Vec<(String, u64, f32)>> {
+        self.search_ids_mode(query_text, limit, MatchMode::Any)
+    }
+
+    /// 全文检索（显式匹配模式）。
+    /// - `Exact`：整串连续出现（分词后 PhraseQuery slop=0）——「全匹配」。
+    /// - `All`：分词后全部词都要有（BooleanQuery Must）——默认 AND。
+    /// - `Any`：分词后任一命中（Should）——OR 模式 / 旧行为。
+    pub fn search_ids_mode(
+        &self,
+        query_text: &str,
+        limit: usize,
+        mode: MatchMode,
+    ) -> Result<Vec<(String, u64, f32)>> {
+        use tantivy::query::{
+            BooleanQuery, Occur, PhraseQuery, Query, TermQuery,
+        };
+        use tantivy::schema::IndexRecordOption;
+        use tantivy::Term;
         self.reader.reload()?;
         let searcher = self.reader.searcher();
-        let qp = QueryParser::for_index(searcher.index(), vec![self.fields.body]);
-        let query = qp.parse_query(query_text).map_err(Error::from)?;
+        let field = self.fields.body;
+        let mut tok = HybridTokenizer::new();
+        // 取分词结果 + **索引里的真实 position**：jieba 对「学习积分」给出
+        // ("学习",0),("积分",2)——位置跳号，普通 PhraseQuery（要求逐 1 相邻）
+        // 永远匹配不上。Exact 模式必须用 new_with_offset 按原位置构造。
+        let (terms, term_positions) = {
+            use tantivy::tokenizer::{TokenStream, Tokenizer};
+            let mut st = tok.token_stream(query_text);
+            let mut terms = Vec::new();
+            let mut pos = Vec::new();
+            while st.advance() {
+                let tk = st.token();
+                if tk.text.is_empty() || !tk.text.chars().any(|c| c.is_alphanumeric()) {
+                    continue;
+                }
+                terms.push(tk.text.clone());
+                pos.push(tk.position as usize);
+            }
+            (terms, pos)
+        };
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query: Box<dyn Query> = match mode {
+            MatchMode::Exact => {
+                // 用分词时的真实 position（jieba 可能跳号，见上）。
+                let ts: Vec<(usize, Term)> = terms
+                    .iter()
+                    .zip(term_positions.iter())
+                    .map(|(t, p)| (*p, Term::from_field_text(field, t)))
+                    .collect();
+                if ts.len() == 1 {
+                    Box::new(TermQuery::new(
+                        ts[0].1.clone(),
+                        IndexRecordOption::WithFreqs,
+                    ))
+                } else {
+                    Box::new(PhraseQuery::new_with_offset(ts))
+                }
+            }
+            MatchMode::All => {
+                let sub: Vec<(Occur, Box<dyn Query>)> = terms
+                    .iter()
+                    .map(|t| {
+                        (
+                            Occur::Must,
+                            Box::new(TermQuery::new(
+                                Term::from_field_text(field, t),
+                                IndexRecordOption::WithFreqs,
+                            )) as Box<dyn Query>,
+                        )
+                    })
+                    .collect();
+                Box::new(BooleanQuery::new(sub))
+            }
+            MatchMode::Any => {
+                let sub: Vec<(Occur, Box<dyn Query>)> = terms
+                    .iter()
+                    .map(|t| {
+                        (
+                            Occur::Should,
+                            Box::new(TermQuery::new(
+                                Term::from_field_text(field, t),
+                                IndexRecordOption::WithFreqs,
+                            )) as Box<dyn Query>,
+                        )
+                    })
+                    .collect();
+                Box::new(BooleanQuery::new(sub))
+            }
+        };
         let top = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
         let mut out = Vec::with_capacity(top.len());
         for (score, addr) in top {
@@ -752,8 +850,14 @@ impl findx2_core::ContentSearch for ContentIndex {
         &self,
         query: &str,
         limit: usize,
+        mode: findx2_core::ContentMatchMode,
     ) -> std::result::Result<Vec<(String, u64)>, findx2_core::Error> {
-        self.search_ids(query, limit)
+        let m = match mode {
+            findx2_core::ContentMatchMode::Exact => MatchMode::Exact,
+            findx2_core::ContentMatchMode::All => MatchMode::All,
+            findx2_core::ContentMatchMode::Any => MatchMode::Any,
+        };
+        self.search_ids_mode(query, limit, m)
             .map(|hits| {
                 hits.into_iter()
                     .map(|(volume_id, frn, _)| (volume_id, frn))

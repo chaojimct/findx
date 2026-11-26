@@ -69,6 +69,12 @@ pub struct ParsedQuery {
     pub regex_pattern: Option<String>,
     /// 通配
     pub glob_pattern: Option<String>,
+    /// `glob:0` 关闭通配解释（`*`/`?` 按字面）；缺省 true。
+    pub glob_enabled: bool,
+    /// `exact:1` 全文全匹配：整串连续出现才算命中（PhraseQuery slop=0）。
+    pub exact: bool,
+    /// `or:1` 全文分词任一命中（默认 AND 全要）。
+    pub or_mode: bool,
     /// 强制拼音；需 `pinyin` feature
     pub pinyin_only: bool,
     pub no_pinyin: bool,
@@ -132,6 +138,9 @@ impl Default for ParsedQuery {
             not_substring: None,
             regex_pattern: None,
             glob_pattern: None,
+            glob_enabled: true,
+            exact: false,
+            or_mode: false,
             pinyin_only: false,
             no_pinyin: false,
             limit: DEFAULT_LIMIT,
@@ -246,7 +255,7 @@ impl QueryParser {
                     }
                 }
             } else {
-                if token.contains('*') || token.contains('?') {
+                if q.glob_enabled && (token.contains('*') || token.contains('?')) {
                     q.glob_pattern = Some(token.to_string());
                 } else {
                     let tnorm = norm_case(&q, token.to_string());
@@ -332,6 +341,18 @@ fn apply_func(q: &mut ParsedQuery, key: &str, val: &str) -> std::result::Result<
             q.case_sensitive = v == "1" || v == "yes" || v == "sensitive";
         }
         "nocase" => q.case_sensitive = false,
+        "exact" => {
+            let v = val.trim().to_ascii_lowercase();
+            q.exact = v != "0" && v != "false" && v != "no";
+        }
+        "or" => {
+            let v = val.trim().to_ascii_lowercase();
+            q.or_mode = v != "0" && v != "false" && v != "no";
+        }
+        "glob" => {
+            let v = val.trim().to_ascii_lowercase();
+            q.glob_enabled = v != "0" && v != "false" && v != "no";
+        }
         "wholeword" => {
             let v = val.trim().to_ascii_lowercase();
             q.whole_word = v != "0" && v != "false" && v != "no";
@@ -1021,6 +1042,9 @@ fn try_parse_func(s: &str) -> Result<Option<(&'static str, &str, &str)>, Error> 
         "folder" => Some("folder"),
         "case" => Some("case"),
         "nocase" => Some("nocase"),
+        "exact" => Some("exact"),
+        "or" => Some("or"),
+        "glob" => Some("glob"),
         "wholeword" => Some("wholeword"),
         "wfn" => Some("wfn"),
         "startwith" => Some("startwith"),

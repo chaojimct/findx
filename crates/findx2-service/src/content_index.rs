@@ -368,14 +368,20 @@ impl findx2_core::ContentSearch for MergedContentSearch {
         &self,
         query: &str,
         limit: usize,
+        mode: findx2_core::ContentMatchMode,
     ) -> Result<Vec<(String, u64)>, findx2_core::Error> {
         use std::collections::HashSet;
         let map_err = |e: findx2_content::Error| {
             findx2_core::Error::Persist(format!("内容索引查询失败: {e}"))
         };
+        let content_mode = match mode {
+            findx2_core::ContentMatchMode::Exact => findx2_content::MatchMode::Exact,
+            findx2_core::ContentMatchMode::All => findx2_content::MatchMode::All,
+            findx2_core::ContentMatchMode::Any => findx2_content::MatchMode::Any,
+        };
         let main_hits = self
             .main
-            .search_ids(query, limit)
+            .search_ids_mode(query, limit, content_mode)
             .map_err(map_err)?;
         if !query.is_ascii() || limit == 0 {
             return Ok(main_hits

@@ -157,8 +157,72 @@ impl MainWindow {
     /// 搜索框输入框内左侧的三段 switch（名称/全文/混合，直选）。
     /// 去边框底色、直接长在输入框底色上；选中态只靠滑动指示块 + 加粗。
     /// tooltip 保留完整语义即拼音入口。
-    fn mode_segmented(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        use crate::settings_logic::{CONTENT_MODE_PAD_X, CONTENT_MODE_SEG_W};
+    /// 搜索框内部右侧的选项图标组：Aa（大小写）/ ab（全匹配）/ *（通配符）/ OR。
+    /// 点击即切换并立刻重搜；状态不落盘（会话内有效）。
+    fn search_option_icons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tokens = Self::tokens(cx);
+        let opts: [(&'static str, &'static str, &'static str, bool); 4] = [
+            (
+                "search-opt-case",
+                "Aa",
+                "区分大小写：标题搜索精确生效；全文搜索按原文后置过滤",
+                self.search_match_case,
+            ),
+            (
+                "search-opt-exact",
+                "ab",
+                "全匹配：整串连续出现才算命中（关闭 = 分词匹配）",
+                self.search_exact,
+            ),
+            (
+                "search-opt-glob",
+                "*",
+                "通配符：* 任意多字，? 单字（关闭时按字面）",
+                self.search_wildcard,
+            ),
+            (
+                "search-opt-or",
+                "OR",
+                "OR 模式：分词词任一命中即可（默认 AND 全要）",
+                self.search_or,
+            ),
+        ];
+        h_flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(1.))
+            .pr(px(2.))
+            .children(opts.into_iter().map(|(id, label, tip, on)| {
+                let entity = cx.entity();
+                Button::new(id)
+                    .ghost()
+                    .label(label)
+                    .selected(on)
+                    .h(px(18.))
+                    .px(px(4.))
+                    .tooltip(tip)
+                    .on_click(move |_, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            match id {
+                                "search-opt-case" => {
+                                    this.search_match_case = !this.search_match_case
+                                }
+                                "search-opt-exact" => this.search_exact = !this.search_exact,
+                                "search-opt-glob" => this.search_wildcard = !this.search_wildcard,
+                                "search-opt-or" => this.search_or = !this.search_or,
+                                _ => {}
+                            }
+                            cx.notify();
+                            // 选项变化立即按新口径重搜（有查询词时）。
+                            if !this.current_query(cx).trim().is_empty() {
+                                this.run_search(cx);
+                            }
+                        })
+                    })
+            }))
+    }
+
+    fn mode_segmented(&self, cx: &mut Context<Self>) -> impl IntoElement {        use crate::settings_logic::{CONTENT_MODE_PAD_X, CONTENT_MODE_SEG_W};
         let tokens = Self::tokens(cx);
         let gx = self.content_mode_glide_px;
         h_flex()
@@ -276,18 +340,15 @@ impl MainWindow {
             .child(
                 div().flex_1().min_w_0().child({
                     let input = Input::new(&self.search)
-                        .cleanable(true)
-                        .focus_bordered(false);
+                        .cleanable(false)
+                        .focus_bordered(false)
+                        .suffix(self.search_option_icons(cx));
                     if content_enabled {
                         input.prefix(self.mode_segmented(cx))
                     } else {
                         input
                     }
                 }),
-            )
-            .child(
-                self.tool_button("search-reveal", "定位", 3, false, cx)
-                    .disabled(self.active_workspace_hit().is_none()),
             )
             .child(self.tool_button("search-preview", "预览", 0, preview, cx))
     }

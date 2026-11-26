@@ -82,8 +82,27 @@ pub struct SearchOptions {
 
 /// 内容倒排查询接口：给定 tantivy 查询串，返回命中的 `(volume_id, frn)`。
 /// 映射到 entry_idx 由 `filter_content` 经 `frn_to_entry.get_scoped` 完成。
+///
+/// `mode`：全文匹配口径（Exact 整串 / All 分词全要 / Any 分词任一）。
 pub trait ContentSearch: Send + Sync {
-    fn search_content(&self, query: &str, limit: usize) -> Result<Vec<(String, u64)>>;
+    fn search_content(
+        &self,
+        query: &str,
+        limit: usize,
+        mode: ContentMatchMode,
+    ) -> Result<Vec<(String, u64)>>;
+}
+
+/// 全文匹配口径（core 侧定义，避免 core 依赖 tantivy/content crate）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContentMatchMode {
+    /// 整串连续出现（「全匹配」）。
+    Exact,
+    /// 分词后全部词都要有（默认 AND）。
+    All,
+    /// 分词后任一命中（OR）。
+    #[default]
+    Any,
 }
 
 impl std::fmt::Debug for SearchOptions {
@@ -3551,7 +3570,18 @@ fn filter_content(
         if cap == 0 {
             return Ok(vec![]);
         }
-        let matches = cs.search_content(ns, cap)?;
+        // 匹配口径：exact（整串）优先；否则 or_mode ? Any : All（默认 AND）。
+        // exact 用「All 取候选 + 原文整串校验」而不是 PhraseQuery：jieba 的
+        // position 随上下文变化（实测「学习积分」→ 学习@0/积分@2），
+        // phrase 会漏判；整串校验只依赖原文，结果可预期。
+        let mode = if q.exact {
+            ContentMatchMode::All
+        } else if q.or_mode {
+            ContentMatchMode::Any
+        } else {
+            ContentMatchMode::All
+        };
+        let matches = cs.search_content(ns, cap, mode)?;
         let slot_of: HashMap<&str, u32> = store
             .volumes
             .iter()
@@ -3572,11 +3602,36 @@ fn filter_content(
             }
         }
         // 纯 `content:` 查询 hits 常是数百万全表，并行求交（乱序无妨，下游重排）。
-        return Ok(hits
+        let mut out: Vec<u32> = hits
             .par_iter()
             .filter(|i| set.contains(*i))
             .copied()
-            .collect());
+            .collect();
+        if q.exact {
+            // 整串校验：只对候选文件读原文，确认 needle 连续出现。
+            // 大文件（> 8 MiB）跳过校验直接放行，避免长尾。
+            const EXACT_CHECK_MAX_BYTES: u64 = 8 * 1024 * 1024;
+            let low = ns.to_ascii_lowercase();
+            out.retain(|&idx| {
+                let Ok(p) = store.entry_display_path(idx as usize) else {
+                    return false;
+                };
+                let path = std::path::Path::new(&p);
+                let Ok(meta) = std::fs::metadata(path) else {
+                    return false;
+                };
+                if meta.len() > EXACT_CHECK_MAX_BYTES {
+                    return true;
+                }
+                let Ok(data) = std::fs::read(path) else {
+                    return true;
+                };
+                String::from_utf8_lossy(&data)
+                    .to_ascii_lowercase()
+                    .contains(&low)
+            });
+        }
+        return Ok(out);
     }
     // 超过此大小的文件跳过内容搜索，避免内存爆炸和长时间阻塞
     const MAX_CONTENT_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
