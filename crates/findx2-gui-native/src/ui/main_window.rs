@@ -2009,7 +2009,7 @@ impl MainWindow {
                             } else {
                                 tokens.text_secondary
                             })
-                            .child(
+                            .child({
                                 StyledText::new(text).with_highlights(ranges.into_iter().map(
                                     |r| {
                                         (
@@ -2021,8 +2021,8 @@ impl MainWindow {
                                             },
                                         )
                                     },
-                                )),
-                            ),
+                                ))
+                            }),
                     )
             }))
             .when(total > shown, |v| {
@@ -2105,6 +2105,9 @@ impl MainWindow {
                     if force || !this.preview_snippet_lock {
                         this.preview_snippet_view = true;
                     }
+                    // 摘要里的 <b> 片段是 service 真正的命中词：用它重算 xlsx 命中，
+                    // 解决「整词 needles 与分词命中口径不一致导致表格不高亮」。
+                    this.recompute_sheet_hits(cx);
                     this.sync_table(false, cx);
                     cx.notify();
                 }
@@ -2262,26 +2265,57 @@ impl MainWindow {
     }
 
     /// xlsx 工作簿解析（命中上下文表格自绘）：calamine 纯 Rust。
+    /// 解析阶段只读单元格（不做命中检测），命中由 `recompute_sheet_hits` 另算，
+    /// 避免「3 万格 × N 词 × 逐字拼音」把加载拖慢一个数量级。
     fn fetch_sheet(&mut self, path: String, cx: &mut Context<Self>) {
         self.sheet_book = None;
-        self.deck = None;
-        self.deck_hits.clear();
-        let q = self.effective_query(cx);
-        let needles = crate::docx_blocks::content_needles_of(&q);
         cx.spawn(async move |this, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || {
-                let _ = tx.send(crate::xlsx_blocks::parse(&path, &needles));
+                let _ = tx.send(crate::xlsx_blocks::parse(&path));
             });
             let parsed = rx.await;
             let _ = this.update(cx, |this, cx| {
-                if let Ok(Ok(wb)) = parsed {
+                if let Ok(Ok(mut wb)) = parsed {
+                    let words = this.hit_words(cx);
+                    crate::xlsx_blocks::recompute_hits(&mut wb, &words);
                     this.sheet_book = Some(wb);
                     cx.notify();
                 }
             });
         })
         .detach();
+    }
+
+    /// 实际命中词：查询词 + service 摘要里被 `<b>` 标热的片段。
+    /// 后者是 service 真正匹配到的（分词/拼音对齐后），与列表口径一致。
+    fn hit_words(&self, cx: &mut Context<Self>) -> Vec<String> {
+        let q = self.effective_query(cx);
+        let mut words = crate::docx_blocks::content_needles_of(&q);
+        let (plain, ranges) = search_logic::snippet_plain_and_ranges(&self.preview_snippet);
+        for r in ranges.iter().take(32) {
+            if let Some(w) = plain.get(r.clone()) {
+                let w = w.trim();
+                if !w.is_empty() && w.len() <= 64 {
+                    words.push(w.to_string());
+                }
+            }
+        }
+        words.sort();
+        words.dedup();
+        words.truncate(32);
+        words
+    }
+
+    /// 摘要到达后重算 xlsx 命中（与 `hit_words` 同源）。
+    fn recompute_sheet_hits(&mut self, cx: &mut Context<Self>) {
+        if self.sheet_book.is_none() {
+            return;
+        }
+        let words = self.hit_words(cx);
+        if let Some(wb) = self.sheet_book.as_mut() {
+            crate::xlsx_blocks::recompute_hits(wb, &words);
+        }
     }
 
     /// md 块解析（命中上下文自绘用）：pulldown-cmark 纯 Rust，毫秒级。

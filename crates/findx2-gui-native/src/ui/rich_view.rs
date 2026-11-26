@@ -178,6 +178,17 @@ pub fn render_sheet(wb: &crate::xlsx_blocks::Workbook, tokens: &FindxTokens) -> 
     let Some(sheet) = wb.sheets.get(wb.focus_sheet) else {
         return div().into_any_element();
     };
+    if sheet.oversized {
+        return div()
+            .p_3()
+            .text_sm()
+            .text_color(tokens.text_secondary)
+            .child(format!(
+                "「{}」数据量过大（上万行），已跳过网格渲染；可切换「文字摘录」查看内容。",
+                sheet.name
+            ))
+            .into_any_element();
+    }
     let cols = sheet.cols().max(1);
 
     let mut grid = v_flex().w(px(GUTTER_W + CELL_W * cols as f32));
@@ -583,16 +594,6 @@ fn render_paragraph(
         }
     }
 
-    if !hits.is_empty() && plain_start < 200 {
-        use std::io::Write as _;
-        let _ = writeln!(
-            std::io::stderr(),
-            "[render] start={plain_start} text_len={} hits={} spans={:?} heading={is_heading}",
-            text.len(),
-            hits.len(),
-            spans.iter().map(|(r, _)| (r.start, r.end)).collect::<Vec<_>>()
-        );
-    }
     let styled = StyledText::new(text).with_highlights(spans);
     let mut el = div()
         .w_full()

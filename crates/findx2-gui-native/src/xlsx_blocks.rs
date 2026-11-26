@@ -13,6 +13,8 @@ pub struct Sheet {
     pub rows: Vec<Vec<String>>,
     /// 命中格坐标 (row, col)，1-based 显示。
     pub hits: Vec<(usize, usize)>,
+    /// 超大 sheet（原始数据等）：只保留名字，不解析内容（加载保护）。
+    pub oversized: bool,
 }
 
 impl Sheet {
@@ -28,42 +30,63 @@ pub struct Workbook {
     pub focus_sheet: usize,
 }
 
-const MAX_ROWS: usize = 500;
+const MAX_ROWS: usize = 300;
 const MAX_COLS: usize = 60;
 
 /// 读工作簿。失败返回 Err（调用方降级文字摘录）。
-pub fn parse(path: &str, needles: &[String]) -> Result<Workbook, String> {
+///
+/// 注意：这里**不做命中检测**。逐格做子串/拼音匹配会让加载慢一个数量级
+/// （3 万格 × N 词 × 逐字拼音）。命中由 `recompute_hits` 在拿到实际命中词后
+/// 一次性计算（纯 `contains`，不碰拼音）。
+pub fn parse(path: &str) -> Result<Workbook, String> {
     let mut wb = open_workbook_auto(path).map_err(|e| format!("xlsx 打开失败: {e}"))?;
     let names = wb.sheet_names().to_vec();
     if names.is_empty() {
         return Err("工作簿没有工作表".into());
     }
+    // 预先取各 sheet 的未压缩大小：原始数据 sheet 常有数万行/几十 MB，
+    // calamine 会整表加载，单个就能拖到 6s+。超过阈值只保留名字不解析。
+    const MAX_SHEET_BYTES: usize = 4 * 1024 * 1024;
+    // 单独开一次 zip 读各 sheet 的未压缩大小（calamine 不暴露）。
+    // sheet_names() 的顺序与 xl/worksheets/sheetN.xml 的顺序一致（Excel/WPS 都如此），
+    // 这里按序号映射；取不到就当 0（不跳过，行为与之前一致）。
+    let sizes: Vec<usize> = (|| {
+        let f = std::fs::File::open(path).ok()?;
+        let mut z = zip::ZipArchive::new(f).ok()?;
+        Some(
+            (1..=names.len())
+                .map(|i| {
+                    let p = format!("xl/worksheets/sheet{i}.xml");
+                    z.by_name(&p).map(|f| f.size() as usize).unwrap_or(0)
+                })
+                .collect::<Vec<_>>(),
+        )
+    })()
+    .unwrap_or_default();
+
     let mut out = Workbook::default();
-    for name in names.iter().take(20) {
+    for (idx, name) in names.iter().take(20).enumerate() {
+        if sizes.get(idx).copied().unwrap_or(0) > MAX_SHEET_BYTES {
+            out.sheets.push(Sheet {
+                name: name.clone(),
+                rows: Vec::new(),
+                hits: Vec::new(),
+                oversized: true,
+            });
+            continue;
+        }
         let range = match wb.worksheet_range(name) {
             Ok(r) => r,
             Err(_) => continue,
         };
         let mut rows: Vec<Vec<String>> = Vec::new();
-        let mut hits: Vec<(usize, usize)> = Vec::new();
         for (r, row) in range.rows().enumerate().take(MAX_ROWS) {
             if r + 1 > MAX_ROWS {
                 break;
             }
             let mut cells: Vec<String> = Vec::new();
             for (c, cell) in row.iter().enumerate().take(MAX_COLS) {
-                let text = cell_text(cell);
-                if !text.is_empty() && !needles.is_empty() {
-                    let low = text.to_ascii_lowercase();
-                    if needles.iter().any(|n| {
-                        !n.is_empty()
-                            && (low.contains(&n.to_ascii_lowercase())
-                                || crate::docx_blocks::match_hits(&text, n).iter().next().is_some())
-                    }) {
-                        hits.push((r, c));
-                    }
-                }
-                cells.push(text);
+                cells.push(cell_text(cell));
             }
             // 去掉行尾空格
             while cells.last().is_some_and(|s| s.is_empty()) {
@@ -82,19 +105,49 @@ pub fn parse(path: &str, needles: &[String]) -> Result<Workbook, String> {
         if rows.is_empty() {
             continue;
         }
-        if !hits.is_empty() && out.focus_sheet == 0 {
-            out.focus_sheet = out.sheets.len();
-        }
         out.sheets.push(Sheet {
             name: name.clone(),
             rows,
-            hits,
+            hits: Vec::new(),
+            oversized: false,
         });
     }
     if out.sheets.is_empty() {
         return Err("工作簿没有可显示的单元格".into());
     }
     Ok(out)
+}
+
+/// 命中重算：给定**实际命中词**（来自 service 的摘要高亮），逐格做 contains。
+/// 不碰拼音，纯 ASCII 小写比较，3 万格约几毫秒。
+pub fn recompute_hits(wb: &mut Workbook, words: &[String]) {
+    let words: Vec<String> = words
+        .iter()
+        .map(|w| w.trim().to_ascii_lowercase())
+        .filter(|w| !w.is_empty() && w.len() <= 64)
+        .collect();
+    if words.is_empty() {
+        return;
+    }
+    for sheet in &mut wb.sheets {
+        let mut hits: Vec<(usize, usize)> = Vec::new();
+        for (r, row) in sheet.rows.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                if cell.is_empty() {
+                    continue;
+                }
+                let low = cell.to_ascii_lowercase();
+                if words.iter().any(|w| low.contains(w.as_str())) {
+                    hits.push((r, c));
+                }
+            }
+        }
+        sheet.hits = hits;
+    }
+    // 默认聚焦第一个有命中的 sheet。
+    if let Some(i) = wb.sheets.iter().position(|s| !s.hits.is_empty()) {
+        wb.focus_sheet = i;
+    }
 }
 
 fn cell_text(cell: &Data) -> String {
