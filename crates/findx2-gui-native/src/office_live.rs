@@ -1015,47 +1015,40 @@ fn place_owned(child: usize, owner: usize, x: i32, y: i32, w: i32, h: i32) {
     if child == 0 || owner == 0 {
         return;
     }
+    let (w, h) = (w.max(1), h.max(1));
     unsafe {
         // place() 给的是主窗口客户区相对物理像素，转屏幕坐标。
         let mut pt = POINT { x, y };
         let _ = ClientToScreen(HWND(owner as *mut _), &mut pt);
+
+        // 1) 普通窗口响应 SetWindowPos；全屏窗口（Word View.FullScreen）忽略它，
+        //    所以这步对全屏是无害的 no-op。
+        let _ = SetWindowPos(
+            HWND(child as *mut _),
+            None,
+            pt.x,
+            pt.y,
+            w,
+            h,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+
+        // 2) 统一用 rgn 把可见区域对齐到预览区：
+        //    普通窗口此时 rect 已等于目标 → rgn 覆盖整窗（无裁剪效果）；
+        //    全屏窗口 rect 仍是整屏 → rgn 精确裁出预览区那一条。
+        //    不用屏幕尺寸判断（任务栏会让全屏高度 < SM_CYSCREEN，判断会失效）。
         let mut wr = RECT::default();
         if GetWindowRect(HWND(child as *mut _), &mut wr).is_err() {
             return;
         }
-        let (win_w, win_h) = (wr.right - wr.left, wr.bottom - wr.top);
-        // 判断是否全屏（覆盖整块屏幕/远超目标区域）：全屏窗口忽略 SetWindowPos，
-        // 只能靠 SetWindowRgn 把可见区域裁到预览区。
-        let screen_w = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-            windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN,
+        let rgn = CreateRectRgn(
+            pt.x - wr.left,
+            pt.y - wr.top,
+            pt.x - wr.left + w,
+            pt.y - wr.top + h,
         );
-        let screen_h = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-            windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN,
-        );
-        let is_fullscreen = win_w >= screen_w - 4 && win_h >= screen_h - 4;
-        if is_fullscreen {
-            // rgn 坐标相对窗口左上角。
-            let rgn = CreateRectRgn(
-                pt.x - wr.left,
-                pt.y - wr.top,
-                pt.x - wr.left + w.max(1),
-                pt.y - wr.top + h.max(1),
-            );
-            if !rgn.is_invalid() {
-                let _ = SetWindowRgn(HWND(child as *mut _), Some(rgn), true);
-            }
-        } else {
-            // 普通窗口：清掉可能存在的旧裁剪，再摆位。
-            let _ = SetWindowRgn(HWND(child as *mut _), None, true);
-            let _ = SetWindowPos(
-                HWND(child as *mut _),
-                None,
-                pt.x,
-                pt.y,
-                w.max(1),
-                h.max(1),
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
+        if !rgn.is_invalid() {
+            let _ = SetWindowRgn(HWND(child as *mut _), Some(rgn), true);
         }
     }
 }
