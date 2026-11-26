@@ -835,9 +835,17 @@ fn hide_chrome(app: &com::Dispatch, engine: LiveEngine) {
     match engine.kind() {
         LiveKind::Word => {
             if let Ok(win) = app.get("ActiveWindow") {
-                // 全屏：Word 唯一可靠清 chrome 的方式（非全屏时 ribbon/标题栏
+                // FullScreen 是 View 的属性（不是 Window），设错层会静默失败。
+                // 全屏是 Word 唯一可靠清 chrome 的方式（非全屏时 ribbon/标题栏
                 // 会被 Word 周期性还原，实测 MinimizeRibbon 无效）。
-                let _ = win.put_bool("FullScreen", true);
+                if let Ok(view) = win.get("View") {
+                    if let Err(e) = view.put_bool("FullScreen", true) {
+                        {
+                            use std::io::Write as _;
+                            let _ = writeln!(std::io::stderr(), "[live] fullscreen failed: {e}");
+                        }
+                    }
+                }
                 let _ = win.put_bool("DocumentMap", false);
             }
         }
@@ -855,9 +863,11 @@ fn ensure_fullscreen(app: &com::Dispatch, engine: LiveEngine) {
         return;
     }
     if let Ok(win) = app.get("ActiveWindow") {
-        if let Ok(on) = win.prop_bool("FullScreen") {
-            if !on {
-                let _ = win.put_bool("FullScreen", true);
+        if let Ok(view) = win.get("View") {
+            if let Ok(on) = view.prop_bool("FullScreen") {
+                if !on {
+                    let _ = view.put_bool("FullScreen", true);
+                }
             }
         }
     }
