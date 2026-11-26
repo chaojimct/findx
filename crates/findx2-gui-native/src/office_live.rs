@@ -329,6 +329,17 @@ mod com {
                 }
             }
         }
+        pub fn prop_bool(&self, name: &str) -> Result<bool, String> {
+            let v = invoke(&self.0, name, 2, vec![])?;
+            unsafe {
+                let a = &*v.Anonymous.Anonymous;
+                if a.vt == VT_BOOL {
+                    Ok(a.Anonymous.boolVal != windows::Win32::Foundation::VARIANT_BOOL(0))
+                } else {
+                    Err(format!("{name} 非布尔"))
+                }
+            }
+        }
         pub fn raw(&self) -> &IDispatch {
             &self.0
         }
@@ -476,7 +487,6 @@ impl LiveSession {
             use std::io::Write as _;
             let _ = writeln!(std::io::stderr(), "[live] alerts ok");
         }
-        let _ = app.put_bool("DisplayAlerts", false);
 
         // 打开目标：先试只读源文件；needs_paint 则直接用 temp 副本。
         let (open_path, temp_copy) = if needs_paint {
@@ -502,6 +512,9 @@ impl LiveSession {
             use std::io::Write as _;
             let _ = writeln!(std::io::stderr(), "[live] doc opened");
         }
+        // 隐藏 chrome：只留文档内容，视觉上与预览区融合。
+        // 系统版式（IPreviewHandler）是纯内容无 chrome，这里对齐同一观感。
+        hide_chrome(&app, engine);
         let doc_name = std::path::Path::new(&open_path)
             .file_name()
             .and_then(|s| s.to_str())
@@ -551,6 +564,11 @@ impl LiveSession {
             self.embedded_hwnd = h;
             set_owner_follow(h, self.host_hwnd);
         }
+    }
+
+    /// 维持无 chrome 状态：Word 被 Esc/Alt 退出全屏后立刻恢复。
+    pub fn keep_chrome_hidden(&self) {
+        ensure_fullscreen(&self.app, self.engine);
     }
 
     /// Word：Find 第 n 个命中并滚入视口。返回是否找到。
@@ -802,6 +820,49 @@ fn find_app_window_titled(engine: LiveEngine, title_sub: &str) -> usize {
     find_app_window_impl(engine, Some(title_sub))
 }
 
+/// 隐藏应用 chrome，只留文档内容（与系统版式 IPreviewHandler 的观感对齐）。
+/// Word：全屏（chrome 归零，唯一不被 Word 还原的方式）+ 关导航窗格。
+/// Excel：ribbon 最小化 + 关编辑栏（保留行列头/页签，AnyTXT 同款真表格）。
+/// 全部 best-effort：任一失败不影响会话（部分版本属性名不同）。
+#[cfg(windows)]
+fn hide_chrome(app: &com::Dispatch, engine: LiveEngine) {
+    use com as C;
+    // ribbon 最小化：Excel 的有效手段（Word 走全屏）。
+    if let Ok(bars) = app.get("CommandBars") {
+        let _ = bars.call("ExecuteMso", vec![C::v_str("MinimizeRibbon")]);
+    }
+    let _ = app.put_bool("DisplayStatusBar", false);
+    match engine.kind() {
+        LiveKind::Word => {
+            if let Ok(win) = app.get("ActiveWindow") {
+                // 全屏：Word 唯一可靠清 chrome 的方式（非全屏时 ribbon/标题栏
+                // 会被 Word 周期性还原，实测 MinimizeRibbon 无效）。
+                let _ = win.put_bool("FullScreen", true);
+                let _ = win.put_bool("DocumentMap", false);
+            }
+        }
+        LiveKind::Excel => {
+            let _ = app.put_bool("DisplayFormulaBar", false);
+        }
+    }
+}
+
+/// 确认 Word 仍处于全屏（用户按 Esc/Alt 会退出全屏，chrome 会回来）。
+/// 循环里定期调用，被退出就立刻恢复。
+#[cfg(windows)]
+fn ensure_fullscreen(app: &com::Dispatch, engine: LiveEngine) {
+    if engine.kind() != LiveKind::Word {
+        return;
+    }
+    if let Ok(win) = app.get("ActiveWindow") {
+        if let Ok(on) = win.prop_bool("FullScreen") {
+            if !on {
+                let _ = win.put_bool("FullScreen", true);
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 fn find_app_window(engine: LiveEngine) -> usize {
     find_app_window_impl(engine, None)
@@ -914,12 +975,22 @@ fn set_owner_follow(child: usize, owner: usize) {
             GWLP_HWNDPARENT,
             owner as isize,
         );
-        // 去标题栏/粗边框，观感嵌入；保持 POPUP 顶层形态。
+        // 去标题栏/粗边框/系统菜单，观感嵌入；保持顶层形态（DX 不覆盖 owner 窗口）。
         let style = GetWindowLongW(HWND(child as *mut _), GWL_STYLE) as u32;
         let _ = SetWindowLongW(
             HWND(child as *mut _),
             GWL_STYLE,
-            (style & !(WS_CAPTION.0 | WS_THICKFRAME.0)) as i32,
+            (style & !(WS_CAPTION.0 | WS_THICKFRAME.0 | WS_SYSMENU.0)) as i32,
+        );
+        // 让 style 变更立即生效（否则边框/圆角残留）。
+        let _ = SetWindowPos(
+            HWND(child as *mut _),
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
     }
 }
@@ -927,26 +998,55 @@ fn set_owner_follow(child: usize, owner: usize) {
 #[cfg(windows)]
 fn place_owned(child: usize, owner: usize, x: i32, y: i32, w: i32, h: i32) {
     use windows::Win32::{
-        Foundation::{HWND, POINT},
-        Graphics::Gdi::ClientToScreen,
-        UI::WindowsAndMessaging::*,
+        Foundation::{HWND, POINT, RECT},
+        Graphics::Gdi::{ClientToScreen, CreateRectRgn, SetWindowRgn},
+        UI::WindowsAndMessaging::{GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_SHOWWINDOW},
     };
     if child == 0 || owner == 0 {
         return;
     }
     unsafe {
-        // place() 给的是主窗口客户区相对物理像素，转屏幕坐标再跟随。
+        // place() 给的是主窗口客户区相对物理像素，转屏幕坐标。
         let mut pt = POINT { x, y };
         let _ = ClientToScreen(HWND(owner as *mut _), &mut pt);
-        let _ = SetWindowPos(
-            HWND(child as *mut _),
-            Some(HWND_TOP),
-            pt.x,
-            pt.y,
-            w.max(1),
-            h.max(1),
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        let mut wr = RECT::default();
+        if GetWindowRect(HWND(child as *mut _), &mut wr).is_err() {
+            return;
+        }
+        let (win_w, win_h) = (wr.right - wr.left, wr.bottom - wr.top);
+        // 判断是否全屏（覆盖整块屏幕/远超目标区域）：全屏窗口忽略 SetWindowPos，
+        // 只能靠 SetWindowRgn 把可见区域裁到预览区。
+        let screen_w = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+            windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN,
         );
+        let screen_h = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+            windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN,
+        );
+        let is_fullscreen = win_w >= screen_w - 4 && win_h >= screen_h - 4;
+        if is_fullscreen {
+            // rgn 坐标相对窗口左上角。
+            let rgn = CreateRectRgn(
+                pt.x - wr.left,
+                pt.y - wr.top,
+                pt.x - wr.left + w.max(1),
+                pt.y - wr.top + h.max(1),
+            );
+            if !rgn.is_invalid() {
+                let _ = SetWindowRgn(HWND(child as *mut _), Some(rgn), true);
+            }
+        } else {
+            // 普通窗口：清掉可能存在的旧裁剪，再摆位。
+            let _ = SetWindowRgn(HWND(child as *mut _), None, true);
+            let _ = SetWindowPos(
+                HWND(child as *mut _),
+                None,
+                pt.x,
+                pt.y,
+                w.max(1),
+                h.max(1),
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
     }
 }
 
@@ -1175,6 +1275,8 @@ pub mod host {
                 let before = sess.embedded_hwnd;
                 let alive_now = is_window_alive(before);
                 sess.reembed_if_needed();
+                // 全屏状态会被 Esc/Alt 打断，定期恢复（chrome 一旦回来观感就破）。
+                sess.keep_chrome_hidden();
                 if sess.embedded_hwnd != before || !alive_now {
                     tlog!(
                         "recheck hwnd {before} alive={alive_now} -> {}",
