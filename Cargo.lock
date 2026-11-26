@@ -2123,6 +2123,7 @@ dependencies = [
  "image",
  "libc",
  "pdfium-render",
+ "pinyin",
  "pulldown-cmark",
  "quick-xml 0.32.0",
  "raw-window-handle",

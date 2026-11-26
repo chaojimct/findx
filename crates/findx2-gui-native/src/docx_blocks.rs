@@ -300,6 +300,105 @@ fn parse_hex_color(s: &str) -> Option<u32> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 命中匹配（docx 侧自算，不依赖 service 的提取器）
+// ---------------------------------------------------------------------------
+
+/// 在文本里查查询词的命中区间：先字面（ASCII 小写），失败再走拼音对齐。
+/// 为什么要自算：service 用 `document_preview::xml_text`、文档侧用 rdocx，
+/// 两套提取器的空白/表格顺序不同，跨提取器按字节定位会失败。
+pub fn match_hits(text: &str, needle: &str) -> Vec<std::ops::Range<usize>> {
+    let needle = needle.trim();
+    if needle.is_empty() || text.is_empty() {
+        return Vec::new();
+    }
+    // 1) 字面（大小写不敏感；中文大小写无影响）。
+    let low = text.to_ascii_lowercase();
+    let nl = needle.to_ascii_lowercase();
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut from = 0usize;
+    while let Some(p) = low[from..].find(&nl) {
+        let a = from + p;
+        let b = a + nl.len();
+        if text.is_char_boundary(a) && text.is_char_boundary(b) {
+            out.push(a..b);
+        }
+        from = b.max(a + 1);
+        if out.len() >= 2000 {
+            break;
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+    // 2) 拼音对齐（仅纯 ASCII 查询，如 `machuntian` → 马春天）。
+    if needle.is_ascii() && needle.len() >= 2 {
+        return pinyin_hits(text, &nl);
+    }
+    out
+}
+
+/// 逐字拼音对齐：`machuntian` → `马春天`、`mct` → `马春天`（首字母）。
+/// 逐字尝试「全拼」或「首字母」两种消费方式，命中连续区间。
+fn pinyin_hits(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    use pinyin::ToPinyin;
+    const MAX_SCAN: usize = 2 << 20; // 2 MiB 扫描上限（超长文档只标前面）
+    struct Item {
+        start: usize,
+        end: usize,
+        full: String,
+        first: u8,
+    }
+    let mut seq: Vec<Item> = Vec::new();
+    let scan_end = text.len().min(MAX_SCAN);
+    for (i, ch) in text[..scan_end].char_indices() {
+        if let Some(py) = ch.to_pinyin() {
+            let full = py.plain();
+            let first = full.as_bytes().first().copied().unwrap_or(b' ');
+            seq.push(Item {
+                start: i,
+                end: i + ch.len_utf8(),
+                full: full.to_string(),
+                first,
+            });
+        }
+    }
+    if seq.is_empty() {
+        return Vec::new();
+    }
+    let qb = query.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < seq.len() {
+        let mut qi = 0usize;
+        let mut j = i;
+        while j < seq.len() && qi < qb.len() {
+            let it = &seq[j];
+            if qb[qi..].starts_with(it.full.as_bytes()) {
+                qi += it.full.len();
+                j += 1;
+                continue;
+            }
+            if qb[qi] == it.first {
+                qi += 1;
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        if qi == qb.len() && j > i {
+            out.push(seq[i].start..seq[j - 1].end);
+            if out.len() >= 2000 {
+                break;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,5 +427,41 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(p.text(), "abcdef");
+    }
+
+    #[test]
+    fn literal_hits_case_insensitive() {
+        let t = "Hello 马春天 World 马春天";
+        let hits = match_hits(t, "马春天");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(&t[hits[0].clone()], "马春天");
+    }
+
+    #[test]
+    fn pinyin_hits_full_and_initials() {
+        let t = "我与青松——马春天采访文稿";
+        // 全拼
+        let hits = match_hits(t, "machuntian");
+        assert_eq!(hits.len(), 1, "全拼应命中马春天");
+        assert_eq!(&t[hits[0].clone()], "马春天");
+        // 首字母
+        let hits2 = match_hits(t, "mct");
+        assert_eq!(hits2.len(), 1, "首字母应命中马春天");
+        assert_eq!(&t[hits2[0].clone()], "马春天");
+    }
+
+    #[test]
+    fn block_of_offset_maps_back() {
+        let mut d = DocxDoc::default();
+        d.plain = "aaa\nbbb\nccc\n".into();
+        d.block_starts = vec![0, 4, 8];
+        d.blocks = vec![
+            DocxBlock::Paragraph(StyledParagraph::default()),
+            DocxBlock::Paragraph(StyledParagraph::default()),
+            DocxBlock::Paragraph(StyledParagraph::default()),
+        ];
+        assert_eq!(d.block_of_offset(0), Some(0));
+        assert_eq!(d.block_of_offset(5), Some(1));
+        assert_eq!(d.block_of_offset(9), Some(2));
     }
 }

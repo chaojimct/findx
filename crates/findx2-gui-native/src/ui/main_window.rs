@@ -384,8 +384,29 @@ fn flatten_with_ranges(
     (out, new_ranges)
 }
 
-fn preview_has_mode_tabs(path: &str) -> bool {
-    matches!(
+/// 从查询串里取 `content:` / `utf8content:` 的值（去掉引号与修饰符）。
+/// `content:"马春天" glob:0` → `马春天`
+fn content_needle_of(query: &str) -> Option<String> {
+    let lower = query.to_ascii_lowercase();
+    for key in ["content:", "utf8content:"] {
+        if let Some(i) = lower.find(key) {
+            let rest = &query[i + key.len()..];
+            let v = rest.trim_start();
+            let needle: String = if let Some(stripped) = v.strip_prefix('"') {
+                stripped.chars().take_while(|&c| c != '"').collect()
+            } else {
+                v.chars().take_while(|c| !c.is_whitespace()).collect()
+            };
+            let needle = needle.trim().to_string();
+            if !needle.is_empty() {
+                return Some(needle);
+            }
+        }
+    }
+    None
+}
+
+fn preview_has_mode_tabs(path: &str) -> bool {    matches!(
         std::path::Path::new(path)
             .extension()
             .and_then(|x| x.to_str())
@@ -2142,7 +2163,7 @@ impl MainWindow {
                     this.full_total = total;
                     this.full_truncated = truncated;
                     // 全文到了：用命中词在 docx.plain 内重新定位（拼音已对齐到汉字）。
-                    this.recompute_docx_hits();
+                    this.recompute_docx_hits(cx);
                     cx.notify();
                 }
             });
@@ -2171,7 +2192,7 @@ impl MainWindow {
                 match parsed {
                     Ok(Ok(doc)) => {
                         this.docx_doc = Some(doc);
-                        this.recompute_docx_hits();
+                        this.recompute_docx_hits(cx);
                         cx.notify();
                     }
                     _ => {
@@ -2184,66 +2205,24 @@ impl MainWindow {
         .detach();
     }
 
-    /// 用全文命中词在 docx.plain 内字面定位（拼音命中也已由 service 对齐到汉字，
-    /// 所以这里拿到的词就是原文片段）。
-    fn recompute_docx_hits(&mut self) {
+    /// 用查询词在 docx.plain 内自算命中（字面 + 拼音对齐）。
+    /// 不依赖 service 的 full_spans：两套文本提取器的空白/表格顺序不同，
+    /// 跨提取器按字节定位会失败（这是此前"命中列表有、文档内无高亮"的根因）。
+    fn recompute_docx_hits(&mut self, cx: &mut Context<Self>) {
         self.docx_hits.clear();
         let Some(doc) = self.docx_doc.as_ref() else {
             return;
         };
-        let mut words: Vec<String> = Vec::new();
-        if !self.full_text.is_empty() && !self.full_spans.is_empty() {
-            for &[a, b] in &self.full_spans {
-                if b <= a || b > self.full_text.len() {
-                    continue;
-                }
-                if let Some(w) = self.full_text.get(a..b) {
-                    let w = w.trim();
-                    if !w.is_empty() && w.len() <= 64 {
-                        words.push(w.to_string());
-                    }
-                }
-                if words.len() >= 32 {
-                    break;
-                }
-            }
-        }
-        if words.is_empty() {
-            // 全文未到：用摘要高亮区间反推词。
-            let (plain, ranges) = search_logic::snippet_plain_and_ranges(&self.preview_snippet);
-            for r in ranges.iter().take(32) {
-                if let Some(w) = plain.get(r.clone()) {
-                    let w = w.trim();
-                    if !w.is_empty() {
-                        words.push(w.to_string());
-                    }
-                }
-            }
-        }
-        if words.is_empty() {
+        let q = self.effective_query(cx);
+        let Some(needle) = content_needle_of(&q) else {
             return;
-        }
-        words.sort();
-        words.dedup();
-        let text = &doc.plain;
-        let mut hits: Vec<std::ops::Range<usize>> = Vec::new();
-        for w in &words {
-            let mut from = 0usize;
-            while let Some(pos) = text[from..].find(w.as_str()) {
-                let start = from + pos;
-                let end = start + w.len();
-                hits.push(start..end);
-                from = end;
-                if hits.len() >= 2000 {
-                    break;
-                }
-            }
-            if hits.len() >= 2000 {
-                break;
-            }
-        }
-        hits.sort_by_key(|r| r.start);
-        self.docx_hits = hits;
+        };
+        self.docx_hits = crate::docx_blocks::match_hits(&doc.plain, &needle);
+        // 命中定位：默认跳到第一处，避免长文档打开在开头看不到命中。
+        self.docx_focus = self
+            .docx_hits
+            .first()
+            .and_then(|r| doc.block_of_offset(r.start));
     }
 
     /// 取自渲染 PDF 当前页的命中框（高亮黄框用；失败/无命中静默无高亮）。
@@ -2366,6 +2345,11 @@ impl MainWindow {
         self.full_spans.clear();
         self.full_total = 0;
         self.full_truncated = false;
+        // 任何新目标都先清空 docx 状态：非 docx 文件不会走 fetch_docx_blocks，
+        // 不清就会渲染上一个 docx 的内容（预览卡住）。
+        self.docx_doc = None;
+        self.docx_hits.clear();
+        self.docx_focus = None;
         if reset_view {
             self.preview_snippet_view =
                 !hit.is_directory && (content_query || !hit.snippet.is_empty());

@@ -48,6 +48,8 @@ pdfium-render = "0.8"
 # docx 富文本自绘：纯 Rust 解析（不启动 Word、不转 PDF/图）。
 rdocx = "0.17"
 rdocx-oxml = "0.17"
+# docx 侧命中匹配（拼音对齐）：轻量纯 Rust，与索引侧同源词表。
+pinyin = "0.11"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
