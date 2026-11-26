@@ -308,6 +308,10 @@ pub struct MainWindow {
     md_hits: Vec<std::ops::Range<usize>>,
     /// xlsx 工作簿模型（表格网格自绘：行列标 + sheet 页签 + 命中格高亮）。
     sheet_book: Option<crate::xlsx_blocks::Workbook>,
+    /// pptx 幻灯片模型（按页分组渲染 + 命中高亮）。
+    deck: Option<crate::pptx_blocks::Deck>,
+    /// pptx 命中区间（deck.plain 字节坐标）。
+    deck_hits: Vec<std::ops::Range<usize>>,
     /// 搜索选项：区分大小写（Aa）。标题搜索精确生效；全文搜索后置过滤。
     search_match_case: bool,
     /// 搜索选项：全匹配（ab）。整串连续出现才算命中。
@@ -633,6 +637,8 @@ impl MainWindow {
             md_doc: None,
             md_hits: Vec::new(),
             sheet_book: None,
+            deck: None,
+            deck_hits: Vec::new(),
             search_match_case: false,
             search_exact: false,
             search_wildcard: false,
@@ -2232,9 +2238,34 @@ impl MainWindow {
         .detach();
     }
 
+    /// pptx 幻灯片解析（按页分组 + 命中高亮）：quick-xml 纯 Rust。
+    fn fetch_deck(&mut self, path: String, cx: &mut Context<Self>) {
+        self.deck = None;
+        self.deck_hits.clear();
+        let q = self.effective_query(cx);
+        let needles = crate::docx_blocks::content_needles_of(&q);
+        cx.spawn(async move |this, cx| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::pptx_blocks::parse(&path));
+            });
+            let parsed = rx.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(Ok(deck)) = parsed {
+                    this.deck_hits = crate::docx_blocks::match_hits_multi(&deck.plain, &needles);
+                    this.deck = Some(deck);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// xlsx 工作簿解析（命中上下文表格自绘）：calamine 纯 Rust。
     fn fetch_sheet(&mut self, path: String, cx: &mut Context<Self>) {
         self.sheet_book = None;
+        self.deck = None;
+        self.deck_hits.clear();
         let q = self.effective_query(cx);
         let needles = crate::docx_blocks::content_needles_of(&q);
         cx.spawn(async move |this, cx| {
@@ -2513,6 +2544,8 @@ impl MainWindow {
                 self.fetch_md_blocks(hit.path.clone(), cx);
             } else if matches!(ext_l.as_str(), "xlsx" | "xlsm" | "xls") {
                 self.fetch_sheet(hit.path.clone(), cx);
+            } else if matches!(ext_l.as_str(), "pptx" | "ppt") {
+                self.fetch_deck(hit.path.clone(), cx);
             }
         }
         if self.preview_memo.len() > 64 {
@@ -3053,6 +3086,64 @@ impl MainWindow {
                     })
             })
     }
+    /// PDF 页面视图：光栅页 + 本页命中黄框（命中上下文与独立预览共用）。
+    fn pdf_page_view(&self, tokens: FindxTokens) -> AnyElement {
+        let Some(pdf) = self.preview.pdf else {
+            return div().into_any_element();
+        };
+        let width = if self.preview_options.fit_width {
+            (self.actual_preview_width - 24.).max(120.)
+        } else {
+            pdf.width * self.preview_options.zoom
+        };
+        let height = width * pdf.height / pdf.width.max(1.);
+        let show_hl = self.preview.pdf_hl_page == Some(pdf.page)
+            && self
+                .preview
+                .pdf_hl_path
+                .as_deref()
+                .zip(self.preview.meta.as_ref().map(|m| m.path.as_str()))
+                .is_some_and(|(a, b)| a == b);
+        let hl = if show_hl {
+            self.preview.pdf_highlights.clone()
+        } else {
+            Vec::new()
+        };
+        let sx = width / pdf.width.max(1.);
+        let sy = height / pdf.height.max(1.);
+        let mut stack = div().relative().child(
+            img(self.preview.image.clone().unwrap())
+                .w(px(width))
+                .h(px(height))
+                .object_fit(ObjectFit::Contain),
+        );
+        for r in hl {
+            let (w, h) = ((r[2] - r[0]) * sx, (r[3] - r[1]) * sy);
+            if w <= 0. || h <= 0. {
+                continue;
+            }
+            stack = stack.child(
+                div()
+                    .absolute()
+                    .left(px(r[0] * sx))
+                    .top(px(r[1] * sy))
+                    .w(px(w))
+                    .h(px(h))
+                    .bg(rgba(0xffee58cc)),
+            );
+        }
+        let mut col = v_flex().p_3().gap_1();
+        if !self.preview.pdf_highlights.is_empty() && show_hl {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(tokens.text_tertiary)
+                    .child(format!("本页 {} 个命中", self.preview.pdf_highlights.len())),
+            );
+        }
+        col.child(stack).into_any_element()
+    }
+
     fn render_single_preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = Self::tokens(cx);
         let header = match &self.preview.meta {
@@ -3207,61 +3298,7 @@ impl MainWindow {
                     ),
                 )
                 .into_any_element(),
-            PreviewKind::Image if self.preview.pdf.is_some() => {
-                let pdf = self.preview.pdf.unwrap();
-                let width = if self.preview_options.fit_width {
-                    self.actual_preview_width - 24.
-                } else {
-                    pdf.width * self.preview_options.zoom
-                };
-                let height = width * pdf.height / pdf.width.max(1.);
-                // 本页命中框（点→显示像素；仅同文件同页展示，翻页/切文件即失效）。
-                let show_hl = self.preview.pdf_hl_page == Some(pdf.page)
-                    && self
-                        .preview
-                        .pdf_hl_path
-                        .as_deref()
-                        .zip(self.preview.meta.as_ref().map(|m| m.path.as_str()))
-                        .is_some_and(|(a, b)| a == b);
-                let hl = if show_hl {
-                    self.preview.pdf_highlights.clone()
-                } else {
-                    Vec::new()
-                };
-                let sx = width / pdf.width.max(1.);
-                let sy = height / pdf.height.max(1.);
-                let mut stack = div().relative().child(
-                    img(self.preview.image.clone().unwrap())
-                        .w(px(width))
-                        .h(px(height))
-                        .object_fit(ObjectFit::Contain),
-                );
-                for r in hl {
-                    let (w, h) = ((r[2] - r[0]) * sx, (r[3] - r[1]) * sy);
-                    if w <= 0. || h <= 0. {
-                        continue;
-                    }
-                    stack = stack.child(
-                        div()
-                            .absolute()
-                            .left(px(r[0] * sx))
-                            .top(px(r[1] * sy))
-                            .w(px(w))
-                            .h(px(h))
-                            .bg(rgba(0xffee58cc)),
-                    );
-                }
-                let mut col = v_flex().p_3().gap_1();
-                if !self.preview.pdf_highlights.is_empty() && show_hl {
-                    col = col.child(
-                        div()
-                            .text_xs()
-                            .text_color(tokens.text_tertiary)
-                            .child(format!("本页 {} 个命中", self.preview.pdf_highlights.len())),
-                    );
-                }
-                col.child(stack).into_any_element()
-            }
+            PreviewKind::Image if self.preview.pdf.is_some() => self.pdf_page_view(tokens),
             PreviewKind::Image => {
                 let mut col = v_flex()
                     .w_full()
@@ -3532,6 +3569,18 @@ impl MainWindow {
                     .min_h_0()
                     .min_w_0()
                     .child(
+                        if self.preview.pdf.is_some() {
+                            // PDF：命中上下文里也显示真文档页面 + 命中黄框，
+                            // 而不是退化成纯文本流。
+                            div()
+                                .id("pdf-hit-scroll")
+                                .flex_1()
+                                .min_h_0()
+                                .min_w_0()
+                                .overflow_scroll()
+                                .child(self.pdf_page_view(tokens))
+                                .into_any_element()
+                        } else {
                         div()
                             .id("hit-text-scroll")
                             .flex_1()
@@ -3562,6 +3611,9 @@ impl MainWindow {
                                     crate::ui::rich_view::sheet_tabs(book, &tokens),
                                     crate::ui::rich_view::render_sheet(book, &tokens),
                                 ]
+                            } else if let Some(deck) = self.deck.as_ref() {
+                                // pptx：按页分组 + 段落 + 命中高亮。
+                                crate::ui::rich_view::render_pptx(deck, &self.deck_hits, &tokens)
                             } else {
                                 // 未解析完成或解析失败：回退纯文本列（渐进态）。
                                 let (plain, ranges) = self.hit_text_and_ranges();
@@ -3586,7 +3638,8 @@ impl MainWindow {
                                         .into_any_element()]
                                 }
                             })
-                            .into_any_element(),
+                            .into_any_element()
+                        },
                     )
                     .child(
                         div()

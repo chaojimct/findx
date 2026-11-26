@@ -51,6 +51,7 @@ pub mod usage_cache;
 pub mod markdown_blocks;
 pub mod docx_blocks;
 pub mod xlsx_blocks;
+pub mod pptx_blocks;
 
 pub mod indexed_usage;
 

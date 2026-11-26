@@ -114,6 +114,58 @@ pub fn render_docx(
 }
 
 // ---------------------------------------------------------------------------
+// pptx 幻灯片渲染（按页分组 + 段落 + 命中高亮）
+// ---------------------------------------------------------------------------
+
+/// 渲染 pptx：每页一个标题条 + 段落流。命中按 para_starts 映射到段内。
+pub fn render_pptx(
+    deck: &crate::pptx_blocks::Deck,
+    hits: &[Range<usize>],
+    tokens: &FindxTokens,
+) -> Vec<AnyElement> {
+    let mut out: Vec<AnyElement> = Vec::with_capacity(deck.slides.len() * 4);
+    let mut para_idx = 0usize;
+    for slide in &deck.slides {
+        out.push(
+            div()
+                .w_full()
+                .pt(px(10.))
+                .pb(px(4.))
+                .border_b_1()
+                .border_color(tokens.border_soft)
+                .text_xs()
+                .text_color(tokens.text_tertiary)
+                .child(format!("第 {} 页", slide.number))
+                .into_any_element(),
+        );
+        for para in &slide.paragraphs {
+            let start = deck.para_starts.get(para_idx).copied().unwrap_or(0);
+            para_idx += 1;
+            let spans = simple_spans(para, start, hits, tokens);
+            // 首段当作标题（PowerPoint 习惯），字号略大。
+            let is_title = para_idx == 1 || slide.paragraphs.first().is_some_and(|f| std::ptr::eq(f, para));
+            let size = if is_title {
+                BASE_PX * 1.25
+            } else {
+                BASE_PX
+            };
+            out.push(
+                div()
+                    .w_full()
+                    .py(px(2.))
+                    .text_size(px(size))
+                    .line_height(px(size * 1.55))
+                    .when(is_title, |d| d.font_weight(FontWeight::BOLD))
+                    .text_color(tokens.text_primary)
+                    .child(StyledText::new(para.clone()).with_highlights(spans))
+                    .into_any_element(),
+            );
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // xlsx 表格网格渲染（对标 AnyTXT：行列标 + 命中格高亮）
 // ---------------------------------------------------------------------------
 
