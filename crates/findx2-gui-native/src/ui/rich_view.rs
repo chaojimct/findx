@@ -144,7 +144,28 @@ fn render_paragraph(
         }
     };
 
-    // run 级样式 + 命中区间，统一转成相对本段的字节区间。
+    // 命中区间转到段内坐标（只保留落在本段、边界合法的）。
+    let hit_ranges: Vec<Range<usize>> = hits
+        .iter()
+        .filter_map(|h| {
+            let a = h.start.saturating_sub(plain_start);
+            let b = h.end.saturating_sub(plain_start);
+            if b > a
+                && b <= text.len()
+                && text.is_char_boundary(a)
+                && text.is_char_boundary(b)
+            {
+                Some(a..b)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // 关键：GPUI 的 compute_runs 按顺序消费 highlights，**假设严格有序且不重叠**。
+    // 若把「run 整段样式」和「命中局部样式」直接堆在一起，区间重叠会让它把
+    // ix 回退、总长度算错（文字重复、高亮丢失）。这里按 run 边界切分，
+    // 命中样式覆盖 run 样式，保证输出有序不重叠。
     let mut spans: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
     let mut cursor = 0usize;
     for run in &p.runs {
@@ -152,41 +173,52 @@ fn render_paragraph(
         if len == 0 {
             continue;
         }
-        let run_range = cursor..cursor + len;
-        // run 自身样式（整段区间）
-        let run_style = run_highlight_style(run, tokens);
-        if run_style.font_weight.is_some()
-            || run_style.font_style.is_some()
-            || run_style.underline.is_some()
-            || run_style.color.is_some()
-        {
-            spans.push((run_range.clone(), run_style));
+        let run_start = cursor;
+        let run_end = cursor + len;
+        cursor = run_end;
+        let base = run_highlight_style(run, tokens);
+        let mut cuts = vec![run_start, run_end];
+        for h in &hit_ranges {
+            let a = h.start.max(run_start);
+            let b = h.end.min(run_end);
+            if b > a {
+                cuts.push(a);
+                cuts.push(b);
+            }
         }
-        cursor += len;
+        cuts.sort_unstable();
+        cuts.dedup();
+        for w in cuts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if b <= a {
+                continue;
+            }
+            let mut st = base.clone();
+            if hit_ranges.iter().any(|h| h.start <= a && h.end >= b) {
+                st.background_color = Some(tokens.hit_bg);
+                st.color = Some(tokens.hit_fg);
+            }
+            if st.font_weight.is_some()
+                || st.font_style.is_some()
+                || st.underline.is_some()
+                || st.color.is_some()
+                || st.background_color.is_some()
+            {
+                spans.push((a..b, st));
+            }
+        }
     }
 
-    // 命中区间（plain 绝对坐标 → 段内相对坐标）
-    for h in hits {
-        let rel_start = h.start.saturating_sub(plain_start);
-        let rel_end = h.end.saturating_sub(plain_start);
-        if rel_end <= rel_start || rel_start >= text.len() {
-            continue;
-        }
-        let a = rel_start.min(text.len());
-        let b = rel_end.min(text.len());
-        if !text.is_char_boundary(a) || !text.is_char_boundary(b) {
-            continue;
-        }
-        spans.push((
-            a..b,
-            HighlightStyle {
-                background_color: Some(tokens.hit_bg),
-                color: Some(tokens.hit_fg),
-                ..Default::default()
-            },
-        ));
+    if !hits.is_empty() && plain_start < 200 {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "[render] start={plain_start} text_len={} hits={} spans={:?} heading={is_heading}",
+            text.len(),
+            hits.len(),
+            spans.iter().map(|(r, _)| (r.start, r.end)).collect::<Vec<_>>()
+        );
     }
-
     let styled = StyledText::new(text).with_highlights(spans);
     let mut el = div()
         .w_full()
