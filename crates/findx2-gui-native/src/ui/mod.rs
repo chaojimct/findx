@@ -6,6 +6,7 @@ mod file_icon;
 pub mod main_window;
 mod native_focus;
 mod result_table;
+pub mod rich_view;
 pub mod settings_window;
 pub mod update_card;
 
