@@ -1864,8 +1864,8 @@ impl MainWindow {
             return;
         };
         self.docx_focus = Some(block);
-        // 滚回顶部（窗口换了，旧偏移无意义）。
-        self.hit_scroll.scroll_to_top_of_item(0);
+        // 让句柄滚到该块（此时 track_scroll 生效）。
+        self.hit_scroll.scroll_to_top_of_item(block);
     }
 
     /// docx 命中列表（与文档高亮/跳转同源）：
@@ -3491,14 +3491,18 @@ impl MainWindow {
                             .min_h_0()
                             .min_w_0()
                             .track_scroll(&self.hit_scroll)
-                            .overflow_y_scrollbar()
+                            // 必须用原生 overflow_y_scroll：gpui-component 的
+                            // overflow_y_scrollbar() 返回 Scrollable，它在 render 里
+                            // 自建 scroll_handle，会完全忽略 track_scroll 的句柄
+                            // （这是此前 set_offset/scroll_to_item 全部无效的根因）。
+                            .overflow_y_scroll()
                             .px_3()
                             .py_2()
                             .text_sm()
                             // 每个块一个子元素：ScrollHandle::scroll_to_item(块号) 才能定位。
                             .children(if let Some(doc) = self.docx_doc.as_ref() {
                                 // docx：纯 Rust 自绘真版式（标题/段落/粗体/表格/命中高亮）。
-                                crate::ui::rich_view::render_docx(doc, &self.docx_hits, self.docx_focus, &tokens)
+                                crate::ui::rich_view::render_docx(doc, &self.docx_hits, None, &tokens)
                             } else {
                                 // 未解析完成或解析失败：回退纯文本列（渐进态）。
                                 let (plain, ranges) = self.hit_text_and_ranges();
