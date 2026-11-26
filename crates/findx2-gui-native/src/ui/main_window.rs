@@ -1728,7 +1728,13 @@ impl MainWindow {
     fn snippet_pager(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = Self::tokens(cx);
         let cur = self.snippet_window;
-        let total = self.snippet_total as usize;
+        // docx 场景：命中数以文档侧 hits 为准（与列表/高亮同源）。
+        let docx_mode = self.docx_doc.is_some() && !self.docx_hits.is_empty();
+        let total = if docx_mode {
+            self.docx_hits.len()
+        } else {
+            self.snippet_total as usize
+        };
         let label = if total > 0 {
             format!("{}/{}", cur + 1, total)
         } else {
@@ -1757,8 +1763,13 @@ impl MainWindow {
                         }
                         let w = this.snippet_window - 1;
                         this.preview_snippet_lock = true;
-                        this.fetch_snippet_window(entry_idx, w, true, cx);
-                        this.scroll_to_hit(w);
+                        if this.docx_doc.is_some() {
+                            this.snippet_window = w;
+                            this.scroll_to_hit(w);
+                        } else {
+                            this.fetch_snippet_window(entry_idx, w, true, cx);
+                            this.scroll_to_hit(w);
+                        }
                         cx.notify();
                     })),
             )
@@ -1788,8 +1799,13 @@ impl MainWindow {
                         }
                         let w = this.snippet_window + 1;
                         this.preview_snippet_lock = true;
-                        this.fetch_snippet_window(entry_idx, w, true, cx);
-                        this.scroll_to_hit(w);
+                        if this.docx_doc.is_some() {
+                            this.snippet_window = w;
+                            this.scroll_to_hit(w);
+                        } else {
+                            this.fetch_snippet_window(entry_idx, w, true, cx);
+                            this.scroll_to_hit(w);
+                        }
                         cx.notify();
                     })),
             )
@@ -1852,44 +1868,102 @@ impl MainWindow {
         self.hit_scroll.scroll_to_top_of_item(0);
     }
 
+    /// docx 命中列表（与文档高亮/跳转同源）：
+    /// 每条 = 一个命中区间 + 命中前后各 40 字上下文 + 该条内部的高亮区间。
+    /// 列表条目数 == docx_hits.len()，点第 N 条就跳到第 N 个命中块。
+    fn docx_hit_rows(&self) -> Vec<(String, Vec<std::ops::Range<usize>>)> {
+        let Some(doc) = self.docx_doc.as_ref() else {
+            return Vec::new();
+        };
+        const CTX: usize = 40;
+        self.docx_hits
+            .iter()
+            .map(|r| {
+                let mut a = r.start.saturating_sub(CTX);
+                while a > 0 && !doc.plain.is_char_boundary(a) {
+                    a -= 1;
+                }
+                let mut b = (r.end + CTX).min(doc.plain.len());
+                while b < doc.plain.len() && !doc.plain.is_char_boundary(b) {
+                    b += 1;
+                }
+                let ctx = doc.plain[a..b].replace(['\n', '\r', '\t'], " ");
+                let inner: Vec<std::ops::Range<usize>> = self
+                    .docx_hits
+                    .iter()
+                    .filter(|h| h.start >= a && h.end <= b)
+                    .map(|h| (h.start - a)..(h.end - a))
+                    .collect();
+                (ctx, inner)
+            })
+            .collect()
+    }
+
     fn snippet_list_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = Self::tokens(cx);
         let cur = self.snippet_window;
-        let total = self.snippet_total as usize;
-        let rows = self.snippet_list.clone();
-        let shown = rows.len();
-        // 整串查询词：用于判断每条是「全匹配」还是「分词匹配」。
-        let needle = {
-            let q = self.current_query(cx);
-            let lower = q.to_ascii_lowercase();
-            lower
-                .split("content:")
-                .nth(1)
-                .map(|rest| {
-                    let v = rest.trim_start();
-                    if let Some(stripped) = v.strip_prefix('"') {
-                        stripped.chars().take_while(|&c| c != '"').collect::<String>()
-                    } else {
-                        v.chars().take_while(|c| !c.is_whitespace()).collect::<String>()
-                    }
+
+        // 统一行模型：序号 / 单行文本 / 高亮区间 / 是否整串命中。
+        // docx 场景用**文档侧 hits**生成（与高亮、跳转同一套坐标），
+        // 非 docx 继续用 service 摘要窗口。
+        let (total, rows): (
+            usize,
+            Vec<(usize, String, Vec<std::ops::Range<usize>>, bool)>,
+        ) = if self.docx_doc.is_some() && !self.docx_hits.is_empty() {
+            let q = self.effective_query(cx);
+            let mut uniq = content_needles_of(&q);
+            uniq.sort();
+            uniq.dedup();
+            let single = uniq.len() <= 1;
+            let rs = self.docx_hit_rows();
+            let total = rs.len();
+            let rows = rs
+                .into_iter()
+                .enumerate()
+                .map(|(i, (ctx, ranges))| (i, ctx, ranges, single))
+                .collect();
+            (total, rows)
+        } else {
+            let needle = {
+                let q = self.current_query(cx);
+                let lower = q.to_ascii_lowercase();
+                lower
+                    .split("content:")
+                    .nth(1)
+                    .map(|rest| {
+                        let v = rest.trim_start();
+                        if let Some(stripped) = v.strip_prefix('"') {
+                            stripped.chars().take_while(|&c| c != '"').collect::<String>()
+                        } else {
+                            v.chars().take_while(|c| !c.is_whitespace()).collect::<String>()
+                        }
+                    })
+                    .filter(|s| !s.is_empty())
+            };
+            let rows = self
+                .snippet_list
+                .clone()
+                .into_iter()
+                .map(|(w, html)| {
+                    let (plain, ranges) = search_logic::snippet_plain_and_ranges(&html);
+                    let (flat, flat_ranges) = flatten_with_ranges(&plain, &ranges);
+                    let is_exact = needle.as_ref().is_some_and(|n| {
+                        flat_ranges.iter().any(|r| {
+                            flat.get(r.clone()).is_some_and(|s| s.eq_ignore_ascii_case(n))
+                        })
+                    });
+                    (w, flat, flat_ranges, is_exact)
                 })
-                .filter(|s| !s.is_empty())
+                .collect();
+            (self.snippet_total as usize, rows)
         };
+        let shown = rows.len();
+
         v_flex()
             .w_full()
             .flex_shrink_0()
             .gap_px()
-            .children(rows.into_iter().map(|(w, html)| {
-                let (plain, ranges) = search_logic::snippet_plain_and_ranges(&html);
-                // 单行：空白折叠（不改变字符数，只把连续空白压成一个空格，
-                // 这样 ranges 仍然有效——用字符级重算）。
-                let (flat, flat_ranges) = flatten_with_ranges(&plain, &ranges);
-                // 匹配类型：任一命中区间内容等于整串查询词 → 全匹配。
-                let is_exact = needle.as_ref().is_some_and(|n| {
-                    flat_ranges
-                        .iter()
-                        .any(|r| flat.get(r.clone()).is_some_and(|s| s.eq_ignore_ascii_case(n)))
-                });
+            .children(rows.into_iter().map(|(w, text, ranges, is_exact)| {
                 let badge_text = if is_exact { "全" } else { "词" };
                 let badge_color = if is_exact {
                     tokens.accent
@@ -1920,13 +1994,16 @@ impl MainWindow {
                                 return;
                             }
                             this.preview_snippet_lock = true;
-                            this.fetch_snippet_window(entry_idx, w, true, cx);
-                            // docx：内容区滚到该命中所在块。
-                            this.scroll_to_hit(w);
+                            if this.docx_doc.is_some() {
+                                // docx：同源列表，直接切焦点块（不重取 service 摘要）。
+                                this.snippet_window = w;
+                                this.scroll_to_hit(w);
+                            } else {
+                                this.fetch_snippet_window(entry_idx, w, true, cx);
+                            }
                             cx.notify();
                         })
                     })
-                    // 序号
                     .child(
                         div()
                             .flex_shrink_0()
@@ -1935,7 +2012,6 @@ impl MainWindow {
                             .text_color(tokens.text_tertiary)
                             .child(format!("{}", w + 1)),
                     )
-                    // 匹配类型徽章
                     .child(
                         div()
                             .flex_shrink_0()
@@ -1946,7 +2022,6 @@ impl MainWindow {
                             .when(is_exact, |d| d.bg(tokens.row_selected))
                             .child(badge_text),
                     )
-                    // 单行上下文（命中高亮）
                     .child(
                         div()
                             .flex_1()
@@ -1960,8 +2035,8 @@ impl MainWindow {
                                 tokens.text_secondary
                             })
                             .child(
-                                StyledText::new(flat).with_highlights(
-                                    flat_ranges.into_iter().map(|r| {
+                                StyledText::new(text).with_highlights(ranges.into_iter().map(
+                                    |r| {
                                         (
                                             r,
                                             HighlightStyle {
@@ -1970,8 +2045,8 @@ impl MainWindow {
                                                 ..Default::default()
                                             },
                                         )
-                                    }),
-                                ),
+                                    },
+                                )),
                             ),
                     )
             }))
@@ -1982,12 +2057,11 @@ impl MainWindow {
                         .py_1()
                         .text_xs()
                         .text_color(tokens.text_tertiary)
-                        .child(format!(
-                            "共 {total} 处，只列前 {shown}（上一个/下一个可达其余）"
-                        )),
+                        .child(format!("共 {total} 处，只列前 {shown}（上一个/下一个可达其余）")),
                 )
             })
     }
+
 
     /// 按需取指定窗口的摘要（选中行补取 + 上一个/下一个翻页共用）。
     /// window==0 时同时回填行内摘要；总是刷新预览卡；总数回填供翻页按钮用。
