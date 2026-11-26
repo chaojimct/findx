@@ -17,6 +17,55 @@ pub enum MdBlock {
 #[derive(Debug, Clone, Default)]
 pub struct MdDoc {
     pub blocks: Vec<MdBlock>,
+    /// 全文纯文本（块之间 `\n` 分隔），供命中区间映射。
+    pub plain: String,
+    /// 每块在 `plain` 中的字节起点（与 blocks 一一对应）。
+    pub block_starts: Vec<usize>,
+}
+
+impl MdDoc {
+    /// plain 字节偏移落在第几个块（命中→块 定位）。
+    pub fn block_of_offset(&self, off: usize) -> Option<usize> {
+        if self.blocks.is_empty() {
+            return None;
+        }
+        match self.block_starts.binary_search(&off) {
+            Ok(i) => Some(i),
+            Err(0) => Some(0),
+            Err(i) => Some(i - 1),
+        }
+    }
+
+    /// 块的纯文本（用于拼 plain）。
+    fn block_text(b: &MdBlock) -> String {
+        match b {
+            MdBlock::Heading { text, .. } => text.clone(),
+            MdBlock::Paragraph { text } => text.clone(),
+            MdBlock::Code { text, .. } => text.clone(),
+            MdBlock::List { items, .. } => items.join(" "),
+            MdBlock::Table { headers, rows } => {
+                let mut s = headers.join("\t");
+                for r in rows {
+                    s.push('\n');
+                    s.push_str(&r.join("\t"));
+                }
+                s
+            }
+            MdBlock::Rule => String::new(),
+        }
+    }
+
+    /// 解析完成后回填 plain / block_starts。
+    pub fn finalize(&mut self) {
+        let mut plain = String::new();
+        self.block_starts.clear();
+        for b in &self.blocks {
+            self.block_starts.push(plain.len());
+            plain.push_str(&Self::block_text(b));
+            plain.push('\n');
+        }
+        self.plain = plain;
+    }
 }
 
 const MAX_BLOCKS: usize = 2000;
@@ -31,7 +80,7 @@ pub fn parse(text: &str) -> MdDoc {
     opts.insert(Options::ENABLE_TASKLISTS);
     let text = truncate(text);
     let parser = Parser::new_ext(&text, opts);
-    let mut doc = MdDoc { blocks: Vec::new() };
+    let mut doc = MdDoc::default();
     let mut cur_text = String::new();
     let mut cur_heading: Option<u8> = None;
     let mut cur_code_lang = None::<String>;
@@ -215,6 +264,7 @@ pub fn parse(text: &str) -> MdDoc {
         }
     }
     flush_para(&mut doc, &mut cur_text);
+    doc.finalize();
     doc
 }
 

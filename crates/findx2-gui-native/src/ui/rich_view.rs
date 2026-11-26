@@ -113,6 +113,328 @@ pub fn render_docx(
     out
 }
 
+// ---------------------------------------------------------------------------
+// xlsx 表格网格渲染（对标 AnyTXT：行列标 + 命中格高亮）
+// ---------------------------------------------------------------------------
+
+/// 单元格宽度 / 行号列宽度（px）。
+const CELL_W: f32 = 112.0;
+const GUTTER_W: f32 = 46.0;
+
+/// 渲染当前 sheet 的网格（不含页签；页签由调用方渲染以便交互）。
+pub fn render_sheet(wb: &crate::xlsx_blocks::Workbook, tokens: &FindxTokens) -> AnyElement {
+    let Some(sheet) = wb.sheets.get(wb.focus_sheet) else {
+        return div().into_any_element();
+    };
+    let cols = sheet.cols().max(1);
+
+    let mut grid = v_flex().w(px(GUTTER_W + CELL_W * cols as f32));
+
+    // 列标行（A B C ...）
+    let mut head = h_flex().w_full().flex_shrink_0();
+    head = head.child(
+        div()
+            .w(px(GUTTER_W))
+            .h(px(24.))
+            .flex_shrink_0()
+            .border_r_1()
+            .border_b_1()
+            .border_color(tokens.border)
+            .bg(tokens.surface_raised),
+    );
+    for c in 0..cols {
+        head = head.child(
+            div()
+                .w(px(CELL_W))
+                .h(px(24.))
+                .flex_shrink_0()
+                .px_1()
+                .flex()
+                .items_center()
+                .border_r_1()
+                .border_b_1()
+                .border_color(tokens.border_soft)
+                .bg(tokens.surface_raised)
+                .text_xs()
+                .text_color(tokens.text_tertiary)
+                .child(crate::xlsx_blocks::col_label(c)),
+        );
+    }
+    grid = grid.child(head);
+
+    // 数据行
+    for (r, row) in sheet.rows.iter().enumerate() {
+        let mut row_el = h_flex().w_full().flex_shrink_0();
+        row_el = row_el.child(
+            div()
+                .w(px(GUTTER_W))
+                .h(px(22.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .border_r_1()
+                .border_b_1()
+                .border_color(tokens.border_soft)
+                .bg(tokens.surface_raised)
+                .text_xs()
+                .text_color(tokens.text_tertiary)
+                .child(format!("{}", r + 1)),
+        );
+        for c in 0..cols {
+            let text = row.get(c).map(|s| s.as_str()).unwrap_or("");
+            let is_hit = sheet.hits.contains(&(r, c));
+            let mut cell = div()
+                .w(px(CELL_W))
+                .h(px(22.))
+                .flex_shrink_0()
+                .px_1()
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .border_r_1()
+                .border_b_1()
+                .border_color(tokens.border_soft)
+                .text_xs()
+                .text_color(tokens.text_primary);
+            if is_hit {
+                cell = cell.bg(tokens.hit_bg).text_color(tokens.hit_fg);
+            }
+            cell = cell.child(text.to_string());
+            row_el = row_el.child(cell);
+        }
+        grid = grid.child(row_el);
+    }
+
+    // 横向 + 纵向滚动（网格可能比视口宽/高）
+    div()
+        .id("sheet-grid-scroll")
+        .size_full()
+        .overflow_x_scroll()
+        .overflow_y_scroll()
+        .child(grid)
+        .into_any_element()
+}
+
+/// sheet 页签行（点击切换由调用方用 Button 包裹）。
+pub fn sheet_tabs(wb: &crate::xlsx_blocks::Workbook, tokens: &FindxTokens) -> AnyElement {
+    let mut tabs = h_flex().w_full().flex_shrink_0().gap(px(2.)).px_2().py(px(3.));
+    for (i, sh) in wb.sheets.iter().enumerate() {
+        let active = i == wb.focus_sheet;
+        let label = if sh.hits.is_empty() {
+            sh.name.clone()
+        } else {
+            format!("{} ({})", sh.name, sh.hits.len())
+        };
+        tabs = tabs.child(
+            div()
+                .px_2()
+                .py(px(2.))
+                .rounded_sm()
+                .text_xs()
+                .when(active, |d| {
+                    d.bg(tokens.row_selected)
+                        .text_color(tokens.text_primary)
+                        .font_weight(FontWeight::BOLD)
+                })
+                .when(!active, |d| d.text_color(tokens.text_secondary))
+                .child(label),
+        );
+    }
+    tabs.into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// md 渲染（与 docx 共用版式与命中映射）
+// ---------------------------------------------------------------------------
+
+/// 渲染 md 块模型。命中区间是 `doc.plain` 的字节坐标，按块映射到段内。
+pub fn render_md(
+    doc: &crate::markdown_blocks::MdDoc,
+    hit_ranges: &[Range<usize>],
+    tokens: &FindxTokens,
+) -> Vec<AnyElement> {
+    use crate::markdown_blocks::MdBlock;
+    let mut out: Vec<AnyElement> = Vec::with_capacity(doc.blocks.len());
+    for (i, block) in doc.blocks.iter().enumerate() {
+        let start = doc.block_starts.get(i).copied().unwrap_or(0);
+        let el: AnyElement = match block {
+            MdBlock::Heading { level, text } => {
+                let px_size = heading_px(*level);
+                let spans = simple_spans(text, start, hit_ranges, tokens);
+                div()
+                    .w_full()
+                    .pt(px(10.))
+                    .pb(px(4.))
+                    .text_size(px(px_size))
+                    .line_height(px(px_size * 1.45))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(tokens.text_primary)
+                    .child(StyledText::new(text.clone()).with_highlights(spans))
+                    .into_any_element()
+            }
+            MdBlock::Paragraph { text } => {
+                let spans = simple_spans(text, start, hit_ranges, tokens);
+                div()
+                    .w_full()
+                    .py(px(3.))
+                    .text_size(px(BASE_PX))
+                    .line_height(px(BASE_PX * 1.6))
+                    .text_color(tokens.text_primary)
+                    .child(StyledText::new(text.clone()).with_highlights(spans))
+                    .into_any_element()
+            }
+            MdBlock::Code { lang, text } => {
+                let spans = simple_spans(text, start, hit_ranges, tokens);
+                let mut body = v_flex()
+                    .w_full()
+                    .my(px(4.))
+                    .px_3()
+                    .py_2()
+                    .rounded_sm()
+                    .bg(tokens.surface_raised)
+                    .border_1()
+                    .border_color(tokens.border_soft);
+                if !lang.is_empty() {
+                    body = body.child(
+                        div()
+                            .text_xs()
+                            .text_color(tokens.text_tertiary)
+                            .pb(px(2.))
+                            .child(lang.clone()),
+                    );
+                }
+                body.child(
+                    div()
+                        .text_size(px(BASE_PX * 0.9))
+                        .line_height(px(BASE_PX * 1.45))
+                        .font_family("Consolas")
+                        .text_color(tokens.text_primary)
+                        .child(StyledText::new(text.clone()).with_highlights(spans)),
+                )
+                .into_any_element()
+            }
+            MdBlock::List { ordered, items } => {
+                let mut list = v_flex().w_full().py(px(2.)).gap(px(2.));
+                let mut off = start;
+                for (n, item) in items.iter().enumerate() {
+                    let marker = if *ordered {
+                        format!("{}.", n + 1)
+                    } else {
+                        "•".to_string()
+                    };
+                    let spans = simple_spans(item, off, hit_ranges, tokens);
+                    list = list.child(
+                        h_flex()
+                            .w_full()
+                            .items_start()
+                            .gap(px(6.))
+                            .pl(px(8.))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .w(px(20.))
+                                    .text_size(px(BASE_PX))
+                                    .text_color(tokens.text_tertiary)
+                                    .child(marker),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(BASE_PX))
+                                    .line_height(px(BASE_PX * 1.55))
+                                    .text_color(tokens.text_primary)
+                                    .child(StyledText::new(item.clone()).with_highlights(spans)),
+                            ),
+                    );
+                    off += item.len() + 1;
+                }
+                list.into_any_element()
+            }
+            MdBlock::Table { headers, rows } => {
+                let mut table = v_flex().w_full().my(px(6.)).border_1().border_color(tokens.border);
+                let mut off = start;
+                let mut head = h_flex().w_full();
+                for hcell in headers {
+                    let spans = simple_spans(hcell, off, hit_ranges, tokens);
+                    head = head.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px_2()
+                            .py_1()
+                            .border_r_1()
+                            .border_b_1()
+                            .border_color(tokens.border_soft)
+                            .bg(tokens.surface_raised)
+                            .text_size(px(BASE_PX * 0.92))
+                            .font_weight(FontWeight::BOLD)
+                            .child(StyledText::new(hcell.clone()).with_highlights(spans)),
+                    );
+                    off += hcell.len() + 1;
+                }
+                table = table.child(head);
+                for row in rows {
+                    let mut r = h_flex().w_full();
+                    for cell in row {
+                        let spans = simple_spans(cell, off, hit_ranges, tokens);
+                        r = r.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .px_2()
+                                .py_1()
+                                .border_r_1()
+                                .border_b_1()
+                                .border_color(tokens.border_soft)
+                                .text_size(px(BASE_PX * 0.92))
+                                .child(StyledText::new(cell.clone()).with_highlights(spans)),
+                        );
+                        off += cell.len() + 1;
+                    }
+                    table = table.child(r);
+                }
+                table.into_any_element()
+            }
+            MdBlock::Rule => div()
+                .w_full()
+                .my(px(8.))
+                .h(px(1.))
+                .bg(tokens.border_soft)
+                .into_any_element(),
+        };
+        out.push(el);
+    }
+    out
+}
+
+/// 单段纯文本 + 命中高亮（md 没有 run 级样式，只需命中覆盖）。
+fn simple_spans(
+    text: &str,
+    plain_start: usize,
+    hits: &[Range<usize>],
+    tokens: &FindxTokens,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let mut spans = Vec::new();
+    for h in hits {
+        let a = h.start.saturating_sub(plain_start);
+        let b = h.end.saturating_sub(plain_start);
+        if b > a && b <= text.len() && text.is_char_boundary(a) && text.is_char_boundary(b) {
+            spans.push((
+                a..b,
+                HighlightStyle {
+                    background_color: Some(tokens.hit_bg),
+                    color: Some(tokens.hit_fg),
+                    ..Default::default()
+                },
+            ));
+        }
+    }
+    spans
+}
+
 fn render_paragraph(
     p: &StyledParagraph,
     plain_start: usize,

@@ -302,6 +302,12 @@ pub struct MainWindow {
     hit_scroll: gpui_kit::ScrollHandle,
     /// docx 定向渲染焦点块（点击列表/翻页时切换，只渲染该块附近的窗口）。
     docx_focus: Option<usize>,
+    /// md/txt 块模型（命中上下文富文本自绘；与 docx 共用渲染器）。
+    md_doc: Option<crate::markdown_blocks::MdDoc>,
+    /// md 命中区间（md.plain 字节坐标）。
+    md_hits: Vec<std::ops::Range<usize>>,
+    /// xlsx 工作簿模型（表格网格自绘：行列标 + sheet 页签 + 命中格高亮）。
+    sheet_book: Option<crate::xlsx_blocks::Workbook>,
     /// 搜索选项：区分大小写（Aa）。标题搜索精确生效；全文搜索后置过滤。
     search_match_case: bool,
     /// 搜索选项：全匹配（ab）。整串连续出现才算命中。
@@ -624,6 +630,9 @@ impl MainWindow {
             docx_gen: 0,
             hit_scroll: gpui_kit::ScrollHandle::new(),
             docx_focus: None,
+            md_doc: None,
+            md_hits: Vec::new(),
+            sheet_book: None,
             search_match_case: false,
             search_exact: false,
             search_wildcard: false,
@@ -2223,6 +2232,66 @@ impl MainWindow {
         .detach();
     }
 
+    /// xlsx 工作簿解析（命中上下文表格自绘）：calamine 纯 Rust。
+    fn fetch_sheet(&mut self, path: String, cx: &mut Context<Self>) {
+        self.sheet_book = None;
+        let q = self.effective_query(cx);
+        let needles = crate::docx_blocks::content_needles_of(&q);
+        cx.spawn(async move |this, cx| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::xlsx_blocks::parse(&path, &needles));
+            });
+            let parsed = rx.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(Ok(wb)) = parsed {
+                    this.sheet_book = Some(wb);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// md 块解析（命中上下文自绘用）：pulldown-cmark 纯 Rust，毫秒级。
+    fn fetch_md_blocks(&mut self, path: String, cx: &mut Context<Self>) {
+        self.md_doc = None;
+        self.md_hits.clear();
+        self.sheet_book = None;
+        cx.spawn(async move |this, cx| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                let r = std::fs::read_to_string(&path)
+                    .map(|text| crate::markdown_blocks::parse(&text))
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(r);
+            });
+            let parsed = rx.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(Ok(doc)) = parsed {
+                    this.md_doc = Some(doc);
+                    this.recompute_md_hits(cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// md 命中：用查询词在 md.plain 内自算（字面 + 拼音）。
+    fn recompute_md_hits(&mut self, cx: &mut Context<Self>) {
+        self.md_hits.clear();
+        let Some(doc) = self.md_doc.as_ref() else {
+            return;
+        };
+        let q = self.effective_query(cx);
+        let needles = crate::docx_blocks::content_needles_of(&q);
+        if needles.is_empty() {
+            return;
+        }
+        self.md_hits = crate::docx_blocks::match_hits_multi(&doc.plain, &needles);
+    }
+
     /// docx 富文本块解析（命中上下文自绘用）：纯 Rust、进程内，约 90ms。
     /// 后台线程解析，不卡 UI；代际校验防止旧结果覆盖新目标。
     fn fetch_docx_blocks(&mut self, path: String, cx: &mut Context<Self>) {
@@ -2231,6 +2300,8 @@ impl MainWindow {
         self.docx_doc = None;
         self.docx_hits.clear();
         self.docx_focus = None;
+        self.md_doc = None;
+        self.md_hits.clear();
         cx.spawn(async move |this, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || {
@@ -2430,13 +2501,18 @@ impl MainWindow {
         if self.preview_snippet_view && !hit.is_directory {
             self.fetch_full_text(hit.entry_idx, cx);
             self.fetch_snippet_list(hit.entry_idx, cx);
-            // docx：纯 Rust 块解析 → 命中上下文自绘真版式（零外部进程）。
-            if std::path::Path::new(&hit.path)
+            // docx / md：纯 Rust 块解析 → 命中上下文自绘真版式（零外部进程）。
+            let ext_l = std::path::Path::new(&hit.path)
                 .extension()
                 .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("docx"))
-            {
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default();
+            if ext_l == "docx" {
                 self.fetch_docx_blocks(hit.path.clone(), cx);
+            } else if matches!(ext_l.as_str(), "md" | "markdown") {
+                self.fetch_md_blocks(hit.path.clone(), cx);
+            } else if matches!(ext_l.as_str(), "xlsx" | "xlsm" | "xls") {
+                self.fetch_sheet(hit.path.clone(), cx);
             }
         }
         if self.preview_memo.len() > 64 {
@@ -3467,6 +3543,9 @@ impl MainWindow {
                             // 自建 scroll_handle，会完全忽略 track_scroll 的句柄
                             // （这是此前 set_offset/scroll_to_item 全部无效的根因）。
                             .overflow_y_scroll()
+                            // 滚动条单独挂在同一个句柄上（ScrollableElement trait），
+                            // 既显示滚动条又不干扰滚动控制。
+                            .vertical_scrollbar(&self.hit_scroll)
                             .px_3()
                             .py_2()
                             .text_sm()
@@ -3474,6 +3553,15 @@ impl MainWindow {
                             .children(if let Some(doc) = self.docx_doc.as_ref() {
                                 // docx：纯 Rust 自绘真版式（标题/段落/粗体/表格/命中高亮）。
                                 crate::ui::rich_view::render_docx(doc, &self.docx_hits, None, &tokens)
+                            } else if let Some(doc) = self.md_doc.as_ref() {
+                                // md：pulldown-cmark 块模型自绘（标题/段落/列表/表格/代码）。
+                                crate::ui::rich_view::render_md(doc, &self.md_hits, &tokens)
+                            } else if let Some(book) = self.sheet_book.as_ref() {
+                                // xlsx：表格网格（行列标 + 命中格高亮）。
+                                vec![
+                                    crate::ui::rich_view::sheet_tabs(book, &tokens),
+                                    crate::ui::rich_view::render_sheet(book, &tokens),
+                                ]
                             } else {
                                 // 未解析完成或解析失败：回退纯文本列（渐进态）。
                                 let (plain, ranges) = self.hit_text_and_ranges();
