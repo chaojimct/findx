@@ -1748,10 +1748,31 @@ impl MainWindow {
                 self.preview_file = None;
             }
             self.office_text_only = false;
+            // 同一文件的不同命中行（常见于多卷重复文件）：预览模型还可以复用，
+            // 不能清空——清空后 preview_active_selection 的“同文件早退”会让模型
+            // 永远补不回来（预览退化/不自动定位的根因之一）。
+            let prev_path = self
+                .selected
+                .and_then(|i| self.hits.get(i))
+                .map(|h| h.path.clone());
+            let next_path = index
+                .and_then(|i| self.hits.get(i))
+                .map(|h| h.path.clone());
+            let same_file = prev_path.is_some() && prev_path == next_path;
             self.selected = index;
-            // 关键：先把上一个文件的预览模型/列表清干净，否则列表会串文件。
-            self.clear_preview_models();
+            if !same_file {
+                // 关键：先把上一个文件的预览模型/列表清干净，否则列表会串文件。
+                self.clear_preview_models();
+            }
             self.auto_first_pending = index.is_some();
+            {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[sel] idx={index:?} auto_first={}",
+                    self.auto_first_pending
+                );
+            }
             self.preview_active_selection(cx);
         } else {
             self.selected = index;
@@ -1864,13 +1885,25 @@ impl MainWindow {
             .and_then(|e| e.to_str().map(|s| s.to_string()))
             .unwrap_or_default();
         if self.preview.pdf.is_some() {
+            {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[auto] pdf ext={ext} spans={} pending={}",
+                    self.full_spans.len(),
+                    self.auto_first_pending
+                );
+            }
             if self.full_spans.is_empty() {
                 return;
             }
+            let Some(hit) = self.active_workspace_hit() else {
+                return;
+            };
+            // 先跳再清 pending：goto_pdf_hit 在位图未就绪时会直接返回，
+            // 若先清 pending，位图晚到后就再也不会跳了（实测的竞态）。
             self.auto_first_pending = false;
-            if let Some(hit) = self.active_workspace_hit() {
-                self.goto_pdf_hit(hit.entry_idx, 0, cx);
-            }
+            self.goto_pdf_hit(hit.entry_idx, 0, cx);
             return;
         }
         let (ready, has_hits) = match ext.as_str() {
@@ -3562,6 +3595,15 @@ impl MainWindow {
             return;
         }
         self.snippet_window = h;
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "[pdf] goto entry={entry_idx} h={h} cur_page={} cached={}",
+                self.pdf_options.page,
+                self.pdf_hit_pages.is_some()
+            );
+        }
         if let Some((e, g, pages)) = self.pdf_hit_pages.as_ref() {
             if *e == entry_idx && *g == self.search_gen {
                 let page = pages.get(h).copied().unwrap_or(0);
