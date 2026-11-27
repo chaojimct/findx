@@ -1888,7 +1888,7 @@ impl MainWindow {
             })
             .and_then(|e| e.to_str().map(|s| s.to_string()))
             .unwrap_or_default();
-        if self.preview.pdf.is_some() {
+        if ext == "pdf" && self.preview.pdf.is_some() {
             {
                 use std::io::Write as _;
                 let _ = writeln!(
@@ -2122,7 +2122,12 @@ impl MainWindow {
             self.md_hits.len()
         } else if self.deck.is_some() && !self.deck_hits.is_empty() {
             self.deck_hits.len()
-        } else if !self.full_spans.is_empty() {
+        } else if !self.full_spans.is_empty()
+            && self.docx_doc.is_none()
+            && self.md_doc.is_none()
+            && self.deck.is_none()
+            && self.sheet_book.is_none()
+        {
             self.full_spans.len()
         } else {
             self.snippet_total as usize
@@ -2732,7 +2737,12 @@ impl MainWindow {
                 .map(|(i, (ctx, ranges))| (i, ctx, ranges, single))
                 .collect();
             (total, rows)
-        } else if !self.full_spans.is_empty() {
+        } else if !self.full_spans.is_empty()
+            && self.docx_doc.is_none()
+            && self.md_doc.is_none()
+            && self.deck.is_none()
+            && self.sheet_book.is_none()
+        {
             let needles = crate::docx_blocks::content_needles_of(&self.effective_query(cx));
             let single = needles.len() <= 1;
             let hits: Vec<std::ops::Range<usize>> =
@@ -3704,9 +3714,15 @@ impl MainWindow {
             return;
         };
         let bi = h.saturating_sub(first);
-        let Some(r) = self.preview.pdf_highlights.get(bi) else {
-            return; // 框还没回来，保留待办
+        let vh = self.pdf_scroll.bounds().size.height.as_f32();
+        let Some(r) = self.preview.pdf_highlights.get(bi).cloned() else {
+            // 框还没回来（本页框是异步取的）：保留待办，下一帧再试。
+            return;
         };
+        if vh <= 1.0 {
+            // 页面视图还没布局出来：set_offset 会被首次布局清掉，保留待办。
+            return;
+        }
         let width = if self.preview_options.fit_width {
             (self.actual_preview_width - 24.).max(120.)
         } else {
@@ -3714,10 +3730,16 @@ impl MainWindow {
         };
         let height = width * pdf.height / pdf.width.max(1.);
         let y = r[1] * height / pdf.height.max(1.);
-        let vh = self.pdf_scroll.bounds().size.height.as_f32();
         let target = (y - vh * 0.3).max(0.0);
         self.pdf_scroll
             .set_offset(gpui::point(gpui::px(0.), gpui::px(-target)));
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "[pdf-scroll] h={h} box_y={y:.1} vh={vh:.1} target={target:.1}"
+            );
+        }
         self.pdf_scroll_to = None;
     }
 
