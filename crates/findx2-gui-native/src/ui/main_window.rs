@@ -2346,19 +2346,10 @@ impl MainWindow {
     /// 避免「3 万格 × N 词 × 逐字拼音」把加载拖慢一个数量级。
     fn fetch_sheet(&mut self, path: String, cx: &mut Context<Self>) {
         self.sheet_book = None;
-        // 宽匹配词：查询词 + 中文二元组（“我与青松” -> 我与/与青/青松）。
+        // 命中词与索引同口径：只取 content: 里的空格分隔词（不再扩二元组）。
         let keep_words = {
             let q = self.effective_query(cx);
-            let base = crate::docx_blocks::content_needles_of(&q);
-            let mut out: Vec<String> = base.clone();
-            for w in &base {
-                let chars: Vec<char> = w.chars().collect();
-                if chars.len() > 2 && chars.iter().all(|c| !c.is_ascii()) {
-                    for i in 0..chars.len() - 1 {
-                        out.push(chars[i..i + 2].iter().collect());
-                    }
-                }
-            }
+            let mut out = crate::docx_blocks::content_needles_of(&q);
             out.sort();
             out.dedup();
             out
@@ -2464,17 +2455,6 @@ impl MainWindow {
                     if !w.is_empty() && w.len() <= 64 {
                         words.push(w.to_string());
                     }
-                }
-            }
-        }
-        // 补中文二元组：service 按分词命中（如 "青松"），整词 "我与青松" 匹配不上；
-        // 二元组（我与/与青/青松）能覆盖，保证表格/列表能标出命中。
-        let base: Vec<String> = words.clone();
-        for w in &base {
-            let chars: Vec<char> = w.chars().collect();
-            if chars.len() > 2 && chars.iter().all(|c| !c.is_ascii()) {
-                for i in 0..chars.len() - 1 {
-                    words.push(chars[i..i + 2].iter().collect());
                 }
             }
         }

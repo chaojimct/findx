@@ -31,6 +31,39 @@ use crate::{Error, Result};
 pub const SCHEMA_VERSION: u32 = 4;
 pub const TOKENIZER_JIEBA: &str = "jieba_findx";
 
+/// 预览/摘要用的「命中词」：只取 `content:"…"` 里的空格分隔词。
+///
+/// 必须与索引的 per-word phrase 口径一致：不能拿 jieba token 或整条查询
+/// 语法（`content:` / `glob:0`）去匹配，否则预览会把 `content`、`glob`、
+/// 单字都算命中，跟结果列表对不上。`utf8content:` 同义。
+pub fn content_needles(query_text: &str) -> Vec<String> {
+    let lower = query_text.to_ascii_lowercase();
+    let mut best: Option<(usize, usize)> = None;
+    for key in ["content:", "utf8content:"] {
+        if let Some(i) = lower.find(key) {
+            if best.map_or(true, |(bi, _)| i < bi) {
+                best = Some((i, key.len()));
+            }
+        }
+    }
+    let inner = match best {
+        Some((i, klen)) => {
+            let v = query_text[i + klen..].trim_start();
+            if let Some(s) = v.strip_prefix('"') {
+                s.chars().take_while(|&c| c != '"').collect::<String>()
+            } else {
+                v.chars().take_while(|c| !c.is_whitespace()).collect()
+            }
+        }
+        None => query_text.to_string(),
+    };
+    inner
+        .split_whitespace()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// 单个查询词 → tantivy 查询。
 ///
 /// 词被切成多个 token 时用 `PhraseQuery`（position 必须连续 = 原文连续出现）。
@@ -764,8 +797,7 @@ impl ContentIndex {
         let started = std::time::Instant::now();
         self.reader.reload()?;
         let searcher = self.reader.searcher();
-        let mut tok = HybridTokenizer::new();
-        let terms = crate::snippet::query_terms(query_text, &mut tok);
+        let terms = content_needles(query_text);
         if terms.is_empty() {
             return Ok(out);
         }
@@ -826,8 +858,7 @@ impl ContentIndex {
         }
         self.reader.reload()?;
         let searcher = self.reader.searcher();
-        let mut tok = HybridTokenizer::new();
-        let terms = crate::snippet::query_terms(query_text, &mut tok);
+        let terms = content_needles(query_text);
         if terms.is_empty() {
             return Ok(None);
         }
@@ -871,8 +902,7 @@ impl ContentIndex {
         key: u64,
         wire_cap: usize,
     ) -> Result<Option<(String, Vec<(usize, usize)>, usize, bool)>> {
-        let mut tok = HybridTokenizer::new();
-        let terms = crate::snippet::query_terms(query_text, &mut tok);
+        let terms = content_needles(query_text);
         if terms.is_empty() {
             return Ok(None);
         }
@@ -928,8 +958,7 @@ impl ContentIndex {
         let qp = QueryParser::for_index(searcher.index(), vec![self.fields.body]);
         let query = qp.parse_query(query_text).map_err(Error::from)?;
         let top = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
-        let mut tok = HybridTokenizer::new();
-        let terms = crate::snippet::query_terms(query_text, &mut tok);
+        let terms = content_needles(query_text);
         // snippet 按需回读原文，贵：只给前 5 个生成，其余空串（展示页按需取）。
         let snippet_cap = top.len().min(5);
         let mut out = Vec::with_capacity(top.len());
@@ -1167,5 +1196,22 @@ mod tests {
         assert!(miss.is_empty(), "『岛』不应命中任何文档：{miss:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preview_needles_are_phrases_not_tokens() {
+        let q = "content:\"马春天 我与青松\" glob:0";
+        assert_eq!(content_needles(q), vec!["马春天", "我与青松"]);
+        // 预览只标两段短语，不能把单字/二元组也算命中。
+        let text = "x 马春天 y 我与青松 z 与 w 青松";
+        let spans = crate::snippet::match_spans(text, &content_needles(q));
+        assert_eq!(spans.len(), 2, "spans={spans:?}");
+        // mix 查询（含 | 分支）同样只取 content: 的值。
+        assert_eq!(
+            content_needles("马春天 我与青松 | content:\"马春天 我与青松\" glob:0"),
+            vec!["马春天", "我与青松"]
+        );
+        // 没有 content: 时整串作为词（文件名/拼音查询走不到预览）。
+        assert_eq!(content_needles("青松"), vec!["青松"]);
     }
 }
