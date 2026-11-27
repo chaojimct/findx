@@ -1684,7 +1684,9 @@ impl MainWindow {
     /// 命中上下文文本列内容：全文优先（spans 为字节区间），
     /// 全文未到/超大回退时用摘要窗（`<b>` 标记解析成区间）。
     fn hit_text_and_ranges(&self) -> (String, Vec<std::ops::Range<usize>>) {
-        if !self.full_text.is_empty() {
+        // 大文件全文只传前 256KB：若命中点不在这段里，spans 为空，
+        // 此时必须回退摘要窗，否则预览永远停在文件开头、点了也不跳。
+        if !self.full_text.is_empty() && !self.full_spans.is_empty() {
             let t = &self.full_text;
             let ranges: Vec<std::ops::Range<usize>> = self
                 .full_spans
@@ -1726,7 +1728,7 @@ impl MainWindow {
             self.md_hits.len()
         } else if self.deck.is_some() && !self.deck_hits.is_empty() {
             self.deck_hits.len()
-        } else if !self.full_text.is_empty() && self.preview.pdf.is_none() {
+        } else if !self.full_spans.is_empty() && self.preview.pdf.is_none() {
             self.full_spans.len()
         } else {
             self.snippet_total as usize
@@ -1783,7 +1785,7 @@ impl MainWindow {
                             && (this.docx_doc.is_some()
                                 || this.md_doc.is_some()
                                 || this.deck.is_some()
-                                || !this.full_text.is_empty())
+                                || !this.full_spans.is_empty())
                         {
                             this.snippet_window = w;
                             this.scroll_to_hit(w);
@@ -1831,7 +1833,7 @@ impl MainWindow {
                             && (this.docx_doc.is_some()
                                 || this.md_doc.is_some()
                                 || this.deck.is_some()
-                                || !this.full_text.is_empty())
+                                || !this.full_spans.is_empty())
                         {
                             this.snippet_window = w;
                             this.scroll_to_hit(w);
@@ -1975,6 +1977,34 @@ impl MainWindow {
             }
         }
         Some(lo.saturating_sub(1))
+    }
+
+    /// 摘要窗很长（日志一行可能上千字）：只保留第一个命中词前后一段，
+    /// 避免列表行前面全是无效前缀、高亮词被挤出屏幕。
+    fn center_on_first_hit(
+        text: &str,
+        ranges: &[std::ops::Range<usize>],
+        before: usize,
+        after: usize,
+    ) -> (String, Vec<std::ops::Range<usize>>) {
+        let Some(first) = ranges.first() else {
+            return (text.to_string(), ranges.to_vec());
+        };
+        let mut a = first.start.saturating_sub(before);
+        while a > 0 && !text.is_char_boundary(a) {
+            a -= 1;
+        }
+        let mut b = (first.end + after).min(text.len());
+        while b < text.len() && !text.is_char_boundary(b) {
+            b += 1;
+        }
+        let line = text[a..b].replace(['\n', '\r', '\t'], " ");
+        let inner: Vec<std::ops::Range<usize>> = ranges
+            .iter()
+            .filter(|r| r.start >= a && r.end <= b)
+            .map(|r| (r.start - a)..(r.end - a))
+            .collect();
+        (line, inner)
     }
 
     /// 统一命中行模型：每条 = 命中前后 ctx 字节上下文 + 该条内部的高亮区间。
@@ -2151,9 +2181,7 @@ impl MainWindow {
                 .map(|(i, (ctx, ranges))| (i, ctx, ranges, single))
                 .collect();
             (total, rows)
-        } else if !self.full_text.is_empty()
-            && !self.full_spans.is_empty()
-            && self.preview.pdf.is_none()
+        } else if !self.full_spans.is_empty() && self.preview.pdf.is_none()
         {
             let needles = crate::docx_blocks::content_needles_of(&self.effective_query(cx));
             let single = needles.len() <= 1;
@@ -2196,6 +2224,8 @@ impl MainWindow {
                             flat.get(r.clone()).is_some_and(|s| s.eq_ignore_ascii_case(n))
                         })
                     });
+                    let (flat, flat_ranges) =
+                        Self::center_on_first_hit(&flat, &flat_ranges, 48, 96);
                     (w, flat, flat_ranges, is_exact)
                 })
                 .collect();
