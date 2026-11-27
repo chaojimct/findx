@@ -2989,50 +2989,52 @@ impl MainWindow {
             }
             idx.min(count.saturating_sub(1))
         };
-        let anchor = first.min(count.saturating_sub(1));
-        let sticky = self
-            .list_groups
-            .partition_point(|g| g.row <= anchor)
-            .checked_sub(1)
-            .and_then(|i| self.list_groups.get(i))
-            .cloned();
+        // 第一行本身是分组头时不需要吸顶条（组头就在眼前，避免出现两行一样
+        // 的内容；也避免盖住组头后三角点不到）。
+        let at_group_header = self.list_groups.iter().any(|g| g.row == first);
+        let sticky = if at_group_header {
+            None
+        } else {
+            self.list_groups
+                .partition_point(|g| g.row <= first)
+                .checked_sub(1)
+                .and_then(|i| self.list_groups.get(i))
+                .cloned()
+        };
 
-        // 吸顶条放在列表「上方」（正常布局），不覆盖第一行 —— 否则折叠后
-        // 当前分组的组头被盖住，就再也点不开、三角也不变。
-        let mut host = v_flex().w_full().h_full().min_h_0().min_w_0();
+        // 覆盖式吸顶：只盖住「命中行」（组头行时上面已判空），所以折叠三角
+        // 永远点得到，也不会出现两行相同内容。
+        let mut host = div()
+            .relative()
+            .w_full()
+            .h_full()
+            .min_h_0()
+            .min_w_0()
+            .child(list)
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .right(px(0.))
+                    .bottom(px(0.))
+                    .w(px(12.))
+                    .child(
+                        Scrollbar::vertical(&self.list_vscroll)
+                            .viewport_from_layout()
+                            .mode(ScrollbarMode::Always)
+                            .styles(|styles| {
+                                styles
+                                    .track(|style| style.bg(tokens.border_soft))
+                                    .thumb(|style| style.bg(tokens.text_tertiary))
+                                    .thumb_hover(|style| style.bg(tokens.text_secondary))
+                                    .thumb_active(|style| style.bg(tokens.accent))
+                            }),
+                    ),
+            );
         if let Some(g) = sticky {
             host = host.child(self.sticky_group_bar(&g, tokens_copy, cx));
         }
-        host.child(
-            div()
-                .relative()
-                .w_full()
-                .flex_1()
-                .min_h_0()
-                .min_w_0()
-                .child(list)
-                .child(
-                    div()
-                        .absolute()
-                        .top(px(0.))
-                        .right(px(0.))
-                        .bottom(px(0.))
-                        .w(px(12.))
-                        .child(
-                            Scrollbar::vertical(&self.list_vscroll)
-                                .viewport_from_layout()
-                                .mode(ScrollbarMode::Always)
-                                .styles(|styles| {
-                                    styles
-                                        .track(|style| style.bg(tokens.border_soft))
-                                        .thumb(|style| style.bg(tokens.text_tertiary))
-                                        .thumb_hover(|style| style.bg(tokens.text_secondary))
-                                        .thumb_active(|style| style.bg(tokens.accent))
-                                }),
-                        ),
-                ),
-        )
-        .into_any_element()
+        host.into_any_element()
     }
 
     /// 按需取指定窗口的摘要（选中行补取 + 上一个/下一个翻页共用）。
@@ -3436,8 +3438,10 @@ impl MainWindow {
         let e_toggle = cx.entity();
         let e_select = cx.entity();
         h_flex()
-            .w_full()
-            .flex_shrink_0()
+            .absolute()
+            .left(px(0.))
+            .right(px(12.))
+            .top(px(0.))
             .h(px(LIST_ROW_H))
             .items_center()
             .gap(px(4.))
