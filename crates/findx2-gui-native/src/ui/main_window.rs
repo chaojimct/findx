@@ -2186,10 +2186,7 @@ impl MainWindow {
                 let list_label = if self.snippet_list_loading {
                     SharedString::from("拉取中…")
                 } else {
-                    SharedString::from(format!(
-                        "全部{total}处{}",
-                        if self.snippet_list_open { "▾" } else { "▸" }
-                    ))
+                    SharedString::from(format!("全部{total}处"))
                 };
                 row.child(
                     Button::new("snippet-list")
@@ -2198,21 +2195,23 @@ impl MainWindow {
                         .disabled(self.snippet_list_loading)
                         .h(px(22.))
                         .px_2()
-                        .tooltip("编号命中列表（一次拉全窗，点击行号跳窗）")
+                        .tooltip("展开全部命中列表，并回到第一处")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            if this.snippet_list_open {
-                                this.snippet_list_open = false;
-                                cx.notify();
-                                return;
-                            }
-                            if !this.snippet_list.is_empty() {
+                            // 不再支持“收起”（收起没有实际意义）：点击只保证列表
+                            // 展开并回到第一处。
+                            if !this.snippet_list_open {
                                 this.snippet_list_open = true;
+                            }
+                            this.list_vscroll
+                                .scroll_to_item(0, gpui_kit::ScrollStrategy::Top);
+                            if !this.snippet_list.is_empty() {
                                 cx.notify();
                                 return;
                             }
                             let Some(entry_idx) =
                                 this.active_workspace_hit().map(|h| h.entry_idx)
                             else {
+                                cx.notify();
                                 return;
                             };
                             this.fetch_snippet_list(entry_idx, cx);
@@ -4979,6 +4978,21 @@ impl MainWindow {
                                 - 24.0
                                 - 30.0)
                                 .clamp(140.0, 520.0);
+                            // 直接点单元格 → 选中该格（显示高亮 + 展开浮层）。
+                            let on_select_cell: Option<
+                                std::rc::Rc<
+                                    dyn Fn(usize, usize, &mut gpui_kit::App),
+                                >,
+                            > = {
+                                let entity = cx.entity();
+                                Some(std::rc::Rc::new(move |r, c, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.sheet_selected = Some((r, c));
+                                        this.sheet_scroll_to = None;
+                                        cx.notify();
+                                    });
+                                }))
+                            };
                             let book = self.sheet_book.as_ref().expect("checked is_some");
                             v_flex()
                                 .flex_1()
@@ -5034,6 +5048,7 @@ impl MainWindow {
                                             &words,
                                             popup_close,
                                             popup_max_h,
+                                            on_select_cell,
                                         )),
                                 )
                                 .into_any_element()

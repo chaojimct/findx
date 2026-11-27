@@ -189,6 +189,7 @@ pub fn render_sheet(
     hit_words: &[String],
     popup_close: Option<std::rc::Rc<dyn Fn(&mut gpui_kit::App)>>,
     popup_max_h: f32,
+    on_select_cell: Option<std::rc::Rc<dyn Fn(usize, usize, &mut gpui_kit::App)>>,
 ) -> AnyElement {
     let Some(sheet) = book.sheets.get(book.focus_sheet) else {
         return div().into_any_element();
@@ -266,6 +267,7 @@ pub fn render_sheet(
                     let is_hit = sheet_arc.hits.binary_search(&(r, c)).is_ok();
                     let is_sel = selected == Some((r, c));
                     let mut cell = div()
+                        .id(SharedString::from(format!("sheet-cell-{r}-{c}")))
                         .w(px(CELL_W))
                         .h(px(row_h))
                         .flex_shrink_0()
@@ -279,6 +281,13 @@ pub fn render_sheet(
                         .border_color(tokens_copy.border_soft)
                         .text_xs()
                         .text_color(tokens_copy.text_primary);
+                    // 直接点单元格也能选中（显示高亮 + 展开浮层）。
+                    if let Some(cb) = on_select_cell.as_ref() {
+                        let cb = cb.clone();
+                        cell = cell
+                            .cursor_pointer()
+                            .on_click(move |_, _, cx| cb(r, c, cx));
+                    }
                     if is_sel {
                         // 选中格：主题强调色描边 + 淡底（AnyTXT 的蓝框效果）
                         cell = cell
