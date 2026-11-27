@@ -193,8 +193,32 @@ impl MainWindow {
         }
         self.file_actions.pointer_event = Some((search, row));
         if search {
+            // 鼠标点搜索结果必须和键盘一样触发「自动定位第一个命中」：
+            // 这里原来直接改 self.selected，绕过了 set_selected 的
+            // clear_preview_models + auto_first_pending 逻辑，所以点文件
+            // 只会换预览、不会跳到命中（也不会有翻页/滚动定位）。
+            let prev_path = self
+                .selected
+                .and_then(|i| self.hits.get(i))
+                .map(|h| h.path.clone());
+            let next_path = focus
+                .and_then(|i| self.hits.get(i))
+                .map(|h| h.path.clone());
+            let same_file = prev_path.is_some() && prev_path == next_path;
             self.selected = focus;
             self.preview_file = None;
+            if !same_file && focus.is_some() {
+                self.clear_preview_models();
+            }
+            self.auto_first_pending = focus.is_some() && !same_file;
+            {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[sel-mouse] row={row} focus={focus:?} same_file={same_file} auto_first={}",
+                    self.auto_first_pending
+                );
+            }
         } else {
             self.workspace.selected = focus;
         }
