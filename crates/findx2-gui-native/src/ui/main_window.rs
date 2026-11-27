@@ -2992,14 +2992,20 @@ impl MainWindow {
                     this.sheet_book = Some(wb);
                     cx.notify();
                     this.maybe_auto_first_hit(cx);
-                    // 全扫替换模型后行索引可能变化：把当前命中格重新对齐一次
-                    // （纵向回行首 + 横向回命中列），否则会停在错行/错列。
+                    // 全扫替换模型后行索引可能变化：优先保持已有选中格，
+                    // 否则补一次「首个命中格」定位（命中在首屏 1200 行之外时，
+                    // 首屏快照那次没有命中可跳，这里才拿到）。
                     if let Some((r, c)) = this.sheet_selected {
                         let si = this
                             .sheet_book
                             .as_ref()
                             .map(|b| b.focus_sheet)
                             .unwrap_or(0);
+                        this.goto_sheet_cell(si, r, c);
+                        cx.notify();
+                    } else if let Some((si, r, c, _, _)) =
+                        this.sheet_hit_rows().first().cloned()
+                    {
                         this.goto_sheet_cell(si, r, c);
                         cx.notify();
                     }
