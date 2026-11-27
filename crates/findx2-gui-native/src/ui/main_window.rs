@@ -1637,6 +1637,34 @@ impl MainWindow {
         }
     }
 
+    /// 切换文件时清空上一个文件的预览模型与命中列表。
+    /// 不清会让「上一个文件」的 sheet/docx/deck/full_text 继续参与列表渲染
+    /// （例如 xlsx 的 "E2: ..." 行会卡在 pptx 的预览下面不动）。
+    fn clear_preview_models(&mut self) {
+        self.docx_doc = None;
+        self.docx_hits.clear();
+        self.docx_focus = None;
+        self.md_doc = None;
+        self.md_hits.clear();
+        self.deck = None;
+        self.deck_hits.clear();
+        self.sheet_book = None;
+        self.sheet_selected = None;
+        self.full_text.clear();
+        self.full_spans.clear();
+        self.full_total = 0;
+        self.full_truncated = false;
+        self.text_arc = std::sync::Arc::new(String::new());
+        self.text_lines = std::sync::Arc::new(Vec::new());
+        self.text_spans = std::sync::Arc::new(Vec::new());
+        self.text_content_w = 0.0;
+        self.snippet_list.clear();
+        self.snippet_total = 0;
+        self.snippet_list_loading = false;
+        self.preview_snippet.clear();
+        self.snippet_window = 0;
+    }
+
     fn set_selected(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
         if !self.file_rows_current(true) { return; }
         self.record_single_selection(true, index);
@@ -1646,7 +1674,8 @@ impl MainWindow {
             }
             self.office_text_only = false;
             self.selected = index;
-            self.snippet_window = 0;
+            // 关键：先把上一个文件的预览模型/列表清干净，否则列表会串文件。
+            self.clear_preview_models();
             self.auto_first_pending = index.is_some();
             self.preview_active_selection(cx);
         } else {
