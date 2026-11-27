@@ -16,7 +16,7 @@ use workspace::{ViewMode, Workspace, key};
 use findx2_ipc::SearchHitDto;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode, ScrollableElement as _};
 use gpui_kit::component::{Icon, IconName, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -3817,6 +3817,7 @@ impl MainWindow {
             .h_full()
             .min_h_0()
             .flex_shrink_0()
+            .overflow_hidden()
             .bg(tokens.surface)
             .border_l_1()
             .border_color(tokens.border)
@@ -4011,6 +4012,7 @@ impl MainWindow {
                         div()
                             .id("hit-text-scroll")
                             .flex_1()
+                            .w_full()
                             .min_h_0()
                             .min_w_0()
                             .track_scroll(&self.hit_scroll)
@@ -4091,6 +4093,15 @@ impl MainWindow {
                                     els
                                 }
                             })
+                            // 常显纵向滚动条：默认 ScrollbarMode::Scrolling 只在滚动时
+                            // 闪现，窗口矮/内容长时用户看不到条也找不到可滚的区域。
+                            .child(
+                                div().absolute().inset_0().child(
+                                    Scrollbar::vertical(&self.hit_scroll)
+                                        .viewport_from_layout()
+                                        .mode(ScrollbarMode::Always),
+                                ),
+                            )
                             .into_any_element()
                         },
                     )
