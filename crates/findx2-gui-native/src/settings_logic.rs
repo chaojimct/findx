@@ -227,6 +227,9 @@ pub struct FindxGuiSettings {
     #[serde(default)]
     pub content_default_mode: ContentDefaultMode,
     /// 结果表第二行 + 预览窗显示命中摘要。
+    /// 命中上下文：自动换行（关 = 长行不换行，横向滚动查看）。
+    #[serde(default = "default_true")]
+    pub preview_wrap: bool,
     #[serde(default = "default_true")]
     pub content_snippet: bool,
     /// 全文拼音辅库：首字母查询（`qw` 命中“全文”）。缺库时自动降级。
@@ -310,6 +313,7 @@ impl FindxGuiSettings {
             content_enabled: true,
             content_default_mode: ContentDefaultMode::Name,
             content_snippet: true,
+            preview_wrap: true,
             content_pinyin_initials: true,
             content_pinyin_full: true,
             content_mix_limit: default_content_mix_limit(),

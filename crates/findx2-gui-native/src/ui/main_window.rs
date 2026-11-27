@@ -1712,18 +1712,15 @@ impl MainWindow {
     }
 
     /// 上一个/下一个匹配点翻页（snippet_total>1 时展示；点击即取对应窗口）。
-    fn snippet_pager(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let tokens = Self::tokens(cx);
-        let cur = self.snippet_window;
-        // 命中数以侧模型为准（与列表/高亮同源）。
-        let docx_mode = self.docx_doc.is_some() && !self.docx_hits.is_empty();
-        let sheet_mode = self
+    /// 当前文档的命中总数（列表 / 翻页 / 边界判断同一口径）。
+    fn hit_count(&self) -> usize {
+        if self.docx_doc.is_some() && !self.docx_hits.is_empty() {
+            self.docx_hits.len()
+        } else if self
             .sheet_book
             .as_ref()
-            .is_some_and(|b| b.sheets.iter().any(|s| !s.hits.is_empty()));
-        let total = if docx_mode {
-            self.docx_hits.len()
-        } else if sheet_mode {
+            .is_some_and(|b| b.sheets.iter().any(|s| !s.hits.is_empty()))
+        {
             self.sheet_hit_rows().len()
         } else if self.md_doc.is_some() && !self.md_hits.is_empty() {
             self.md_hits.len()
@@ -1733,7 +1730,20 @@ impl MainWindow {
             self.full_spans.len()
         } else {
             self.snippet_total as usize
-        };
+        }
+    }
+
+    fn snippet_pager(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tokens = Self::tokens(cx);
+        let cur = self.snippet_window;
+        let wrap = self.session.read(cx).settings.preview_wrap;
+        // 命中数以侧模型为准（与列表/高亮同源）。
+        let docx_mode = self.docx_doc.is_some() && !self.docx_hits.is_empty();
+        let sheet_mode = self
+            .sheet_book
+            .as_ref()
+            .is_some_and(|b| b.sheets.iter().any(|s| !s.hits.is_empty()));
+        let total = self.hit_count();
         let label = if total > 0 {
             format!("{}/{}", cur + 1, total)
         } else {
@@ -1804,7 +1814,7 @@ impl MainWindow {
                         else {
                             return;
                         };
-                        let total = this.snippet_total as usize;
+                        let total = this.hit_count();
                         if total > 0 && this.snippet_window + 1 >= total {
                             return;
                         }
@@ -1817,7 +1827,12 @@ impl MainWindow {
                             {
                                 this.goto_sheet_cell(si, r, c);
                             }
-                        } else if this.docx_doc.is_some() {
+                        } else if this.preview.pdf.is_none()
+                            && (this.docx_doc.is_some()
+                                || this.md_doc.is_some()
+                                || this.deck.is_some()
+                                || !this.full_text.is_empty())
+                        {
                             this.snippet_window = w;
                             this.scroll_to_hit(w);
                         } else {
@@ -1864,6 +1879,23 @@ impl MainWindow {
                         })),
                 )
             })
+            .child(div().flex_1())
+            .child(
+                Button::new("preview-wrap-toggle")
+                    .ghost()
+                    .h(px(22.))
+                    .px_2()
+                    .label(if wrap { "自动换行: 开" } else { "自动换行: 关" })
+                    .tooltip("关：长行不换行，用横向滚动条查看")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let new = !this.session.read(cx).settings.preview_wrap;
+                        this.session.update(cx, |s, cx| {
+                            s.settings.preview_wrap = new;
+                            crate::session::persist_settings(s.settings.clone(), cx);
+                        });
+                        cx.notify();
+                    })),
+            )
     }
 
     /// 纯文本块切分：按行聚合，每块约 512B（超长行再按 512B 切）。
@@ -3551,6 +3583,7 @@ impl MainWindow {
 
     fn render_single_preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = Self::tokens(cx);
+        let wrap = self.session.read(cx).settings.preview_wrap;
         let header = match &self.preview.meta {
             Some(meta) => v_flex()
                 .h(px(56.)).overflow_hidden()
@@ -4071,6 +4104,21 @@ impl MainWindow {
                                     // 按行切块渲染：ScrollHandle::scroll_to_top_of_item(块号)
                                     // 才能跳转（整段 StyledText 只有一个子元素，点了没反应）。
                                     let blocks = Self::text_blocks(&plain);
+                                    // 不换行：按最长行估算内容宽度，横向滚动才有 range。
+                                    let content_w = if wrap {
+                                        0.0
+                                    } else {
+                                        plain
+                                            .lines()
+                                            .map(|l| {
+                                                let units: usize = l
+                                                    .chars()
+                                                    .map(|c| if c.is_ascii() { 1 } else { 2 })
+                                                    .sum();
+                                                units as f32 * 7.6 + 16.0
+                                            })
+                                            .fold(self.actual_preview_width, f32::max)
+                                    };
                                     let mut els: Vec<AnyElement> =
                                         Vec::with_capacity(blocks.len());
                                     for (a, b) in blocks {
@@ -4088,7 +4136,10 @@ impl MainWindow {
                                         } else {
                                             els.push(
                                                 div()
-                                                    .w_full()
+                                                    .when(wrap, |d| d.w_full())
+                                                    .when(!wrap, |d| {
+                                                        d.w(px(content_w)).whitespace_nowrap()
+                                                    })
                                                     .child(
                                                         StyledText::new(seg.to_string())
                                                             .with_highlights(rel.into_iter().map(
@@ -4131,20 +4182,28 @@ impl MainWindow {
                                         }),
                                 ),
                             )
-                            .child(
-                                div().absolute().inset_0().child(
-                                    Scrollbar::horizontal(&self.hit_scroll)
-                                        .viewport_from_layout()
-                                        .mode(ScrollbarMode::Always)
-                                        .styles(|styles| {
-                                            styles
-                                                .track(|style| style.bg(tokens.border_soft))
-                                                .thumb(|style| style.bg(tokens.text_tertiary))
-                                                .thumb_hover(|style| style.bg(tokens.text_secondary))
-                                                .thumb_active(|style| style.bg(tokens.accent))
-                                        }),
-                                ),
-                            )
+                            .when(!wrap, |d| {
+                                d.child(
+                                    div().absolute().inset_0().child(
+                                        Scrollbar::horizontal(&self.hit_scroll)
+                                            .viewport_from_layout()
+                                            .mode(ScrollbarMode::Always)
+                                            .styles(|styles| {
+                                                styles
+                                                    .track(|style| style.bg(tokens.border_soft))
+                                                    .thumb(|style| {
+                                                        style.bg(tokens.text_tertiary)
+                                                    })
+                                                    .thumb_hover(|style| {
+                                                        style.bg(tokens.text_secondary)
+                                                    })
+                                                    .thumb_active(|style| {
+                                                        style.bg(tokens.accent)
+                                                    })
+                                            }),
+                                    ),
+                                )
+                            })
                             .into_any_element()
                         },
                     )
