@@ -204,7 +204,6 @@ enum HitListRow {
         si: usize,
         name: String,
         count: usize,
-        active: bool,
         collapsed: bool,
     },
     /// 命中行：`window` 是全局命中序号（与翻页/跳转同口径）。
@@ -2601,10 +2600,12 @@ impl MainWindow {
                     si,
                     name: sh.name.clone(),
                     count: sh.hits.len(),
-                    active: si == book.focus_sheet,
                     collapsed,
                 });
                 if collapsed {
+                    // 折叠也要占号：否则后面分组的 window 会从 0 重新开始，
+                    // 点列表会跳到第一个 sheet 的错误格子。
+                    window += sh.hits.len();
                     continue;
                 }
                 for &(r, c) in sh.hits.iter() {
@@ -2758,6 +2759,13 @@ impl MainWindow {
         // 命中格内窗口」保证首屏可见。
         let tokens_copy = tokens;
         let entity = cx.entity();
+        // 当前 sheet 在 render 时取，不在列表缓存里存（缓存会过期，
+        // 导致两个分组同时显示「当前」）。
+        let active_sheet = self
+            .sheet_book
+            .as_ref()
+            .map(|b| b.focus_sheet)
+            .unwrap_or(usize::MAX);
         let processor = move |range: std::ops::Range<usize>,
                               _window: &mut gpui_kit::Window,
                               _cx: &mut gpui_kit::App|
@@ -2772,11 +2780,10 @@ impl MainWindow {
                         si,
                         name,
                         count,
-                        active,
                         collapsed,
                     } => {
                         let si = *si;
-                        let active = *active;
+                        let active = si == active_sheet;
                         let collapsed = *collapsed;
                         let label = if active {
                             format!("{name}  （{count} 个结果）  · 当前")
@@ -2878,7 +2885,19 @@ impl MainWindow {
                                         if this.sheet_book.is_some() {
                                             // xlsx：滚到命中格并选中（sheet/行/列）。
                                             this.snippet_window = w;
-                                            if let Some((si, r, c)) = this.sheet_hit_at(w) {
+                                            let at = this.sheet_hit_at(w);
+                                            {
+                                                use std::io::Write as _;
+                                                let _ = writeln!(
+                                                    std::io::stderr(),
+                                                    "[xlsx-click] w={w} at={at:?} focus={}",
+                                                    this.sheet_book
+                                                        .as_ref()
+                                                        .map(|b| b.focus_sheet)
+                                                        .unwrap_or(0)
+                                                );
+                                            }
+                                            if let Some((si, r, c)) = at {
                                                 this.goto_sheet_cell(si, r, c);
                                             }
                                         } else if this.preview.pdf.is_none()
@@ -2970,9 +2989,11 @@ impl MainWindow {
             }
             idx.min(count.saturating_sub(1))
         };
+        // 吸顶条自己盖住了列表第一行，所以按「第一个真正可见的行」取分组。
+        let anchor = (first + 1).min(count.saturating_sub(1));
         let sticky = self
             .list_groups
-            .partition_point(|g| g.row <= first)
+            .partition_point(|g| g.row <= anchor)
             .checked_sub(1)
             .and_then(|i| self.list_groups.get(i))
             .cloned();
@@ -3531,12 +3552,7 @@ impl MainWindow {
         };
         // uniform_list 的 base_handle 不一定有 bounds()，网格 host 的高用
         // 横向滚动容器（普通 div，bounds 一定有）反推。
-        let host_h = self
-            .sheet_hscroll
-            .bounds()
-            .size
-            .height
-            .as_f32();
+        let host_h = self.sheet_hscroll.bounds().size.height.as_f32();
         if host_h <= 1.0 || item_h <= 1.0 {
             return None;
         }
@@ -3546,19 +3562,12 @@ impl MainWindow {
         if y < -item_h || y > vh {
             return None;
         }
-        // 网格结构：表头 24px + 数据区 vh；列宽/行号列宽与 render_sheet 一致。
         const CELL_W: f32 = crate::ui::rich_view::SHEET_CELL_W;
         const GUTTER_W: f32 = crate::ui::rich_view::SHEET_GUTTER_W;
-        let host_h = HEAD_H + vh;
+        // 浮层从单元格顶部开始，第一段与单元格等高 → 正好盖住原格，其余向下延伸。
         let cell_top = HEAD_H + y.max(0.0);
+        let max_h = (host_h - cell_top - 2.0).max(60.0);
         let x = GUTTER_W + CELL_W * c as f32 + self.sheet_hscroll.offset().x.as_f32();
-        let below = host_h - cell_top - 4.0;
-        let above = cell_top - HEAD_H - 4.0;
-        let (up, max_h) = if below < 170.0 && above > below {
-            (true, above.max(60.0))
-        } else {
-            (false, below.max(60.0).min(320.0))
-        };
         let addr = format!("{}{}", crate::xlsx_blocks::col_label(c), r + 1);
         let words = self.hit_words(cx);
         let ranges = crate::docx_blocks::match_hits_multi(&text, &words);
@@ -3568,6 +3577,7 @@ impl MainWindow {
             .id("sheet-cell-popup")
             .absolute()
             .left(px(x.max(0.0)))
+            .top(px(cell_top))
             .w(px(CELL_W))
             .max_h(px(max_h))
             .flex()
@@ -3576,34 +3586,33 @@ impl MainWindow {
             .rounded_sm()
             .border_2()
             .border_color(tokens.accent)
-            .bg(tokens.surface)
+            // 不透明白底（AnyTXT 风格）：主题色带 alpha 会透出下层内容。
+            .bg(gpui::rgb(0xFFFFFF))
             .text_xs()
-            .text_color(tokens.text_primary)
+            .text_color(gpui::rgb(0x1F2937))
             .on_mouse_down(MouseButton::Left, |_, _, _| {});
-        if up {
-            panel = panel.bottom(px(host_h - cell_top + 2.0));
-        } else {
-            panel = panel.top(px(cell_top + 2.0));
-        }
 
         Some(
             panel
                 .child(
                     h_flex()
                         .flex_shrink_0()
+                        .h(px(item_h))
                         .items_center()
                         .gap(px(4.))
                         .px_1()
-                        .py(px(1.))
-                        .bg(tokens.surface_raised)
-                        .text_color(tokens.text_secondary)
+                        .bg(gpui::rgb(0xF3F4F6))
+                        .border_b_1()
+                        .border_color(gpui::rgb(0xD1D5DB))
+                        .text_color(gpui::rgb(0x374151))
                         .child(div().flex_1().min_w_0().child(addr))
                         .child(
                             div()
                                 .id("sheet-cell-popup-close")
                                 .px_1()
+                                .rounded_sm()
                                 .cursor_pointer()
-                                .hover(|d| d.text_color(tokens.accent))
+                                .hover(|d| d.bg(gpui::rgb(0xE5E7EB)))
                                 .child("×")
                                 .on_click(move |_, _, cx| {
                                     entity.update(cx, |this, cx| {
@@ -3627,8 +3636,8 @@ impl MainWindow {
                                     (
                                         range,
                                         HighlightStyle {
-                                            color: Some(tokens.hit_fg),
-                                            background_color: Some(tokens.hit_bg),
+                                            color: Some(gpui::rgb(0x111827).into()),
+                                            background_color: Some(gpui::rgb(0xFFE58A).into()),
                                             ..Default::default()
                                         },
                                     )
