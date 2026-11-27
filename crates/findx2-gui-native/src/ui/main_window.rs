@@ -205,6 +205,7 @@ enum HitListRow {
         name: String,
         count: usize,
         active: bool,
+        collapsed: bool,
     },
     /// 命中行：`window` 是全局命中序号（与翻页/跳转同口径）。
     Hit {
@@ -345,6 +346,8 @@ pub struct MainWindow {
     list_hits: usize,
     /// 列表内容宽度（按最长行估算一次；渲染每帧不再逐行扫描）。
     list_content_w: f32,
+    /// 列表里被收起的 sheet 分组（树状折叠）。
+    list_collapsed: std::collections::BTreeSet<usize>,
     /// 编号列表虚拟滚动（只渲染可见行）。
     list_vscroll: gpui_kit::UniformListScrollHandle,
     /// docx 定向渲染焦点块（点击列表/翻页时切换，只渲染该块附近的窗口）。
@@ -701,6 +704,7 @@ impl MainWindow {
             list_rows: std::rc::Rc::new(Vec::new()),
             list_hits: 0,
             list_content_w: 0.0,
+            list_collapsed: std::collections::BTreeSet::new(),
             list_vscroll: gpui_kit::UniformListScrollHandle::new(),
             docx_focus: None,
             md_doc: None,
@@ -1713,6 +1717,7 @@ impl MainWindow {
         self.list_rows = std::rc::Rc::new(Vec::new());
         self.list_hits = 0;
         self.list_content_w = 0.0;
+        self.list_collapsed.clear();
         // 列表滚动位置也归零（否则新文件的列表停在旧位置）。
         self.list_vscroll
             .scroll_to_item(0, gpui_kit::ScrollStrategy::Top);
@@ -2496,49 +2501,60 @@ impl MainWindow {
         hit_col: usize,
         words: &[String],
     ) -> (String, Vec<std::ops::Range<usize>>) {
-        let mut out = String::new();
-        let mut hit_span: Option<(usize, usize)> = None;
-        if let Some(cells) = row {
-            for (i, cell) in cells.iter().enumerate() {
-                let cell = cell.trim();
-                if cell.is_empty() {
-                    continue;
-                }
-                if !out.is_empty() {
-                    out.push_str("  ");
-                }
-                let start = out.len();
-                out.push_str(cell);
-                if i == hit_col {
-                    hit_span = Some((start, out.len()));
-                }
-                if out.len() > 1200 {
-                    break;
-                }
+        let Some(cells) = row else {
+            return (String::new(), Vec::new());
+        };
+        let hit_cell = cells.get(hit_col).map(|s| s.trim()).unwrap_or("");
+        let hits = crate::docx_blocks::match_hits_multi(hit_cell, words);
+        // 命中格内取「命中前后一小段」的窗口：列表首屏就能看到关键字，
+        // 不再把 A..K 列全部拼进去导致命中跑到屏幕外。
+        let (win, mut ranges) = if let Some(first) = hits.first() {
+            let mut ws = first.start.saturating_sub(28);
+            while ws > 0 && !hit_cell.is_char_boundary(ws) {
+                ws -= 1;
             }
-        }
-        if out.len() > 1200 {
-            let cut = out
-                .char_indices()
-                .nth(400)
-                .map(|(i, _)| i)
-                .unwrap_or(out.len());
-            out.truncate(cut);
-        }
-        let mut ranges = Vec::new();
-        if let Some((a, b)) = hit_span {
-            let b = b.min(out.len());
-            if a < b {
-                for r in crate::docx_blocks::match_hits_multi(&out[a..b], words) {
-                    let rs = a + r.start;
-                    let re = (a + r.end).min(out.len());
-                    if rs < re {
-                        ranges.push(rs..re);
-                    }
-                }
+            let mut we = (first.end + 90).min(hit_cell.len());
+            while we < hit_cell.len() && !hit_cell.is_char_boundary(we) {
+                we += 1;
             }
+            let rel = hits
+                .iter()
+                .filter_map(|r| {
+                    let a = r.start.max(ws);
+                    let b = r.end.min(we);
+                    (a < b).then_some(a - ws..b - ws)
+                })
+                .collect::<Vec<_>>();
+            (hit_cell[ws..we].to_string(), rel)
+        } else {
+            let mut we = hit_cell.len().min(120);
+            while we < hit_cell.len() && !hit_cell.is_char_boundary(we) {
+                we += 1;
+            }
+            (hit_cell[..we].to_string(), Vec::new())
+        };
+        // 行首 ID（命中列之外的第一个非空格）作为上下文，便于识别是哪一行。
+        let id = cells
+            .iter()
+            .enumerate()
+            .find(|(i, c)| *i != hit_col && !c.trim().is_empty())
+            .map(|(_, c)| c.trim().chars().take(16).collect::<String>())
+            .unwrap_or_default();
+        let mut label = String::new();
+        if !id.is_empty() {
+            label.push_str(&id);
+            label.push_str("  ");
         }
-        (out, ranges)
+        if win.len() < hit_cell.len() {
+            label.push('…');
+        }
+        let base = label.len();
+        label.push_str(&win);
+        for r in &mut ranges {
+            r.start += base;
+            r.end += base;
+        }
+        (label, ranges)
     }
 
     /// 生成列表行（按当前目标类型）：xlsx 按 sheet 分组，其余用文档/全文命中。
@@ -2573,12 +2589,17 @@ impl MainWindow {
                 if sh.hits.is_empty() {
                     continue;
                 }
+                let collapsed = self.list_collapsed.contains(&si);
                 out.push(HitListRow::Group {
                     si,
                     name: sh.name.clone(),
                     count: sh.hits.len(),
                     active: si == book.focus_sheet,
+                    collapsed,
                 });
+                if collapsed {
+                    continue;
+                }
                 for &(r, c) in sh.hits.iter() {
                     let (text, ranges) = Self::xlsx_row_label(sh.rows.get(r), c, &words);
                     out.push(HitListRow::Hit {
@@ -2747,14 +2768,22 @@ impl MainWindow {
                         name,
                         count,
                         active,
+                        collapsed,
                     } => {
                         let si = *si;
                         let active = *active;
-                        let entity = entity.clone();
-                        let label = format!("{name}  （{count} 个结果）");
+                        let collapsed = *collapsed;
+                        let label = if active {
+                            format!("{name}  （{count} 个结果）  · 当前")
+                        } else {
+                            format!("{name}  （{count} 个结果）")
+                        };
+                        // 树状分组：三角只负责展开/收起；点名称切到该 sheet
+                        // （并把列表滚到该分组），两个动作互不干扰。
+                        let e_toggle = entity.clone();
+                        let e_select = entity.clone();
                         out.push(
                             h_flex()
-                                .id(SharedString::from(format!("snippet-group-{si}")))
                                 .w(px(list_w))
                                 .h(px(LIST_ROW_H))
                                 .flex_shrink_0()
@@ -2762,30 +2791,41 @@ impl MainWindow {
                                 .gap(px(4.))
                                 .px_2()
                                 .bg(tokens_copy.surface_raised)
-                                .cursor_pointer()
                                 .text_xs()
                                 .when(active, |d| {
                                     d.text_color(tokens_copy.accent)
                                         .font_weight(FontWeight::BOLD)
                                 })
                                 .when(!active, |d| d.text_color(tokens_copy.text_secondary))
-                                .hover(|d| d.bg(tokens_copy.hover))
-                                .child(label)
-                                .on_click(move |_, _, cx| {
-                                    entity.update(cx, |this, cx| {
-                                        if let Some(book) = this.sheet_book.as_mut() {
-                                            book.focus_sheet = si;
-                                        }
-                                        this.sheet_selected = None;
-                                        this.sheet_scroll_to = None;
-                                        this.sheet_scroll
-                                            .scroll_to_item(0, gpui_kit::ScrollStrategy::Top);
-                                        this.sheet_hscroll
-                                            .set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
-                                        this.refresh_list_cache(cx);
-                                        cx.notify();
-                                    });
-                                })
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "snippet-group-toggle-{si}"
+                                        )))
+                                        .w(px(14.))
+                                        .cursor_pointer()
+                                        .hover(|d| d.text_color(tokens_copy.text_primary))
+                                        .child(if collapsed { "▸" } else { "▾" })
+                                        .on_click(move |_, _, cx| {
+                                            e_toggle.update(cx, |this, cx| {
+                                                this.toggle_list_sheet(si, cx);
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("snippet-group-{si}")))
+                                        .flex_1()
+                                        .min_w_0()
+                                        .cursor_pointer()
+                                        .hover(|d| d.text_color(tokens_copy.text_primary))
+                                        .child(label)
+                                        .on_click(move |_, _, cx| {
+                                            e_select.update(cx, |this, cx| {
+                                                this.select_sheet(si, cx);
+                                            });
+                                        }),
+                                )
                                 .into_any_element(),
                         );
                     }
@@ -3311,6 +3351,90 @@ impl MainWindow {
         None
     }
 
+    /// 列表里展开/收起某个 sheet 分组。
+    fn toggle_list_sheet(&mut self, si: usize, cx: &mut Context<Self>) {
+        if !self.list_collapsed.remove(&si) {
+            self.list_collapsed.insert(si);
+        }
+        self.refresh_list_cache(cx);
+        cx.notify();
+    }
+
+    /// 切换预览当前 sheet（页签 / 分组名共用）：回到该 sheet 顶部，
+    /// 并收/展开无关分组后把列表滚到该 sheet 的分组头。
+    fn select_sheet(&mut self, si: usize, cx: &mut Context<Self>) {
+        let Some(book) = self.sheet_book.as_mut() else {
+            return;
+        };
+        if si >= book.sheets.len() {
+            return;
+        }
+        book.focus_sheet = si;
+        self.sheet_selected = None;
+        self.sheet_scroll_to = Some((0, 0));
+        self.sheet_scroll
+            .scroll_to_item(0, gpui_kit::ScrollStrategy::Top);
+        self.sheet_hscroll
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
+        self.list_collapsed.remove(&si);
+        self.refresh_list_cache(cx);
+        if let Some(pos) = self
+            .list_rows
+            .iter()
+            .position(|r| matches!(r, HitListRow::Group { si: g, .. } if *g == si))
+        {
+            self.list_vscroll
+                .scroll_to_item(pos, gpui_kit::ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
+    /// 预览上方的 sheet 页签（可点击切换）。
+    fn sheet_tabs_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tokens = Self::tokens(cx);
+        let Some(book) = self.sheet_book.as_ref() else {
+            return div().into_any_element();
+        };
+        let mut row = h_flex()
+            .w_full()
+            .flex_shrink_0()
+            .gap(px(2.))
+            .px_2()
+            .py(px(3.));
+        for (i, sh) in book.sheets.iter().enumerate() {
+            let active = i == book.focus_sheet;
+            let label = if sh.hits.is_empty() {
+                sh.name.clone()
+            } else {
+                format!("{} ({})", sh.name, sh.hits.len())
+            };
+            let entity = cx.entity();
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("sheet-tab-{i}")))
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_sm()
+                    .text_xs()
+                    .cursor_pointer()
+                    .when(active, |d| {
+                        d.bg(tokens.row_selected)
+                            .text_color(tokens.text_primary)
+                            .font_weight(FontWeight::BOLD)
+                    })
+                    .when(!active, |d| {
+                        d.text_color(tokens.text_secondary)
+                            .hover(|d| d.bg(tokens.hover))
+                    })
+                    .child(label)
+                    .on_click(move |_, _, cx| {
+                        entity.update(cx, |this, cx| this.select_sheet(i, cx));
+                    }),
+            );
+        }
+        row.into_any_element()
+    }
+
     /// 点 xlsx 列表项：滚到该行并选中该格。
     fn goto_sheet_cell(&mut self, sheet_idx: usize, row: usize, col: usize) {
         if let Some(book) = self.sheet_book.as_mut() {
@@ -3340,7 +3464,9 @@ impl MainWindow {
         let x = crate::ui::rich_view::SHEET_GUTTER_W
             + crate::ui::rich_view::SHEET_CELL_W * col as f32;
         // 命中列落在视口左侧 1/3 附近（列宽固定，可直接算）。
-        let target = (x - vw * 0.3).min(0.0);
+        // 注意偏移是**负数**（向左滚）：写成 (x - vw*0.3).min(0) 会把所有
+        // 正数目标夹成 0 —— 这正是「横向不跳转」的根因。
+        let target = (vw * 0.3 - x).min(0.0);
         self.sheet_hscroll
             .set_offset(gpui::point(gpui::px(target), gpui::px(0.0)));
     }
@@ -4742,7 +4868,7 @@ impl MainWindow {
                                         .flex_shrink_0()
                                         .px_2()
                                         .pt_2()
-                                        .child(crate::ui::rich_view::sheet_tabs(book, &tokens)),
+                                        .child(self.sheet_tabs_bar(cx)),
                                 )
                                 .child(crate::ui::rich_view::render_sheet(
                                     book,

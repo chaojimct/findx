@@ -397,34 +397,6 @@ pub fn render_sheet(
         .into_any_element()
 }
 
-/// sheet 页签行（点击切换由调用方用 Button 包裹）。
-pub fn sheet_tabs(wb: &crate::xlsx_blocks::Workbook, tokens: &FindxTokens) -> AnyElement {
-    let mut tabs = h_flex().w_full().flex_shrink_0().gap(px(2.)).px_2().py(px(3.));
-    for (i, sh) in wb.sheets.iter().enumerate() {
-        let active = i == wb.focus_sheet;
-        let label = if sh.hits.is_empty() {
-            sh.name.clone()
-        } else {
-            format!("{} ({})", sh.name, sh.hits.len())
-        };
-        tabs = tabs.child(
-            div()
-                .px_2()
-                .py(px(2.))
-                .rounded_sm()
-                .text_xs()
-                .when(active, |d| {
-                    d.bg(tokens.row_selected)
-                        .text_color(tokens.text_primary)
-                        .font_weight(FontWeight::BOLD)
-                })
-                .when(!active, |d| d.text_color(tokens.text_secondary))
-                .child(label),
-        );
-    }
-    tabs.into_any_element()
-}
-
 // ---------------------------------------------------------------------------
 // md 渲染（与 docx 共用版式与命中映射）
 // ---------------------------------------------------------------------------
