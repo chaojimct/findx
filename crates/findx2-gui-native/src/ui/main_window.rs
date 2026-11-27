@@ -378,6 +378,8 @@ pub struct MainWindow {
     /// 待定位的命中格 (row, col)：在 render 里应用（此时已有上一帧布局，
     /// 横向 set_offset 不会被首次布局覆盖掉——「横向不滚动」的根因）。
     sheet_scroll_to: Option<(usize, usize)>,
+    /// 上次渲染时的横向偏移（行号列固定需要跟着滚动态重绘）。
+    sheet_hx_seen: f32,
     /// 搜索选项：区分大小写（Aa）。标题搜索精确生效；全文搜索后置过滤。
     search_match_case: bool,
     /// 搜索选项：全匹配（ab）。整串连续出现才算命中。
@@ -722,6 +724,7 @@ impl MainWindow {
             sheet_hscroll: gpui_kit::ScrollHandle::new(),
             sheet_selected: None,
             sheet_scroll_to: None,
+            sheet_hx_seen: 0.0,
             search_match_case: false,
             search_exact: false,
             search_wildcard: false,
@@ -2920,7 +2923,9 @@ impl MainWindow {
                                 .child(
                                     div()
                                         .flex_shrink_0()
-                                        .w(px(18.))
+                                        .w(px(38.))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
                                         .text_xs()
                                         .text_color(tokens_copy.text_tertiary)
                                         .child(format!("{}", w + 1)),
@@ -4989,11 +4994,37 @@ impl MainWindow {
                                 )
                                 .child(
                                     v_flex()
+                                        .id("xlsx-grid-host")
                                         .relative()
                                         .w_full()
                                         .flex_1()
                                         .min_h_0()
                                         .min_w_0()
+                                        // 行号列的固定是「渲染时按 -hx 补偿」实现的：
+                                        // 拖横向滚动条时 GPUI 不会重跑 render，这里在
+                                        // 鼠标移动/滚轮时检测偏移变化并主动重绘。
+                                        .on_mouse_move(cx.listener(|this, _, _, cx| {
+                                            let hx = this
+                                                .sheet_hscroll
+                                                .offset()
+                                                .x
+                                                .as_f32();
+                                            if (hx - this.sheet_hx_seen).abs() > 0.5 {
+                                                this.sheet_hx_seen = hx;
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                                            let hx = this
+                                                .sheet_hscroll
+                                                .offset()
+                                                .x
+                                                .as_f32();
+                                            if (hx - this.sheet_hx_seen).abs() > 0.5 {
+                                                this.sheet_hx_seen = hx;
+                                                cx.notify();
+                                            }
+                                        }))
                                         .child(crate::ui::rich_view::render_sheet(
                                             book,
                                             &tokens,

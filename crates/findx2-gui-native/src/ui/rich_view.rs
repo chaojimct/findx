@@ -195,19 +195,15 @@ pub fn render_sheet(
     };
     let cols = sheet.cols().max(1);
     let row_h = 22.0;
+    // 横向偏移：行号列用 -hx 反向补偿，视觉上固定在最左侧。
+    let hx = hscroll.offset().x.as_f32();
 
     // 列标行（固定不滚动）
-    let mut head = h_flex().w(px(GUTTER_W + CELL_W * cols as f32)).flex_shrink_0();
-    head = head.child(
-        div()
-            .w(px(GUTTER_W))
-            .h(px(24.))
-            .flex_shrink_0()
-            .border_r_1()
-            .border_b_1()
-            .border_color(tokens.border)
-            .bg(tokens.surface_raised),
-    );
+    let mut head = h_flex()
+        .relative()
+        .w(px(GUTTER_W + CELL_W * cols as f32))
+        .flex_shrink_0();
+    head = head.child(div().w(px(GUTTER_W)).h(px(24.)).flex_shrink_0());
     for c in 0..cols {
         head = head.child(
             div()
@@ -226,6 +222,19 @@ pub fn render_sheet(
                 .child(crate::xlsx_blocks::col_label(c)),
         );
     }
+    // 左上角：固定在视口最左侧（横向滚动时补偿 hx）。
+    head = head.child(
+        div()
+            .absolute()
+            .left(px(-hx))
+            .top(px(0.))
+            .w(px(GUTTER_W))
+            .h(px(24.))
+            .border_r_1()
+            .border_b_1()
+            .border_color(tokens.border)
+            .bg(tokens.surface_raised),
+    );
 
     let row_count = sheet.rows.len();
     // Sheet 内部 rows/hits 都是 Arc，clone 只加引用计数（每帧不复制大表）。
@@ -246,22 +255,7 @@ pub fn render_sheet(
                     .w(px(GUTTER_W + CELL_W * cols as f32))
                     .h(px(row_h))
                     .flex_shrink_0();
-                row_el = row_el.child(
-                    div()
-                        .w(px(GUTTER_W))
-                        .h(px(row_h))
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .border_r_1()
-                        .border_b_1()
-                        .border_color(tokens_copy.border_soft)
-                        .bg(tokens_copy.surface_raised)
-                        .text_xs()
-                        .text_color(tokens_copy.text_tertiary)
-                        .child(format!("{}", r + 1)),
-                );
+                row_el = row_el.child(div().w(px(GUTTER_W)).h(px(row_h)).flex_shrink_0());
                 for c in 0..cols {
                     let text = if row_empty && c == 0 {
                         "…（未加载行）"
@@ -316,6 +310,25 @@ pub fn render_sheet(
                     };
                     row_el = row_el.child(cell.child(content));
                 }
+                // 行号列固定在左侧：横向滚动时用 -hx 抵消（覆盖在单元格之上）。
+                row_el = row_el.child(
+                    div()
+                        .absolute()
+                        .left(px(-hx))
+                        .top(px(0.))
+                        .w(px(GUTTER_W))
+                        .h(px(row_h))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .border_r_1()
+                        .border_b_1()
+                        .border_color(tokens_copy.border_soft)
+                        .bg(tokens_copy.surface_raised)
+                        .text_xs()
+                        .text_color(tokens_copy.text_tertiary)
+                        .child(format!("{}", r + 1)),
+                );
                 // 选中格的展开浮层：挂在行内 → 位置/列宽天然对齐；
                 // deferred 让它最后绘制（覆盖下面的行），并盖住原单元格。
                 if let Some((sr, sc)) = selected {
