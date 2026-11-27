@@ -3631,6 +3631,18 @@ impl MainWindow {
                 | PreviewKind::Error
         );
 
+        // xlsx：命中上下文用专用表格布局（固定页签 + 自绘网格 + 双滚动条）。
+        // 不能塞进 docx/md 的文本滚动容器：那会把「页签 + h_full 表格 + padding」
+        // 当成滚动内容，凭空多出一条滚整块的外层滚动条，反而淹没表格自己的条。
+        let sheet_preview = self.preview.meta.as_ref().is_some_and(|m| {
+            std::path::Path::new(&m.path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| {
+                    matches!(e.to_ascii_lowercase().as_str(), "xlsx" | "xlsm" | "xls")
+                })
+        });
+
         v_flex()
             .w(px(self.actual_preview_width))
             .h_full()
@@ -3802,6 +3814,30 @@ impl MainWindow {
                                 .overflow_scroll()
                                 .child(self.pdf_page_view(tokens))
                                 .into_any_element()
+                        } else if sheet_preview && self.sheet_book.is_some() {
+                            // xlsx：专用表格布局。页签固定，网格自带横/纵滚动条，
+                            // 不再经过 #hit-text-scroll（避免外层假滚动条）。
+                            let book = self.sheet_book.as_ref().expect("checked is_some");
+                            v_flex()
+                                .flex_1()
+                                .min_h_0()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .flex_shrink_0()
+                                        .px_2()
+                                        .pt_2()
+                                        .child(crate::ui::rich_view::sheet_tabs(book, &tokens)),
+                                )
+                                .child(crate::ui::rich_view::render_sheet(
+                                    book,
+                                    &tokens,
+                                    self.sheet_selected,
+                                    &self.sheet_scroll,
+                                    &self.sheet_hscroll,
+                                ))
+                                .into_any_element()
                         } else {
                         div()
                             .id("hit-text-scroll")
@@ -3827,18 +3863,6 @@ impl MainWindow {
                             } else if let Some(doc) = self.md_doc.as_ref() {
                                 // md：pulldown-cmark 块模型自绘（标题/段落/列表/表格/代码）。
                                 crate::ui::rich_view::render_md(doc, &self.md_hits, &tokens)
-                            } else if let Some(book) = self.sheet_book.as_ref() {
-                                // xlsx：表格网格（行列标 + 命中格高亮）。
-                                vec![
-                                    crate::ui::rich_view::sheet_tabs(book, &tokens),
-                                    crate::ui::rich_view::render_sheet(
-                                    book,
-                                    &tokens,
-                                    self.sheet_selected,
-                                    &self.sheet_scroll,
-                                    &self.sheet_hscroll,
-                                ),
-                                ]
                             } else if let Some(deck) = self.deck.as_ref() {
                                 // pptx：按页分组 + 段落 + 命中高亮。
                                 crate::ui::rich_view::render_pptx(deck, &self.deck_hits, &tokens)

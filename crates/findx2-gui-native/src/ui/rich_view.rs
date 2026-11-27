@@ -10,6 +10,7 @@
 
 use std::ops::Range;
 
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -292,33 +293,57 @@ pub fn render_sheet(
             out
         };
 
+    let total_w = GUTTER_W + CELL_W * cols as f32;
     let list = uniform_list("sheet-rows", row_count, processor)
         .track_scroll(scroll)
-        .w(px(GUTTER_W + CELL_W * cols as f32))
+        .w(px(total_w))
         .flex_1()
         .min_h_0();
 
-    v_flex()
+    // 表格区：同一块 host 里叠三层（都相对 host 定位）：
+    //   1) 横向滚动容器（表头 + 数据行一起左右滚）
+    //   2) 横向滚动条（必须在滚动容器之外，否则会随内容一起滚走）
+    //   3) 纵向滚动条（同样在滚动容器之外；top(24) 与表头同高，
+    //      这样 Scrollbar::viewport_from_layout 拿到的视口正好是数据区）
+    div()
+        .relative()
         .w_full()
-        .h_full()
+        .flex_1()
         .min_h_0()
+        .min_w_0()
         .child(
-            // 横向滚动包住「列标 + 数据区」，两者一起左右滚。
-            // restrict_scroll_to_axis：滚轮只交给纵向（uniform_list），
-            // 横向只响应横向手势——否则两层滚动会被同一次滚轮同时驱动。
             div()
                 .id("sheet-hscroll")
-                .flex_1()
-                .min_h_0()
+                .size_full()
+                .track_scroll(hscroll)
                 .overflow_x_scroll()
+                .restrict_scroll_to_axis()
                 .child(
                     v_flex()
-                        .w(px(GUTTER_W + CELL_W * cols as f32))
+                        .w(px(total_w))
                         .h_full()
                         .min_h_0()
                         .child(head)
                         .child(list),
                 ),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(0.))
+                .right(px(0.))
+                .bottom(px(0.))
+                .h(px(16.))
+                .horizontal_scrollbar(hscroll),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(24.))
+                .right(px(0.))
+                .bottom(px(0.))
+                .w(px(16.))
+                .vertical_scrollbar(scroll),
         )
         .into_any_element()
 }
