@@ -4075,9 +4075,6 @@ impl MainWindow {
                             .overflow_y_scroll()
                             // 长代码行（不可断词）允许横向滚动。
                             .overflow_x_scroll()
-                            // 滚动条单独挂在同一个句柄上（ScrollableElement trait），
-                            // 既显示滚动条又不干扰滚动控制。
-                            .vertical_scrollbar(&self.hit_scroll)
                             .px_3()
                             .py_2()
                             .text_sm()
