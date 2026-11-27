@@ -309,6 +309,8 @@ pub struct MainWindow {
     text_content_w: f32,
     text_scroll: gpui_kit::UniformListScrollHandle,
     text_hscroll: gpui_kit::ScrollHandle,
+    /// 切换选中文件后，等该文件命中模型就绪自动定位第一个命中。
+    auto_first_pending: bool,
     /// docx 定向渲染焦点块（点击列表/翻页时切换，只渲染该块附近的窗口）。
     docx_focus: Option<usize>,
     /// md/txt 块模型（命中上下文富文本自绘；与 docx 共用渲染器）。
@@ -655,6 +657,7 @@ impl MainWindow {
             text_content_w: 0.0,
             text_scroll: gpui_kit::UniformListScrollHandle::new(),
             text_hscroll: gpui_kit::ScrollHandle::new(),
+            auto_first_pending: false,
             docx_focus: None,
             md_doc: None,
             md_hits: Vec::new(),
@@ -1643,6 +1646,8 @@ impl MainWindow {
             }
             self.office_text_only = false;
             self.selected = index;
+            self.snippet_window = 0;
+            self.auto_first_pending = index.is_some();
             self.preview_active_selection(cx);
         } else {
             self.selected = index;
@@ -1727,6 +1732,34 @@ impl MainWindow {
     }
 
     /// 上一个/下一个匹配点翻页（snippet_total>1 时展示；点击即取对应窗口）。
+    /// 切换文件后，等该类型的命中模型就绪 → 自动定位第一个命中。
+    fn maybe_auto_first_hit(&mut self, cx: &mut Context<Self>) {
+        if !self.auto_first_pending {
+            return;
+        }
+        let ready = (self.docx_doc.is_some() && !self.docx_hits.is_empty())
+            || (self.md_doc.is_some() && !self.md_hits.is_empty())
+            || (self.deck.is_some() && !self.deck_hits.is_empty())
+            || (self.sheet_book.is_some() && !self.sheet_hit_rows().is_empty())
+            || (!self.full_spans.is_empty() && self.preview.pdf.is_none());
+        if !ready {
+            return;
+        }
+        self.auto_first_pending = false;
+        // xlsx：选中第一个命中单元格。
+        if self.sheet_book.is_some() {
+            if let Some((si, r, c, _, _)) = self.sheet_hit_rows().first().cloned() {
+                self.goto_sheet_cell(si, r, c);
+            }
+            return;
+        }
+        self.snippet_window = 0;
+        // uniform_list 的 scroll_to_item 会延迟到下次布局；docx 走 docx_focus
+        // 渲染窗口；两者都能在数据写入后立即调用。
+        self.scroll_to_hit(0);
+        cx.notify();
+    }
+
     /// 大文本虚拟滚动快照：行索引 + spans + 内容宽度（只在全文更新时算一次）。
     fn rebuild_text_view(&mut self) {
         let mut lines: Vec<(usize, usize)> = Vec::new();
@@ -2779,6 +2812,7 @@ impl MainWindow {
                     // xlsx 命中也用全文命中词重算（比摘要窗口的 <b> 更准）。
                     this.recompute_sheet_hits(cx);
                     cx.notify();
+                    this.maybe_auto_first_hit(cx);
                 }
             });
         })
@@ -2803,6 +2837,7 @@ impl MainWindow {
                     this.deck_hits = crate::docx_blocks::match_hits_multi(&deck.plain, &needles);
                     this.deck = Some(deck);
                     cx.notify();
+                    this.maybe_auto_first_hit(cx);
                 }
             });
         })
@@ -2839,6 +2874,7 @@ impl MainWindow {
                     crate::xlsx_blocks::recompute_hits(&mut wb, &words);
                     this.sheet_book = Some(wb);
                     cx.notify();
+                    this.maybe_auto_first_hit(cx);
                 }
             });
 
@@ -2853,6 +2889,7 @@ impl MainWindow {
                     crate::xlsx_blocks::recompute_hits(&mut wb, &words);
                     this.sheet_book = Some(wb);
                     cx.notify();
+                    this.maybe_auto_first_hit(cx);
                 }
             });
         })
@@ -2973,6 +3010,7 @@ impl MainWindow {
                     this.md_doc = Some(doc);
                     this.recompute_md_hits(cx);
                     cx.notify();
+                    this.maybe_auto_first_hit(cx);
                 }
             });
         })
@@ -3018,6 +3056,7 @@ impl MainWindow {
                         this.docx_doc = Some(doc);
                         this.recompute_docx_hits(cx);
                         cx.notify();
+                        this.maybe_auto_first_hit(cx);
                     }
                     _ => {
                         // 解析失败：保持 None，渲染回退到纯文本列。
