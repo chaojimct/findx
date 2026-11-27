@@ -2959,12 +2959,16 @@ impl MainWindow {
             .h_full();
 
         // 吸顶分组头：按「当前可见首行」找所属分组（不需要把组头做成 row）。
+        // uniform_list 的 base_handle 只维护像素偏移（不填 child_bounds），
+        // 所以用 offset / 行高算首行，而不是 logical_scroll_top()（恒为 0）。
         let first = {
             let st = self.list_vscroll.0.borrow();
-            st.deferred_scroll_to_item
-                .as_ref()
-                .map(|d| d.item_index)
-                .unwrap_or_else(|| st.base_handle.logical_scroll_top().0)
+            let off = st.base_handle.offset().y.as_f32();
+            let mut idx = ((-off) / LIST_ROW_H).floor().max(0.0) as usize;
+            if let Some(d) = st.deferred_scroll_to_item.as_ref() {
+                idx = idx.max(d.item_index);
+            }
+            idx.min(count.saturating_sub(1))
         };
         let sticky = self
             .list_groups
@@ -3516,34 +3520,33 @@ impl MainWindow {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())?;
 
-        // 行位置：可见首行索引 + 该行已滚出的像素 + 行高。
-        let (first, off, item_h) = {
+        // 行位置：内容坐标 = 行号 × 行高，屏幕 y = 内容 y + 滚动偏移（负值）。
+        let (off, item_h) = {
             let st = self.sheet_scroll.0.borrow();
-            let (first, off) = st.base_handle.logical_scroll_top();
             let item_h = st
                 .last_item_size
                 .map(|sz| sz.item.height.as_f32())
                 .unwrap_or(22.0);
-            (first, off.as_f32(), item_h)
+            (st.base_handle.offset().y.as_f32(), item_h)
         };
-        let vh = self
-            .sheet_scroll
-            .0
-            .borrow()
-            .base_handle
+        // uniform_list 的 base_handle 不一定有 bounds()，网格 host 的高用
+        // 横向滚动容器（普通 div，bounds 一定有）反推。
+        let host_h = self
+            .sheet_hscroll
             .bounds()
             .size
             .height
             .as_f32();
-        if vh <= 1.0 || item_h <= 1.0 {
+        if host_h <= 1.0 || item_h <= 1.0 {
             return None;
         }
-        let y = (r as f32 - first as f32) * item_h - off;
+        const HEAD_H: f32 = 24.0;
+        let vh = (host_h - HEAD_H).max(1.0);
+        let y = r as f32 * item_h + off;
         if y < -item_h || y > vh {
             return None;
         }
         // 网格结构：表头 24px + 数据区 vh；列宽/行号列宽与 render_sheet 一致。
-        const HEAD_H: f32 = 24.0;
         const CELL_W: f32 = crate::ui::rich_view::SHEET_CELL_W;
         const GUTTER_W: f32 = crate::ui::rich_view::SHEET_GUTTER_W;
         let host_h = HEAD_H + vh;
@@ -5064,7 +5067,7 @@ impl MainWindow {
                                         .child(self.sheet_tabs_bar(cx)),
                                 )
                                 .child(
-                                    div()
+                                    v_flex()
                                         .relative()
                                         .w_full()
                                         .flex_1()
