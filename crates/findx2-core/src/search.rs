@@ -3570,14 +3570,15 @@ fn filter_content(
         if cap == 0 {
             return Ok(vec![]);
         }
-        // 匹配口径：exact（整串）优先；否则 or_mode ? Any : All（默认 AND）。
-        // exact 用「All 取候选 + 原文整串校验」而不是 PhraseQuery：jieba 的
-        // position 随上下文变化（实测「学习积分」→ 学习@0/积分@2），
-        // phrase 会漏判；整串校验只依赖原文，结果可预期。
-        let mode = if q.exact {
-            ContentMatchMode::All
-        } else if q.or_mode {
+        // 口径（与 AnyTXT 的 Exact Match 对齐）：
+        // - 默认 All：每个空白分隔词都命中，词内多 token 用短语（原文连续）；
+        // - or_mode：任一空白词命中即可；
+        // - exact（全匹配）：整串 token 连成一个短语，原文严格连续。
+        // 索引侧 position = 词序号，PhraseQuery 才真正生效，无需读原文校验。
+        let mode = if q.or_mode {
             ContentMatchMode::Any
+        } else if q.exact {
+            ContentMatchMode::Exact
         } else {
             ContentMatchMode::All
         };
@@ -3607,30 +3608,6 @@ fn filter_content(
             .filter(|i| set.contains(*i))
             .copied()
             .collect();
-        if q.exact {
-            // 整串校验：只对候选文件读原文，确认 needle 连续出现。
-            // 大文件（> 8 MiB）跳过校验直接放行，避免长尾。
-            const EXACT_CHECK_MAX_BYTES: u64 = 8 * 1024 * 1024;
-            let low = ns.to_ascii_lowercase();
-            out.retain(|&idx| {
-                let Ok(p) = store.entry_display_path(idx as usize) else {
-                    return false;
-                };
-                let path = std::path::Path::new(&p);
-                let Ok(meta) = std::fs::metadata(path) else {
-                    return false;
-                };
-                if meta.len() > EXACT_CHECK_MAX_BYTES {
-                    return true;
-                }
-                let Ok(data) = std::fs::read(path) else {
-                    return true;
-                };
-                String::from_utf8_lossy(&data)
-                    .to_ascii_lowercase()
-                    .contains(&low)
-            });
-        }
         return Ok(out);
     }
     // 超过此大小的文件跳过内容搜索，避免内存爆炸和长时间阻塞

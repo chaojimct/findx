@@ -1,4 +1,4 @@
-//! 内容倒排（tantivy）。schema v1，字段冻结；升级 = 版本号 bump + 全量重建。
+//! 内容倒排（tantivy）。schema 版本见 SCHEMA_VERSION；升级 = 版本号 bump + 全量重建。
 //!
 //! 并发模型：`IndexWriter` 本身线程安全（内部 craving），抽取与入库都在 rayon
 //! 池里并行；`commit` 仍由调用方串行触发（分批 commit 定界内存）。
@@ -18,9 +18,7 @@ use tantivy::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, INDEXED,
     STORED,
 };
-use tantivy::tokenizer::{
-    BoxTokenStream, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer, Tokenizer,
-};
+use tantivy::tokenizer::Tokenizer;
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 use tantivy_jieba::JiebaTokenizer;
 
@@ -28,17 +26,75 @@ use crate::{Error, Result};
 
 /// 内容 schema 版本。v2：body 去 STORED（体积杀手），snippet 改按需回读；
 /// 改字段必须 bump 并全量重建。
-pub const SCHEMA_VERSION: u32 = 2;
+/// v4：分词器位置语义改为「词序号」（jieba 词 + ordinal position），
+/// 让 PhraseQuery 真正生效（v3 的 bigram 实验作废）。改分词器/位置必须 bump。
+pub const SCHEMA_VERSION: u32 = 4;
 pub const TOKENIZER_JIEBA: &str = "jieba_findx";
+
+/// 单个查询词 → tantivy 查询。
+///
+/// 词被切成多个 token 时用 `PhraseQuery`（position 必须连续 = 原文连续出现）。
+/// 纯 CJK 词额外 OR 一个「整词前缀」兜底：jieba 在查询/文档上下文里切分可能
+/// 不同（如文档把「马春天」当成一个未登录词整体成词），这跟 AnyTXT 建 `prefix=1`
+/// 前缀索引是同一个目的。兜底只放宽到「以整词开头的 token」，不会回到单字匹配。
+fn content_word_query(
+    field: Field,
+    tok: &mut HybridTokenizer,
+    word: &str,
+) -> Option<Box<dyn tantivy::query::Query>> {
+    use tantivy::query::{
+        BooleanQuery, Occur, PhrasePrefixQuery, PhraseQuery, Query, TermQuery,
+    };
+    use tantivy::Term;
+    let terms = crate::snippet::query_terms(word, tok);
+    match terms.len() {
+        0 => None,
+        1 => {
+            let term = Term::from_field_text(field, &terms[0]);
+            // 单个 CJK 字：对齐 AnyTXT 的 `prefix=1` 前缀索引——
+            // 单字查询匹配「以该字开头的词」（如 青 → 青松/青岛），
+            // 否则 jieba 词索引里根本没有单字 token，搜单字会永远为空。
+            if word.chars().count() == 1 && word.chars().all(is_cjk_char) {
+                let mut prefix = PhrasePrefixQuery::new(vec![term]);
+                prefix.set_max_expansions(1024);
+                Some(Box::new(prefix))
+            } else {
+                Some(Box::new(TermQuery::new(
+                    term,
+                    IndexRecordOption::WithFreqs,
+                )))
+            }
+        }
+        _ => {
+            let phrase = PhraseQuery::new(
+                terms
+                    .iter()
+                    .map(|t| Term::from_field_text(field, t))
+                    .collect(),
+            );
+            if word.chars().all(is_cjk_char) {
+                let mut prefix =
+                    PhrasePrefixQuery::new(vec![Term::from_field_text(field, word)]);
+                prefix.set_max_expansions(256);
+                Some(Box::new(BooleanQuery::new(vec![
+                    (Occur::Should, Box::new(phrase) as Box<dyn Query>),
+                    (Occur::Should, Box::new(prefix) as Box<dyn Query>),
+                ])))
+            } else {
+                Some(Box::new(phrase))
+            }
+        }
+    }
+}
 
 /// 全文匹配模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MatchMode {
-    /// 整串连续出现（PhraseQuery slop=0）——「全匹配」。
+    /// 整串：所有词的全部 token 连成一个短语（原文严格连续）——「全匹配」。
     Exact,
-    /// 分词后全部词都要有（默认 AND）。
+    /// 每个空白分隔词都要命中；词内多 token 用短语（默认 AND）。
     All,
-    /// 分词后任一命中（OR）。
+    /// 任一空白分隔词命中即可（OR）。
     #[default]
     Any,
 }
@@ -66,28 +122,53 @@ fn write_schema_version(dir: &Path) -> Result<()> {
     .map_err(|e| Error::Io(dir.display().to_string(), e))
 }
 
-/// 混合分词：纯 ASCII 文本（代码/日志/英文文档，占全盘大多数）走快道
-///（切分 + 去超长 token + 小写），不碰 jieba；含非 ASCII 才走结巴。
-/// 快道单篇提速一个数量级以上，是全量构建超越单线程方案的关键之一。
-/// 小写与 AnyTXT 的 FoldCase 对齐；老索引本来就是大小写敏感，
-/// 新索引统一小写后英文搜索只会更准（内容索引尚无线上兼容负担）。
+/// 预生成 token 流（tantivy 0.27 未导出 VecTokenStream）。
+pub struct BufTokenStream {
+    iter: std::vec::IntoIter<tantivy::tokenizer::Token>,
+    current: tantivy::tokenizer::Token,
+}
+
+impl tantivy::tokenizer::TokenStream for BufTokenStream {
+    fn advance(&mut self) -> bool {
+        match self.iter.next() {
+            Some(t) => {
+                self.current = t;
+                true
+            }
+            None => false,
+        }
+    }
+    fn token(&self) -> &tantivy::tokenizer::Token {
+        &self.current
+    }
+    fn token_mut(&mut self) -> &mut tantivy::tokenizer::Token {
+        &mut self.current
+    }
+}
+
+/// 统一分词器：索引与查询共用同一套规则，保证两侧切分/位置一致。
 ///
-/// `JiebaTokenizer::new()` 背后是全局静态实例，Clone 零成本；
-/// tantivy 给每个索引线程 clone 一份，不存在跨线程争用。
+/// 规则（对齐 AnyTXT：中文按 jieba 词，position = **词序号**）：
+/// - CJK 连续段（汉字/假名/谚文）→ jieba 切词，position 逐 1 递增；
+/// - 拉丁/数字等连续段 → 整词一个 token（小写）；
+/// - 空白/标点 → 跳过，不占 position（标点不打断短语）。
+///
+/// position 必须是「词序号」而不是字符偏移：tantivy 的 PhraseQuery 要求
+/// position 连续，用字符偏移会让短语查询永远失效，搜「马春天」就退化成
+/// 「马」AND「春天」，命中所有只含单字的文档（用户实测的误召回）。
+///
+/// `JiebaTokenizer` 背后是全局静态实例，Clone 零成本；tantivy 给每个索引
+/// 线程 clone 一份，不存在跨线程争用。
 #[derive(Clone)]
 pub struct HybridTokenizer {
     jieba: JiebaTokenizer,
-    ascii: TextAnalyzer,
 }
 
 impl HybridTokenizer {
     pub fn new() -> Self {
         Self {
+            // HMM 打开：未登录词/人名能整体成词；position 由本结构自己分配。
             jieba: JiebaTokenizer::new(),
-            ascii: TextAnalyzer::builder(SimpleTokenizer::default())
-                .filter(RemoveLongFilter::limit(40))
-                .filter(LowerCaser)
-                .build(),
         }
     }
 }
@@ -98,14 +179,90 @@ impl Default for HybridTokenizer {
     }
 }
 
-impl Tokenizer for HybridTokenizer {
-    type TokenStream<'a> = BoxTokenStream<'a>;
+/// CJK 文字（汉字/假名/谚文），不含标点：标点交给分隔符分支，不占 position。
+fn is_cjk_char(c: char) -> bool {
+    matches!(c as u32,
+        0x3400..=0x4DBF      // 扩展 A
+        | 0x4E00..=0x9FFF    // 统一表意
+        | 0xF900..=0xFAFF    // 兼容表意
+        | 0x3040..=0x30FF    // 日文假名
+        | 0x31F0..=0x31FF    // 片假名扩展
+        | 0xAC00..=0xD7AF    // 谚文音节
+    )
+}
 
-    fn token_stream<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a> {
-        if text.is_ascii() {
-            BoxTokenStream::new(self.ascii.token_stream(text))
-        } else {
-            BoxTokenStream::new(self.jieba.token_stream(text))
+fn is_token_char(c: char) -> bool {
+    c.is_alphanumeric() || is_cjk_char(c)
+}
+
+impl Tokenizer for HybridTokenizer {
+    type TokenStream<'a> = BufTokenStream;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> BufTokenStream {
+        use tantivy::tokenizer::{Token, TokenStream};
+        let mut tokens: Vec<Token> = Vec::new();
+        let mut pos = 0usize;
+        let mut i = 0usize;
+        while i < text.len() {
+            let ch = text[i..].chars().next().expect("char boundary");
+            let clen = ch.len_utf8();
+            if is_cjk_char(ch) {
+                // 连续 CJK 段：交给 jieba 切词（标点/空白不属于 CJK，天然断开）。
+                let start = i;
+                i += clen;
+                while i < text.len() {
+                    let c = text[i..].chars().next().expect("char boundary");
+                    if !is_cjk_char(c) {
+                        break;
+                    }
+                    i += c.len_utf8();
+                }
+                let mut stream = self.jieba.token_stream(&text[start..i]);
+                while stream.advance() {
+                    let t = stream.token();
+                    // jieba 对未登录的非汉字字符会逐字吐（含标点）：只收有效词。
+                    if !t.text.chars().any(|c| c.is_alphanumeric()) {
+                        continue;
+                    }
+                    tokens.push(Token {
+                        offset_from: start + t.offset_from,
+                        offset_to: start + t.offset_to,
+                        position: pos,
+                        text: t.text.clone(),
+                        position_length: 1,
+                    });
+                    pos += 1;
+                }
+            } else if is_token_char(ch) {
+                // 非 CJK 的文字/数字（英文、全角字母、带音标字母…）：整段一个词。
+                let start = i;
+                i += clen;
+                while i < text.len() {
+                    let c = text[i..].chars().next().expect("char boundary");
+                    if is_cjk_char(c) || !is_token_char(c) {
+                        break;
+                    }
+                    i += c.len_utf8();
+                }
+                let word = text[start..i].to_lowercase();
+                if word.len() <= 40 {
+                    tokens.push(Token {
+                        offset_from: start,
+                        offset_to: i,
+                        position: pos,
+                        text: word,
+                        position_length: 1,
+                    });
+                    pos += 1;
+                }
+            } else {
+                // 空白/标点：不产生 token，也不占 position（短语可跨标点）。
+                i += clen;
+            }
+        }
+        BufTokenStream {
+            iter: tokens.into_iter(),
+            current: Token::default(),
         }
     }
 }
@@ -308,93 +465,65 @@ impl ContentIndex {
     }
 
     /// 全文检索（显式匹配模式）。
-    /// - `Exact`：整串连续出现（分词后 PhraseQuery slop=0）——「全匹配」。
-    /// - `All`：分词后全部词都要有（BooleanQuery Must）——默认 AND。
-    /// - `Any`：分词后任一命中（Should）——OR 模式 / 旧行为。
+    /// - `All`（默认）：每个空白分隔的词都要命中；词内多 token 用短语
+    ///   （position 连续 = 原文连续出现）。
+    /// - `Any`：任一空白词命中即可（OR 开关）。
+    /// - `Exact`（全匹配）：整串所有 token 连成一个短语，原文必须严格连续。
     pub fn search_ids_mode(
         &self,
         query_text: &str,
         limit: usize,
         mode: MatchMode,
     ) -> Result<Vec<(String, u64, f32)>> {
-        use tantivy::query::{
-            BooleanQuery, Occur, PhraseQuery, Query, TermQuery,
-        };
+        use tantivy::query::{BooleanQuery, Occur, PhraseQuery, Query, TermQuery};
         use tantivy::schema::IndexRecordOption;
         use tantivy::Term;
         self.reader.reload()?;
         let searcher = self.reader.searcher();
         let field = self.fields.body;
         let mut tok = HybridTokenizer::new();
-        // 取分词结果 + **索引里的真实 position**：jieba 对「学习积分」给出
-        // ("学习",0),("积分",2)——位置跳号，普通 PhraseQuery（要求逐 1 相邻）
-        // 永远匹配不上。Exact 模式必须用 new_with_offset 按原位置构造。
-        let (terms, term_positions) = {
-            use tantivy::tokenizer::{TokenStream, Tokenizer};
-            let mut st = tok.token_stream(query_text);
-            let mut terms = Vec::new();
-            let mut pos = Vec::new();
-            while st.advance() {
-                let tk = st.token();
-                if tk.text.is_empty() || !tk.text.chars().any(|c| c.is_alphanumeric()) {
-                    continue;
-                }
-                terms.push(tk.text.clone());
-                pos.push(tk.position as usize);
-            }
-            (terms, pos)
-        };
-        if terms.is_empty() {
-            return Ok(Vec::new());
-        }
+
         let query: Box<dyn Query> = match mode {
-            MatchMode::Exact => {
-                // 用分词时的真实 position（jieba 可能跳号，见上）。
-                let ts: Vec<(usize, Term)> = terms
-                    .iter()
-                    .zip(term_positions.iter())
-                    .map(|(t, p)| (*p, Term::from_field_text(field, t)))
-                    .collect();
-                if ts.len() == 1 {
-                    Box::new(TermQuery::new(
-                        ts[0].1.clone(),
-                        IndexRecordOption::WithFreqs,
-                    ))
+            MatchMode::All | MatchMode::Any => {
+                let occur = if mode == MatchMode::All {
+                    Occur::Must
                 } else {
-                    Box::new(PhraseQuery::new_with_offset(ts))
+                    Occur::Should
+                };
+                let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+                for word in query_text.split_whitespace() {
+                    let w = word.trim();
+                    if w.is_empty() {
+                        continue;
+                    }
+                    if let Some(q) = content_word_query(field, &mut tok, w) {
+                        clauses.push((occur, q));
+                    }
+                }
+                if clauses.is_empty() {
+                    return Ok(Vec::new());
+                }
+                Box::new(BooleanQuery::new(clauses))
+            }
+            MatchMode::Exact => {
+                // 整串：忽略空白，把所有 token 连成一个短语（要求原文连续）。
+                let mut terms: Vec<Term> = Vec::new();
+                for word in query_text.split_whitespace() {
+                    for t in crate::snippet::query_terms(word, &mut tok) {
+                        terms.push(Term::from_field_text(field, &t));
+                    }
+                }
+                match terms.len() {
+                    0 => return Ok(Vec::new()),
+                    1 => Box::new(TermQuery::new(
+                        terms.pop().expect("one term"),
+                        IndexRecordOption::WithFreqs,
+                    )),
+                    _ => Box::new(PhraseQuery::new(terms)),
                 }
             }
-            MatchMode::All => {
-                let sub: Vec<(Occur, Box<dyn Query>)> = terms
-                    .iter()
-                    .map(|t| {
-                        (
-                            Occur::Must,
-                            Box::new(TermQuery::new(
-                                Term::from_field_text(field, t),
-                                IndexRecordOption::WithFreqs,
-                            )) as Box<dyn Query>,
-                        )
-                    })
-                    .collect();
-                Box::new(BooleanQuery::new(sub))
-            }
-            MatchMode::Any => {
-                let sub: Vec<(Occur, Box<dyn Query>)> = terms
-                    .iter()
-                    .map(|t| {
-                        (
-                            Occur::Should,
-                            Box::new(TermQuery::new(
-                                Term::from_field_text(field, t),
-                                IndexRecordOption::WithFreqs,
-                            )) as Box<dyn Query>,
-                        )
-                    })
-                    .collect();
-                Box::new(BooleanQuery::new(sub))
-            }
         };
+
         let top = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
         let mut out = Vec::with_capacity(top.len());
         for (score, addr) in top {
@@ -895,10 +1024,148 @@ mod tests {
     }
 
     #[test]
+    fn positions_are_ordinal() {
+        // position 必须是词序号 0,1,2...（不是字符偏移），PhraseQuery 才有效。
+        let mut t = HybridTokenizer::new();
+        let mut st = t.token_stream("马春天加入青松");
+        let mut out = Vec::new();
+        while st.advance() {
+            out.push(st.token().position);
+        }
+        assert_eq!(out, (0..out.len()).collect::<Vec<_>>(), "position 必须连续无跳号");
+        assert!(out.len() >= 3);
+
+        // 标点/空白不占 position：短语可以跨标点。
+        let mut t2 = HybridTokenizer::new();
+        let mut st2 = t2.token_stream("马春天，。加入");
+        let mut out2 = Vec::new();
+        while st2.advance() {
+            out2.push(st2.token().position);
+        }
+        assert_eq!(out2, (0..out2.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn ascii_runs_are_whole_words() {
+        // 中文文档里夹的英文/数字必须整词入索引（旧实现会逐字符切）。
+        let toks = tokens_of("hello world 2024年度报告");
+        assert!(toks.iter().any(|t| t == "hello"), "{toks:?}");
+        assert!(toks.iter().any(|t| t == "world"), "{toks:?}");
+        assert!(toks.iter().any(|t| t == "2024"), "{toks:?}");
+        assert!(toks.iter().any(|t| t == "年度"), "{toks:?}");
+    }
+
+    #[test]
+    fn phrase_matches_contiguous_only() {
+        use tantivy::collector::TopDocs;
+        use tantivy::doc;
+        use tantivy::query::BooleanQuery;
+        use tantivy::query::Occur;
+        use tantivy::{Index, Term};
+
+        let (schema, fields) = build_schema();
+        let index = Index::create_in_ram(schema);
+        index
+            .tokenizers()
+            .register(TOKENIZER_JIEBA, HybridTokenizer::new());
+        let mut w = index.writer::<tantivy::TantivyDocument>(50_000_000).unwrap();
+        w.add_document(doc!(fields.key => 1u64, fields.body => "我与青松——马春天采访文稿"))
+            .unwrap();
+        w.add_document(doc!(fields.key => 2u64, fields.body => "马加入春天"))
+            .unwrap();
+        w.add_document(doc!(fields.key => 3u64, fields.body => "山东哈尔滨理工大学"))
+            .unwrap();
+        w.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let mut tok = HybridTokenizer::new();
+
+        // 「马春天」只应命中连续出现的那一篇；「马加入春天」不算；无关文档不算。
+        let q1 = content_word_query(fields.body, &mut tok, "马春天").unwrap();
+        let top = searcher
+            .search(q1.as_ref(), &TopDocs::with_limit(10).order_by_score())
+            .unwrap();
+        assert_eq!(top.len(), 1, "马春天 误召回：只应命中连续出现的一篇");
+
+        let q2 = content_word_query(fields.body, &mut tok, "我与青松").unwrap();
+        let top2 = searcher
+            .search(q2.as_ref(), &TopDocs::with_limit(10).order_by_score())
+            .unwrap();
+        assert_eq!(top2.len(), 1);
+
+        // 两个词 AND：都连续出现才命中。
+        let both = BooleanQuery::new(vec![
+            (Occur::Must, q1),
+            (Occur::Must, q2),
+        ]);
+        let top3 = searcher
+            .search(&both, &TopDocs::with_limit(10).order_by_score())
+            .unwrap();
+        assert_eq!(top3.len(), 1);
+    }
+
+    #[test]
     fn cjk_still_segments() {
         // 含 CJK 走结巴： smoke 级断言不断言具体切分（词典版本相关）。
         let toks = tokens_of("全文搜索 hello world");
         assert!(toks.len() >= 2);
         assert!(toks.iter().any(|t| t.contains("全文") || t.contains("搜索")));
+    }
+
+    /// 端到端：建库 → 索引进倒排 → 三种模式检索。
+    /// 直接覆盖用户实测的误召回：搜「马春天」不能命中「马加入春天」。
+    #[test]
+    fn search_modes_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("findx2-content-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let idx = open_or_create(&dir).unwrap();
+        let meta = |frn: u64| DocMeta {
+            frn,
+            volume_id: "v".into(),
+            path: format!("f{frn}.txt"),
+            mtime: 0,
+            size: 0,
+        };
+        idx.index_doc(&meta(1), "我与青松——马春天采访文稿").unwrap();
+        idx.index_doc(&meta(2), "马加入春天").unwrap();
+        idx.index_doc(&meta(3), "山东哈尔滨理工大学").unwrap();
+        idx.index_doc(&meta(4), "青松测评学校").unwrap();
+        idx.commit().unwrap();
+
+        // 单词短语：只命中连续出现的那一篇（「马加入春天」不算）。
+        let hit = idx.search_ids_mode("马春天", 10, MatchMode::All).unwrap();
+        assert_eq!(hit.len(), 1, "马春天 误召回：{hit:?}");
+        assert_eq!(hit[0].1, 1);
+
+        // 两个词的 AND：两段都连续出现才命中。
+        let both = idx
+            .search_ids_mode("马春天 我与青松", 10, MatchMode::All)
+            .unwrap();
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].1, 1);
+
+        // 全匹配（整串）：查询顺序是「马春天 我与青松」，原文顺序相反 → 不命中。
+        let exact = idx
+            .search_ids_mode("马春天 我与青松", 10, MatchMode::Exact)
+            .unwrap();
+        assert!(exact.is_empty(), "整串模式要求严格连续：{exact:?}");
+
+        // OR：任一词命中即可，三篇里至少命中前两篇相邻词中的一篇。
+        let any = idx
+            .search_ids_mode("马春天 山东", 10, MatchMode::Any)
+            .unwrap();
+        assert_eq!(any.len(), 2, "OR 应命中 马春天 与 山东 两篇：{any:?}");
+
+        // 单字：前缀命中以该字开头的词（对齐 AnyTXT 的 prefix=1）。
+        let one = idx.search_ids_mode("青", 10, MatchMode::All).unwrap();
+        assert!(
+            one.iter().any(|(_, frn, _)| *frn == 4),
+            "单字『青』应命中『青松测评学校』：{one:?}"
+        );
+        let miss = idx.search_ids_mode("岛", 10, MatchMode::All).unwrap();
+        assert!(miss.is_empty(), "『岛』不应命中任何文档：{miss:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -376,15 +376,20 @@ pub fn build_from_plan(
                     Some(Ok((meta, text, raw_bytes))) => {
                         // 慢入库抓现行：单篇超 10 秒打一行（分词/写入病态输入）。
                         let t0 = std::time::Instant::now();
-                        let ok = cidx.index_doc(meta, text).is_ok();
+                        let r = cidx.index_doc(meta, text);
                         let dt = t0.elapsed();
                         if dt.as_secs() >= 10 {
                             eprintln!("[content] slow index {:?} {}", dt, meta.path);
                         }
-                        if ok {
-                            (1, *raw_bytes, 0, 0, Vec::new())
-                        } else {
-                            (0, 0, 1, 0, vec![format!("入库失败 {}", meta.path)])
+                        match r {
+                            Ok(()) => (1, *raw_bytes, 0, 0, Vec::new()),
+                            Err(e) => (
+                                0,
+                                0,
+                                1,
+                                0,
+                                vec![format!("入库失败 {}: {e}", meta.path)],
+                            ),
                         }
                     }
                 }
