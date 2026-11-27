@@ -2995,11 +2995,13 @@ impl MainWindow {
                                             if let Some((si, r, c)) = at {
                                                 this.goto_sheet_cell(si, r, c);
                                             }
-                                        } else if this.preview.pdf.is_none()
-                                            && (this.docx_doc.is_some()
-                                                || this.md_doc.is_some()
-                                                || this.deck.is_some()
-                                                || !this.full_text.is_empty())
+                                        } else if this.preview.pdf.is_some() {
+                                            // PDF：跳到该命中所在页（页内全部命中高亮）。
+                                            this.goto_pdf_hit(entry_idx, w, cx);
+                                        } else if this.docx_doc.is_some()
+                                            || this.md_doc.is_some()
+                                            || this.deck.is_some()
+                                            || !this.full_text.is_empty()
                                         {
                                             // 文档侧命中：列表与高亮同源，直接滚到对应块。
                                             this.snippet_window = w;
