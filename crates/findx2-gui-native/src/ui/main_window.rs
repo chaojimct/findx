@@ -1722,6 +1722,12 @@ impl MainWindow {
             self.docx_hits.len()
         } else if sheet_mode {
             self.sheet_hit_rows().len()
+        } else if self.md_doc.is_some() && !self.md_hits.is_empty() {
+            self.md_hits.len()
+        } else if self.deck.is_some() && !self.deck_hits.is_empty() {
+            self.deck_hits.len()
+        } else if !self.full_text.is_empty() && self.preview.pdf.is_none() {
+            self.full_spans.len()
         } else {
             self.snippet_total as usize
         };
@@ -1760,7 +1766,12 @@ impl MainWindow {
                             {
                                 this.goto_sheet_cell(si, r, c);
                             }
-                        } else if this.docx_doc.is_some() {
+                        } else if this.preview.pdf.is_none()
+                            && (this.docx_doc.is_some()
+                                || this.md_doc.is_some()
+                                || this.deck.is_some()
+                                || !this.full_text.is_empty())
+                        {
                             this.snippet_window = w;
                             this.scroll_to_hit(w);
                         } else {
@@ -1852,24 +1863,177 @@ impl MainWindow {
             })
     }
 
+    /// 纯文本块切分：按行聚合，每块约 512B（超长行再按 512B 切）。
+    /// 渲染与 scroll_to_hit 必须用同一套切分，块号才对得上。
+    /// 不逐行成块：256KB 全文逐行会有数千个子元素，渲染太重。
+    fn text_blocks(text: &str) -> Vec<(usize, usize)> {
+        const MAX: usize = 512;
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        let mut group_start = 0usize;
+        let mut group_end = 0usize;
+        let mut pos = 0usize;
+        while pos < text.len() {
+            let line_end = text[pos..]
+                .find('\n')
+                .map(|i| pos + i + 1)
+                .unwrap_or(text.len());
+            if line_end - pos > MAX {
+                if group_end > group_start {
+                    out.push((group_start, group_end));
+                }
+                Self::push_text_block(text, pos, line_end, MAX, &mut out);
+                group_start = line_end;
+                group_end = line_end;
+            } else if group_end > group_start && line_end - group_start > MAX {
+                out.push((group_start, group_end));
+                group_start = pos;
+                group_end = line_end;
+            } else {
+                group_end = line_end;
+            }
+            pos = line_end;
+        }
+        if group_end > group_start {
+            out.push((group_start, group_end));
+        }
+        if out.is_empty() && !text.is_empty() {
+            out.push((0, text.len()));
+        }
+        out
+    }
+
+    fn push_text_block(
+        text: &str,
+        start: usize,
+        end: usize,
+        max: usize,
+        out: &mut Vec<(usize, usize)>,
+    ) {
+        let mut a = start;
+        while end - a > max {
+            let mut b = (a + max).min(end);
+            while b > a && !text.is_char_boundary(b) {
+                b -= 1;
+            }
+            if b == a {
+                b = end;
+            }
+            out.push((a, b));
+            a = b;
+        }
+        if a < end {
+            out.push((a, end));
+        }
+    }
+
+    fn block_index(blocks: &[(usize, usize)], off: usize) -> Option<usize> {
+        if blocks.is_empty() {
+            return None;
+        }
+        let (mut lo, mut hi) = (0usize, blocks.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if blocks[mid].0 <= off {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Some(lo.saturating_sub(1))
+    }
+
+    /// 统一命中行模型：每条 = 命中前后 ctx 字节上下文 + 该条内部的高亮区间。
+    /// 上下文里的换行/制表替换成空格（1 字节→1 字节，偏移不变）。
+    fn hit_rows(
+        text: &str,
+        hits: &[std::ops::Range<usize>],
+        ctx: usize,
+    ) -> Vec<(String, Vec<std::ops::Range<usize>>)> {
+        hits.iter()
+            .take(2000)
+            .map(|r| {
+                let mut a = r.start.saturating_sub(ctx);
+                while a > 0 && !text.is_char_boundary(a) {
+                    a -= 1;
+                }
+                let mut b = (r.end + ctx).min(text.len());
+                while b < text.len() && !text.is_char_boundary(b) {
+                    b += 1;
+                }
+                let line = text[a..b].replace(['\n', '\r', '\t'], " ");
+                let inner: Vec<std::ops::Range<usize>> = hits
+                    .iter()
+                    .filter(|h| h.start >= a && h.end <= b)
+                    .map(|h| (h.start - a)..(h.end - a))
+                    .collect();
+                (line, inner)
+            })
+            .collect()
+    }
+
+    /// pptx：命中偏移 → render_pptx 输出里的块序号（每页 1 个标题块 + N 段落块）。
+    fn deck_block_of_offset(deck: &crate::pptx_blocks::Deck, off: usize) -> Option<usize> {
+        let mut block = 0usize;
+        let mut para = 0usize;
+        for slide in &deck.slides {
+            for k in 0..slide.paragraphs.len() {
+                let start = deck.para_starts.get(para + k).copied().unwrap_or(0);
+                let end = deck
+                    .para_starts
+                    .get(para + k + 1)
+                    .copied()
+                    .unwrap_or(deck.plain.len());
+                if off >= start && off < end {
+                    return Some(block + 1 + k);
+                }
+            }
+            block += 1 + slide.paragraphs.len();
+            para += slide.paragraphs.len();
+        }
+        None
+    }
+
     /// AnyTXT 式编号命中列表：行号 badge + 单行摘要；点 badge 即跳窗。
     /// 当前窗行高亮；行数 = service 回传窗数（cap 50 截断，末尾明示）。
     /// docx 内容定位到第 N 个命中所在的块（点列表行 / 翻页共用）。
     /// 采用「定向渲染窗口」而非滚动：切 focus 块重绘，命中必在首屏。
     fn scroll_to_hit(&mut self, n: usize) {
-        let Some(off) = self.docx_hits.get(n).map(|r| r.start) else {
+        // docx：切焦点块（定向渲染）。
+        if let Some(doc) = self.docx_doc.as_ref() {
+            if let Some(off) = self.docx_hits.get(n).map(|r| r.start) {
+                if let Some(block) = doc.block_of_offset(off) {
+                    self.docx_focus = Some(block);
+                    self.hit_scroll.scroll_to_top_of_item(block);
+                }
+            }
             return;
-        };
-        let Some(block) = self
-            .docx_doc
-            .as_ref()
-            .and_then(|d| d.block_of_offset(off))
-        else {
+        }
+        // md：块模型与 render_md 一一对应。
+        if let Some(doc) = self.md_doc.as_ref() {
+            if let Some(off) = self.md_hits.get(n).map(|r| r.start) {
+                if let Some(block) = doc.block_of_offset(off) {
+                    self.hit_scroll.scroll_to_top_of_item(block);
+                }
+            }
             return;
-        };
-        self.docx_focus = Some(block);
-        // 让句柄滚到该块（此时 track_scroll 生效）。
-        self.hit_scroll.scroll_to_top_of_item(block);
+        }
+        // pptx：页标题 + 段落块。
+        if let Some(deck) = self.deck.as_ref() {
+            if let Some(off) = self.deck_hits.get(n).map(|r| r.start) {
+                if let Some(block) = Self::deck_block_of_offset(deck, off) {
+                    self.hit_scroll.scroll_to_top_of_item(block);
+                }
+            }
+            return;
+        }
+        // 纯文本：按行块滚动（与渲染同一套切分）。
+        if let Some(off) = self.full_spans.get(n).map(|s| s[0]) {
+            let (plain, _) = self.hit_text_and_ranges();
+            let blocks = Self::text_blocks(&plain);
+            if let Some(block) = Self::block_index(&blocks, off) {
+                self.hit_scroll.scroll_to_top_of_item(block);
+            }
+        }
     }
 
     /// docx 命中列表（与文档高亮/跳转同源）：
@@ -1879,28 +2043,7 @@ impl MainWindow {
         let Some(doc) = self.docx_doc.as_ref() else {
             return Vec::new();
         };
-        const CTX: usize = 40;
-        self.docx_hits
-            .iter()
-            .map(|r| {
-                let mut a = r.start.saturating_sub(CTX);
-                while a > 0 && !doc.plain.is_char_boundary(a) {
-                    a -= 1;
-                }
-                let mut b = (r.end + CTX).min(doc.plain.len());
-                while b < doc.plain.len() && !doc.plain.is_char_boundary(b) {
-                    b += 1;
-                }
-                let ctx = doc.plain[a..b].replace(['\n', '\r', '\t'], " ");
-                let inner: Vec<std::ops::Range<usize>> = self
-                    .docx_hits
-                    .iter()
-                    .filter(|h| h.start >= a && h.end <= b)
-                    .map(|h| (h.start - a)..(h.end - a))
-                    .collect();
-                (ctx, inner)
-            })
-            .collect()
+        Self::hit_rows(&doc.plain, &self.docx_hits, 40)
     }
 
     fn snippet_list_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1947,6 +2090,46 @@ impl MainWindow {
                     let ranges = crate::docx_blocks::match_hits_multi(&label, &words);
                     (i, label, ranges, false)
                 })
+                .collect();
+            (total, rows)
+        } else if self.md_doc.as_ref().is_some_and(|d| !self.md_hits.is_empty()) {
+            let needles = crate::docx_blocks::content_needles_of(&self.effective_query(cx));
+            let single = needles.len() <= 1;
+            let doc = self.md_doc.as_ref().expect("checked");
+            let rows = Self::hit_rows(&doc.plain, &self.md_hits, 40);
+            let total = rows.len();
+            let rows = rows
+                .into_iter()
+                .enumerate()
+                .map(|(i, (ctx, ranges))| (i, ctx, ranges, single))
+                .collect();
+            (total, rows)
+        } else if self.deck.as_ref().is_some_and(|d| !self.deck_hits.is_empty()) {
+            let needles = crate::docx_blocks::content_needles_of(&self.effective_query(cx));
+            let single = needles.len() <= 1;
+            let deck = self.deck.as_ref().expect("checked");
+            let rows = Self::hit_rows(&deck.plain, &self.deck_hits, 40);
+            let total = rows.len();
+            let rows = rows
+                .into_iter()
+                .enumerate()
+                .map(|(i, (ctx, ranges))| (i, ctx, ranges, single))
+                .collect();
+            (total, rows)
+        } else if !self.full_text.is_empty()
+            && !self.full_spans.is_empty()
+            && self.preview.pdf.is_none()
+        {
+            let needles = crate::docx_blocks::content_needles_of(&self.effective_query(cx));
+            let single = needles.len() <= 1;
+            let hits: Vec<std::ops::Range<usize>> =
+                self.full_spans.iter().map(|&[a, b]| a..b).collect();
+            let rows = Self::hit_rows(&self.full_text, &hits, 60);
+            let total = rows.len();
+            let rows = rows
+                .into_iter()
+                .enumerate()
+                .map(|(i, (ctx, ranges))| (i, ctx, ranges, single))
                 .collect();
             (total, rows)
         } else {
@@ -2043,8 +2226,14 @@ impl MainWindow {
                                 {
                                     this.goto_sheet_cell(si, r, c);
                                 }
-                            } else if this.docx_doc.is_some() {
-                                // docx：同源列表，直接切焦点块（不重取 service 摘要）。
+                            } else if this.preview.pdf.is_none()
+                                && (this.docx_doc.is_some()
+                                    || this.md_doc.is_some()
+                                    || this.deck.is_some()
+                                    || !this.full_text.is_empty())
+                            {
+                                // 文档侧命中（docx/md/pptx/纯文本）：列表与高亮同源，
+                                // 直接滚到对应块，不再重取 service 摘要。
                                 this.snippet_window = w;
                                 this.scroll_to_hit(w);
                             } else {
@@ -3856,18 +4045,50 @@ impl MainWindow {
                                         .child("正在加载命中上下文…")
                                         .into_any_element()]
                                 } else {
-                                    vec![StyledText::new(plain)
-                                        .with_highlights(ranges.into_iter().map(|range| {
-                                            (
-                                                range,
-                                                HighlightStyle {
-                                                    color: Some(tokens.hit_fg),
-                                                    background_color: Some(tokens.hit_bg),
-                                                    ..Default::default()
-                                                },
-                                            )
-                                        }))
-                                        .into_any_element()]
+                                    // 按行切块渲染：ScrollHandle::scroll_to_top_of_item(块号)
+                                    // 才能跳转（整段 StyledText 只有一个子元素，点了没反应）。
+                                    let blocks = Self::text_blocks(&plain);
+                                    let mut els: Vec<AnyElement> =
+                                        Vec::with_capacity(blocks.len());
+                                    for (a, b) in blocks {
+                                        let seg = &plain[a..b];
+                                        let rel: Vec<std::ops::Range<usize>> = ranges
+                                            .iter()
+                                            .filter_map(|r| {
+                                                let s = r.start.max(a).checked_sub(a)?;
+                                                let e = r.end.min(b).checked_sub(a)?;
+                                                (s < e).then_some(s..e)
+                                            })
+                                            .collect();
+                                        if seg.trim().is_empty() {
+                                            els.push(div().h(px(6.)).into_any_element());
+                                        } else {
+                                            els.push(
+                                                div()
+                                                    .w_full()
+                                                    .child(
+                                                        StyledText::new(seg.to_string())
+                                                            .with_highlights(rel.into_iter().map(
+                                                                |range| {
+                                                                    (
+                                                                        range,
+                                                                        HighlightStyle {
+                                                                            color: Some(
+                                                                                tokens.hit_fg,
+                                                                            ),
+                                                                            background_color:
+                                                                                Some(tokens.hit_bg),
+                                                                            ..Default::default()
+                                                                        },
+                                                                    )
+                                                                },
+                                                            )),
+                                                    )
+                                                    .into_any_element(),
+                                            );
+                                        }
+                                    }
+                                    els
                                 }
                             })
                             .into_any_element()
