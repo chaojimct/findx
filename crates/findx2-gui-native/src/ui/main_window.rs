@@ -3523,132 +3523,6 @@ impl MainWindow {
             .scroll_to_item(row, gpui_kit::ScrollStrategy::Top);
     }
 
-    /// 选中单元格的完整内容浮层：与单元格同宽、高度自适应，定位在同一格上
-    /// （AnyTXT 的「格子展开」效果）。用 uniform_list 的可见首行 + 行高
-    /// 反推行位置；处理了向下空间不足时改为向上展开。
-    fn sheet_cell_popup(
-        &self,
-        tokens: FindxTokens,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let (r, c) = self.sheet_selected?;
-        let book = self.sheet_book.as_ref()?;
-        let sheet = book.sheets.get(book.focus_sheet)?;
-        let text = sheet
-            .rows
-            .get(r)
-            .and_then(|row| row.get(c))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())?;
-
-        // 行位置：内容坐标 = 行号 × 行高，屏幕 y = 内容 y + 滚动偏移（负值）。
-        let (off, item_h) = {
-            let st = self.sheet_scroll.0.borrow();
-            let item_h = st
-                .last_item_size
-                .map(|sz| sz.item.height.as_f32())
-                .unwrap_or(22.0);
-            (st.base_handle.offset().y.as_f32(), item_h)
-        };
-        // uniform_list 的 base_handle 不一定有 bounds()，网格 host 的高用
-        // 横向滚动容器（普通 div，bounds 一定有）反推。
-        let host_h = self.sheet_hscroll.bounds().size.height.as_f32();
-        if host_h <= 1.0 || item_h <= 1.0 {
-            return None;
-        }
-        const HEAD_H: f32 = 24.0;
-        let vh = (host_h - HEAD_H).max(1.0);
-        let y = r as f32 * item_h + off;
-        if y < -item_h || y > vh {
-            return None;
-        }
-        const CELL_W: f32 = crate::ui::rich_view::SHEET_CELL_W;
-        const GUTTER_W: f32 = crate::ui::rich_view::SHEET_GUTTER_W;
-        // 浮层从单元格顶部开始，第一段与单元格等高 → 正好盖住原格，其余向下延伸。
-        let cell_top = HEAD_H + y.max(0.0);
-        let max_h = (host_h - cell_top - 2.0).max(60.0);
-        let x = GUTTER_W + CELL_W * c as f32 + self.sheet_hscroll.offset().x.as_f32();
-        let addr = format!("{}{}", crate::xlsx_blocks::col_label(c), r + 1);
-        let words = self.hit_words(cx);
-        let ranges = crate::docx_blocks::match_hits_multi(&text, &words);
-        let entity = cx.entity();
-
-        let mut panel = div()
-            .id("sheet-cell-popup")
-            .absolute()
-            .left(px(x.max(0.0)))
-            .top(px(cell_top))
-            .w(px(CELL_W))
-            .max_h(px(max_h))
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .rounded_sm()
-            .border_2()
-            .border_color(tokens.accent)
-            // 不透明白底（AnyTXT 风格）：主题色带 alpha 会透出下层内容。
-            .bg(gpui::rgb(0xFFFFFF))
-            .text_xs()
-            .text_color(gpui::rgb(0x1F2937))
-            .on_mouse_down(MouseButton::Left, |_, _, _| {});
-
-        Some(
-            panel
-                .child(
-                    h_flex()
-                        .flex_shrink_0()
-                        .h(px(item_h))
-                        .items_center()
-                        .gap(px(4.))
-                        .px_1()
-                        .bg(gpui::rgb(0xF3F4F6))
-                        .border_b_1()
-                        .border_color(gpui::rgb(0xD1D5DB))
-                        .text_color(gpui::rgb(0x374151))
-                        .child(div().flex_1().min_w_0().child(addr))
-                        .child(
-                            div()
-                                .id("sheet-cell-popup-close")
-                                .px_1()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .hover(|d| d.bg(gpui::rgb(0xE5E7EB)))
-                                .child("×")
-                                .on_click(move |_, _, cx| {
-                                    entity.update(cx, |this, cx| {
-                                        this.sheet_selected = None;
-                                        cx.notify();
-                                    });
-                                }),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("sheet-cell-popup-body")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .px_1()
-                        .py(px(2.))
-                        .child(
-                            StyledText::new(text).with_highlights(ranges.into_iter().map(
-                                |range| {
-                                    (
-                                        range,
-                                        HighlightStyle {
-                                            color: Some(gpui::rgb(0x111827).into()),
-                                            background_color: Some(gpui::rgb(0xFFE58A).into()),
-                                            ..Default::default()
-                                        },
-                                    )
-                                },
-                            )),
-                        ),
-                )
-                .into_any_element(),
-        )
-    }
-
     /// 应用待定位的命中格：纵向滚到行 + 横向把命中列滚进视口。
     /// 必须在 render 里调用：此时能拿到上一帧的真实视口宽，
     /// set_offset 才不会被首次布局（宽=0）覆盖成 0。
@@ -5060,8 +4934,27 @@ impl MainWindow {
                             // xlsx：专用表格布局。页签固定，网格自带横/纵滚动条，
                             // 不再经过 #hit-text-scroll（避免外层假滚动条）。
                             let words = self.hit_words(cx);
-                            // 选中格的完整内容浮层（同列宽、高度自适应，盖在网格上）。
-                            let popup = self.sheet_cell_popup(tokens, cx);
+                            // 选中格浮层由 render_sheet 直接挂在行内（位置天然对齐），
+                            // 这里只给关闭回调和可用高度。
+                            let popup_close: Option<
+                                std::rc::Rc<dyn Fn(&mut gpui_kit::App)>,
+                            > = {
+                                let entity = cx.entity();
+                                Some(std::rc::Rc::new(move |cx: &mut gpui_kit::App| {
+                                    entity.update(cx, |this, cx| {
+                                        this.sheet_selected = None;
+                                        cx.notify();
+                                    });
+                                }))
+                            };
+                            let popup_max_h = (self
+                                .sheet_hscroll
+                                .bounds()
+                                .size
+                                .height
+                                .as_f32()
+                                - 24.0)
+                                .clamp(160.0, 520.0);
                             let book = self.sheet_book.as_ref().expect("checked is_some");
                             v_flex()
                                 .flex_1()
@@ -5089,8 +4982,9 @@ impl MainWindow {
                                             &self.sheet_scroll,
                                             &self.sheet_hscroll,
                                             &words,
-                                        ))
-                                        .when_some(popup, |d, popup| d.child(popup)),
+                                            popup_close,
+                                            popup_max_h,
+                                        )),
                                 )
                                 .into_any_element()
                         } else if self.full_text.len() > 256 * 1024

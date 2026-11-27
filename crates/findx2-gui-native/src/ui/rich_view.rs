@@ -187,6 +187,8 @@ pub fn render_sheet(
     scroll: &gpui_kit::UniformListScrollHandle,
     hscroll: &gpui_kit::ScrollHandle,
     hit_words: &[String],
+    popup_close: Option<std::rc::Rc<dyn Fn(&mut gpui_kit::App)>>,
+    popup_max_h: f32,
 ) -> AnyElement {
     let Some(sheet) = book.sheets.get(book.focus_sheet) else {
         return div().into_any_element();
@@ -240,6 +242,7 @@ pub fn render_sheet(
                 let row = sheet_arc.rows.get(r);
                 let row_empty = row.is_none_or(|x| x.is_empty());
                 let mut row_el = h_flex()
+                    .relative()
                     .w(px(GUTTER_W + CELL_W * cols as f32))
                     .h(px(row_h))
                     .flex_shrink_0();
@@ -312,6 +315,101 @@ pub fn render_sheet(
                         text.to_string().into_any_element()
                     };
                     row_el = row_el.child(cell.child(content));
+                }
+                // 选中格的展开浮层：挂在行内 → 位置/列宽天然对齐；
+                // deferred 让它最后绘制（覆盖下面的行），并盖住原单元格。
+                if let Some((sr, sc)) = selected {
+                    if sr == r {
+                        if let Some(cell_text) = row
+                            .and_then(|x| x.get(sc))
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                        {
+                            let ranges =
+                                crate::docx_blocks::match_hits_multi(cell_text, &words);
+                            let addr = format!(
+                                "{}{}",
+                                crate::xlsx_blocks::col_label(sc),
+                                r + 1
+                            );
+                            let cb = popup_close.clone();
+                            let body = StyledText::new(cell_text.to_string())
+                                .with_highlights(ranges.into_iter().map(|range| {
+                                    (
+                                        range,
+                                        HighlightStyle {
+                                            color: Some(gpui_kit::rgb(0x111827).into()),
+                                            background_color: Some(
+                                                gpui_kit::rgb(0xFFE58A).into(),
+                                            ),
+                                            ..Default::default()
+                                        },
+                                    )
+                                }));
+                            let panel = div()
+                                .w(px(CELL_W))
+                                .max_h(px(popup_max_h.max(row_h * 3.0)))
+                                .flex()
+                                .flex_col()
+                                .overflow_hidden()
+                                .rounded_sm()
+                                .border_2()
+                                .border_color(tokens_copy.accent)
+                                .bg(gpui_kit::rgb(0xFFFFFF))
+                                .text_xs()
+                                .text_color(gpui_kit::rgb(0x1F2937))
+                                .child(
+                                    h_flex()
+                                        .h(px(row_h))
+                                        .flex_shrink_0()
+                                        .items_center()
+                                        .gap(px(4.))
+                                        .px_1()
+                                        .bg(gpui_kit::rgb(0xF3F4F6))
+                                        .border_b_1()
+                                        .border_color(gpui_kit::rgb(0xD1D5DB))
+                                        .text_color(gpui_kit::rgb(0x374151))
+                                        .child(div().flex_1().min_w_0().child(addr))
+                                        .child(
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "sheet-popup-close-{r}-{sc}"
+                                                )))
+                                                .px_1()
+                                                .rounded_sm()
+                                                .cursor_pointer()
+                                                .hover(|d| d.bg(gpui_kit::rgb(0xE5E7EB)))
+                                                .child("×")
+                                                .on_click(move |_, _, cx| {
+                                                    if let Some(cb) = &cb {
+                                                        cb(cx);
+                                                    }
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "sheet-popup-body-{r}-{sc}"
+                                        )))
+                                        .flex_shrink_0()
+                                        .max_h(px((popup_max_h - row_h).max(row_h)))
+                                        .overflow_y_scroll()
+                                        .px_1()
+                                        .py(px(2.))
+                                        .child(body),
+                                )
+                                .into_any_element();
+                            row_el = row_el.child(
+                                div()
+                                    .absolute()
+                                    .left(px(GUTTER_W + CELL_W * sc as f32))
+                                    .top(px(0.))
+                                    .w(px(CELL_W))
+                                    .child(gpui_kit::deferred(panel)),
+                            );
+                        }
+                    }
                 }
                 out.push(row_el.into_any_element());
             }
