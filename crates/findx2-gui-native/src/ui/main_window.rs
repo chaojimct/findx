@@ -216,6 +216,16 @@ enum HitListRow {
     },
 }
 
+/// 列表里的 sheet 分组元信息（供吸顶头定位用）。
+#[derive(Clone)]
+struct ListGroup {
+    /// 分组头在 `list_rows` 里的行号。
+    row: usize,
+    si: usize,
+    name: String,
+    count: usize,
+}
+
 /// 编号列表最多缓存多少条命中行（虚拟滚动，只渲染可见行）。
 const LIST_ROWS_CAP: usize = 8000;
 /// 编号列表行高（px，uniform_list 固定行高）。
@@ -325,8 +335,6 @@ pub struct MainWindow {
     docx_gen: u64,
     /// docx 内容区滚动句柄：块与子元素一一对应，点击列表行/翻页可精确定位。
     hit_scroll: gpui_kit::ScrollHandle,
-    /// 命中列表二维滚动（横向看长行，纵向看更多命中）。
-    list_scroll: gpui_kit::ScrollHandle,
     /// 大文本虚拟滚动：全文快照 + 行索引 + 命中 spans（只在全文更新时重建）。
     text_arc: std::sync::Arc<String>,
     text_lines: std::sync::Arc<Vec<(usize, usize)>>,
@@ -344,10 +352,10 @@ pub struct MainWindow {
     list_rows: std::rc::Rc<Vec<HitListRow>>,
     /// 列表命中总数（不含 sheet 分组头）。
     list_hits: usize,
-    /// 列表内容宽度（按最长行估算一次；渲染每帧不再逐行扫描）。
-    list_content_w: f32,
     /// 列表里被收起的 sheet 分组（树状折叠）。
     list_collapsed: std::collections::BTreeSet<usize>,
+    /// 列表分组头位置（吸顶用；按行号升序）。
+    list_groups: std::rc::Rc<Vec<ListGroup>>,
     /// 编号列表虚拟滚动（只渲染可见行）。
     list_vscroll: gpui_kit::UniformListScrollHandle,
     /// docx 定向渲染焦点块（点击列表/翻页时切换，只渲染该块附近的窗口）。
@@ -692,7 +700,6 @@ impl MainWindow {
             docx_hits: Vec::new(),
             docx_gen: 0,
             hit_scroll: gpui_kit::ScrollHandle::new(),
-            list_scroll: gpui_kit::ScrollHandle::new(),
             text_arc: std::sync::Arc::new(String::new()),
             text_lines: std::sync::Arc::new(Vec::new()),
             text_spans: std::sync::Arc::new(Vec::new()),
@@ -703,8 +710,8 @@ impl MainWindow {
             model_gen: 0,
             list_rows: std::rc::Rc::new(Vec::new()),
             list_hits: 0,
-            list_content_w: 0.0,
             list_collapsed: std::collections::BTreeSet::new(),
+            list_groups: std::rc::Rc::new(Vec::new()),
             list_vscroll: gpui_kit::UniformListScrollHandle::new(),
             docx_focus: None,
             md_doc: None,
@@ -1716,13 +1723,11 @@ impl MainWindow {
         self.snippet_list_loading = false;
         self.list_rows = std::rc::Rc::new(Vec::new());
         self.list_hits = 0;
-        self.list_content_w = 0.0;
         self.list_collapsed.clear();
+        self.list_groups = std::rc::Rc::new(Vec::new());
         // 列表滚动位置也归零（否则新文件的列表停在旧位置）。
         self.list_vscroll
             .scroll_to_item(0, gpui_kit::ScrollStrategy::Top);
-        self.list_scroll
-            .set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
         self.preview_snippet.clear();
         self.snippet_window = 0;
     }
@@ -2478,20 +2483,22 @@ impl MainWindow {
     fn refresh_list_cache(&mut self, cx: &mut Context<Self>) {
         let (total, rows) = self.build_list_rows(cx);
         self.list_hits = total;
-        self.list_content_w = rows
-            .iter()
-            .map(|row| match row {
-                HitListRow::Group { name, .. } => name.chars().count() as f32 * 8.0 + 120.0,
-                HitListRow::Hit { text, .. } => {
-                    let units: usize = text
-                        .chars()
-                        .map(|c| if c.is_ascii() { 1 } else { 2 })
-                        .sum();
-                    units as f32 * 7.6 + 80.0
-                }
-            })
-            .fold(0.0, f32::max)
-            .min(6000.0);
+        self.list_groups = std::rc::Rc::new(
+            rows.iter()
+                .enumerate()
+                .filter_map(|(i, row)| match row {
+                    HitListRow::Group {
+                        si, name, count, ..
+                    } => Some(ListGroup {
+                        row: i,
+                        si: *si,
+                        name: name.clone(),
+                        count: *count,
+                    }),
+                    _ => None,
+                })
+                .collect(),
+        );
         self.list_rows = std::rc::Rc::new(rows);
     }
 
@@ -2747,10 +2754,8 @@ impl MainWindow {
                 .into_any_element();
         }
 
-        // 单行 nowrap：内容宽度按最长行估算（refresh 时算过一次），
-        // 横向滚动条才有 range；渲染每帧不再逐行扫描。
-        let list_w = self.list_content_w.max(self.actual_preview_width);
-
+        // 列表不再横向滚动：行宽 = 面板宽，超出裁剪。命中靠「行首 ID +
+        // 命中格内窗口」保证首屏可见。
         let tokens_copy = tokens;
         let entity = cx.entity();
         let processor = move |range: std::ops::Range<usize>,
@@ -2784,7 +2789,7 @@ impl MainWindow {
                         let e_select = entity.clone();
                         out.push(
                             h_flex()
-                                .w(px(list_w))
+                                .w_full()
                                 .h(px(LIST_ROW_H))
                                 .flex_shrink_0()
                                 .items_center()
@@ -2849,7 +2854,7 @@ impl MainWindow {
                         out.push(
                             h_flex()
                                 .id(SharedString::from(format!("snippet-row-{w}")))
-                                .w(px(list_w))
+                                .w_full()
                                 .h(px(LIST_ROW_H))
                                 .flex_shrink_0()
                                 .items_center()
@@ -2950,31 +2955,31 @@ impl MainWindow {
 
         let list = gpui_kit::uniform_list("snippet-hit-rows", count, processor)
             .track_scroll(&self.list_vscroll)
-            .w(px(list_w))
-            .flex_1()
-            .min_h_0();
+            .w_full()
+            .h_full();
 
-        div()
+        // 吸顶分组头：按「当前可见首行」找所属分组（不需要把组头做成 row）。
+        let first = {
+            let st = self.list_vscroll.0.borrow();
+            st.deferred_scroll_to_item
+                .as_ref()
+                .map(|d| d.item_index)
+                .unwrap_or_else(|| st.base_handle.logical_scroll_top().0)
+        };
+        let sticky = self
+            .list_groups
+            .partition_point(|g| g.row <= first)
+            .checked_sub(1)
+            .and_then(|i| self.list_groups.get(i))
+            .cloned();
+
+        let mut host = div()
             .relative()
             .w_full()
             .h_full()
             .min_h_0()
             .min_w_0()
-            .child(
-                div()
-                    .id("snippet-list-hscroll")
-                    .size_full()
-                    .track_scroll(&self.list_scroll)
-                    .overflow_x_scroll()
-                    .restrict_scroll_to_axis()
-                    .child(
-                        v_flex()
-                            .w(px(list_w))
-                            .h_full()
-                            .min_h_0()
-                            .child(list),
-                    ),
-            )
+            .child(list)
             .child(
                 div()
                     .absolute()
@@ -2994,28 +2999,11 @@ impl MainWindow {
                                     .thumb_active(|style| style.bg(tokens.accent))
                             }),
                     ),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(0.))
-                    .right(px(12.))
-                    .bottom(px(0.))
-                    .h(px(10.))
-                    .child(
-                        Scrollbar::horizontal(&self.list_scroll)
-                            .viewport_from_layout()
-                            .mode(ScrollbarMode::Always)
-                            .styles(|styles| {
-                                styles
-                                    .track(|style| style.bg(tokens.border_soft))
-                                    .thumb(|style| style.bg(tokens.text_tertiary))
-                                    .thumb_hover(|style| style.bg(tokens.text_secondary))
-                                    .thumb_active(|style| style.bg(tokens.accent))
-                            }),
-                    ),
-            )
-            .into_any_element()
+            );
+        if let Some(g) = sticky {
+            host = host.child(self.sticky_group_bar(&g, tokens_copy, cx));
+        }
+        host.into_any_element()
     }
 
     /// 按需取指定窗口的摘要（选中行补取 + 上一个/下一个翻页共用）。
@@ -3389,6 +3377,70 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// 吸顶分组头（样式与列表里的分组行一致）。
+    fn sticky_group_bar(
+        &self,
+        g: &ListGroup,
+        tokens: FindxTokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let si = g.si;
+        let collapsed = self.list_collapsed.contains(&si);
+        let active = self
+            .sheet_book
+            .as_ref()
+            .is_some_and(|b| b.focus_sheet == si);
+        let label = if active {
+            format!("{}  （{} 个结果）  · 当前", g.name, g.count)
+        } else {
+            format!("{}  （{} 个结果）", g.name, g.count)
+        };
+        let e_toggle = cx.entity();
+        let e_select = cx.entity();
+        h_flex()
+            .absolute()
+            .left(px(0.))
+            .right(px(12.))
+            .top(px(0.))
+            .h(px(LIST_ROW_H))
+            .items_center()
+            .gap(px(4.))
+            .px_2()
+            .bg(tokens.surface_raised)
+            .border_b_1()
+            .border_color(tokens.border_soft)
+            .text_xs()
+            .when(active, |d| {
+                d.text_color(tokens.accent)
+                    .font_weight(FontWeight::BOLD)
+            })
+            .when(!active, |d| d.text_color(tokens.text_secondary))
+            .child(
+                div()
+                    .id(SharedString::from(format!("sticky-group-toggle-{si}")))
+                    .w(px(14.))
+                    .cursor_pointer()
+                    .hover(|d| d.text_color(tokens.text_primary))
+                    .child(if collapsed { "▸" } else { "▾" })
+                    .on_click(move |_, _, cx| {
+                        e_toggle.update(cx, |this, cx| this.toggle_list_sheet(si, cx));
+                    }),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("sticky-group-{si}")))
+                    .flex_1()
+                    .min_w_0()
+                    .cursor_pointer()
+                    .hover(|d| d.text_color(tokens.text_primary))
+                    .child(label)
+                    .on_click(move |_, _, cx| {
+                        e_select.update(cx, |this, cx| this.select_sheet(si, cx));
+                    }),
+            )
+            .into_any_element()
+    }
+
     /// 预览上方的 sheet 页签（可点击切换）。
     fn sheet_tabs_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let tokens = Self::tokens(cx);
@@ -3444,6 +3496,145 @@ impl MainWindow {
         self.sheet_scroll_to = Some((row, col));
         self.sheet_scroll
             .scroll_to_item(row, gpui_kit::ScrollStrategy::Top);
+    }
+
+    /// 选中单元格的完整内容浮层：与单元格同宽、高度自适应，定位在同一格上
+    /// （AnyTXT 的「格子展开」效果）。用 uniform_list 的可见首行 + 行高
+    /// 反推行位置；处理了向下空间不足时改为向上展开。
+    fn sheet_cell_popup(
+        &self,
+        tokens: FindxTokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (r, c) = self.sheet_selected?;
+        let book = self.sheet_book.as_ref()?;
+        let sheet = book.sheets.get(book.focus_sheet)?;
+        let text = sheet
+            .rows
+            .get(r)
+            .and_then(|row| row.get(c))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())?;
+
+        // 行位置：可见首行索引 + 该行已滚出的像素 + 行高。
+        let (first, off, item_h) = {
+            let st = self.sheet_scroll.0.borrow();
+            let (first, off) = st.base_handle.logical_scroll_top();
+            let item_h = st
+                .last_item_size
+                .map(|sz| sz.item.height.as_f32())
+                .unwrap_or(22.0);
+            (first, off.as_f32(), item_h)
+        };
+        let vh = self
+            .sheet_scroll
+            .0
+            .borrow()
+            .base_handle
+            .bounds()
+            .size
+            .height
+            .as_f32();
+        if vh <= 1.0 || item_h <= 1.0 {
+            return None;
+        }
+        let y = (r as f32 - first as f32) * item_h - off;
+        if y < -item_h || y > vh {
+            return None;
+        }
+        // 网格结构：表头 24px + 数据区 vh；列宽/行号列宽与 render_sheet 一致。
+        const HEAD_H: f32 = 24.0;
+        const CELL_W: f32 = crate::ui::rich_view::SHEET_CELL_W;
+        const GUTTER_W: f32 = crate::ui::rich_view::SHEET_GUTTER_W;
+        let host_h = HEAD_H + vh;
+        let cell_top = HEAD_H + y.max(0.0);
+        let x = GUTTER_W + CELL_W * c as f32 + self.sheet_hscroll.offset().x.as_f32();
+        let below = host_h - cell_top - 4.0;
+        let above = cell_top - HEAD_H - 4.0;
+        let (up, max_h) = if below < 170.0 && above > below {
+            (true, above.max(60.0))
+        } else {
+            (false, below.max(60.0).min(320.0))
+        };
+        let addr = format!("{}{}", crate::xlsx_blocks::col_label(c), r + 1);
+        let words = self.hit_words(cx);
+        let ranges = crate::docx_blocks::match_hits_multi(&text, &words);
+        let entity = cx.entity();
+
+        let mut panel = div()
+            .id("sheet-cell-popup")
+            .absolute()
+            .left(px(x.max(0.0)))
+            .w(px(CELL_W))
+            .max_h(px(max_h))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .rounded_sm()
+            .border_2()
+            .border_color(tokens.accent)
+            .bg(tokens.surface)
+            .text_xs()
+            .text_color(tokens.text_primary)
+            .on_mouse_down(MouseButton::Left, |_, _, _| {});
+        if up {
+            panel = panel.bottom(px(host_h - cell_top + 2.0));
+        } else {
+            panel = panel.top(px(cell_top + 2.0));
+        }
+
+        Some(
+            panel
+                .child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap(px(4.))
+                        .px_1()
+                        .py(px(1.))
+                        .bg(tokens.surface_raised)
+                        .text_color(tokens.text_secondary)
+                        .child(div().flex_1().min_w_0().child(addr))
+                        .child(
+                            div()
+                                .id("sheet-cell-popup-close")
+                                .px_1()
+                                .cursor_pointer()
+                                .hover(|d| d.text_color(tokens.accent))
+                                .child("×")
+                                .on_click(move |_, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.sheet_selected = None;
+                                        cx.notify();
+                                    });
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("sheet-cell-popup-body")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .px_1()
+                        .py(px(2.))
+                        .child(
+                            StyledText::new(text).with_highlights(ranges.into_iter().map(
+                                |range| {
+                                    (
+                                        range,
+                                        HighlightStyle {
+                                            color: Some(tokens.hit_fg),
+                                            background_color: Some(tokens.hit_bg),
+                                            ..Default::default()
+                                        },
+                                    )
+                                },
+                            )),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// 应用待定位的命中格：纵向滚到行 + 横向把命中列滚进视口。
@@ -4857,6 +5048,8 @@ impl MainWindow {
                             // xlsx：专用表格布局。页签固定，网格自带横/纵滚动条，
                             // 不再经过 #hit-text-scroll（避免外层假滚动条）。
                             let words = self.hit_words(cx);
+                            // 选中格的完整内容浮层（同列宽、高度自适应，盖在网格上）。
+                            let popup = self.sheet_cell_popup(tokens, cx);
                             let book = self.sheet_book.as_ref().expect("checked is_some");
                             v_flex()
                                 .flex_1()
@@ -4870,14 +5063,23 @@ impl MainWindow {
                                         .pt_2()
                                         .child(self.sheet_tabs_bar(cx)),
                                 )
-                                .child(crate::ui::rich_view::render_sheet(
-                                    book,
-                                    &tokens,
-                                    self.sheet_selected,
-                                    &self.sheet_scroll,
-                                    &self.sheet_hscroll,
-                                    &words,
-                                ))
+                                .child(
+                                    div()
+                                        .relative()
+                                        .w_full()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .min_w_0()
+                                        .child(crate::ui::rich_view::render_sheet(
+                                            book,
+                                            &tokens,
+                                            self.sheet_selected,
+                                            &self.sheet_scroll,
+                                            &self.sheet_hscroll,
+                                            &words,
+                                        ))
+                                        .when_some(popup, |d, popup| d.child(popup)),
+                                )
                                 .into_any_element()
                         } else if self.full_text.len() > 256 * 1024
                             && self.text_lines.len() > 1
