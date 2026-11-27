@@ -384,6 +384,8 @@ pub struct MainWindow {
     pdf_hit_pages: Option<(u32, u64, std::rc::Rc<Vec<u32>>)>,
     /// 页号表还没回来时，等回来再跳的 (entry_idx, 命中序号)。
     pdf_jump_pending: Option<(u32, usize)>,
+    pdf_scroll: gpui_kit::ScrollHandle,
+    pdf_scroll_to: Option<usize>,
     /// 搜索选项：区分大小写（Aa）。标题搜索精确生效；全文搜索后置过滤。
     search_match_case: bool,
     /// 搜索选项：全匹配（ab）。整串连续出现才算命中。
@@ -731,6 +733,8 @@ impl MainWindow {
             sheet_hx_seen: 0.0,
             pdf_hit_pages: None,
             pdf_jump_pending: None,
+            pdf_scroll: gpui_kit::ScrollHandle::new(),
+            pdf_scroll_to: None,
             search_match_case: false,
             search_exact: false,
             search_wildcard: false,
@@ -2118,7 +2122,7 @@ impl MainWindow {
             self.md_hits.len()
         } else if self.deck.is_some() && !self.deck_hits.is_empty() {
             self.deck_hits.len()
-        } else if !self.full_spans.is_empty() && self.preview.pdf.is_none() {
+        } else if !self.full_spans.is_empty() {
             self.full_spans.len()
         } else {
             self.snippet_total as usize
@@ -2728,7 +2732,7 @@ impl MainWindow {
                 .map(|(i, (ctx, ranges))| (i, ctx, ranges, single))
                 .collect();
             (total, rows)
-        } else if !self.full_spans.is_empty() && self.preview.pdf.is_none() {
+        } else if !self.full_spans.is_empty() {
             let needles = crate::docx_blocks::content_needles_of(&self.effective_query(cx));
             let single = needles.len() <= 1;
             let hits: Vec<std::ops::Range<usize>> =
@@ -3595,6 +3599,7 @@ impl MainWindow {
             return;
         }
         self.snippet_window = h;
+        self.pdf_scroll_to = Some(h);
         {
             use std::io::Write as _;
             let _ = writeln!(
@@ -3673,6 +3678,47 @@ impl MainWindow {
             gpui_kit::ScrollStrategy::Top,
             1,
         );
+    }
+
+    /// 把 PDF 页面视图滚到「当前命中框」附近（命中框可能在同一页多次出现）。
+    fn apply_pdf_scroll(&mut self) {
+        let (Some(pdf), Some(h)) = (self.preview.pdf, self.pdf_scroll_to) else {
+            return;
+        };
+        let Some((entry, g, pages)) = self.pdf_hit_pages.as_ref() else {
+            return;
+        };
+        if *g != self.search_gen {
+            return;
+        }
+        let Some(hit) = self.active_workspace_hit() else {
+            return;
+        };
+        if *entry != hit.entry_idx {
+            return;
+        }
+        if pages.get(h).copied() != Some(pdf.page) {
+            return;
+        }
+        let Some(first) = pages.iter().position(|&p| p == pdf.page) else {
+            return;
+        };
+        let bi = h.saturating_sub(first);
+        let Some(r) = self.preview.pdf_highlights.get(bi) else {
+            return; // 框还没回来，保留待办
+        };
+        let width = if self.preview_options.fit_width {
+            (self.actual_preview_width - 24.).max(120.)
+        } else {
+            pdf.width * self.preview_options.zoom
+        };
+        let height = width * pdf.height / pdf.width.max(1.);
+        let y = r[1] * height / pdf.height.max(1.);
+        let vh = self.pdf_scroll.bounds().size.height.as_f32();
+        let target = (y - vh * 0.3).max(0.0);
+        self.pdf_scroll
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(-target)));
+        self.pdf_scroll_to = None;
     }
 
     /// 应用待定位的命中格：纵向滚到行 + 横向把命中列滚进视口。
@@ -4601,6 +4647,23 @@ impl MainWindow {
         } else {
             Vec::new()
         };
+        // 当前选中的命中在本页的第几个框（用于高亮区分）。
+        let active_box = self
+            .pdf_hit_pages
+            .as_ref()
+            .and_then(|(entry, g, pages)| {
+                if *g != self.search_gen {
+                    return None;
+                }
+                if *entry != self.active_workspace_hit()?.entry_idx {
+                    return None;
+                }
+                if pages.get(self.snippet_window).copied() != Some(pdf.page) {
+                    return None;
+                }
+                let first = pages.iter().position(|&p| p == pdf.page)?;
+                Some(self.snippet_window.saturating_sub(first))
+            });
         let sx = width / pdf.width.max(1.);
         let sy = height / pdf.height.max(1.);
         let mut stack = div().relative().child(
@@ -4609,22 +4672,30 @@ impl MainWindow {
                 .h(px(height))
                 .object_fit(ObjectFit::Contain),
         );
-        for r in hl {
+        for (i, r) in hl.iter().enumerate() {
             let (w, h) = ((r[2] - r[0]) * sx, (r[3] - r[1]) * sy);
             if w <= 0. || h <= 0. {
                 continue;
             }
-            stack = stack.child(
-                div()
-                    .absolute()
-                    .left(px(r[0] * sx))
-                    .top(px(r[1] * sy))
-                    .w(px(w))
-                    .h(px(h))
+            let active = active_box == Some(i);
+            let mut box_el = div()
+                .absolute()
+                .left(px(r[0] * sx))
+                .top(px(r[1] * sy))
+                .w(px(w))
+                .h(px(h));
+            box_el = if active {
+                box_el
+                    .bg(rgba(0xffa00044))
+                    .border_2()
+                    .border_color(rgba(0xff7a00ff))
+            } else {
+                box_el
                     .bg(rgba(0x4a90e233))
                     .border_1()
-                    .border_color(rgba(0x2f6fe0ff)),
-            );
+                    .border_color(rgba(0x2f6fe0ff))
+            };
+            stack = stack.child(box_el);
         }
         let mut col = v_flex().p_3().gap_1();
         if !self.preview.pdf_highlights.is_empty() && show_hl {
@@ -4632,10 +4703,49 @@ impl MainWindow {
                 div()
                     .text_xs()
                     .text_color(tokens.text_tertiary)
-                    .child(format!("本页 {} 个命中", self.preview.pdf_highlights.len())),
+                    .child(format!(
+                        "本页 {} 个命中{}",
+                        self.preview.pdf_highlights.len(),
+                        if active_box.is_some() { "（当前命中已框出）" } else { "" }
+                    )),
             );
         }
-        col.child(stack).into_any_element()
+        div()
+            .relative()
+            .w_full()
+            .h_full()
+            .min_h_0()
+            .min_w_0()
+            .child(
+                div()
+                    .id("pdf-hit-scroll")
+                    .size_full()
+                    .track_scroll(&self.pdf_scroll)
+                    .overflow_y_scroll()
+                    .overflow_x_scroll()
+                    .child(col.child(stack)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .right(px(0.))
+                    .bottom(px(0.))
+                    .w(px(12.))
+                    .child(
+                        Scrollbar::vertical(&self.pdf_scroll)
+                            .viewport_from_layout()
+                            .mode(ScrollbarMode::Always)
+                            .styles(|styles| {
+                                styles
+                                    .track(|style| style.bg(tokens.border_soft))
+                                    .thumb(|style| style.bg(tokens.text_tertiary))
+                                    .thumb_hover(|style| style.bg(tokens.text_secondary))
+                                    .thumb_active(|style| style.bg(tokens.accent))
+                            }),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_single_preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5094,11 +5204,9 @@ impl MainWindow {
                             // PDF：命中上下文里也显示真文档页面 + 命中黄框，
                             // 而不是退化成纯文本流。
                             div()
-                                .id("pdf-hit-scroll")
                                 .flex_1()
                                 .min_h_0()
                                 .min_w_0()
-                                .overflow_scroll()
                                 .child(self.pdf_page_view(tokens))
                                 .into_any_element()
                         } else if sheet_preview && self.sheet_book.is_some() {
@@ -5526,6 +5634,7 @@ impl Render for MainWindow {
         // xlsx 命中定位的横向偏移必须在 render 里应用（此时拿到的是上一帧
         // 真实视口宽）；放在创建表格之前，本帧布局即按新偏移绘制。
         self.apply_sheet_scroll_to();
+        self.apply_pdf_scroll();
         // Each window converges its own backdrop: a cross-window update
         // cannot touch a window mid-dispatch (its state is taken out of the
         // map), but render always runs inside its own window. DWM is only
