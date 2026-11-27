@@ -2992,6 +2992,17 @@ impl MainWindow {
                     this.sheet_book = Some(wb);
                     cx.notify();
                     this.maybe_auto_first_hit(cx);
+                    // 全扫替换模型后行索引可能变化：把当前命中格重新对齐一次
+                    // （纵向回行首 + 横向回命中列），否则会停在错行/错列。
+                    if let Some((r, c)) = this.sheet_selected {
+                        let si = this
+                            .sheet_book
+                            .as_ref()
+                            .map(|b| b.focus_sheet)
+                            .unwrap_or(0);
+                        this.goto_sheet_cell(si, r, c);
+                        cx.notify();
+                    }
                 }
             });
         })
