@@ -196,6 +196,30 @@ pub(crate) fn main_key_bindings() -> Vec<KeyBinding> {
     ]
 }
 
+/// 编号列表的一行：xlsx 的 sheet 分组头，或普通命中行。
+#[derive(Clone)]
+enum HitListRow {
+    /// xlsx：按 sheet 分组的分组头（点击切换 sheet）。
+    Group {
+        si: usize,
+        name: String,
+        count: usize,
+        active: bool,
+    },
+    /// 命中行：`window` 是全局命中序号（与翻页/跳转同口径）。
+    Hit {
+        window: usize,
+        text: String,
+        ranges: Vec<std::ops::Range<usize>>,
+        exact: bool,
+    },
+}
+
+/// 编号列表最多缓存多少条命中行（虚拟滚动，只渲染可见行）。
+const LIST_ROWS_CAP: usize = 8000;
+/// 编号列表行高（px，uniform_list 固定行高）。
+const LIST_ROW_H: f32 = 20.0;
+
 pub struct MainWindow {
     #[cfg(windows)]
     tray: Option<crate::native_tray::Tray>,
@@ -314,6 +338,15 @@ pub struct MainWindow {
     /// 预览模型代：每次切换目标/重开预览自增。异步解析回来时代不同就丢弃，
     /// 防止「上一个文件」的 xlsx/docx/pptx 解析结果晚到后把列表和内容串回去。
     model_gen: u64,
+    /// 编号列表缓存：模型/查询变化时重建，渲染只克隆 Rc。
+    /// 之前每帧重建几千行（xlsx 5000 行 × 多个 div + 高亮扫描）是滚动卡顿的根因。
+    list_rows: std::rc::Rc<Vec<HitListRow>>,
+    /// 列表命中总数（不含 sheet 分组头）。
+    list_hits: usize,
+    /// 列表内容宽度（按最长行估算一次；渲染每帧不再逐行扫描）。
+    list_content_w: f32,
+    /// 编号列表虚拟滚动（只渲染可见行）。
+    list_vscroll: gpui_kit::UniformListScrollHandle,
     /// docx 定向渲染焦点块（点击列表/翻页时切换，只渲染该块附近的窗口）。
     docx_focus: Option<usize>,
     /// md/txt 块模型（命中上下文富文本自绘；与 docx 共用渲染器）。
@@ -332,6 +365,9 @@ pub struct MainWindow {
     sheet_hscroll: gpui_kit::ScrollHandle,
     /// 当前选中的单元格 (row, col)：蓝底强调（对齐 AnyTXT）。
     sheet_selected: Option<(usize, usize)>,
+    /// 待定位的命中格 (row, col)：在 render 里应用（此时已有上一帧布局，
+    /// 横向 set_offset 不会被首次布局覆盖掉——「横向不滚动」的根因）。
+    sheet_scroll_to: Option<(usize, usize)>,
     /// 搜索选项：区分大小写（Aa）。标题搜索精确生效；全文搜索后置过滤。
     search_match_case: bool,
     /// 搜索选项：全匹配（ab）。整串连续出现才算命中。
@@ -662,6 +698,10 @@ impl MainWindow {
             text_hscroll: gpui_kit::ScrollHandle::new(),
             auto_first_pending: false,
             model_gen: 0,
+            list_rows: std::rc::Rc::new(Vec::new()),
+            list_hits: 0,
+            list_content_w: 0.0,
+            list_vscroll: gpui_kit::UniformListScrollHandle::new(),
             docx_focus: None,
             md_doc: None,
             md_hits: Vec::new(),
@@ -671,6 +711,7 @@ impl MainWindow {
             sheet_scroll: gpui_kit::UniformListScrollHandle::new(),
             sheet_hscroll: gpui_kit::ScrollHandle::new(),
             sheet_selected: None,
+            sheet_scroll_to: None,
             search_match_case: false,
             search_exact: false,
             search_wildcard: false,
@@ -1273,6 +1314,7 @@ impl MainWindow {
                                 hit
                             })
                             .collect();
+                        this.refresh_list_cache(cx);
                         this.match_total = out.total;
                         let shown = this.hits.len();
                         let total = out.total as usize;
@@ -1656,6 +1698,7 @@ impl MainWindow {
         self.deck_hits.clear();
         self.sheet_book = None;
         self.sheet_selected = None;
+        self.sheet_scroll_to = None;
         self.full_text.clear();
         self.full_spans.clear();
         self.full_total = 0;
@@ -1667,6 +1710,14 @@ impl MainWindow {
         self.snippet_list.clear();
         self.snippet_total = 0;
         self.snippet_list_loading = false;
+        self.list_rows = std::rc::Rc::new(Vec::new());
+        self.list_hits = 0;
+        self.list_content_w = 0.0;
+        // 列表滚动位置也归零（否则新文件的列表停在旧位置）。
+        self.list_vscroll
+            .scroll_to_item(0, gpui_kit::ScrollStrategy::Top);
+        self.list_scroll
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
         self.preview_snippet.clear();
         self.snippet_window = 0;
     }
@@ -1803,7 +1854,9 @@ impl MainWindow {
             "pptx" | "ppt" => (self.deck.is_some(), !self.deck_hits.is_empty()),
             "xlsx" | "xlsm" | "xls" => (
                 self.sheet_book.is_some(),
-                !self.sheet_hit_rows().is_empty(),
+                self.sheet_book
+                    .as_ref()
+                    .is_some_and(|b| b.sheets.iter().any(|s| !s.hits.is_empty())),
             ),
             _ => (
                 !self.full_text.is_empty() || !self.full_spans.is_empty(),
@@ -1819,7 +1872,7 @@ impl MainWindow {
         }
         // xlsx：选中第一个命中单元格（纵向 + 横向一起定位）。
         if matches!(ext.as_str(), "xlsx" | "xlsm" | "xls") {
-            if let Some((si, r, c, _, _)) = self.sheet_hit_rows().first().cloned() {
+            if let Some((si, r, c)) = self.sheet_hit_at(0) {
                 self.goto_sheet_cell(si, r, c);
             }
             return;
@@ -1996,7 +2049,10 @@ impl MainWindow {
             .as_ref()
             .is_some_and(|b| b.sheets.iter().any(|s| !s.hits.is_empty()))
         {
-            self.sheet_hit_rows().len()
+            self.sheet_book
+                .as_ref()
+                .map(|b| b.sheets.iter().map(|s| s.hits.len()).sum())
+                .unwrap_or(0)
         } else if self.md_doc.is_some() && !self.md_hits.is_empty() {
             self.md_hits.len()
         } else if self.deck.is_some() && !self.deck_hits.is_empty() {
@@ -2050,9 +2106,7 @@ impl MainWindow {
                         this.preview_snippet_lock = true;
                         if this.sheet_book.is_some() {
                             this.snippet_window = w;
-                            if let Some((si, r, c, _, _)) =
-                                this.sheet_hit_rows().get(w).cloned()
-                            {
+                            if let Some((si, r, c)) = this.sheet_hit_at(w) {
                                 this.goto_sheet_cell(si, r, c);
                             }
                         } else if this.preview.pdf.is_none()
@@ -2098,9 +2152,7 @@ impl MainWindow {
                         this.preview_snippet_lock = true;
                         if this.sheet_book.is_some() {
                             this.snippet_window = w;
-                            if let Some((si, r, c, _, _)) =
-                                this.sheet_hit_rows().get(w).cloned()
-                            {
+                            if let Some((si, r, c)) = this.sheet_hit_at(w) {
                                 this.goto_sheet_cell(si, r, c);
                             }
                         } else if this.preview.pdf.is_none()
@@ -2417,11 +2469,80 @@ impl MainWindow {
         Self::hit_rows(&doc.plain, &self.docx_hits, 40)
     }
 
-    fn snippet_list_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let tokens = Self::tokens(cx);
-        let cur = self.snippet_window;
-        // 当前目标的扩展名：模型只允许**本类型**参与列表，杜绝上一个文件的
-        // xlsx/docx 残留在列表里（即便异步结果晚到/状态未清）。
+    /// 重建编号列表缓存：只在模型/查询变化时调用，渲染阶段只克隆 Rc。
+    fn refresh_list_cache(&mut self, cx: &mut Context<Self>) {
+        let (total, rows) = self.build_list_rows(cx);
+        self.list_hits = total;
+        self.list_content_w = rows
+            .iter()
+            .map(|row| match row {
+                HitListRow::Group { name, .. } => name.chars().count() as f32 * 8.0 + 120.0,
+                HitListRow::Hit { text, .. } => {
+                    let units: usize = text
+                        .chars()
+                        .map(|c| if c.is_ascii() { 1 } else { 2 })
+                        .sum();
+                    units as f32 * 7.6 + 80.0
+                }
+            })
+            .fold(0.0, f32::max)
+            .min(6000.0);
+        self.list_rows = std::rc::Rc::new(rows);
+    }
+
+    /// 把一行单元格拼成列表文本，并给命中单元格内的匹配文字算高亮区间。
+    fn xlsx_row_label(
+        row: Option<&Vec<String>>,
+        hit_col: usize,
+        words: &[String],
+    ) -> (String, Vec<std::ops::Range<usize>>) {
+        let mut out = String::new();
+        let mut hit_span: Option<(usize, usize)> = None;
+        if let Some(cells) = row {
+            for (i, cell) in cells.iter().enumerate() {
+                let cell = cell.trim();
+                if cell.is_empty() {
+                    continue;
+                }
+                if !out.is_empty() {
+                    out.push_str("  ");
+                }
+                let start = out.len();
+                out.push_str(cell);
+                if i == hit_col {
+                    hit_span = Some((start, out.len()));
+                }
+                if out.len() > 1200 {
+                    break;
+                }
+            }
+        }
+        if out.len() > 1200 {
+            let cut = out
+                .char_indices()
+                .nth(400)
+                .map(|(i, _)| i)
+                .unwrap_or(out.len());
+            out.truncate(cut);
+        }
+        let mut ranges = Vec::new();
+        if let Some((a, b)) = hit_span {
+            let b = b.min(out.len());
+            if a < b {
+                for r in crate::docx_blocks::match_hits_multi(&out[a..b], words) {
+                    let rs = a + r.start;
+                    let re = (a + r.end).min(out.len());
+                    if rs < re {
+                        ranges.push(rs..re);
+                    }
+                }
+            }
+        }
+        (out, ranges)
+    }
+
+    /// 生成列表行（按当前目标类型）：xlsx 按 sheet 分组，其余用文档/全文命中。
+    fn build_list_rows(&self, cx: &mut Context<Self>) -> (usize, Vec<HitListRow>) {
         let ext = self
             .selected_preview_path()
             .and_then(|p| {
@@ -2435,6 +2556,45 @@ impl MainWindow {
         let is_sheet = matches!(ext.as_str(), "xlsx" | "xlsm" | "xls");
         let is_md = matches!(ext.as_str(), "md" | "markdown");
         let is_ppt = matches!(ext.as_str(), "pptx" | "ppt");
+
+        // xlsx：AnyTXT 式按 sheet 分组，组头可点（切换 sheet），行文本是整行内容。
+        if is_sheet
+            && self
+                .sheet_book
+                .as_ref()
+                .is_some_and(|b| b.sheets.iter().any(|s| !s.hits.is_empty()))
+        {
+            let book = self.sheet_book.as_ref().expect("checked");
+            let q = self.effective_query(cx);
+            let words = crate::docx_blocks::content_needles_of(&q);
+            let mut out: Vec<HitListRow> = Vec::new();
+            let mut window = 0usize;
+            'sheets: for (si, sh) in book.sheets.iter().enumerate() {
+                if sh.hits.is_empty() {
+                    continue;
+                }
+                out.push(HitListRow::Group {
+                    si,
+                    name: sh.name.clone(),
+                    count: sh.hits.len(),
+                    active: si == book.focus_sheet,
+                });
+                for &(r, c) in sh.hits.iter() {
+                    let (text, ranges) = Self::xlsx_row_label(sh.rows.get(r), c, &words);
+                    out.push(HitListRow::Hit {
+                        window,
+                        text,
+                        ranges,
+                        exact: false,
+                    });
+                    window += 1;
+                    if window >= LIST_ROWS_CAP {
+                        break 'sheets;
+                    }
+                }
+            }
+            return (window, out);
+        }
 
         // 统一行模型：序号 / 单行文本 / 高亮区间 / 是否整串命中。
         // docx 场景用**文档侧 hits**生成（与高亮、跳转同一套坐标），
@@ -2454,29 +2614,6 @@ impl MainWindow {
                 .into_iter()
                 .enumerate()
                 .map(|(i, (ctx, ranges))| (i, ctx, ranges, single))
-                .collect();
-            (total, rows)
-        } else if is_sheet
-            && self
-                .sheet_book
-                .as_ref()
-                .is_some_and(|b| b.sheets.iter().any(|s| !s.hits.is_empty()))
-        {
-            // xlsx：列表由**表格命中格**生成（与高亮/跳转同源）。
-            // 每条 = "A1: 单元格文本"，点第 N 条直接滚到那一格并选中。
-            let q = self.effective_query(cx);
-            let words = crate::docx_blocks::content_needles_of(&q);
-            let src = self.sheet_hit_rows();
-            let total = src.len();
-            let rows = src
-                .into_iter()
-                .enumerate()
-                .map(|(i, (_si, r, c, text, _ranges))| {
-                    let addr = format!("{}{}", crate::xlsx_blocks::col_label(c), r + 1);
-                    let label = format!("{addr}: {text}");
-                    let ranges = crate::docx_blocks::match_hits_multi(&label, &words);
-                    (i, label, ranges, false)
-                })
                 .collect();
             (total, rows)
         } else if is_md && self.md_doc.as_ref().is_some_and(|d| !self.md_hits.is_empty()) {
@@ -2503,8 +2640,7 @@ impl MainWindow {
                 .map(|(i, (ctx, ranges))| (i, ctx, ranges, single))
                 .collect();
             (total, rows)
-        } else if !self.full_spans.is_empty() && self.preview.pdf.is_none()
-        {
+        } else if !self.full_spans.is_empty() && self.preview.pdf.is_none() {
             let needles = crate::docx_blocks::content_needles_of(&self.effective_query(cx));
             let single = needles.len() <= 1;
             let hits: Vec<std::ops::Range<usize>> =
@@ -2536,10 +2672,9 @@ impl MainWindow {
             };
             let rows = self
                 .snippet_list
-                .clone()
-                .into_iter()
+                .iter()
                 .map(|(w, html)| {
-                    let (plain, ranges) = search_logic::snippet_plain_and_ranges(&html);
+                    let (plain, ranges) = search_logic::snippet_plain_and_ranges(html);
                     let (flat, flat_ranges) = flatten_with_ranges(&plain, &ranges);
                     let is_exact = needle.as_ref().is_some_and(|n| {
                         flat_ranges.iter().any(|r| {
@@ -2548,14 +2683,33 @@ impl MainWindow {
                     });
                     let (flat, flat_ranges) =
                         Self::center_on_first_hit(&flat, &flat_ranges, 48, 96);
-                    (w, flat, flat_ranges, is_exact)
+                    (*w, flat, flat_ranges, is_exact)
                 })
                 .collect();
             (self.snippet_total as usize, rows)
         };
-        let shown = rows.len();
+        let total = total.min(LIST_ROWS_CAP);
+        let rows = rows
+            .into_iter()
+            .take(LIST_ROWS_CAP)
+            .map(|(window, text, ranges, exact)| HitListRow::Hit {
+                window,
+                text,
+                ranges,
+                exact,
+            })
+            .collect();
+        (total, rows)
+    }
 
-        if shown == 0 {
+    /// 编号命中列表：虚拟滚动（只渲染可见行）+ 常显横向滚动条。
+    fn snippet_list_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tokens = Self::tokens(cx);
+        let cur = self.snippet_window;
+        let rows = self.list_rows.clone();
+        let count = rows.len();
+
+        if count == 0 {
             let msg = if self.sheet_book.is_some() {
                 "当前表格已解析行内没有命中（可切换「文字摘录」看全文命中）"
             } else {
@@ -2568,136 +2722,261 @@ impl MainWindow {
                 .py_2()
                 .text_xs()
                 .text_color(tokens.text_tertiary)
-                .child(msg);
+                .child(msg)
+                .into_any_element();
         }
 
-        // 单行 nowrap：内容宽度按最长行估算，横向滚动条才有 range。
-        let list_w = rows
-            .iter()
-            .map(|(_, text, _, _)| {
-                let units: usize = text
-                    .chars()
-                    .map(|c| if c.is_ascii() { 1 } else { 2 })
-                    .sum();
-                units as f32 * 7.6 + 80.0
-            })
-            .fold(self.actual_preview_width, f32::max);
-        v_flex()
-            .w(px(list_w))
-            .flex_shrink_0()
-            .gap_px()
-            .children(rows.into_iter().map(|(w, text, ranges, is_exact)| {
-                let badge_text = if is_exact { "全" } else { "词" };
-                let badge_color = if is_exact {
-                    tokens.accent
-                } else {
-                    tokens.text_tertiary
-                };
-                let selected = w == cur;
-                let entity = cx.entity();
-                h_flex()
-                    .id(SharedString::from(format!("snippet-row-{w}")))
-                    .w_full()
-                    .items_center()
-                    .gap(px(6.))
-                    .px_2()
-                    .py(px(3.))
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .when(selected, |d| d.bg(tokens.row_selected))
-                    .hover(|d| d.bg(tokens.hover))
-                    .on_click(move |_, _, cx| {
-                        entity.update(cx, |this, cx| {
-                            let Some(entry_idx) =
-                                this.active_workspace_hit().map(|h| h.entry_idx)
-                            else {
-                                return;
-                            };
-                            if !this.snippet_list_open {
-                                return;
-                            }
-                            this.preview_snippet_lock = true;
-                            if this.sheet_book.is_some() {
-                                // xlsx：滚到命中格并选中。
-                                if let Some((si, r, c, _, _)) =
-                                    this.sheet_hit_rows().get(w).cloned()
-                                {
-                                    this.goto_sheet_cell(si, r, c);
-                                }
-                            } else if this.preview.pdf.is_none()
-                                && (this.docx_doc.is_some()
-                                    || this.md_doc.is_some()
-                                    || this.deck.is_some()
-                                    || !this.full_text.is_empty())
-                            {
-                                // 文档侧命中（docx/md/pptx/纯文本）：列表与高亮同源，
-                                // 直接滚到对应块，不再重取 service 摘要。
-                                this.snippet_window = w;
-                                this.scroll_to_hit(w);
-                            } else {
-                                this.fetch_snippet_window(entry_idx, w, true, cx);
-                            }
-                            cx.notify();
-                        })
-                    })
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .w(px(18.))
-                            .text_xs()
-                            .text_color(tokens.text_tertiary)
-                            .child(format!("{}", w + 1)),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .px(px(3.))
-                            .rounded_sm()
-                            .text_xs()
-                            .text_color(badge_color)
-                            .when(is_exact, |d| d.bg(tokens.row_selected))
-                            .child(badge_text),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_xs()
-                            .text_color(if selected {
-                                tokens.text_primary
-                            } else {
-                                tokens.text_secondary
-                            })
-                            .child({
-                                StyledText::new(text).with_highlights(ranges.into_iter().map(
-                                    |r| {
-                                        (
-                                            r,
-                                            HighlightStyle {
-                                                background_color: Some(tokens.hit_bg),
-                                                color: Some(tokens.hit_fg),
-                                                ..Default::default()
-                                            },
-                                        )
-                                    },
-                                ))
-                            }),
-                    )
-            }))
-            .when(total > shown, |v| {
-                v.child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .text_xs()
-                        .text_color(tokens.text_tertiary)
-                        .child(format!("共 {total} 处，只列前 {shown}（上一个/下一个可达其余）")),
-                )
-            })
-    }
+        // 单行 nowrap：内容宽度按最长行估算（refresh 时算过一次），
+        // 横向滚动条才有 range；渲染每帧不再逐行扫描。
+        let list_w = self.list_content_w.max(self.actual_preview_width);
 
+        let tokens_copy = tokens;
+        let entity = cx.entity();
+        let processor = move |range: std::ops::Range<usize>,
+                              _window: &mut gpui_kit::Window,
+                              _cx: &mut gpui_kit::App|
+              -> Vec<AnyElement> {
+            let mut out: Vec<AnyElement> = Vec::with_capacity(range.len());
+            for i in range {
+                let Some(row) = rows.get(i) else {
+                    continue;
+                };
+                match row {
+                    HitListRow::Group {
+                        si,
+                        name,
+                        count,
+                        active,
+                    } => {
+                        let si = *si;
+                        let active = *active;
+                        let entity = entity.clone();
+                        let label = format!("{name}  （{count} 个结果）");
+                        out.push(
+                            h_flex()
+                                .id(SharedString::from(format!("snippet-group-{si}")))
+                                .w(px(list_w))
+                                .h(px(LIST_ROW_H))
+                                .flex_shrink_0()
+                                .items_center()
+                                .gap(px(4.))
+                                .px_2()
+                                .bg(tokens_copy.surface_raised)
+                                .cursor_pointer()
+                                .text_xs()
+                                .when(active, |d| {
+                                    d.text_color(tokens_copy.accent)
+                                        .font_weight(FontWeight::BOLD)
+                                })
+                                .when(!active, |d| d.text_color(tokens_copy.text_secondary))
+                                .hover(|d| d.bg(tokens_copy.hover))
+                                .child(label)
+                                .on_click(move |_, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        if let Some(book) = this.sheet_book.as_mut() {
+                                            book.focus_sheet = si;
+                                        }
+                                        this.sheet_selected = None;
+                                        this.sheet_scroll_to = None;
+                                        this.sheet_scroll
+                                            .scroll_to_item(0, gpui_kit::ScrollStrategy::Top);
+                                        this.sheet_hscroll
+                                            .set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
+                                        this.refresh_list_cache(cx);
+                                        cx.notify();
+                                    });
+                                })
+                                .into_any_element(),
+                        );
+                    }
+                    HitListRow::Hit {
+                        window,
+                        text,
+                        ranges,
+                        exact,
+                    } => {
+                        let w = *window;
+                        let selected = w == cur;
+                        let badge_text = if *exact { "全" } else { "词" };
+                        let badge_color = if *exact {
+                            tokens_copy.accent
+                        } else {
+                            tokens_copy.text_tertiary
+                        };
+                        let entity = entity.clone();
+                        let text = text.clone();
+                        let ranges = ranges.clone();
+                        out.push(
+                            h_flex()
+                                .id(SharedString::from(format!("snippet-row-{w}")))
+                                .w(px(list_w))
+                                .h(px(LIST_ROW_H))
+                                .flex_shrink_0()
+                                .items_center()
+                                .gap(px(6.))
+                                .px_2()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .when(selected, |d| d.bg(tokens_copy.row_selected))
+                                .hover(|d| d.bg(tokens_copy.hover))
+                                .on_click(move |_, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        let Some(entry_idx) =
+                                            this.active_workspace_hit().map(|h| h.entry_idx)
+                                        else {
+                                            return;
+                                        };
+                                        if !this.snippet_list_open {
+                                            return;
+                                        }
+                                        this.preview_snippet_lock = true;
+                                        if this.sheet_book.is_some() {
+                                            // xlsx：滚到命中格并选中（sheet/行/列）。
+                                            this.snippet_window = w;
+                                            if let Some((si, r, c)) = this.sheet_hit_at(w) {
+                                                this.goto_sheet_cell(si, r, c);
+                                            }
+                                        } else if this.preview.pdf.is_none()
+                                            && (this.docx_doc.is_some()
+                                                || this.md_doc.is_some()
+                                                || this.deck.is_some()
+                                                || !this.full_text.is_empty())
+                                        {
+                                            // 文档侧命中：列表与高亮同源，直接滚到对应块。
+                                            this.snippet_window = w;
+                                            this.scroll_to_hit(w);
+                                        } else {
+                                            this.fetch_snippet_window(entry_idx, w, true, cx);
+                                        }
+                                        this.list_vscroll
+                                            .scroll_to_item(i, gpui_kit::ScrollStrategy::Center);
+                                        cx.notify();
+                                    });
+                                })
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .w(px(18.))
+                                        .text_xs()
+                                        .text_color(tokens_copy.text_tertiary)
+                                        .child(format!("{}", w + 1)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .px(px(3.))
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .text_color(badge_color)
+                                        .when(*exact, |d| d.bg(tokens_copy.row_selected))
+                                        .child(badge_text),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_xs()
+                                        .text_color(if selected {
+                                            tokens_copy.text_primary
+                                        } else {
+                                            tokens_copy.text_secondary
+                                        })
+                                        .child({
+                                            StyledText::new(text).with_highlights(
+                                                ranges.into_iter().map(|r| {
+                                                    (
+                                                        r,
+                                                        HighlightStyle {
+                                                            background_color: Some(
+                                                                tokens_copy.hit_bg,
+                                                            ),
+                                                            color: Some(tokens_copy.hit_fg),
+                                                            ..Default::default()
+                                                        },
+                                                    )
+                                                }),
+                                            )
+                                        }),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                }
+            }
+            out
+        };
+
+        let list = gpui_kit::uniform_list("snippet-hit-rows", count, processor)
+            .track_scroll(&self.list_vscroll)
+            .w(px(list_w))
+            .flex_1()
+            .min_h_0();
+
+        div()
+            .relative()
+            .w_full()
+            .h_full()
+            .min_h_0()
+            .min_w_0()
+            .child(
+                div()
+                    .id("snippet-list-hscroll")
+                    .size_full()
+                    .track_scroll(&self.list_scroll)
+                    .overflow_x_scroll()
+                    .restrict_scroll_to_axis()
+                    .child(
+                        v_flex()
+                            .w(px(list_w))
+                            .h_full()
+                            .min_h_0()
+                            .child(list),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .right(px(0.))
+                    .bottom(px(0.))
+                    .w(px(12.))
+                    .child(
+                        Scrollbar::vertical(&self.list_vscroll)
+                            .viewport_from_layout()
+                            .mode(ScrollbarMode::Always)
+                            .styles(|styles| {
+                                styles
+                                    .track(|style| style.bg(tokens.border_soft))
+                                    .thumb(|style| style.bg(tokens.text_tertiary))
+                                    .thumb_hover(|style| style.bg(tokens.text_secondary))
+                                    .thumb_active(|style| style.bg(tokens.accent))
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .right(px(12.))
+                    .bottom(px(0.))
+                    .h(px(10.))
+                    .child(
+                        Scrollbar::horizontal(&self.list_scroll)
+                            .viewport_from_layout()
+                            .mode(ScrollbarMode::Always)
+                            .styles(|styles| {
+                                styles
+                                    .track(|style| style.bg(tokens.border_soft))
+                                    .thumb(|style| style.bg(tokens.text_tertiary))
+                                    .thumb_hover(|style| style.bg(tokens.text_secondary))
+                                    .thumb_active(|style| style.bg(tokens.accent))
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
 
     /// 按需取指定窗口的摘要（选中行补取 + 上一个/下一个翻页共用）。
     /// window==0 时同时回填行内摘要；总是刷新预览卡；总数回填供翻页按钮用。
@@ -2837,6 +3116,7 @@ impl MainWindow {
                 }
                 this.snippet_list = list;
                 this.snippet_list_open = true;
+                this.refresh_list_cache(cx);
                 cx.notify();
             });
         })
@@ -2901,6 +3181,7 @@ impl MainWindow {
                     this.recompute_docx_hits(cx);
                     // xlsx 命中也用全文命中词重算（比摘要窗口的 <b> 更准）。
                     this.recompute_sheet_hits(cx);
+                    this.refresh_list_cache(cx);
                     cx.notify();
                     this.maybe_auto_first_hit(cx);
                 }
@@ -2930,6 +3211,7 @@ impl MainWindow {
                 if let Ok(Ok(deck)) = parsed {
                     this.deck_hits = crate::docx_blocks::match_hits_multi(&deck.plain, &needles);
                     this.deck = Some(deck);
+                    this.refresh_list_cache(cx);
                     cx.notify();
                     this.maybe_auto_first_hit(cx);
                 }
@@ -2971,6 +3253,7 @@ impl MainWindow {
                     let words = this.hit_words(cx);
                     crate::xlsx_blocks::recompute_hits(&mut wb, &words);
                     this.sheet_book = Some(wb);
+                    this.refresh_list_cache(cx);
                     cx.notify();
                     this.maybe_auto_first_hit(cx);
                 }
@@ -2990,6 +3273,7 @@ impl MainWindow {
                     let words = this.hit_words(cx);
                     crate::xlsx_blocks::recompute_hits(&mut wb, &words);
                     this.sheet_book = Some(wb);
+                    this.refresh_list_cache(cx);
                     cx.notify();
                     this.maybe_auto_first_hit(cx);
                     // 全扫替换模型后行索引可能变化：优先保持已有选中格，
@@ -3003,9 +3287,7 @@ impl MainWindow {
                             .unwrap_or(0);
                         this.goto_sheet_cell(si, r, c);
                         cx.notify();
-                    } else if let Some((si, r, c, _, _)) =
-                        this.sheet_hit_rows().first().cloned()
-                    {
+                    } else if let Some((si, r, c)) = this.sheet_hit_at(0) {
                         this.goto_sheet_cell(si, r, c);
                         cx.notify();
                     }
@@ -3015,28 +3297,18 @@ impl MainWindow {
         .detach();
     }
 
-    /// xlsx 命中列表行：与表格命中格**同源**（sheet.hits）。
-    /// 每条 = (sheet_idx, row, col, 单元格文本, 文本内命中区间)。
-    fn sheet_hit_rows(&self) -> Vec<(usize, usize, usize, String, Vec<std::ops::Range<usize>>)> {
-        let Some(book) = self.sheet_book.as_ref() else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
+    /// 全局第 w 个命中格 (sheet, row, col)：与列表/翻页同一顺序、不分配文本。
+    fn sheet_hit_at(&self, w: usize) -> Option<(usize, usize, usize)> {
+        let book = self.sheet_book.as_ref()?;
+        let mut base = 0usize;
         for (si, sh) in book.sheets.iter().enumerate() {
-            for &(r, c) in &sh.hits {
-                let text = sh
-                    .rows
-                    .get(r)
-                    .and_then(|row| row.get(c))
-                    .cloned()
-                    .unwrap_or_default();
-                out.push((si, r, c, text, Vec::new()));
+            if w < base + sh.hits.len() {
+                let (r, c) = sh.hits[w - base];
+                return Some((si, r, c));
             }
-            if out.len() >= 5000 {
-                break;
-            }
+            base += sh.hits.len();
         }
-        out
+        None
     }
 
     /// 点 xlsx 列表项：滚到该行并选中该格。
@@ -3045,17 +3317,29 @@ impl MainWindow {
             book.focus_sheet = sheet_idx;
         }
         self.sheet_selected = Some((row, col));
+        self.sheet_scroll_to = Some((row, col));
         self.sheet_scroll
             .scroll_to_item(row, gpui_kit::ScrollStrategy::Top);
-        // 横向也要跟过去：列固定宽，把命中列滚到视口左侧 1/3 附近。
-        let vw = self.sheet_hscroll.bounds().size.width.as_f32();
-        let vw = if vw > 1.0 {
-            vw
-        } else {
-            self.actual_preview_width.max(200.0)
+    }
+
+    /// 应用待定位的命中格：纵向滚到行 + 横向把命中列滚进视口。
+    /// 必须在 render 里调用：此时能拿到上一帧的真实视口宽，
+    /// set_offset 才不会被首次布局（宽=0）覆盖成 0。
+    fn apply_sheet_scroll_to(&mut self) {
+        let Some((row, col)) = self.sheet_scroll_to else {
+            return;
         };
+        let vw = self.sheet_hscroll.bounds().size.width.as_f32();
+        if vw <= 1.0 {
+            // 还没布局出来：保留待办，下一帧再试。
+            return;
+        }
+        self.sheet_scroll_to = None;
+        self.sheet_scroll
+            .scroll_to_item(row, gpui_kit::ScrollStrategy::Top);
         let x = crate::ui::rich_view::SHEET_GUTTER_W
             + crate::ui::rich_view::SHEET_CELL_W * col as f32;
+        // 命中列落在视口左侧 1/3 附近（列宽固定，可直接算）。
         let target = (x - vw * 0.3).min(0.0);
         self.sheet_hscroll
             .set_offset(gpui::point(gpui::px(target), gpui::px(0.0)));
@@ -3120,6 +3404,7 @@ impl MainWindow {
                 self.full_spans.len()
             );
         }
+        self.refresh_list_cache(cx);
     }
 
     /// md 块解析（命中上下文自绘用）：pulldown-cmark 纯 Rust，毫秒级。
@@ -3164,6 +3449,7 @@ impl MainWindow {
             return;
         }
         self.md_hits = crate::docx_blocks::match_hits_multi(&doc.plain, &needles);
+        self.refresh_list_cache(cx);
     }
 
     /// docx 富文本块解析（命中上下文自绘用）：纯 Rust、进程内，约 90ms。
@@ -3234,6 +3520,7 @@ impl MainWindow {
             .docx_hits
             .first()
             .and_then(|r| doc.block_of_offset(r.start));
+        self.refresh_list_cache(cx);
     }
 
     /// 取自渲染 PDF 当前页的命中框（高亮黄框用；失败/无命中静默无高亮）。
@@ -4413,8 +4700,7 @@ impl MainWindow {
                         div()
                             .w_full()
                             .flex_shrink_0()
-                            .px_2()
-                            .py_1()
+                            .h(px(200.))
                             .border_b_1()
                             .border_color(tokens.border_soft)
                             .child(self.snippet_list_view(cx)),
@@ -4656,51 +4942,13 @@ impl MainWindow {
                             .border_color(tokens.border_soft)
                             .child(self.snippet_pager(cx))
                             .child(if self.snippet_list_open {
-                                // 原生二维滚动（gpui-component 的 Scrollable
-                                // 自建句柄，既拿不到也加不了常显条）。
+                                // 虚拟列表自带上/下与横向常显滚动条，这里只给高度。
                                 div()
-                                    .relative()
+                                    .w_full()
                                     .flex_1()
                                     .min_h_0()
                                     .min_w_0()
-                                    .child(
-                                        div()
-                                            .id("snippet-list-scroll")
-                                            .w_full()
-                                            .h_full()
-                                            .track_scroll(&self.list_scroll)
-                                            .overflow_x_scroll()
-                                            .overflow_y_scroll()
-                                            .child(self.snippet_list_view(cx)),
-                                    )
-                                    .child(
-                                        div().absolute().inset_0().child(
-                                            Scrollbar::vertical(&self.list_scroll)
-                                                .viewport_from_layout()
-                                                .mode(ScrollbarMode::Always)
-                                                .styles(|styles| {
-                                                    styles
-                                                        .track(|style| style.bg(tokens.border_soft))
-                                                        .thumb(|style| style.bg(tokens.text_tertiary))
-                                                        .thumb_hover(|style| style.bg(tokens.text_secondary))
-                                                        .thumb_active(|style| style.bg(tokens.accent))
-                                                }),
-                                        ),
-                                    )
-                                    .child(
-                                        div().absolute().inset_0().child(
-                                            Scrollbar::horizontal(&self.list_scroll)
-                                                .viewport_from_layout()
-                                                .mode(ScrollbarMode::Always)
-                                                .styles(|styles| {
-                                                    styles
-                                                        .track(|style| style.bg(tokens.border_soft))
-                                                        .thumb(|style| style.bg(tokens.text_tertiary))
-                                                        .thumb_hover(|style| style.bg(tokens.text_secondary))
-                                                        .thumb_active(|style| style.bg(tokens.accent))
-                                                }),
-                                        ),
-                                    )
+                                    .child(self.snippet_list_view(cx))
                                     .into_any_element()
                             } else {
                                 div().into_any_element()
@@ -4822,6 +5070,9 @@ selectedIndex={}  results={}\n\
 
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // xlsx 命中定位的横向偏移必须在 render 里应用（此时拿到的是上一帧
+        // 真实视口宽）；放在创建表格之前，本帧布局即按新偏移绘制。
+        self.apply_sheet_scroll_to();
         // Each window converges its own backdrop: a cross-window update
         // cannot touch a window mid-dispatch (its state is taken out of the
         // map), but render always runs inside its own window. DWM is only

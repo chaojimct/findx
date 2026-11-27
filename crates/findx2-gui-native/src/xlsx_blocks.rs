@@ -29,15 +29,22 @@ pub struct Sheet {
     pub name: String,
     /// 行优先的单元格文本（Arc：虚拟滚动闭包可廉价捕获）。
     pub rows: Arc<Vec<Vec<String>>>,
-    /// 命中格坐标 (row, col)。
-    pub hits: Vec<(usize, usize)>,
+    /// 命中格坐标 (row, col)：Arc 共享，渲染每帧克隆 Sheet 不复制命中表。
+    /// 行主序（recompute_hits 按行推入），渲染用二分查找。
+    pub hits: Arc<Vec<(usize, usize)>>,
     /// 该 sheet 真实总行数（来自 XML 的 row 数，用于提示"仅显示前 N 行"）。
     pub total_rows: usize,
+    /// 最大列数（解析时算一次；渲染每帧调用 cols() 时不能重扫全表）。
+    pub cols: usize,
 }
 
 impl Sheet {
-pub fn cols(&self) -> usize {
-        self.rows.iter().map(|r| r.len()).max().unwrap_or(0)
+    pub fn cols(&self) -> usize {
+        if self.cols > 0 {
+            self.cols
+        } else {
+            self.rows.iter().map(|r| r.len()).max().unwrap_or(0)
+        }
     }
 }
 
@@ -101,11 +108,13 @@ pub fn parse_inner(path: &str, keep_words: &[String], base_rows: usize) -> Resul
         if rows.is_empty() {
             continue;
         }
+        let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
         out.sheets.push(Sheet {
             name: name.clone(),
             rows: Arc::new(rows),
-            hits: Vec::new(),
+            hits: Arc::new(Vec::new()),
             total_rows,
+            cols,
         });
     }
     if out.sheets.is_empty() {
@@ -436,7 +445,7 @@ pub fn recompute_hits(wb: &mut Workbook, words: &[String]) {
                 }
             }
         }
-        sheet.hits = hits;
+        sheet.hits = Arc::new(hits);
     }
     if let Some(i) = wb.sheets.iter().position(|s| !s.hits.is_empty()) {
         wb.focus_sheet = i;

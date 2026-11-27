@@ -10,7 +10,7 @@
 
 use std::ops::Range;
 
-use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode, ScrollableElement as _};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -226,10 +226,8 @@ pub fn render_sheet(
     }
 
     let row_count = sheet.rows.len();
+    // Sheet 内部 rows/hits 都是 Arc，clone 只加引用计数（每帧不复制大表）。
     let sheet_arc = std::sync::Arc::new(sheet.clone());
-    // HashSet：可见行每帧要查几十次，Vec::contains 在命中多时会退化成 O(H×cells)。
-    let hit_cells: std::sync::Arc<std::collections::HashSet<(usize, usize)>> =
-        std::sync::Arc::new(sheet.hits.iter().copied().collect());
     let words: std::sync::Arc<Vec<String>> = std::sync::Arc::new(hit_words.to_vec());
     let tokens_copy = *tokens;
     let processor =
@@ -267,7 +265,8 @@ pub fn render_sheet(
                     } else {
                         row.and_then(|x| x.get(c)).map(|s| s.as_str()).unwrap_or("")
                     };
-                    let is_hit = hit_cells.contains(&(r, c));
+                    // hits 行主序 → 二分查找（O(log n)，无每帧 HashSet 分配）。
+                    let is_hit = sheet_arc.hits.binary_search(&(r, c)).is_ok();
                     let is_sel = selected == Some((r, c));
                     let mut cell = div()
                         .w(px(CELL_W))
@@ -359,17 +358,41 @@ pub fn render_sheet(
                 .left(px(0.))
                 .right(px(0.))
                 .bottom(px(0.))
-                .h(px(16.))
-                .horizontal_scrollbar(hscroll),
+                .h(px(12.))
+                .child(
+                    // 用 Scrollbar 组件 + viewport_from_layout：与文本预览同一套，
+                    // 内置 .horizontal_scrollbar() 在嵌套虚拟列表里拿不到真实视口。
+                    Scrollbar::horizontal(hscroll)
+                        .viewport_from_layout()
+                        .mode(ScrollbarMode::Always)
+                        .styles(|styles| {
+                            styles
+                                .track(|style| style.bg(tokens.border_soft))
+                                .thumb(|style| style.bg(tokens.text_tertiary))
+                                .thumb_hover(|style| style.bg(tokens.text_secondary))
+                                .thumb_active(|style| style.bg(tokens.accent))
+                        }),
+                ),
         )
         .child(
             div()
                 .absolute()
                 .top(px(24.))
                 .right(px(0.))
-                .bottom(px(0.))
-                .w(px(16.))
-                .vertical_scrollbar(scroll),
+                .bottom(px(12.))
+                .w(px(12.))
+                .child(
+                    Scrollbar::vertical(scroll)
+                        .viewport_from_layout()
+                        .mode(ScrollbarMode::Always)
+                        .styles(|styles| {
+                            styles
+                                .track(|style| style.bg(tokens.border_soft))
+                                .thumb(|style| style.bg(tokens.text_tertiary))
+                                .thumb_hover(|style| style.bg(tokens.text_secondary))
+                                .thumb_active(|style| style.bg(tokens.accent))
+                        }),
+                ),
         )
         .into_any_element()
 }
