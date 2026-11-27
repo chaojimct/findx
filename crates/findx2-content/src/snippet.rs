@@ -381,10 +381,10 @@ struct TextCache {
 
 /// 全文预览单文档上限（字节）：超出走“命中上下文摘要”通道，不再全文展示。
 /// 与列表摘要的 `SNIPPET_LIST_MAX_BYTES`（index.rs）同口径：超限文件两边一致跳过。
-pub const FULL_TEXT_MAX_BYTES: u64 = 4 << 20;
+pub const FULL_TEXT_MAX_BYTES: u64 = 64 << 20;
 /// IPC/预览传输上限：只传开头截断（char 边界），`truncated` 置位明示。
 pub const FULL_TEXT_WIRE_CAP: usize = 256 << 10;
-const TEXT_CACHE_BYTES: usize = 16 << 20;
+const TEXT_CACHE_BYTES: usize = 64 << 20;
 
 impl SnippetPool {
     pub fn new() -> Self {

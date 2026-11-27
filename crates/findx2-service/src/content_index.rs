@@ -848,7 +848,7 @@ pub(crate) fn full_text_for(
     };
     // 传输上限 256 KiB（与 GUI 预览渲染量级匹配，过长截断明示）。
     let (text, spans, total, truncated) =
-        cidx.full_text_for_key(query, key, 256 << 10).ok()??;
+        cidx.full_text_for_key(query, key, 64 << 20).ok()??;
     let spans = spans.into_iter().map(|(a, b)| [a, b]).collect();
     Some((text, spans, total as u32, truncated))
 }

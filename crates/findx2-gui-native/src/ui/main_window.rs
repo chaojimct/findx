@@ -302,6 +302,13 @@ pub struct MainWindow {
     hit_scroll: gpui_kit::ScrollHandle,
     /// 命中列表二维滚动（横向看长行，纵向看更多命中）。
     list_scroll: gpui_kit::ScrollHandle,
+    /// 大文本虚拟滚动：全文快照 + 行索引 + 命中 spans（只在全文更新时重建）。
+    text_arc: std::sync::Arc<String>,
+    text_lines: std::sync::Arc<Vec<(usize, usize)>>,
+    text_spans: std::sync::Arc<Vec<std::ops::Range<usize>>>,
+    text_content_w: f32,
+    text_scroll: gpui_kit::UniformListScrollHandle,
+    text_hscroll: gpui_kit::ScrollHandle,
     /// docx 定向渲染焦点块（点击列表/翻页时切换，只渲染该块附近的窗口）。
     docx_focus: Option<usize>,
     /// md/txt 块模型（命中上下文富文本自绘；与 docx 共用渲染器）。
@@ -642,6 +649,12 @@ impl MainWindow {
             docx_gen: 0,
             hit_scroll: gpui_kit::ScrollHandle::new(),
             list_scroll: gpui_kit::ScrollHandle::new(),
+            text_arc: std::sync::Arc::new(String::new()),
+            text_lines: std::sync::Arc::new(Vec::new()),
+            text_spans: std::sync::Arc::new(Vec::new()),
+            text_content_w: 0.0,
+            text_scroll: gpui_kit::UniformListScrollHandle::new(),
+            text_hscroll: gpui_kit::ScrollHandle::new(),
             docx_focus: None,
             md_doc: None,
             md_hits: Vec::new(),
@@ -1714,6 +1727,162 @@ impl MainWindow {
     }
 
     /// 上一个/下一个匹配点翻页（snippet_total>1 时展示；点击即取对应窗口）。
+    /// 大文本虚拟滚动快照：行索引 + spans + 内容宽度（只在全文更新时算一次）。
+    fn rebuild_text_view(&mut self) {
+        let mut lines: Vec<(usize, usize)> = Vec::new();
+        let mut start = 0usize;
+        let mut width = self.actual_preview_width;
+        let mut units = 0usize;
+        for (i, ch) in self.full_text.char_indices() {
+            if ch == '\n' {
+                let end = i + 1;
+                lines.push((start, end));
+                width = width.max(units as f32 * 7.6 + 16.0);
+                units = 0;
+                start = end;
+            } else {
+                units += if ch.is_ascii() { 1 } else { 2 };
+            }
+        }
+        if start < self.full_text.len() {
+            lines.push((start, self.full_text.len()));
+            width = width.max(units as f32 * 7.6 + 16.0);
+        }
+        let spans: Vec<std::ops::Range<usize>> =
+            self.full_spans.iter().map(|&[a, b]| a..b).collect();
+        self.text_arc = std::sync::Arc::new(self.full_text.clone());
+        self.text_lines = std::sync::Arc::new(lines);
+        self.text_spans = std::sync::Arc::new(spans);
+        self.text_content_w = width;
+    }
+
+    /// 大文本渲染：uniform_list 只画可见行，纵向/横向都是原生滚动。
+    fn virtual_text_view(&self, tokens: FindxTokens) -> AnyElement {
+        let lines = self.text_lines.clone();
+        let spans = self.text_spans.clone();
+        let text = self.text_arc.clone();
+        let content_w = self.text_content_w;
+        let line_count = lines.len();
+        let tokens_copy = tokens;
+        let processor = move |range: std::ops::Range<usize>,
+                              _window: &mut gpui_kit::Window,
+                              _cx: &mut gpui_kit::App|
+              -> Vec<AnyElement> {
+            let mut out: Vec<AnyElement> = Vec::with_capacity(range.len());
+            for i in range {
+                let Some(&(a, b)) = lines.get(i) else {
+                    continue;
+                };
+                let raw = &text[a..b];
+                let line = raw.strip_suffix('\n').unwrap_or(raw);
+                let idx = spans.partition_point(|s| s.end <= a);
+                let mut rel: Vec<std::ops::Range<usize>> = Vec::new();
+                for s in spans[idx..].iter() {
+                    if s.start >= b {
+                        break;
+                    }
+                    let x = s.start.max(a) - a;
+                    let y = s.end.min(b) - a;
+                    if x < y {
+                        rel.push(x..y);
+                    }
+                }
+                out.push(
+                    div()
+                        .w(px(content_w))
+                        .h(px(18.0))
+                        .flex_shrink_0()
+                        .whitespace_nowrap()
+                        .text_size(px(13.0))
+                        .line_height(px(18.0))
+                        .child(
+                            StyledText::new(line.to_string()).with_highlights(rel.into_iter().map(
+                                |range| {
+                                    (
+                                        range,
+                                        HighlightStyle {
+                                            color: Some(tokens_copy.hit_fg),
+                                            background_color: Some(tokens_copy.hit_bg),
+                                            ..Default::default()
+                                        },
+                                    )
+                                },
+                            )),
+                        )
+                        .into_any_element(),
+                );
+            }
+            out
+        };
+        let list = gpui_kit::uniform_list("hit-text-lines", line_count, processor)
+            .track_scroll(&self.text_scroll)
+            .w(px(content_w))
+            .flex_1()
+            .min_h_0();
+        div()
+            .relative()
+            .w_full()
+            .h_full()
+            .min_h_0()
+            .min_w_0()
+            .child(
+                div()
+                    .id("hit-text-hscroll")
+                    .size_full()
+                    .track_scroll(&self.text_hscroll)
+                    .overflow_x_scroll()
+                    .restrict_scroll_to_axis()
+                    .child(
+                        v_flex()
+                            .w(px(content_w))
+                            .h_full()
+                            .min_h_0()
+                            .child(list),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .right(px(0.))
+                    .bottom(px(0.))
+                    .h(px(14.))
+                    .child(
+                        Scrollbar::horizontal(&self.text_hscroll)
+                            .viewport_from_layout()
+                            .mode(ScrollbarMode::Always)
+                            .styles(|styles| {
+                                styles
+                                    .track(|style| style.bg(tokens.border_soft))
+                                    .thumb(|style| style.bg(tokens.text_tertiary))
+                                    .thumb_hover(|style| style.bg(tokens.text_secondary))
+                                    .thumb_active(|style| style.bg(tokens.accent))
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .right(px(0.))
+                    .bottom(px(14.))
+                    .w(px(14.))
+                    .child(
+                        Scrollbar::vertical(&self.text_scroll)
+                            .viewport_from_layout()
+                            .mode(ScrollbarMode::Always)
+                            .styles(|styles| {
+                                styles
+                                    .track(|style| style.bg(tokens.border_soft))
+                                    .thumb(|style| style.bg(tokens.text_tertiary))
+                                    .thumb_hover(|style| style.bg(tokens.text_secondary))
+                                    .thumb_active(|style| style.bg(tokens.accent))
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// 当前文档的命中总数（列表 / 翻页 / 边界判断同一口径）。
     fn hit_count(&self) -> usize {
         if self.docx_doc.is_some() && !self.docx_hits.is_empty() {
@@ -1739,6 +1908,7 @@ impl MainWindow {
         let tokens = Self::tokens(cx);
         let cur = self.snippet_window;
         let wrap = self.session.read(cx).settings.preview_wrap;
+        let virtual_text = self.full_text.len() > 256 * 1024 && !self.text_lines.is_empty();
         // 命中数以侧模型为准（与列表/高亮同源）。
         let docx_mode = self.docx_doc.is_some() && !self.docx_hits.is_empty();
         let sheet_mode = self
@@ -1887,8 +2057,15 @@ impl MainWindow {
                     .ghost()
                     .h(px(22.))
                     .px_2()
-                    .label(if wrap { "自动换行: 开" } else { "自动换行: 关" })
-                    .tooltip("关：长行不换行，用横向滚动条查看")
+                    .label(if virtual_text {
+                        "自动换行: 大文件虚拟滚动"
+                    } else if wrap {
+                        "自动换行: 开"
+                    } else {
+                        "自动换行: 关"
+                    })
+                    .disabled(virtual_text)
+                    .tooltip("大文件使用虚拟滚动（不换行），横向滚动查看长行")
                     .on_click(cx.listener(|this, _, _, cx| {
                         let new = !this.session.read(cx).settings.preview_wrap;
                         this.session.update(cx, |s, cx| {
@@ -2087,6 +2264,31 @@ impl MainWindow {
             if let Some(off) = self.deck_hits.get(n).map(|r| r.start) {
                 if let Some(block) = Self::deck_block_of_offset(deck, off) {
                     self.hit_scroll.scroll_to_top_of_item(block);
+                }
+            }
+            return;
+        }
+        // 大文本虚拟滚动：按行号跳，并横向滚到命中列附近。
+        if self.full_text.len() > 256 * 1024 && !self.text_lines.is_empty() {
+            if let Some(off) = self.full_spans.get(n).map(|s| s[0]) {
+                let line = self
+                    .text_lines
+                    .partition_point(|&(a, _)| a <= off)
+                    .saturating_sub(1);
+                self.text_scroll
+                    .scroll_to_item(line, gpui_kit::ScrollStrategy::Top);
+                if let Some(&(a, _)) = self.text_lines.get(line) {
+                    let off = off.min(self.full_text.len());
+                    let prefix: usize = self.full_text[a..off]
+                        .chars()
+                        .map(|c| if c.is_ascii() { 1 } else { 2 })
+                        .sum();
+                    let x = prefix as f32 * 7.6;
+                    let vw = self.actual_preview_width.max(200.0);
+                    self.text_hscroll.set_offset(gpui::point(
+                        gpui::px((vw * 0.5 - x).min(0.0)),
+                        gpui::px(0.0),
+                    ));
                 }
             }
             return;
@@ -2571,6 +2773,7 @@ impl MainWindow {
                     this.full_spans = spans;
                     this.full_total = total;
                     this.full_truncated = truncated;
+                    this.rebuild_text_view();
                     // 全文到了：用命中词在 docx.plain 内重新定位（拼音已对齐到汉字）。
                     this.recompute_docx_hits(cx);
                     // xlsx 命中也用全文命中词重算（比摘要窗口的 <b> 更准）。
@@ -4085,6 +4288,11 @@ impl MainWindow {
                                     &self.sheet_hscroll,
                                 ))
                                 .into_any_element()
+                        } else if self.full_text.len() > 256 * 1024
+                            && self.text_lines.len() > 1
+                        {
+                            // 大文本：虚拟滚动，只渲染可见行。
+                            self.virtual_text_view(tokens)
                         } else {
                         div()
                             .relative()
