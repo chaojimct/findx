@@ -314,6 +314,8 @@ pub struct MainWindow {
     deck_hits: Vec<std::ops::Range<usize>>,
     /// xlsx 虚拟列表滚动句柄（点列表项 → 滚到该行）。
     sheet_scroll: gpui_kit::UniformListScrollHandle,
+    /// xlsx 横向滚动句柄（列多时横向滚动 + 横向滚动条）。
+    sheet_hscroll: gpui_kit::ScrollHandle,
     /// 当前选中的单元格 (row, col)：蓝底强调（对齐 AnyTXT）。
     sheet_selected: Option<(usize, usize)>,
     /// 搜索选项：区分大小写（Aa）。标题搜索精确生效；全文搜索后置过滤。
@@ -644,6 +646,7 @@ impl MainWindow {
             deck: None,
             deck_hits: Vec::new(),
             sheet_scroll: gpui_kit::UniformListScrollHandle::new(),
+            sheet_hscroll: gpui_kit::ScrollHandle::new(),
             sheet_selected: None,
             search_match_case: false,
             search_exact: false,
@@ -1982,6 +1985,22 @@ impl MainWindow {
         };
         let shown = rows.len();
 
+        if shown == 0 {
+            let msg = if self.sheet_book.is_some() {
+                "当前表格已解析行内没有命中（可切换「文字摘录」看全文命中）"
+            } else {
+                "暂无命中列表"
+            };
+            return v_flex()
+                .w_full()
+                .flex_shrink_0()
+                .px_2()
+                .py_2()
+                .text_xs()
+                .text_color(tokens.text_tertiary)
+                .child(msg);
+        }
+
         v_flex()
             .w_full()
             .flex_shrink_0()
@@ -2289,6 +2308,8 @@ impl MainWindow {
                     this.full_truncated = truncated;
                     // 全文到了：用命中词在 docx.plain 内重新定位（拼音已对齐到汉字）。
                     this.recompute_docx_hits(cx);
+                    // xlsx 命中也用全文命中词重算（比摘要窗口的 <b> 更准）。
+                    this.recompute_sheet_hits(cx);
                     cx.notify();
                 }
             });
@@ -2325,14 +2346,50 @@ impl MainWindow {
     /// 避免「3 万格 × N 词 × 逐字拼音」把加载拖慢一个数量级。
     fn fetch_sheet(&mut self, path: String, cx: &mut Context<Self>) {
         self.sheet_book = None;
+        // 宽匹配词：查询词 + 中文二元组（“我与青松” -> 我与/与青/青松）。
+        let keep_words = {
+            let q = self.effective_query(cx);
+            let base = crate::docx_blocks::content_needles_of(&q);
+            let mut out: Vec<String> = base.clone();
+            for w in &base {
+                let chars: Vec<char> = w.chars().collect();
+                if chars.len() > 2 && chars.iter().all(|c| !c.is_ascii()) {
+                    for i in 0..chars.len() - 1 {
+                        out.push(chars[i..i + 2].iter().collect());
+                    }
+                }
+            }
+            out.sort();
+            out.dedup();
+            out
+        };
+
+        // 阶段一：首屏快照（只读前 1200 行），立刻出表格。
+        // 阶段二：后台全扫（大表十几秒），补齐深层命中行。
+        let path_fast = path.clone();
+        let path_full = path.clone();
         cx.spawn(async move |this, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || {
-                let _ = tx.send(crate::xlsx_blocks::parse(&path));
+                let _ = tx.send(crate::xlsx_blocks::parse_fast(&path_fast));
             });
             let parsed = rx.await;
             let _ = this.update(cx, |this, cx| {
                 if let Ok(Ok(mut wb)) = parsed {
+                    let words = this.hit_words(cx);
+                    crate::xlsx_blocks::recompute_hits(&mut wb, &words);
+                    this.sheet_book = Some(wb);
+                    cx.notify();
+                }
+            });
+
+            let (tx2, rx2) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                let _ = tx2.send(crate::xlsx_blocks::parse_full(&path_full, &keep_words));
+            });
+            let full = rx2.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(Ok(mut wb)) = full {
                     let words = this.hit_words(cx);
                     crate::xlsx_blocks::recompute_hits(&mut wb, &words);
                     this.sheet_book = Some(wb);
@@ -2349,15 +2406,6 @@ impl MainWindow {
         let Some(book) = self.sheet_book.as_ref() else {
             return Vec::new();
         };
-        let words = {
-            // 命中词用于在单元格文本内标热（与 recompute_hits 同源）
-            let mut w: Vec<String> = Vec::new();
-            if let Some(m) = self.preview.meta.as_ref() {
-                let _ = m;
-            }
-            w
-        };
-        let _ = words;
         let mut out = Vec::new();
         for (si, sh) in book.sheets.iter().enumerate() {
             for &(r, c) in &sh.hits {
@@ -2369,7 +2417,7 @@ impl MainWindow {
                     .unwrap_or_default();
                 out.push((si, r, c, text, Vec::new()));
             }
-            if out.len() >= 2000 {
+            if out.len() >= 5000 {
                 break;
             }
         }
@@ -2386,17 +2434,47 @@ impl MainWindow {
             .scroll_to_item(row, gpui_kit::ScrollStrategy::Top);
     }
 
-    /// 实际命中词：查询词 + service 摘要里被 `<b>` 标热的片段。
-    /// 后者是 service 真正匹配到的（分词/拼音对齐后），与列表口径一致。
+    /// 实际命中词，按可信度排序：
+    /// 1) **全文命中区间**（service 在原文里真正匹配到的片段，最准）
+    /// 2) 查询词（整词）
+    /// 3) 摘要 `<b>` 片段（兜底——注意它只是窗口，可能含"山东"这类邻近噪声词，
+    ///    所以只在 1/2 都没有时才用）
     fn hit_words(&self, cx: &mut Context<Self>) -> Vec<String> {
+        let mut words: Vec<String> = Vec::new();
+        if !self.full_text.is_empty() && !self.full_spans.is_empty() {
+            for &[a, b] in self.full_spans.iter().take(64) {
+                if b <= a || b > self.full_text.len() {
+                    continue;
+                }
+                if let Some(w) = self.full_text.get(a..b) {
+                    let w = w.trim();
+                    if !w.is_empty() && w.len() <= 64 {
+                        words.push(w.to_string());
+                    }
+                }
+            }
+        }
         let q = self.effective_query(cx);
-        let mut words = crate::docx_blocks::content_needles_of(&q);
-        let (plain, ranges) = search_logic::snippet_plain_and_ranges(&self.preview_snippet);
-        for r in ranges.iter().take(32) {
-            if let Some(w) = plain.get(r.clone()) {
-                let w = w.trim();
-                if !w.is_empty() && w.len() <= 64 {
-                    words.push(w.to_string());
+        words.extend(crate::docx_blocks::content_needles_of(&q));
+        if words.is_empty() {
+            let (plain, ranges) = search_logic::snippet_plain_and_ranges(&self.preview_snippet);
+            for r in ranges.iter().take(16) {
+                if let Some(w) = plain.get(r.clone()) {
+                    let w = w.trim();
+                    if !w.is_empty() && w.len() <= 64 {
+                        words.push(w.to_string());
+                    }
+                }
+            }
+        }
+        // 补中文二元组：service 按分词命中（如 "青松"），整词 "我与青松" 匹配不上；
+        // 二元组（我与/与青/青松）能覆盖，保证表格/列表能标出命中。
+        let base: Vec<String> = words.clone();
+        for w in &base {
+            let chars: Vec<char> = w.chars().collect();
+            if chars.len() > 2 && chars.iter().all(|c| !c.is_ascii()) {
+                for i in 0..chars.len() - 1 {
+                    words.push(chars[i..i + 2].iter().collect());
                 }
             }
         }
@@ -2412,8 +2490,19 @@ impl MainWindow {
             return;
         }
         let words = self.hit_words(cx);
+        let mut total_hits = 0usize;
         if let Some(wb) = self.sheet_book.as_mut() {
             crate::xlsx_blocks::recompute_hits(wb, &words);
+            total_hits = wb.sheets.iter().map(|s| s.hits.len()).sum();
+        }
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "[sheet] words={words:?} hits={total_hits} full_text_len={} full_spans={}",
+                self.full_text.len(),
+                self.full_spans.len()
+            );
         }
     }
 
@@ -3742,7 +3831,13 @@ impl MainWindow {
                                 // xlsx：表格网格（行列标 + 命中格高亮）。
                                 vec![
                                     crate::ui::rich_view::sheet_tabs(book, &tokens),
-                                    crate::ui::rich_view::render_sheet(book, &tokens, self.sheet_selected, &self.sheet_scroll),
+                                    crate::ui::rich_view::render_sheet(
+                                    book,
+                                    &tokens,
+                                    self.sheet_selected,
+                                    &self.sheet_scroll,
+                                    &self.sheet_hscroll,
+                                ),
                                 ]
                             } else if let Some(deck) = self.deck.as_ref() {
                                 // pptx：按页分组 + 段落 + 命中高亮。

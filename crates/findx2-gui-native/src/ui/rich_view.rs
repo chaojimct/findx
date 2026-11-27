@@ -181,6 +181,7 @@ pub fn render_sheet(
     tokens: &FindxTokens,
     selected: Option<(usize, usize)>,
     scroll: &gpui_kit::UniformListScrollHandle,
+    hscroll: &gpui_kit::ScrollHandle,
 ) -> AnyElement {
     let Some(sheet) = book.sheets.get(book.focus_sheet) else {
         return div().into_any_element();
@@ -231,6 +232,7 @@ pub fn render_sheet(
             let mut out: Vec<AnyElement> = Vec::with_capacity(range.len());
             for r in range {
                 let row = sheet_arc.rows.get(r);
+                let row_empty = row.is_none_or(|x| x.is_empty());
                 let mut row_el = h_flex()
                     .w(px(GUTTER_W + CELL_W * cols as f32))
                     .h(px(row_h))
@@ -252,10 +254,11 @@ pub fn render_sheet(
                         .child(format!("{}", r + 1)),
                 );
                 for c in 0..cols {
-                    let text = row
-                        .and_then(|x| x.get(c))
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
+                    let text = if row_empty && c == 0 {
+                        "…（未加载行）"
+                    } else {
+                        row.and_then(|x| x.get(c)).map(|s| s.as_str()).unwrap_or("")
+                    };
                     let is_hit = hits.contains(&(r, c));
                     let is_sel = selected == Some((r, c));
                     let mut cell = div()
@@ -301,6 +304,8 @@ pub fn render_sheet(
         .min_h_0()
         .child(
             // 横向滚动包住「列标 + 数据区」，两者一起左右滚。
+            // restrict_scroll_to_axis：滚轮只交给纵向（uniform_list），
+            // 横向只响应横向手势——否则两层滚动会被同一次滚轮同时驱动。
             div()
                 .id("sheet-hscroll")
                 .flex_1()

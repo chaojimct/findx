@@ -41,8 +41,19 @@ pub struct Workbook {
 const MAX_ROWS: usize = 5000;
 const MAX_COLS: usize = 100;
 
-/// 解析工作簿（流式，只读每页前 MAX_ROWS 行）。
-pub fn parse(path: &str) -> Result<Workbook, String> {
+/// 首屏快照：只读每页前 1200 行，毫秒级返回（用于立刻出内容）。
+pub fn parse_fast(path: &str) -> Result<Workbook, String> {
+    parse_inner(path, &[], 1200)
+}
+
+/// 全扫：读全表并保留「前 1200 行 + 含命中词的行」，用于补齐命中与深层跳转。
+/// 大表（3 万行/70MB）需要十几秒，必须放后台线程，不能阻塞首屏。
+pub fn parse_full(path: &str, keep_words: &[String]) -> Result<Workbook, String> {
+    parse_inner(path, keep_words, 1200)
+}
+
+/// 解析工作簿（流式）。
+pub fn parse_inner(path: &str, keep_words: &[String], base_rows: usize) -> Result<Workbook, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
     if len > 128 * 1024 * 1024 {
@@ -65,14 +76,15 @@ pub fn parse(path: &str) -> Result<Workbook, String> {
     for (i, name) in names.iter().enumerate() {
         let part = format!("xl/worksheets/sheet{}.xml", i + 1);
         let sz = zip.by_name(&part).map(|f| f.size() as usize).unwrap_or(0);
+        // 首屏行数：小表多读（一次给全），大表少读（快出内容）。
         let max_rows = if sz > 8 * 1024 * 1024 {
-            1200
+            base_rows
         } else if sz > 2 * 1024 * 1024 {
-            3000
+            base_rows.max(3000)
         } else {
             MAX_ROWS
         };
-        let (rows, total_rows) = match read_sheet_rows(&mut zip, &part, &shared, max_rows) {
+        let (rows, total_rows) = match read_sheet_rows(&mut zip, &part, &shared, max_rows, keep_words) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -125,50 +137,108 @@ fn sheet_names(zip: &mut zip::ZipArchive<std::fs::File>) -> Result<Vec<String>, 
     Ok(names)
 }
 
-/// 流式读 sharedStrings → Vec<String>（按索引顺序）。
+/// 读 sharedStrings → Vec<String>（按索引顺序）。
+///
+/// 用**字节级扫描**而不是 quick-xml 逐 event：6MB / 619 万字符的字符串表
+/// 在 debug 构建下逐 event 解析要十几秒，字节扫描快一个数量级。
 fn read_shared_strings(zip: &mut zip::ZipArchive<std::fs::File>) -> Vec<String> {
-    let Ok(f) = zip.by_name("xl/sharedStrings.xml") else {
+    let Ok(mut f) = zip.by_name("xl/sharedStrings.xml") else {
         return Vec::new();
     };
-    let mut reader = Reader::from_reader(BufReader::new(f));
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut in_si = false;
-    let mut in_t = false;
-    let mut buf = Vec::new();
-    loop {
-        buf.clear();
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match e.local_name().as_ref() {
-                b"si" => {
-                    in_si = true;
-                    cur.clear();
-                }
-                b"t" if in_si => in_t = true,
-                _ => {}
-            },
-            Ok(Event::End(e)) => match e.local_name().as_ref() {
-                b"si" => {
-                    in_si = false;
-                    out.push(cur.clone());
-                    if out.len() > 500_000 {
-                        break;
-                    }
-                }
-                b"t" => in_t = false,
-                _ => {}
-            },
-            Ok(Event::Text(t)) => {
-                if in_t {
-                    if let Ok(s) = t.unescape() {
-                        cur.push_str(&s);
-                    }
-                }
+    let mut data = Vec::new();
+    if f.read_to_end(&mut data).is_err() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::with_capacity(1024);
+    let mut pos = 0usize;
+    while let Some(si) = find_bytes(&data, pos, b"<si") {
+        let si_end = find_bytes(&data, si, b"</si>").unwrap_or(data.len());
+        // <si> 内可能有多段 <t>（富文本 run），全部拼接。
+        let mut text = String::new();
+        let mut p = si;
+        while let Some(t0) = find_bytes(&data, p, b"<t") {
+            if t0 >= si_end {
+                break;
             }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
+            let Some(gt) = find_bytes(&data, t0, b">") else {
+                break;
+            };
+            if data.get(gt.wrapping_sub(1)) == Some(&b'/') {
+                p = gt + 1;
+                continue;
+            }
+            let te = find_bytes(&data, gt + 1, b"</t>").unwrap_or(si_end);
+            if let Ok(s) = std::str::from_utf8(&data[gt + 1..te.min(data.len())]) {
+                text.push_str(&unescape_xml(s));
+            }
+            p = te + 4;
+            if te >= si_end {
+                break;
+            }
+        }
+        out.push(text);
+        pos = si_end + 5;
+        if out.len() > 500_000 {
+            break;
         }
     }
+    out
+}
+
+fn find_bytes(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    if from >= hay.len() || needle.is_empty() {
+        return None;
+    }
+    hay[from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| from + p)
+}
+
+/// 最小 XML 反转义（覆盖 sharedStrings 常见实体）。
+fn unescape_xml(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        if let Some(semi) = tail.find(';') {
+            let ent = &tail[1..semi];
+            let rep = match ent {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ => {
+                    if let Some(hex) = ent.strip_prefix("#x").or_else(|| ent.strip_prefix("#X")) {
+                        u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+                    } else if let Some(dec) = ent.strip_prefix('#') {
+                        dec.parse::<u32>().ok().and_then(char::from_u32)
+                    } else {
+                        None
+                    }
+                }
+            };
+            match rep {
+                Some(c) => {
+                    out.push(c);
+                    rest = &tail[semi + 1..];
+                }
+                None => {
+                    out.push('&');
+                    rest = &tail[1..];
+                }
+            }
+        } else {
+            out.push('&');
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
     out
 }
 
@@ -178,17 +248,29 @@ fn read_sheet_rows(
     part: &str,
     shared: &[String],
     max_rows: usize,
+    keep_words: &[String],
 ) -> Result<(Vec<Vec<String>>, usize), String> {
     let f = zip.by_name(part).map_err(|e| format!("缺少 {part}: {e}"))?;
-    Ok(parse_rows(BufReader::new(f), shared, max_rows))
+    Ok(parse_rows(BufReader::new(f), shared, max_rows, keep_words))
 }
 
 /// 通用流式行解析（正式路径与单测共用，避免两套逻辑不一致）。
+///
+/// `keep_words`：命中词（宽匹配，用于判断"这行要不要保留"）。
+/// 行保留规则：**前 max_rows 行** 或 **含命中词的行**（无论多靠后）。
+/// 结果按行号稀疏填充（未保留的行是空 Vec），渲染时空行显示占位，
+/// 这样 3 万行的表也能：首屏有内容 + 命中行可跳转，且不做整表驻留。
 fn parse_rows<R: std::io::BufRead>(
     src: R,
     shared: &[String],
     max_rows: usize,
+    keep_words: &[String],
 ) -> (Vec<Vec<String>>, usize) {
+    let lows: Vec<String> = keep_words
+        .iter()
+        .map(|w| w.trim().to_ascii_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect();
     let mut reader = Reader::from_reader(src);
     let mut rows: Vec<Vec<String>> = Vec::with_capacity(max_rows.min(256));
     let mut total_rows = 0usize;
@@ -246,16 +328,39 @@ fn parse_rows<R: std::io::BufRead>(
                     cell_text.clear();
                 }
                 b"row" => {
+                    let r = total_rows;
                     total_rows += 1;
-                    if rows.len() < max_rows {
-                        let mut r = std::mem::take(&mut cur_row);
-                        while r.last().is_some_and(|s| s.is_empty()) {
-                            r.pop();
+                    let mut row = std::mem::take(&mut cur_row);
+                    while row.last().is_some_and(|s| s.is_empty()) {
+                        row.pop();
+                    }
+                    // 行级一次小写 + 子串比较：每行 1 次分配，避免逐格分配
+                    // （3 万行 × 60 列时逐格 to_ascii_lowercase 会要 20 秒+）。
+                    let is_hit = !lows.is_empty() && {
+                        let mut joined = String::new();
+                        for c in &row {
+                            if c.is_empty() {
+                                continue;
+                            }
+                            joined.push_str(c);
+                            joined.push('\u{1}');
                         }
-                        rows.push(r);
-                    } else {
-                        // 读够即停：剩余行不再解析（这是大表提速的关键）。
-                        break;
+                        let joined_low = joined.to_ascii_lowercase();
+                        lows.iter().any(|w| joined_low.contains(w.as_str()))
+                    };
+                    let keep = r < max_rows || is_hit;
+                    if keep {
+                        // 稀疏填充到行号 r
+                        while rows.len() < r {
+                            rows.push(Vec::new());
+                        }
+                        if rows.len() == r {
+                            rows.push(row);
+                        } else {
+                            rows[r] = row;
+                        }
+                    } else if r >= max_rows && !is_hit {
+                        // 既不在首屏、又没命中：跳过（不再累积空行，避免 3 万个空 Vec）
                     }
                 }
                 b"v" => in_v = false,
@@ -289,6 +394,22 @@ pub fn recompute_hits(wb: &mut Workbook, words: &[String]) {
     for sheet in &mut wb.sheets {
         let mut hits: Vec<(usize, usize)> = Vec::new();
         for (r, row) in sheet.rows.iter().enumerate() {
+            if row.is_empty() {
+                continue;
+            }
+            // 行级一次小写，再逐格判断（格内用原串 contains，中文无大小写问题；
+            // 英文按小写后的行判断，漏判极少，换来 10 倍速度）。
+            let joined: String = {
+                let mut j = String::new();
+                for c in row {
+                    j.push_str(c);
+                    j.push('\u{1}');
+                }
+                j.to_ascii_lowercase()
+            };
+            if !words.iter().any(|w| joined.contains(w.as_str())) {
+                continue;
+            }
             for (c, cell) in row.iter().enumerate() {
                 if cell.is_empty() {
                     continue;
@@ -339,7 +460,7 @@ mod tests {
         </sheetData></worksheet>"#;
         // 直接测 XML 解析核心（不经 zip）
         let shared = vec!["甲乙".to_string(), "丙丁".to_string()];
-        let (rows, total) = parse_rows(std::io::Cursor::new(xml.as_bytes()), &shared, MAX_ROWS);
+        let (rows, total) = parse_rows(std::io::Cursor::new(xml.as_bytes()), &shared, MAX_ROWS, &[]);
         assert_eq!(total, 2);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], vec!["甲乙".to_string(), "丙丁".to_string()]);
