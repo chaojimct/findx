@@ -3973,16 +3973,19 @@ impl MainWindow {
         }
         // Hit-context prefetch: full text + numbered list auto-open.
         // System layout stays native; other tabs keep existing behavior.
-        let prefer_native = !self.office_text_only;
+        let ext_l = std::path::Path::new(&hit.path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        // 「命中上下文」里的 PDF 必须用自渲染栅格页：只有走 preview_worker
+        // 的 Pdf 请求才会拿到页面位图 + 命中框；系统版式仍走原生处理器。
+        let prefer_native =
+            !self.office_text_only && !(ext_l == "pdf" && self.preview_snippet_view);
         if self.preview_snippet_view && !hit.is_directory {
             self.fetch_full_text(hit.entry_idx, cx);
             self.fetch_snippet_list(hit.entry_idx, cx);
             // docx / md：纯 Rust 块解析 → 命中上下文自绘真版式（零外部进程）。
-            let ext_l = std::path::Path::new(&hit.path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_ascii_lowercase())
-                .unwrap_or_default();
             if ext_l == "docx" {
                 self.fetch_docx_blocks(hit.path.clone(), cx);
             } else if matches!(ext_l.as_str(), "md" | "markdown") {
@@ -4076,6 +4079,8 @@ impl MainWindow {
                     }
                 }
                 cx.notify();
+                // PDF 栅格可能比全文晚到：到这里再试一次「跳到首个命中页」。
+                this.maybe_auto_first_hit(cx);
             })
             .ok();
         }));
@@ -4574,7 +4579,9 @@ impl MainWindow {
                     .top(px(r[1] * sy))
                     .w(px(w))
                     .h(px(h))
-                    .bg(rgba(0xffee58cc)),
+                    .bg(rgba(0x4a90e233))
+                    .border_1()
+                    .border_color(rgba(0x2f6fe0ff)),
             );
         }
         let mut col = v_flex().p_3().gap_1();
@@ -4928,6 +4935,20 @@ impl MainWindow {
                                                 // 切走 tab 时全文被清，回来补一次。
                                                 this.preview_snippet_view = true;
                                                 this.preview_snippet_lock = true;
+                                                // PDF：系统版式加载的是原生控件，没有
+                                                // 栅格页；切到命中上下文要补一次栅格请求。
+                                                let is_pdf = this
+                                                    .preview
+                                                    .meta
+                                                    .as_ref()
+                                                    .is_some_and(|m| {
+                                                        m.path
+                                                            .to_ascii_lowercase()
+                                                            .ends_with(".pdf")
+                                                    });
+                                                if is_pdf && this.preview.pdf.is_none() {
+                                                    this.request_preview(cx, false);
+                                                }
                                                 if this.full_text.is_empty() {
                                                     if let Some(h) = this
                                                         .active_workspace_hit()
