@@ -312,6 +312,10 @@ pub struct MainWindow {
     deck: Option<crate::pptx_blocks::Deck>,
     /// pptx 命中区间（deck.plain 字节坐标）。
     deck_hits: Vec<std::ops::Range<usize>>,
+    /// xlsx 虚拟列表滚动句柄（点列表项 → 滚到该行）。
+    sheet_scroll: gpui_kit::UniformListScrollHandle,
+    /// 当前选中的单元格 (row, col)：蓝底强调（对齐 AnyTXT）。
+    sheet_selected: Option<(usize, usize)>,
     /// 搜索选项：区分大小写（Aa）。标题搜索精确生效；全文搜索后置过滤。
     search_match_case: bool,
     /// 搜索选项：全匹配（ab）。整串连续出现才算命中。
@@ -639,6 +643,8 @@ impl MainWindow {
             sheet_book: None,
             deck: None,
             deck_hits: Vec::new(),
+            sheet_scroll: gpui_kit::UniformListScrollHandle::new(),
+            sheet_selected: None,
             search_match_case: false,
             search_exact: false,
             search_wildcard: false,
@@ -1703,10 +1709,16 @@ impl MainWindow {
     fn snippet_pager(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = Self::tokens(cx);
         let cur = self.snippet_window;
-        // docx 场景：命中数以文档侧 hits 为准（与列表/高亮同源）。
+        // 命中数以侧模型为准（与列表/高亮同源）。
         let docx_mode = self.docx_doc.is_some() && !self.docx_hits.is_empty();
+        let sheet_mode = self
+            .sheet_book
+            .as_ref()
+            .is_some_and(|b| b.sheets.iter().any(|s| !s.hits.is_empty()));
         let total = if docx_mode {
             self.docx_hits.len()
+        } else if sheet_mode {
+            self.sheet_hit_rows().len()
         } else {
             self.snippet_total as usize
         };
@@ -1738,7 +1750,14 @@ impl MainWindow {
                         }
                         let w = this.snippet_window - 1;
                         this.preview_snippet_lock = true;
-                        if this.docx_doc.is_some() {
+                        if this.sheet_book.is_some() {
+                            this.snippet_window = w;
+                            if let Some((si, r, c, _, _)) =
+                                this.sheet_hit_rows().get(w).cloned()
+                            {
+                                this.goto_sheet_cell(si, r, c);
+                            }
+                        } else if this.docx_doc.is_some() {
                             this.snippet_window = w;
                             this.scroll_to_hit(w);
                         } else {
@@ -1774,7 +1793,14 @@ impl MainWindow {
                         }
                         let w = this.snippet_window + 1;
                         this.preview_snippet_lock = true;
-                        if this.docx_doc.is_some() {
+                        if this.sheet_book.is_some() {
+                            this.snippet_window = w;
+                            if let Some((si, r, c, _, _)) =
+                                this.sheet_hit_rows().get(w).cloned()
+                            {
+                                this.goto_sheet_cell(si, r, c);
+                            }
+                        } else if this.docx_doc.is_some() {
                             this.snippet_window = w;
                             this.scroll_to_hit(w);
                         } else {
@@ -1898,6 +1924,28 @@ impl MainWindow {
                 .map(|(i, (ctx, ranges))| (i, ctx, ranges, single))
                 .collect();
             (total, rows)
+        } else if self
+            .sheet_book
+            .as_ref()
+            .is_some_and(|b| b.sheets.iter().any(|s| !s.hits.is_empty()))
+        {
+            // xlsx：列表由**表格命中格**生成（与高亮/跳转同源）。
+            // 每条 = "A1: 单元格文本"，点第 N 条直接滚到那一格并选中。
+            let q = self.effective_query(cx);
+            let words = crate::docx_blocks::content_needles_of(&q);
+            let src = self.sheet_hit_rows();
+            let total = src.len();
+            let rows = src
+                .into_iter()
+                .enumerate()
+                .map(|(i, (_si, r, c, text, _ranges))| {
+                    let addr = format!("{}{}", crate::xlsx_blocks::col_label(c), r + 1);
+                    let label = format!("{addr}: {text}");
+                    let ranges = crate::docx_blocks::match_hits_multi(&label, &words);
+                    (i, label, ranges, false)
+                })
+                .collect();
+            (total, rows)
         } else {
             let needle = {
                 let q = self.current_query(cx);
@@ -1969,7 +2017,14 @@ impl MainWindow {
                                 return;
                             }
                             this.preview_snippet_lock = true;
-                            if this.docx_doc.is_some() {
+                            if this.sheet_book.is_some() {
+                                // xlsx：滚到命中格并选中。
+                                if let Some((si, r, c, _, _)) =
+                                    this.sheet_hit_rows().get(w).cloned()
+                                {
+                                    this.goto_sheet_cell(si, r, c);
+                                }
+                            } else if this.docx_doc.is_some() {
                                 // docx：同源列表，直接切焦点块（不重取 service 摘要）。
                                 this.snippet_window = w;
                                 this.scroll_to_hit(w);
@@ -2245,6 +2300,7 @@ impl MainWindow {
     fn fetch_deck(&mut self, path: String, cx: &mut Context<Self>) {
         self.deck = None;
         self.deck_hits.clear();
+        self.sheet_selected = None;
         let q = self.effective_query(cx);
         let needles = crate::docx_blocks::content_needles_of(&q);
         cx.spawn(async move |this, cx| {
@@ -2285,6 +2341,49 @@ impl MainWindow {
             });
         })
         .detach();
+    }
+
+    /// xlsx 命中列表行：与表格命中格**同源**（sheet.hits）。
+    /// 每条 = (sheet_idx, row, col, 单元格文本, 文本内命中区间)。
+    fn sheet_hit_rows(&self) -> Vec<(usize, usize, usize, String, Vec<std::ops::Range<usize>>)> {
+        let Some(book) = self.sheet_book.as_ref() else {
+            return Vec::new();
+        };
+        let words = {
+            // 命中词用于在单元格文本内标热（与 recompute_hits 同源）
+            let mut w: Vec<String> = Vec::new();
+            if let Some(m) = self.preview.meta.as_ref() {
+                let _ = m;
+            }
+            w
+        };
+        let _ = words;
+        let mut out = Vec::new();
+        for (si, sh) in book.sheets.iter().enumerate() {
+            for &(r, c) in &sh.hits {
+                let text = sh
+                    .rows
+                    .get(r)
+                    .and_then(|row| row.get(c))
+                    .cloned()
+                    .unwrap_or_default();
+                out.push((si, r, c, text, Vec::new()));
+            }
+            if out.len() >= 2000 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// 点 xlsx 列表项：滚到该行并选中该格。
+    fn goto_sheet_cell(&mut self, sheet_idx: usize, row: usize, col: usize) {
+        if let Some(book) = self.sheet_book.as_mut() {
+            book.focus_sheet = sheet_idx;
+        }
+        self.sheet_selected = Some((row, col));
+        self.sheet_scroll
+            .scroll_to_item(row, gpui_kit::ScrollStrategy::Top);
     }
 
     /// 实际命中词：查询词 + service 摘要里被 `<b>` 标热的片段。
@@ -3643,7 +3742,7 @@ impl MainWindow {
                                 // xlsx：表格网格（行列标 + 命中格高亮）。
                                 vec![
                                     crate::ui::rich_view::sheet_tabs(book, &tokens),
-                                    crate::ui::rich_view::render_sheet(book, &tokens),
+                                    crate::ui::rich_view::render_sheet(book, &tokens, self.sheet_selected, &self.sheet_scroll),
                                 ]
                             } else if let Some(deck) = self.deck.as_ref() {
                                 // pptx：按页分组 + 段落 + 命中高亮。

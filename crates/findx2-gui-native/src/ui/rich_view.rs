@@ -179,6 +179,8 @@ const GUTTER_W: f32 = 46.0;
 pub fn render_sheet(
     book: &crate::xlsx_blocks::Workbook,
     tokens: &FindxTokens,
+    selected: Option<(usize, usize)>,
+    scroll: &gpui_kit::UniformListScrollHandle,
 ) -> AnyElement {
     let Some(sheet) = book.sheets.get(book.focus_sheet) else {
         return div().into_any_element();
@@ -255,6 +257,7 @@ pub fn render_sheet(
                         .map(|s| s.as_str())
                         .unwrap_or("");
                     let is_hit = hits.contains(&(r, c));
+                    let is_sel = selected == Some((r, c));
                     let mut cell = div()
                         .w(px(CELL_W))
                         .h(px(row_h))
@@ -272,6 +275,13 @@ pub fn render_sheet(
                     if is_hit {
                         cell = cell.bg(tokens_copy.hit_bg).text_color(tokens_copy.hit_fg);
                     }
+                    if is_sel {
+                        // 选中格：主题强调色描边 + 淡底（AnyTXT 的蓝框效果）
+                        cell = cell
+                            .border_2()
+                            .border_color(tokens_copy.accent)
+                            .bg(tokens_copy.row_selected);
+                    }
                     row_el = row_el.child(cell.child(text.to_string()));
                 }
                 out.push(row_el.into_any_element());
@@ -280,6 +290,7 @@ pub fn render_sheet(
         };
 
     let list = uniform_list("sheet-rows", row_count, processor)
+        .track_scroll(scroll)
         .w(px(GUTTER_W + CELL_W * cols as f32))
         .flex_1()
         .min_h_0();
