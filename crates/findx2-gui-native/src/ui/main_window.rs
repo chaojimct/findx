@@ -1888,6 +1888,16 @@ impl MainWindow {
             })
             .and_then(|e| e.to_str().map(|s| s.to_string()))
             .unwrap_or_default();
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "[auto?] ext={ext} pdf={} spans={} selected={:?}",
+                self.preview.pdf.is_some(),
+                self.full_spans.len(),
+                self.selected
+            );
+        }
         if ext == "pdf" && self.preview.pdf.is_some() {
             {
                 use std::io::Write as _;
@@ -1907,7 +1917,8 @@ impl MainWindow {
             // 先跳再清 pending：goto_pdf_hit 在位图未就绪时会直接返回，
             // 若先清 pending，位图晚到后就再也不会跳了（实测的竞态）。
             self.auto_first_pending = false;
-            self.goto_pdf_hit(hit.entry_idx, 0, cx);
+            // 用搜索命中的窗口（PDF 的一条命中可能落在很后面的窗口/页）。
+            self.goto_pdf_hit(hit.entry_idx, hit.snippet_window, cx);
             return;
         }
         let (ready, has_hits) = match ext.as_str() {
@@ -3605,9 +3616,6 @@ impl MainWindow {
     /// 跳到 PDF 第 h 个命中所在的页（与摘要窗口同序）。
     /// 页号表按 (entry, search_gen) 缓存，第一次请求后本地直接命中。
     fn goto_pdf_hit(&mut self, entry_idx: u32, h: usize, cx: &mut Context<Self>) {
-        if self.preview.pdf.is_none() {
-            return;
-        }
         self.snippet_window = h;
         self.pdf_scroll_to = Some(h);
         {
@@ -3622,10 +3630,21 @@ impl MainWindow {
         if let Some((e, g, pages)) = self.pdf_hit_pages.as_ref() {
             if *e == entry_idx && *g == self.search_gen {
                 let page = pages.get(h).copied().unwrap_or(0);
-                if self.pdf_options.page != page {
-                    self.pdf_options.page = page;
-                    self.request_preview(cx, false);
+                if self.preview.pdf.is_some()
+                    && self.pdf_options.page == page
+                    && self.preview.pdf.map(|p| p.page) == Some(page)
+                {
+                    // 已经在目标页：只滚到命中框。
+                    self.pdf_jump_pending = None;
+                    cx.notify();
+                    return;
                 }
+                self.pdf_options.page = page;
+                // 位图还没加载完也先记下目标页，加载完成回调会再进来一次。
+                self.pdf_jump_pending = Some((entry_idx, h));
+                self.request_preview(cx, false);
+                // request_preview 会用搜索命中的 snippet_window 覆盖，重置回目标命中。
+                self.snippet_window = h;
                 cx.notify();
                 return;
             }
@@ -3996,6 +4015,16 @@ impl MainWindow {
     }
 
     fn request_preview(&mut self, cx: &mut Context<Self>, reset_view: bool) {
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "[req] reset={reset_view} page={} snippet_view={} office_text={}",
+                self.pdf_options.page,
+                self.preview_snippet_view,
+                self.office_text_only
+            );
+        }
         self.preview_cancel
             .store(true, std::sync::atomic::Ordering::Release);
         self.preview_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -4170,6 +4199,17 @@ impl MainWindow {
                     this.pdf_options.page = pdf.page;
                     this.preview_options.page = pdf.page;
                 }
+                {
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "[load] gen={} kind={:?} pdf={} page={}",
+                        generation,
+                        loaded.kind,
+                        loaded.pdf.is_some(),
+                        loaded.pdf.map(|p| p.page).unwrap_or(99)
+                    );
+                }
                 this.preview = loaded;
                 // 自渲染 PDF 页：顺手取本页命中框（翻页重载也会经过这里）。
                 // 预取（request 时并行发出）通常已命中：仅当框缺失/过期
@@ -4189,6 +4229,10 @@ impl MainWindow {
                     }
                 }
                 cx.notify();
+                // 待跳的 PDF 页：加载完成后重试一次（take 掉避免同目标请求拦截）。
+                if let Some((entry, h)) = this.pdf_jump_pending.take() {
+                    this.goto_pdf_hit(entry, h, cx);
+                }
                 // PDF 栅格可能比全文晚到：到这里再试一次「跳到首个命中页」。
                 this.maybe_auto_first_hit(cx);
             })

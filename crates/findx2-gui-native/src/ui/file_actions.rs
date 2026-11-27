@@ -224,6 +224,19 @@ impl MainWindow {
         }
         self.office_text_only = false;
         self.preview_active_selection(cx);
+        // PDF：立刻按搜索命中的窗口发起跳页（不必等 full_text/模型回调，
+        // 位图没就绪时会把目标页记下来，加载完成再跳）。
+        if search {
+            if let Some(hit) = self.active_workspace_hit() {
+                if std::path::Path::new(&hit.path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+                {
+                    self.goto_pdf_hit(hit.entry_idx, hit.snippet_window, cx);
+                }
+            }
+        }
         if focus != Some(row) {
             let owner = cx.weak_entity();
             let table_search = self.table.clone();
