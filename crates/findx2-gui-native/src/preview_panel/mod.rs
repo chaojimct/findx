@@ -165,6 +165,78 @@ pub trait PreviewSurface: 'static {
     }
 }
 
+/// 该扩展名是否有「内容视图」（自渲染）。
+pub fn content_supported(path: &str) -> bool {
+    let ext = ext_of(path);
+    matches!(
+        ext.as_str(),
+        "docx"
+            | "rtf"
+            | "md"
+            | "markdown"
+            | "xlsx"
+            | "xlsm"
+            | "pptx"
+            | "pdf"
+            | "txt"
+            | "log"
+            | "csv"
+            | "tsv"
+            | "json"
+            | "xml"
+            | "yml"
+            | "yaml"
+            | "toml"
+            | "ini"
+            | "cfg"
+            | "conf"
+            | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "mjs"
+            | "py"
+            | "rs"
+            | "c"
+            | "h"
+            | "cc"
+            | "cpp"
+            | "hpp"
+            | "cs"
+            | "java"
+            | "kt"
+            | "go"
+            | "html"
+            | "htm"
+            | "css"
+            | "scss"
+            | "less"
+            | "sql"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "bat"
+            | "cmd"
+            | "ps1"
+            | "vue"
+            | "svelte"
+    )
+}
+
+/// 该扩展名是否提供「系统版式」（PDF / xlsx 不提供，自渲染更完整）。
+pub fn system_supported(path: &str) -> bool {
+    let ext = ext_of(path);
+    matches!(ext.as_str(), "docx" | "doc" | "xls" | "ppt" | "pptx" | "rtf")
+}
+
+fn ext_of(path: &str) -> String {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
 /// 格式无关的编排器：选中 → 解析 → 安装 → 命中 → 自动定位。
 #[derive(Default)]
 pub struct PreviewController {
@@ -287,6 +359,27 @@ mod tests {
             len: 1,
             mtime: 2,
         }
+    }
+
+    #[test]
+    fn capability_matrix() {
+        // 有内容视图
+        assert!(content_supported("a.docx"));
+        assert!(content_supported("a.PDF"));
+        assert!(content_supported("a.txt"));
+        assert!(content_supported("a.ts"));
+        // 老二进制 Office 没有自渲染，走系统版式
+        assert!(!content_supported("a.doc"));
+        assert!(!content_supported("a.xls"));
+        assert!(!content_supported("a.ppt"));
+        assert!(!content_supported("a.zip"));
+
+        // 系统版式：docx/pptx 有，pdf/xlsx 没有
+        assert!(system_supported("a.docx"));
+        assert!(system_supported("a.PPTX"));
+        assert!(!system_supported("a.pdf"));
+        assert!(!system_supported("a.xlsx"));
+        assert!(!system_supported("a.txt"));
     }
 
     #[test]

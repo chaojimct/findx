@@ -380,6 +380,8 @@ pub struct MainWindow {
     sheet_scroll_to: Option<(usize, usize)>,
     /// 上次渲染时的横向偏移（行号列固定需要跟着滚动态重绘）。
     sheet_hx_seen: f32,
+    /// 是否在用系统版式（外部 IPreviewHandler）。默认 false：只能手动点按钮进入。
+    system_preview: bool,
     /// PDF 命中点页号缓存：(entry_idx, search_gen, pages)。
     pdf_hit_pages: Option<(u32, u64, std::rc::Rc<Vec<u32>>)>,
     /// 页号表还没回来时，等回来再跳的 (entry_idx, 命中序号)。
@@ -731,6 +733,7 @@ impl MainWindow {
             sheet_selected: None,
             sheet_scroll_to: None,
             sheet_hx_seen: 0.0,
+            system_preview: false,
             pdf_hit_pages: None,
             pdf_jump_pending: None,
             pdf_scroll: gpui_kit::ScrollHandle::new(),
@@ -1813,7 +1816,11 @@ impl MainWindow {
     /// 命中上下文是否可用（与是否已有异步结果无关）：
     /// 全文检索 + 选中非目录文件。tab 显示与激活态都用这个口径。
     fn hit_ctx_available(&self, cx: &mut Context<Self>) -> bool {
-        if !self.preview_snippet_view && !self.is_content_query(cx) {
+        // 新的 UI 骨架：命中栏/列表只由「内容检索 + 确实有命中」决定。
+        if !self.is_content_query(cx) {
+            return false;
+        }
+        if self.hit_count() == 0 && self.snippet_total == 0 {
             return false;
         }
         match self.active_workspace_hit() {
@@ -1845,6 +1852,11 @@ impl MainWindow {
                 })
                 .collect();
             (t.clone(), ranges)
+        } else if let Some(t) = self.preview.text.as_ref().filter(|t| !t.trim().is_empty()) {
+            // 标题搜索 / 文件浏览：没有全文命中，直接展示抽取出来的正文。
+            (t.clone(), Vec::new())
+        } else if !self.full_text.is_empty() {
+            (self.full_text.clone(), Vec::new())
         } else {
             search_logic::snippet_plain_and_ranges(&self.preview_snippet)
         }
@@ -4104,6 +4116,7 @@ impl MainWindow {
             self.pdf_hit_pages = None;
             self.pdf_jump_pending = None;
             self.pdf_scroll_to = None;
+            self.system_preview = false;
         }
         self.preview_snippet = hit.snippet.clone();
         self.snippet_window = hit.snippet_window;
@@ -4125,9 +4138,21 @@ impl MainWindow {
         self.docx_doc = None;
         self.docx_hits.clear();
         self.docx_focus = None;
+        let ext_l = std::path::Path::new(&hit.path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        // 默认永远走内容视图（自渲染）；系统版式只在用户点按钮时启动，
+        // PDF 永不提供系统版式（栅格页 + 命中框已覆盖）。
+        let content_supported = crate::preview_panel::content_supported(&hit.path);
+        let system_preview =
+            self.system_preview && crate::preview_panel::system_supported(&hit.path);
         if reset_view {
+            // 支持的格式默认进内容视图（标题搜索/文件浏览也一样）；
+            // 系统版式必须手动进入。
             self.preview_snippet_view =
-                !hit.is_directory && (content_query || !hit.snippet.is_empty());
+                !hit.is_directory && content_supported && !system_preview;
             self.preview_snippet_lock = false;
         }
         // 选中行无摘要时按需补第 0 窗（列表首屏只填前 N 行；失败静默）。
@@ -4135,17 +4160,8 @@ impl MainWindow {
             let entry_idx = hit.entry_idx;
             self.fetch_snippet_window(entry_idx, 0, false, cx);
         }
-        // Hit-context prefetch: full text + numbered list auto-open.
-        // System layout stays native; other tabs keep existing behavior.
-        let ext_l = std::path::Path::new(&hit.path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .unwrap_or_default();
-        // 「命中上下文」里的 PDF 必须用自渲染栅格页：只有走 preview_worker
-        // 的 Pdf 请求才会拿到页面位图 + 命中框；系统版式仍走原生处理器。
-        let prefer_native =
-            !self.office_text_only && !(ext_l == "pdf" && self.preview_snippet_view);
+        // 内容视图需要预取全文/编号列表。
+        let prefer_native = system_preview;
         if self.preview_snippet_view && !hit.is_directory {
             self.fetch_full_text(hit.entry_idx, cx);
             self.fetch_snippet_list(hit.entry_idx, cx);
@@ -4604,6 +4620,76 @@ impl MainWindow {
         }
         cx.notify();
     }
+    /// 预览视图条：左侧当前视图的操作（PDF 页码/缩放），右侧「系统版式」开关。
+    fn render_view_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let ext = self
+            .preview
+            .meta
+            .as_ref()
+            .map(|m| {
+                std::path::Path::new(&m.path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let has_pdf_controls = self.preview.pdf.is_some() && self.preview_snippet_view;
+        let can_system = crate::preview_panel::system_supported(&ext);
+        if !has_pdf_controls && !can_system {
+            return None;
+        }
+        let tokens = Self::tokens(cx);
+        let mut bar = h_flex()
+            .w_full()
+            .flex_shrink_0()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(tokens.border_soft);
+        if has_pdf_controls {
+            bar = bar.child(div().flex_1().min_w_0().child(self.render_pdf_controls(cx)));
+        } else {
+            bar = bar.child(div().flex_1());
+        }
+        if can_system {
+            let entity = cx.entity();
+            let on = self.system_preview;
+            bar = bar.child(
+                Button::new("preview-system-toggle")
+                    .ghost()
+                    .label(if on { "内容视图" } else { "系统版式" })
+                    .selected(on)
+                    .h(px(22.))
+                    .px_2()
+                    .tooltip("系统版式由系统预览处理器渲染；离开即销毁并恢复亚克力")
+                    .on_click(move |_, _, cx| {
+                        entity.update(cx, |this, cx| this.toggle_system_preview(cx));
+                    }),
+            );
+        }
+        Some(bar.into_any_element())
+    }
+
+    /// 进入/退出系统版式：只在点击时发生，绝不自动启动。
+    fn toggle_system_preview(&mut self, cx: &mut Context<Self>) {
+        if !self
+            .preview
+            .meta
+            .as_ref()
+            .is_some_and(|m| crate::preview_panel::system_supported(&m.path))
+        {
+            return;
+        }
+        self.system_preview = !self.system_preview;
+        self.preview_snippet_view = !self.system_preview;
+        self.preview_snippet_lock = true;
+        self.request_preview(cx, false);
+        cx.notify();
+    }
+
     fn render_pdf_controls(&self, cx: &Context<Self>) -> impl IntoElement {
         let page = self.preview_options.page;
         h_flex()
@@ -5136,164 +5222,8 @@ impl MainWindow {
             .border_l_1()
             .border_color(tokens.border)
             .child(header)
-            .when(self.preview.meta.as_ref().is_some_and(|m| std::path::Path::new(&m.path)
-                .extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pdf")))
-                && self.preview.pdf.is_some(), |view| {
-                view.child(self.render_pdf_controls(cx))
-            })
-            .when(
-                self.preview
-                    .meta
-                    .as_ref()
-                    .is_some_and(|m| preview_has_mode_tabs(&m.path)),
-                |view| {
-                    view.child(
-                        h_flex().px_2().py_1().gap_1().flex_shrink_0().children(
-                            {
-                                // 命中上下文排第一个：全文检索即出现（不等异步摘要），
-                                // 非全文查询仍有摘要时也展示。
-                                let mut tabs: Vec<(&'static str, &'static str, bool)> =
-                                    vec![];
-                                if self.hit_ctx_available(cx) {
-                                    tabs.push((
-                                        "snippet",
-                                        "命中上下文",
-                                        self.preview_snippet_view,
-                                    ));
-                                }
-                                tabs.push((
-                                    "office-native",
-                                    "系统版式",
-                                    !self.office_text_only && !self.preview_snippet_view,
-                                ));
-                                tabs.push((
-                                    "office-text",
-                                    "文字摘录",
-                                    self.office_text_only && !self.preview_snippet_view,
-                                ));
-                                tabs
-                            }
-                            .into_iter()
-                            .map(|(id, label, selected)| {
-                                let entity = cx.entity();
-                                Button::new(id)
-                                    .ghost()
-                                    .label(label)
-                                    .selected(selected)
-                                    .on_click(move |_, _, cx| {
-                                        entity.update(cx, |this, cx| {
-                                            if id == "snippet" {
-                                                // 摘要已在内存，只切视图；
-                                                // 切走 tab 时全文被清，回来补一次。
-                                                this.preview_snippet_view = true;
-                                                this.preview_snippet_lock = true;
-                                                // PDF：系统版式加载的是原生控件，没有
-                                                // 栅格页；切到命中上下文要补一次栅格请求。
-                                                let is_pdf = this
-                                                    .preview
-                                                    .meta
-                                                    .as_ref()
-                                                    .is_some_and(|m| {
-                                                        m.path
-                                                            .to_ascii_lowercase()
-                                                            .ends_with(".pdf")
-                                                    });
-                                                if is_pdf && this.preview.pdf.is_none() {
-                                                    this.request_preview(cx, false);
-                                                }
-                                                if this.full_text.is_empty() {
-                                                    if let Some(h) = this
-                                                        .active_workspace_hit()
-                                                    {
-                                                        if !h.is_directory {
-                                                            this.fetch_full_text(h.entry_idx, cx);
-                                                            if std::path::Path::new(&h.path)
-                                                                .extension()
-                                                                .and_then(|e| e.to_str())
-                                                                .is_some_and(|e| {
-                                                                    e.eq_ignore_ascii_case("docx")
-                                                                })
-                                                            {
-                                                                this.fetch_docx_blocks(
-                                                                    h.path.clone(),
-                                                                    cx,
-                                                                );
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                cx.notify();
-                                                return;
-                                            }
-                                            if !this.preview_is_current() {
-                                                return;
-                                            }
-                                            this.office_text_only = id == "office-text";
-                                            // 意图先行：request_preview 按当前视图算 intent，
-                                            // 必须先落到目标 tab 再请求。
-                                            this.preview_snippet_view = false;
-                                            this.preview_snippet_lock = true;
-                                            this.request_preview(cx, false);
-                                            cx.notify();
-                                        })
-                                    })
-                            }),
-                        ),
-                    )
-                },
-            )
-            // 命中上下文的操作栏：上一个/下一个翻页
-            //（仅 office 预览、摘要 tab 激活且有多处匹配时展示一行；
-            // PDF 可视态走专用列，这里隐藏，避免重复）。
-            .when(
-                !self.hit_text_active()
-                    && self.preview_snippet_view
-                    && self.snippet_total > 1
-                    && self
-                        .preview
-                        .meta
-                        .as_ref()
-                        .is_some_and(|m| preview_has_mode_tabs(&m.path)),
-                |view| {
-                    view.child(
-                        h_flex()
-                            .w_full()
-                            .flex_shrink_0()
-                            .px_2()
-                            .py_1()
-                            .gap_1()
-                            .border_b_1()
-                            .border_color(tokens.border_soft)
-                            .child(self.snippet_pager(cx)),
-                    )
-                },
-            )
-            // 编号命中列表（office 摘要 tab 同款，位置在操作栏与正文之间；
-            // PDF 可视态走专用列这里隐藏避免重复）。
-            .when(
-                !self.hit_text_active()
-                    && self.preview_snippet_view
-                    && self.snippet_list_open
-                    && self
-                        .preview
-                        .meta
-                        .as_ref()
-                        .is_some_and(|m| preview_has_mode_tabs(&m.path)),
-                |view| {
-                    view.child(
-                        div()
-                            .w_full()
-                            .flex_shrink_0()
-                            .h(px(200.))
-                            .border_b_1()
-                            .border_color(tokens.border_soft)
-                            .child(self.snippet_list_view(cx)),
-                    )
-                },
-            )
-            // PDF 可视命中上下文专用列：内容在上、导航在下。
-            // 光栅（含黄框）占整块 + pager + 编号列表（capped 高度内部滚动）。
-            // 光栅未就绪时不走这里（走下面的纯文本渐进态），避免转圈。
+            // 视图条：PDF 页码/缩放 放左边，「系统版式」开关固定右边。
+            .when_some(self.render_view_bar(cx), |view, bar| view.child(bar))
             .child(if self.hit_text_active() {
                 v_flex()
                     .flex_1()
@@ -5568,7 +5498,7 @@ impl MainWindow {
                             .into_any_element()
                         },
                     )
-                    .child(
+                    .when(self.hit_ctx_available(cx), |v| v.child(
                         div()
                             .id("hit-split-divider")
                             .w_full()
@@ -5593,7 +5523,7 @@ impl MainWindow {
                                 }),
                             ),
                     )
-                    .child(
+.child(
                         v_flex()
                             .w_full()
                             .flex_shrink_0()
@@ -5614,7 +5544,8 @@ impl MainWindow {
                             } else {
                                 div().into_any_element()
                             }),
-                    )
+                    ))
+
                     .on_mouse_move(cx.listener(
                         |this, event: &MouseMoveEvent, _, cx| {
                             if let Some((start_y, start_h)) = this.split_drag {
