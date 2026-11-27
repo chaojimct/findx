@@ -2989,8 +2989,7 @@ impl MainWindow {
             }
             idx.min(count.saturating_sub(1))
         };
-        // 吸顶条自己盖住了列表第一行，所以按「第一个真正可见的行」取分组。
-        let anchor = (first + 1).min(count.saturating_sub(1));
+        let anchor = first.min(count.saturating_sub(1));
         let sticky = self
             .list_groups
             .partition_point(|g| g.row <= anchor)
@@ -2998,37 +2997,42 @@ impl MainWindow {
             .and_then(|i| self.list_groups.get(i))
             .cloned();
 
-        let mut host = div()
-            .relative()
-            .w_full()
-            .h_full()
-            .min_h_0()
-            .min_w_0()
-            .child(list)
-            .child(
-                div()
-                    .absolute()
-                    .top(px(0.))
-                    .right(px(0.))
-                    .bottom(px(0.))
-                    .w(px(12.))
-                    .child(
-                        Scrollbar::vertical(&self.list_vscroll)
-                            .viewport_from_layout()
-                            .mode(ScrollbarMode::Always)
-                            .styles(|styles| {
-                                styles
-                                    .track(|style| style.bg(tokens.border_soft))
-                                    .thumb(|style| style.bg(tokens.text_tertiary))
-                                    .thumb_hover(|style| style.bg(tokens.text_secondary))
-                                    .thumb_active(|style| style.bg(tokens.accent))
-                            }),
-                    ),
-            );
+        // 吸顶条放在列表「上方」（正常布局），不覆盖第一行 —— 否则折叠后
+        // 当前分组的组头被盖住，就再也点不开、三角也不变。
+        let mut host = v_flex().w_full().h_full().min_h_0().min_w_0();
         if let Some(g) = sticky {
             host = host.child(self.sticky_group_bar(&g, tokens_copy, cx));
         }
-        host.into_any_element()
+        host.child(
+            div()
+                .relative()
+                .w_full()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .child(list)
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(0.))
+                        .right(px(0.))
+                        .bottom(px(0.))
+                        .w(px(12.))
+                        .child(
+                            Scrollbar::vertical(&self.list_vscroll)
+                                .viewport_from_layout()
+                                .mode(ScrollbarMode::Always)
+                                .styles(|styles| {
+                                    styles
+                                        .track(|style| style.bg(tokens.border_soft))
+                                        .thumb(|style| style.bg(tokens.text_tertiary))
+                                        .thumb_hover(|style| style.bg(tokens.text_secondary))
+                                        .thumb_active(|style| style.bg(tokens.accent))
+                                }),
+                        ),
+                ),
+        )
+        .into_any_element()
     }
 
     /// 按需取指定窗口的摘要（选中行补取 + 上一个/下一个翻页共用）。
@@ -3370,6 +3374,15 @@ impl MainWindow {
             self.list_collapsed.insert(si);
         }
         self.refresh_list_cache(cx);
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "[list-toggle] si={si} collapsed={} rows={}",
+                self.list_collapsed.contains(&si),
+                self.list_rows.len()
+            );
+        }
         cx.notify();
     }
 
@@ -3423,10 +3436,8 @@ impl MainWindow {
         let e_toggle = cx.entity();
         let e_select = cx.entity();
         h_flex()
-            .absolute()
-            .left(px(0.))
-            .right(px(12.))
-            .top(px(0.))
+            .w_full()
+            .flex_shrink_0()
             .h(px(LIST_ROW_H))
             .items_center()
             .gap(px(4.))
@@ -3519,15 +3530,20 @@ impl MainWindow {
         }
         self.sheet_selected = Some((row, col));
         self.sheet_scroll_to = Some((row, col));
-        self.sheet_scroll
-            .scroll_to_item(row, gpui_kit::ScrollStrategy::Top);
+        // 浮层向下展开会占很多行：把命中行「尽量往上滚」（放在顶部下 1 行），
+        // 这样浮层能完整显示，不用把网格滚到底才看得见。
+        self.sheet_scroll.scroll_to_item_strict_with_offset(
+            row,
+            gpui_kit::ScrollStrategy::Top,
+            1,
+        );
     }
 
     /// 应用待定位的命中格：纵向滚到行 + 横向把命中列滚进视口。
     /// 必须在 render 里调用：此时能拿到上一帧的真实视口宽，
     /// set_offset 才不会被首次布局（宽=0）覆盖成 0。
     fn apply_sheet_scroll_to(&mut self) {
-        let Some((row, col)) = self.sheet_scroll_to else {
+        let Some((_row, col)) = self.sheet_scroll_to else {
             return;
         };
         let vw = self.sheet_hscroll.bounds().size.width.as_f32();
@@ -3536,8 +3552,6 @@ impl MainWindow {
             return;
         }
         self.sheet_scroll_to = None;
-        self.sheet_scroll
-            .scroll_to_item(row, gpui_kit::ScrollStrategy::Top);
         let x = crate::ui::rich_view::SHEET_GUTTER_W
             + crate::ui::rich_view::SHEET_CELL_W * col as f32;
         // 命中列落在视口左侧 1/3 附近（列宽固定，可直接算）。
@@ -4953,8 +4967,9 @@ impl MainWindow {
                                 .size
                                 .height
                                 .as_f32()
-                                - 24.0)
-                                .clamp(160.0, 520.0);
+                                - 24.0
+                                - 30.0)
+                                .clamp(140.0, 520.0);
                             let book = self.sheet_book.as_ref().expect("checked is_some");
                             v_flex()
                                 .flex_1()
