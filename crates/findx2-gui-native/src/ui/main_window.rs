@@ -311,6 +311,9 @@ pub struct MainWindow {
     text_hscroll: gpui_kit::ScrollHandle,
     /// 切换选中文件后，等该文件命中模型就绪自动定位第一个命中。
     auto_first_pending: bool,
+    /// 预览模型代：每次切换目标/重开预览自增。异步解析回来时代不同就丢弃，
+    /// 防止「上一个文件」的 xlsx/docx/pptx 解析结果晚到后把列表和内容串回去。
+    model_gen: u64,
     /// docx 定向渲染焦点块（点击列表/翻页时切换，只渲染该块附近的窗口）。
     docx_focus: Option<usize>,
     /// md/txt 块模型（命中上下文富文本自绘；与 docx 共用渲染器）。
@@ -658,6 +661,7 @@ impl MainWindow {
             text_scroll: gpui_kit::UniformListScrollHandle::new(),
             text_hscroll: gpui_kit::ScrollHandle::new(),
             auto_first_pending: false,
+            model_gen: 0,
             docx_focus: None,
             md_doc: None,
             md_hits: Vec::new(),
@@ -1641,6 +1645,8 @@ impl MainWindow {
     /// 不清会让「上一个文件」的 sheet/docx/deck/full_text 继续参与列表渲染
     /// （例如 xlsx 的 "E2: ..." 行会卡在 pptx 的预览下面不动）。
     fn clear_preview_models(&mut self) {
+        // 代自增：所有在途的异步解析结果立刻作废。
+        self.model_gen = self.model_gen.wrapping_add(1);
         self.docx_doc = None;
         self.docx_hits.clear();
         self.docx_focus = None;
@@ -1760,23 +1766,59 @@ impl MainWindow {
         self.preview = PreviewState::empty();
     }
 
-    /// 上一个/下一个匹配点翻页（snippet_total>1 时展示；点击即取对应窗口）。
+    /// 当前预览目标路径（搜索模式以选中行为准，其余以打开的预览文件为准）。
+    /// 不能用 `preview.meta`：切换目标后它要等新预览加载完成才更新。
+    fn selected_preview_path(&self) -> Option<String> {
+        if self.workspace.mode == ViewMode::Search {
+            self.active_workspace_hit().map(|h| h.path)
+        } else {
+            self.preview_file
+                .clone()
+                .or_else(|| self.preview.meta.as_ref().map(|m| m.path.clone()))
+        }
+    }
+
     /// 切换文件后，等该类型的命中模型就绪 → 自动定位第一个命中。
     fn maybe_auto_first_hit(&mut self, cx: &mut Context<Self>) {
         if !self.auto_first_pending {
             return;
         }
-        let ready = (self.docx_doc.is_some() && !self.docx_hits.is_empty())
-            || (self.md_doc.is_some() && !self.md_hits.is_empty())
-            || (self.deck.is_some() && !self.deck_hits.is_empty())
-            || (self.sheet_book.is_some() && !self.sheet_hit_rows().is_empty())
-            || (!self.full_spans.is_empty() && self.preview.pdf.is_none());
+        // 就绪判断必须按**当前文件的类型**来做：旧模型（比如刚切走的 xlsx）
+        // 还在内存里时不能算“就绪”，否则 pending 会被它消费掉，新文件到了反而没跳。
+        let ext = self
+            .selected_preview_path()
+            .and_then(|p| {
+                std::path::Path::new(&p)
+                    .extension()
+                    .map(|e| e.to_ascii_lowercase())
+            })
+            .and_then(|e| e.to_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        let (ready, has_hits) = match ext.as_str() {
+            "docx" => (
+                self.docx_doc.is_some(),
+                !self.docx_hits.is_empty(),
+            ),
+            "md" | "markdown" => (self.md_doc.is_some(), !self.md_hits.is_empty()),
+            "pptx" | "ppt" => (self.deck.is_some(), !self.deck_hits.is_empty()),
+            "xlsx" | "xlsm" | "xls" => (
+                self.sheet_book.is_some(),
+                !self.sheet_hit_rows().is_empty(),
+            ),
+            _ => (
+                !self.full_text.is_empty() || !self.full_spans.is_empty(),
+                !self.full_spans.is_empty() && self.preview.pdf.is_none(),
+            ),
+        };
         if !ready {
             return;
         }
         self.auto_first_pending = false;
-        // xlsx：选中第一个命中单元格。
-        if self.sheet_book.is_some() {
+        if !has_hits {
+            return;
+        }
+        // xlsx：选中第一个命中单元格（纵向 + 横向一起定位）。
+        if matches!(ext.as_str(), "xlsx" | "xlsm" | "xls") {
             if let Some((si, r, c, _, _)) = self.sheet_hit_rows().first().cloned() {
                 self.goto_sheet_cell(si, r, c);
             }
@@ -2378,6 +2420,21 @@ impl MainWindow {
     fn snippet_list_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = Self::tokens(cx);
         let cur = self.snippet_window;
+        // 当前目标的扩展名：模型只允许**本类型**参与列表，杜绝上一个文件的
+        // xlsx/docx 残留在列表里（即便异步结果晚到/状态未清）。
+        let ext = self
+            .selected_preview_path()
+            .and_then(|p| {
+                std::path::Path::new(&p)
+                    .extension()
+                    .map(|e| e.to_ascii_lowercase())
+            })
+            .and_then(|e| e.to_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        let is_docx = ext == "docx";
+        let is_sheet = matches!(ext.as_str(), "xlsx" | "xlsm" | "xls");
+        let is_md = matches!(ext.as_str(), "md" | "markdown");
+        let is_ppt = matches!(ext.as_str(), "pptx" | "ppt");
 
         // 统一行模型：序号 / 单行文本 / 高亮区间 / 是否整串命中。
         // docx 场景用**文档侧 hits**生成（与高亮、跳转同一套坐标），
@@ -2385,7 +2442,7 @@ impl MainWindow {
         let (total, rows): (
             usize,
             Vec<(usize, String, Vec<std::ops::Range<usize>>, bool)>,
-        ) = if self.docx_doc.is_some() && !self.docx_hits.is_empty() {
+        ) = if is_docx && self.docx_doc.is_some() && !self.docx_hits.is_empty() {
             let q = self.effective_query(cx);
             let mut uniq = crate::docx_blocks::content_needles_of(&q);
             uniq.sort();
@@ -2399,10 +2456,11 @@ impl MainWindow {
                 .map(|(i, (ctx, ranges))| (i, ctx, ranges, single))
                 .collect();
             (total, rows)
-        } else if self
-            .sheet_book
-            .as_ref()
-            .is_some_and(|b| b.sheets.iter().any(|s| !s.hits.is_empty()))
+        } else if is_sheet
+            && self
+                .sheet_book
+                .as_ref()
+                .is_some_and(|b| b.sheets.iter().any(|s| !s.hits.is_empty()))
         {
             // xlsx：列表由**表格命中格**生成（与高亮/跳转同源）。
             // 每条 = "A1: 单元格文本"，点第 N 条直接滚到那一格并选中。
@@ -2421,7 +2479,7 @@ impl MainWindow {
                 })
                 .collect();
             (total, rows)
-        } else if self.md_doc.as_ref().is_some_and(|d| !self.md_hits.is_empty()) {
+        } else if is_md && self.md_doc.as_ref().is_some_and(|d| !self.md_hits.is_empty()) {
             let needles = crate::docx_blocks::content_needles_of(&self.effective_query(cx));
             let single = needles.len() <= 1;
             let doc = self.md_doc.as_ref().expect("checked");
@@ -2433,7 +2491,7 @@ impl MainWindow {
                 .map(|(i, (ctx, ranges))| (i, ctx, ranges, single))
                 .collect();
             (total, rows)
-        } else if self.deck.as_ref().is_some_and(|d| !self.deck_hits.is_empty()) {
+        } else if is_ppt && self.deck.as_ref().is_some_and(|d| !self.deck_hits.is_empty()) {
             let needles = crate::docx_blocks::content_needles_of(&self.effective_query(cx));
             let single = needles.len() <= 1;
             let deck = self.deck.as_ref().expect("checked");
@@ -2740,6 +2798,7 @@ impl MainWindow {
             .session
             .read_with(cx, |s, _| (s.endpoint.clone(), s.ipc.clone()));
         let search_gen_at_req = self.search_gen;
+        let model_gen_at_req = self.model_gen;
         self.snippet_list_loading = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -2755,10 +2814,11 @@ impl MainWindow {
                 .await
                 .unwrap_or_else(|_| Err("IPC 通道已关闭".into()));
             let _ = this.update(cx, |this, cx| {
-                this.snippet_list_loading = false;
-                if this.search_gen != search_gen_at_req {
+                // 目标已切走：晚到的旧列表必须丢弃（否则右侧列表卡在上一个文件）。
+                if this.search_gen != search_gen_at_req || this.model_gen != model_gen_at_req {
                     return;
                 }
+                this.snippet_list_loading = false;
                 let Ok(findx2_ipc::IpcResponse::ContentSnippets { snippets }) = result
                 else {
                     return;
@@ -2800,6 +2860,7 @@ impl MainWindow {
             .session
             .read_with(cx, |s, _| (s.endpoint.clone(), s.ipc.clone()));
         let search_gen_at_req = self.search_gen;
+        let model_gen_at_req = self.model_gen;
         cx.spawn(async move |this, cx| {
             let result = ipc
                 .request(
@@ -2824,7 +2885,7 @@ impl MainWindow {
                 return;
             }
             let _ = this.update(cx, |this, cx| {
-                if this.search_gen != search_gen_at_req {
+                if this.search_gen != search_gen_at_req || this.model_gen != model_gen_at_req {
                     return;
                 }
                 if this
@@ -2855,6 +2916,7 @@ impl MainWindow {
         self.sheet_selected = None;
         let q = self.effective_query(cx);
         let needles = crate::docx_blocks::content_needles_of(&q);
+        let model_gen_at_req = self.model_gen;
         cx.spawn(async move |this, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || {
@@ -2862,6 +2924,9 @@ impl MainWindow {
             });
             let parsed = rx.await;
             let _ = this.update(cx, |this, cx| {
+                if this.model_gen != model_gen_at_req {
+                    return;
+                }
                 if let Ok(Ok(deck)) = parsed {
                     this.deck_hits = crate::docx_blocks::match_hits_multi(&deck.plain, &needles);
                     this.deck = Some(deck);
@@ -2891,6 +2956,7 @@ impl MainWindow {
         // 阶段二：后台全扫（大表十几秒），补齐深层命中行。
         let path_fast = path.clone();
         let path_full = path.clone();
+        let model_gen_at_req = self.model_gen;
         cx.spawn(async move |this, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || {
@@ -2898,6 +2964,9 @@ impl MainWindow {
             });
             let parsed = rx.await;
             let _ = this.update(cx, |this, cx| {
+                if this.model_gen != model_gen_at_req {
+                    return;
+                }
                 if let Ok(Ok(mut wb)) = parsed {
                     let words = this.hit_words(cx);
                     crate::xlsx_blocks::recompute_hits(&mut wb, &words);
@@ -2913,6 +2982,10 @@ impl MainWindow {
             });
             let full = rx2.await;
             let _ = this.update(cx, |this, cx| {
+                // 用户可能已经切走：大表全扫要十几秒，晚到的结果必须丢弃。
+                if this.model_gen != model_gen_at_req {
+                    return;
+                }
                 if let Ok(Ok(mut wb)) = full {
                     let words = this.hit_words(cx);
                     crate::xlsx_blocks::recompute_hits(&mut wb, &words);
@@ -2957,6 +3030,18 @@ impl MainWindow {
         self.sheet_selected = Some((row, col));
         self.sheet_scroll
             .scroll_to_item(row, gpui_kit::ScrollStrategy::Top);
+        // 横向也要跟过去：列固定宽，把命中列滚到视口左侧 1/3 附近。
+        let vw = self.sheet_hscroll.bounds().size.width.as_f32();
+        let vw = if vw > 1.0 {
+            vw
+        } else {
+            self.actual_preview_width.max(200.0)
+        };
+        let x = crate::ui::rich_view::SHEET_GUTTER_W
+            + crate::ui::rich_view::SHEET_CELL_W * col as f32;
+        let target = (x - vw * 0.3).min(0.0);
+        self.sheet_hscroll
+            .set_offset(gpui::point(gpui::px(target), gpui::px(0.0)));
     }
 
     /// 实际命中词，按可信度排序：
@@ -3025,6 +3110,7 @@ impl MainWindow {
         self.md_doc = None;
         self.md_hits.clear();
         self.sheet_book = None;
+        let model_gen_at_req = self.model_gen;
         cx.spawn(async move |this, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || {
@@ -3035,6 +3121,9 @@ impl MainWindow {
             });
             let parsed = rx.await;
             let _ = this.update(cx, |this, cx| {
+                if this.model_gen != model_gen_at_req {
+                    return;
+                }
                 if let Ok(Ok(doc)) = parsed {
                     this.md_doc = Some(doc);
                     this.recompute_md_hits(cx);
@@ -3065,6 +3154,7 @@ impl MainWindow {
     fn fetch_docx_blocks(&mut self, path: String, cx: &mut Context<Self>) {
         self.docx_gen = self.docx_gen.wrapping_add(1);
         let req_gen = self.docx_gen;
+        let model_gen_at_req = self.model_gen;
         self.docx_doc = None;
         self.docx_hits.clear();
         self.docx_focus = None;
@@ -3077,7 +3167,7 @@ impl MainWindow {
             });
             let parsed = rx.await;
             let _ = this.update(cx, |this, cx| {
-                if this.docx_gen != req_gen {
+                if this.docx_gen != req_gen || this.model_gen != model_gen_at_req {
                     return;
                 }
                 match parsed {
@@ -3234,6 +3324,8 @@ impl MainWindow {
             self._preview_task = None;
             return;
         };
+        // 新目标：模型代自增（旧目标的异步解析结果一律作废）。
+        self.model_gen = self.model_gen.wrapping_add(1);
         self.preview_snippet = hit.snippet.clone();
         self.snippet_window = hit.snippet_window;
         self.snippet_total = hit.snippet_total;
@@ -4335,6 +4427,7 @@ impl MainWindow {
                         } else if sheet_preview && self.sheet_book.is_some() {
                             // xlsx：专用表格布局。页签固定，网格自带横/纵滚动条，
                             // 不再经过 #hit-text-scroll（避免外层假滚动条）。
+                            let words = self.hit_words(cx);
                             let book = self.sheet_book.as_ref().expect("checked is_some");
                             v_flex()
                                 .flex_1()
@@ -4354,6 +4447,7 @@ impl MainWindow {
                                     self.sheet_selected,
                                     &self.sheet_scroll,
                                     &self.sheet_hscroll,
+                                    &words,
                                 ))
                                 .into_any_element()
                         } else if self.full_text.len() > 256 * 1024

@@ -171,18 +171,22 @@ pub fn render_pptx(
 // ---------------------------------------------------------------------------
 
 /// 单元格宽度 / 行号列宽度（px）。
-const CELL_W: f32 = 112.0;
-const GUTTER_W: f32 = 46.0;
+pub const SHEET_CELL_W: f32 = 112.0;
+pub const SHEET_GUTTER_W: f32 = 46.0;
+const CELL_W: f32 = SHEET_CELL_W;
+const GUTTER_W: f32 = SHEET_GUTTER_W;
 
 /// 渲染当前 sheet 网格：列标行（固定）+ 虚拟滚动数据区。
 /// 数据区用 `uniform_list`，只渲染可见行——上万行 sheet 也不卡。
 /// `cx` 用于构造行渲染闭包（闭包只捕获 `Arc<Sheet>`，无逐帧深拷贝）。
+/// `hit_words`：当前查询的命中词，用于给命中单元格做**文字级**高亮。
 pub fn render_sheet(
     book: &crate::xlsx_blocks::Workbook,
     tokens: &FindxTokens,
     selected: Option<(usize, usize)>,
     scroll: &gpui_kit::UniformListScrollHandle,
     hscroll: &gpui_kit::ScrollHandle,
+    hit_words: &[String],
 ) -> AnyElement {
     let Some(sheet) = book.sheets.get(book.focus_sheet) else {
         return div().into_any_element();
@@ -223,7 +227,10 @@ pub fn render_sheet(
 
     let row_count = sheet.rows.len();
     let sheet_arc = std::sync::Arc::new(sheet.clone());
-    let hits: std::sync::Arc<Vec<(usize, usize)>> = std::sync::Arc::new(sheet.hits.clone());
+    // HashSet：可见行每帧要查几十次，Vec::contains 在命中多时会退化成 O(H×cells)。
+    let hit_cells: std::sync::Arc<std::collections::HashSet<(usize, usize)>> =
+        std::sync::Arc::new(sheet.hits.iter().copied().collect());
+    let words: std::sync::Arc<Vec<String>> = std::sync::Arc::new(hit_words.to_vec());
     let tokens_copy = *tokens;
     let processor =
         move |range: std::ops::Range<usize>,
@@ -260,7 +267,7 @@ pub fn render_sheet(
                     } else {
                         row.and_then(|x| x.get(c)).map(|s| s.as_str()).unwrap_or("")
                     };
-                    let is_hit = hits.contains(&(r, c));
+                    let is_hit = hit_cells.contains(&(r, c));
                     let is_sel = selected == Some((r, c));
                     let mut cell = div()
                         .w(px(CELL_W))
@@ -276,9 +283,6 @@ pub fn render_sheet(
                         .border_color(tokens_copy.border_soft)
                         .text_xs()
                         .text_color(tokens_copy.text_primary);
-                    if is_hit {
-                        cell = cell.bg(tokens_copy.hit_bg).text_color(tokens_copy.hit_fg);
-                    }
                     if is_sel {
                         // 选中格：主题强调色描边 + 淡底（AnyTXT 的蓝框效果）
                         cell = cell
@@ -286,7 +290,29 @@ pub fn render_sheet(
                             .border_color(tokens_copy.accent)
                             .bg(tokens_copy.row_selected);
                     }
-                    row_el = row_el.child(cell.child(text.to_string()));
+                    // 命中：只高亮**单元格内匹配到的文字**（不再是整格铺底色）。
+                    let content: AnyElement = if is_hit && !text.is_empty() {
+                        let ranges = crate::docx_blocks::match_hits_multi(text, &words);
+                        if ranges.is_empty() {
+                            text.to_string().into_any_element()
+                        } else {
+                            StyledText::new(text.to_string())
+                                .with_highlights(ranges.into_iter().map(|range| {
+                                    (
+                                        range,
+                                        HighlightStyle {
+                                            color: Some(tokens_copy.hit_fg),
+                                            background_color: Some(tokens_copy.hit_bg),
+                                            ..Default::default()
+                                        },
+                                    )
+                                }))
+                                .into_any_element()
+                        }
+                    } else {
+                        text.to_string().into_any_element()
+                    };
+                    row_el = row_el.child(cell.child(content));
                 }
                 out.push(row_el.into_any_element());
             }
