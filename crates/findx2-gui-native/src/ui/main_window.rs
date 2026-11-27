@@ -2966,6 +2966,17 @@ impl MainWindow {
                                             return;
                                         }
                                         this.preview_snippet_lock = true;
+                                        {
+                                            use std::io::Write as _;
+                                            let _ = writeln!(
+                                                std::io::stderr(),
+                                                "[row-click] w={w} sheet={} pdf={} doc={} text_spans={}",
+                                                this.sheet_book.is_some(),
+                                                this.preview.pdf.is_some(),
+                                                this.docx_doc.is_some() || this.md_doc.is_some() || this.deck.is_some(),
+                                                this.full_spans.len()
+                                            );
+                                        }
                                         if this.sheet_book.is_some() {
                                             // xlsx：滚到命中格并选中（sheet/行/列）。
                                             this.snippet_window = w;
@@ -4080,6 +4091,18 @@ impl MainWindow {
         };
         // 新目标：模型代自增（旧目标的异步解析结果一律作废）。
         self.model_gen = self.model_gen.wrapping_add(1);
+        // 换文件时 PDF 页码归零，避免新文件继承上一个文件的当前页。
+        let same_preview_file = self
+            .preview
+            .meta
+            .as_ref()
+            .is_some_and(|m| m.path == hit.path);
+        if !same_preview_file {
+            self.pdf_options.page = 0;
+            self.pdf_hit_pages = None;
+            self.pdf_jump_pending = None;
+            self.pdf_scroll_to = None;
+        }
         self.preview_snippet = hit.snippet.clone();
         self.snippet_window = hit.snippet_window;
         self.snippet_total = hit.snippet_total;
@@ -4765,14 +4788,23 @@ impl MainWindow {
         }
         let mut col = v_flex().p_3().gap_1();
         if !self.preview.pdf_highlights.is_empty() && show_hl {
+            let total_hits = self.pdf_hit_pages.as_ref().map(|(_, _, p)| p.len()).unwrap_or(0);
             col = col.child(
                 div()
                     .text_xs()
                     .text_color(tokens.text_tertiary)
                     .child(format!(
-                        "本页 {} 个命中{}",
+                        "命中 {}/{} · 第 {}/{} 页 · 本页 {} 个框{}",
+                        (self.snippet_window + 1).min(total_hits.max(1)),
+                        total_hits,
+                        pdf.page + 1,
+                        pdf.count,
                         self.preview.pdf_highlights.len(),
-                        if active_box.is_some() { "（当前命中已框出）" } else { "" }
+                        if active_box.is_some() {
+                            "（当前命中已框出）"
+                        } else {
+                            "（未定位到本页命中）"
+                        }
                     )),
             );
         }
