@@ -94,6 +94,7 @@ pub(crate) fn req_kind_label(r: &IpcRequest) -> &'static str {
         IpcRequest::ContentSnippets { .. } => "ContentSnippets",
         IpcRequest::ContentSnippetsAll { .. } => "ContentSnippetsAll",
         IpcRequest::ContentPdfBoxes { .. } => "ContentPdfBoxes",
+        IpcRequest::ContentPdfHitPages { .. } => "ContentPdfHitPages",
         IpcRequest::ContentFullText { .. } => "ContentFullText",
     }
 }
@@ -511,6 +512,13 @@ pub(crate) fn process_request(slot: &EngineSlot, req: IpcRequest) -> IpcResponse
                 page_h: 0.0,
             },
         },
+        (IpcRequest::ContentPdfHitPages { query, entry_index }, Some(eng)) => {
+            let pages = crate::content_index::pdf_hit_pages_for(&eng, &query, entry_index);
+            IpcResponse::ContentPdfHitPages { pages }
+        }
+        (IpcRequest::ContentPdfHitPages { .. }, None) => {
+            IpcResponse::ContentPdfHitPages { pages: Vec::new() }
+        }
         (IpcRequest::ContentPdfBoxes { .. }, None) => IpcResponse::ContentPdfBoxes {
             rects: Vec::new(),
             page_w: 0.0,

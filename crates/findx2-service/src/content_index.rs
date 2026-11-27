@@ -748,6 +748,38 @@ pub(crate) fn pdf_boxes_for(
     Some((pb.rects, pb.page_w, pb.page_h))
 }
 
+/// PDF 每个命中点所在页号（与 `ContentSnippets` 的 window 同序）。
+/// 索引里的 PDF 全文就是 `pdf-worker --extract` 的「每页 text().all() + '\n'」，
+/// 所以用 `pdf_boxes::page_ends` 的累计偏移可以直接二分映射到页号。
+pub(crate) fn pdf_hit_pages_for(
+    engine: &SearchEngine,
+    query: &str,
+    entry_index: u32,
+) -> Vec<u32> {
+    let path = {
+        let g = engine.index_store();
+        g.entry_display_path(entry_index as usize).ok()
+    }
+    .unwrap_or_default();
+    if !path.to_ascii_lowercase().ends_with(".pdf") {
+        return Vec::new();
+    }
+    let ends = match findx2_content::pdf_boxes::page_ends(Path::new(&path)) {
+        Ok(e) if !e.is_empty() => e,
+        _ => return Vec::new(),
+    };
+    let Some((_text, spans, _total, _trunc)) = full_text_for(engine, query, entry_index) else {
+        return Vec::new();
+    };
+    let last = ends.len().saturating_sub(1);
+    let mut out = Vec::with_capacity(spans.len());
+    for [a, _b] in spans {
+        let p = ends.partition_point(|&e| (e as usize) <= a);
+        out.push(p.min(last) as u32);
+    }
+    out
+}
+
 /// 搜索装配用：按页内 `entry_idx` 取前 `cap` 个 snippet（key→html，无命中缺席）。
 /// 搜索装配用：按页内 `entry_idx` 取第 `window_idx` 个匹配窗口的 snippet。
 /// 返回 `entry_idx → (html, 全文匹配点总数, 实际窗口号)`；找不到/回读失败的 key 缺席。

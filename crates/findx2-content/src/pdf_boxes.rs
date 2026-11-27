@@ -113,6 +113,84 @@ fn run_job(worker: &mut Worker, job: &[u8]) -> Result<PageBoxes> {
     })
 }
 
+/// 每页文本在全文中的累计结束字节偏移（命中跳页用）。
+/// 与索引侧 `extract_one`（`page.text().all() + '\n'`）同一口径，
+/// 所以索引里的匹配字节偏移可以直接二分映射到页号。
+pub fn page_ends(path: &Path) -> Result<Vec<u64>> {
+    let job = serde_json::json!({
+        "path": path.display().to_string(),
+        "pagelens": true,
+    });
+    let mut line = serde_json::to_vec(&job)
+        .map_err(|e| Error::Extract("pdf-boxes".into(), format!("job 序列化失败: {e}")))?;
+    line.push(b'\n');
+    let mut guard = slot().lock().expect("boxes worker 锁中毒");
+    if guard.is_none() {
+        *guard = Some(spawn()?);
+    }
+    let r = run_job_bytes(guard.as_mut().expect("boxes worker 已建"), &line);
+    if r.is_err() {
+        *guard = None;
+    }
+    let raw = r?;
+    let v: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| Error::Extract("pdf-boxes".into(), format!("回包解析失败: {e}")))?;
+    let ends: Vec<u64> = v
+        .get("ends")
+        .and_then(|e| serde_json::from_value(e.clone()).ok())
+        .unwrap_or_default();
+    Ok(ends)
+}
+
+/// 与 `run_job` 相同，但返回原始回包字节（供多种 reply 结构复用）。
+fn run_job_bytes(worker: &mut Worker, job: &[u8]) -> Result<Vec<u8>> {
+    worker
+        .stdin
+        .write_all(job)
+        .and_then(|_| worker.stdin.flush())
+        .map_err(|e| Error::Extract("pdf-boxes".into(), format!("下发任务失败: {e}")))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let r = read_frame_bytes(&mut worker.stdout);
+            let _ = tx.send(r);
+        });
+        match rx.recv_timeout(JOB_TIMEOUT) {
+            Ok(r) => r,
+            Err(_) => {
+                let _ = worker.child.kill();
+                Err(Error::Extract(
+                    "pdf-boxes".into(),
+                    "单页超时 20s，已重启 boxes worker".into(),
+                ))
+            }
+        }
+    })
+}
+
+fn read_frame_bytes(out: &mut BufReader<ChildStdout>) -> Result<Vec<u8>> {
+    let mut len_b = [0u8; 8];
+    out.read_exact(&mut len_b)
+        .map_err(|e| Error::Extract("pdf-boxes".into(), format!("读回包失败: {e}")))?;
+    let len = u64::from_le_bytes(len_b);
+    if len == FAIL_MARK {
+        return Err(Error::Extract(
+            "pdf-boxes".into(),
+            "本页无框（越界/无文本层/解析失败）".into(),
+        ));
+    }
+    if len > 32 * 1024 * 1024 {
+        return Err(Error::Extract(
+            "pdf-boxes".into(),
+            format!("回包过大 {len}B，疑似 worker 异常"),
+        ));
+    }
+    let mut buf = vec![0u8; len as usize];
+    out.read_exact(&mut buf)
+        .map_err(|e| Error::Extract("pdf-boxes".into(), format!("读包体失败: {e}")))?;
+    Ok(buf)
+}
+
 fn read_frame(out: &mut BufReader<ChildStdout>) -> Result<PageBoxes> {
     let mut len_b = [0u8; 8];
     out.read_exact(&mut len_b)

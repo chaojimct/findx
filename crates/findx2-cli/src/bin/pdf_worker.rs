@@ -141,6 +141,8 @@ fn boxes_run() -> Result<(), String> {
             break;
         }
         let reply: Option<Vec<u8>> = match serde_json::from_slice::<BoxesJob>(&line) {
+            Ok(job) if job.pagelens => page_ends_one(&pdfium, &job.path)
+                .and_then(|ends| serde_json::to_vec(&serde_json::json!({ "ends": ends })).ok()),
             Ok(job) => boxes_one(&pdfium, &job).and_then(|r| serde_json::to_vec(&r).ok()),
             Err(_) => None,
         };
@@ -165,8 +167,13 @@ fn boxes_run() -> Result<(), String> {
 #[derive(serde::Deserialize)]
 struct BoxesJob {
     path: String,
+    #[serde(default)]
     page: u32,
+    #[serde(default)]
     needles: Vec<String>,
+    /// true = 本次只取「每页文本在全文中的累计结束字节偏移」（命中跳页用）。
+    #[serde(default)]
+    pagelens: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -179,6 +186,28 @@ struct BoxesReply {
 /// 单页命中框：逐字重建文本（保证字↔框 1:1，不依赖 `all()` 的 rect 抽取顺序），
 /// 命中 spans 复用 `snippet::match_spans`（字面优先 + 拼音对齐，与摘要高亮同口径），
 /// 合并重叠命中后取并框；单页上限 2000 框（交互 sanity）。
+/// 每页文本在「全文」中的累计结束偏移（与 `extract_one` 的 `page.text().all() + '\n'`
+/// 完全一致，索引里的全文就是同一份文本，所以字节偏移可以直接映射到页号）。
+fn page_ends_one(
+    pdfium: &pdfium_render::prelude::Pdfium,
+    path: &str,
+) -> Option<Vec<u64>> {
+    use pdfium_render::prelude::*;
+    let document = pdfium.load_pdf_from_file(path, None).ok()?;
+    let mut ends: Vec<u64> = Vec::new();
+    let mut acc: u64 = 0;
+    for page in document.pages().iter() {
+        let page = page.text().ok()?;
+        acc += page.all().len() as u64 + 1; // + '\n'（extract_one 每页后补一个换行）
+        ends.push(acc);
+    }
+    if ends.is_empty() {
+        None
+    } else {
+        Some(ends)
+    }
+}
+
 fn boxes_one(
     pdfium: &pdfium_render::prelude::Pdfium,
     job: &BoxesJob,

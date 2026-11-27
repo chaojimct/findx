@@ -150,6 +150,9 @@ fn handle_request(req: IpcRequest) -> IpcResponse {
             page_w: 0.0,
             page_h: 0.0,
         },
+        IpcRequest::ContentPdfHitPages { .. } => {
+            IpcResponse::ContentPdfHitPages { pages: vec![] }
+        }
         IpcRequest::ContentFullText { .. } => IpcResponse::ContentFullText {
             text: String::new(),
             spans: Vec::new(),

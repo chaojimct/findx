@@ -380,6 +380,10 @@ pub struct MainWindow {
     sheet_scroll_to: Option<(usize, usize)>,
     /// 上次渲染时的横向偏移（行号列固定需要跟着滚动态重绘）。
     sheet_hx_seen: f32,
+    /// PDF 命中点页号缓存：(entry_idx, search_gen, pages)。
+    pdf_hit_pages: Option<(u32, u64, std::rc::Rc<Vec<u32>>)>,
+    /// 页号表还没回来时，等回来再跳的 (entry_idx, 命中序号)。
+    pdf_jump_pending: Option<(u32, usize)>,
     /// 搜索选项：区分大小写（Aa）。标题搜索精确生效；全文搜索后置过滤。
     search_match_case: bool,
     /// 搜索选项：全匹配（ab）。整串连续出现才算命中。
@@ -725,6 +729,8 @@ impl MainWindow {
             sheet_selected: None,
             sheet_scroll_to: None,
             sheet_hx_seen: 0.0,
+            pdf_hit_pages: None,
+            pdf_jump_pending: None,
             search_match_case: false,
             search_exact: false,
             search_wildcard: false,
@@ -1857,6 +1863,16 @@ impl MainWindow {
             })
             .and_then(|e| e.to_str().map(|s| s.to_string()))
             .unwrap_or_default();
+        if self.preview.pdf.is_some() {
+            if self.full_spans.is_empty() {
+                return;
+            }
+            self.auto_first_pending = false;
+            if let Some(hit) = self.active_workspace_hit() {
+                self.goto_pdf_hit(hit.entry_idx, 0, cx);
+            }
+            return;
+        }
         let (ready, has_hits) = match ext.as_str() {
             "docx" => (
                 self.docx_doc.is_some(),
@@ -2121,11 +2137,13 @@ impl MainWindow {
                             if let Some((si, r, c)) = this.sheet_hit_at(w) {
                                 this.goto_sheet_cell(si, r, c);
                             }
-                        } else if this.preview.pdf.is_none()
-                            && (this.docx_doc.is_some()
-                                || this.md_doc.is_some()
-                                || this.deck.is_some()
-                                || !this.full_spans.is_empty())
+                        } else if this.preview.pdf.is_some() {
+                            // PDF：跳到该命中所在页（页内全部命中高亮）。
+                            this.goto_pdf_hit(entry_idx, w, cx);
+                        } else if this.docx_doc.is_some()
+                            || this.md_doc.is_some()
+                            || this.deck.is_some()
+                            || !this.full_spans.is_empty()
                         {
                             this.snippet_window = w;
                             this.scroll_to_hit(w);
@@ -2167,11 +2185,13 @@ impl MainWindow {
                             if let Some((si, r, c)) = this.sheet_hit_at(w) {
                                 this.goto_sheet_cell(si, r, c);
                             }
-                        } else if this.preview.pdf.is_none()
-                            && (this.docx_doc.is_some()
-                                || this.md_doc.is_some()
-                                || this.deck.is_some()
-                                || !this.full_spans.is_empty())
+                        } else if this.preview.pdf.is_some() {
+                            // PDF：跳到该命中所在页（页内全部命中高亮）。
+                            this.goto_pdf_hit(entry_idx, w, cx);
+                        } else if this.docx_doc.is_some()
+                            || this.md_doc.is_some()
+                            || this.deck.is_some()
+                            || !this.full_spans.is_empty()
                         {
                             this.snippet_window = w;
                             this.scroll_to_hit(w);
@@ -2411,8 +2431,12 @@ impl MainWindow {
         if let Some(doc) = self.docx_doc.as_ref() {
             if let Some(off) = self.docx_hits.get(n).map(|r| r.start) {
                 if let Some(block) = doc.block_of_offset(off) {
+                    // docx 是「按焦点窗口渲染」的：设置 docx_focus 后只渲染该块
+                    // 附近的窗口，所以只需把内容滚回窗口顶部（hit_scroll 的子元素
+                    // 索引与文档绝对块号不再一一对应，不能再 scroll_to_item）。
                     self.docx_focus = Some(block);
-                    self.hit_scroll.scroll_to_top_of_item(block);
+                    self.hit_scroll
+                        .set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
                 }
             }
             return;
@@ -3529,6 +3553,68 @@ impl MainWindow {
             );
         }
         row.into_any_element()
+    }
+
+    /// 跳到 PDF 第 h 个命中所在的页（与摘要窗口同序）。
+    /// 页号表按 (entry, search_gen) 缓存，第一次请求后本地直接命中。
+    fn goto_pdf_hit(&mut self, entry_idx: u32, h: usize, cx: &mut Context<Self>) {
+        if self.preview.pdf.is_none() {
+            return;
+        }
+        self.snippet_window = h;
+        if let Some((e, g, pages)) = self.pdf_hit_pages.as_ref() {
+            if *e == entry_idx && *g == self.search_gen {
+                let page = pages.get(h).copied().unwrap_or(0);
+                if self.pdf_options.page != page {
+                    self.pdf_options.page = page;
+                    self.request_preview(cx, false);
+                }
+                cx.notify();
+                return;
+            }
+        }
+        if self.pdf_jump_pending == Some((entry_idx, h)) {
+            return; // 同目标请求在途
+        }
+        let sent = self.effective_query(cx);
+        let (endpoint, ipc) = self
+            .session
+            .read_with(cx, |s, _| (s.endpoint.clone(), s.ipc.clone()));
+        let search_gen_at_req = self.search_gen;
+        self.pdf_jump_pending = Some((entry_idx, h));
+        cx.spawn(async move |this, cx| {
+            let result = ipc
+                .request(
+                    endpoint,
+                    findx2_ipc::IpcRequest::ContentPdfHitPages {
+                        query: sent,
+                        entry_index: entry_idx,
+                    },
+                )
+                .await
+                .unwrap_or_else(|_| Err("IPC 通道已关闭".into()));
+            let Ok(findx2_ipc::IpcResponse::ContentPdfHitPages { pages }) = result else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                if this.search_gen != search_gen_at_req {
+                    return;
+                }
+                if this.pdf_jump_pending.take() != Some((entry_idx, h)) {
+                    return;
+                }
+                if !this
+                    .active_workspace_hit()
+                    .is_some_and(|hit| hit.entry_idx == entry_idx)
+                {
+                    return;
+                }
+                this.pdf_hit_pages =
+                    Some((entry_idx, search_gen_at_req, std::rc::Rc::new(pages)));
+                this.goto_pdf_hit(entry_idx, h, cx);
+            });
+        })
+        .detach();
     }
 
     /// 点 xlsx 列表项：滚到该行并选中该格。
@@ -5083,7 +5169,12 @@ impl MainWindow {
                             // 每个块一个子元素：ScrollHandle::scroll_to_item(块号) 才能定位。
                             .children(if let Some(doc) = self.docx_doc.as_ref() {
                                 // docx：纯 Rust 自绘真版式（标题/段落/粗体/表格/命中高亮）。
-                                crate::ui::rich_view::render_docx(doc, &self.docx_hits, None, &tokens)
+                                crate::ui::rich_view::render_docx(
+                                    doc,
+                                    &self.docx_hits,
+                                    self.docx_focus,
+                                    &tokens,
+                                )
                             } else if let Some(doc) = self.md_doc.as_ref() {
                                 // md：pulldown-cmark 块模型自绘（标题/段落/列表/表格/代码）。
                                 crate::ui::rich_view::render_md(doc, &self.md_hits, &tokens)

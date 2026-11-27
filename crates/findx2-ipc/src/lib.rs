@@ -133,6 +133,12 @@ pub enum IpcRequest {
         entry_index: u32,
         page: u32,
     },
+    /// 取 PDF 每个命中点所在页号（与 `ContentSnippets` 的 window 同序），
+    /// 用于「上一个/下一个/点列表」直接跳到命中页。
+    ContentPdfHitPages {
+        query: String,
+        entry_index: u32,
+    },
     /// 取某文档的全文文本（命中上下文文本预览用；与摘要同源解析 query）。
     /// query 取 content: 取值原文；entry_index 为结果行号。
     /// 应答 `ContentFullText`：text 为上限内的原文（UTF-8，可能截断），
@@ -368,6 +374,11 @@ pub enum IpcResponse {
         page_w: f32,
         #[serde(default)]
         page_h: f32,
+    },
+    /// `ContentPdfHitPages` 应答：pages[i] 为第 i 个命中点所在页（0 基）。
+    ContentPdfHitPages {
+        #[serde(default)]
+        pages: Vec<u32>,
     },
     /// `ContentFullText` 应答：全文文本 + 命中区间（字节偏移，char 边界对齐）。
     /// 空 text = 超大/失败，调用方回退摘要窗展示。

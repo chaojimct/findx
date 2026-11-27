@@ -47,7 +47,9 @@ pub fn render_docx(
     focus_block: Option<usize>,
     tokens: &FindxTokens,
 ) -> Vec<AnyElement> {
-    const WINDOW_BEFORE: usize = 12;
+    // 命中窗口上方的上下文行数：只留 2 块，保证「窗口顶部」就能看到命中
+    // （原来是 12 块，长段落时命中会被挤到第一屏之外）。
+    const WINDOW_BEFORE: usize = 2;
     const WINDOW_AFTER: usize = 80;
 
     let total = doc.blocks.len();
