@@ -8,6 +8,7 @@ pub mod mock_backend;
 pub mod open_path;
 pub mod prefs;
 pub mod preview;
+pub mod preview_panel;
 pub mod search_logic;
 pub mod session;
 pub mod settings_logic;
