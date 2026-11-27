@@ -300,6 +300,8 @@ pub struct MainWindow {
     docx_gen: u64,
     /// docx 内容区滚动句柄：块与子元素一一对应，点击列表行/翻页可精确定位。
     hit_scroll: gpui_kit::ScrollHandle,
+    /// 命中列表二维滚动（横向看长行，纵向看更多命中）。
+    list_scroll: gpui_kit::ScrollHandle,
     /// docx 定向渲染焦点块（点击列表/翻页时切换，只渲染该块附近的窗口）。
     docx_focus: Option<usize>,
     /// md/txt 块模型（命中上下文富文本自绘；与 docx 共用渲染器）。
@@ -639,6 +641,7 @@ impl MainWindow {
             docx_hits: Vec::new(),
             docx_gen: 0,
             hit_scroll: gpui_kit::ScrollHandle::new(),
+            list_scroll: gpui_kit::ScrollHandle::new(),
             docx_focus: None,
             md_doc: None,
             md_hits: Vec::new(),
@@ -2184,8 +2187,19 @@ impl MainWindow {
                 .child(msg);
         }
 
+        // 单行 nowrap：内容宽度按最长行估算，横向滚动条才有 range。
+        let list_w = rows
+            .iter()
+            .map(|(_, text, _, _)| {
+                let units: usize = text
+                    .chars()
+                    .map(|c| if c.is_ascii() { 1 } else { 2 })
+                    .sum();
+                units as f32 * 7.6 + 80.0
+            })
+            .fold(self.actual_preview_width, f32::max);
         v_flex()
-            .w_full()
+            .w(px(list_w))
             .flex_shrink_0()
             .gap_px()
             .children(rows.into_iter().map(|(w, text, ranges, is_exact)| {
@@ -4010,17 +4024,24 @@ impl MainWindow {
                                 .into_any_element()
                         } else {
                         div()
-                            .id("hit-text-scroll")
+                            .relative()
                             .flex_1()
                             .w_full()
                             .min_h_0()
                             .min_w_0()
+                            .child(
+                                div()
+                            .id("hit-text-scroll")
+                            .w_full()
+                            .h_full()
                             .track_scroll(&self.hit_scroll)
                             // 必须用原生 overflow_y_scroll：gpui-component 的
                             // overflow_y_scrollbar() 返回 Scrollable，它在 render 里
                             // 自建 scroll_handle，会完全忽略 track_scroll 的句柄
                             // （这是此前 set_offset/scroll_to_item 全部无效的根因）。
                             .overflow_y_scroll()
+                            // 长代码行（不可断词）允许横向滚动。
+                            .overflow_x_scroll()
                             // 滚动条单独挂在同一个句柄上（ScrollableElement trait），
                             // 既显示滚动条又不干扰滚动控制。
                             .vertical_scrollbar(&self.hit_scroll)
@@ -4093,13 +4114,35 @@ impl MainWindow {
                                     els
                                 }
                             })
-                            // 常显纵向滚动条：默认 ScrollbarMode::Scrolling 只在滚动时
-                            // 闪现，窗口矮/内容长时用户看不到条也找不到可滚的区域。
+                            )
+                            // 滚动条放在滚动容器的**兄弟**层：绝对定位覆盖在视口上，
+                            // 不会随内容滚走，也不会被 overflow 裁剪。
                             .child(
                                 div().absolute().inset_0().child(
                                     Scrollbar::vertical(&self.hit_scroll)
                                         .viewport_from_layout()
-                                        .mode(ScrollbarMode::Always),
+                                        .mode(ScrollbarMode::Always)
+                                        .styles(|styles| {
+                                            styles
+                                                .track(|style| style.bg(tokens.border_soft))
+                                                .thumb(|style| style.bg(tokens.text_tertiary))
+                                                .thumb_hover(|style| style.bg(tokens.text_secondary))
+                                                .thumb_active(|style| style.bg(tokens.accent))
+                                        }),
+                                ),
+                            )
+                            .child(
+                                div().absolute().inset_0().child(
+                                    Scrollbar::horizontal(&self.hit_scroll)
+                                        .viewport_from_layout()
+                                        .mode(ScrollbarMode::Always)
+                                        .styles(|styles| {
+                                            styles
+                                                .track(|style| style.bg(tokens.border_soft))
+                                                .thumb(|style| style.bg(tokens.text_tertiary))
+                                                .thumb_hover(|style| style.bg(tokens.text_secondary))
+                                                .thumb_active(|style| style.bg(tokens.accent))
+                                        }),
                                 ),
                             )
                             .into_any_element()
@@ -4140,11 +4183,51 @@ impl MainWindow {
                             .border_color(tokens.border_soft)
                             .child(self.snippet_pager(cx))
                             .child(if self.snippet_list_open {
+                                // 原生二维滚动（gpui-component 的 Scrollable
+                                // 自建句柄，既拿不到也加不了常显条）。
                                 div()
+                                    .relative()
                                     .flex_1()
                                     .min_h_0()
-                                    .overflow_y_scrollbar()
-                                    .child(self.snippet_list_view(cx))
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .id("snippet-list-scroll")
+                                            .w_full()
+                                            .h_full()
+                                            .track_scroll(&self.list_scroll)
+                                            .overflow_x_scroll()
+                                            .overflow_y_scroll()
+                                            .child(self.snippet_list_view(cx)),
+                                    )
+                                    .child(
+                                        div().absolute().inset_0().child(
+                                            Scrollbar::vertical(&self.list_scroll)
+                                                .viewport_from_layout()
+                                                .mode(ScrollbarMode::Always)
+                                                .styles(|styles| {
+                                                    styles
+                                                        .track(|style| style.bg(tokens.border_soft))
+                                                        .thumb(|style| style.bg(tokens.text_tertiary))
+                                                        .thumb_hover(|style| style.bg(tokens.text_secondary))
+                                                        .thumb_active(|style| style.bg(tokens.accent))
+                                                }),
+                                        ),
+                                    )
+                                    .child(
+                                        div().absolute().inset_0().child(
+                                            Scrollbar::horizontal(&self.list_scroll)
+                                                .viewport_from_layout()
+                                                .mode(ScrollbarMode::Always)
+                                                .styles(|styles| {
+                                                    styles
+                                                        .track(|style| style.bg(tokens.border_soft))
+                                                        .thumb(|style| style.bg(tokens.text_tertiary))
+                                                        .thumb_hover(|style| style.bg(tokens.text_secondary))
+                                                        .thumb_active(|style| style.bg(tokens.accent))
+                                                }),
+                                        ),
+                                    )
                                     .into_any_element()
                             } else {
                                 div().into_any_element()
