@@ -7,6 +7,16 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use std::io::Read;
 
+/// `&entity;`（quick-xml 0.42 的 `Event::GeneralRef`）解析成字符串。
+fn general_ref(r: quick_xml::events::BytesRef<'_>) -> String {
+    let name = r.into_inner();
+    let raw = format!("&{};", name.as_ref());
+    quick_xml::escape::unescape(&raw)
+        .map(|c| c.into_owned())
+        .unwrap_or_default()
+}
+
+
 #[derive(Debug, Clone, Default)]
 pub struct Slide {
     /// 1-based 页码（与 PowerPoint 显示一致）。
@@ -26,7 +36,7 @@ pub struct Deck {
 
 impl Deck {
     /// 命中偏移 → (页码, 段落下标)，用于跳转与页签定位。
-    pub fn locate(&self, off: usize) -> Option<(usize, usize)> {
+pub fn locate(&self, off: usize) -> Option<(usize, usize)> {
         match self.para_starts.binary_search(&off) {
             Ok(i) => Some((i / 1, i)), // 占位：下面用真实映射修正
             Err(0) => Some((0, 0)),
@@ -51,10 +61,11 @@ pub fn parse(path: &str) -> Result<Deck, String> {
     // slide 文件名按数字排序（slide2 在 slide10 前）
     let mut names: Vec<String> = zip
         .file_names()
+        .filter_map(|n| n.ok())
         .filter(|n| {
             n.starts_with("ppt/slides/slide") && n.ends_with(".xml") && !n.contains("/_rels/")
         })
-        .map(|s| s.to_string())
+        .map(|s| s.into_owned())
         .collect();
     names.sort_by_key(|s| {
         s.trim_start_matches("ppt/slides/slide")
@@ -125,18 +136,18 @@ fn parse_slide_paragraphs(xml: &str) -> Vec<String> {
             Ok(Event::Start(e)) => {
                 let local = e.local_name();
                 let name = local.as_ref();
-                if name == b"p" {
+                if name == "p" {
                     in_p = true;
                     depth_p += 1;
                     cur.clear();
-                } else if name == b"t" && in_p {
+                } else if name == "t" && in_p {
                     in_t = true;
                 }
             }
             Ok(Event::End(e)) => {
                 let local = e.local_name();
                 match local.as_ref() {
-                    b"p" => {
+                    "p" => {
                         depth_p = depth_p.saturating_sub(1);
                         if depth_p == 0 {
                             in_p = false;
@@ -147,15 +158,21 @@ fn parse_slide_paragraphs(xml: &str) -> Vec<String> {
                             cur.clear();
                         }
                     }
-                    b"t" => in_t = false,
+                    "t" => in_t = false,
                     _ => {}
                 }
             }
             Ok(Event::Text(t)) => {
                 if in_t {
-                    if let Ok(s) = t.unescape() {
+                    let raw = t.into_inner();
+                    if let Ok(s) = quick_xml::escape::unescape(raw.as_ref()) {
                         cur.push_str(&s);
                     }
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if in_t {
+                    cur.push_str(&general_ref(r));
                 }
             }
             Ok(Event::Eof) | Err(_) => break,

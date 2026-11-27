@@ -1014,6 +1014,12 @@ fn try_parse_func(s: &str) -> Result<Option<(&'static str, &str, &str)>, Error> 
         None => return Ok(None),
     };
     let key = &s[..colon];
+    // 修饰符 key 必须是单个非空词：含空白说明这个冒号属于**后面的**修饰符，
+    // 当前这段是普通查询文本（GUI 文件名模式会拼出 "山东 glob:0"）。
+    // 不这样判断的话会把 "山东 glob" 整段当 key，报「未知修饰符」。
+    if key.is_empty() || key.chars().any(char::is_whitespace) {
+        return Ok(None);
+    }
     let rest = &s[colon + 1..];
     let (val, remain) = take_func_val_and_remain(rest);
     let remain = remain.trim_start();
@@ -1169,5 +1175,38 @@ fn split_top_level_bar(input: &str) -> Vec<String> {
         vec![input.to_string()]
     } else {
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trailing_modifier_after_free_text() {
+        // GUI 文件名模式：基础查询 + " glob:0"；不能把 "山东 glob" 当修饰符。
+        let q = QueryParser::parse("山东 glob:0").unwrap();
+        assert_eq!(q.name_terms, vec!["山东"]);
+        assert!(!q.glob_enabled);
+        assert!(q.content_substring.is_none());
+    }
+
+    #[test]
+    fn quoted_free_text_before_modifier() {
+        let q = QueryParser::parse("\"山东 大学\" glob:0").unwrap();
+        assert_eq!(q.name_terms, vec!["山东 大学"]);
+        assert!(!q.glob_enabled);
+    }
+
+    #[test]
+    fn modifiers_with_spaced_values_still_parse() {
+        let q = QueryParser::parse("content:\"我与青松 马春天\" glob:0").unwrap();
+        assert_eq!(q.content_substring.as_deref(), Some("我与青松 马春天"));
+        assert!(!q.glob_enabled);
+    }
+
+    #[test]
+    fn unknown_single_word_modifier_still_errors() {
+        assert!(QueryParser::parse("foo:bar").is_err());
     }
 }

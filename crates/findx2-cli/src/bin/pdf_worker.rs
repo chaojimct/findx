@@ -16,12 +16,22 @@ use std::io::{BufRead, BufReader, Read, Write};
 fn main() {
     let mut args = std::env::args();
     let _exe = args.next();
-    if args.next().as_deref() == Some("--boxes") {
-        if let Err(e) = boxes_run() {
-            eprintln!("pdf-worker boxes fatal: {e}");
-            std::process::exit(1);
+    match args.next().as_deref() {
+        Some("--boxes") => {
+            if let Err(e) = boxes_run() {
+                eprintln!("pdf-worker boxes fatal: {e}");
+                std::process::exit(1);
+            }
+            return;
         }
-        return;
+        Some("--ifilter") => {
+            if let Err(e) = ifilter_run() {
+                eprintln!("pdf-worker ifilter fatal: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        _ => {}
     }
     if let Err(e) = run() {
         eprintln!("pdf-worker fatal: {e}");
@@ -48,6 +58,47 @@ fn run() -> Result<(), String> {
             line.pop();
         }
         let text = extract_one(&pdfium, &line);
+        match text {
+            Some(t) => {
+                let b = t.into_bytes();
+                out.write_all(&(b.len() as u64).to_le_bytes())
+                    .map_err(|e| format!("stdout 写入失败: {e}"))?;
+                out.write_all(&b)
+                    .map_err(|e| format!("stdout 写入失败: {e}"))?;
+            }
+            None => {
+                out.write_all(&u64::MAX.to_le_bytes())
+                    .map_err(|e| format!("stdout 写入失败: {e}"))?;
+            }
+        }
+        out.flush()
+            .map_err(|e| format!("stdout 刷新失败: {e}"))?;
+    }
+    Ok(())
+}
+
+/// IFilter 模式（老格式 .doc/.ppt/.msg/.rtf）：协议与 PDF 文本模式相同，
+/// 路径行 → u64 LE 长度 + UTF-8 文本；失败回 `u64::MAX`。
+fn ifilter_run() -> Result<(), String> {
+    let stdin = std::io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let n = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|e| format!("stdin 读取失败: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        let raw = String::from_utf8_lossy(&line);
+        let path = std::path::Path::new(raw.as_ref());
+        let text = findx2_content::ifilter::extract(path).ok();
         match text {
             Some(t) => {
                 let b = t.into_bytes();

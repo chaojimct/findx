@@ -30,7 +30,7 @@ foreach ($blocked in @(
     throw "StageDir is an official path: $StageDir"
   }
 }
-foreach ($req in @('FindX.exe','findx2.exe','fx.exe','findx2-service.exe','FindX.installed')) {
+foreach ($req in @('FindX.exe','findx2.exe','fx.exe','findx2-service.exe','pdf-worker.exe','FindX.installed')) {
   $p = Join-Path $StageDir $req
   if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw "Stage is missing $req" }
 }

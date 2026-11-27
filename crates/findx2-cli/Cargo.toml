@@ -25,7 +25,7 @@ pinyin = ["findx2-core/pinyin"]
 findx2-core = { path = "../findx2-core" }
 findx2-content = { path = "../findx2-content" }
 findx2-ipc = { path = "../findx2-ipc" }
-pdfium-render = "0.8"
+pdfium-render = "0.9"
 serde = { version = "1", features = ["derive"] }
 chrono = "0.4"
 clap = { version = "4.5", features = ["derive"] }

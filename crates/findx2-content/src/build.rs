@@ -2,8 +2,9 @@
 //!
 //! 流水线：`plan_range_from_store`（纯内存规划，service 按 50k 分片循环调用，
 //! 扩展名/体积/目录三层预过滤，无路径拼接、无 syscall，被过滤项只计 `skipped`）
-//! + `build_from_plan`（rayon 并行抽取 IO+解析，tantivy 单线程串行写入，
-//! 1024 子批次定界内存，跨分片追加到同一 `cdir`）。
+//! + `build_from_plan`（**流水线**：专用抽取线程池并行做 IO+解析，结果经
+//! 有界队列交给入库线程写 tantivy；抽取与入库重叠，队列满即背压。
+//! 跨分片追加到同一 `cdir`）。
 //!
 //! service 在线构建不能长持 store 读锁（会饿死 USN 增量与 checkpoint），
 //! 因此拆成两步：`plan_range_from_store`（store 读锁只拿毫秒级）
@@ -55,6 +56,10 @@ pub struct BuildConfig {
     pub batch: usize,
     /// 磁盘读取上限 MB/s，0=不限。低配机默认限速，做后台好公民。
     pub read_mbps: u64,
+    /// 抽取线程数（独立线程池，与 tantivy 写入线程分开抢核）。
+    pub extract_threads: usize,
+    /// 抽取→入库 有界队列深度（背压；太大吃内存，太小空转）。
+    pub queue: usize,
 }
 
 impl BuildConfig {
@@ -69,6 +74,8 @@ impl BuildConfig {
                 heap_bytes: 512 << 20,
                 batch: 512,
                 read_mbps: 40,
+                extract_threads: 2,
+                queue: 64,
             }
         } else if cpus <= 8 {
             Self {
@@ -76,6 +83,8 @@ impl BuildConfig {
                 heap_bytes: 768 << 20,
                 batch: 1024,
                 read_mbps: 80,
+                extract_threads: 4,
+                queue: 128,
             }
         } else {
             Self {
@@ -83,6 +92,8 @@ impl BuildConfig {
                 heap_bytes: 1536 << 20,
                 batch: 1024,
                 read_mbps: 0,
+                extract_threads: 8,
+                queue: 256,
             }
         };
         if let Some(v) = std::env::var("FINDX_INDEX_THREADS")
@@ -96,6 +107,12 @@ impl BuildConfig {
             .and_then(|s| s.parse::<usize>().ok())
         {
             cfg.heap_bytes = v.max(64) << 20;
+        }
+        if let Some(v) = std::env::var("FINDX_EXTRACT_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            cfg.extract_threads = v.max(1);
         }
         if let Some(v) = std::env::var("FINDX_READ_MBPS")
             .ok()
@@ -308,11 +325,23 @@ pub fn build_from_plan(
     st: &mut BuildStats,
     mut progress: impl FnMut(&BuildStats) -> bool,
 ) -> Result<u64> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    enum BuildMsg {
+        Doc(DocMeta, String, u64),
+        Batch {
+            skipped: u64,
+            failed: u64,
+            samples: Vec<String>,
+        },
+    }
+
     const COMMIT_EVERY: u64 = 50_000;
+    const SAMPLE_PER_BATCH: usize = 16;
+
     let cfg = BuildConfig::auto();
     lower_self_priority();
-    let mut throttle = IoThrottle::new(cfg.read_mbps);
-    let existed = cdir.exists();
     let existed = cdir.exists();
     if rebuild && existed {
         std::fs::remove_dir_all(cdir).map_err(|e| Error::Io(cdir.display().to_string(), e))?;
@@ -320,112 +349,164 @@ pub fn build_from_plan(
     let fresh = rebuild || !existed;
     let cidx = open_or_create(cdir)?;
     let mut since_commit = 0u64;
-    // progress 返回 false = 调用方要求中止：跳出循环，统一在循环后清理
-    //（`drop(cidx)` 释放 mmap 后再删目录，Windows 下才能删掉）。
     let mut cancelled = false;
-    // 启动即回调一次：调用方（service）第一时间看到 extracted/skipped 开始跳动，
-    // 也让“取消”在抽取开始前就生效。返回 false 直接走统一取消清理。
+    let mut fatal: Option<Error> = None;
+
+    // 抽取专用线程池：与 tantivy 写入线程分开，IO/解析 与 倒排写入重叠。
+    let extract_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(cfg.extract_threads.max(1))
+        .thread_name(|i| format!("findx-extract-{i}"))
+        .build()
+        .map_err(|e| Error::Index(format!("抽取线程池创建失败: {e}")))?;
+
+    let cancel = AtomicBool::new(false);
+    // 有界队列：抽取快于入库时阻塞生产者（背压），不会把整盘文本堆内存。
+    let (tx, rx) = mpsc::sync_channel::<BuildMsg>(cfg.queue.max(16));
+
+    // 启动即回调一次，让调用方（service）第一时间看到状态、也让“取消”在抽取前生效。
     if !progress(st) {
         cancelled = true;
+        cancel.store(true, Ordering::Relaxed);
     }
-    for batch in items.chunks(cfg.batch) {
-        if cancelled {
-            break;
-        }
-        // 并行抽取（保序 collect）：None = 执行阶段复检跳过（文件刚好被删/改大等竞态），
-        // Some(Ok) = 待写入，Some(Err(reason)) = 抽取失败（reason 含路径，供采样）。
-        let extracted: Vec<Option<std::result::Result<(DocMeta, String, u64), String>>> = batch
-            .par_iter()
-            .map(|item| {
-                let path = Path::new(&item.path);
-                if should_extract(path).is_none() {
-                    return None;
+
+    std::thread::scope(|scope| {
+        // 生产者：分批并行抽取，结果入队。
+        // 注意必须 move：tx 的所有权随闭包一起结束，消费者才能看到通道关闭；
+        // 否则 tx 活到 scope 结束，消费者会永远等不到 EOF（实测卡死）。
+        let cancel_ref = &cancel;
+        let producer = scope.spawn(move || {
+            let mut throttle = IoThrottle::new(cfg.read_mbps);
+            for batch in items.chunks(cfg.batch) {
+                if cancel_ref.load(Ordering::Relaxed) {
+                    break;
                 }
-                // 慢文件抓现行：单文件抽取超 10 秒打一行（正常文件毫秒级）。
-                let t0 = std::time::Instant::now();
-                let r = extract_text(path);
-                let dt = t0.elapsed();
-                if dt.as_secs() >= 10 {
-                    eprintln!("[content] slow extract {:?} {}", dt, item.path);
-                }
-                match r {
-                    Ok(t) => Some(Ok((
-                        DocMeta {
-                            frn: item.frn,
-                            volume_id: item.volume_key.clone(),
-                            path: item.path.clone(),
-                            mtime: item.mtime,
-                            size: item.size,
-                        },
-                        t.text,
-                        t.raw_bytes,
-                    ))),
-                    Err(e) => Some(Err(format!("{e}"))),
-                }
-            })
-            .collect();
-        // 并行入库：`ContentIndex` 线程安全，同批 key 唯一无冲突；
-        // 计数用 reduce 汇总（无锁、无原子），顺序不保证但总量精确。
-        // 失败原因只采样前 100（路径+原因），供诊断失败构成。
-        let (ext_n, byte_n, fail_n, skip_n, mut fail_samples) = extracted
-            .par_iter()
-            .map(|slot| -> (u64, u64, u64, u64, Vec<String>) {
-                match slot {
-                    None => (0, 0, 0, 1, Vec::new()),
-                    Some(Err(reason)) => (0, 0, 1, 0, vec![reason.clone()]),
-                    Some(Ok((meta, text, raw_bytes))) => {
-                        // 慢入库抓现行：单篇超 10 秒打一行（分词/写入病态输入）。
-                        let t0 = std::time::Instant::now();
-                        let r = cidx.index_doc(meta, text);
-                        let dt = t0.elapsed();
-                        if dt.as_secs() >= 10 {
-                            eprintln!("[content] slow index {:?} {}", dt, meta.path);
+                let extracted: Vec<Option<std::result::Result<(DocMeta, String, u64), String>>> =
+                    extract_pool.install(|| {
+                        batch
+                            .par_iter()
+                            .map(|item| {
+                                let path = Path::new(&item.path);
+                                if should_extract(path).is_none() {
+                                    return None;
+                                }
+                                let t0 = std::time::Instant::now();
+                                let r = extract_text(path);
+                                let dt = t0.elapsed();
+                                if dt.as_secs() >= 10 {
+                                    eprintln!("[content] slow extract {:?} {}", dt, item.path);
+                                }
+                                match r {
+                                    Ok(t) => Some(Ok((
+                                        DocMeta {
+                                            frn: item.frn,
+                                            volume_id: item.volume_key.clone(),
+                                            path: item.path.clone(),
+                                            mtime: item.mtime,
+                                            size: item.size,
+                                        },
+                                        t.text,
+                                        t.raw_bytes,
+                                    ))),
+                                    Err(e) => Some(Err(format!("{e}"))),
+                                }
+                            })
+                            .collect()
+                    });
+
+                let mut skipped = 0u64;
+                let mut failed = 0u64;
+                let mut samples: Vec<String> = Vec::new();
+                for slot in extracted {
+                    match slot {
+                        None => skipped += 1,
+                        Some(Err(reason)) => {
+                            failed += 1;
+                            if samples.len() < SAMPLE_PER_BATCH {
+                                samples.push(reason);
+                            }
                         }
-                        match r {
-                            Ok(()) => (1, *raw_bytes, 0, 0, Vec::new()),
-                            Err(e) => (
-                                0,
-                                0,
-                                1,
-                                0,
-                                vec![format!("入库失败 {}: {e}", meta.path)],
-                            ),
+                        Some(Ok((meta, text, raw_bytes))) => {
+                            throttle.add(raw_bytes);
+                            if tx.send(BuildMsg::Doc(meta, text, raw_bytes)).is_err() {
+                                return; // 消费者已退出（取消）
+                            }
                         }
                     }
                 }
-            })
-            .reduce(
-                || (0, 0, 0, 0, Vec::new()),
-                |mut a, b| {
-                    a.0 += b.0;
-                    a.1 += b.1;
-                    a.2 += b.2;
-                    a.3 += b.3;
-                    if a.4.len() < 100 {
-                        a.4.extend(b.4.into_iter().take(100 - a.4.len()));
+                if tx
+                    .send(BuildMsg::Batch {
+                        skipped,
+                        failed,
+                        samples,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        // 消费者（主线程）：写倒排 + 汇报进度。抽取在别的线程并行推进。
+        for msg in rx {
+            match msg {
+                BuildMsg::Doc(meta, text, raw_bytes) => {
+                    let t0 = std::time::Instant::now();
+                    match cidx.index_doc(&meta, &text) {
+                        Ok(()) => {
+                            st.extracted += 1;
+                            st.bytes += raw_bytes;
+                        }
+                        Err(e) => {
+                            st.failed += 1;
+                            if st.failed_samples.len() < 100 {
+                                st.failed_samples
+                                    .push(format!("入库失败 {}: {e}", meta.path));
+                            }
+                        }
                     }
-                    a
-                },
-            );
-        st.extracted += ext_n;
-        st.bytes += byte_n;
-        st.failed += fail_n;
-        st.skipped += skip_n;
-        if st.failed_samples.len() < 100 {
-            let room = 100 - st.failed_samples.len();
-            fail_samples.truncate(room);
-            st.failed_samples.append(&mut fail_samples);
+                    let dt = t0.elapsed();
+                    if dt.as_secs() >= 10 {
+                        eprintln!("[content] slow index {:?} {}", dt, meta.path);
+                    }
+                    since_commit += 1;
+                    if since_commit >= COMMIT_EVERY {
+                        if let Err(e) = commit_retry(&cidx) {
+                            fatal = Some(e);
+                            cancel.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        since_commit = 0;
+                    }
+                }
+                BuildMsg::Batch {
+                    skipped,
+                    failed,
+                    samples,
+                } => {
+                    st.skipped += skipped;
+                    st.failed += failed;
+                    if st.failed_samples.len() < 100 {
+                        let room = 100 - st.failed_samples.len();
+                        st.failed_samples
+                            .extend(samples.into_iter().take(room));
+                    }
+                    if !progress(st) {
+                        cancel.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
         }
-        throttle.add(byte_n);
-        since_commit += ext_n;
-        if since_commit >= COMMIT_EVERY {
-            commit_retry(&cidx)?;
-            since_commit = 0;
+        // 主线程退出接收（正常结束/取消/致命错误）→ 生产者 send 失败并退出。
+        let _ = producer.join();
+    });
+
+    if let Some(e) = fatal {
+        drop(cidx);
+        if fresh {
+            let _ = std::fs::remove_dir_all(cdir);
         }
-        // 每子批次查一次取消（中止响应有界，代价一次闭包调用）。
-        if !progress(st) {
-            cancelled = true;
-        }
+        return Err(e);
     }
     if cancelled {
         drop(cidx);

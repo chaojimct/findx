@@ -118,6 +118,7 @@ Source: "{#PublishDir}\resources\*"; DestDir: "{app}\resources"; Flags: ignoreve
 Source: "{#PublishDir}\findx2.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: main
 Source: "{#PublishDir}\fx.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: main
 Source: "{#PublishDir}\findx2-service.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: main
+Source: "{#PublishDir}\pdf-worker.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: main
 Source: "{#PublishDir}\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: main
 
 [Icons]

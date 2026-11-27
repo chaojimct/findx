@@ -13,6 +13,16 @@ use quick_xml::Reader;
 use std::io::{BufReader, Read};
 use std::sync::Arc;
 
+/// `&entity;`（quick-xml 0.42 的 `Event::GeneralRef`）解析成字符串。
+fn general_ref(r: quick_xml::events::BytesRef<'_>) -> String {
+    let name = r.into_inner();
+    let raw = format!("&{};", name.as_ref());
+    quick_xml::escape::unescape(&raw)
+        .map(|c| c.into_owned())
+        .unwrap_or_default()
+}
+
+
 /// 单页表格。
 #[derive(Debug, Clone, Default)]
 pub struct Sheet {
@@ -26,7 +36,7 @@ pub struct Sheet {
 }
 
 impl Sheet {
-    pub fn cols(&self) -> usize {
+pub fn cols(&self) -> usize {
         self.rows.iter().map(|r| r.len()).max().unwrap_or(0)
     }
 }
@@ -120,10 +130,10 @@ fn sheet_names(zip: &mut zip::ZipArchive<std::fs::File>) -> Result<Vec<String>, 
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                if e.local_name().as_ref() == b"sheet" {
+                if e.local_name().as_ref() == "sheet" {
                     for a in e.attributes().flatten() {
-                        if a.key.local_name().as_ref() == b"name" {
-                            if let Ok(v) = a.unescape_value() {
+                        if a.key.local_name().as_ref() == "name" {
+                            if let Ok(v) = a.normalized_value(quick_xml::XmlVersion::Implicit1_0) {
                                 names.push(v.into_owned());
                             }
                         }
@@ -286,27 +296,27 @@ fn parse_rows<R: std::io::BufRead>(
         buf.clear();
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => match e.local_name().as_ref() {
-                b"row" => cur_row.clear(),
-                b"c" => {
+                "row" => cur_row.clear(),
+                "c" => {
                     ctype = 0;
                     is_inline = false;
                     for a in e.attributes().flatten() {
-                        if a.key.local_name().as_ref() == b"t" {
+                        if a.key.local_name().as_ref() == "t" {
                             match a.value.as_ref() {
-                                b"s" => ctype = b's',
-                                b"inlineStr" => is_inline = true,
+                                "s" => ctype = b's',
+                                "inlineStr" => is_inline = true,
                                 _ => {}
                             }
                         }
                     }
                     cell_text.clear();
                 }
-                b"v" => in_v = true,
-                b"t" if is_inline => in_is_t = true,
+                "v" => in_v = true,
+                "t" if is_inline => in_is_t = true,
                 _ => {}
             },
             Ok(Event::End(e)) => match e.local_name().as_ref() {
-                b"c" => {
+                "c" => {
                     let text = if ctype == b's' {
                         cell_text
                             .trim()
@@ -327,7 +337,7 @@ fn parse_rows<R: std::io::BufRead>(
                     in_is_t = false;
                     cell_text.clear();
                 }
-                b"row" => {
+                "row" => {
                     let r = total_rows;
                     total_rows += 1;
                     let mut row = std::mem::take(&mut cur_row);
@@ -363,15 +373,21 @@ fn parse_rows<R: std::io::BufRead>(
                         // 既不在首屏、又没命中：跳过（不再累积空行，避免 3 万个空 Vec）
                     }
                 }
-                b"v" => in_v = false,
-                b"t" => in_is_t = false,
+                "v" => in_v = false,
+                "t" => in_is_t = false,
                 _ => {}
             },
             Ok(Event::Text(t)) => {
                 if in_v || in_is_t {
-                    if let Ok(s) = t.unescape() {
+                    let raw = t.into_inner();
+                    if let Ok(s) = quick_xml::escape::unescape(raw.as_ref()) {
                         cell_text.push_str(&s);
                     }
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if in_v || in_is_t {
+                    cell_text.push_str(&general_ref(r));
                 }
             }
             Ok(Event::Eof) | Err(_) => break,

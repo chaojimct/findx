@@ -15,8 +15,10 @@ pub const RICH_MAX_XML_BYTES: usize = 64 * 1024 * 1024;
 
 /// `word/document.xml` 的 `<w:t>`、sheet/slide 的 `<t>`/`<a:t>`：后缀匹配即可，
 /// 忽略命名空间前缀差异（`w:t` vs 裸 `t`），大小写不敏感。
-fn is_text_element(name: &[u8]) -> bool {
-    name.eq_ignore_ascii_case(b"w:t") || name.eq_ignore_ascii_case(b"t") || name.eq_ignore_ascii_case(b"a:t")
+fn is_text_element(name: &str) -> bool {
+    name.eq_ignore_ascii_case("w:t")
+        || name.eq_ignore_ascii_case("t")
+        || name.eq_ignore_ascii_case("a:t")
 }
 
 /// 从 zip 包内的 XML 文件收集所有文本节点（流式，不全量建 DOM）。
@@ -50,34 +52,53 @@ fn collect_zip_xml_text(zip_path: &Path, inner_names: &[&str]) -> Result<String>
     Ok(out)
 }
 
+/// `&entity;`（quick-xml 0.42 的 `Event::GeneralRef`）解析成字符串。
+fn general_ref(r: quick_xml::events::BytesRef<'_>) -> String {
+    let name = r.into_inner();
+    let raw = format!("&{};", name.as_ref());
+    quick_xml::escape::unescape(&raw)
+        .map(|c| c.into_owned())
+        .unwrap_or_default()
+}
+
 fn collect_xml_text(xml: &str, out: &mut String) -> std::result::Result<(), String> {
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    // 不 trim：实体（&amp;）前后依赖原始空格，trim 掉就成了 "Safe &local"。
+    // 以每个 <w:t>/<a:t> 为单位收集，结束时统一压缩空白。
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut in_text = false;
+    let mut run = String::new();
     loop {
         match reader.read_event_into(&mut buf).map_err(|e| e.to_string())? {
             Event::Start(ref e) => {
-                in_text = is_text_element(e.name().as_ref());
-            }
-            Event::Empty(ref e) => {
-                let _ = is_text_element(e.name().as_ref());
-            }
-            Event::Text(e) => {
-                if in_text {
-                    if let Ok(s) = e.unescape() {
-                        let s = s.trim();
-                        if !s.is_empty() {
-                            out.push_str(&s);
-                            out.push(' ');
-                        }
-                    }
+                if is_text_element(e.name().as_ref()) {
+                    in_text = true;
+                    run.clear();
                 }
             }
-            Event::End(_) => {
-                in_text = false;
+            Event::End(ref e) => {
+                if in_text && is_text_element(e.name().as_ref()) {
+                    let s = run.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if !s.is_empty() {
+                        out.push_str(&s);
+                        out.push(' ');
+                    }
+                    run.clear();
+                    in_text = false;
+                }
+            }
+            Event::Text(e) if in_text => {
+                let raw = e.into_inner();
+                let unescaped = quick_xml::escape::unescape(raw.as_ref())
+                    .map(|c| c.into_owned())
+                    .unwrap_or_else(|_| raw.into_owned());
+                run.push_str(&unescaped);
+            }
+            Event::GeneralRef(r) if in_text => {
+                run.push_str(&general_ref(r));
             }
             Event::Eof => break,
             _ => {}
@@ -218,8 +239,9 @@ pub fn extract_pptx(path: &Path) -> Result<String> {
         .map_err(|e| Error::Extract(path.display().to_string(), format!("zip 打开失败: {e}")))?;
     let slides: Vec<String> = zip
         .file_names()
+        .filter_map(|n| n.ok())
         .filter(|n| n.starts_with("ppt/slides/slide") || n.starts_with("ppt/notesSlides/notesSlide"))
-        .map(|s| s.to_owned())
+        .map(|s| s.into_owned())
         .collect();
     if slides.is_empty() {
         return Err(Error::Extract(
@@ -460,5 +482,23 @@ mod tests {
             std::fs::write(&p, data).unwrap();
             assert!(extract_pdf(&p).is_err(), "case {i}");
         }
+    }
+
+    #[test]
+    fn docx_xml_entities_resolved() {
+        let mut out = String::new();
+        collect_xml_text(
+            "<w:document><w:p><w:r><w:t>Safe &amp; local</w:t></w:r></w:p></w:document>",
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "Safe & local");
+    }
+
+    #[test]
+    fn docx_xml_numeric_refs_resolved() {
+        let mut out = String::new();
+        collect_xml_text("<w:t>&#x4E2D;文</w:t>", &mut out).unwrap();
+        assert_eq!(out.trim(), "中文");
     }
 }

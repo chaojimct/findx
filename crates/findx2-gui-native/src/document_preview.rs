@@ -58,6 +58,7 @@ fn office_text<R: Read + Seek>(file: R, ext: &str) -> Result<String, String> {
     }
     let mut names: Vec<_> = zip
         .file_names()
+        .filter_map(|n| n.ok())
         .filter(|n| match ext {
             "pptx" => {
                 n.starts_with("ppt/slides/slide") && n.ends_with(".xml") && !n.contains("/_rels/")
@@ -65,7 +66,7 @@ fn office_text<R: Read + Seek>(file: R, ext: &str) -> Result<String, String> {
             "xlsx" => n.starts_with("xl/worksheets/sheet") && n.ends_with(".xml"),
             _ => false,
         })
-        .map(str::to_owned)
+        .map(|s| s.into_owned())
         .collect();
     // Numeric ordering: slide2 before slide10.
     names.sort_by_key(|s| {
@@ -79,7 +80,11 @@ fn office_text<R: Read + Seek>(file: R, ext: &str) -> Result<String, String> {
         return Err("文档没有可提取的工作表或幻灯片".into());
     }
     let mut shared = Vec::new();
-    if ext == "xlsx" && zip.file_names().any(|s| s == "xl/sharedStrings.xml") {
+    if ext == "xlsx"
+        && zip
+            .file_names()
+            .any(|s| s.ok().is_some_and(|s| s == "xl/sharedStrings.xml"))
+    {
         shared = shared_strings(&part(&mut zip, "xl/sharedStrings.xml")?)?;
     }
     let mut out = String::new();
@@ -129,22 +134,23 @@ fn xml_text(xml: &str) -> Result<String, String> {
     loop {
         match reader.read_event().map_err(|e| e.to_string())? {
             Event::Start(e) => {
-                if e.local_name().as_ref() == b"t" {
+                if e.local_name().as_ref() == "t" {
                     in_text = true;
                 }
             }
             Event::End(e) => match e.local_name().as_ref() {
-                b"t" => in_text = false,
-                b"p" | b"tr" => out.push('\n'),
-                b"tc" => out.push('\t'),
+                "t" => in_text = false,
+                "p" | "tr" => out.push('\n'),
+                "tc" => out.push('\t'),
                 _ => {}
             },
             Event::Empty(e) => match e.local_name().as_ref() {
-                b"tab" => out.push('\t'),
-                b"br" | b"cr" => out.push('\n'),
+                "ta" => out.push('\t'),
+                "br" | "cr" => out.push('\n'),
                 _ => {}
             },
-            Event::Text(e) if in_text => out.push_str(&e.unescape().map_err(|e| e.to_string())?),
+            Event::Text(e) if in_text => out.push_str(&unescape_text(e)?),
+            Event::GeneralRef(r) if in_text => out.push_str(&general_ref(r)),
             Event::DocType(_) => return Err("不支持含 DTD 的文档".into()),
             Event::Eof => break,
             _ => {}
@@ -155,6 +161,22 @@ fn xml_text(xml: &str) -> Result<String, String> {
     }
     Ok(capped(out))
 }
+/// `&entity;`（quick-xml 0.42 的 `Event::GeneralRef`）解析成字符串。
+fn general_ref(r: quick_xml::events::BytesRef<'_>) -> String {
+    let name = r.into_inner();
+    let raw = format!("&{};", name.as_ref());
+    quick_xml::escape::unescape(&raw)
+        .map(|c| c.into_owned())
+        .unwrap_or_default()
+}
+
+fn unescape_text(e: quick_xml::events::BytesText<'_>) -> Result<String, String> {
+    let raw = e.into_inner();
+    Ok(quick_xml::escape::unescape(raw.as_ref())
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| raw.into_owned()))
+}
+
 fn shared_strings(xml: &str) -> Result<Vec<String>, String> {
     let mut reader = Reader::from_str(xml);
     let mut result = Vec::new();
@@ -163,16 +185,17 @@ fn shared_strings(xml: &str) -> Result<Vec<String>, String> {
     loop {
         match reader.read_event().map_err(|e| e.to_string())? {
             Event::Start(e) => match e.local_name().as_ref() {
-                b"si" => item.clear(),
-                b"t" => text = true,
+                "si" => item.clear(),
+                "t" => text = true,
                 _ => {}
             },
             Event::End(e) => match e.local_name().as_ref() {
-                b"si" => result.push(item.clone()),
-                b"t" => text = false,
+                "si" => result.push(item.clone()),
+                "t" => text = false,
                 _ => {}
             },
-            Event::Text(e) if text => item.push_str(&e.unescape().map_err(|e| e.to_string())?),
+            Event::Text(e) if text => item.push_str(&unescape_text(e)?),
+            Event::GeneralRef(r) if text => item.push_str(&general_ref(r)),
             Event::DocType(_) => return Err("不支持含 DTD 的文档".into()),
             Event::Eof => break,
             _ => {}
@@ -190,26 +213,26 @@ fn sheet_text(xml: &str, shared: &[String]) -> Result<String, String> {
     loop {
         match reader.read_event().map_err(|e| e.to_string())? {
             Event::Start(e) => match e.local_name().as_ref() {
-                b"c" => {
+                "c" => {
                     typ.clear();
                     address.clear();
                     value.clear();
                     for a in e.attributes() {
                         let a = a.map_err(|e| e.to_string())?;
-                        if a.key.as_ref() == b"t" {
-                            typ = a.unescape_value().map_err(|e| e.to_string())?.into_owned();
+                        if a.key.as_ref() == "t" {
+                            typ = a.normalized_value(quick_xml::XmlVersion::Implicit1_0).map_err(|e| e.to_string())?.into_owned();
                         }
-                        if a.key.as_ref() == b"r" {
-                            address = a.unescape_value().map_err(|e| e.to_string())?.into_owned();
+                        if a.key.as_ref() == "r" {
+                            address = a.normalized_value(quick_xml::XmlVersion::Implicit1_0).map_err(|e| e.to_string())?.into_owned();
                         }
                     }
                 }
-                b"v" | b"t" => in_value = true,
+                "v" | "t" => in_value = true,
                 _ => {}
             },
             Event::End(e) => match e.local_name().as_ref() {
-                b"v" | b"t" => in_value = false,
-                b"c" => {
+                "v" | "t" => in_value = false,
+                "c" => {
                     let val = if typ == "s" {
                         value
                             .parse::<usize>()
@@ -222,10 +245,11 @@ fn sheet_text(xml: &str, shared: &[String]) -> Result<String, String> {
                     };
                     out.push_str(&format!("{address}: {val}\t"));
                 }
-                b"row" => out.push('\n'),
+                "row" => out.push('\n'),
                 _ => {}
             },
-            Event::Text(e) if in_value => value.push_str(&e.unescape().map_err(|e| e.to_string())?),
+            Event::Text(e) if in_value => value.push_str(&unescape_text(e)?),
+            Event::GeneralRef(r) if in_value => value.push_str(&general_ref(r)),
             Event::DocType(_) => return Err("不支持含 DTD 的文档".into()),
             Event::Eof => break,
             _ => {}
@@ -380,7 +404,7 @@ pub fn pdf_page(
     if count == 0 {
         return Err("此 PDF 没有可显示的页面".into());
     }
-    let idx = page_index.min(count.saturating_sub(1)) as u16;
+    let idx = page_index.min(count.saturating_sub(1)) as i32;
     let page = document
         .pages()
         .get(idx)
@@ -396,7 +420,9 @@ pub fn pdf_page(
     let bitmap = page
         .render_with_config(&config)
         .map_err(|e| format!("PDF 渲染失败：{e}"))?;
-    let img = bitmap.as_image();
+    let img = bitmap
+        .as_image()
+        .map_err(|e| format!("PDF 位图转换失败：{e}"))?;
     let mut png = Vec::new();
     {
         let mut cursor = std::io::Cursor::new(&mut png);

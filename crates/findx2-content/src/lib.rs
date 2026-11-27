@@ -7,6 +7,8 @@
 
 pub mod error;
 pub mod extract;
+pub mod ifilter;
+pub mod ifilter_pool;
 pub mod index;
 pub mod office;
 pub mod pdf_boxes;

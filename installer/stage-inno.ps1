@@ -26,7 +26,7 @@ foreach ($candidate in $candidates) {
 }
 if (-not $rel) { throw "Missing native GUI in requested build directories; requires findx2-gui-native.exe (pinyin default feature)." }
 $files=@(@{source=$main;name='FindX.exe'})
-foreach ($name in @('findx2.exe','fx.exe','findx2-service.exe')) {
+foreach ($name in @('findx2.exe','fx.exe','findx2-service.exe','pdf-worker.exe')) {
   $file=Join-Path $rel $name
   if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing companion in SAME build directory: $file" }
   $files+=@{source=$file;name=$name}

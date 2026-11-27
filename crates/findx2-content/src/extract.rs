@@ -18,6 +18,8 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "txt", "md", "markdown", "csv", "log", "ini", "cfg", "env", "properties", "text",
     // M1 富格式（专用抽取器，见 office.rs）
     "docx", "xlsx", "xls", "pptx", "pdf",
+    // 老格式 / 邮件 / RTF：走系统 IFilter（ifilter_pool，worker 进程隔离）
+    "doc", "ppt", "msg", "rtf",
     // 代码
     "rs", "toml", "json", "json5", "xml", "html", "htm", "xhtml", "js", "mjs", "cjs", "ts",
     "mts", "cts", "jsx", "tsx", "css", "scss", "less", "sass", "py", "pyi", "go", "java",
@@ -136,11 +138,44 @@ pub fn extract_text(path: &Path) -> Result<ExtractedText> {
                 text,
             });
         }
+        "doc" | "ppt" | "rtf" => {
+            let text = crate::ifilter_pool::extract(path)?;
+            return Ok(ExtractedText {
+                raw_bytes: text.len() as u64,
+                text,
+            });
+        }
+        "msg" => {
+            // .msg 有两种：Outlook 二进制邮件，以及 Tcl/系统里的纯文本消息目录。
+            // 文本目录 IFilter 不认识（会直接失败），先嗅探再分流。
+            if is_probably_text(path) {
+                return extract_plain(path);
+            }
+            let text = crate::ifilter_pool::extract(path)?;
+            return Ok(ExtractedText {
+                raw_bytes: text.len() as u64,
+                text,
+            });
+        }
         _ => {}
     }
-    let raw = std::fs::read(path).map_err(|e| {
-        Error::Io(path.display().to_string(), e)
-    })?;
+    extract_plain(path)
+}
+
+/// 头 4KB 无 NUL 视为文本（Tcl .msg / 误标扩展名的文件）。
+fn is_probably_text(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 4096];
+    let n = f.read(&mut buf).unwrap_or(0);
+    !buf[..n].contains(&0)
+}
+
+/// 纯文本/代码路径：整读 → UTF-8 / GB18030 / lossy 三级解码。
+fn extract_plain(path: &Path) -> Result<ExtractedText> {
+    let raw = std::fs::read(path).map_err(|e| Error::Io(path.display().to_string(), e))?;
     if raw.len() as u64 > MAX_EXTRACT_BYTES {
         return Err(Error::Extract(
             path.display().to_string(),
