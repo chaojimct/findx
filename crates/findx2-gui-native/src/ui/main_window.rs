@@ -327,7 +327,9 @@ pub struct MainWindow {
     match_list_h: f32,
     split_drag: Option<(f32, f32)>,
     /// docx 块模型（命中上下文富文本自绘：纯 Rust 解析，零外部进程）。
-    docx_doc: Option<crate::docx_blocks::DocxDoc>,
+    docx_doc: Option<std::sync::Arc<crate::docx_blocks::DocxDoc>>,
+    /// docx 块的高变高虚拟列表（没有段数上限）。
+    docx_list: gpui_kit::ListState,
     /// docx 命中区间（docx.plain 字节坐标，由命中词在 plain 内字面定位）。
     docx_hits: Vec<std::ops::Range<usize>>,
     /// docx 解析代（防止旧解析覆盖新目标）。
@@ -706,6 +708,11 @@ impl MainWindow {
             match_list_h: 220.0,
             split_drag: None,
             docx_doc: None,
+            docx_list: gpui_kit::ListState::new(
+                0,
+                gpui_kit::ListAlignment::Top,
+                gpui::px(600.),
+            ),
             docx_hits: Vec::new(),
             docx_gen: 0,
             hit_scroll: gpui_kit::ScrollHandle::new(),
@@ -2496,12 +2503,9 @@ impl MainWindow {
         if let Some(doc) = self.docx_doc.as_ref() {
             if let Some(off) = self.docx_hits.get(n).map(|r| r.start) {
                 if let Some(block) = doc.block_of_offset(off) {
-                    // docx 是「按焦点窗口渲染」的：设置 docx_focus 后只渲染该块
-                    // 附近的窗口，所以只需把内容滚回窗口顶部（hit_scroll 的子元素
-                    // 索引与文档绝对块号不再一一对应，不能再 scroll_to_item）。
                     self.docx_focus = Some(block);
-                    self.hit_scroll
-                        .set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
+                    // 虚拟列表：按块号直接滚过去（没有 5000 段/窗口限制）。
+                    self.docx_list.scroll_to_reveal_item(block);
                 }
             }
             return;
@@ -3940,6 +3944,8 @@ impl MainWindow {
                 }
                 match parsed {
                     Ok(Ok(doc)) => {
+                        let doc = std::sync::Arc::new(doc);
+                        this.docx_list.reset(doc.blocks.len());
                         this.docx_doc = Some(doc);
                         this.recompute_docx_hits(cx);
                         cx.notify();
@@ -4138,6 +4144,7 @@ impl MainWindow {
         self.docx_doc = None;
         self.docx_hits.clear();
         self.docx_focus = None;
+        self.docx_list.reset(0);
         let ext_l = std::path::Path::new(&hit.path)
             .extension()
             .and_then(|e| e.to_str())
@@ -4620,6 +4627,45 @@ impl MainWindow {
         }
         cx.notify();
     }
+    /// docx 正文：高变高虚拟列表（ListState），按需渲染可见段，没有段数上限。
+    fn docx_list_view(&self, tokens: FindxTokens) -> AnyElement {
+        let Some(doc) = self.docx_doc.clone() else {
+            return div().into_any_element();
+        };
+        let hits = std::rc::Rc::new(self.docx_hits.clone());
+        let list = gpui_kit::list(self.docx_list.clone(), move |ix, _w, _cx| {
+            let hits = hits.clone();
+            crate::ui::rich_view::render_docx_block(doc.as_ref(), ix, &hits, &tokens)
+        });
+        div()
+            .relative()
+            .size_full()
+            .min_h_0()
+            .min_w_0()
+            .child(list)
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .right(px(0.))
+                    .bottom(px(0.))
+                    .w(px(12.))
+                    .child(
+                        Scrollbar::vertical(&self.docx_list)
+                            .viewport_from_layout()
+                            .mode(ScrollbarMode::Always)
+                            .styles(|styles| {
+                                styles
+                                    .track(|style| style.bg(tokens.border_soft))
+                                    .thumb(|style| style.bg(tokens.text_tertiary))
+                                    .thumb_hover(|style| style.bg(tokens.text_secondary))
+                                    .thumb_active(|style| style.bg(tokens.accent))
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// 预览视图条：左侧当前视图的操作（PDF 页码/缩放），右侧「系统版式」开关。
     fn render_view_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let ext = self
@@ -5225,6 +5271,9 @@ impl MainWindow {
             // 视图条：PDF 页码/缩放 放左边，「系统版式」开关固定右边。
             .when_some(self.render_view_bar(cx), |view, bar| view.child(bar))
             .child(if self.hit_text_active() {
+                if self.docx_doc.is_some() {
+                    self.docx_list_view(tokens)
+                } else {
                 v_flex()
                     .flex_1()
                     .min_h_0()
@@ -5567,6 +5616,8 @@ impl MainWindow {
                         }),
                     )
                     .into_any_element()
+            
+                }
             } else if self.preview.pdf.is_some() {
                 div()
                     .id("pdf-page-scroll")

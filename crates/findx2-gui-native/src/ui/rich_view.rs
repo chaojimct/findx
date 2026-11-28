@@ -20,8 +20,13 @@ use crate::theme::FindxTokens;
 
 /// 正文基准字号（px）。Word 默认 12pt ≈ 16px（96 DPI 逻辑像素）。
 const BASE_PX: f32 = 16.0;
-/// 渲染块数上限（GPUI 元素树过大影响布局性能；超出提示截断）。
-const MAX_RENDER_BLOCKS: usize = 600;
+/// 正常文档一次渲染整篇；超过这个块数才退回“按命中窗口渲染”。
+/// 之前固定 600 块 + 永远按焦点窗口渲染，导致打开 docx 永远是
+/// 「（前面还有 N 段，已按命中定位）」的半篇视图。
+pub const DOCX_FULL_BLOCKS: usize = 5000;
+
+/// 窗口模式下，命中块之后渲染多少块。
+const WINDOW_AFTER: usize = 80;
 
 /// 标题字号（px），按级别 1..=6。
 fn heading_px(level: u8) -> f32 {
@@ -41,6 +46,23 @@ fn heading_px(level: u8) -> f32 {
 /// 命中总能落在可见区第一屏——比依赖 GPUI 滚动 API 可靠（实测 `set_offset`
 /// 会被内部滚动状态覆盖）。点击列表行/翻页只需切换 focus 并重绘。
 /// `hit_ranges` 是 `doc.plain` 的字节区间（来自 match_spans）。
+/// 渲染 docx 的单个块（虚拟列表用：ListState 按需调用，不一次铺全文）。
+pub fn render_docx_block(
+    doc: &DocxDoc,
+    index: usize,
+    hit_ranges: &[Range<usize>],
+    tokens: &FindxTokens,
+) -> AnyElement {
+    let Some(block) = doc.blocks.get(index) else {
+        return div().into_any_element();
+    };
+    let start = doc.block_starts.get(index).copied().unwrap_or(0);
+    match block {
+        DocxBlock::Paragraph(p) => render_paragraph(p, start, hit_ranges, tokens),
+        DocxBlock::Table(t) => render_table(t, start, hit_ranges, tokens),
+    }
+}
+
 pub fn render_docx(
     doc: &DocxDoc,
     hit_ranges: &[Range<usize>],
@@ -50,15 +72,17 @@ pub fn render_docx(
     // 命中窗口上方的上下文行数：只留 2 块，保证「窗口顶部」就能看到命中
     // （原来是 12 块，长段落时命中会被挤到第一屏之外）。
     const WINDOW_BEFORE: usize = 2;
-    const WINDOW_AFTER: usize = 80;
 
     let total = doc.blocks.len();
-    let (lo, hi) = match focus_block {
-        Some(f) if total > WINDOW_BEFORE + WINDOW_AFTER => {
-            let lo = f.saturating_sub(WINDOW_BEFORE);
-            (lo, (lo + WINDOW_BEFORE + WINDOW_AFTER).min(total))
-        }
-        _ => (0, total.min(MAX_RENDER_BLOCKS)),
+    // 普通文档：整篇渲染（和 Word/预览器一样从第一段开始，不再半篇 + banner）。
+    // 超过 DOCX_FULL_BLOCKS 的巨型文档才退到「命中窗口」，避免一次铺太多元素。
+    let (lo, hi) = if total <= DOCX_FULL_BLOCKS {
+        (0, total)
+    } else if let Some(f) = focus_block {
+        let lo = f.saturating_sub(WINDOW_BEFORE);
+        (lo, (lo + WINDOW_BEFORE + WINDOW_AFTER).min(total))
+    } else {
+        (0, DOCX_FULL_BLOCKS)
     };
     let truncated_head = lo > 0;
     let truncated_tail = hi < total;
@@ -77,16 +101,7 @@ pub fn render_docx(
     }
 
     for i in lo..hi {
-        let block = &doc.blocks[i];
-        let start = doc.block_starts.get(i).copied().unwrap_or(0);
-        match block {
-            DocxBlock::Paragraph(p) => {
-                out.push(render_paragraph(p, start, hit_ranges, tokens));
-            }
-            DocxBlock::Table(t) => {
-                out.push(render_table(t, start, hit_ranges, tokens));
-            }
-        }
+        out.push(render_docx_block(doc, i, hit_ranges, tokens));
     }
 
     if truncated_tail {
@@ -96,18 +111,9 @@ pub fn render_docx(
                 .py_2()
                 .text_xs()
                 .text_color(tokens.text_tertiary)
-                .child(format!("（后面还有 {} 段）", total - hi))
-                .into_any_element(),
-        );
-    } else if total > MAX_RENDER_BLOCKS && focus_block.is_none() {
-        out.push(
-            div()
-                .px_3()
-                .py_2()
-                .text_sm()
-                .text_color(tokens.text_secondary)
                 .child(format!(
-                    "（已渲染前 {MAX_RENDER_BLOCKS} 段；点命中列表可定位到后面）"
+                    "（后面还有 {} 段；点命中列表可定位到后面）",
+                    total - hi
                 ))
                 .into_any_element(),
         );
