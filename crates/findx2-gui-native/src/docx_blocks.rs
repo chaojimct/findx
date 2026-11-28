@@ -141,16 +141,152 @@ pub fn parse_bytes(raw: &[u8]) -> Result<DocxDoc, String> {
     parse_document(&doc)
 }
 
-/// 老式 .doc（Word 97-2003）：rwml 纯 Rust 解析 → 转成 docx 字节 →
-/// 复用既有的 docx 块模型/渲染器（段落、run 样式、表格、标题、列表）。
+/// 老式 .doc（Word 97-2003）：rwml 纯 Rust 解析 → 直接把 `DocModel` 映射成
+/// 我们的块模型（段落、run 样式、表格、标题、列表），不再绕 `to_docx()` 重新
+/// 打包 OOXML 再解一遍（省 ~0.5s / 十几 MB 中间分配）。
 pub fn parse_legacy_doc(path: &str) -> Result<DocxDoc, String> {
+    let t0 = std::time::Instant::now();
     let raw = std::fs::read(path).map_err(|e| e.to_string())?;
     let legacy = rwml::Document::open(&raw).map_err(|e| format!("doc 解析失败: {e}"))?;
-    let docx = legacy.to_docx();
-    if docx.is_empty() {
-        return Err("doc 转换失败：空文档".into());
+    let model = legacy.model();
+
+    let mut out = DocxDoc::default();
+    let mut plain = String::new();
+    for block in &model.blocks {
+        if out.blocks.len() >= MAX_BLOCKS || plain.len() >= MAX_PLAIN {
+            out.truncated = true;
+            break;
+        }
+        match block {
+            rwml::Block::Paragraph(p) => {
+                let para = convert_rwml_paragraph(p);
+                if para.is_empty() {
+                    continue;
+                }
+                out.block_starts.push(plain.len());
+                plain.push_str(&para.text());
+                plain.push('\n');
+                out.blocks.push(DocxBlock::Paragraph(para));
+            }
+            rwml::Block::Table(t) => {
+                let table = convert_rwml_table(t);
+                if table.rows.is_empty() {
+                    continue;
+                }
+                out.block_starts.push(plain.len());
+                for row in &table.rows {
+                    for cell in row {
+                        for p in &cell.paragraphs {
+                            plain.push_str(&p.text());
+                            plain.push(' ');
+                        }
+                    }
+                    plain.push('\n');
+                }
+                out.blocks.push(DocxBlock::Table(table));
+            }
+            // 图片/图表暂不渲染；分页/分节忽略（连续视图）。
+            rwml::Block::Image(_) | rwml::Block::Chart(_) => {}
+            rwml::Block::PageBreak | rwml::Block::SectionBreak(_) => {}
+        }
     }
-    parse_bytes(&docx)
+    if out.blocks.is_empty() {
+        return Err("doc 没有可显示的文本".into());
+    }
+    out.plain = plain;
+    {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "[doc] {} blocks={} plain={}B in {:?}",
+            path,
+            out.blocks.len(),
+            out.plain.len(),
+            t0.elapsed()
+        );
+    }
+    Ok(out)
+}
+
+/// rwml 段落 → 我们自己的段落模型（run 样式、对齐、标题、列表、间距）。
+fn convert_rwml_paragraph(p: &rwml::Paragraph) -> StyledParagraph {
+    let mut sp = StyledParagraph {
+        align: match p.props.align {
+            rwml::Align::Left => Align::Left,
+            rwml::Align::Center => Align::Center,
+            rwml::Align::Right => Align::Right,
+            rwml::Align::Justify => Align::Both,
+        },
+        heading: p.props.heading_level.map(|l| l.clamp(1, 6)),
+        ..Default::default()
+    };
+    if let Some(list) = p.props.list.as_ref() {
+        sp.list_level = Some(list.level.min(8));
+        sp.list_ordered = list.ordered;
+    }
+    if let Some(v) = p.props.spacing.before_pt {
+        sp.space_before = v.max(0.0);
+    }
+    if let Some(v) = p.props.spacing.after_pt {
+        sp.space_after = v.max(0.0);
+    }
+    if let Some(v) = p.props.spacing.line_pct {
+        sp.line_spacing = v;
+    }
+    if let Some(v) = p.props.indent.left_pt {
+        sp.indent_left = v;
+    }
+    if let Some(v) = p.props.indent.first_line_pt {
+        sp.indent_first = v;
+    }
+    sp.runs = p
+        .runs
+        .iter()
+        .filter(|r| !r.text.is_empty())
+        .map(|r| StyledRun {
+            text: r.text.clone(),
+            bold: r.props.bold,
+            italic: r.props.italic,
+            underline: r.props.underline,
+            size_pt: r
+                .props
+                .size_half_pt
+                .map(|h| h as f32 / 2.0)
+                .unwrap_or(0.0),
+            color: r
+                .props
+                .color
+                .as_ref()
+                .map(|c| ((c.r as u32) << 16) | ((c.g as u32) << 8) | c.b as u32),
+        })
+        .collect();
+    sp
+}
+
+fn convert_rwml_table(t: &rwml::Table) -> TableBlock {
+    let mut rows = Vec::new();
+    for row in &t.rows {
+        let mut cells = Vec::new();
+        for cell in &row.cells {
+            let paragraphs: Vec<StyledParagraph> = cell
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    rwml::Block::Paragraph(p) => Some(convert_rwml_paragraph(p)),
+                    _ => None,
+                })
+                .collect();
+            cells.push(TableCell {
+                paragraphs,
+                colspan: cell.col_span.max(1) as usize,
+            });
+        }
+        rows.push(cells);
+    }
+    TableBlock {
+        rows,
+        col_weights: t.col_widths_pct.clone(),
+    }
 }
 
 fn parse_document(doc: &Document) -> Result<DocxDoc, String> {
