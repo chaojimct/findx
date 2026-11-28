@@ -4673,7 +4673,17 @@ impl MainWindow {
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .child(list)
+            // 正文左右留白：左 12px，右侧给滚动条留 14px（12px 条 + 2px 间隙），
+            // 这样文字不会压在滚动条下面，左右观感基本对称。
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(12.))
+                    .bottom(px(0.))
+                    .right(px(14.))
+                    .child(list),
+            )
             .child(
                 div()
                     .absolute()
