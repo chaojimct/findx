@@ -5412,22 +5412,36 @@ impl MainWindow {
                                         // 拖横向滚动条时 GPUI 不会重跑 render，这里在
                                         // 鼠标移动/滚轮时检测偏移变化并主动重绘。
                                         .on_mouse_move(cx.listener(|this, _, _, cx| {
+                                            let max = this
+                                                .sheet_hscroll
+                                                .max_offset()
+                                                .x
+                                                .as_f32()
+                                                .max(0.0);
                                             let hx = this
                                                 .sheet_hscroll
                                                 .offset()
                                                 .x
-                                                .as_f32();
+                                                .as_f32()
+                                                .clamp(-max, 0.0);
                                             if (hx - this.sheet_hx_seen).abs() > 0.5 {
                                                 this.sheet_hx_seen = hx;
                                                 cx.notify();
                                             }
                                         }))
                                         .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                                            let max = this
+                                                .sheet_hscroll
+                                                .max_offset()
+                                                .x
+                                                .as_f32()
+                                                .max(0.0);
                                             let hx = this
                                                 .sheet_hscroll
                                                 .offset()
                                                 .x
-                                                .as_f32();
+                                                .as_f32()
+                                                .clamp(-max, 0.0);
                                             if (hx - this.sheet_hx_seen).abs() > 0.5 {
                                                 this.sheet_hx_seen = hx;
                                                 cx.notify();

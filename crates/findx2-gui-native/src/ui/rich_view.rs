@@ -205,7 +205,13 @@ pub fn render_sheet(
     let cols = sheet.cols().max(1);
     let row_h = 22.0;
     // 横向偏移：行号列用 -hx 反向补偿，视觉上固定在最左侧。
-    let hx = hscroll.offset().x.as_f32();
+    // 必须夹紧到 [−max, 0]：滚到最右继续滚时会有越界/回弹，直接用原始
+    // offset 会把行号列拖着来回闪。
+    let hx = {
+        let raw = hscroll.offset().x.as_f32();
+        let max = hscroll.max_offset().x.as_f32();
+        raw.clamp(-max.max(0.0), 0.0)
+    };
 
     // 列标行（固定不滚动）
     let mut head = h_flex()
