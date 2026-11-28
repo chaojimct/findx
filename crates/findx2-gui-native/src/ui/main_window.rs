@@ -4632,14 +4632,32 @@ impl MainWindow {
         let Some(doc) = self.docx_doc.clone() else {
             return div().into_any_element();
         };
+        // 渲染前保证列表项数与文档块数一致（解析完成/换文件/reset 时机都可能错开）。
+        if self.docx_list.item_count() != doc.blocks.len() {
+            self.docx_list.reset(doc.blocks.len());
+        }
         let hits = std::rc::Rc::new(self.docx_hits.clone());
         let list = gpui_kit::list(self.docx_list.clone(), move |ix, _w, _cx| {
             let hits = hits.clone();
-            crate::ui::rich_view::render_docx_block(doc.as_ref(), ix, &hits, &tokens)
-        });
+            // 每个 item 包一层 w_full 行（与 gpui-component 的 message_scroller
+            // 用法一致）；直接把段落元素交给 list 时，行宽可能塌成 0。
+            div()
+                .w_full()
+                .min_w_0()
+                .child(crate::ui::rich_view::render_docx_block(
+                    doc.as_ref(),
+                    ix,
+                    &hits,
+                    &tokens,
+                ))
+                .into_any_element()
+        })
+        // List 必须显式给满尺寸，否则在 flex 列里高度塌成 0（只闪一下）。
+        .size_full()
+        .min_h_0();
         div()
             .relative()
-            .size_full()
+            .flex_1()
             .min_h_0()
             .min_w_0()
             .child(list)
