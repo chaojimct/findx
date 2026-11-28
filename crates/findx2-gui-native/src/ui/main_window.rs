@@ -2672,7 +2672,8 @@ impl MainWindow {
             })
             .and_then(|e| e.to_str().map(|s| s.to_string()))
             .unwrap_or_default();
-        let is_docx = ext == "docx";
+        // .doc 也走 docx 块模型（rwml 直读），命中列表与高亮共用 docx_hits。
+        let is_docx = matches!(ext.as_str(), "docx" | "doc");
         let is_sheet = matches!(ext.as_str(), "xlsx" | "xlsm" | "xls");
         let is_md = matches!(ext.as_str(), "md" | "markdown");
         let is_ppt = matches!(ext.as_str(), "pptx" | "ppt");
@@ -2737,6 +2738,16 @@ impl MainWindow {
             let single = uniq.len() <= 1;
             let rs = self.docx_hit_rows();
             let total = rs.len();
+            {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[list] docx rows={} hits={} ext={}",
+                    total,
+                    self.docx_hits.len(),
+                    ext
+                );
+            }
             let rows = rs
                 .into_iter()
                 .enumerate()
