@@ -384,6 +384,8 @@ pub struct MainWindow {
     sheet_hx_seen: f32,
     /// 是否在用系统版式（外部 IPreviewHandler）。默认 false：只能手动点按钮进入。
     system_preview: bool,
+    /// 内容模型（docx/md/xlsx/pptx）解析中：显示 loading，而不是先把抽取文本闪一下。
+    content_loading: bool,
     /// PDF 命中点页号缓存：(entry_idx, search_gen, pages)。
     pdf_hit_pages: Option<(u32, u64, std::rc::Rc<Vec<u32>>)>,
     /// 页号表还没回来时，等回来再跳的 (entry_idx, 命中序号)。
@@ -741,6 +743,7 @@ impl MainWindow {
             sheet_scroll_to: None,
             sheet_hx_seen: 0.0,
             system_preview: false,
+            content_loading: false,
             pdf_hit_pages: None,
             pdf_jump_pending: None,
             pdf_scroll: gpui_kit::ScrollHandle::new(),
@@ -3369,6 +3372,7 @@ impl MainWindow {
         self.deck = None;
         self.deck_hits.clear();
         self.sheet_selected = None;
+        self.content_loading = true;
         let q = self.effective_query(cx);
         let needles = crate::docx_blocks::content_needles_of(&q);
         let model_gen_at_req = self.model_gen;
@@ -3382,6 +3386,7 @@ impl MainWindow {
                 if this.model_gen != model_gen_at_req {
                     return;
                 }
+                this.content_loading = false;
                 if let Ok(Ok(deck)) = parsed {
                     this.deck_hits = crate::docx_blocks::match_hits_multi(&deck.plain, &needles);
                     this.deck = Some(deck);
@@ -3399,6 +3404,7 @@ impl MainWindow {
     /// 避免「3 万格 × N 词 × 逐字拼音」把加载拖慢一个数量级。
     fn fetch_sheet(&mut self, path: String, cx: &mut Context<Self>) {
         self.sheet_book = None;
+        self.content_loading = true;
         // 命中词与索引同口径：只取 content: 里的空格分隔词（不再扩二元组）。
         let keep_words = {
             let q = self.effective_query(cx);
@@ -3423,6 +3429,7 @@ impl MainWindow {
                 if this.model_gen != model_gen_at_req {
                     return;
                 }
+                this.content_loading = false;
                 if let Ok(Ok(mut wb)) = parsed {
                     let words = this.hit_words(cx);
                     crate::xlsx_blocks::recompute_hits(&mut wb, &words);
@@ -3443,6 +3450,7 @@ impl MainWindow {
                 if this.model_gen != model_gen_at_req {
                     return;
                 }
+                this.content_loading = false;
                 if let Ok(Ok(mut wb)) = full {
                     let words = this.hit_words(cx);
                     crate::xlsx_blocks::recompute_hits(&mut wb, &words);
@@ -3881,6 +3889,7 @@ impl MainWindow {
         self.md_doc = None;
         self.md_hits.clear();
         self.sheet_book = None;
+        self.content_loading = true;
         let model_gen_at_req = self.model_gen;
         cx.spawn(async move |this, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3895,6 +3904,7 @@ impl MainWindow {
                 if this.model_gen != model_gen_at_req {
                     return;
                 }
+                this.content_loading = false;
                 if let Ok(Ok(doc)) = parsed {
                     this.md_doc = Some(doc);
                     this.recompute_md_hits(cx);
@@ -3927,6 +3937,7 @@ impl MainWindow {
         self.docx_gen = self.docx_gen.wrapping_add(1);
         let req_gen = self.docx_gen;
         let model_gen_at_req = self.model_gen;
+        self.content_loading = true;
         self.docx_doc = None;
         self.docx_hits.clear();
         self.docx_focus = None;
@@ -3942,6 +3953,7 @@ impl MainWindow {
                 if this.docx_gen != req_gen || this.model_gen != model_gen_at_req {
                     return;
                 }
+                this.content_loading = false;
                 match parsed {
                     Ok(Ok(doc)) => {
                         let doc = std::sync::Arc::new(doc);
@@ -4141,6 +4153,7 @@ impl MainWindow {
         self.full_truncated = false;
         // 任何新目标都先清空 docx 状态：非 docx 文件不会走 fetch_docx_blocks，
         // 不清就会渲染上一个 docx 的内容（预览卡住）。
+        self.content_loading = false;
         self.docx_doc = None;
         self.docx_hits.clear();
         self.docx_focus = None;
@@ -5289,15 +5302,32 @@ impl MainWindow {
             // 视图条：PDF 页码/缩放 放左边，「系统版式」开关固定右边。
             .when_some(self.render_view_bar(cx), |view, bar| view.child(bar))
             .child(if self.hit_text_active() {
-                if self.docx_doc.is_some() {
-                    self.docx_list_view(tokens)
-                } else {
                 v_flex()
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
                     .child(
-                        if self.preview.pdf.is_some() {
+                        if self.content_loading
+                            || (self.preview.pdf.is_none()
+                                && matches!(self.preview.kind, PreviewKind::Loading)
+                                && self.preview.meta.as_ref().is_some_and(|m| {
+                                    m.path.to_ascii_lowercase().ends_with(".pdf")
+                                }))
+                        {
+                            v_flex()
+                                .size_full()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(tokens.text_tertiary)
+                                        .child("正在加载预览…"),
+                                )
+                                .into_any_element()
+                        } else if self.docx_doc.is_some() {
+                            self.docx_list_view(tokens)
+                        } else if self.preview.pdf.is_some() {
                             // PDF：命中上下文里也显示真文档页面 + 命中黄框，
                             // 而不是退化成纯文本流。
                             div()
@@ -5634,8 +5664,6 @@ impl MainWindow {
                         }),
                     )
                     .into_any_element()
-            
-                }
             } else if self.preview.pdf.is_some() {
                 div()
                     .id("pdf-page-scroll")
