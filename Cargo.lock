@@ -921,6 +921,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f4c707c6a209cbe82d10abd08e1ea8995e9ea937d2550646e02798948992be0"
 
 [[package]]
+name = "cfb"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8a4f8e55be323b378facfcf1f06aa97f6ec17cf4ac84fb17325093aaf62da41"
+dependencies = [
+ "byteorder",
+ "fnv",
+ "uuid",
+]
+
+[[package]]
 name = "cff-parser"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2065,6 +2076,8 @@ dependencies = [
 name = "findx2-gui-native"
 version = "2.5.12"
 dependencies = [
+ "calamine",
+ "cfb",
  "encoding_rs",
  "findx2-ipc",
  "flate2",
@@ -2082,6 +2095,7 @@ dependencies = [
  "rdocx-oxml",
  "rustc-hash 2.1.3",
  "rusty-leveldb",
+ "rwml",
  "semver",
  "serde",
  "serde_json",
@@ -6929,6 +6943,21 @@ dependencies = [
  "byteorder",
  "thiserror 1.0.69",
  "twox-hash",
+]
+
+[[package]]
+name = "rwml"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "620ee710f5ba70a6d7a8930961b11ca1623ceac0876ec7f910626fc6ba109aeb"
+dependencies = [
+ "cfb",
+ "encoding_rs",
+ "flate2",
+ "quick-xml 0.41.0",
+ "thiserror 2.0.21",
+ "wasm-bindgen",
+ "zip",
 ]
 
 [[package]]

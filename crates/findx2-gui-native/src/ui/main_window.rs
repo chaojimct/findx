@@ -3376,10 +3376,16 @@ impl MainWindow {
         let q = self.effective_query(cx);
         let needles = crate::docx_blocks::content_needles_of(&q);
         let model_gen_at_req = self.model_gen;
+        let legacy_ppt = path.to_ascii_lowercase().ends_with(".ppt");
         cx.spawn(async move |this, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || {
-                let _ = tx.send(crate::pptx_blocks::parse(&path));
+                let r = if legacy_ppt {
+                    crate::pptx_blocks::parse_ppt(&path)
+                } else {
+                    crate::pptx_blocks::parse(&path)
+                };
+                let _ = tx.send(r);
             });
             let parsed = rx.await;
             let _ = this.update(cx, |this, cx| {
@@ -3416,9 +3422,36 @@ impl MainWindow {
 
         // 阶段一：首屏快照（只读前 1200 行），立刻出表格。
         // 阶段二：后台全扫（大表十几秒），补齐深层命中行。
+        let model_gen_at_req = self.model_gen;
+        // 老式 .xls（BIFF8）：calamine 一次读完，直接进同一套表格视图。
+        if path.to_ascii_lowercase().ends_with(".xls") {
+            let path_xls = path.clone();
+            cx.spawn(async move |this, cx| {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(crate::xlsx_blocks::parse_xls(&path_xls));
+                });
+                let parsed = rx.await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.model_gen != model_gen_at_req {
+                        return;
+                    }
+                    this.content_loading = false;
+                    if let Ok(Ok(mut wb)) = parsed {
+                        let words = this.hit_words(cx);
+                        crate::xlsx_blocks::recompute_hits(&mut wb, &words);
+                        this.sheet_book = Some(wb);
+                        this.refresh_list_cache(cx);
+                        cx.notify();
+                        this.maybe_auto_first_hit(cx);
+                    }
+                });
+            })
+            .detach();
+            return;
+        }
         let path_fast = path.clone();
         let path_full = path.clone();
-        let model_gen_at_req = self.model_gen;
         cx.spawn(async move |this, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || {
@@ -3943,10 +3976,16 @@ impl MainWindow {
         self.docx_focus = None;
         self.md_doc = None;
         self.md_hits.clear();
+        let legacy_doc = path.to_ascii_lowercase().ends_with(".doc");
         cx.spawn(async move |this, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || {
-                let _ = tx.send(crate::docx_blocks::parse(&path));
+                let r = if legacy_doc {
+                    crate::docx_blocks::parse_legacy_doc(&path)
+                } else {
+                    crate::docx_blocks::parse(&path)
+                };
+                let _ = tx.send(r);
             });
             let parsed = rx.await;
             let _ = this.update(cx, |this, cx| {
@@ -4186,7 +4225,7 @@ impl MainWindow {
             self.fetch_full_text(hit.entry_idx, cx);
             self.fetch_snippet_list(hit.entry_idx, cx);
             // docx / md：纯 Rust 块解析 → 命中上下文自绘真版式（零外部进程）。
-            if ext_l == "docx" {
+            if ext_l == "docx" || ext_l == "doc" {
                 self.fetch_docx_blocks(hit.path.clone(), cx);
             } else if matches!(ext_l.as_str(), "md" | "markdown") {
                 self.fetch_md_blocks(hit.path.clone(), cx);

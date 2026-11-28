@@ -171,12 +171,15 @@ pub fn content_supported(path: &str) -> bool {
     matches!(
         ext.as_str(),
         "docx"
+            | "doc"
             | "rtf"
             | "md"
             | "markdown"
             | "xlsx"
             | "xlsm"
+            | "xls"
             | "pptx"
+            | "ppt"
             | "pdf"
             | "txt"
             | "log"
@@ -226,7 +229,7 @@ pub fn content_supported(path: &str) -> bool {
 /// 该扩展名是否提供「系统版式」（PDF / xlsx 不提供，自渲染更完整）。
 pub fn system_supported(path: &str) -> bool {
     let ext = ext_of(path);
-    matches!(ext.as_str(), "docx" | "doc" | "xls" | "ppt" | "pptx" | "rtf")
+    matches!(ext.as_str(), "docx" | "doc" | "ppt" | "pptx" | "rtf")
 }
 
 fn ext_of(path: &str) -> String {
@@ -368,17 +371,19 @@ mod tests {
         assert!(content_supported("a.PDF"));
         assert!(content_supported("a.txt"));
         assert!(content_supported("a.ts"));
-        // 老二进制 Office 没有自渲染，走系统版式
-        assert!(!content_supported("a.doc"));
-        assert!(!content_supported("a.xls"));
-        assert!(!content_supported("a.ppt"));
+        // 老二进制 Office：doc/xls 已自渲染；ppt 走“文本分页”视图
+        assert!(content_supported("a.doc"));
+        assert!(content_supported("a.xls"));
+        assert!(content_supported("a.ppt"));
         assert!(!content_supported("a.zip"));
 
-        // 系统版式：docx/pptx 有，pdf/xlsx 没有
+        // 系统版式：doc/docx/pptx/ppt 有，pdf/xlsx/xls 没有
         assert!(system_supported("a.docx"));
         assert!(system_supported("a.PPTX"));
+        assert!(system_supported("a.doc"));
         assert!(!system_supported("a.pdf"));
         assert!(!system_supported("a.xlsx"));
+        assert!(!system_supported("a.xls"));
         assert!(!system_supported("a.txt"));
     }
 

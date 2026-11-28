@@ -34,6 +34,104 @@ pub struct Deck {
     pub para_starts: Vec<usize>,
 }
 
+/// 老式 .ppt（PowerPoint 97-2003）：从 OLE 的 "PowerPoint Document" 流里
+/// 递归扫描 TextCharsAtom(0x0FA0) / TextBytesAtom(0x0FA8)，取出文本；
+/// 暂时按段落组成一页，复用 pptx 的幻灯片视图（没有形状/版式）。
+pub fn parse_ppt(path: &str) -> Result<Deck, String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len > 128 * 1024 * 1024 {
+        return Err("ppt 超过 128 MiB 上限".into());
+    }
+    let mut comp = cfb::CompoundFile::open(file).map_err(|e| format!("ppt 打开失败: {e}"))?;
+    let mut stream = comp
+        .open_stream("PowerPoint Document")
+        .map_err(|e| format!("缺少 PowerPoint Document 流: {e}"))?;
+    let mut data = Vec::new();
+    stream
+        .read_to_end(&mut data)
+        .map_err(|e| format!("读取 ppt 流失败: {e}"))?;
+
+    let mut raw: Vec<String> = Vec::new();
+    walk_ppt_records(&data, &mut raw);
+    let mut paragraphs: Vec<String> = Vec::new();
+    for p in raw {
+        for line in p.split(['\r', '\u{0b}']) {
+            let t = line.trim();
+            if !t.is_empty() && t.chars().count() <= 2000 {
+                paragraphs.push(t.to_string());
+            }
+            if paragraphs.len() >= 4000 {
+                break;
+            }
+        }
+        if paragraphs.len() >= 4000 {
+            break;
+        }
+    }
+    if paragraphs.is_empty() {
+        return Err("ppt 没有可显示的文本".into());
+    }
+    let mut plain = String::new();
+    let mut para_starts = Vec::new();
+    for p in &paragraphs {
+        para_starts.push(plain.len());
+        plain.push_str(p);
+        plain.push('\n');
+    }
+    Ok(Deck {
+        slides: vec![Slide {
+            number: 1,
+            paragraphs,
+        }],
+        plain,
+        para_starts,
+    })
+}
+
+fn walk_ppt_records(data: &[u8], out: &mut Vec<String>) {
+    let mut pos = 0usize;
+    while pos + 8 <= data.len() {
+        let ver_inst = u16::from_le_bytes([data[pos], data[pos + 1]]);
+        let rtype = u16::from_le_bytes([data[pos + 2], data[pos + 3]]);
+        let len = u32::from_le_bytes([
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
+        ]) as usize;
+        pos += 8;
+        if pos + len > data.len() {
+            break;
+        }
+        let payload = &data[pos..pos + len];
+        if ver_inst & 0x000F == 0x000F {
+            walk_ppt_records(payload, out);
+        } else if rtype == 0x0FA0 {
+            out.push(decode_utf16(payload));
+        } else if rtype == 0x0FA8 {
+            out.push(decode_ansi(payload));
+        }
+        pos += len;
+    }
+}
+
+fn decode_utf16(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+fn decode_ansi(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => encoding_rs::GBK.decode(bytes).0.into_owned(),
+    }
+}
+
 impl Deck {
     /// 命中偏移 → (页码, 段落下标)，用于跳转与页签定位。
 pub fn locate(&self, off: usize) -> Option<(usize, usize)> {
@@ -184,6 +282,16 @@ fn parse_slide_paragraphs(xml: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn parse_ppt_smoke_env() {
+        let Ok(path) = std::env::var("FINDX_PPT_SMOKE") else {
+            return;
+        };
+        let deck = parse_ppt(&path).expect("parse_ppt");
+        assert!(!deck.slides.is_empty());
+        assert!(!deck.plain.trim().is_empty());
+    }
     use super::*;
 
     #[test]

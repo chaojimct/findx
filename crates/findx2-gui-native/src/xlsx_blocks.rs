@@ -273,6 +273,53 @@ fn read_sheet_rows(
     Ok(parse_rows(BufReader::new(f), shared, max_rows, keep_words))
 }
 
+/// 老式 .xls（BIFF8）：calamine 原生支持，转成与 xlsx 同一套 Workbook 模型。
+/// 只取前 `MAX_ROWS` 行 / `MAX_COLS` 列，保证预览不因巨表卡死。
+pub fn parse_xls(path: &str) -> Result<Workbook, String> {
+    use calamine::{open_workbook_auto, Data, Reader};
+    let mut book = open_workbook_auto(path).map_err(|e| format!("xls 打开失败: {e}"))?;
+    let names: Vec<String> = book.sheet_names().to_owned();
+    let mut out = Workbook::default();
+    for name in names {
+        let Ok(range) = book.worksheet_range(&name) else {
+            continue;
+        };
+        let total_rows = range.height();
+        let mut rows: Vec<Vec<String>> = Vec::with_capacity(total_rows.min(MAX_ROWS));
+        for (r, row) in range.rows().enumerate() {
+            if r >= MAX_ROWS {
+                break;
+            }
+            let mut cells: Vec<String> = Vec::with_capacity(row.len().min(MAX_COLS));
+            for cell in row.iter().take(MAX_COLS) {
+                cells.push(match cell {
+                    Data::Empty => String::new(),
+                    other => other.to_string(),
+                });
+            }
+            while cells.last().is_some_and(|s| s.is_empty()) {
+                cells.pop();
+            }
+            rows.push(cells);
+        }
+        if rows.is_empty() {
+            continue;
+        }
+        let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        out.sheets.push(Sheet {
+            name,
+            rows: Arc::new(rows),
+            hits: Arc::new(Vec::new()),
+            total_rows,
+            cols,
+        });
+    }
+    if out.sheets.is_empty() {
+        return Err("工作簿没有可显示的单元格".into());
+    }
+    Ok(out)
+}
+
 /// 通用流式行解析（正式路径与单测共用，避免两套逻辑不一致）。
 ///
 /// `keep_words`：命中词（宽匹配，用于判断"这行要不要保留"）。
@@ -475,6 +522,19 @@ mod tests {
         assert_eq!(col_label(25), "Z");
         assert_eq!(col_label(26), "AA");
         assert_eq!(col_label(27), "AB");
+    }
+
+    #[test]
+    fn parse_xls_smoke_env() {
+        let Ok(path) = std::env::var("FINDX_XLS_SMOKE") else {
+            return;
+        };
+        let wb = parse_xls(&path).expect("parse_xls");
+        assert!(!wb.sheets.is_empty());
+        assert!(wb
+            .sheets
+            .iter()
+            .any(|s| s.rows.iter().any(|r| r.iter().any(|c| !c.is_empty()))));
     }
 
     #[test]

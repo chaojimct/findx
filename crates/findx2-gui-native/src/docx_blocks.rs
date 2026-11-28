@@ -135,6 +135,24 @@ pub fn parse(path: &str) -> Result<DocxDoc, String> {
     parse_document(&doc)
 }
 
+/// 从字节解析 docx（供老 .doc 转 docx 后复用同一套块模型）。
+pub fn parse_bytes(raw: &[u8]) -> Result<DocxDoc, String> {
+    let doc = Document::from_bytes(raw).map_err(|e| format!("docx 解析失败: {e}"))?;
+    parse_document(&doc)
+}
+
+/// 老式 .doc（Word 97-2003）：rwml 纯 Rust 解析 → 转成 docx 字节 →
+/// 复用既有的 docx 块模型/渲染器（段落、run 样式、表格、标题、列表）。
+pub fn parse_legacy_doc(path: &str) -> Result<DocxDoc, String> {
+    let raw = std::fs::read(path).map_err(|e| e.to_string())?;
+    let legacy = rwml::Document::open(&raw).map_err(|e| format!("doc 解析失败: {e}"))?;
+    let docx = legacy.to_docx();
+    if docx.is_empty() {
+        return Err("doc 转换失败：空文档".into());
+    }
+    parse_bytes(&docx)
+}
+
 fn parse_document(doc: &Document) -> Result<DocxDoc, String> {
     let mut out = DocxDoc::default();
     let mut plain = String::new();
@@ -546,6 +564,16 @@ mod tests {
         for w in hits.windows(2) {
             assert!(w[0].end <= w[1].start);
         }
+    }
+
+    #[test]
+    fn parse_legacy_doc_smoke_env() {
+        let Ok(path) = std::env::var("FINDX_DOC_SMOKE") else {
+            return;
+        };
+        let doc = parse_legacy_doc(&path).expect("parse_legacy_doc");
+        assert!(!doc.blocks.is_empty());
+        assert!(!doc.plain.trim().is_empty());
     }
 
     #[test]
