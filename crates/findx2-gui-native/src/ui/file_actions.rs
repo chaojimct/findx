@@ -1836,7 +1836,7 @@ impl MainWindow {
         (!self.file_actions.report.is_empty() && !self.file_actions.activity_dismissed)
             || self.file_actions.busy
     }
-    pub(super) fn render_preview(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_preview(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let hits = self.selected_file_hits();
         if hits.len() < 2 {
             return self.render_single_preview(cx).into_any_element();

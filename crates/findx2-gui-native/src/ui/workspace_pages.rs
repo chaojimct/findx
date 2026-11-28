@@ -10,7 +10,7 @@ use gpui_kit::AnimationExt as _;
 
 impl MainWindow {
     pub(in super::super) fn render_workspace_page(
-        &self,
+        &mut self,
         sidebar: bool,
         preview: bool,
         window: &mut Window,

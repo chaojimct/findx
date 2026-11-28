@@ -361,6 +361,11 @@ pub struct MainWindow {
     list_vscroll: gpui_kit::UniformListScrollHandle,
     /// docx 定向渲染焦点块（点击列表/翻页时切换，只渲染该块附近的窗口）。
     docx_focus: Option<usize>,
+    /// docx 块的平均高度估值（virtual list 的统一高度提示）。
+    docx_avg_h: f32,
+    /// 首次布局会把 height hint 全部清成 0（gpui list 按宽度失效重建），
+    /// 布局后需要补一次提示；这个标记保证只补一次。
+    docx_hint_restored: bool,
     /// md/txt 块模型（命中上下文富文本自绘；与 docx 共用渲染器）。
     md_doc: Option<crate::markdown_blocks::MdDoc>,
     /// md 命中区间（md.plain 字节坐标）。
@@ -732,6 +737,8 @@ impl MainWindow {
             list_groups: std::rc::Rc::new(Vec::new()),
             list_vscroll: gpui_kit::UniformListScrollHandle::new(),
             docx_focus: None,
+            docx_avg_h: 40.0,
+            docx_hint_restored: false,
             md_doc: None,
             md_hits: Vec::new(),
             sheet_book: None,
@@ -1944,10 +1951,8 @@ impl MainWindow {
             return;
         }
         let (ready, has_hits) = match ext.as_str() {
-            "docx" => (
-                self.docx_doc.is_some(),
-                !self.docx_hits.is_empty(),
-            ),
+            // .doc 与 .docx 共用同一套块模型/命中。
+            "docx" | "doc" => (self.docx_doc.is_some(), !self.docx_hits.is_empty()),
             "md" | "markdown" => (self.md_doc.is_some(), !self.md_hits.is_empty()),
             "pptx" | "ppt" => (self.deck.is_some(), !self.deck_hits.is_empty()),
             "xlsx" | "xlsm" | "xls" => (
@@ -2502,13 +2507,18 @@ impl MainWindow {
     /// docx 内容定位到第 N 个命中所在的块（点列表行 / 翻页共用）。
     /// 采用「定向渲染窗口」而非滚动：切 focus 块重绘，命中必在首屏。
     fn scroll_to_hit(&mut self, n: usize) {
-        // docx：切焦点块（定向渲染）。
+        // docx：把目标块锚到视口顶部。
         if let Some(doc) = self.docx_doc.as_ref() {
             if let Some(off) = self.docx_hits.get(n).map(|r| r.start) {
                 if let Some(block) = doc.block_of_offset(off) {
                     self.docx_focus = Some(block);
-                    // 虚拟列表：按块号直接滚过去（没有 5000 段/窗口限制）。
-                    self.docx_list.scroll_to_reveal_item(block);
+                    // 高变高虚拟列表：直接锚定**块号**（scroll_to），不要用
+                    // scroll_to_reveal_item —— 后者按像素估算，未测量项高度为 0，
+                    // 跳远距离会落回错误位置（实测：几千块的大文档跳不动/乱跳）。
+                    self.docx_list.scroll_to(gpui_kit::ListOffset {
+                        item_ix: block,
+                        offset_in_item: gpui::px(0.),
+                    });
                 }
             }
             return;
@@ -4006,8 +4016,13 @@ impl MainWindow {
                 this.content_loading = false;
                 match parsed {
                     Ok(Ok(doc)) => {
+                        // 未测量项按 0 高会让滚动条/跳转失真，先给统一高度提示。
+                        let hint = doc.avg_block_height();
+                        this.docx_avg_h = hint;
+                        this.docx_hint_restored = false;
                         let doc = std::sync::Arc::new(doc);
-                        this.docx_list.reset(doc.blocks.len());
+                        this.docx_list
+                            .reset_with_uniform_height(doc.blocks.len(), gpui::px(hint));
                         this.docx_doc = Some(doc);
                         this.recompute_docx_hits(cx);
                         cx.notify();
@@ -4691,13 +4706,31 @@ impl MainWindow {
         cx.notify();
     }
     /// docx 正文：高变高虚拟列表（ListState），按需渲染可见段，没有段数上限。
-    fn docx_list_view(&self, tokens: FindxTokens) -> AnyElement {
+    fn docx_list_view(&mut self, tokens: FindxTokens, cx: &mut Context<Self>) -> AnyElement {
         let Some(doc) = self.docx_doc.clone() else {
             return div().into_any_element();
         };
         // 渲染前保证列表项数与文档块数一致（解析完成/换文件/reset 时机都可能错开）。
+        // 用统一高度提示重置：未测量项按 0 高会让滚动条/跳转整体失真。
         if self.docx_list.item_count() != doc.blocks.len() {
-            self.docx_list.reset(doc.blocks.len());
+            self.docx_avg_h = doc.avg_block_height();
+            self.docx_hint_restored = false;
+            self.docx_list
+                .reset_with_uniform_height(doc.blocks.len(), gpui::px(self.docx_avg_h));
+        }
+        // gpui 的 list 在**首次布局**（宽度未知）时会把所有 height hint 清成 0：
+        // 之后滚动条只剩「已测量项」的高度，几千块的文档滑块比例会严重偏小，
+        // 拖动/跳转也失去依据。这里在布局后补一次统一高度提示（只补一次，
+        // 否则每帧重建 SumTree 会把已测量项也打回未测量）。
+        if !self.docx_hint_restored && self.docx_list.item_count() > 24 {
+            let expected = self.docx_list.item_count() as f32 * self.docx_avg_h * 0.5;
+            if self.docx_list.max_offset_for_scrollbar().y < gpui::px(expected) {
+                self.docx_list
+                    .clone()
+                    .with_uniform_item_height(gpui::px(self.docx_avg_h));
+                self.docx_hint_restored = true;
+                cx.notify();
+            }
         }
         let hits = std::rc::Rc::new(self.docx_hits.clone());
         let list = gpui_kit::list(self.docx_list.clone(), move |ix, _w, _cx| {
@@ -5041,7 +5074,7 @@ impl MainWindow {
             .into_any_element()
     }
 
-    fn render_single_preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_single_preview(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = Self::tokens(cx);
         let wrap = self.session.read(cx).settings.preview_wrap;
         let header = match &self.preview.meta {
@@ -5385,7 +5418,7 @@ impl MainWindow {
                                 )
                                 .into_any_element()
                         } else if self.docx_doc.is_some() {
-                            self.docx_list_view(tokens)
+                            self.docx_list_view(tokens, cx)
                         } else if self.preview.pdf.is_some() {
                             // PDF：命中上下文里也显示真文档页面 + 命中黄框，
                             // 而不是退化成纯文本流。

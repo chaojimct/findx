@@ -124,6 +124,56 @@ impl DocxDoc {
             Err(i) => Some(i - 1),
         }
     }
+
+    /// 粗略估算平均块高（px），给虚拟列表做「统一高度提示」。
+    ///
+    /// GPUI 的高变高列表把**未测量**项按 0 高处理，几千块的文档在跳转/滚动条上
+    /// 会完全失真（跳到底部变成跳回顶部、滑块比例随渲染不断变化）。给一个接近
+    /// 实际均值的提示后：项索引↔像素的换算有据可依，滚动条比例首帧即正确，
+    /// 跳转用 `scroll_to(item_ix)` 直接锚定块号，不依赖估算像素。
+    ///
+    /// 口径：正文宽约 700px、基准字号 16px、中文按 2 个宽度单位。
+    pub fn avg_block_height(&self) -> f32 {
+        if self.blocks.is_empty() {
+            return 40.0;
+        }
+        const LINE_UNITS: f32 = 80.0;
+        let mut total = 0.0f32;
+        for b in &self.blocks {
+            match b {
+                DocxBlock::Paragraph(p) => {
+                    let units: f32 = p
+                        .text()
+                        .chars()
+                        .map(|c| if c.is_ascii() { 1.0 } else { 2.0 })
+                        .sum();
+                    let lines = (units / LINE_UNITS).ceil().max(1.0);
+                    let font = match p.heading {
+                        Some(1) => 30.0,
+                        Some(2) => 25.0,
+                        Some(3) => 21.0,
+                        Some(4) => 18.5,
+                        Some(5) => 17.0,
+                        Some(_) => 16.0,
+                        None => {
+                            let m = p.runs.iter().map(|r| r.size_pt).fold(0.0f32, f32::max);
+                            if m > 0.0 {
+                                (m * 4.0 / 3.0).clamp(12.0, 36.0)
+                            } else {
+                                16.0
+                            }
+                        }
+                    };
+                    let spacing = (p.space_before + p.space_after) * 4.0 / 3.0;
+                    total += lines * font * 1.5 * p.line_spacing.max(1.0) + spacing + 4.0;
+                }
+                // 表格行普遍比正文行高（内边距 + 单元格多段），按每行 34px 估。
+                DocxBlock::Table(t) => total += t.rows.len() as f32 * 34.0 + 8.0,
+            }
+        }
+        (total / self.blocks.len() as f32).clamp(24.0, 240.0)
+    }
+
 }
 
 const MAX_BLOCKS: usize = 4000;
