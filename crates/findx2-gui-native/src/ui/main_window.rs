@@ -4709,55 +4709,25 @@ impl MainWindow {
 
     /// 预览视图条：左侧当前视图的操作（PDF 页码/缩放），右侧「系统版式」开关。
     fn render_view_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let ext = self
-            .preview
-            .meta
-            .as_ref()
-            .map(|m| {
-                std::path::Path::new(&m.path)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.to_ascii_lowercase())
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default();
+        // 只有 PDF 需要额外的页操作条；系统版式按钮在文件头右侧。
         let has_pdf_controls = self.preview.pdf.is_some() && self.preview_snippet_view;
-        let can_system = crate::preview_panel::system_supported(&ext);
-        if !has_pdf_controls && !can_system {
+        if !has_pdf_controls {
             return None;
         }
         let tokens = Self::tokens(cx);
-        let mut bar = h_flex()
-            .w_full()
-            .flex_shrink_0()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .border_b_1()
-            .border_color(tokens.border_soft);
-        if has_pdf_controls {
-            bar = bar.child(div().flex_1().min_w_0().child(self.render_pdf_controls(cx)));
-        } else {
-            bar = bar.child(div().flex_1());
-        }
-        if can_system {
-            let entity = cx.entity();
-            let on = self.system_preview;
-            bar = bar.child(
-                Button::new("preview-system-toggle")
-                    .ghost()
-                    .label(if on { "内容视图" } else { "系统版式" })
-                    .selected(on)
-                    .h(px(22.))
-                    .px_2()
-                    .tooltip("系统版式由系统预览处理器渲染；离开即销毁并恢复亚克力")
-                    .on_click(move |_, _, cx| {
-                        entity.update(cx, |this, cx| this.toggle_system_preview(cx));
-                    }),
-            );
-        }
-        Some(bar.into_any_element())
+        Some(
+            h_flex()
+                .w_full()
+                .flex_shrink_0()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .border_b_1()
+                .border_color(tokens.border_soft)
+                .child(self.render_pdf_controls(cx))
+                .into_any_element(),
+        )
     }
 
     /// 进入/退出系统版式：只在点击时发生，绝不自动启动。
@@ -5025,42 +4995,71 @@ impl MainWindow {
         let tokens = Self::tokens(cx);
         let wrap = self.session.read(cx).settings.preview_wrap;
         let header = match &self.preview.meta {
-            Some(meta) => v_flex()
-                .h(px(56.)).overflow_hidden()
-                .w_full()
-                .min_w_0()
-                .flex_shrink_0()
-                .px_3()
-                .py_2()
-                .gap_1()
-                .border_b_1()
-                .border_color(tokens.border)
-                .child(
-                    div()
-                        .id("preview-filename")
-                        .role(gpui_kit::accesskit::Role::Label)
-                        .aria_label(meta.name.clone())
-                        .w_full()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_sm()
-                        .aria_description(meta.path.clone())
-                        .child(meta.name.clone()),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_xs()
-                        .text_color(tokens.text_secondary)
-                        .child(preview::format_meta_line(meta)),
-                )
-                .into_any_element(),
+            Some(meta) => {
+                let can_system = crate::preview_panel::system_supported(&meta.path);
+                let entity = cx.entity();
+                let on = self.system_preview;
+                h_flex()
+                    .h(px(56.))
+                    .w_full()
+                    .min_w_0()
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(tokens.border)
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id("preview-filename")
+                                    .role(gpui_kit::accesskit::Role::Label)
+                                    .aria_label(meta.name.clone())
+                                    .w_full()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_sm()
+                                    .aria_description(meta.path.clone())
+                                    .child(meta.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_xs()
+                                    .text_color(tokens.text_secondary)
+                                    .child(preview::format_meta_line(meta)),
+                            ),
+                    )
+                    // 系统版式入口固定在文件头右侧（只有支持的格式才出现）。
+                    .when(can_system, |h| {
+                        h.child(
+                            Button::new("preview-system-toggle")
+                                .ghost()
+                                .label(if on { "内容视图" } else { "系统版式" })
+                                .selected(on)
+                                .h(px(22.))
+                                .px_2()
+                                .tooltip("系统版式由系统预览处理器渲染；离开即销毁并恢复亚克力")
+                                .on_click(move |_, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.toggle_system_preview(cx);
+                                    });
+                                }),
+                        )
+                    })
+                    .into_any_element()
+            }
             None => div().h(px(56.)).flex_shrink_0().into_any_element(),
         };
 
